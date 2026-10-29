@@ -6,13 +6,15 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use skywave_core::{
-    Action, BlobPolicy, Core, DeviceId, Link, LinkRejection, PairedCredentials, Request, Route,
-    Screen, Seam, Seq, ViewState,
+    Action, ApprovalId, BlobPolicy, CommandId, Core, DeviceId, FailReason, Link, LinkRejection,
+    PairedCredentials, Request, Route, Screen, Seam, Seq, SessionId, ViewState,
 };
+use skywave_proto::{CommandResult, Event, EventBatch, EventKind, SessionState as LogState};
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
 use skywave_tui::ui;
@@ -157,6 +159,61 @@ fn assert_contains(screen: &str, needle: &str) {
         screen.contains(needle),
         "{needle:?} not on screen:\n{screen}"
     );
+}
+
+/// The one screen line containing `needle`.
+fn line_with(screen: &str, needle: &str) -> String {
+    let lines: Vec<&str> = screen.lines().filter(|l| l.contains(needle)).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "{needle:?} on {} lines:\n{screen}",
+        lines.len()
+    );
+    lines[0].to_owned()
+}
+
+fn at(minute: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap()
+}
+
+/// Plays the sync engine: hands the core the next pulled batch, as if the
+/// server's log grew, e.g. because another device acted.
+fn pull(h: &mut Harness, events: Vec<Event>) {
+    let from = Seq(h.seam.cursor().unwrap().0 + 1);
+    h.seam.apply_events(&EventBatch { from, events }).unwrap();
+    h.sync();
+}
+
+fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
+    Event {
+        session_id,
+        at: at(minute),
+        kind,
+    }
+}
+
+fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::SessionCreated {
+            workdir: workdir.into(),
+        },
+    )
+}
+
+fn selected_workdir(h: &Harness) -> Option<String> {
+    let Screen::SessionList(list) = &h.app.view().screen else {
+        panic!("not on the session list");
+    };
+    let i = h.app.selected_index(list)?;
+    list.sessions[i].workdir.clone()
+}
+
+/// The id of the newest command in the outbox.
+fn last_command(h: &Harness) -> CommandId {
+    h.seam.pending_outbox().unwrap().last().unwrap().command.id
 }
 
 #[test]
@@ -333,7 +390,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         "offline · 2 queued · retrying… (attempt 3)"
     );
     // Local data still renders under the banner.
-    assert_contains(&h.screen(), "/srv/a  [queued]");
+    assert_contains(&line_with(&h.screen(), "/srv/a"), "[queued]");
 
     // A new attempt restarts the countdown from when it arrived.
     let later = t0 + Duration::from_secs(10);
@@ -427,6 +484,8 @@ fn help_overlay_lists_keys_and_closes() {
     h.key(KeyCode::Char('?'));
     let screen = h.screen();
     assert_contains(&screen, "open session");
+    assert_contains(&screen, "new session in a server directory");
+    assert_contains(&screen, "agent blocked on an approval");
     assert_contains(&screen, "Ctrl-C");
     // Keys do nothing else while help is open.
     assert_eq!(h.key(KeyCode::Char('s')), None);
@@ -466,4 +525,220 @@ fn quit_keys() {
     let mut h = Harness::new();
     h.key_with(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(h.app.ui().quit, "Ctrl-C quits even while typing");
+}
+
+#[test]
+fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
+    let mut h = Harness::paired();
+    assert_contains(&h.screen(), "No sessions yet. Press n to start one.");
+
+    // Another device created a session: the pulled batch alone, without a
+    // key press, puts the row on screen.
+    let a = SessionId::new();
+    pull(&mut h, vec![created(a, 0, "/srv/a")]);
+    let row = line_with(&h.screen(), "/srv/a");
+    assert_contains(&row, "> [idle]");
+    assert_contains(&row, "2026-10-29 12:00 UTC");
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/a"));
+
+    // A newer session sorts above it; the selection stays on /srv/a.
+    let b = SessionId::new();
+    pull(&mut h, vec![created(b, 5, "/srv/b")]);
+    let screen = h.screen();
+    assert_contains(&screen, "Sessions (2)");
+    assert!(screen.find("/srv/b").unwrap() < screen.find("/srv/a").unwrap());
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/a"));
+    assert!(!line_with(&screen, "/srv/b").contains("> "));
+
+    // Activity reorders the rows; the selection follows the session.
+    h.key(KeyCode::Up);
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+    pull(
+        &mut h,
+        vec![event(
+            a,
+            9,
+            EventKind::SessionStateChanged(LogState::AgentWorking),
+        )],
+    );
+    let screen = h.screen();
+    assert!(screen.find("/srv/a").unwrap() < screen.find("/srv/b").unwrap());
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(b)));
+
+    // Back on the list, the same session is still selected.
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+    h.key(KeyCode::Char('j'));
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"), "last row");
+    h.key(KeyCode::Char('k'));
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/a"));
+}
+
+#[test]
+fn every_session_state_has_its_own_badge() {
+    let mut h = Harness::paired();
+    let [idle, working, approval, errored] = std::array::from_fn(|_| SessionId::new());
+    pull(
+        &mut h,
+        vec![
+            created(idle, 0, "/srv/idle"),
+            created(working, 1, "/srv/working"),
+            created(approval, 2, "/srv/approval"),
+            created(errored, 3, "/srv/errored"),
+            event(
+                working,
+                4,
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+            ),
+            event(
+                approval,
+                5,
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    tool: "Bash".into(),
+                    summary: "rm -rf target".into(),
+                    input: None,
+                },
+            ),
+            event(
+                errored,
+                6,
+                EventKind::SessionStateChanged(LogState::Errored {
+                    message: "agent exited with status 1".into(),
+                }),
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&line_with(&screen, "/srv/idle"), "[idle]");
+    assert_contains(&line_with(&screen, "/srv/working"), "[working]");
+    let row = line_with(&screen, "/srv/approval");
+    assert_contains(&row, "[approval]");
+    assert_contains(&row, "! 1 approval pending");
+    let row = line_with(&screen, "/srv/errored");
+    assert_contains(&row, "[error]");
+    assert_contains(&row, "agent exited with status 1");
+    assert_contains(&row, "2026-10-29 12:06 UTC");
+    // Badges are padded so the workdirs line up.
+    let column = |dir: &str| line_with(&screen, dir).find(dir).unwrap();
+    assert_eq!(column("/srv/idle"), column("/srv/approval"));
+}
+
+#[test]
+fn create_session_goes_from_queued_to_the_real_row() {
+    let mut h = Harness::paired();
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert!(h.app.typing());
+    let screen = h.screen();
+    assert_contains(&screen, "New session · workdir on the server");
+    assert_contains(&screen, "Enter create · Esc cancel");
+
+    // Letters are text in the prompt, not commands.
+    h.type_text("/srv/quiet");
+    assert!(!h.app.ui().quit);
+    for _ in 0.."quiet".len() {
+        h.key(KeyCode::Backspace);
+    }
+    h.type_text("new");
+    assert_contains(&h.screen(), "> /srv/new");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            workdir: "/srv/new".into()
+        })
+    );
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
+    assert!(h.app.ui().create.is_none(), "the prompt closes");
+    assert!(!h.app.typing());
+    let command = last_command(&h);
+
+    assert_contains(&line_with(&h.screen(), "/srv/new"), "[queued]");
+    assert_contains(&h.screen(), "Creating");
+
+    h.seam.command_sending(command).unwrap();
+    h.sync();
+    assert_contains(&line_with(&h.screen(), "/srv/new"), "[sending]");
+
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(1) })
+        .unwrap();
+    h.sync();
+    let row = line_with(&h.screen(), "/srv/new");
+    assert_contains(&row, "[accepted]");
+    assert_contains(&row, "created, syncing…");
+
+    // The session's event arrives: the pending row becomes the real one.
+    let id = SessionId::new();
+    pull(&mut h, vec![created(id, 0, "/srv/new")]);
+    let screen = h.screen();
+    assert!(!screen.contains("Creating"));
+    assert_contains(&line_with(&screen, "/srv/new"), "> [idle]");
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+}
+
+#[test]
+fn refused_creations_say_why() {
+    let mut h = Harness::paired();
+    let cases = [
+        (
+            "/etc",
+            FailReason::WorkdirNotAllowed,
+            "not under a configured root on the server",
+        ),
+        (
+            "/srv/missing",
+            FailReason::WorkdirNotFound,
+            "no such directory on the server",
+        ),
+    ];
+    for (workdir, reason, words) in cases {
+        h.key(KeyCode::Char('n'));
+        h.app.on_paste(&format!(" {workdir}\n"));
+        assert!(matches!(
+            h.key(KeyCode::Enter),
+            Some(Action::CreateSession { .. })
+        ));
+        let command = last_command(&h);
+        h.seam.command_sending(command).unwrap();
+        h.seam
+            .command_result(command, &CommandResult::Rejected { reason })
+            .unwrap();
+        h.sync();
+        let row = line_with(&h.screen(), workdir);
+        assert_contains(&row, "[failed]");
+        assert_contains(&row, words);
+    }
+    assert_contains(&h.screen(), "No sessions yet.");
+}
+
+#[test]
+fn esc_cancels_the_new_session_prompt() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    h.type_text("/srv/a");
+    h.key_with(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(h.app.ui().create.as_ref().unwrap().workdir, "");
+    h.type_text("/srv/b");
+    // `?` is text here; F1 still opens help, which lists the prompt's keys.
+    h.key(KeyCode::Char('?'));
+    assert!(!h.app.ui().help);
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::F(1));
+    assert_contains(&h.screen(), "create the session");
+    h.key(KeyCode::Esc);
+    assert!(!h.app.ui().help);
+    assert_eq!(h.app.ui().create.as_ref().unwrap().workdir, "/srv/b");
+
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().create.is_none());
+    assert!(h.drain_requests().is_empty());
+    assert!(h.seam.pending_outbox().unwrap().is_empty());
+    assert_contains(&h.screen(), "n new session");
+    // Out of the prompt, `q` quits again.
+    h.key(KeyCode::Char('q'));
+    assert!(h.app.ui().quit);
 }

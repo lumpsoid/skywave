@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
-    Action, BlobPolicy, CoreError, Link, LinkRejection, PairingView, Route, Screen, ViewState,
+    Action, BlobPolicy, CoreError, Link, LinkRejection, PairingView, Route, Screen, SessionId,
+    SessionListView, ViewState,
 };
 
 /// One of the pairing form's fields, in tab order.
@@ -171,13 +172,33 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// The "new session" prompt on the session list: the server workdir being
+/// typed. Whether the path is acceptable is the server's call (D14).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateInput {
+    pub workdir: String,
+    /// Enter was pressed; the prompt closes once the core takes the action
+    /// and stays open with the text if dispatching fails.
+    submitted: bool,
+}
+
+impl CreateInput {
+    fn insert(&mut self, text: &str) {
+        self.workdir
+            .extend(text.chars().filter(|c| !c.is_control()));
+    }
+}
+
 /// Presentation state owned by the head.
 #[derive(Debug, Clone)]
 pub struct UiState {
     pub help: bool,
     pub form: PairingForm,
-    /// Selected row on the session list.
-    pub selected: usize,
+    /// Selected session on the session list, by id so it stays put when
+    /// rows arrive or reorder.
+    pub selected: Option<SessionId>,
+    /// The open "new session" prompt, if any.
+    pub create: Option<CreateInput>,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
     /// When the current [`Link`] value arrived; the retry countdown runs
@@ -202,7 +223,8 @@ impl App {
             ui: UiState {
                 help: false,
                 form: PairingForm::default(),
-                selected: 0,
+                selected: None,
+                create: None,
                 revoked_dismissed: false,
                 link_since: now,
                 error: None,
@@ -210,6 +232,7 @@ impl App {
             },
         };
         app.prefill(&view);
+        app.keep_selection(None);
         app
     }
 
@@ -238,15 +261,71 @@ impl App {
             (true, false) => self.ui.form = PairingForm::default(),
             _ => {}
         }
-        if let Screen::SessionList(list) = &view.screen {
-            self.ui.selected = self.ui.selected.min(list.sessions.len().saturating_sub(1));
+        if !matches!(view.screen, Screen::SessionList(_)) {
+            self.ui.create = None;
         }
+        let old_index = self
+            .session_list()
+            .and_then(|list| self.selected_index(list));
         self.view = view;
+        self.keep_selection(old_index);
     }
 
     /// Records the outcome of dispatching an action from [`App::on_key`].
     pub fn dispatched(&mut self, result: Result<(), CoreError>) {
+        if let Some(create) = &mut self.ui.create
+            && create.submitted
+        {
+            if result.is_ok() {
+                self.ui.create = None;
+            } else {
+                create.submitted = false;
+            }
+        }
         self.ui.error = result.err().map(|err| err.to_string());
+    }
+
+    /// The session list on screen, if that is the current screen.
+    pub fn session_list(&self) -> Option<&SessionListView> {
+        match &self.view.screen {
+            Screen::SessionList(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// Position of the selected session in `list`.
+    pub fn selected_index(&self, list: &SessionListView) -> Option<usize> {
+        let id = self.ui.selected?;
+        list.sessions.iter().position(|row| row.id == id)
+    }
+
+    /// Keeps the selected session selected. If it is gone (or nothing was
+    /// selected), selects the row at `old_index`, clamped, so the cursor
+    /// does not jump to the top.
+    fn keep_selection(&mut self, old_index: Option<usize>) {
+        let Screen::SessionList(list) = &self.view.screen else {
+            return;
+        };
+        if self.selected_index(list).is_some() {
+            return;
+        }
+        let last = list.sessions.len().checked_sub(1);
+        self.ui.selected = last.map(|last| list.sessions[old_index.unwrap_or(0).min(last)].id);
+    }
+
+    fn move_selection(&mut self, down: bool) {
+        let Screen::SessionList(list) = &self.view.screen else {
+            return;
+        };
+        let Some(last) = list.sessions.len().checked_sub(1) else {
+            return;
+        };
+        let index = match (self.selected_index(list), down) {
+            (None, _) => 0,
+            (Some(i), true) => (i + 1).min(last),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.ui.selected = Some(list.sessions[index].id);
     }
 
     /// The revoked full-screen state covers the current screen.
@@ -258,13 +337,23 @@ impl App {
 
     /// The focused element takes text, so letters are input, not commands.
     pub fn typing(&self) -> bool {
-        matches!(self.view.screen, Screen::Pairing(_)) && !self.revoked_screen()
+        !self.revoked_screen()
+            && match self.view.screen {
+                Screen::Pairing(_) => true,
+                Screen::SessionList(_) => self.ui.create.is_some(),
+                _ => false,
+            }
     }
 
-    /// Bracketed paste: a pairing URI fills the whole form, anything else
-    /// goes into the focused field.
+    /// Bracketed paste: on the pairing screen a pairing URI fills the whole
+    /// form, anything else goes into the focused field; in the new-session
+    /// prompt it goes into the workdir.
     pub fn on_paste(&mut self, text: &str) {
         if !self.typing() || self.ui.help {
+            return;
+        }
+        if let Some(create) = &mut self.ui.create {
+            create.insert(text.trim());
             return;
         }
         match PairUri::parse(text) {
@@ -316,21 +405,24 @@ impl App {
                 let paired = pairing.paired.is_some();
                 self.pairing_key(key, ctrl, paired)
             }
+            Screen::SessionList(_) if self.ui.create.is_some() => self.create_key(key, ctrl),
             Screen::SessionList(list) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.ui.selected = self.ui.selected.saturating_sub(1);
+                    self.move_selection(false);
                     None
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let last = list.sessions.len().saturating_sub(1);
-                    self.ui.selected = (self.ui.selected + 1).min(last);
+                    self.move_selection(true);
                     None
                 }
-                KeyCode::Enter => list
-                    .sessions
-                    .get(self.ui.selected)
-                    .map(|row| Action::OpenSession(row.id)),
+                KeyCode::Enter => self
+                    .selected_index(list)
+                    .map(|i| Action::OpenSession(list.sessions[i].id)),
+                KeyCode::Char('n') => {
+                    self.ui.create = Some(CreateInput::default());
+                    None
+                }
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
                 _ => None,
             },
@@ -380,6 +472,29 @@ impl App {
                 form.value_mut(field).clear();
             }
             KeyCode::Char(c) if !ctrl => form.insert(c.encode_utf8(&mut [0; 4])),
+            _ => {}
+        }
+        None
+    }
+
+    /// Keys while the new-session prompt is open.
+    fn create_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let create = self.ui.create.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.ui.create = None,
+            // Blank or unacceptable paths are refused by the core or the
+            // server, not here.
+            KeyCode::Enter => {
+                create.submitted = true;
+                return Some(Action::CreateSession {
+                    workdir: create.workdir.clone(),
+                });
+            }
+            KeyCode::Backspace => {
+                create.workdir.pop();
+            }
+            KeyCode::Char('u') if ctrl => create.workdir.clear(),
+            KeyCode::Char(c) if !ctrl => create.insert(c.encode_utf8(&mut [0; 4])),
             _ => {}
         }
         None

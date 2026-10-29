@@ -14,4 +14,8 @@ crossterm.workspace = true
 ratatui.workspace = true
 
 [dev-dependencies]
+# Tests play the engine through `core.seam()`, which speaks proto types.
+# The head itself depends on skywave-core only.
+skywave-proto.workspace = true
+chrono.workspace = true
 tempfile.workspace = true

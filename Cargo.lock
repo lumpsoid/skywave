@@ -1417,10 +1417,12 @@ dependencies = [
 name = "skywave-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "crossterm",
  "ratatui",
  "skywave-core",
+ "skywave-proto",
  "tempfile",
 ]
 

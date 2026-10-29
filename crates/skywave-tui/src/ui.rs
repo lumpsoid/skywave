@@ -7,10 +7,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 use skywave_core::{
-    ApprovalStatus, BlobPolicy, Decision, Entry, Link, LinkRejection, Outgoing, PairingStatus,
-    PairingView, Screen, SessionListView, SessionState, SessionView, SettingsView, TimelineItem,
+    ApprovalStatus, BlobPolicy, Decision, Entry, FailReason, Link, LinkRejection, Outgoing,
+    PairingStatus, PairingView, PendingSession, Screen, SessionListView, SessionRow, SessionState,
+    SessionView, SettingsView, TimelineItem,
 };
 
 use crate::app::{App, Field};
@@ -188,41 +191,126 @@ fn render_pairing(frame: &mut Frame, area: Rect, app: &App, pairing: &PairingVie
 }
 
 fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionListView) {
-    let mut lines = Vec::new();
-    if list.sessions.is_empty() && list.creating.is_empty() {
-        lines.push(Line::from("No sessions yet.").dark_gray());
-    }
-    for (i, row) in list.sessions.iter().enumerate() {
-        let name = row.workdir.clone().unwrap_or_else(|| row.id.0.to_string());
-        let mut text = format!(
-            "{name}  [{}]  {}",
-            state_badge(&row.state),
-            row.last_activity.format("%Y-%m-%d %H:%M")
-        );
-        if row.pending_approvals > 0 {
-            text.push_str(&format!("  {} approval(s) pending", row.pending_approvals));
-        }
-        let line = if i == app.ui().selected {
-            Line::from(format!("> {text}")).reversed()
+    let create = app.ui().create.as_ref();
+    let creating_height = if list.creating.is_empty() {
+        0
+    } else {
+        list.creating.len() as u16 + 2
+    };
+    let [sessions_area, creating_area, prompt_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Max(creating_height),
+        Constraint::Length(if create.is_some() { 3 } else { 0 }),
+    ])
+    .areas(area);
+
+    let block = Block::bordered().title(format!(" Sessions ({}) ", list.sessions.len()));
+    if list.sessions.is_empty() {
+        let hint = if list.creating.is_empty() {
+            "No sessions yet. Press n to start one."
         } else {
-            Line::from(format!("  {text}"))
+            "No sessions yet."
         };
-        lines.push(line);
-    }
-    for pending in &list.creating {
-        lines.push(
-            Line::from(format!(
-                "  {}  [{}]",
-                pending.workdir,
-                outgoing_label(&pending.outgoing)
-            ))
-            .dark_gray(),
+        frame.render_widget(
+            Paragraph::new(Line::from(hint).dark_gray()).block(block),
+            sessions_area,
+        );
+    } else {
+        let items: Vec<ListItem> = list.sessions.iter().map(session_row_line).collect();
+        let mut state = ListState::default().with_selected(app.selected_index(list));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_symbol("> ")
+                .highlight_spacing(HighlightSpacing::Always)
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+            sessions_area,
+            &mut state,
         );
     }
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Sessions ")),
-        area,
+
+    if !list.creating.is_empty() {
+        let lines: Vec<Line> = list.creating.iter().map(pending_session_line).collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Creating ")),
+            creating_area,
+        );
+    }
+
+    if let Some(create) = create {
+        let block = Block::bordered()
+            .title(" New session · workdir on the server ")
+            .cyan();
+        let inner = block.inner(prompt_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("> "),
+                Span::raw(create.workdir.clone()),
+            ]))
+            .block(block),
+            prompt_area,
+        );
+        if app.typing() && !app.ui().help {
+            let width = create.workdir.chars().count() as u16 + 2;
+            let x = (inner.x + width).min(inner.right().saturating_sub(1));
+            frame.set_cursor_position(Position::new(x, inner.y));
+        }
+    }
+}
+
+/// Width every badge is padded to, so workdirs line up.
+const BADGE_WIDTH: usize = 12;
+
+fn session_row_line(row: &SessionRow) -> ListItem<'static> {
+    let name = row.workdir.clone().unwrap_or_else(|| row.id.0.to_string());
+    let (badge, style) = state_badge(&row.state);
+    let mut spans = vec![
+        Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
+        Span::raw(" "),
+        Span::raw(name),
+    ];
+    if row.pending_approvals > 0 {
+        let noun = if row.pending_approvals == 1 {
+            "approval"
+        } else {
+            "approvals"
+        };
+        spans.push(
+            Span::raw(format!("  ! {} {noun} pending", row.pending_approvals))
+                .yellow()
+                .bold(),
+        );
+    }
+    if let SessionState::Errored(info) = &row.state {
+        spans.push(Span::raw(format!("  {}", info.message)).red());
+    }
+    spans.push(
+        Span::raw(format!(
+            "  · {}",
+            row.last_activity.format("%Y-%m-%d %H:%M UTC")
+        ))
+        .dark_gray(),
     );
+    ListItem::new(Line::from(spans))
+}
+
+fn pending_session_line(pending: &PendingSession) -> Line<'static> {
+    let (badge, style) = outgoing_badge(&pending.outgoing);
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
+        Span::raw(" "),
+        Span::raw(pending.workdir.clone()),
+    ];
+    match pending.outgoing {
+        Outgoing::Queued => spans.push(Span::raw("  · waits for the server").dark_gray()),
+        Outgoing::Sending => {}
+        Outgoing::Accepted(_) => spans.push(Span::raw("  · created, syncing…").dark_gray()),
+        Outgoing::Failed(reason) => {
+            spans.push(Span::raw(format!("  {}", fail_reason(reason))).red())
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_session(frame: &mut Frame, area: Rect, session: &SessionView) {
@@ -230,7 +318,7 @@ fn render_session(frame: &mut Frame, area: Rect, session: &SessionView) {
         .workdir
         .clone()
         .unwrap_or_else(|| session.id.0.to_string());
-    let block = Block::bordered().title(format!(" {title} · {} ", state_badge(&session.state)));
+    let block = Block::bordered().title(format!(" {title} · {} ", state_badge(&session.state).0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -354,7 +442,12 @@ fn footer_hint(app: &App) -> &'static str {
             paired: Some(_), ..
         }) => "Tab next field · Enter next/submit · Esc cancel · F1 help · Ctrl-C quit",
         Screen::Pairing(_) => "Tab next field · Enter next/submit · F1 help · Ctrl-C quit",
-        Screen::SessionList(_) => "↑↓ select · Enter open · s settings · ? help · q quit",
+        Screen::SessionList(_) if app.ui().create.is_some() => {
+            "Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        Screen::SessionList(_) => {
+            "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
+        }
         Screen::Session(_) => "Esc back · ? help · q quit",
         Screen::Settings(_) => "b toggle blob policy · p re-pair · Esc back · ? help · q quit",
     }
@@ -390,11 +483,27 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("paste", "a skywave://pair?… URI fills all fields"),
             key("Esc", "cancel re-pairing"),
         ]),
+        Screen::SessionList(_) if app.ui().create.is_some() => lines.extend([
+            section("New session"),
+            key("type / paste", "the session's directory on the server"),
+            key("Enter", "create the session"),
+            key("Backspace", "delete a character"),
+            key("Ctrl-U", "clear"),
+            key("Esc", "cancel"),
+        ]),
         Screen::SessionList(_) => lines.extend([
             section("Sessions"),
             key("↑↓ / k j", "select"),
             key("Enter", "open session"),
+            key("n", "new session in a server directory"),
             key("s", "settings"),
+            Line::from(""),
+            section("Badges"),
+            key("[idle]", "agent waiting for a message"),
+            key("[working]", "agent busy with a turn"),
+            key("[approval]", "agent blocked on an approval"),
+            key("[error]", "agent reported an error"),
+            key("! N pending", "approvals waiting for an answer"),
         ]),
         Screen::Session(_) => lines.extend([section("Session"), key("Esc", "back to sessions")]),
         Screen::Settings(_) => lines.extend([
@@ -423,12 +532,24 @@ fn render_help(frame: &mut Frame, app: &App) {
     );
 }
 
-fn state_badge(state: &SessionState) -> &'static str {
+/// Short text and colour for a session state; the text alone tells them
+/// apart.
+fn state_badge(state: &SessionState) -> (&'static str, Style) {
     match state {
-        SessionState::Idle => "idle",
-        SessionState::AgentWorking => "working",
-        SessionState::AwaitingApproval(_) => "needs approval",
-        SessionState::Errored(_) => "error",
+        SessionState::Idle => ("idle", Style::new().green()),
+        SessionState::AgentWorking => ("working", Style::new().cyan().bold()),
+        SessionState::AwaitingApproval(_) => ("approval", Style::new().yellow().bold()),
+        SessionState::Errored(_) => ("error", Style::new().red().bold()),
+    }
+}
+
+/// Short text and colour for a command's delivery state.
+fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
+    match outgoing {
+        Outgoing::Queued => ("queued", Style::new().dark_gray()),
+        Outgoing::Sending => ("sending", Style::new().cyan()),
+        Outgoing::Accepted(_) => ("accepted", Style::new().green()),
+        Outgoing::Failed(_) => ("failed", Style::new().red().bold()),
     }
 }
 
@@ -437,7 +558,19 @@ fn outgoing_label(outgoing: &Outgoing) -> String {
         Outgoing::Queued => "queued".to_owned(),
         Outgoing::Sending => "sending".to_owned(),
         Outgoing::Accepted(_) => "sent".to_owned(),
-        Outgoing::Failed(reason) => format!("failed: {reason:?}"),
+        Outgoing::Failed(reason) => format!("failed: {}", fail_reason(*reason)),
+    }
+}
+
+/// Why the server refused a command, in words.
+fn fail_reason(reason: FailReason) -> &'static str {
+    match reason {
+        FailReason::WorkdirNotAllowed => "not under a configured root on the server",
+        FailReason::WorkdirNotFound => "no such directory on the server",
+        FailReason::UnknownSession => "the server does not know this session",
+        FailReason::UnknownApproval => "the server does not know this approval",
+        FailReason::ApprovalAlreadyResolved => "already answered on another device",
+        FailReason::NoActiveTurn => "the agent was not working",
     }
 }
 
