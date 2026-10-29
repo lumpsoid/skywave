@@ -354,10 +354,7 @@ async fn f5_converse() {
         .await;
     assert!(screen.contains("you [accepted]: hello agent"), "{screen}");
     assert!(screen.contains("agent: Listing files"), "{screen}");
-    assert!(
-        screen.contains("tool shell: {\"command\":\"ls\"}"),
-        "{screen}"
-    );
+    assert!(screen.contains("tool shell: ls"), "{screen}");
     let result = line_with(&screen, "result: file-000.txt");
     assert!(
         result.contains("[full 5.1 KiB · not downloaded]"),

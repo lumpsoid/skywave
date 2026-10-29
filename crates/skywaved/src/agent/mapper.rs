@@ -1,19 +1,22 @@
 //! Maps one session's [`AdapterEvent`]s to log events.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
+use skywave_proto::limits::{
+    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
+};
 use skywave_proto::{
-    ApprovalId, BlobRef, EventKind, Seq, SessionId, SessionState, ToolCall, ToolDisplay, ToolKind,
-    ToolResult,
+    self as proto, ApprovalId, BlobRef, Body, CallId, EventKind, Seq, SessionId, SessionState,
+    ToolCall, ToolKind, ToolResult,
 };
 
-use super::{AdapterEvent, AgentRequestId, TurnOutcome, store_resume_handle};
+use super::{
+    AdapterEvent, AgentCallId, AgentRequestId, DisplayBody, ResultDisplay, ToolDisplay,
+    TurnOutcome, store_resume_handle,
+};
 use crate::error::Result;
 use crate::{EventLog, Storage};
-
-/// Payloads larger than this many bytes become blobs (spec §5: 4 KiB).
-pub const DEFAULT_BLOB_THRESHOLD: usize = 4096;
-/// Longest first-line preview a summary of a blob payload carries.
-pub const SUMMARY_MAX_CHARS: usize = 120;
 
 /// Reason for approvals still pending when their turn ends.
 const TURN_ENDED: &str = "turn ended";
@@ -29,55 +32,77 @@ const AGENT_EXITED: &str = "agent exited";
 /// |---------------|-----|
 /// | `TurnStarted` | `SessionStateChanged(AgentWorking)` |
 /// | `Text` | `AgentMessage` |
-/// | `ToolCall` | `ToolCall` (input as summary or blob) |
-/// | `ToolResult` | `ToolResult` (output as summary or blob) |
-/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`] |
+/// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display |
+/// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
+/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
 /// | `Exited` | leftover approvals cancelled; `Errored` if a turn was open or the exit was abnormal |
 ///
-/// **Payloads.** A tool input, tool output or approval input of at most
-/// the threshold ([`DEFAULT_BLOB_THRESHOLD`] bytes unless set with
-/// [`EventMapper::with_blob_threshold`]) is carried whole in the event's
-/// `summary`, with no blob. A larger one is stored as a blob and the summary
-/// is a preview: its first non-blank line, cut at [`SUMMARY_MAX_CHARS`], and
-/// its line count and size. JSON inputs are summarized compactly and stored
-/// pretty-printed. A failed tool's summary starts with `[error] `. Agent text
-/// stays inline: `AgentMessage` has no blob field.
+/// **Calls.** Every `ToolCall` gets a fresh [`CallId`]. The mapper remembers
+/// which [`AgentCallId`] it stands for until the turn ends; a result or
+/// approval naming that id carries the same [`CallId`], one naming no id or
+/// an unknown one carries `call: None`.
 ///
-/// **Approvals.** The mapper remembers which [`AgentRequestId`] each
-/// [`ApprovalId`] it logged stands for. When an `ApprovalResolved` for the
-/// session appears in the log, the supervisor calls
-/// [`EventMapper::take_approval`] for the agent's id and answers the agent.
+/// **Bounds.** Every event is cut to `skywave_proto::limits`, whatever the
+/// adapter handed over: a title, detail or status to its first non-blank
+/// line and its char cap (a cut one ends in `…`); a body or result preview
+/// to its first [`PREVIEW_MAX_LINES`] lines and [`PREVIEW_MAX_BYTES`] bytes.
+/// Cuts fall on char boundaries; `lines` counts the whole content. Failure
+/// is `is_error`, never a marker in the text.
+///
+/// **Blobs** are made only for content that was cut: a body's text
+/// (`Body::full`) when its preview is shorter; a result's output when its
+/// preview is shorter; a call's input (pretty JSON, or the string itself)
+/// when its display does not show all of it: its title, detail or body was
+/// cut, or the generic display left fields out. Agent text stays inline:
+/// `AgentMessage` has no blob field.
+///
+/// **Generic display.** A call the adapter gives no display for is shown as
+/// kind [`ToolKind::Other`] titled with its input: the input itself if it is
+/// a string, else its first string field, else its compact JSON.
+///
+/// **Approvals.** An approval for a known call is summarized by that call's
+/// title and carries no input when its input equals the call's; otherwise
+/// its input is a blob. An approval for no known call is summarized like a
+/// generic display and blobs its input under the same rule. The mapper
+/// remembers which [`AgentRequestId`] each [`ApprovalId`] it logged stands
+/// for. When an `ApprovalResolved` for the session appears in the log, the
+/// supervisor calls [`EventMapper::take_approval`] for the agent's id and
+/// answers the agent.
 ///
 /// Blocking: it runs SQLite and blob writes.
 #[derive(Debug)]
 pub struct EventMapper {
     session_id: SessionId,
-    blob_threshold: usize,
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
     approvals: Vec<(AgentRequestId, ApprovalId)>,
+    /// Calls logged in the current turn, by the agent's id.
+    calls: HashMap<AgentCallId, LoggedCall>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
     turn_open: bool,
+}
+
+/// What the mapper keeps of a logged call to link its result and approval.
+#[derive(Debug)]
+struct LoggedCall {
+    id: CallId,
+    /// The title as logged.
+    title: String,
+    input: Value,
 }
 
 impl EventMapper {
     pub fn new(session_id: SessionId) -> EventMapper {
         EventMapper {
             session_id,
-            blob_threshold: DEFAULT_BLOB_THRESHOLD,
             approvals: Vec::new(),
+            calls: HashMap::new(),
             turn_open: false,
         }
-    }
-
-    /// Payloads above `bytes` become blobs.
-    pub fn with_blob_threshold(mut self, bytes: usize) -> EventMapper {
-        self.blob_threshold = bytes;
-        self
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -124,60 +149,72 @@ impl EventMapper {
             AdapterEvent::Text(text) => {
                 seqs.push(self.append(log, storage, EventKind::AgentMessage { text })?);
             }
-            AdapterEvent::ToolCall { name, input } => {
-                let (summary, input) = self.json_payload(storage, &input)?;
-                seqs.push(self.append(
-                    log,
-                    storage,
-                    EventKind::ToolCall(ToolCall {
-                        call: None,
-                        name,
-                        display: ToolDisplay {
-                            kind: ToolKind::Other,
-                            title: summary,
-                            detail: None,
-                            body: None,
-                        },
+            AdapterEvent::ToolCall {
+                call,
+                name,
+                input,
+                display,
+            } => {
+                let id = CallId::new();
+                let (display, input_blob) = call_display(storage, &input, display)?;
+                if let Some(agent_id) = call {
+                    let logged = LoggedCall {
+                        id,
+                        title: display.title.clone(),
                         input,
-                    }),
-                )?);
-            }
-            AdapterEvent::ToolResult { output, is_error } => {
-                let lines = u32::try_from(output.lines().count()).unwrap_or(u32::MAX);
-                let (mut summary, output) = if output.is_empty() {
-                    ("(no output)".to_owned(), None)
-                } else {
-                    self.payload(storage, output.clone(), output.into_bytes())?
-                };
-                if is_error {
-                    summary.insert_str(0, "[error] ");
+                    };
+                    if let Some(earlier) = self.calls.insert(agent_id, logged) {
+                        tracing::debug!(call = %earlier.id.0, "agent reused a call id; linking the newer call");
+                    }
                 }
                 seqs.push(self.append(
                     log,
                     storage,
-                    EventKind::ToolResult(ToolResult {
-                        call: None,
-                        is_error,
-                        status: None,
-                        preview: summary,
-                        lines,
-                        output,
+                    EventKind::ToolCall(ToolCall {
+                        call: Some(id),
+                        name,
+                        display,
+                        input: input_blob,
                     }),
                 )?);
             }
+            AdapterEvent::ToolResult { call, result } => {
+                let call = self.linked(call.as_ref()).map(|c| c.id);
+                let result = tool_result(storage, call, result)?;
+                seqs.push(self.append(log, storage, EventKind::ToolResult(result))?);
+            }
             AdapterEvent::ApprovalRequested {
                 request,
+                call,
                 tool,
                 input,
             } => {
-                let (summary, input) = self.json_payload(storage, &input)?;
+                let (call, summary, input) = match self.linked(call.as_ref()) {
+                    Some(logged) => {
+                        let blob = if logged.input == input {
+                            None
+                        } else {
+                            Some(input_blob(storage, &input)?)
+                        };
+                        (Some(logged.id), logged.title.clone(), blob)
+                    }
+                    None => {
+                        let (summary, shown_whole) = generic_title(&input);
+                        let blob = if shown_whole {
+                            None
+                        } else {
+                            Some(input_blob(storage, &input)?)
+                        };
+                        (None, summary, blob)
+                    }
+                };
                 let id = ApprovalId::new();
                 seqs.push(self.append(
                     log,
                     storage,
                     EventKind::ApprovalRequested {
                         id,
-                        call: None,
+                        call,
                         tool,
                         summary,
                         input,
@@ -198,6 +235,7 @@ impl EventMapper {
             }
             AdapterEvent::TurnEnded(outcome) => {
                 self.turn_open = false;
+                self.calls.clear();
                 let (reason, state) = match outcome {
                     TurnOutcome::Completed => (TURN_ENDED, SessionState::Idle),
                     TurnOutcome::Interrupted => (TURN_INTERRUPTED, SessionState::Idle),
@@ -211,6 +249,7 @@ impl EventMapper {
             }
             AdapterEvent::Exited { error } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
+                self.calls.clear();
                 let message = match error {
                     Some(error) => Some(format!("agent exited: {error}")),
                     None if self.turn_open => Some("agent exited during a turn".to_owned()),
@@ -233,6 +272,16 @@ impl EventMapper {
         log.append(&mut storage.db, self.session_id, kind)
     }
 
+    /// The call logged in this turn for the agent's `call`, if any.
+    fn linked(&self, call: Option<&AgentCallId>) -> Option<&LoggedCall> {
+        let call = call?;
+        let logged = self.calls.get(call);
+        if logged.is_none() {
+            tracing::debug!(call = %call.0, "agent named a call not logged in this turn");
+        }
+        logged
+    }
+
     /// Cancels every approval still pending, oldest first. One already
     /// answered in the log stays answered (D5).
     fn cancel_pending(
@@ -247,85 +296,223 @@ impl EventMapper {
         }
         Ok(())
     }
+}
 
-    /// Summary and blob for a JSON payload: compact text inline, pretty text
-    /// in the blob. A JSON string is its own text.
-    fn json_payload(&self, storage: &Storage, value: &Value) -> Result<(String, Option<BlobRef>)> {
-        match value {
-            Value::String(text) => self.payload(storage, text.clone(), text.clone().into_bytes()),
-            _ => {
-                let compact = serde_json::to_string(value)?;
-                if compact.len() <= self.blob_threshold {
-                    return Ok((compact, None));
+/// The bounded display for a call and, when it does not show all of the
+/// input, the input as a blob.
+fn call_display(
+    storage: &Storage,
+    input: &Value,
+    display: Option<ToolDisplay>,
+) -> Result<(proto::ToolDisplay, Option<BlobRef>)> {
+    let (display, shown_whole) = match display {
+        Some(display) => {
+            let (title, title_cut) = cut_line(&display.title, TITLE_MAX_CHARS);
+            let (detail, detail_cut) = match &display.detail {
+                Some(detail) => {
+                    let (detail, cut) = cut_line(detail, DETAIL_MAX_CHARS);
+                    (Some(detail), cut)
                 }
-                self.payload(storage, compact, serde_json::to_vec_pretty(value)?)
-            }
+                None => (None, false),
+            };
+            let body = display
+                .body
+                .map(|body| display_body(storage, body))
+                .transpose()?;
+            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
+            let display = proto::ToolDisplay {
+                kind: display.kind,
+                title,
+                detail,
+                body,
+            };
+            (display, !(title_cut || detail_cut || body_cut))
         }
-    }
-
-    /// `text` whole when it fits the threshold, else a preview of it and a
-    /// blob holding `full`.
-    fn payload(
-        &self,
-        storage: &Storage,
-        text: String,
-        full: Vec<u8>,
-    ) -> Result<(String, Option<BlobRef>)> {
-        if text.len() <= self.blob_threshold {
-            return Ok((text, None));
+        None => {
+            let (title, shown_whole) = generic_title(input);
+            let display = proto::ToolDisplay {
+                kind: ToolKind::Other,
+                title,
+                detail: None,
+                body: None,
+            };
+            (display, shown_whole)
         }
-        let blob = storage.put_blob(full.as_slice())?;
-        Ok((preview(&text, blob.size), Some(blob)))
-    }
-}
-
-/// First non-blank line of `text`, cut at [`SUMMARY_MAX_CHARS`], followed by
-/// an ellipsis and the line count and `size` of the whole.
-fn preview(text: &str, size: u64) -> String {
-    let first = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
-    let mut out: String = first.chars().take(SUMMARY_MAX_CHARS).collect();
-    out.push('…');
-    let lines = text.lines().count();
-    let unit = if lines == 1 { "line" } else { "lines" };
-    out.push_str(&format!(" [{lines} {unit}, {}]", human_size(size)));
-    out
-}
-
-fn human_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    let b = bytes as f64;
-    if b < KIB {
-        format!("{bytes} B")
-    } else if b < KIB * KIB {
-        format!("{:.1} KiB", b / KIB)
+    };
+    let blob = if shown_whole {
+        None
     } else {
-        format!("{:.1} MiB", b / (KIB * KIB))
+        Some(input_blob(storage, input)?)
+    };
+    Ok((display, blob))
+}
+
+/// A body's preview, with its text as a blob when the preview is shorter.
+fn display_body(storage: &Storage, body: DisplayBody) -> Result<Body> {
+    let (preview, cut) = cut_preview(&body.text);
+    let full = if cut {
+        Some(storage.put_blob(body.text.as_bytes())?)
+    } else {
+        None
+    };
+    Ok(Body {
+        format: body.format,
+        preview,
+        lines: line_count(&body.text),
+        full,
+    })
+}
+
+/// A result's preview, with its output as a blob when the preview is
+/// shorter.
+fn tool_result(
+    storage: &Storage,
+    call: Option<CallId>,
+    result: ResultDisplay,
+) -> Result<ToolResult> {
+    let (preview, cut) = cut_preview(&result.output);
+    let output = if cut {
+        Some(storage.put_blob(result.output.as_bytes())?)
+    } else {
+        None
+    };
+    Ok(ToolResult {
+        call,
+        is_error: result.is_error,
+        status: result
+            .status
+            .map(|status| cut_line(&status, STATUS_MAX_CHARS).0),
+        preview,
+        lines: line_count(&result.output),
+        output,
+    })
+}
+
+/// Title of the generic display for `input`, cut, and whether it shows all
+/// of the input: the input itself if it is a string, else its first string
+/// field, else its compact JSON.
+fn generic_title(input: &Value) -> (String, bool) {
+    let (text, whole) = match input {
+        Value::String(text) => (text.clone(), true),
+        Value::Object(fields) => match fields.values().find_map(Value::as_str) {
+            Some(text) => (text.to_owned(), fields.len() == 1),
+            None => (input.to_string(), true),
+        },
+        Value::Null => (String::new(), true),
+        _ => (input.to_string(), true),
+    };
+    let (title, cut) = cut_line(&text, TITLE_MAX_CHARS);
+    (title, whole && !cut)
+}
+
+/// `input` stored whole: a string as itself, anything else pretty-printed.
+fn input_blob(storage: &Storage, input: &Value) -> Result<BlobRef> {
+    let bytes = match input {
+        Value::String(text) => text.clone().into_bytes(),
+        _ => serde_json::to_vec_pretty(input)?,
+    };
+    storage.put_blob(bytes.as_slice())
+}
+
+/// The first non-blank line of `text`, trimmed, at most `max_chars` chars,
+/// and whether anything but surrounding whitespace was left out. A cut line
+/// ends in `…` (within `max_chars`).
+fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
+    let text = text.trim();
+    let line = text.lines().next().unwrap_or("").trim_end();
+    let mut out: String = line.chars().take(max_chars).collect();
+    let cut = line.len() < text.len() || out.len() < line.len();
+    if cut {
+        if out.chars().count() >= max_chars {
+            out.pop();
+        }
+        out.push('…');
     }
+    (out, cut)
+}
+
+/// The head of `text`: at most [`PREVIEW_MAX_LINES`] lines and
+/// [`PREVIEW_MAX_BYTES`] bytes, cut on a char boundary, and whether it
+/// leaves anything out (a lone trailing newline does not count).
+fn cut_preview(text: &str) -> (String, bool) {
+    // The newline ending the last line kept, unless it ends the text too.
+    let mut end = match text.match_indices('\n').nth(PREVIEW_MAX_LINES - 1) {
+        Some((i, _)) if i + 1 < text.len() => i,
+        _ => text.len(),
+    };
+    if end > PREVIEW_MAX_BYTES {
+        end = PREVIEW_MAX_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    let cut = !matches!(&text[end..], "" | "\n");
+    (text[..end].to_owned(), cut)
+}
+
+fn line_count(text: &str) -> u32 {
+    u32::try_from(text.lines().count()).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
-    fn preview_takes_the_first_non_blank_line_and_reports_size() {
-        let text = format!("\n  {}\nsecond\n", "x".repeat(200));
-        let summary = preview(&text, 5000);
+    fn a_line_is_cut_on_a_char_boundary_with_an_ellipsis() {
+        assert_eq!(cut_line("  ls -la \n", 120), ("ls -la".to_owned(), false));
+        let (line, cut) = cut_line(&"é".repeat(300), TITLE_MAX_CHARS);
+        assert!(cut);
+        assert_eq!(line, format!("{}…", "é".repeat(TITLE_MAX_CHARS - 1)));
         assert_eq!(
-            summary,
-            format!("{}… [3 lines, 4.9 KiB]", "x".repeat(SUMMARY_MAX_CHARS))
+            cut_line("\n first\nsecond", 120),
+            ("first…".to_owned(), true)
         );
-        assert_eq!(preview("ok", 2), "ok… [1 line, 2 B]");
+        assert_eq!(cut_line("", 120), (String::new(), false));
     }
 
     #[test]
-    fn preview_cuts_at_a_char_boundary() {
-        let summary = preview(&"é".repeat(300), 600);
-        assert!(summary.starts_with(&"é".repeat(SUMMARY_MAX_CHARS)));
-        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MiB");
+    fn a_preview_keeps_the_head_within_lines_and_bytes() {
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let (preview, cut) = cut_preview(&text);
+        assert!(cut);
+        assert_eq!(
+            preview,
+            text.lines()
+                .take(PREVIEW_MAX_LINES)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let (preview, cut) = cut_preview(&"é".repeat(400));
+        assert!(cut);
+        assert_eq!(preview, "é".repeat(PREVIEW_MAX_BYTES / 2));
+        let (preview, _) = cut_preview(&format!("x{}", "é".repeat(400)));
+        assert_eq!(preview.len(), PREVIEW_MAX_BYTES - 1);
+
+        assert_eq!(cut_preview("a\nb\n"), ("a\nb\n".to_owned(), false));
+        assert_eq!(cut_preview(""), (String::new(), false));
+        let eight: String = (0..PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
+        assert!(!cut_preview(&eight).1);
+    }
+
+    #[test]
+    fn the_generic_title_is_the_first_string_field() {
+        assert_eq!(
+            generic_title(&json!({ "command": "ls" })),
+            ("ls".to_owned(), true)
+        );
+        assert_eq!(
+            generic_title(&json!({ "count": 3, "path": "a.txt", "text": "hi" })),
+            ("a.txt".to_owned(), false)
+        );
+        assert_eq!(
+            generic_title(&json!({ "count": 3 })),
+            (r#"{"count":3}"#.to_owned(), true)
+        );
+        assert_eq!(generic_title(&json!("echo")), ("echo".to_owned(), true));
+        assert_eq!(generic_title(&Value::Null), (String::new(), true));
     }
 }

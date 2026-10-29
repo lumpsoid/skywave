@@ -17,7 +17,7 @@ use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERS
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    ResumeHandle, StartSpec, TurnOutcome,
+    ResultDisplay, ResumeHandle, StartSpec, TurnOutcome,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -126,9 +126,9 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
             AdapterEvent::Text(text) => format!("text: {}", cut(text)),
             AdapterEvent::ToolCall { name, .. } => format!("tool call: {name}"),
-            AdapterEvent::ToolResult { output, is_error } => {
-                let kind = if *is_error { "error" } else { "ok" };
-                format!("tool result {kind}: {}", cut(output))
+            AdapterEvent::ToolResult { result, .. } => {
+                let kind = if result.is_error { "error" } else { "ok" };
+                format!("tool result {kind}: {}", cut(&result.output))
             }
             AdapterEvent::ApprovalRequested { request, tool, .. } => {
                 format!("approval {}: {tool}", request.0)
@@ -214,6 +214,17 @@ fn replay_permissions_allow_then_deny() {
     let write = json!({ "file_path": "/tmp/skywave-t07-scratch/hello.txt", "content": "hi" });
     assert!(matches!(&events[2], AdapterEvent::ToolCall { input, .. } if *input == write));
     assert!(matches!(&events[3], AdapterEvent::ApprovalRequested { input, .. } if *input == write));
+    // Call, approval and result name the same tool-use id.
+    let AdapterEvent::ToolCall {
+        call: Some(call), ..
+    } = &events[2]
+    else {
+        panic!("expected a tool call with an id, got {:?}", events[2]);
+    };
+    assert!(
+        matches!(&events[3], AdapterEvent::ApprovalRequested { call: Some(c), .. } if c == call)
+    );
+    assert!(matches!(&events[4], AdapterEvent::ToolResult { call: Some(c), .. } if c == call));
 }
 
 #[test]
@@ -392,23 +403,33 @@ fn text(text: &str) -> AdapterEvent {
     AdapterEvent::Text(text.to_owned())
 }
 
+/// The fake CLI's one tool call id.
+const CALL: &str = "toolu_1";
+
 fn tool_result(output: &str, is_error: bool) -> AdapterEvent {
     AdapterEvent::ToolResult {
-        output: output.to_owned(),
-        is_error,
+        call: Some(CALL.into()),
+        result: ResultDisplay {
+            is_error,
+            status: None,
+            output: output.to_owned(),
+        },
     }
 }
 
 fn write_call() -> AdapterEvent {
     AdapterEvent::ToolCall {
+        call: Some(CALL.into()),
         name: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
+        display: None,
     }
 }
 
 fn write_approval() -> AdapterEvent {
     AdapterEvent::ApprovalRequested {
         request: "perm-1".into(),
+        call: Some(CALL.into()),
         tool: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
     }

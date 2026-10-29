@@ -4,8 +4,14 @@
 //! session. The session takes the supervisor's requests (send a message,
 //! answer an approval, interrupt, shut down) and reports what the agent does
 //! as a stream of agent-agnostic [`AdapterEvent`]s. An [`EventMapper`] turns
-//! those into log [`EventKind`](skywave_proto::EventKind)s, moving large
-//! payloads into blobs.
+//! those into log [`EventKind`](skywave_proto::EventKind)s, cutting what an
+//! adapter shows to the protocol's caps and moving what was cut into blobs.
+//!
+//! **Tool calls.** An adapter reports a tool call with its agent's own
+//! [`AgentCallId`], the full input and, when it knows the tool, a
+//! [`ToolDisplay`] with uncut content; the result and any approval for the
+//! call name the same [`AgentCallId`]. Adapters never cut or blob anything:
+//! the mapper alone applies `skywave_proto::limits`.
 //!
 //! Everything agent-specific stays behind this seam: the agent's own
 //! approval request ids are opaque [`AgentRequestId`]s, and its resume state
@@ -48,7 +54,8 @@ use tokio::sync::mpsc;
 use crate::db::Db;
 use crate::error::{Error, Result};
 
-pub use mapper::{DEFAULT_BLOB_THRESHOLD, EventMapper, SUMMARY_MAX_CHARS};
+pub use mapper::EventMapper;
+pub use skywave_proto::{BodyFormat, ToolKind};
 
 /// The agent's own id for one approval request (e.g. a control request id).
 ///
@@ -63,6 +70,53 @@ impl From<&str> for AgentRequestId {
     fn from(id: &str) -> Self {
         AgentRequestId(id.to_owned())
     }
+}
+
+/// The agent's own id for one tool call (e.g. a tool-use id).
+///
+/// Meaningful only to its adapter; it links a call to its result and its
+/// approval. The [`EventMapper`] gives each one a
+/// [`CallId`](skywave_proto::CallId) for the log, valid until the turn ends.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct AgentCallId(pub String);
+
+impl From<&str> for AgentCallId {
+    fn from(id: &str) -> Self {
+        AgentCallId(id.to_owned())
+    }
+}
+
+/// How to show a tool call, uncut. Agent-agnostic (D3): the adapter maps its
+/// agent's tool onto a [`ToolKind`] and hands over full content; the
+/// [`EventMapper`] cuts it to the protocol's caps and stores what was cut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDisplay {
+    pub kind: ToolKind,
+    /// Main line, e.g. a path or a command. Only its first line is shown.
+    pub title: String,
+    /// Optional second line, e.g. a description.
+    pub detail: Option<String>,
+    /// Content worth showing beneath the title, e.g. a diff, in full.
+    pub body: Option<DisplayBody>,
+}
+
+/// Full content shown beneath a tool call's title.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayBody {
+    pub format: BodyFormat,
+    pub text: String,
+}
+
+/// How a tool call ended, uncut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultDisplay {
+    /// The tool failed or was denied.
+    pub is_error: bool,
+    /// Short outcome, e.g. `exit 1`, `3 matches`; cut to one short line.
+    pub status: Option<String>,
+    /// The whole output.
+    pub output: String,
 }
 
 /// Whatever an adapter needs to resume an agent session after a restart.
@@ -100,17 +154,25 @@ pub enum AdapterEvent {
     TurnStarted,
     /// Text the agent wrote for the user.
     Text(String),
-    /// The agent invoked a tool with `input`.
+    /// The agent invoked tool `name` with `input`. `call` is the agent's id
+    /// for it, if it has one; `display` is how to show it, or `None` for a
+    /// generic display derived from `input`.
     ToolCall {
+        call: Option<AgentCallId>,
         name: String,
         input: serde_json::Value,
+        display: Option<ToolDisplay>,
     },
-    /// Output of a tool call; `is_error` when the tool failed or was denied.
-    ToolResult { output: String, is_error: bool },
+    /// A tool call ended; `call` names it, if the agent said which.
+    ToolResult {
+        call: Option<AgentCallId>,
+        result: ResultDisplay,
+    },
     /// The agent is blocked until [`AgentSession::answer_approval`] for
-    /// `request` (D8).
+    /// `request` (D8). `call` is the tool call the approval gates, if known.
     ApprovalRequested {
         request: AgentRequestId,
+        call: Option<AgentCallId>,
         tool: String,
         input: serde_json::Value,
     },
