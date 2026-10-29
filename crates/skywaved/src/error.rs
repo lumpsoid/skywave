@@ -61,6 +61,8 @@ pub enum Error {
     Qr(String),
     #[error("no session with id {}", .0.0)]
     UnknownSession(skywave_proto::SessionId),
+    #[error("agent supervisor: {0}")]
+    Supervisor(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

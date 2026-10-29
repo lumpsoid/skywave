@@ -17,12 +17,14 @@ pub mod identity;
 pub mod logging;
 pub mod pairing;
 pub mod server;
+pub mod supervisor;
 
 use std::io::Read;
 use std::path::PathBuf;
 
 pub use error::{Error, Result};
 pub use event_log::EventLog;
+pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 
 use blobs::{BlobFile, BlobStore};
 use data_dir::DataDir;

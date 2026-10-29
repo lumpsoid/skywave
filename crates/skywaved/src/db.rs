@@ -90,6 +90,17 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX approvals_pending ON approvals (closed_seq) WHERE closed_seq IS NULL;
     "#,
+    // v3: the agent supervisor's read position in the log (T10).
+    r#"
+    -- Seq of the last event the agent supervisor has handled; one row. A
+    -- database that predates the supervisor starts at its current head:
+    -- nothing logged before had an agent to deliver to.
+    CREATE TABLE supervisor_cursor (
+        id  INTEGER PRIMARY KEY CHECK (id = 1),
+        seq INTEGER NOT NULL CHECK (seq >= 0)
+    ) STRICT;
+    INSERT INTO supervisor_cursor (id, seq) SELECT 1, COALESCE(MAX(seq), 0) FROM events;
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -176,7 +187,7 @@ fn check_supported(found: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    const TABLES: [&str; 7] = [
+    const TABLES: [&str; 8] = [
         "approvals",
         "blobs",
         "commands",
@@ -184,6 +195,7 @@ mod tests {
         "events",
         "pair_codes",
         "sessions",
+        "supervisor_cursor",
     ];
 
     fn schema(db: &Db) -> Vec<(String, String)> {
