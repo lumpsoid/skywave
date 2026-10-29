@@ -26,5 +26,6 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 toml = "1.1.8"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -71,6 +71,25 @@ const MIGRATIONS: &[&str] = &[
         sha256 TEXT NOT NULL
     ) STRICT;
     "#,
+    // v2: projections that command validation reads (T03). They are derived
+    // from `events` and updated in the transaction that appends the event.
+    r#"
+    -- 1 while the session's agent has a running turn: set by
+    -- SessionStateChanged(AgentWorking), cleared by SessionStateChanged(Idle
+    -- or Errored) and by TurnInterrupted.
+    ALTER TABLE sessions ADD COLUMN
+        turn_active INTEGER NOT NULL DEFAULT 0 CHECK (turn_active IN (0, 1));
+
+    -- Approval requests seen in the log.
+    CREATE TABLE approvals (
+        id         TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions (id),
+        -- Seq of the ApprovalResolved or ApprovalCancelled that closed the
+        -- request; NULL while it is pending.
+        closed_seq INTEGER
+    ) STRICT;
+    CREATE INDEX approvals_pending ON approvals (closed_seq) WHERE closed_seq IS NULL;
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -157,7 +176,8 @@ fn check_supported(found: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    const TABLES: [&str; 6] = [
+    const TABLES: [&str; 7] = [
+        "approvals",
         "blobs",
         "commands",
         "devices",

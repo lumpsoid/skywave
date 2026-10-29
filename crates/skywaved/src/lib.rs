@@ -4,21 +4,26 @@
 //! integration tests share one implementation.
 
 pub mod blobs;
+pub mod commands;
 pub mod config;
 pub mod data_dir;
 pub mod db;
 pub mod devices;
 pub mod error;
+pub mod event_log;
 pub mod identity;
 pub mod logging;
 
+use std::io::Read;
 use std::path::PathBuf;
 
 pub use error::{Error, Result};
+pub use event_log::EventLog;
 
-use blobs::BlobStore;
+use blobs::{BlobFile, BlobStore};
 use data_dir::DataDir;
 use db::Db;
+use skywave_proto::{BlobId, BlobRef};
 
 /// Everything the daemon persists: the data dir, its database and blobs.
 #[derive(Debug)]
@@ -36,6 +41,16 @@ impl Storage {
         let db = Db::open(&dir.db_path())?;
         let blobs = BlobStore::new(dir.blobs_dir());
         Ok(Storage { dir, db, blobs })
+    }
+
+    /// Stores `content` as a new blob, for an event to reference.
+    pub fn put_blob(&self, content: impl Read) -> Result<BlobRef> {
+        Ok(self.blobs.put(self.db.conn(), content)?.blob_ref())
+    }
+
+    /// Opens blob `id` for `GET /v1/blobs/{id}`; `None` if it is unknown.
+    pub fn open_blob(&self, id: BlobId) -> Result<Option<BlobFile>> {
+        self.blobs.open(self.db.conn(), id)
     }
 }
 
@@ -65,5 +80,22 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn blob_put_then_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let blob = storage.put_blob(&b"tool output"[..]).unwrap();
+        assert_eq!(blob.size, 11);
+        let mut content = String::new();
+        storage
+            .open_blob(blob.id)
+            .unwrap()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "tool output");
+        assert!(storage.open_blob(BlobId::new()).unwrap().is_none());
     }
 }

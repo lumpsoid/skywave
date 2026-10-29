@@ -1,0 +1,168 @@
+//! Command handling (spec §5): dedup, validation and append in one
+//! transaction, so a [`CommandId`] has exactly one outcome however often it
+//! is resent (D7).
+//!
+//! What each command appends, and the seq its `Accepted` names:
+//! - `CreateSession` → `SessionCreated` with the canonical workdir and a new
+//!   [`SessionId`];
+//! - `SendMessage` → `UserMessage`;
+//! - `ResolveApproval` → `ApprovalResolved`;
+//! - `Interrupt` → `TurnInterrupted`.
+//!
+//! **Interrupt.** `TurnInterrupted` is appended when the command is
+//! accepted, not when the agent has actually stopped. The result is then
+//! settled inside the command's transaction like every other command, and
+//! `Accepted { seq }` names the command's own event. The event records that
+//! the turn was interrupted: from that seq the session has no active turn, so
+//! a second `Interrupt` is `NoActiveTurn`. The supervisor (T10) reacts to the
+//! event by interrupting the agent, cancels approvals the agent abandons
+//! with [`EventLog::cancel_approval`], and appends
+//! `SessionStateChanged(Idle)` once the agent has stopped.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use skywave_proto::{
+    Command, CommandId, CommandKind, CommandResult, DeviceId, EventKind, RejectReason, Seq, SessionId,
+};
+
+use crate::db::Db;
+use crate::error::Result;
+use crate::event_log::{self, EventLog};
+
+impl EventLog {
+    /// Handles `command` from `device` and returns its result.
+    ///
+    /// A known command id returns the stored result, `Rejected` included,
+    /// and appends nothing. Otherwise the command is validated, its event
+    /// appended and its result stored in one transaction. `Err` means the
+    /// database failed and nothing was recorded, so a resend is still safe.
+    ///
+    /// Blocking: it runs SQLite and, for `CreateSession`, file system calls.
+    pub fn handle(&self, db: &mut Db, device: DeviceId, command: &Command) -> Result<CommandResult> {
+        let tx = event_log::begin(db)?;
+        if let Some(stored) = stored_result(&tx, command.id)? {
+            return Ok(stored);
+        }
+        let result = match self.apply(&tx, device, command)? {
+            Ok(seq) => CommandResult::Accepted { seq },
+            Err(reason) => CommandResult::Rejected { reason },
+        };
+        tx.execute(
+            "INSERT INTO commands (command_id, device_id, result) VALUES (?1, ?2, ?3)",
+            params![
+                command.id.0.to_string(),
+                device.0.to_string(),
+                serde_json::to_string(&result)?
+            ],
+        )?;
+        tx.commit()?;
+        match &result {
+            CommandResult::Accepted { seq } => {
+                tracing::debug!(command = %command.id.0, seq = seq.0, "command accepted");
+                self.published(*seq);
+            }
+            CommandResult::Rejected { reason } => {
+                tracing::debug!(command = %command.id.0, ?reason, "command rejected");
+            }
+        }
+        Ok(result)
+    }
+
+    /// Validates `command` and appends its event, returning the event's seq
+    /// or why the command is refused.
+    fn apply(
+        &self,
+        tx: &Connection,
+        device: DeviceId,
+        command: &Command,
+    ) -> Result<Result<Seq, RejectReason>> {
+        let (session_id, kind) = match &command.kind {
+            CommandKind::CreateSession { workdir } => {
+                match resolve_workdir(self.roots(), workdir) {
+                    Ok(workdir) => (SessionId::new(), EventKind::SessionCreated { workdir }),
+                    Err(reason) => return Ok(Err(reason)),
+                }
+            }
+            CommandKind::SendMessage { session_id, text } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let kind = EventKind::UserMessage {
+                    command_id: command.id,
+                    device_id: device,
+                    text: text.clone(),
+                };
+                (*session_id, kind)
+            }
+            CommandKind::ResolveApproval { id, decision } => {
+                // A cancelled approval is closed too: no answer can win it.
+                let session_id = match event_log::approval_in(tx, *id)? {
+                    None => return Ok(Err(RejectReason::UnknownApproval)),
+                    Some((_, Some(_closed))) => {
+                        return Ok(Err(RejectReason::ApprovalAlreadyResolved));
+                    }
+                    Some((session_id, None)) => session_id,
+                };
+                let kind = EventKind::ApprovalResolved {
+                    id: *id,
+                    decision: *decision,
+                    by: device,
+                };
+                (session_id, kind)
+            }
+            CommandKind::Interrupt { session_id } => {
+                match event_log::session_in(tx, *session_id)? {
+                    None => return Ok(Err(RejectReason::UnknownSession)),
+                    Some(session) if !session.turn_active => {
+                        return Ok(Err(RejectReason::NoActiveTurn));
+                    }
+                    Some(_) => {}
+                }
+                (*session_id, EventKind::TurnInterrupted)
+            }
+        };
+        Ok(Ok(event_log::append_in(tx, session_id, &kind)?))
+    }
+}
+
+fn stored_result(conn: &Connection, id: CommandId) -> Result<Option<CommandResult>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT result FROM commands WHERE command_id = ?1",
+            [id.0.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(json.as_deref().map(serde_json::from_str).transpose()?)
+}
+
+/// The canonical form of `workdir` if it is an existing directory under one
+/// of `roots` (D14).
+///
+/// Canonicalizing resolves `..` and symlinks before the check, so neither
+/// can escape a root. Roots are canonicalized too; a root that does not
+/// exist admits nothing. A relative `workdir` names no directory on the
+/// server and is not allowed.
+fn resolve_workdir(roots: &[PathBuf], workdir: &str) -> Result<String, RejectReason> {
+    let path = Path::new(workdir);
+    if !path.is_absolute() {
+        return Err(RejectReason::WorkdirNotAllowed);
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| RejectReason::WorkdirNotFound)?;
+    if !canonical.is_dir() {
+        return Err(RejectReason::WorkdirNotFound);
+    }
+    let allowed = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| canonical.starts_with(root));
+    if !allowed {
+        return Err(RejectReason::WorkdirNotAllowed);
+    }
+    // The wire carries workdirs as strings; a non-UTF-8 target can't be named.
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| RejectReason::WorkdirNotAllowed)
+}

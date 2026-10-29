@@ -29,6 +29,14 @@ pub enum Error {
         expected: u64,
         actual: u64,
     },
+    #[error("stored JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("stored value: {0}")]
+    Corrupt(String),
+    /// A caller tried to append an event the log does not accept from it,
+    /// e.g. the supervisor appending a command-owned event kind.
+    #[error("cannot append event: {0}")]
+    InvalidAppend(String),
     #[error("logging: {0}")]
     Logging(String),
     #[error("certificate: {0}")]
