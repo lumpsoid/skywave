@@ -9,12 +9,25 @@ publish.workspace = true
 
 [dependencies]
 skywave-proto.workspace = true
+bytes.workspace = true
 chrono.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+rcgen.workspace = true
 rusqlite.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-rustls.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+skywaved = { path = "../skywaved" }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

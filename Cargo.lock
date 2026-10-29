@@ -1386,13 +1386,25 @@ dependencies = [
 name = "skywave-core"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "skywave-proto",
+ "skywaved",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 

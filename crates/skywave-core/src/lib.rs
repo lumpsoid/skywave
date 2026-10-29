@@ -11,19 +11,33 @@
 //!   outbox, cursor, blobs, settings.
 //! - [`projection`]: the pure fold from events to session summaries.
 //! - [`identity`]: the device's pairing credentials behind [`Identity`].
+//! - [`transport`]: the [`Transport`] trait to the server and its typed
+//!   errors; [`HttpsTransport`] is the mTLS implementation.
+//! - [`pairing`]: the pairing client, plus code, fingerprint and pairing
+//!   URI parsing for heads.
 
 pub mod action;
+mod address;
 mod client;
+mod https;
 pub mod identity;
 mod model;
+pub mod pairing;
 pub mod projection;
 pub mod seam;
 pub mod store;
+mod tls;
+pub mod transport;
 pub mod view;
 
 pub use action::{Action, Route};
+pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
 pub use client::{Core, CoreError, SubscriptionId};
+pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
+pub use pairing::{
+    PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
+};
 pub use projection::SessionSummary;
 pub use seam::{Request, Seam};
 pub use skywave_proto::PROTOCOL_VERSION;
@@ -31,6 +45,8 @@ pub use store::{
     Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, Settings, Snapshot,
     Store, StoreError,
 };
+pub use tls::Fingerprint;
+pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
 pub use view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, CommandId,
     Decision, DeviceId, Entry, ErrorInfo, FailReason, Link, LinkRejection, Outgoing, PairedInfo,
