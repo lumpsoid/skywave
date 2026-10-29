@@ -659,6 +659,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
             result: ResultDisplay {
                 is_error: false,
                 status: None,
+                preview: None,
                 output: String::new(),
             },
         },
@@ -717,6 +718,7 @@ fn ok(output: &str) -> ResultDisplay {
     ResultDisplay {
         is_error: false,
         status: None,
+        preview: None,
         output: output.to_owned(),
     }
 }
@@ -762,6 +764,7 @@ fn large_content_gives_small_events_and_blobs() {
                 result: ResultDisplay {
                     is_error: true,
                     status: Some(huge.clone()),
+                    preview: None,
                     output: huge.clone(),
                 },
             },
@@ -777,6 +780,7 @@ fn large_content_gives_small_events_and_blobs() {
                         format: BodyFormat::Diff,
                         text: huge.clone(),
                     }),
+                    shows_all_input: true,
                 }),
             },
         ],
@@ -860,6 +864,7 @@ fn content_shown_whole_makes_no_blob() {
                         format: BodyFormat::Text,
                         text: eight_lines.clone(),
                     }),
+                    shows_all_input: true,
                 }),
             },
             AdapterEvent::ToolResult {
@@ -867,6 +872,7 @@ fn content_shown_whole_makes_no_blob() {
                 result: ResultDisplay {
                     is_error: false,
                     status: Some("exit 0".into()),
+                    preview: None,
                     output: eight_lines.clone(),
                 },
             },
@@ -904,6 +910,68 @@ fn content_shown_whole_makes_no_blob() {
             output: None,
         })
     );
+}
+
+#[test]
+fn omitted_input_and_a_separate_preview_are_blobs() {
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id);
+    let input = json!({ "command": "make", "timeout": 600 });
+    let note = "built\n(a note for the model)";
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::ToolCall {
+                call: Some("c1".into()),
+                name: "shell".into(),
+                input: input.clone(),
+                display: Some(agent::ToolDisplay {
+                    kind: ToolKind::Shell,
+                    title: "make".into(),
+                    detail: None,
+                    body: None,
+                    shows_all_input: false,
+                }),
+            },
+            AdapterEvent::ToolResult {
+                call: Some("c1".into()),
+                result: ResultDisplay {
+                    is_error: false,
+                    status: Some("created".into()),
+                    preview: Some("built".into()),
+                    output: note.into(),
+                },
+            },
+            AdapterEvent::ToolResult {
+                call: Some("c1".into()),
+                result: ResultDisplay {
+                    is_error: false,
+                    status: None,
+                    preview: Some(note.into()),
+                    output: note.into(),
+                },
+            },
+        ],
+    );
+    let kinds = f.kinds();
+    // The display left a field out: the input is a blob, uncut title or not.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&f.blob(&kinds[1])).unwrap(),
+        input
+    );
+    // The preview is the adapter's text; the output keeps the note.
+    let EventKind::ToolResult(result) = &kinds[2] else {
+        panic!("expected ToolResult, got {:?}", kinds[2]);
+    };
+    assert_eq!((result.preview.as_str(), result.lines), ("built", 2));
+    assert_eq!(f.blob(&kinds[2]), note);
+    // A preview equal to the output is no reason for a blob.
+    let EventKind::ToolResult(result) = &kinds[3] else {
+        panic!("expected ToolResult, got {:?}", kinds[3]);
+    };
+    assert_eq!((result.preview.as_str(), &result.output), (note, &None));
 }
 
 #[test]

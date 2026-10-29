@@ -27,6 +27,7 @@
 //! grace period for the process to exit before killing it. The event stream
 //! ends with `Exited`.
 
+pub mod display;
 pub mod protocol;
 
 use std::path::Path;

@@ -132,6 +132,7 @@ impl Step {
             result: ResultDisplay {
                 is_error,
                 status: None,
+                preview: None,
                 output,
             },
         })

@@ -19,15 +19,14 @@
 //! `ApprovalCancelled`. An answer to a request that is no longer pending
 //! writes nothing.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 use skywave_proto::Decision;
 use uuid::Uuid;
 
-use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, ResultDisplay, ResumeHandle, TurnOutcome,
-};
+use super::display;
+use crate::agent::{AdapterEvent, AgentCallId, AgentRequestId, ResumeHandle, TurnOutcome};
 
 /// The CLI version the protocol was confirmed against (T07). Another version
 /// is logged as a warning, not refused.
@@ -153,6 +152,9 @@ pub struct Protocol {
     interrupt_sent: bool,
     queued: VecDeque<String>,
     pending: Vec<Pending>,
+    /// Tool name of each call this turn that has no result yet, by
+    /// tool-use id: a structured result is read by its tool.
+    tools: HashMap<String, String>,
     shutting_down: bool,
 }
 
@@ -174,6 +176,7 @@ impl Protocol {
             interrupt_sent: false,
             queued: VecDeque::new(),
             pending: Vec::new(),
+            tools: HashMap::new(),
             shutting_down: false,
         }
     }
@@ -295,7 +298,7 @@ impl Protocol {
         let mut out = Output::default();
         match str_field(message, "type") {
             "system" if str_field(message, "subtype") == "init" => self.on_init(message, &mut out),
-            "assistant" => on_assistant(message, &mut out),
+            "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
             "control_cancel_request" => self.on_cancel(message, &mut out),
@@ -359,16 +362,55 @@ impl Protocol {
         }
     }
 
+    fn on_assistant(&mut self, message: &Value, out: &mut Output) {
+        let Some(blocks) = content_blocks(message) else {
+            return;
+        };
+        for block in blocks {
+            match str_field(block, "type") {
+                "text" => {
+                    let text = str_field(block, "text");
+                    if !text.is_empty() {
+                        out.events.push(AdapterEvent::Text(text.to_owned()));
+                    }
+                }
+                "tool_use" => {
+                    let name = str_field(block, "name").to_owned();
+                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    let id = block.get("id").and_then(Value::as_str);
+                    if let Some(id) = id {
+                        self.tools.insert(id.to_owned(), name.clone());
+                    }
+                    out.events.push(AdapterEvent::ToolCall {
+                        call: id.map(AgentCallId::from),
+                        display: display::call_display(&name, &input),
+                        name,
+                        input,
+                    });
+                }
+                // thinking blocks are opaque.
+                _ => {}
+            }
+        }
+    }
+
     fn on_user(&mut self, message: &Value, out: &mut Output) {
         // Text blocks here are the CLI's own markers ("[Request interrupted
         // by user]"); only tool results matter.
         let Some(blocks) = content_blocks(message) else {
             return;
         };
-        for block in blocks
+        let results: Vec<&Value> = blocks
             .iter()
             .filter(|b| str_field(b, "type") == "tool_result")
-        {
+            .collect();
+        // The structured result sits beside the content, so it is only
+        // unambiguous for a message with one result (as the CLI sends them).
+        let structured = match results.as_slice() {
+            [_] => message.get("tool_use_result"),
+            _ => None,
+        };
+        for block in results {
             let output = tool_output(block.get("content"));
             let is_error = block
                 .get("is_error")
@@ -395,13 +437,10 @@ impl Protocol {
                     reason,
                 });
             }
+            let tool = tool_use_id.and_then(|id| self.tools.remove(id));
             out.events.push(AdapterEvent::ToolResult {
                 call: tool_use_id.map(AgentCallId::from),
-                result: ResultDisplay {
-                    is_error,
-                    status: None,
-                    output,
-                },
+                result: display::result_display(tool.as_deref(), structured, output, is_error),
             });
         }
     }
@@ -521,6 +560,7 @@ impl Protocol {
             });
         }
         out.events.push(AdapterEvent::TurnEnded(outcome));
+        self.tools.clear();
         self.turn_open = false;
         self.interrupt_sent = false;
         if !self.shutting_down
@@ -529,35 +569,6 @@ impl Protocol {
             let next = self.begin_turn(&next);
             out.writes.extend(next.writes);
             out.events.extend(next.events);
-        }
-    }
-}
-
-fn on_assistant(message: &Value, out: &mut Output) {
-    let Some(blocks) = content_blocks(message) else {
-        return;
-    };
-    for block in blocks {
-        match str_field(block, "type") {
-            "text" => {
-                let text = str_field(block, "text");
-                if !text.is_empty() {
-                    out.events.push(AdapterEvent::Text(text.to_owned()));
-                }
-            }
-            "tool_use" => out.events.push(AdapterEvent::ToolCall {
-                call: block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(AgentCallId::from),
-                name: str_field(block, "name").to_owned(),
-                input: block.get("input").cloned().unwrap_or(Value::Null),
-                // Tool-specific displays come later; the mapper's generic
-                // one applies.
-                display: None,
-            }),
-            // thinking blocks are opaque.
-            _ => {}
         }
     }
 }
