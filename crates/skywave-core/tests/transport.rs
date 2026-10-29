@@ -124,7 +124,7 @@ async fn read_all(mut download: BlobDownload) -> Vec<u8> {
 async fn pair_then_talk_to_the_server_until_revoked() {
     let fx = Fixture::start().await;
     let data = tempfile::tempdir().unwrap();
-    let core = Core::open(data.path()).unwrap();
+    let core = Core::open_detached(data.path()).unwrap();
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
 
@@ -338,7 +338,7 @@ async fn wrong_code_then_rate_limit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_input_is_reported_on_the_pairing_screen() {
     let data = tempfile::tempdir().unwrap();
-    let core = Core::open(data.path()).unwrap();
+    let core = Core::open_detached(data.path()).unwrap();
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
     // Port 9 (discard) is never contacted: the code is malformed.

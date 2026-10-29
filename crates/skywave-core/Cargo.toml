@@ -23,11 +23,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 tokio-rustls.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 skywaved = { path = "../skywaved" }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }

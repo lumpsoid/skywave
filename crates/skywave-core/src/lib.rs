@@ -2,7 +2,10 @@
 //!
 //! Heads use [`Core::open`], [`Core::dispatch`] with an [`Action`], and
 //! [`Core::subscribe`] to receive [`ViewState`] snapshots (spec §7). They
-//! depend on this crate only, never on `skywave-proto`.
+//! depend on this crate only, never on `skywave-proto`. `Core::open` also
+//! starts the sync engine ([`EngineConfig`]), which pairs, pulls the log,
+//! drains the outbox and reconnects; heads that background call
+//! [`Core::suspend`] and [`Core::resume`].
 //!
 //! - [`view`]: the snapshot types heads render.
 //! - [`action`]: the user intents heads dispatch.
@@ -18,7 +21,9 @@
 
 pub mod action;
 mod address;
+mod backoff;
 mod client;
+mod engine;
 mod https;
 pub mod identity;
 mod model;
@@ -32,7 +37,9 @@ pub mod view;
 
 pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
+pub use backoff::{Backoff, Jitter};
 pub use client::{Core, CoreError, SubscriptionId};
+pub use engine::{Connector, DEFAULT_WAIT_SECS, EngineConfig, default_device_name};
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
 pub use pairing::{

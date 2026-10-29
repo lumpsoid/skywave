@@ -6,7 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
+use tokio::runtime::Runtime;
+use tokio::sync::{mpsc as async_mpsc, watch};
+
 use crate::action::Action;
+use crate::engine::{Engine, EngineConfig};
 use crate::identity::{FileIdentity, Identity, IdentityError};
 use crate::model::{Effect, Model};
 use crate::seam::{Request, Seam};
@@ -19,6 +23,8 @@ pub enum CoreError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    #[error("cannot start the sync engine: {0}")]
+    Runtime(std::io::Error),
 }
 
 /// Handle returned by [`Core::subscribe`], for [`Core::unsubscribe`].
@@ -27,18 +33,55 @@ pub struct SubscriptionId(u64);
 
 type Callback = Box<dyn FnMut(ViewState) + Send>;
 
-/// The client core. Cheap to clone; every clone is the same core.
+/// The client core. Cheap to clone; every clone is the same core. The sync
+/// engine stops when the last clone is dropped.
 #[derive(Clone)]
 pub struct Core {
     pub(crate) shared: Arc<Shared>,
+    /// `None` for a detached core, and in the engine's own handle (so the
+    /// engine does not keep itself alive).
+    engine: Option<Arc<EngineHandle>>,
 }
 
 pub(crate) struct Shared {
     pub(crate) data_dir: PathBuf,
     pub(crate) state: Mutex<State>,
-    requests: Sender<Request>,
+    requests: Requests,
+    /// A detached core's receiver, for [`Seam::take_requests`].
     pub(crate) request_rx: Mutex<Option<Receiver<Request>>>,
     delivery: Delivery,
+}
+
+/// Where requests go: to the engine, or to whoever took the receiver.
+enum Requests {
+    Engine(async_mpsc::UnboundedSender<Request>),
+    Detached(Sender<Request>),
+}
+
+impl Requests {
+    fn send(&self, request: Request) {
+        // No receiver means nobody plays the engine; the outbox keeps the
+        // work for when one starts.
+        match self {
+            Requests::Engine(tx) => drop(tx.send(request)),
+            Requests::Detached(tx) => drop(tx.send(request)),
+        }
+    }
+}
+
+/// The running engine: its runtime and its suspend switch.
+struct EngineHandle {
+    runtime: Option<Runtime>,
+    suspended: watch::Sender<bool>,
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            // Does not block, so it is safe inside another runtime too.
+            runtime.shutdown_background();
+        }
+    }
 }
 
 pub(crate) struct State {
@@ -51,28 +94,69 @@ pub(crate) struct State {
 }
 
 impl Core {
-    /// Opens the core over `data_dir`: the replica and, if the device is
-    /// paired, its identity. Renders from local data alone; nothing here
-    /// touches the network.
+    /// Opens the core over `data_dir` — the replica and, if the device is
+    /// paired, its identity — and starts the sync engine with the default
+    /// [`EngineConfig`]. The first snapshot renders from local data alone;
+    /// the engine connects in the background once the device is paired.
     pub fn open(data_dir: &Path) -> Result<Core, CoreError> {
-        let store = Store::open(data_dir)?;
-        let identity = FileIdentity::load(data_dir)?.map(Arc::new);
-        let model = Model::new(store.load()?, identity.as_ref().map(|i| i.device_id()));
-        let (requests, request_rx) = mpsc::channel();
+        Core::open_with(data_dir, EngineConfig::default())
+    }
+
+    /// [`open`](Core::open) with an engine tuned by `config`.
+    pub fn open_with(data_dir: &Path, config: EngineConfig) -> Result<Core, CoreError> {
+        let (requests, request_rx) = async_mpsc::unbounded_channel();
+        let shared = Shared::open(data_dir, Requests::Engine(requests), None)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("skywave-core")
+            .enable_all()
+            .build()
+            .map_err(CoreError::Runtime)?;
+        let (suspended, suspended_rx) = watch::channel(false);
+        let seam = Seam {
+            core: Core {
+                shared: shared.clone(),
+                engine: None,
+            },
+        };
+        runtime.spawn(Engine::new(seam, config, request_rx, suspended_rx).run());
         Ok(Core {
-            shared: Arc::new(Shared {
-                data_dir: data_dir.to_path_buf(),
-                state: Mutex::new(State {
-                    store,
-                    model,
-                    identity,
-                    version: 0,
-                }),
-                requests,
-                request_rx: Mutex::new(Some(request_rx)),
-                delivery: Delivery::default(),
-            }),
+            shared,
+            engine: Some(Arc::new(EngineHandle {
+                runtime: Some(runtime),
+                suspended,
+            })),
         })
+    }
+
+    /// Opens the core without a sync engine: nothing touches the network,
+    /// and requests wait in [`Seam::take_requests`] for whoever plays the
+    /// engine (tests).
+    pub fn open_detached(data_dir: &Path) -> Result<Core, CoreError> {
+        let (requests, request_rx) = mpsc::channel();
+        let shared = Shared::open(data_dir, Requests::Detached(requests), Some(request_rx))?;
+        Ok(Core {
+            shared,
+            engine: None,
+        })
+    }
+
+    /// Pauses the sync engine's network loops, e.g. while an Android app is
+    /// in the background. Nothing is lost: actions still persist and queue,
+    /// and an unanswered command is resent with its id later. No-op for a
+    /// detached core.
+    pub fn suspend(&self) {
+        if let Some(engine) = &self.engine {
+            engine.suspended.send_replace(true);
+        }
+    }
+
+    /// Undoes [`suspend`](Core::suspend): the link starts again from
+    /// `Connecting`, unless the server rejected the device.
+    pub fn resume(&self) {
+        if let Some(engine) = &self.engine {
+            engine.suspended.send_replace(false);
+        }
     }
 
     /// Applies a user action. Everything the action changes is written to
@@ -149,6 +233,28 @@ impl Core {
 }
 
 impl Shared {
+    fn open(
+        data_dir: &Path,
+        requests: Requests,
+        request_rx: Option<Receiver<Request>>,
+    ) -> Result<Arc<Shared>, CoreError> {
+        let store = Store::open(data_dir)?;
+        let identity = FileIdentity::load(data_dir)?.map(Arc::new);
+        let model = Model::new(store.load()?, identity.as_ref().map(|i| i.device_id()));
+        Ok(Arc::new(Shared {
+            data_dir: data_dir.to_path_buf(),
+            state: Mutex::new(State {
+                store,
+                model,
+                identity,
+                version: 0,
+            }),
+            requests,
+            request_rx: Mutex::new(request_rx),
+            delivery: Delivery::default(),
+        }))
+    }
+
     /// Runs `change` under the state lock, hands its requests to the engine
     /// and publishes the new snapshot — also after an error, since the
     /// model may have been resynced.
@@ -163,9 +269,7 @@ impl Shared {
         };
         let outcome = result.map(|(value, requests)| {
             for request in requests {
-                // No receiver means no engine is running; the outbox keeps
-                // the work for when one starts.
-                let _ = self.requests.send(request);
+                self.requests.send(request);
             }
             value
         });

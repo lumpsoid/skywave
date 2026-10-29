@@ -35,7 +35,7 @@ struct Harness {
 impl Harness {
     fn new() -> Harness {
         let dir = tempfile::tempdir().unwrap();
-        let core = Core::open(dir.path()).unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
         let seam = core.seam();
         let requests = seam.take_requests().unwrap();
         let (tx, views) = mpsc::channel();

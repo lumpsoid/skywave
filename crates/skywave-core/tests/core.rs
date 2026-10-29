@@ -68,7 +68,7 @@ fn drain(requests: &Receiver<Request>) -> Vec<Request> {
 
 /// A core over `dir` paired through the seam, with its request channel.
 fn paired_core(dir: &Path) -> (Core, Seam, Receiver<Request>, DeviceId) {
-    let core = Core::open(dir).unwrap();
+    let core = Core::open_detached(dir).unwrap();
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
     core.dispatch(Action::Pair {
@@ -102,7 +102,7 @@ fn session_view(view: &ViewState) -> &SessionView {
 #[test]
 fn pairing_runs_through_the_seam_and_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let core = Core::open(dir.path()).unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
     let views = Views::subscribe(&core);
     assert_eq!(views.count(), 1, "current snapshot right away");
     assert!(matches!(views.last().screen, Screen::Pairing(_)));
@@ -158,7 +158,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     drop((core, seam));
 
     // Cold start: paired, address remembered, straight to the session list.
-    let core = Core::open(dir.path()).unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
     assert!(matches!(core.view().screen, Screen::SessionList(_)));
     let seam = core.seam();
     assert_eq!(seam.identity().unwrap().device_id(), device);
@@ -265,7 +265,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     drop((core, seam));
 
     // Cold start renders the same thing from the replica alone.
-    let core = Core::open(dir.path()).unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
     core.dispatch(Action::OpenSession(sid)).unwrap();
     let cold = core.view();
     assert_eq!(cold.screen, live.screen);
@@ -366,7 +366,7 @@ fn blob_progress_is_persisted_and_shown() {
     );
     drop((core, seam));
 
-    let core = Core::open(dir.path()).unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
     core.dispatch(Action::OpenSession(sid)).unwrap();
     assert_eq!(
         output_state(&core),
