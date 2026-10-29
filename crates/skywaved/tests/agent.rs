@@ -1,0 +1,645 @@
+//! Agent adapter seam (T08): the fake agent driven through the event mapper.
+//!
+//! Each test plays the supervisor's part by hand: commands go through
+//! `EventLog::handle`, the agent is told directly, and every adapter event is
+//! fed to the mapper.
+
+use std::io::Read;
+use std::path::PathBuf;
+
+use serde_json::json;
+use skywave_proto::{
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
+    RejectReason, Seq, SessionId, SessionState,
+};
+use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step};
+use skywaved::agent::{
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, DEFAULT_BLOB_THRESHOLD,
+    EventMapper, StartSpec, TurnOutcome, load_resume_handle,
+};
+use skywaved::{EventLog, Storage};
+use tempfile::TempDir;
+
+struct Fixture {
+    _tmp: TempDir,
+    storage: Storage,
+    log: EventLog,
+    session_id: SessionId,
+    workdir: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let workdir = root.join("project");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let storage = Storage::open(tmp.path().join("data")).unwrap();
+        let log = EventLog::open(&storage.db, vec![root]).unwrap();
+        let mut fixture = Fixture {
+            _tmp: tmp,
+            storage,
+            log,
+            session_id: SessionId::new(),
+            workdir: workdir.clone(),
+        };
+        let seq = accepted(fixture.handle(CommandKind::CreateSession {
+            workdir: workdir.to_str().unwrap().to_owned(),
+        }));
+        let batch = fixture
+            .log
+            .read(&fixture.storage.db, Seq(seq.0 - 1), 1)
+            .unwrap();
+        fixture.session_id = batch.events[0].session_id;
+        fixture
+    }
+
+    fn handle(&mut self, kind: CommandKind) -> CommandResult {
+        let command = Command {
+            id: CommandId::new(),
+            kind,
+        };
+        self.log
+            .handle(&mut self.storage.db, DeviceId::new(), &command)
+            .unwrap()
+    }
+
+    fn spec(&self) -> StartSpec {
+        StartSpec {
+            session_id: self.session_id,
+            workdir: self.workdir.clone(),
+            resume: load_resume_handle(&self.storage.db, self.session_id).unwrap(),
+        }
+    }
+
+    /// Feeds adapter events to `mapper` until one matches `until`, and
+    /// returns them all.
+    async fn pump(
+        &mut self,
+        events: &mut AdapterEvents,
+        mapper: &mut EventMapper,
+        until: impl Fn(&AdapterEvent) -> bool,
+    ) -> Vec<AdapterEvent> {
+        let mut seen = Vec::new();
+        loop {
+            let event = events.recv().await.expect("agent event stream ended");
+            mapper
+                .apply(&self.log, &mut self.storage, event.clone())
+                .unwrap();
+            let done = until(&event);
+            seen.push(event);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// The session's log after `SessionCreated`.
+    fn kinds(&self) -> Vec<EventKind> {
+        let batch = self.log.read(&self.storage.db, Seq::ZERO, 1000).unwrap();
+        batch
+            .events
+            .into_iter()
+            .filter(|e| e.session_id == self.session_id)
+            .map(|e| e.kind)
+            .skip(1)
+            .collect()
+    }
+
+    fn blob(&self, kind: &EventKind) -> String {
+        let blob = match kind {
+            EventKind::ToolCall { input, .. } | EventKind::ApprovalRequested { input, .. } => input,
+            EventKind::ToolResult { output, .. } => output,
+            other => panic!("no blob in {other:?}"),
+        }
+        .clone()
+        .expect("payload should be a blob");
+        let mut content = String::new();
+        self.storage
+            .open_blob(blob.id)
+            .unwrap()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content.len() as u64, blob.size);
+        content
+    }
+
+    fn approval_id(&self) -> ApprovalId {
+        self.kinds()
+            .iter()
+            .rev()
+            .find_map(|k| match k {
+                EventKind::ApprovalRequested { id, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("an approval was requested")
+    }
+}
+
+fn accepted(result: CommandResult) -> Seq {
+    match result {
+        CommandResult::Accepted { seq } => seq,
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+}
+
+fn turn_ended(event: &AdapterEvent) -> bool {
+    matches!(event, AdapterEvent::TurnEnded(_))
+}
+
+fn approval_requested(event: &AdapterEvent) -> bool {
+    matches!(event, AdapterEvent::ApprovalRequested { .. })
+}
+
+fn state(state: SessionState) -> EventKind {
+    EventKind::SessionStateChanged(state)
+}
+
+fn big_output() -> String {
+    (0..400)
+        .map(|i| format!("line {i:04} of the listing\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn full_turn_with_blob_output_and_approved_approval() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([
+            Step::text("Looking around."),
+            Step::tool_call("shell", json!({ "command": "ls -la" })),
+            Step::tool_result(big_output()),
+            Step::approval(
+                "req-1",
+                "write",
+                json!({ "path": "notes.txt", "content": "hi" }),
+            )
+            .on_approve([Step::tool_result("written"), Step::text("Done.")])
+            .on_deny([Step::text("Not writing it.")]),
+        ]),
+    );
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+
+    accepted(f.handle(CommandKind::SendMessage {
+        session_id: f.session_id,
+        text: "look around".into(),
+    }));
+    session.send_message("look around".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, approval_requested).await;
+
+    // The resume handle arrived before the turn finished.
+    assert_eq!(
+        load_resume_handle(&f.storage.db, f.session_id).unwrap(),
+        Some(FakeAgent::resume_handle(f.session_id))
+    );
+    let id = f.approval_id();
+    assert_eq!(mapper.pending_approvals().collect::<Vec<_>>(), [id]);
+    assert!(
+        f.log
+            .session(&f.storage.db, f.session_id)
+            .unwrap()
+            .unwrap()
+            .turn_active
+    );
+
+    // A device approves; the supervisor relays the answer.
+    accepted(f.handle(CommandKind::ResolveApproval {
+        id,
+        decision: Decision::Approve,
+    }));
+    let request = mapper
+        .take_approval(id)
+        .expect("the mapper knows the request");
+    assert_eq!(request.0, "req-1");
+    assert_eq!(mapper.take_approval(id), None);
+    session
+        .answer_approval(request, Decision::Approve)
+        .await
+        .unwrap();
+    let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(
+        tail.last(),
+        Some(&AdapterEvent::TurnEnded(TurnOutcome::Completed))
+    );
+
+    let kinds = f.kinds();
+    assert!(matches!(&kinds[0], EventKind::UserMessage { text, .. } if text == "look around"));
+    assert_eq!(kinds[1], state(SessionState::AgentWorking));
+    assert_eq!(
+        kinds[2],
+        EventKind::AgentMessage {
+            text: "Looking around.".into()
+        }
+    );
+    // A small input is carried whole in the summary.
+    assert_eq!(
+        kinds[3],
+        EventKind::ToolCall {
+            name: "shell".into(),
+            summary: r#"{"command":"ls -la"}"#.into(),
+            input: None,
+        }
+    );
+    // A large output becomes a blob with a preview summary.
+    let EventKind::ToolResult { summary, output } = &kinds[4] else {
+        panic!("expected ToolResult, got {:?}", kinds[4]);
+    };
+    assert!(big_output().len() > DEFAULT_BLOB_THRESHOLD);
+    assert_eq!(summary, "line 0000 of the listing… [400 lines, 9.8 KiB]");
+    assert_eq!(output.as_ref().unwrap().size, big_output().len() as u64);
+    assert_eq!(f.blob(&kinds[4]), big_output());
+    assert!(matches!(
+        &kinds[5],
+        EventKind::ApprovalRequested { id: a, tool, summary, input: None }
+            if *a == id && tool == "write" && summary == r#"{"content":"hi","path":"notes.txt"}"#
+    ));
+    assert!(matches!(
+        kinds[6],
+        EventKind::ApprovalResolved {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+    assert_eq!(
+        kinds[7],
+        EventKind::ToolResult {
+            summary: "written".into(),
+            output: None
+        }
+    );
+    assert_eq!(
+        kinds[8],
+        EventKind::AgentMessage {
+            text: "Done.".into()
+        }
+    );
+    assert_eq!(kinds[9], state(SessionState::Idle));
+    assert_eq!(kinds.len(), 10);
+    assert!(
+        !f.log
+            .session(&f.storage.db, f.session_id)
+            .unwrap()
+            .unwrap()
+            .turn_active
+    );
+
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::Message("look around".into()),
+            FakeInput::Answer("req-1".into(), Decision::Approve),
+        ]
+    );
+    session.shutdown().await.unwrap();
+    let rest = f.pump(&mut events, &mut mapper, |_| true).await;
+    assert_eq!(rest, [AdapterEvent::Exited { error: None }]);
+    assert_eq!(f.kinds().len(), 10, "a clean exit while idle logs nothing");
+}
+
+#[tokio::test]
+async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([
+                Step::tool_call("shell", json!({ "command": "rm -rf build" })),
+                Step::approval("req-7", "shell", json!({ "command": "rm -rf build" }))
+                    .on_approve([Step::tool_result("removed")]),
+            ])
+            .turn([Step::text("Second turn.")]),
+    );
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+
+    session.send_message("clean up".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, approval_requested).await;
+    let id = f.approval_id();
+
+    // The Interrupt command is accepted at once; the agent is told after.
+    let interrupted = accepted(f.handle(CommandKind::Interrupt {
+        session_id: f.session_id,
+    }));
+    session.interrupt().await.unwrap();
+    let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(
+        tail,
+        [
+            AdapterEvent::ApprovalCancelled {
+                request: "req-7".into(),
+                reason: INTERRUPT_REASON.into(),
+            },
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
+        ]
+    );
+
+    let kinds = f.kinds();
+    let n = kinds.len();
+    assert_eq!(kinds[n - 3], EventKind::TurnInterrupted);
+    assert_eq!(
+        kinds[n - 2],
+        EventKind::ApprovalCancelled {
+            id,
+            reason: INTERRUPT_REASON.into()
+        }
+    );
+    assert_eq!(kinds[n - 1], state(SessionState::Idle));
+    assert_eq!(f.log.head(), Seq(interrupted.0 + 2));
+    assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
+    assert_eq!(mapper.pending_approvals().count(), 0);
+    // Too late: a device answering now loses.
+    assert_eq!(
+        f.handle(CommandKind::ResolveApproval {
+            id,
+            decision: Decision::Approve
+        }),
+        CommandResult::Rejected {
+            reason: RejectReason::ApprovalAlreadyResolved
+        }
+    );
+
+    // A stale answer is ignored and the next message runs the next turn.
+    session
+        .answer_approval("req-7".into(), Decision::Approve)
+        .await
+        .unwrap();
+    session.send_message("go on".into()).await.unwrap();
+    let next = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(
+        next,
+        [
+            AdapterEvent::TurnStarted,
+            AdapterEvent::Text("Second turn.".into()),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
+    let mut f = Fixture::new();
+    let gate = Gate::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([Step::text("working"), Step::Hang, Step::text("never")])
+            .turn([Step::Wait(gate.clone()), Step::text("released")]),
+    );
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+
+    session.send_message("first".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, |e| {
+        matches!(e, AdapterEvent::Text(_))
+    })
+    .await;
+    // A message sent mid-turn is queued for the next turn.
+    session.send_message("second".into()).await.unwrap();
+    session.interrupt().await.unwrap();
+    let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(tail, [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]);
+
+    f.pump(&mut events, &mut mapper, |e| {
+        *e == AdapterEvent::TurnStarted
+    })
+    .await;
+    gate.open();
+    let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(
+        tail,
+        [
+            AdapterEvent::Text("released".into()),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
+    );
+    let kinds = f.kinds();
+    assert_eq!(
+        kinds,
+        [
+            state(SessionState::AgentWorking),
+            EventKind::AgentMessage {
+                text: "working".into()
+            },
+            state(SessionState::Idle),
+            state(SessionState::AgentWorking),
+            EventKind::AgentMessage {
+                text: "released".into()
+            },
+            state(SessionState::Idle),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn denied_approval_runs_the_deny_branch() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([Step::approval("r", "write", json!({ "path": "x" }))
+            .on_approve([Step::text("approved")])
+            .on_deny([Step::tool_error("denied by user"), Step::text("Skipping.")])]),
+    );
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+    session.send_message("write x".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, approval_requested).await;
+    let id = f.approval_id();
+    accepted(f.handle(CommandKind::ResolveApproval {
+        id,
+        decision: Decision::Deny,
+    }));
+    let request = mapper.take_approval(id).unwrap();
+    session
+        .answer_approval(request, Decision::Deny)
+        .await
+        .unwrap();
+    f.pump(&mut events, &mut mapper, turn_ended).await;
+    let kinds = f.kinds();
+    let n = kinds.len();
+    assert_eq!(
+        kinds[n - 3],
+        EventKind::ToolResult {
+            summary: "[error] denied by user".into(),
+            output: None
+        }
+    );
+    assert_eq!(
+        kinds[n - 2],
+        EventKind::AgentMessage {
+            text: "Skipping.".into()
+        }
+    );
+    assert_eq!(kinds[n - 1], state(SessionState::Idle));
+}
+
+#[tokio::test]
+async fn restart_resumes_with_the_stored_handle() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([Step::text("one")])
+            .turn([Step::text("two")]),
+    );
+    assert_eq!(f.spec().resume, None);
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+    session.send_message("a".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, turn_ended).await;
+    session.shutdown().await.unwrap();
+    f.pump(&mut events, &mut mapper, |e| {
+        matches!(e, AdapterEvent::Exited { .. })
+    })
+    .await;
+    assert!(matches!(
+        fresh_start_error(&agent, &f).await,
+        AgentError::Start(_)
+    ));
+
+    // The restart finds the handle in sessions.agent_state.
+    let spec = f.spec();
+    assert_eq!(spec.resume, Some(FakeAgent::resume_handle(f.session_id)));
+    let (mut session, mut events) = agent.start(spec).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+    session.send_message("b".into()).await.unwrap();
+    let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(turn[1], AdapterEvent::Text("two".into()));
+    // Past the script, the fake echoes.
+    session.send_message("c".into()).await.unwrap();
+    let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(turn[1], AdapterEvent::Text("echo: c".into()));
+
+    // A handle for another session is refused.
+    let mut wrong = f.spec();
+    wrong.resume = Some(FakeAgent::resume_handle(SessionId::new()));
+    assert!(matches!(
+        agent.start(wrong).await,
+        Err(AgentError::Resume(_))
+    ));
+}
+
+/// Starting a session fresh again fails, like a reused agent session id.
+async fn fresh_start_error(agent: &FakeAgent, f: &Fixture) -> AgentError {
+    let mut fresh = f.spec();
+    fresh.resume = None;
+    match agent.start(fresh).await {
+        Err(error) => error,
+        Ok(_) => panic!("a second fresh start must fail"),
+    }
+}
+
+#[tokio::test]
+async fn failures_and_exits_mark_the_session_errored() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([Step::Fail("model overloaded".into())])
+            .turn([
+                Step::approval("r", "shell", json!({ "command": "make" })),
+                Step::Exit(Some("crashed".into())),
+            ]),
+    );
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id);
+    session.send_message("1".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, turn_ended).await;
+    assert_eq!(
+        f.kinds().last().unwrap(),
+        &state(SessionState::Errored {
+            message: "model overloaded".into()
+        })
+    );
+
+    session.send_message("2".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, approval_requested).await;
+    let id = f.approval_id();
+    accepted(f.handle(CommandKind::ResolveApproval {
+        id,
+        decision: Decision::Approve,
+    }));
+    let request = mapper.take_approval(id).unwrap();
+    session
+        .answer_approval(request, Decision::Approve)
+        .await
+        .unwrap();
+    let tail = f
+        .pump(&mut events, &mut mapper, |e| {
+            matches!(e, AdapterEvent::Exited { .. })
+        })
+        .await;
+    assert_eq!(
+        tail,
+        [AdapterEvent::Exited {
+            error: Some("crashed".into())
+        }]
+    );
+    assert_eq!(
+        f.kinds().last().unwrap(),
+        &state(SessionState::Errored {
+            message: "agent exited: crashed".into()
+        })
+    );
+    assert!(!mapper.turn_open());
+    assert!(matches!(
+        session.send_message("3".into()).await,
+        Err(AgentError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn exit_with_a_pending_approval_cancels_it() {
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id).with_blob_threshold(16);
+    for event in [
+        AdapterEvent::TurnStarted,
+        AdapterEvent::ToolCall {
+            name: "write".into(),
+            input: json!({ "path": "a.txt", "content": "a long enough body" }),
+        },
+        AdapterEvent::ApprovalRequested {
+            request: "q".into(),
+            tool: "write".into(),
+            input: json!("short"),
+        },
+        AdapterEvent::ToolResult {
+            output: String::new(),
+            is_error: false,
+        },
+        AdapterEvent::Exited { error: None },
+    ] {
+        mapper.apply(&f.log, &mut f.storage, event).unwrap();
+    }
+    let kinds = f.kinds();
+    // Over the lowered threshold: the input is a pretty-printed JSON blob.
+    let EventKind::ToolCall { summary, .. } = &kinds[1] else {
+        panic!("expected ToolCall, got {:?}", kinds[1]);
+    };
+    assert!(summary.starts_with(r#"{"content":"a long enough body","path":"a.txt"}…"#));
+    let blob: serde_json::Value = serde_json::from_str(&f.blob(&kinds[1])).unwrap();
+    assert_eq!(blob["path"], "a.txt");
+    assert!(f.blob(&kinds[1]).contains('\n'));
+    let id = f.approval_id();
+    assert!(
+        matches!(&kinds[2], EventKind::ApprovalRequested { summary, input: None, .. } if summary == "short")
+    );
+    assert_eq!(
+        kinds[3],
+        EventKind::ToolResult {
+            summary: "(no output)".into(),
+            output: None
+        }
+    );
+    assert_eq!(
+        kinds[4],
+        EventKind::ApprovalCancelled {
+            id,
+            reason: "agent exited".into()
+        }
+    );
+    assert_eq!(
+        kinds[5],
+        state(SessionState::Errored {
+            message: "agent exited during a turn".into()
+        })
+    );
+    assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
+}

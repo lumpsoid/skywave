@@ -3,6 +3,7 @@
 //! The binary is a thin CLI over this library so later server pieces and
 //! integration tests share one implementation.
 
+pub mod agent;
 pub mod blobs;
 pub mod commands;
 pub mod config;

@@ -57,6 +57,8 @@ pub enum Error {
     Random(getrandom::Error),
     #[error("QR code: {0}")]
     Qr(String),
+    #[error("no session with id {}", .0.0)]
+    UnknownSession(skywave_proto::SessionId),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
