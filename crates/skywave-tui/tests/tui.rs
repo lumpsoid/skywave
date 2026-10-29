@@ -16,8 +16,8 @@ use skywave_core::{
     SessionId, ViewState,
 };
 use skywave_proto::{
-    BlobRef, CommandResult, Event, EventBatch, EventKind, SessionState as LogState, ToolCall,
-    ToolDisplay, ToolKind, ToolResult,
+    BlobRef, CallId, CommandResult, Event, EventBatch, EventKind, SessionState as LogState,
+    ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
@@ -1422,4 +1422,68 @@ fn settings_explain_the_blob_policy() {
     let screen = h.screen();
     assert_contains(&screen, "( ) On demand");
     assert_contains(&screen, "(•) Eager");
+}
+
+#[test]
+fn a_grouped_tool_call_shows_its_approval_and_result() {
+    let (mut h, id, me) = open_session();
+    let (call, approval) = (CallId::new(), ApprovalId::new());
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(ToolCall {
+                    call: Some(call),
+                    name: "Write".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::FileWrite,
+                        title: "a.txt".into(),
+                        detail: None,
+                        body: None,
+                    },
+                    input: None,
+                }),
+            ),
+            event(
+                id,
+                2,
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: Some(call),
+                    tool: "Write".into(),
+                    summary: "a.txt".into(),
+                    input: None,
+                },
+            ),
+            event(
+                id,
+                3,
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: me,
+                },
+            ),
+            event(
+                id,
+                4,
+                EventKind::ToolResult(ToolResult {
+                    call: Some(call),
+                    is_error: false,
+                    status: Some("created".into()),
+                    preview: "wrote 1 line".into(),
+                    lines: 1,
+                    output: None,
+                }),
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "12:01 ▸ tool Write: a.txt");
+    assert_contains(&screen, "approval Write [approved here]");
+    assert_contains(&screen, "result: wrote 1 line");
+    assert!(!screen.contains("12:02"), "folded into the call: {screen}");
+    assert!(!screen.contains("12:04"), "folded into the call: {screen}");
 }

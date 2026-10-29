@@ -8,22 +8,24 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, Event, EventBatch, EventKind,
-    SessionState as LogState, ToolCall, ToolResult,
+    SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
-use crate::projection::{SessionSummary, blob_ref};
+use crate::projection::{SessionSummary, blob_refs};
 use crate::seam::Request;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, Settings, Snapshot,
 };
 use crate::view::{
-    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, CommandId,
-    DeviceId, Entry, ErrorInfo, Link, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingSession, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView,
-    SettingsView, TimelineItem, ViewState,
+    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyView,
+    CallId, CommandId, Decision, DeviceId, Entry, ErrorInfo, Link, Outgoing, PairedInfo,
+    PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId, SessionListView,
+    SessionRow, SessionState, SessionView, SettingsView, TimelineItem, ToolApproval, ToolOutcome,
+    ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -265,7 +267,7 @@ impl Model {
                 Some(summary) => summary.apply(seq, event),
                 None => self.sessions.push(SessionSummary::new(seq, event)),
             }
-            if let Some(blob) = blob_ref(&event.kind) {
+            for blob in blob_refs(&event.kind) {
                 self.blobs.entry(blob.id).or_insert_with(|| BlobRecord {
                     id: blob.id,
                     size: blob.size,
@@ -410,12 +412,13 @@ impl Model {
             events.iter().find_map(|(_, event)| match &event.kind {
                 EventKind::ApprovalRequested {
                     id,
-                    call: _,
+                    call,
                     tool,
                     summary,
                     input,
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
+                    call: *call,
                     tool: tool.clone(),
                     summary: summary.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
@@ -447,29 +450,9 @@ impl Model {
             .iter()
             .map(|e| (e.command.id, Outgoing::from(&e.status)))
             .collect();
-        let outcomes: HashMap<ApprovalId, ApprovalStatus> = events
-            .iter()
-            .filter_map(|(_, event)| match &event.kind {
-                EventKind::ApprovalResolved { id, decision, by } => Some((
-                    *id,
-                    ApprovalStatus::Resolved {
-                        decision: *decision,
-                        by: *by,
-                        by_me: self.device == Some(*by),
-                    },
-                )),
-                EventKind::ApprovalCancelled { id, reason } => Some((
-                    *id,
-                    ApprovalStatus::Cancelled {
-                        reason: reason.clone(),
-                    },
-                )),
-                _ => None,
-            })
-            .collect();
-
         let mut logged = HashSet::new();
         let mut items = Vec::with_capacity(events.len());
+        let mut tools = ToolIndex::default();
         for (seq, event) in events {
             let entry = match &event.kind {
                 EventKind::UserMessage {
@@ -490,6 +473,32 @@ impl Model {
                     Some(Entry::AgentMessage { text: text.clone() })
                 }
                 EventKind::ToolCall(ToolCall {
+                    call: Some(call),
+                    name,
+                    display,
+                    input,
+                }) if !tools.calls.contains_key(call) => {
+                    tools.calls.insert(*call, (items.len(), event.at));
+                    tools.open.push(items.len());
+                    Some(Entry::Tool(Box::new(ToolView {
+                        call: *call,
+                        name: name.clone(),
+                        kind: display.kind,
+                        title: display.title.clone(),
+                        detail: display.detail.clone(),
+                        body: display.body.as_ref().map(|body| BodyView {
+                            format: body.format,
+                            preview: body.preview.clone(),
+                            lines: body.lines,
+                            full: body.full.as_ref().map(|b| self.blob_view(b)),
+                        }),
+                        input: input.as_ref().map(|b| self.blob_view(b)),
+                        approval: None,
+                        outcome: ToolOutcome::Running { since: event.at },
+                    })))
+                }
+                // No call id (v1), or one already taken.
+                EventKind::ToolCall(ToolCall {
                     name,
                     display,
                     input,
@@ -499,36 +508,97 @@ impl Model {
                     summary: display.title.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
                 }),
-                EventKind::ToolResult(ToolResult {
-                    preview, output, ..
-                }) => Some(Entry::ToolResult {
-                    summary: preview.clone(),
-                    output: output.as_ref().map(|b| self.blob_view(b)),
-                }),
+                EventKind::ToolResult(result) => {
+                    match tools.call(&mut items, result.call) {
+                        Some((_, view, called))
+                            if !matches!(view.outcome, ToolOutcome::Done { .. }) =>
+                        {
+                            // A denied or cancelled call's result only
+                            // reports that; the outcome already says it.
+                            if matches!(
+                                view.outcome,
+                                ToolOutcome::Running { .. } | ToolOutcome::NoResult
+                            ) {
+                                view.outcome = ToolOutcome::Done {
+                                    is_error: result.is_error,
+                                    status: result.status.clone(),
+                                    preview: result.preview.clone(),
+                                    lines: result.lines,
+                                    output: result.output.as_ref().map(|b| self.blob_view(b)),
+                                    took: (event.at - called).to_std().unwrap_or_default(),
+                                };
+                            }
+                            None
+                        }
+                        // No call to fold into, or a second result for one.
+                        _ => Some(Entry::ToolResult {
+                            summary: result.preview.clone(),
+                            output: result.output.as_ref().map(|b| self.blob_view(b)),
+                        }),
+                    }
+                }
                 EventKind::ApprovalRequested {
                     id,
-                    call: _,
+                    call,
                     tool,
                     summary,
                     input,
-                } => Some(Entry::Approval {
-                    id: *id,
-                    tool: tool.clone(),
-                    summary: summary.clone(),
-                    input: input.as_ref().map(|b| self.blob_view(b)),
-                    status: outcomes.get(id).cloned().unwrap_or(ApprovalStatus::Pending),
-                }),
-                EventKind::TurnInterrupted => Some(Entry::Interrupted),
-                EventKind::SessionStateChanged(LogState::Errored { message }) => {
-                    Some(Entry::AgentErrored {
-                        message: message.clone(),
-                    })
+                } => match tools.call(&mut items, *call) {
+                    Some((item, view, _)) if view.approval.is_none() => {
+                        view.approval = Some(ToolApproval {
+                            id: *id,
+                            status: ApprovalStatus::Pending,
+                        });
+                        tools.approvals.insert(*id, item);
+                        None
+                    }
+                    _ => {
+                        tools.approvals.insert(*id, items.len());
+                        Some(Entry::Approval {
+                            id: *id,
+                            tool: tool.clone(),
+                            summary: summary.clone(),
+                            input: input.as_ref().map(|b| self.blob_view(b)),
+                            status: ApprovalStatus::Pending,
+                        })
+                    }
+                },
+                EventKind::ApprovalResolved { id, decision, by } => {
+                    let by_me = self.device == Some(*by);
+                    let status = ApprovalStatus::Resolved {
+                        decision: *decision,
+                        by: *by,
+                        by_me,
+                    };
+                    let ends = (*decision == Decision::Deny)
+                        .then_some(ToolOutcome::Denied { by: *by, by_me });
+                    tools.settle(&mut items, *id, status, ends);
+                    None
                 }
-                // Folded into the approval entry, the header and the state.
-                EventKind::ApprovalResolved { .. }
-                | EventKind::ApprovalCancelled { .. }
-                | EventKind::SessionCreated { .. }
-                | EventKind::SessionStateChanged(_) => None,
+                EventKind::ApprovalCancelled { id, reason } => {
+                    let status = ApprovalStatus::Cancelled {
+                        reason: reason.clone(),
+                    };
+                    let ends = ToolOutcome::Cancelled {
+                        reason: reason.clone(),
+                    };
+                    tools.settle(&mut items, *id, status, Some(ends));
+                    None
+                }
+                EventKind::TurnInterrupted => Some(Entry::Interrupted),
+                EventKind::SessionStateChanged(state) => {
+                    // Every state change ends a turn or starts the next.
+                    tools.end_turn(&mut items);
+                    match state {
+                        LogState::Errored { message } => Some(Entry::AgentErrored {
+                            message: message.clone(),
+                        }),
+                        // Shown in the header.
+                        LogState::Idle | LogState::AgentWorking => None,
+                    }
+                }
+                // Shown in the header.
+                EventKind::SessionCreated { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -583,6 +653,86 @@ impl Model {
     }
 }
 
+/// Where the linked tool calls sit while a timeline is built, so their
+/// approvals and results fold into them (spec §7 "Tool timeline").
+#[derive(Default)]
+struct ToolIndex {
+    /// Each linked call's item and the call's time.
+    calls: HashMap<CallId, (usize, DateTime<Utc>)>,
+    /// Each approval's item: its call's [`Entry::Tool`] or its own
+    /// [`Entry::Approval`].
+    approvals: HashMap<ApprovalId, usize>,
+    /// Items of the calls made since the last turn boundary.
+    open: Vec<usize>,
+}
+
+impl ToolIndex {
+    /// The linked call `call` names: its item, view and time.
+    fn call<'a>(
+        &self,
+        items: &'a mut [TimelineItem],
+        call: Option<CallId>,
+    ) -> Option<(usize, &'a mut ToolView, DateTime<Utc>)> {
+        let &(item, at) = self.calls.get(&call?)?;
+        Some((item, tool_at(items, item)?, at))
+    }
+
+    /// An approval was answered or cancelled. A linked call still running
+    /// `ends` with it (a denial or cancellation); a standalone approval only
+    /// takes the status.
+    fn settle(
+        &self,
+        items: &mut [TimelineItem],
+        approval: ApprovalId,
+        status: ApprovalStatus,
+        ends: Option<ToolOutcome>,
+    ) {
+        let Some(TimelineItem::Logged { entry, .. }) = self
+            .approvals
+            .get(&approval)
+            .and_then(|&item| items.get_mut(item))
+        else {
+            return;
+        };
+        match entry {
+            Entry::Tool(view) => {
+                if let Some(linked) = view.approval.as_mut() {
+                    linked.status = status;
+                }
+                if let Some(end) = ends
+                    && matches!(view.outcome, ToolOutcome::Running { .. })
+                {
+                    view.outcome = end;
+                }
+            }
+            Entry::Approval { status: own, .. } => *own = status,
+            _ => {}
+        }
+    }
+
+    /// The turn ended or the next one started: calls still running never
+    /// got a result.
+    fn end_turn(&mut self, items: &mut [TimelineItem]) {
+        for item in self.open.drain(..) {
+            if let Some(view) = tool_at(items, item)
+                && matches!(view.outcome, ToolOutcome::Running { .. })
+            {
+                view.outcome = ToolOutcome::NoResult;
+            }
+        }
+    }
+}
+
+fn tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
+    match items.get_mut(item)? {
+        TimelineItem::Logged {
+            entry: Entry::Tool(view),
+            ..
+        } => Some(view.as_mut()),
+        _ => None,
+    }
+}
+
 /// A pending approval overrides the logged agent state.
 fn session_state(summary: &SessionSummary) -> SessionState {
     if let Some(id) = summary.pending_approval() {
@@ -603,7 +753,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use chrono::{TimeZone, Utc};
-    use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind};
+    use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind, ToolResult};
 
     use super::*;
     use crate::view::LinkRejection;
@@ -963,6 +1113,7 @@ mod tests {
             view.pending_approval,
             Some(ApprovalPrompt {
                 id: approval,
+                call: None,
                 tool: "bash".into(),
                 summary: "rm -rf build".into(),
                 input: Some(blob.clone()),
@@ -1272,5 +1423,400 @@ mod tests {
         f.model.set_link(Link::Rejected(LinkRejection::Revoked));
         // Local data stays readable while rejected.
         assert_eq!(f.list_view().sessions.len(), 1);
+    }
+
+    // Tool timeline (spec §7): calls group their approval and result.
+
+    fn tool_call(call: Option<CallId>, kind: ToolKind, title: &str) -> EventKind {
+        EventKind::ToolCall(ToolCall {
+            call,
+            name: "agent-tool".into(),
+            display: ToolDisplay {
+                kind,
+                title: title.into(),
+                detail: None,
+                body: None,
+            },
+            input: None,
+        })
+    }
+
+    fn tool_result(call: Option<CallId>, is_error: bool, preview: &str) -> EventKind {
+        EventKind::ToolResult(ToolResult {
+            call,
+            is_error,
+            status: None,
+            preview: preview.into(),
+            lines: 1,
+            output: None,
+        })
+    }
+
+    fn approval_requested(id: ApprovalId, call: Option<CallId>) -> EventKind {
+        EventKind::ApprovalRequested {
+            id,
+            call,
+            tool: "agent-tool".into(),
+            summary: "the call's title".into(),
+            input: None,
+        }
+    }
+
+    /// The logged entries of the open session, in order.
+    fn entries(f: &Fixture) -> Vec<Entry> {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged { entry, .. } => Some(entry),
+                TimelineItem::Pending { .. } => None,
+            })
+            .collect()
+    }
+
+    fn tools(f: &Fixture) -> Vec<ToolView> {
+        entries(f)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool(view) => Some(*view),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The fixture's time of the n-th logged event.
+    fn minute(n: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 29, 10, n, 0).unwrap()
+    }
+
+    #[test]
+    fn a_call_its_approval_and_its_result_are_one_item() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a"); // minute 0
+        let (call, approval) = (CallId::new(), ApprovalId::new());
+        let (input, full) = (
+            BlobRef {
+                id: BlobId::new(),
+                size: 9000,
+            },
+            BlobRef {
+                id: BlobId::new(),
+                size: 7000,
+            },
+        );
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                EventKind::ToolCall(ToolCall {
+                    call: Some(call),
+                    name: "Write".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::FileWrite,
+                        title: "src/lib.rs".into(),
+                        detail: Some("new file".into()),
+                        body: Some(skywave_proto::Body {
+                            format: skywave_proto::BodyFormat::Diff,
+                            preview: "+fn main() {}".into(),
+                            lines: 300,
+                            full: Some(full.clone()),
+                        }),
+                    },
+                    input: Some(input.clone()),
+                }),
+                approval_requested(approval, Some(call)),
+            ],
+        );
+        // The body's whole content is a blob like any other.
+        assert!(f.model.blobs.contains_key(&full.id));
+        f.open(sid);
+
+        let view = f.session_view();
+        assert_eq!(view.pending_approval.as_ref().unwrap().call, Some(call));
+        let blob = |b: &BlobRef| BlobView {
+            id: b.id,
+            state: BlobState::NotDownloaded { size: b.size },
+        };
+        let waiting = ToolView {
+            call,
+            name: "Write".into(),
+            kind: ToolKind::FileWrite,
+            title: "src/lib.rs".into(),
+            detail: Some("new file".into()),
+            body: Some(BodyView {
+                format: skywave_proto::BodyFormat::Diff,
+                preview: "+fn main() {}".into(),
+                lines: 300,
+                full: Some(blob(&full)),
+            }),
+            input: Some(blob(&input)),
+            approval: Some(ToolApproval {
+                id: approval,
+                status: ApprovalStatus::Pending,
+            }),
+            outcome: ToolOutcome::Running { since: minute(2) },
+        };
+        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(waiting.clone()))]);
+        assert!(matches!(
+            view.timeline[0],
+            TimelineItem::Logged { seq: Seq(3), .. }
+        ));
+
+        f.log(
+            sid,
+            vec![
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: f.me,
+                },
+                EventKind::ToolResult(ToolResult {
+                    call: Some(call),
+                    is_error: false,
+                    status: Some("created".into()),
+                    preview: "ok".into(),
+                    lines: 1,
+                    output: None,
+                }),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        let done = ToolView {
+            approval: Some(ToolApproval {
+                id: approval,
+                status: ApprovalStatus::Resolved {
+                    decision: Decision::Approve,
+                    by: f.me,
+                    by_me: true,
+                },
+            }),
+            outcome: ToolOutcome::Done {
+                is_error: false,
+                status: Some("created".into()),
+                preview: "ok".into(),
+                lines: 1,
+                output: None,
+                took: Duration::from_secs(3 * 60),
+            },
+            ..waiting
+        };
+        assert_eq!(entries(&f), vec![Entry::Tool(Box::new(done))]);
+        assert_eq!(f.session_view().pending_approval, None);
+    }
+
+    #[test]
+    fn parallel_calls_take_their_own_results_in_any_order() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (a, b) = (CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(a), ToolKind::FileRead, "a.txt"),
+                tool_call(Some(b), ToolKind::Search, "needle"),
+                tool_result(Some(b), false, "3 matches"),
+            ],
+        );
+        f.open(sid);
+        let outcomes = |f: &Fixture| -> Vec<(CallId, ToolOutcome)> {
+            tools(f).into_iter().map(|v| (v.call, v.outcome)).collect()
+        };
+        let done = |preview: &str, minutes: u64| ToolOutcome::Done {
+            is_error: false,
+            status: None,
+            preview: preview.into(),
+            lines: 1,
+            output: None,
+            took: Duration::from_secs(minutes * 60),
+        };
+        assert_eq!(
+            outcomes(&f),
+            vec![
+                (a, ToolOutcome::Running { since: minute(2) }),
+                (b, done("3 matches", 1)),
+            ]
+        );
+        f.log(sid, vec![tool_result(Some(a), false, "contents")]);
+        assert_eq!(
+            outcomes(&f),
+            vec![(a, done("contents", 3)), (b, done("3 matches", 1))]
+        );
+        assert_eq!(entries(&f).len(), 2);
+    }
+
+    #[test]
+    fn a_denial_and_its_error_result_are_one_denied_item() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (call, approval, phone) = (CallId::new(), ApprovalId::new(), DeviceId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::Shell, "rm -rf build"),
+                approval_requested(approval, Some(call)),
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Deny,
+                    by: phone,
+                },
+                tool_result(Some(call), true, "the user denied this"),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        f.open(sid);
+        let entries = entries(&f);
+        let [Entry::Tool(view)] = entries.as_slice() else {
+            panic!("expected one tool item, got {entries:?}");
+        };
+        assert_eq!(
+            view.outcome,
+            ToolOutcome::Denied {
+                by: phone,
+                by_me: false
+            }
+        );
+        assert_eq!(
+            view.approval,
+            Some(ToolApproval {
+                id: approval,
+                status: ApprovalStatus::Resolved {
+                    decision: Decision::Deny,
+                    by: phone,
+                    by_me: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_cancelled_approval_cancels_its_call() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (call, approval) = (CallId::new(), ApprovalId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::FileEdit, "a.rs"),
+                approval_requested(approval, Some(call)),
+                EventKind::ApprovalCancelled {
+                    id: approval,
+                    reason: "daemon restarted".into(),
+                },
+                EventKind::SessionStateChanged(LogState::Errored {
+                    message: "turn lost".into(),
+                }),
+            ],
+        );
+        f.open(sid);
+        let view = &tools(&f)[0];
+        assert_eq!(
+            view.outcome,
+            ToolOutcome::Cancelled {
+                reason: "daemon restarted".into()
+            }
+        );
+        assert_eq!(
+            view.approval.as_ref().unwrap().status,
+            ApprovalStatus::Cancelled {
+                reason: "daemon restarted".into()
+            }
+        );
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::Tool(Box::new(view.clone())),
+                Entry::AgentErrored {
+                    message: "turn lost".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_ending_without_a_result_leaves_no_result() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (a, b, c) = (CallId::new(), CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(a), ToolKind::Shell, "sleep 1"),
+                EventKind::TurnInterrupted,
+                EventKind::SessionStateChanged(LogState::Idle),
+                // A later turn starting also ends what the last one left.
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(b), ToolKind::Fetch, "https://example.com"),
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(c), ToolKind::Subagent, "explore"),
+            ],
+        );
+        f.open(sid);
+        let outcomes: Vec<ToolOutcome> = tools(&f).into_iter().map(|v| v.outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ToolOutcome::NoResult,
+                ToolOutcome::NoResult,
+                ToolOutcome::Running { since: minute(8) },
+            ]
+        );
+    }
+
+    #[test]
+    fn events_without_a_call_stay_separate_entries() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (approval, stray) = (ApprovalId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(None, ToolKind::Other, "{\"command\":\"ls\"}"),
+                approval_requested(approval, None),
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Deny,
+                    by: f.me,
+                },
+                tool_result(None, false, "[error] denied"),
+                // A result for a call that is not in the log.
+                tool_result(Some(stray), false, "orphan"),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        f.open(sid);
+        assert_eq!(
+            entries(&f),
+            vec![
+                Entry::ToolCall {
+                    name: "agent-tool".into(),
+                    summary: "{\"command\":\"ls\"}".into(),
+                    input: None,
+                },
+                Entry::Approval {
+                    id: approval,
+                    tool: "agent-tool".into(),
+                    summary: "the call's title".into(),
+                    input: None,
+                    status: ApprovalStatus::Resolved {
+                        decision: Decision::Deny,
+                        by: f.me,
+                        by_me: true,
+                    },
+                },
+                Entry::ToolResult {
+                    summary: "[error] denied".into(),
+                    output: None,
+                },
+                Entry::ToolResult {
+                    summary: "orphan".into(),
+                    output: None,
+                },
+            ]
+        );
     }
 }

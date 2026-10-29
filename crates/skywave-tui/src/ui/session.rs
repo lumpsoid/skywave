@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use skywave_core::{
     ApprovalPrompt, ApprovalStatus, BlobState, BlobView, DeviceId, Entry, Link, Outgoing,
-    SessionState, SessionView, TimelineItem,
+    SessionState, SessionView, TimelineItem, ToolOutcome, ToolView,
 };
 
 use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
@@ -184,6 +184,13 @@ fn item_lines(item: &TimelineItem, ui: &SessionUi, focused: bool) -> Vec<Line<'s
         Entry::AgentMessage { text } => {
             head.push(Span::raw("agent: ").green().bold());
             text_lines(head, text)
+        }
+        Entry::Tool(view) => {
+            head.push(expander(expanded));
+            head.push(Span::raw(format!("tool {}: ", view.name)).cyan().bold());
+            let mut lines = tool_lines(head, &view.title, entry, expanded);
+            lines.splice(1..1, tool_status_lines(view));
+            lines
         }
         Entry::ToolCall { name, summary, .. } => {
             head.push(expander(expanded));
@@ -364,6 +371,43 @@ fn read_head(path: &Path) -> std::io::Result<(String, u64)> {
     let mut head = Vec::new();
     file.take(SHOW_BYTES).read_to_end(&mut head)?;
     Ok((String::from_utf8_lossy(&head).into_owned(), size))
+}
+
+/// A grouped call's approval and result, one line each, under its title.
+fn tool_status_lines(view: &ToolView) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(approval) = &view.approval {
+        let (status, style) = approval_status(&approval.status);
+        lines.push(Line::from(vec![
+            Span::raw(format!("{INDENT}  ")),
+            Span::raw(format!("approval {} ", view.name))
+                .yellow()
+                .bold(),
+            Span::styled(format!("[{status}]"), style),
+        ]));
+    }
+    let outcome = match &view.outcome {
+        ToolOutcome::Done {
+            is_error, preview, ..
+        } => {
+            let label = if *is_error { "error: " } else { "result: " };
+            Some(vec![
+                Span::raw(label).cyan().bold(),
+                Span::raw(clean(preview.split('\n').next().unwrap_or_default())),
+            ])
+        }
+        ToolOutcome::NoResult => Some(vec![Span::raw("no result").dark_gray()]),
+        // The approval line says why it stopped.
+        ToolOutcome::Running { .. }
+        | ToolOutcome::Denied { .. }
+        | ToolOutcome::Cancelled { .. } => None,
+    };
+    if let Some(spans) = outcome {
+        let mut line = vec![Span::raw(format!("{INDENT}  "))];
+        line.extend(spans);
+        lines.push(Line::from(line));
+    }
+    lines
 }
 
 fn approval_status(status: &ApprovalStatus) -> (String, Style) {

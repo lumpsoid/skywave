@@ -59,8 +59,9 @@ pub use store::{
 pub use tls::Fingerprint;
 pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
 pub use view::{
-    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, CommandId,
-    Decision, DeviceId, Entry, ErrorInfo, FailReason, Link, LinkRejection, Outgoing, PairedInfo,
-    PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId, SessionListView,
-    SessionRow, SessionState, SessionView, SettingsView, TimelineItem, ViewState,
+    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat,
+    BodyView, CallId, CommandId, Decision, DeviceId, Entry, ErrorInfo, FailReason, Link,
+    LinkRejection, Outgoing, PairedInfo, PairingStatus, PairingView, PendingSession, Screen, Seq,
+    SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView, TimelineItem,
+    ToolApproval, ToolKind, ToolOutcome, ToolView, ViewState,
 };
