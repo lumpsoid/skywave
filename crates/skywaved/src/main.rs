@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use skywaved::Storage;
 use skywaved::config::{Config, ProcessEnv};
+use skywaved::devices::{self, Revoke};
+use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 
 #[derive(Parser)]
 #[command(name = "skywaved", version, about = "Skywave server daemon")]
@@ -57,19 +60,50 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     let storage = Storage::open(&config.data_dir)?;
     tracing::debug!(data_dir = %storage.dir.root().display(), "opened data dir");
 
-    let name = match cli.command {
-        Command::Serve => "serve",
-        Command::Pair => "pair",
+    match cli.command {
+        Command::Serve => {
+            let names = server_names(
+                config.listen,
+                local_hostname().as_deref(),
+                &config.server_names,
+            );
+            let identity = ServerIdentity::bootstrap(&storage.dir, &names)?;
+            tracing::info!(
+                server_id = %identity.server_id().0,
+                ca_fingerprint = %identity.ca_fingerprint(),
+                names = ?identity.server_names(),
+                "server identity ready"
+            );
+            not_implemented("serve");
+        }
+        Command::Pair => not_implemented("pair"),
         Command::Devices {
             command: DevicesCommand::List,
-        } => "devices list",
+        } => print!(
+            "{}",
+            devices::format_table(&devices::list(storage.db.conn())?)
+        ),
         Command::Devices {
-            command: DevicesCommand::Revoke { .. },
-        } => "devices revoke",
-    };
+            command: DevicesCommand::Revoke { id },
+        } => {
+            let id = devices::parse_id(&id)?;
+            match devices::revoke(storage.db.conn(), id, Utc::now())? {
+                Revoke::Revoked(d) => println!("revoked device {} ({})", d.id.0, d.name),
+                Revoke::AlreadyRevoked(d) => println!(
+                    "device {} ({}) was already revoked at {}",
+                    d.id.0,
+                    d.name,
+                    d.revoked_at.map(|t| t.to_rfc3339()).unwrap_or_default()
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn not_implemented(name: &str) {
     eprintln!(
         "skywaved {name}: not implemented (protocol v{})",
         skywave_proto::PROTOCOL_VERSION
     );
-    Ok(())
 }

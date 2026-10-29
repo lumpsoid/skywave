@@ -7,7 +7,9 @@ pub mod blobs;
 pub mod config;
 pub mod data_dir;
 pub mod db;
+pub mod devices;
 pub mod error;
+pub mod identity;
 pub mod logging;
 
 use std::path::PathBuf;

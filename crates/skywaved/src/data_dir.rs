@@ -4,8 +4,9 @@
 //! <data_dir>/
 //!   skywave.db   SQLite database (see `db`)
 //!   blobs/       blob files named by BlobId (see `blobs`)
-//!   ca/          CA key and certificate
-//!   server/      server key and certificate
+//!   ca/          CA key and certificate (see `identity`)
+//!   server/      server key and certificate (see `identity`)
+//!   server_id    the stable ServerId (see `identity`)
 //! ```
 //!
 //! Directories are created with mode 0700 on Unix: `ca/` and `server/` hold

@@ -29,6 +29,9 @@ pub struct Config {
     pub agent: AgentConfig,
     /// Log to this file instead of stderr.
     pub log_file: Option<PathBuf>,
+    /// Extra DNS names or IP addresses for the server certificate, on top of
+    /// the derived ones (see [`crate::identity::server_names`]).
+    pub server_names: Vec<String>,
 }
 
 /// How to start the agent process.
@@ -50,6 +53,8 @@ struct RawConfig {
     #[serde(default)]
     agent: RawAgent,
     log_file: Option<PathBuf>,
+    #[serde(default)]
+    server_names: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,6 +167,7 @@ impl Config {
                 args: raw.agent.args,
             },
             log_file: raw.log_file.map(abs),
+            server_names: raw.server_names,
         })
     }
 }
@@ -226,6 +232,7 @@ mod tests {
             data_dir = "state"
             roots = ["/srv/code", "projects"]
             log_file = "/var/log/skywaved.log"
+            server_names = ["skywave.example", "10.0.0.7"]
 
             [agent]
             command = "bin/claude"
@@ -244,6 +251,7 @@ mod tests {
             c.log_file.as_deref(),
             Some(Path::new("/var/log/skywaved.log"))
         );
+        assert_eq!(c.server_names, ["skywave.example", "10.0.0.7"]);
     }
 
     #[test]
@@ -256,6 +264,7 @@ mod tests {
         assert_eq!(c.agent.command, Path::new(DEFAULT_AGENT_COMMAND));
         assert!(c.agent.args.is_empty());
         assert_eq!(c.log_file, None);
+        assert!(c.server_names.is_empty());
     }
 
     #[test]

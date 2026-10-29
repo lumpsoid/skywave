@@ -31,6 +31,20 @@ pub enum Error {
     },
     #[error("logging: {0}")]
     Logging(String),
+    #[error("certificate: {0}")]
+    Certificate(#[from] rcgen::Error),
+    #[error("{}: {reason}", path.display())]
+    BadIdentity { path: PathBuf, reason: String },
+    #[error("invalid server name: {0}")]
+    InvalidServerName(String),
+    #[error("invalid certificate signing request: {0}")]
+    InvalidCsr(#[source] rcgen::Error),
+    #[error("invalid fingerprint {0:?}: expected 32 hex bytes")]
+    InvalidFingerprint(String),
+    #[error("invalid device id {0:?}: expected a UUID")]
+    InvalidDeviceId(String),
+    #[error("no device with id {}", .0.0)]
+    UnknownDevice(skywave_proto::DeviceId),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
