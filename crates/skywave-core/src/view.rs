@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 pub use skywave_proto::RejectReason as FailReason;
-pub use skywave_proto::{ApprovalId, BlobId, CommandId, Decision, DeviceId, Seq, SessionId};
+pub use skywave_proto::{
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Seq, SessionId, ToolKind,
+};
 
 use crate::store::{BlobPolicy, BlobRecord, BlobStatus, OutboxStatus};
 
@@ -234,15 +236,24 @@ pub enum Entry {
     AgentMessage {
         text: String,
     },
+    /// One tool call with its approval and result folded in, placed at the
+    /// call's seq (spec §7 "Tool timeline").
+    Tool(Box<ToolView>),
+    /// A tool call no [`CallId`] links to anything (v1 logs); its result and
+    /// approval, if any, are entries of their own.
     ToolCall {
         name: String,
         summary: String,
         input: Option<BlobView>,
     },
+    /// A tool result with no logged call to fold into (v1 logs, or a result
+    /// for a call that is not in the log).
     ToolResult {
         summary: String,
         output: Option<BlobView>,
     },
+    /// An approval with no logged call to fold into (v1 logs, or a request
+    /// gating no logged call).
     Approval {
         id: ApprovalId,
         tool: String,
@@ -256,6 +267,75 @@ pub enum Entry {
     AgentErrored {
         message: String,
     },
+}
+
+/// A tool call as one timeline item: what it does (decided by the server,
+/// D4), whether it needed an approval, and how it ended. Heads branch on
+/// [`kind`](Self::kind), never on [`name`](Self::name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolView {
+    pub call: CallId,
+    /// The agent's own tool name, for display only.
+    pub name: String,
+    pub kind: ToolKind,
+    /// One line, e.g. a path or command.
+    pub title: String,
+    /// Optional second line.
+    pub detail: Option<String>,
+    /// Content worth showing beneath the title, e.g. a diff.
+    pub body: Option<BodyView>,
+    /// The call's whole input.
+    pub input: Option<BlobView>,
+    /// The approval that gated the call, if it needed one.
+    pub approval: Option<ToolApproval>,
+    pub outcome: ToolOutcome,
+}
+
+/// A bounded preview of some content, with the whole of it as a blob.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyView {
+    pub format: BodyFormat,
+    /// Head of the content, with real newlines.
+    pub preview: String,
+    /// Line count of the whole content.
+    pub lines: u32,
+    /// The whole content, when `preview` does not hold all of it.
+    pub full: Option<BlobView>,
+}
+
+/// The approval a tool call waited on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApproval {
+    pub id: ApprovalId,
+    pub status: ApprovalStatus,
+}
+
+/// How a tool call stands (spec §7 "Tool timeline").
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolOutcome {
+    /// No result yet, possibly waiting on its approval; `since` is the
+    /// call's time.
+    Running { since: DateTime<Utc> },
+    /// The tool finished; `took` runs from the call to its result.
+    Done {
+        is_error: bool,
+        /// Short outcome, e.g. `exit 1`.
+        status: Option<String>,
+        /// Head of the output, with real newlines.
+        preview: String,
+        /// Line count of the whole output.
+        lines: u32,
+        /// The whole output, when `preview` does not hold all of it.
+        output: Option<BlobView>,
+        took: Duration,
+    },
+    /// Its approval was denied, so the tool did not run; `by_me` is false
+    /// when another device answered.
+    Denied { by: DeviceId, by_me: bool },
+    /// Its approval was cancelled before anyone answered.
+    Cancelled { reason: String },
+    /// The turn ended without a result.
+    NoResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +356,9 @@ pub enum ApprovalStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalPrompt {
     pub id: ApprovalId,
+    /// The tool call the approval gates, an [`Entry::Tool`] in the timeline;
+    /// `None` for an approval with no logged call.
+    pub call: Option<CallId>,
     pub tool: String,
     pub summary: String,
     pub input: Option<BlobView>,

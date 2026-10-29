@@ -72,20 +72,25 @@ impl SessionSummary {
     }
 }
 
-/// The blob an event references, if any.
-pub(crate) fn blob_ref(kind: &EventKind) -> Option<&BlobRef> {
-    match kind {
-        EventKind::ToolCall(ToolCall { input, .. })
-        | EventKind::ApprovalRequested { input, .. } => input.as_ref(),
-        EventKind::ToolResult(ToolResult { output, .. }) => output.as_ref(),
+/// The blobs an event references: a tool call's input and the whole of its
+/// display body, a result's output, an approval's input.
+pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
+    let (first, second) = match kind {
+        EventKind::ToolCall(ToolCall { input, display, .. }) => (
+            input.as_ref(),
+            display.body.as_ref().and_then(|body| body.full.as_ref()),
+        ),
+        EventKind::ApprovalRequested { input, .. } => (input.as_ref(), None),
+        EventKind::ToolResult(ToolResult { output, .. }) => (output.as_ref(), None),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
         | EventKind::ApprovalResolved { .. }
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
-        | EventKind::SessionStateChanged(_) => None,
-    }
+        | EventKind::SessionStateChanged(_) => (None, None),
+    };
+    first.into_iter().chain(second)
 }
 
 #[cfg(test)]
@@ -160,5 +165,32 @@ mod tests {
             summary.last_activity,
             event(sid, 6, EventKind::TurnInterrupted).at
         );
+    }
+
+    #[test]
+    fn a_tool_call_references_its_input_and_its_whole_body() {
+        let blob = |size| BlobRef {
+            id: skywave_proto::BlobId::new(),
+            size,
+        };
+        let (input, full) = (blob(10), blob(20));
+        let call = EventKind::ToolCall(ToolCall {
+            call: Some(skywave_proto::CallId::new()),
+            name: "Edit".into(),
+            display: skywave_proto::ToolDisplay {
+                kind: skywave_proto::ToolKind::FileEdit,
+                title: "a.rs".into(),
+                detail: None,
+                body: Some(skywave_proto::Body {
+                    format: skywave_proto::BodyFormat::Diff,
+                    preview: "-a\n+b".into(),
+                    lines: 2,
+                    full: Some(full.clone()),
+                }),
+            },
+            input: Some(input.clone()),
+        });
+        assert_eq!(blob_refs(&call).collect::<Vec<_>>(), vec![&input, &full]);
+        assert_eq!(blob_refs(&EventKind::TurnInterrupted).count(), 0);
     }
 }

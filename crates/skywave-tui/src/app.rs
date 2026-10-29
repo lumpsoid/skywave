@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
     Action, BlobPolicy, BlobState, BlobView, CoreError, Decision, Entry, Link, LinkRejection,
     PairingView, Route, Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem,
-    ViewState,
+    ToolOutcome, ToolView, ViewState,
 };
 
 use crate::composer::Composer;
@@ -269,8 +269,21 @@ pub fn item_blob(entry: &Entry) -> Option<&BlobView> {
     match entry {
         Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => input.as_ref(),
         Entry::ToolResult { output, .. } => output.as_ref(),
+        Entry::Tool(view) => tool_blob(view),
         _ => None,
     }
+}
+
+/// A grouped call's blob: its output once done, else its body, else its
+/// input.
+fn tool_blob(view: &ToolView) -> Option<&BlobView> {
+    let output = match &view.outcome {
+        ToolOutcome::Done { output, .. } => output.as_ref(),
+        _ => None,
+    };
+    output
+        .or_else(|| view.body.as_ref().and_then(|body| body.full.as_ref()))
+        .or(view.input.as_ref())
 }
 
 /// Tool calls, tool results and approvals can be selected and expanded.
@@ -278,7 +291,11 @@ pub fn selectable(item: &TimelineItem) -> Option<Seq> {
     match item {
         TimelineItem::Logged {
             seq,
-            entry: Entry::ToolCall { .. } | Entry::ToolResult { .. } | Entry::Approval { .. },
+            entry:
+                Entry::Tool(_)
+                | Entry::ToolCall { .. }
+                | Entry::ToolResult { .. }
+                | Entry::Approval { .. },
             ..
         } => Some(*seq),
         _ => None,

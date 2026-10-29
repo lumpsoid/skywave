@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use skywave_proto::{BlobId, Command, CommandId, CommandResult, Event, EventBatch, Seq, SessionId};
 use uuid::Uuid;
 
-use crate::projection::{SessionSummary, blob_ref};
+use crate::projection::{SessionSummary, blob_refs};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -294,7 +294,7 @@ impl Store {
                     touched.insert(event.session_id, summary);
                 }
             }
-            if let Some(blob) = blob_ref(&event.kind) {
+            for blob in blob_refs(&event.kind) {
                 let inserted = tx.execute(
                     "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
                      ON CONFLICT (id) DO NOTHING",
