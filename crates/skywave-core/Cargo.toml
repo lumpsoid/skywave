@@ -30,5 +30,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 skywaved = { path = "../skywaved" }
+skywave-testkit = { path = "../skywave-testkit" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }

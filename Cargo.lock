@@ -1400,6 +1400,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "skywave-proto",
+ "skywave-testkit",
  "skywaved",
  "tempfile",
  "thiserror",
@@ -1424,6 +1425,13 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "skywave-testkit"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

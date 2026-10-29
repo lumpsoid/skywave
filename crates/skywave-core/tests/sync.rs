@@ -1,361 +1,36 @@
 //! The sync engine (T14) against a real `skywaved` — HTTPS API and agent
 //! supervisor with the fake agent — in-process on 127.0.0.1 over real TLS.
-//! The client reaches the server through a small TCP proxy the tests can
-//! take down and whose connections they can cut.
+//! The client reaches the server through the link harness proxy
+//! (`skywave-testkit`) on a clean profile, which the tests take down and
+//! whose connections they cut; `tests/link.rs` runs it on bad links.
 //!
 //! Waits are bounded and driven by the client's `ViewState` snapshots or
 //! the server log's notifier; nothing relies on a fixed sleep, except the
 //! one quiet period that checks a rejected device stays silent.
 
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+mod support;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, Backoff, BlobDownload, BoxFuture, Connector, Core, EngineConfig, HttpsTransport,
-    Jitter, Link, LinkRejection, OutboxStatus, Screen, Seam, Store, Transport, TransportConfig,
-    TransportError, ViewState,
+    Action, BlobDownload, BoxFuture, Connector, EngineConfig, HttpsTransport, Link, LinkRejection,
+    OutboxStatus, Screen, Transport, TransportError,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
-    EventsQuery, HelloResponse, Seq, SessionId, SessionState,
+    EventsQuery, HelloResponse, Seq, SessionState,
 };
+use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
-use skywaved::identity::ServerIdentity;
-use skywaved::pairing;
-use skywaved::server::Server;
-use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle, devices};
-use tempfile::TempDir;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch};
-use tokio::task::{AbortHandle, JoinHandle};
+use skywaved::devices;
+use support::{Client, Daemon, assert_same_log, config, count, is_reconnecting, user_messages};
 
-/// Upper bound for any wait; a passing test never gets near it.
-const SOON: Duration = Duration::from_secs(20);
-
-// ---- server -----------------------------------------------------------------
-
-/// `skywaved` in-process: API server plus supervisor with the fake agent.
-struct Daemon {
-    tmp: TempDir,
-    storage: Storage,
-    identity: Arc<ServerIdentity>,
-    log: EventLog,
-    addr: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: JoinHandle<skywaved::Result<()>>,
-    _supervisor: SupervisorHandle,
-}
-
-impl Daemon {
-    async fn start(agent: FakeAgent) -> Daemon {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
-        let data = tmp.path().join("server");
-        let storage = Storage::open(&data).unwrap();
-        let identity = Arc::new(
-            ServerIdentity::bootstrap(&storage.dir, &["localhost".into(), "127.0.0.1".into()])
-                .unwrap(),
-        );
-        let log = EventLog::open(&storage.db, vec![tmp.path().join("root")]).unwrap();
-        let server = Server::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            &storage.dir,
-            identity.clone(),
-            log.clone(),
-        )
-        .await
-        .unwrap();
-        let addr = server.local_addr();
-        let (stop, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(server.serve(async {
-            let _ = stopped.await;
-        }));
-        let supervisor = Supervisor::start(agent, &data, log.clone(), SupervisorConfig::default())
-            .await
-            .unwrap();
-        Daemon {
-            tmp,
-            storage,
-            identity,
-            log,
-            addr,
-            stop: Some(stop),
-            task,
-            _supervisor: supervisor,
-        }
-    }
-
-    fn workdir(&self) -> String {
-        self.tmp.path().join("root/project").display().to_string()
-    }
-
-    /// The whole log, seq 1 first.
-    fn events(&self) -> Vec<Event> {
-        self.log
-            .read(&self.storage.db, Seq::ZERO, 5000)
-            .unwrap()
-            .events
-    }
-
-    /// Pairs `client` through its engine: the head's `Pair` action, with
-    /// what `skywaved pair` would print.
-    async fn pair(&self, client: &Client, proxy: &Proxy) {
-        let code = pairing::issue_code(self.storage.db.conn(), Utc::now(), pairing::DEFAULT_TTL)
-            .unwrap()
-            .code;
-        client
-            .core
-            .dispatch(Action::Pair {
-                address: proxy.addr.clone(),
-                code: code.to_string(),
-                fingerprint: self.identity.ca_fingerprint().to_string(),
-            })
-            .unwrap();
-        client
-            .wait("paired and online", |_, view| {
-                matches!(view.screen, Screen::SessionList(_))
-                    && matches!(view.link, Link::Online { .. })
-            })
-            .await;
-    }
-
-    /// Waits until the log satisfies `done`.
-    async fn wait_log(&self, what: &str, done: impl Fn(&[Event]) -> bool) {
-        let mut head = self.log.subscribe();
-        tokio::time::timeout(SOON, async {
-            loop {
-                head.borrow_and_update();
-                if done(&self.events()) {
-                    return;
-                }
-                head.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for the log: {what}"));
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        self.task.abort();
-    }
-}
-
-// ---- proxy ------------------------------------------------------------------
-
-/// A TCP proxy in front of the server. While down it accepts and drops
-/// every connection; `cut` kills the live ones.
-struct Proxy {
-    /// `127.0.0.1:<port>`, as the client pairs and connects.
-    addr: String,
-    up: Arc<AtomicBool>,
-    live: Arc<Mutex<Vec<AbortHandle>>>,
-    task: JoinHandle<()>,
-}
-
-impl Proxy {
-    async fn start(upstream: SocketAddr) -> Proxy {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let up = Arc::new(AtomicBool::new(true));
-        let live = Arc::new(Mutex::new(Vec::<AbortHandle>::new()));
-        let (accept_up, accept_live) = (up.clone(), live.clone());
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut inbound, _)) = listener.accept().await else {
-                    return;
-                };
-                if !accept_up.load(Ordering::SeqCst) {
-                    continue;
-                }
-                let pipe = tokio::spawn(async move {
-                    if let Ok(mut outbound) = TcpStream::connect(upstream).await {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                    }
-                });
-                let mut live = accept_live.lock().unwrap();
-                live.retain(|conn| !conn.is_finished());
-                live.push(pipe.abort_handle());
-            }
-        });
-        Proxy {
-            addr,
-            up,
-            live,
-            task,
-        }
-    }
-
-    /// Kills every live connection.
-    fn cut(&self) {
-        for conn in self.live.lock().unwrap().drain(..) {
-            conn.abort();
-        }
-    }
-
-    fn down(&self) {
-        self.up.store(false, Ordering::SeqCst);
-        self.cut();
-    }
-
-    fn up(&self) {
-        self.up.store(true, Ordering::SeqCst);
-    }
-}
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        self.task.abort();
-        self.cut();
-    }
-}
-
-// ---- client -----------------------------------------------------------------
-
-/// A core with its engine, its snapshots on a watch channel.
-struct Client {
-    dir: TempDir,
-    core: Core,
-    seam: Seam,
-    views: watch::Receiver<ViewState>,
-}
-
-impl Client {
-    fn open(config: EngineConfig) -> Client {
-        let dir = tempfile::tempdir().unwrap();
-        let core = Core::open_with(dir.path(), config).unwrap();
-        let (tx, views) = watch::channel(core.view());
-        core.subscribe(move |view| {
-            tx.send_replace(view);
-        });
-        Client {
-            dir,
-            seam: core.seam(),
-            core,
-            views,
-        }
-    }
-
-    /// Waits until `done` holds for the latest snapshot (and whatever else
-    /// it checks), re-checking on every new snapshot.
-    async fn wait(&self, what: &str, done: impl Fn(&Client, &ViewState) -> bool) -> ViewState {
-        let mut views = self.views.clone();
-        tokio::time::timeout(SOON, async {
-            loop {
-                let view = views.borrow_and_update().clone();
-                if done(self, &view) {
-                    return view;
-                }
-                views.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "timed out waiting for {what}; last view: {:?}",
-                self.core.view()
-            )
-        })
-    }
-
-    fn cursor(&self) -> Seq {
-        self.seam.cursor().unwrap()
-    }
-
-    /// Every event in the local replica, seq order.
-    fn local_events(&self) -> Vec<(Seq, Event)> {
-        local_events(self.dir.path())
-    }
-
-    /// Creates a session and waits until the replica has it and the
-    /// command has its result.
-    async fn create_session(&self, daemon: &Daemon) -> SessionId {
-        self.core
-            .dispatch(Action::CreateSession {
-                workdir: daemon.workdir(),
-            })
-            .unwrap();
-        let view = self
-            .wait("the session in the list", |_, view| match &view.screen {
-                Screen::SessionList(list) => list.sessions.len() == 1 && view.queued == 0,
-                _ => false,
-            })
-            .await;
-        let Screen::SessionList(list) = view.screen else {
-            unreachable!()
-        };
-        list.sessions[0].id
-    }
-}
-
-fn local_events(dir: &Path) -> Vec<(Seq, Event)> {
-    let store = Store::open(dir).unwrap();
-    let mut events: Vec<(Seq, Event)> = store
-        .sessions()
-        .unwrap()
-        .into_iter()
-        .flat_map(|s| store.session_events(s.id).unwrap())
-        .collect();
-    events.sort_by_key(|(seq, _)| *seq);
-    events
-}
-
-/// Fast retries, short long-polls, small batches.
-fn config() -> EngineConfig {
-    EngineConfig {
-        transport: TransportConfig {
-            connect_timeout: SOON,
-            request_timeout: SOON,
-            ..TransportConfig::default()
-        },
-        wait_secs: 1,
-        limit: Some(7),
-        backoff: Backoff {
-            base: Duration::from_millis(20),
-            cap: Duration::from_millis(200),
-            jitter: Jitter::random(),
-        },
-        device_name: Some("sync test".into()),
-        ..EngineConfig::default()
-    }
-}
-
-fn is_reconnecting(link: &Link) -> bool {
-    matches!(link, Link::Reconnecting { .. })
-}
-
-fn user_messages(events: &[Event]) -> Vec<(CommandId, String)> {
-    events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::UserMessage {
-                command_id, text, ..
-            } => Some((*command_id, text.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-fn count(events: &[Event], what: impl Fn(&EventKind) -> bool) -> usize {
-    events.iter().filter(|e| what(&e.kind)).count()
-}
-
-/// The server log and the replica hold the same events at the same seqs.
-fn assert_same_log(server: &[Event], local: &[(Seq, Event)]) {
-    let seqs: Vec<u64> = local.iter().map(|(seq, _)| seq.0).collect();
-    let expected: Vec<u64> = (1..=server.len() as u64).collect();
-    assert_eq!(seqs, expected, "no gaps, no duplicates");
-    for ((seq, mine), theirs) in local.iter().zip(server) {
-        assert_eq!(mine, theirs, "event {seq:?}");
-    }
+/// A clean link the tests can take down and whose connections they can cut.
+async fn proxy(daemon: &Daemon) -> LinkProxy {
+    LinkProxy::start(daemon.addr, LinkProfile::clean(), seed()).await
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -366,9 +41,9 @@ fn assert_same_log(server: &[Event], local: &[(Seq, Event)]) {
 async fn offline_queue_drains_exactly_once() {
     let agent = FakeAgent::new(FakeScript::new());
     let daemon = Daemon::start(agent.clone()).await;
-    let proxy = Proxy::start(daemon.addr).await;
+    let proxy = proxy(&daemon).await;
     let client = Client::open(config());
-    daemon.pair(&client, &proxy).await;
+    daemon.pair(&client, &proxy.address()).await;
     let session = client.create_session(&daemon).await;
 
     proxy.down();
@@ -437,7 +112,7 @@ async fn offline_queue_drains_exactly_once() {
 
     let events = daemon.events();
     assert!(client.seam.pending_outbox().unwrap().is_empty());
-    let outbox = Store::open(client.dir.path()).unwrap().outbox().unwrap();
+    let outbox = client.outbox();
     let messages: Vec<(CommandId, String)> = outbox
         .iter()
         .filter_map(|e| match &e.command.kind {
@@ -483,9 +158,9 @@ async fn dropped_link_catches_up_without_gaps() {
     turn.extend((0..150).map(|i| Step::text(format!("late {i}"))));
     let agent = FakeAgent::new(FakeScript::new().turn(turn));
     let daemon = Daemon::start(agent).await;
-    let proxy = Proxy::start(daemon.addr).await;
+    let proxy = proxy(&daemon).await;
     let client = Client::open(config());
-    daemon.pair(&client, &proxy).await;
+    daemon.pair(&client, &proxy.address()).await;
     let session = client.create_session(&daemon).await;
 
     client
@@ -591,7 +266,7 @@ impl Transport for Counting {
 #[tokio::test(flavor = "multi_thread")]
 async fn revoked_device_is_rejected_until_it_re_pairs() {
     let daemon = Daemon::start(FakeAgent::new(FakeScript::new())).await;
-    let proxy = Proxy::start(daemon.addr).await;
+    let proxy = proxy(&daemon).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let client = Client::open(EngineConfig {
@@ -604,7 +279,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         }),
         ..config()
     });
-    daemon.pair(&client, &proxy).await;
+    daemon.pair(&client, &proxy.address()).await;
     let device = client.seam.identity().unwrap().device_id();
 
     devices::revoke(daemon.storage.db.conn(), device, Utc::now()).unwrap();
@@ -652,7 +327,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         .core
         .dispatch(Action::Navigate(skywave_core::Route::Pairing))
         .unwrap();
-    daemon.pair(&client, &proxy).await;
+    daemon.pair(&client, &proxy.address()).await;
     assert_ne!(client.seam.identity().unwrap().device_id(), device);
     client
         .wait("the queue to drain", |c, view| {
@@ -673,9 +348,9 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn suspend_pauses_and_resume_syncs() {
     let daemon = Daemon::start(FakeAgent::new(FakeScript::new())).await;
-    let proxy = Proxy::start(daemon.addr).await;
+    let proxy = proxy(&daemon).await;
     let client = Client::open(config());
-    daemon.pair(&client, &proxy).await;
+    daemon.pair(&client, &proxy.address()).await;
 
     client.core.suspend();
     client

@@ -31,6 +31,7 @@ One server = one account. Many devices = many views of the same data.
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
 | `skywave-core-ffi` | UniFFI wrapper over `skywave-core`; `skywave-core` has no FFI dependency |
 | `skywave-tui`      | First head |
+| `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `android/`         | Gradle project, Kotlin head, builds `skywave-core-ffi` via `cargo-ndk` |
 
 Crates live under `crates/`. Every crate carries the `skywave-` prefix (the

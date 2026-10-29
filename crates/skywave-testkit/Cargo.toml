@@ -1,0 +1,17 @@
+[package]
+name = "skywave-testkit"
+description = "Test-only helpers: the link harness proxy (spec §9, D11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Dev-only: other crates may list this under [dev-dependencies], never under
+# [dependencies].
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
