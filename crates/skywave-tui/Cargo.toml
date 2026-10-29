@@ -9,3 +9,9 @@ publish.workspace = true
 
 [dependencies]
 skywave-core.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
