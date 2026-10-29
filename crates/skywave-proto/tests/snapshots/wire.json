@@ -1,149 +1,193 @@
 {
   "protocol_version": 1,
-  "events": [
-    {
-      "seq": 1,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "session_created"
-      }
-    },
-    {
-      "seq": 2,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "user_message",
-        "command_id": "01920000-0000-7000-8000-000000000002",
-        "device_id": "01920000-0000-7000-8000-000000000003",
-        "text": "run the tests"
-      }
-    },
-    {
-      "seq": 3,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "agent_message",
-        "text": "Running cargo test."
-      }
-    },
-    {
-      "seq": 4,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "tool_call",
-        "name": "bash",
-        "summary": "cargo test",
-        "input": null
-      }
-    },
-    {
-      "seq": 5,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "tool_call",
-        "name": "write",
-        "summary": "src/lib.rs",
-        "input": {
-          "id": "01920000-0000-7000-8000-000000000005",
-          "size": 48213
+  "hello": {
+    "protocol_version": 1,
+    "server_id": "01920000-0000-7000-8000-000000000006",
+    "device_id": "01920000-0000-7000-8000-000000000003",
+    "head": 16
+  },
+  "pair_request": {
+    "code": "K7Q4-9M2X",
+    "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIIB\n-----END CERTIFICATE REQUEST-----\n",
+    "device_name": "laptop"
+  },
+  "pair_response": {
+    "device_id": "01920000-0000-7000-8000-000000000003",
+    "device_cert_pem": "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n",
+    "ca_cert_pem": "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----\n"
+  },
+  "events_query": {
+    "after": 16,
+    "wait": 30,
+    "limit": 500
+  },
+  "event_batch": {
+    "from": 1,
+    "events": [
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "session_created",
+          "workdir": "/srv/code/skywave"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "user_message",
+          "command_id": "01920000-0000-7000-8000-000000000002",
+          "device_id": "01920000-0000-7000-8000-000000000003",
+          "text": "run the tests"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "agent_message",
+          "text": "Running cargo test."
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "tool_call",
+          "name": "bash",
+          "summary": "cargo test",
+          "input": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "tool_call",
+          "name": "write",
+          "summary": "src/lib.rs",
+          "input": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "tool_result",
+          "summary": "exit 0",
+          "output": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "tool_result",
+          "summary": "no output",
+          "output": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_requested",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "tool": "bash",
+          "summary": "rm -rf target",
+          "input": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_requested",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "tool": "write",
+          "summary": "src/main.rs",
+          "input": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_resolved",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "decision": "approve",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_resolved",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "decision": "deny",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_cancelled",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "reason": "daemon restarted"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "turn_interrupted"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "session_state_changed",
+          "state": "idle"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "session_state_changed",
+          "state": "agent_working"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "session_state_changed",
+          "state": "errored",
+          "message": "agent exited"
         }
       }
-    },
-    {
-      "seq": 6,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "tool_result",
-        "summary": "exit 0",
-        "output": {
-          "id": "01920000-0000-7000-8000-000000000005",
-          "size": 48213
-        }
-      }
-    },
-    {
-      "seq": 7,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "tool_result",
-        "summary": "no output",
-        "output": null
-      }
-    },
-    {
-      "seq": 8,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "approval_requested",
-        "id": "01920000-0000-7000-8000-000000000004",
-        "tool": "bash",
-        "summary": "rm -rf target"
-      }
-    },
-    {
-      "seq": 9,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "approval_resolved",
-        "id": "01920000-0000-7000-8000-000000000004",
-        "decision": "approve",
-        "by": "01920000-0000-7000-8000-000000000003"
-      }
-    },
-    {
-      "seq": 10,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "approval_resolved",
-        "id": "01920000-0000-7000-8000-000000000004",
-        "decision": "deny",
-        "by": "01920000-0000-7000-8000-000000000003"
-      }
-    },
-    {
-      "seq": 11,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "session_state_changed",
-        "state": "idle"
-      }
-    },
-    {
-      "seq": 12,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "session_state_changed",
-        "state": "agent_working"
-      }
-    },
-    {
-      "seq": 13,
-      "session_id": "01920000-0000-7000-8000-000000000001",
-      "at": "2026-10-29T12:00:00Z",
-      "kind": {
-        "type": "session_state_changed",
-        "state": "errored",
-        "message": "agent exited"
-      }
-    }
-  ],
+    ]
+  },
   "commands": [
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
-        "type": "create_session"
+        "type": "create_session",
+        "workdir": "/srv/code/skywave"
       }
     },
     {
@@ -169,6 +213,43 @@
         "id": "01920000-0000-7000-8000-000000000004",
         "decision": "deny"
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "interrupt",
+        "session_id": "01920000-0000-7000-8000-000000000001"
+      }
+    }
+  ],
+  "command_results": [
+    {
+      "result": "accepted",
+      "seq": 42
+    },
+    {
+      "result": "rejected",
+      "reason": "workdir_not_allowed"
+    },
+    {
+      "result": "rejected",
+      "reason": "workdir_not_found"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_session"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_approval"
+    },
+    {
+      "result": "rejected",
+      "reason": "approval_already_resolved"
+    },
+    {
+      "result": "rejected",
+      "reason": "no_active_turn"
     }
   ]
 }
