@@ -55,6 +55,8 @@ pub enum Error {
     UnknownDevice(skywave_proto::DeviceId),
     #[error("system random number generator: {0}")]
     Random(getrandom::Error),
+    #[error("TLS setup: {0}")]
+    Tls(String),
     #[error("QR code: {0}")]
     Qr(String),
     #[error("no session with id {}", .0.0)]

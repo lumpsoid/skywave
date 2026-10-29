@@ -4,6 +4,7 @@
 //! integration tests share one implementation.
 
 pub mod agent;
+pub mod api;
 pub mod blobs;
 pub mod commands;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod event_log;
 pub mod identity;
 pub mod logging;
 pub mod pairing;
+pub mod server;
 
 use std::io::Read;
 use std::path::PathBuf;

@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use skywaved::Storage;
 use skywaved::config::{Config, ProcessEnv};
 use skywaved::devices::{self, Revoke};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::pairing;
+use skywaved::server::Server;
+use skywaved::{EventLog, Storage};
 
 #[derive(Parser)]
 #[command(name = "skywaved", version, about = "Skywave server daemon")]
@@ -81,7 +83,14 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                 names = ?identity.server_names(),
                 "server identity ready"
             );
-            not_implemented("serve");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|source| skywaved::Error::Io {
+                    context: "starting the async runtime".into(),
+                    source,
+                })?;
+            runtime.block_on(serve(&config, &storage, identity))?;
         }
         Command::Pair { ttl } => {
             let identity = bootstrap()?;
@@ -126,9 +135,51 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     Ok(())
 }
 
-fn not_implemented(name: &str) {
-    eprintln!(
-        "skywaved {name}: not implemented (protocol v{})",
-        skywave_proto::PROTOCOL_VERSION
+/// Runs the daemon until Ctrl-C or SIGTERM.
+async fn serve(
+    config: &Config,
+    storage: &Storage,
+    identity: ServerIdentity,
+) -> skywaved::Result<()> {
+    // The one event log of the process: every writer shares it so appends
+    // wake the API's long-polls.
+    let log = EventLog::open(&storage.db, config.roots.clone())?;
+    let server = Server::bind(config.listen, &storage.dir, Arc::new(identity), log).await?;
+    tracing::info!(
+        addr = %server.local_addr(),
+        protocol_version = skywave_proto::PROTOCOL_VERSION,
+        "listening"
     );
+    server.serve(shutdown_signal()).await?;
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// Completes on Ctrl-C or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "cannot listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received Ctrl-C"),
+        () = term => tracing::info!("received SIGTERM"),
+    }
 }

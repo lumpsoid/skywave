@@ -42,6 +42,14 @@ pub struct BlobFile {
     file: File,
 }
 
+impl BlobFile {
+    /// The underlying file, positioned where reads and seeks left it; for
+    /// serving it asynchronously.
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
 impl Read for BlobFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.file.read(buf)
