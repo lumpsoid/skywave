@@ -55,10 +55,11 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 
 ## Sync model
 
-- **Server log is the source of truth.** Each session is an append-only event
-  log with a monotonic `seq`.
-- **Pull:** `GET /sessions/{id}/events?after={seq}` (long-poll / SSE). After a
-  drop the client resumes from its last `seq` — no gaps, no duplicates.
+- **Server log is the source of truth.** One append-only event log per server
+  with a single monotonic `seq`; every event carries its `session_id` (D12).
+- **Pull:** `GET /v1/events?after={seq}&wait={secs}` (long-poll). After a
+  drop the client resumes from its last `seq` — no gaps, no duplicates. One
+  cursor per device covers all sessions, including ones created elsewhere.
 - **Push:** commands carry a client-generated id (UUIDv7); the server dedups,
   so resend after reconnect is always safe.
 - **Ordering:** concurrent sends from several devices are ordered by server

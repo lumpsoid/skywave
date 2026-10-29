@@ -64,3 +64,24 @@ Pairing and device management are `skywaved` subcommands, not head features:
 ## D11. Risk focus is the link
 The agent side on the server is not a major risk. Engineering effort goes
 into the client–server link: jitter, low bandwidth, drops.
+
+## D12. One global event log per server
+A single monotonic `seq` across all sessions; each event carries its
+`session_id`. A device keeps one cursor and one long-poll.
+**Why:** one account per server (D5), so a global log costs nothing, and
+sessions created on another device arrive through the same stream.
+Seqs are contiguous (single writer), so an event batch carries its first seq
+once (`from`) and events carry no seq on the wire.
+**Status:** provisional — chosen until real usage shows we need something else.
+
+## D13. MVP = `skywaved` + `skywave-core` + `skywave-tui`
+The Android head is the first post-MVP milestone. The core is designed for it
+from day one (D2), but no Kotlin ships in the MVP.
+
+## D14. Sessions run in a server directory under configured roots
+`CreateSession` names a working directory on the server. `skywaved` rejects
+paths outside the `roots` list in its config.
+
+## D15. Long-poll over HTTPS for the MVP
+`GET /v1/events?after=&wait=` returns a batch or times out empty. Survives
+proxies and the worst links; SSE/QUIC can replace it behind `Transport`.
