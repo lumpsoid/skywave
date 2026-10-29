@@ -30,8 +30,10 @@
 //!   [`AgentSession::shutdown`] or on its own.
 //!
 //! The scripted [`fake::FakeAgent`] implements the trait for deterministic
-//! tests.
+//! tests; [`claude_code`] holds the real adapter, the only module that names
+//! the agent it drives (D3).
 
+pub mod claude_code;
 pub mod fake;
 mod mapper;
 

@@ -315,6 +315,33 @@ same process, with the same session id.
 - **No CLI timeout while idle [C].** In the interrupt run the process sat idle
   for about 240 s between turns with no output, and then served the next turn.
 
+## 6a. How T09 implements it
+
+`skywaved::agent::claude_code` (`protocol.rs` is the pure translator,
+replay-tested on the fixtures in `tests/claude_code.rs`). Choices beyond the
+notes above:
+
+- **Mid-turn messages are queued by the adapter**, not sent: the next user
+  message is written only after the turn's `result`. So each written message
+  is exactly one turn, and the [U] CLI-side queueing (§7) is never relied on.
+- **`start` waits for the initialize reply.** A CLI that exits or reports an
+  error `result` before it is a start error; with `--resume` and
+  `No conversation found` in the error text, a resume error (§5). If a CLI
+  ever reports the unknown id only after the handshake, it surfaces as
+  `Exited { error }` instead, which still marks the session errored.
+- **An error `tool_result` for a call whose approval is pending** (stdin
+  closed, or a future CLI-side timeout, §3.4) reports `ApprovalCancelled`
+  with the result's first line as the reason.
+- **Approvals still pending at `result`** are cancelled (`interrupted` or
+  `turn ended`) before `TurnEnded`.
+- **Turn outcome:** `success` and not `is_error` → completed; otherwise
+  interrupted if an interrupt was sent this turn or `terminal_reason` starts
+  with `aborted`; otherwise failed with `errors` (or `result`) as message.
+- **Other CLI control requests** (hooks, MCP) get an `error`
+  control_response so the CLI does not wait on them.
+- The deny message is `The user denied this action.`; the version check
+  warns when `claude_code_version` is not `2.1.310`.
+
 ## 7. Not covered (out of MVP scope or not needed by T09)
 
 - Images and attachments in `user.content`

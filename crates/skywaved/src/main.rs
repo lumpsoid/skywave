@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::config::{Config, ProcessEnv};
 use skywaved::devices::{self, Revoke};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::pairing;
 use skywaved::server::Server;
-use skywaved::{EventLog, Storage};
+use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig};
 
 #[derive(Parser)]
 #[command(name = "skywaved", version, about = "Skywave server daemon")]
@@ -144,13 +145,23 @@ async fn serve(
     // The one event log of the process: every writer shares it so appends
     // wake the API's long-polls.
     let log = EventLog::open(&storage.db, config.roots.clone())?;
+    let adapter = ClaudeCodeAdapter::new(config.agent.clone());
+    let supervisor = Supervisor::start(
+        adapter,
+        config.data_dir.clone(),
+        log.clone(),
+        SupervisorConfig::default(),
+    )
+    .await?;
     let server = Server::bind(config.listen, &storage.dir, Arc::new(identity), log).await?;
     tracing::info!(
         addr = %server.local_addr(),
         protocol_version = skywave_proto::PROTOCOL_VERSION,
         "listening"
     );
-    server.serve(shutdown_signal()).await?;
+    let served = server.serve(shutdown_signal()).await;
+    supervisor.shutdown().await?;
+    served?;
     tracing::info!("stopped");
     Ok(())
 }
