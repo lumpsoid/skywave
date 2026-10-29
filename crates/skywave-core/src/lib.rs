@@ -16,12 +16,15 @@
 //! - [`identity`]: the device's pairing credentials behind [`Identity`].
 //! - [`transport`]: the [`Transport`] trait to the server and its typed
 //!   errors; [`HttpsTransport`] is the mTLS implementation.
+//! - blob downloads ([`blob_dir`]) follow the [`BlobPolicy`] apart from
+//!   event sync.
 //! - [`pairing`]: the pairing client, plus code, fingerprint and pairing
 //!   URI parsing for heads.
 
 pub mod action;
 mod address;
 mod backoff;
+mod blobs;
 mod client;
 mod engine;
 mod https;
@@ -38,6 +41,7 @@ pub mod view;
 pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
 pub use backoff::{Backoff, Jitter};
+pub use blobs::blob_dir;
 pub use client::{Core, CoreError, SubscriptionId};
 pub use engine::{Connector, DEFAULT_WAIT_SECS, EngineConfig, default_device_name};
 pub use https::{HttpsTransport, TransportConfig};

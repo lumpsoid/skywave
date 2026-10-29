@@ -80,6 +80,11 @@ impl Seam {
         Ok(lock(&self.core.shared.state).store.blobs()?)
     }
 
+    /// One blob, `None` if no event references it.
+    pub fn blob(&self, id: BlobId) -> Result<Option<BlobRecord>, CoreError> {
+        Ok(lock(&self.core.shared.state).store.blob(id)?)
+    }
+
     /// Stores a pulled batch (one transaction, cursor included) and shows
     /// it. A batch that would leave a gap is refused with
     /// [`StoreError::Gap`](crate::StoreError::Gap) and changes nothing.

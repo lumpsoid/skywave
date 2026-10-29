@@ -175,6 +175,9 @@ pub struct Applied {
     pub new_events: usize,
     /// Sessions whose summaries changed.
     pub sessions: Vec<SessionId>,
+    /// Blobs first referenced by this batch, now registered as
+    /// [`BlobStatus::NotDownloaded`], in log order.
+    pub blobs: Vec<BlobId>,
 }
 
 /// Everything the replica holds except the events themselves, as read on
@@ -268,6 +271,7 @@ impl Store {
         let mut touched: BTreeMap<SessionId, SessionSummary> = BTreeMap::new();
         let mut new_cursor = cursor;
         let mut new_events = 0;
+        let mut blobs = Vec::new();
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
             tx.execute(
                 "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
@@ -291,11 +295,14 @@ impl Store {
                 }
             }
             if let Some(blob) = blob_ref(&event.kind) {
-                tx.execute(
+                let inserted = tx.execute(
                     "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
                      ON CONFLICT (id) DO NOTHING",
                     params![blob.id.0.to_string(), u64_sql(blob.size)?],
                 )?;
+                if inserted > 0 {
+                    blobs.push(blob.id);
+                }
             }
             new_cursor = seq;
             new_events += 1;
@@ -314,6 +321,7 @@ impl Store {
             cursor: new_cursor,
             new_events,
             sessions: touched.into_keys().collect(),
+            blobs,
         })
     }
 

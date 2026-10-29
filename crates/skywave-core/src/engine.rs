@@ -10,8 +10,9 @@
 //! - `Connect` (re)starts the link with the stored identity and address,
 //!   also after `Rejected`.
 //! - `OutboxChanged` wakes the outbox sender.
-//! - `DownloadBlob` and `BlobPolicyChanged` go to [`BlobRequests`], where
-//!   the blob downloader (T15) picks them up.
+//! - `DownloadBlob` and `BlobPolicyChanged` go to the blob queue; the blob
+//!   downloader (see [`crate::blobs`]) runs beside the link, on its own
+//!   task and connections, so blobs never hold up the pull or the sender.
 //!
 //! **The link** runs while the device is paired, not rejected and not
 //! suspended. Each connection starts with `hello`, then runs two loops side
@@ -26,7 +27,8 @@
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
 //! head `hello` reported (or a later batch revealed), else
-//! `Online { latency_ms }` with `hello`'s round trip. Any failure ends the
+//! `Online { latency_ms }` with `hello`'s round trip — blob downloads play
+//! no part: metadata synced counts as synced (D6). Any failure ends the
 //! connection: a rejection (401/403, protocol mismatch) shows
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
 //! else shows `Reconnecting { attempt, next_in, offline_since }`, waits
@@ -35,12 +37,12 @@
 //! a pull succeeds, so a server that answers `hello` and then fails keeps
 //! backing off.
 //!
-//! [`Core::suspend`](crate::Core::suspend) stops the link (in-flight
-//! requests are dropped; an unanswered command is resent later with the
-//! same id) and [`Core::resume`](crate::Core::resume) starts it again from
-//! `Connecting`. Pairing runs regardless.
+//! [`Core::suspend`](crate::Core::suspend) stops the link and the
+//! downloader (in-flight requests are dropped; an unanswered command is
+//! resent later with the same id; an interrupted blob resumes from its
+//! partial file) and [`Core::resume`](crate::Core::resume) starts them
+//! again from `Connecting`. Pairing runs regardless.
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
@@ -51,14 +53,15 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::backoff::Backoff;
+use crate::blobs::{BlobCtx, BlobQueue, run_downloader};
 use crate::client::CoreError;
 use crate::https::{HttpsTransport, TransportConfig};
 use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
-use crate::store::{BlobPolicy, StoreError};
+use crate::store::StoreError;
 use crate::transport::{Transport, TransportError};
-use crate::view::{BlobId, Link, LinkRejection};
+use crate::view::{Link, LinkRejection};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
@@ -127,7 +130,7 @@ impl Connector {
         Connector(Arc::new(connect))
     }
 
-    fn connect(
+    pub(crate) fn connect(
         &self,
         address: &str,
         identity: &dyn Identity,
@@ -159,29 +162,6 @@ pub fn default_device_name() -> String {
         .unwrap_or_else(|| "skywave device".to_owned())
 }
 
-/// A blob request from the core, for the blob downloader.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobRequest {
-    Download(BlobId),
-    PolicyChanged(BlobPolicy),
-}
-
-/// Where blob requests wait for the blob downloader. T15 plugs in here:
-/// it drains [`BlobRequests::queued`] (and is woken by new ones) and
-/// reports through [`Seam::blob_status`]. Until then requests are only
-/// kept, and blobs stay `NotDownloaded`.
-#[derive(Debug, Default)]
-pub(crate) struct BlobRequests {
-    pub(crate) queued: VecDeque<BlobRequest>,
-}
-
-impl BlobRequests {
-    fn push(&mut self, request: BlobRequest) {
-        tracing::debug!(?request, "blob request queued for the downloader");
-        self.queued.push_back(request);
-    }
-}
-
 /// The engine's state between requests. Runs on the core's runtime.
 pub(crate) struct Engine {
     seam: Seam,
@@ -192,9 +172,12 @@ pub(crate) struct Engine {
     /// Wakes the outbox sender; outlives each link so no wake-up is lost.
     outbox: Arc<Notify>,
     link: Option<JoinHandle<()>>,
+    /// The blob downloader, running while the link does.
+    downloader: Option<JoinHandle<Infallible>>,
     /// The server refused the device; no link until the next `Connect`.
     rejected: watch::Sender<bool>,
-    blobs: BlobRequests,
+    /// Blobs waiting for the downloader; outlives each downloader.
+    blobs: Arc<BlobQueue>,
 }
 
 impl Engine {
@@ -209,15 +192,16 @@ impl Engine {
             .clone()
             .unwrap_or_else(default_device_name);
         Engine {
-            seam,
+            seam: seam.clone(),
             config: Arc::new(config),
             device_name,
             requests,
             suspended,
             outbox: Arc::new(Notify::new()),
             link: None,
+            downloader: None,
             rejected: watch::Sender::new(false),
-            blobs: BlobRequests::default(),
+            blobs: Arc::new(BlobQueue::restore(&seam)),
         }
     }
 
@@ -267,15 +251,19 @@ impl Engine {
                 self.start_link();
             }
             Request::OutboxChanged => self.outbox.notify_one(),
-            Request::DownloadBlob(id) => self.blobs.push(BlobRequest::Download(id)),
+            Request::DownloadBlob(id) => self.blobs.want(id),
             Request::BlobPolicyChanged(policy) => {
-                self.blobs.push(BlobRequest::PolicyChanged(policy))
+                let blobs = self.seam.blobs().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "cannot read blobs; queueing none");
+                    Vec::new()
+                });
+                self.blobs.set_policy(policy, &blobs);
             }
         }
     }
 
-    /// (Re)starts the link if the device is paired, not rejected and not
-    /// suspended.
+    /// (Re)starts the link and the blob downloader if the device is
+    /// paired, not rejected and not suspended.
     fn start_link(&mut self) {
         self.stop_link();
         if *self.suspended.borrow() || *self.rejected.borrow() {
@@ -294,10 +282,20 @@ impl Engine {
         let Some(address) = address else {
             return;
         };
+        let downloader = tokio::spawn(run_downloader(BlobCtx {
+            seam: self.seam.clone(),
+            config: self.config.clone(),
+            address: address.clone(),
+            identity: identity.clone(),
+            queue: self.blobs.clone(),
+        }));
+        let stop_downloader = downloader.abort_handle();
+        self.downloader = Some(downloader);
         let ctx = LinkCtx {
             seam: self.seam.clone(),
             config: self.config.clone(),
             outbox: self.outbox.clone(),
+            blobs: self.blobs.clone(),
             address,
             identity,
         };
@@ -305,6 +303,7 @@ impl Engine {
         self.link = Some(tokio::spawn(async move {
             let rejection = run_link(ctx).await;
             tracing::warn!(?rejection, "the server refused this device; sync stopped");
+            stop_downloader.abort();
             rejected.send_replace(true);
         }));
     }
@@ -312,6 +311,9 @@ impl Engine {
     fn stop_link(&mut self) {
         if let Some(link) = self.link.take() {
             link.abort();
+        }
+        if let Some(downloader) = self.downloader.take() {
+            downloader.abort();
         }
     }
 }
@@ -321,6 +323,8 @@ pub(crate) struct LinkCtx {
     pub(crate) seam: Seam,
     pub(crate) config: Arc<EngineConfig>,
     pub(crate) outbox: Arc<Notify>,
+    /// Where an `Eager` policy queues the blobs a batch registers.
+    pub(crate) blobs: Arc<BlobQueue>,
     pub(crate) address: String,
     pub(crate) identity: Arc<dyn Identity>,
 }
@@ -473,7 +477,10 @@ async fn pull(
             continue;
         }
         match ctx.seam.apply_events(&batch) {
-            Ok(applied) => head = head.max(applied.cursor),
+            Ok(applied) => {
+                head = head.max(applied.cursor);
+                ctx.blobs.registered(&applied.blobs);
+            }
             Err(CoreError::Store(StoreError::Gap { cursor, from })) => {
                 // The log is contiguous, so the server misbehaved; the next
                 // connection pulls again from the store's cursor.
@@ -614,6 +621,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
         };
