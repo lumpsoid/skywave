@@ -11,7 +11,7 @@ publish.workspace = true
 skywave-core.workspace = true
 clap.workspace = true
 crossterm.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 
 [dev-dependencies]
 # Tests play the engine through `core.seam()`, which speaks proto types.
@@ -19,3 +19,9 @@ ratatui.workspace = true
 skywave-proto.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+# End-to-end tests (tests/e2e.rs) run a real server with the fake agent.
+# Test-only: never a normal dependency.
+serde_json.workspace = true
+skywaved = { path = "../skywaved" }
+skywave-testkit = { path = "../skywave-testkit" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

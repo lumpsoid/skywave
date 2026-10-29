@@ -1442,9 +1442,13 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "serde_json",
  "skywave-core",
  "skywave-proto",
+ "skywave-testkit",
+ "skywaved",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

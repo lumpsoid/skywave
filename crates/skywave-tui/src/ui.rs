@@ -1,5 +1,12 @@
-//! Pure rendering: draws an [`App`] into a frame. No state changes, no I/O;
-//! `now` is passed in so the retry countdown renders deterministically.
+//! Rendering: draws an [`App`] into a frame. `now` is passed in so the
+//! retry countdown renders deterministically. The only state written is the
+//! timeline geometry the session view records for paging
+//! ([`Geometry`](crate::app::Geometry)); the only I/O is reading downloaded
+//! blobs to show them.
+
+mod session;
+
+pub use session::{SHOW_BYTES, SHOW_LINES, bytes};
 
 use std::time::{Duration, Instant};
 
@@ -11,12 +18,11 @@ use ratatui::widgets::{
     Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use skywave_core::{
-    ApprovalStatus, BlobPolicy, Decision, Entry, FailReason, Link, LinkRejection, Outgoing,
-    PairingStatus, PairingView, PendingSession, Screen, SessionListView, SessionRow, SessionState,
-    SessionView, SettingsView, TimelineItem,
+    BlobPolicy, Decision, FailReason, Link, LinkRejection, Outgoing, PairingStatus, PairingView,
+    PendingSession, Screen, SessionListView, SessionRow, SessionState, SettingsView,
 };
 
-use crate::app::{App, Field};
+use crate::app::{App, Field, Focus};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
 pub fn render(frame: &mut Frame, app: &App, now: Instant) {
@@ -41,7 +47,11 @@ pub fn render(frame: &mut Frame, app: &App, now: Instant) {
         match &view.screen {
             Screen::Pairing(pairing) => render_pairing(frame, body, app, pairing),
             Screen::SessionList(list) => render_session_list(frame, body, app, list),
-            Screen::Session(session) => render_session(frame, body, session),
+            Screen::Session(_) => {
+                if let Some((session, ui)) = app.session() {
+                    session::render(frame, body, app, session, ui);
+                }
+            }
             Screen::Settings(settings) => render_settings(frame, body, settings),
         }
     }
@@ -313,104 +323,33 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_session(frame: &mut Frame, area: Rect, session: &SessionView) {
-    let title = session
-        .workdir
-        .clone()
-        .unwrap_or_else(|| session.id.0.to_string());
-    let block = Block::bordered().title(format!(" {title} · {} ", state_badge(&session.state).0));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines: Vec<Line> = session.timeline.iter().flat_map(timeline_lines).collect();
-    if let Some(prompt) = &session.pending_approval {
-        let answer = match &prompt.answer {
-            Some(answer) => format!(
-                " · answered {} ({})",
-                decision_label(answer.decision),
-                outgoing_label(&answer.outgoing)
-            ),
-            None => String::new(),
-        };
-        lines.push(
-            Line::from(format!(
-                "awaiting approval: {} — {}{answer}",
-                prompt.tool, prompt.summary
-            ))
-            .yellow(),
-        );
-    }
-    if lines.is_empty() {
-        lines.push(Line::from("Nothing here yet.").dark_gray());
-    }
-    // Newest at the bottom: show the tail that fits.
-    let skip = lines.len().saturating_sub(inner.height as usize);
-    frame.render_widget(Paragraph::new(lines.split_off(skip)), inner);
-}
-
-fn timeline_lines(item: &TimelineItem) -> Vec<Line<'static>> {
-    let (prefix, text) = match item {
-        TimelineItem::Pending { text, outgoing, .. } => (
-            format!("you [{}]: ", outgoing_label(outgoing)),
-            text.clone(),
-        ),
-        TimelineItem::Logged { entry, .. } => match entry {
-            Entry::UserMessage {
-                text,
-                from,
-                own,
-                outgoing,
-            } => {
-                let who = if *own {
-                    "you".to_owned()
-                } else {
-                    format!("device {}", short_id(&from.0.to_string()))
-                };
-                let state = outgoing
-                    .as_ref()
-                    .map(|o| format!(" [{}]", outgoing_label(o)))
-                    .unwrap_or_default();
-                (format!("{who}{state}: "), text.clone())
-            }
-            Entry::AgentMessage { text } => ("agent: ".to_owned(), text.clone()),
-            Entry::ToolCall { name, summary, .. } => (format!("tool {name}: "), summary.clone()),
-            Entry::ToolResult { summary, .. } => ("result: ".to_owned(), summary.clone()),
-            Entry::Approval {
-                tool,
-                summary,
-                status,
-                ..
-            } => {
-                let status = match status {
-                    ApprovalStatus::Pending => "pending".to_owned(),
-                    ApprovalStatus::Resolved {
-                        decision, by_me, ..
-                    } => {
-                        let who = if *by_me { "here" } else { "elsewhere" };
-                        format!("{} {who}", decision_label(*decision))
-                    }
-                    ApprovalStatus::Cancelled { reason } => format!("cancelled: {reason}"),
-                };
-                (format!("approval {tool} [{status}]: "), summary.clone())
-            }
-            Entry::Interrupted => ("interrupted".to_owned(), String::new()),
-            Entry::AgentErrored { message } => ("error: ".to_owned(), message.clone()),
-        },
-    };
-    let mut text_lines = text.lines();
-    let first = text_lines.next().unwrap_or("").to_owned();
-    let mut lines = vec![Line::from(vec![Span::raw(prefix).bold(), Span::raw(first)])];
-    lines.extend(text_lines.map(|l| Line::from(format!("  {l}"))));
-    lines
-}
-
 fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
     let policy = match settings.blob_policy {
         BlobPolicy::Eager => "eager (download every blob)",
         BlobPolicy::OnDemand => "on demand (download when opened)",
     };
+    let mark = |policy: BlobPolicy| {
+        if settings.blob_policy == policy {
+            "(•)"
+        } else {
+            "( )"
+        }
+    };
     let lines = vec![
         Line::from(format!("Blob policy: {policy}")),
+        Line::from(""),
+        Line::from("  Blobs hold full tool inputs and outputs; sessions sync without them.")
+            .dark_gray(),
+        Line::from(format!(
+            "  {} On demand  a blob downloads when you expand its tool output",
+            mark(BlobPolicy::OnDemand)
+        )),
+        Line::from(format!(
+            "  {} Eager      every blob downloads as soon as it is synced",
+            mark(BlobPolicy::Eager)
+        )),
+        Line::from("  Press b to switch. Eager uses more data and disk.").dark_gray(),
+        Line::from(""),
         Line::from(format!(
             "Server:      {}",
             settings.server_address.as_deref().unwrap_or("not paired")
@@ -448,7 +387,14 @@ fn footer_hint(app: &App) -> &'static str {
         Screen::SessionList(_) => {
             "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
         }
-        Screen::Session(_) => "Esc back · ? help · q quit",
+        Screen::Session(_) => match app.session().map(|(_, ui)| ui.focus) {
+            Some(Focus::Timeline) => {
+                "↑↓ select · Enter expand · d download · a/x approve/deny · PgUp/PgDn · Tab write · Esc back · ? help"
+            }
+            _ => {
+                "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
+            }
+        },
         Screen::Settings(_) => "b toggle blob policy · p re-pair · Esc back · ? help · q quit",
     }
 }
@@ -505,10 +451,40 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("[error]", "agent reported an error"),
             key("! N pending", "approvals waiting for an answer"),
         ]),
-        Screen::Session(_) => lines.extend([section("Session"), key("Esc", "back to sessions")]),
+        Screen::Session(_) => {
+            lines.extend([
+                section("Session"),
+                key("Ctrl-X", "interrupt the agent's turn"),
+                key("PgUp / PgDn", "scroll the timeline"),
+                key("Tab", "switch between message and timeline"),
+                Line::from(""),
+            ]);
+            // One focus at a time, so the overlay fits a small terminal.
+            match app.session().map(|(_, ui)| ui.focus) {
+                Some(Focus::Timeline) => lines.extend([
+                    section("Timeline (Tab or i: message keys)"),
+                    key("↑↓ / k j", "select a tool call, result or approval"),
+                    key("Enter / Space", "expand it; downloads its blob if needed"),
+                    key("d", "download the selected blob"),
+                    key("a / x", "approve / deny the pending approval"),
+                    key("Home g/End G", "oldest / newest (End follows new items)"),
+                    key("i", "write a message"),
+                    key("Esc", "back to sessions"),
+                ]),
+                _ => lines.extend([
+                    section("Message (Esc or Tab: timeline keys)"),
+                    key("Enter", "send (queued while offline)"),
+                    key("Ctrl-J", "new line (also Alt-Enter, Shift-Enter)"),
+                    key("paste", "inserts text, line breaks included"),
+                    key("←→↑↓ Home End", "move the cursor"),
+                    key("Ctrl-U", "clear the message"),
+                    key("Esc", "go to the timeline"),
+                ]),
+            }
+        }
         Screen::Settings(_) => lines.extend([
             section("Settings"),
-            key("b", "toggle blob policy"),
+            key("b", "toggle blob policy: on demand / eager"),
             key("p", "re-pair"),
             key("Esc", "back to sessions"),
         ]),
@@ -534,7 +510,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 
 /// Short text and colour for a session state; the text alone tells them
 /// apart.
-fn state_badge(state: &SessionState) -> (&'static str, Style) {
+pub(crate) fn state_badge(state: &SessionState) -> (&'static str, Style) {
     match state {
         SessionState::Idle => ("idle", Style::new().green()),
         SessionState::AgentWorking => ("working", Style::new().cyan().bold()),
@@ -544,7 +520,7 @@ fn state_badge(state: &SessionState) -> (&'static str, Style) {
 }
 
 /// Short text and colour for a command's delivery state.
-fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
+pub(crate) fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
     match outgoing {
         Outgoing::Queued => ("queued", Style::new().dark_gray()),
         Outgoing::Sending => ("sending", Style::new().cyan()),
@@ -553,11 +529,11 @@ fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
     }
 }
 
-fn outgoing_label(outgoing: &Outgoing) -> String {
+pub(crate) fn outgoing_label(outgoing: &Outgoing) -> String {
     match outgoing {
         Outgoing::Queued => "queued".to_owned(),
         Outgoing::Sending => "sending".to_owned(),
-        Outgoing::Accepted(_) => "sent".to_owned(),
+        Outgoing::Accepted(_) => "accepted".to_owned(),
         Outgoing::Failed(reason) => format!("failed: {}", fail_reason(*reason)),
     }
 }
@@ -574,13 +550,9 @@ fn fail_reason(reason: FailReason) -> &'static str {
     }
 }
 
-fn decision_label(decision: Decision) -> &'static str {
+pub(crate) fn decision_label(decision: Decision) -> &'static str {
     match decision {
         Decision::Approve => "approved",
         Decision::Deny => "denied",
     }
-}
-
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
 }

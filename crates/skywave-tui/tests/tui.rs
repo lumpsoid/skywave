@@ -11,10 +11,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use skywave_core::{
-    Action, ApprovalId, BlobPolicy, CommandId, Core, DeviceId, FailReason, Link, LinkRejection,
-    PairedCredentials, Request, Route, Screen, Seam, Seq, SessionId, ViewState,
+    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, DeviceId,
+    FailReason, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam, Seq,
+    SessionId, ViewState,
 };
-use skywave_proto::{CommandResult, Event, EventBatch, EventKind, SessionState as LogState};
+use skywave_proto::{
+    BlobRef, CommandResult, Event, EventBatch, EventKind, SessionState as LogState,
+};
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
 use skywave_tui::ui;
@@ -566,7 +569,9 @@ fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
     assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(b)));
 
-    // Back on the list, the same session is still selected.
+    // Back on the list (Esc leaves the composer, then the session), the
+    // same session is still selected.
+    assert_eq!(h.key(KeyCode::Esc), None);
     assert_eq!(
         h.key(KeyCode::Esc),
         Some(Action::Navigate(Route::SessionList))
@@ -741,4 +746,639 @@ fn esc_cancels_the_new_session_prompt() {
     // Out of the prompt, `q` quits again.
     h.key(KeyCode::Char('q'));
     assert!(h.app.ui().quit);
+}
+
+// ---- session view -----------------------------------------------------------
+
+/// A paired harness with one session `/srv/work` open, plus this device's id.
+fn open_session() -> (Harness, SessionId, DeviceId) {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    pull(&mut h, vec![created(id, 0, "/srv/work")]);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    let me = h.seam.identity().unwrap().device_id();
+    (h, id, me)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+/// The last 8 hex digits of a device id, as the timeline names devices.
+fn tail(device: DeviceId) -> String {
+    device.0.simple().to_string()[24..].to_owned()
+}
+
+fn blob(size: u64) -> (BlobId, BlobRef) {
+    let id = BlobId::new();
+    (id, BlobRef { id, size })
+}
+
+#[test]
+fn every_timeline_entry_renders_distinctly() {
+    let (mut h, id, me) = open_session();
+    assert_contains(&h.screen(), "Nothing here yet.");
+    let other = DeviceId::new();
+    let (_, output) = blob(10_000);
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: other,
+                    text: "from the laptop".into(),
+                },
+            ),
+            event(
+                id,
+                2,
+                EventKind::AgentMessage {
+                    text: "Looking.\nSecond line".into(),
+                },
+            ),
+            event(
+                id,
+                3,
+                EventKind::ToolCall {
+                    name: "shell".into(),
+                    summary: "{\"command\":\"ls\"}".into(),
+                    input: None,
+                },
+            ),
+            event(
+                id,
+                4,
+                EventKind::ToolResult {
+                    summary: "file-000".into(),
+                    output: Some(output),
+                },
+            ),
+            event(id, 5, EventKind::TurnInterrupted),
+            event(
+                id,
+                6,
+                EventKind::SessionStateChanged(LogState::Errored {
+                    message: "agent crashed".into(),
+                }),
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        &format!("12:01 device …{}: from the laptop", tail(other)),
+    );
+    assert_contains(&screen, "12:02 agent: Looking.");
+    assert_contains(&screen, "        Second line");
+    assert_contains(&screen, "12:03 ▸ tool shell: {\"command\":\"ls\"}");
+    assert_contains(
+        &screen,
+        "12:04 ▸ result: file-000 [full 9.8 KiB · not downloaded]",
+    );
+    assert_contains(&screen, "12:05 interrupted · the agent stopped its turn");
+    assert_contains(&screen, "12:06 agent error: agent crashed");
+    assert_contains(&screen, "/srv/work · error");
+    assert!(!screen.contains(&me.0.simple().to_string()[24..]));
+}
+
+#[test]
+fn own_messages_show_their_delivery_state() {
+    let (mut h, id, me) = open_session();
+    assert!(h.app.typing(), "the composer has the focus");
+    assert_contains(&h.screen(), "Write to the agent…");
+    // `q` and `?` are text here.
+    h.type_text("q? line one");
+    h.key_with(ctrl('j'));
+    h.type_text("line two");
+    assert!(!h.app.ui().quit && !h.app.ui().help);
+    let screen = h.screen();
+    assert_contains(&screen, "│q? line one");
+    assert_contains(&screen, "│line two");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SendMessage {
+            session_id: id,
+            text: "q? line one\nline two".into(),
+        })
+    );
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
+    assert_eq!(h.app.draft(id).unwrap().text(), "", "sent drafts clear");
+    let command = last_command(&h);
+    let screen = h.screen();
+    assert_contains(&screen, "you [queued]: q? line one");
+    assert_contains(&screen, "        line two");
+
+    h.seam.command_sending(command).unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "you [sending]: q? line one");
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(2) })
+        .unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "you [accepted]: q? line one");
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::UserMessage {
+                command_id: command,
+                device_id: me,
+                text: "q? line one\nline two".into(),
+            },
+        )],
+    );
+    assert_contains(&line_with(&h.screen(), "line one"), "12:01 you [accepted]");
+
+    // A refused message says why, in words.
+    h.type_text("again");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.seam
+        .command_result(
+            command,
+            &CommandResult::Rejected {
+                reason: FailReason::UnknownSession,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(
+        &h.screen(),
+        "you [failed: the server does not know this session]: again",
+    );
+
+    // A blank draft goes nowhere: the core refuses it.
+    h.drain_requests();
+    h.key(KeyCode::Enter);
+    h.type_text("   ");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.drain_requests(), vec![]);
+
+    // A paste keeps its line breaks and lands in the composer, also from
+    // the timeline.
+    h.key(KeyCode::Esc);
+    assert!(!h.app.typing());
+    h.app.on_paste("pasted\r\nlines");
+    assert!(h.app.typing());
+    assert_eq!(h.app.draft(id).unwrap().text(), "pasted\nlines");
+}
+
+#[test]
+fn approval_prompt_answer_and_resolutions() {
+    let (mut h, id, me) = open_session();
+    let first = ApprovalId::new();
+    let (_, input) = blob(6000);
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::ApprovalRequested {
+                id: first,
+                tool: "write".into(),
+                summary: "{\"path\":\"a.txt\"}".into(),
+                input: Some(input),
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "Approval needed");
+    assert_contains(&screen, "The agent wants to use write");
+    assert_contains(&screen, "Esc, then a approve · x deny");
+    assert_contains(&screen, "[full 5.9 KiB · not downloaded]");
+    assert_contains(&screen, "approval write [waiting for an answer]");
+    // In the composer `a` is text.
+    assert_eq!(h.key(KeyCode::Char('a')), None);
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), "│a approve · x deny");
+    assert_eq!(
+        h.key(KeyCode::Char('a')),
+        Some(Action::ResolveApproval {
+            id: first,
+            decision: Decision::Approve,
+        })
+    );
+    assert_contains(&h.screen(), "you approved · queued");
+    let command = last_command(&h);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(3) })
+        .unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "you approved · accepted");
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::ApprovalResolved {
+                id: first,
+                decision: Decision::Approve,
+                by: me,
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert!(!screen.contains("Approval needed"), "{screen}");
+    assert_contains(&screen, "approval write [approved here]");
+
+    // Answered on another device: named, and the controls are gone.
+    let other = DeviceId::new();
+    let second = ApprovalId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            3,
+            EventKind::ApprovalRequested {
+                id: second,
+                tool: "shell".into(),
+                summary: "rm -rf build".into(),
+                input: None,
+            },
+        )],
+    );
+    assert_contains(&h.screen(), "The agent wants to use shell");
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            4,
+            EventKind::ApprovalResolved {
+                id: second,
+                decision: Decision::Deny,
+                by: other,
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert!(!screen.contains("a approve"), "{screen}");
+    assert_contains(
+        &screen,
+        &format!("approval shell [denied on device …{}]", tail(other)),
+    );
+    assert_eq!(h.key(KeyCode::Char('x')), None, "nothing left to answer");
+
+    let third = ApprovalId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                5,
+                EventKind::ApprovalRequested {
+                    id: third,
+                    tool: "net".into(),
+                    summary: "curl".into(),
+                    input: None,
+                },
+            ),
+            event(
+                id,
+                6,
+                EventKind::ApprovalCancelled {
+                    id: third,
+                    reason: "interrupted".into(),
+                },
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "approval net [cancelled: interrupted]");
+    assert!(!screen.contains("Approval needed"));
+}
+
+#[test]
+fn interrupt_key_and_its_delivery_state() {
+    let (mut h, id, _) = open_session();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::SessionStateChanged(LogState::AgentWorking),
+        )],
+    );
+    assert_contains(&h.screen(), "agent working · Ctrl-X interrupts");
+    // From the composer and from the timeline alike.
+    assert_eq!(
+        h.key_with(ctrl('x')),
+        Some(Action::Interrupt { session_id: id })
+    );
+    assert_contains(&h.screen(), "interrupt queued");
+    let command = last_command(&h);
+    h.seam.command_sending(command).unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "interrupt sending");
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(2) })
+        .unwrap();
+    pull(
+        &mut h,
+        vec![
+            event(id, 2, EventKind::TurnInterrupted),
+            event(id, 3, EventKind::SessionStateChanged(LogState::Idle)),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "interrupted · the agent stopped its turn");
+    assert_contains(&screen, "agent idle");
+    assert!(!screen.contains("interrupt accepted"), "{screen}");
+
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key_with(ctrl('x')),
+        Some(Action::Interrupt { session_id: id })
+    );
+    let command = last_command(&h);
+    h.seam
+        .command_result(
+            command,
+            &CommandResult::Rejected {
+                reason: FailReason::NoActiveTurn,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "interrupt failed: the agent was not working");
+}
+
+#[test]
+fn tool_output_expands_through_every_blob_state() {
+    let (mut h, id, _) = open_session();
+    let (blob_id, output) = blob(10_000);
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall {
+                    name: "shell".into(),
+                    summary: "line a\nline b\nline c".into(),
+                    input: None,
+                },
+            ),
+            event(
+                id,
+                2,
+                EventKind::ToolResult {
+                    summary: "file-000".into(),
+                    output: Some(output),
+                },
+            ),
+        ],
+    );
+    assert_contains(&h.screen(), "tool shell: line a (+2 lines)");
+    h.key(KeyCode::Esc);
+    // Selection starts at the newest tool item.
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:02 ▸ result: file-000");
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    // Expanding asks for it too.
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::DownloadBlob(blob_id)));
+    assert_contains(
+        &h.screen(),
+        "not downloaded · 9.8 KiB · press d to download",
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("blob.part");
+    h.seam
+        .blob_status(
+            blob_id,
+            BlobStatus::Downloading {
+                got: 4096,
+                path: part,
+            },
+        )
+        .unwrap();
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "[downloading 40%]");
+    assert_contains(&screen, "downloading · 4.0 KiB of 9.8 KiB (40%)");
+
+    // Content arrives; invalid UTF-8 and control bytes are shown safely.
+    let path = dir.path().join("blob");
+    let content = b"file-000\nfile-001\tx\n\xff\xfebroken\x07\n".to_vec();
+    std::fs::write(&path, &content).unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "▾ result: file-000 [downloaded]");
+    assert_contains(&screen, "          file-000");
+    assert_contains(&screen, "          file-001    x");
+    assert_contains(&screen, "          ��broken");
+    assert_eq!(h.key(KeyCode::Char('d')), None, "already here");
+
+    // Collapse; the inline tool call expands to its whole summary.
+    h.key(KeyCode::Enter);
+    assert!(!h.screen().contains("file-001"));
+    h.key(KeyCode::Char('k'));
+    assert_eq!(h.key(KeyCode::Char(' ')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "▾ tool shell: line a");
+    assert_contains(&screen, "          line c");
+}
+
+#[test]
+fn large_blobs_are_cut_short_when_shown() {
+    let (mut h, id, _) = open_session();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big");
+    let text: String = (0..1000).map(|i| format!("row {i}\n")).collect();
+    std::fs::write(&path, &text).unwrap();
+    let (blob_id, output) = blob(text.len() as u64);
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::ToolResult {
+                summary: "row 0".into(),
+                output: Some(output),
+            },
+        )],
+    );
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    // Following the bottom shows the end of what is shown.
+    let screen = h.screen();
+    assert_contains(&screen, "row 399");
+    assert_contains(&screen, "… cut short: 400 lines of");
+    assert!(!screen.contains("row 400"));
+}
+
+#[test]
+fn timeline_follows_new_items_until_scrolled_back() {
+    let (mut h, id, _) = open_session();
+    let messages = |from: u32, to: u32| {
+        (from..to)
+            .map(|i| {
+                event(
+                    id,
+                    1,
+                    EventKind::AgentMessage {
+                        text: format!("message {i:02}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    pull(&mut h, messages(0, 40));
+    let screen = h.screen();
+    assert_contains(&screen, "message 39");
+    assert!(!screen.contains("message 00"));
+    pull(&mut h, messages(40, 41));
+    assert_contains(&h.screen(), "message 40");
+
+    // Page back (works from the composer too); new items do not move it.
+    h.key(KeyCode::PageUp);
+    let screen = h.screen();
+    assert!(!screen.contains("message 40"), "{screen}");
+    assert_contains(&screen, "scrolled back, End follows");
+    let before = screen.clone();
+    pull(&mut h, messages(41, 45));
+    assert_eq!(h.screen(), before);
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Home);
+    assert_contains(&h.screen(), "message 00");
+    h.key(KeyCode::PageDown);
+    assert!(!h.screen().contains("message 00"));
+    h.key(KeyCode::End);
+    let screen = h.screen();
+    assert_contains(&screen, "message 44");
+    assert!(!screen.contains("scrolled back"));
+
+    // Paging forward to the bottom follows again.
+    h.key(KeyCode::PageUp);
+    h.screen();
+    h.key(KeyCode::PageDown);
+    pull(&mut h, messages(45, 46));
+    let screen = h.screen();
+    assert_contains(&screen, "message 45");
+    assert!(!screen.contains("scrolled back"));
+}
+
+#[test]
+fn selecting_an_old_tool_item_scrolls_to_it() {
+    let (mut h, id, _) = open_session();
+    let mut events = vec![event(
+        id,
+        1,
+        EventKind::ToolCall {
+            name: "early".into(),
+            summary: "first".into(),
+            input: None,
+        },
+    )];
+    events.extend((0..40).map(|i| {
+        event(
+            id,
+            2,
+            EventKind::AgentMessage {
+                text: format!("chatter {i}"),
+            },
+        )
+    }));
+    events.push(event(
+        id,
+        3,
+        EventKind::ToolCall {
+            name: "late".into(),
+            summary: "second".into(),
+            input: None,
+        },
+    ));
+    pull(&mut h, events);
+    assert!(!h.screen().contains("tool early"));
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:03 ▸ tool late");
+    h.key(KeyCode::Up);
+    let screen = h.screen();
+    assert_contains(&screen, "> 12:01 ▸ tool early");
+    assert!(!screen.contains("tool late"));
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), "> 12:03 ▸ tool late");
+}
+
+#[test]
+fn session_keys_are_in_help_and_footer() {
+    let (mut h, _, _) = open_session();
+    assert_contains(
+        &h.screen(),
+        "Enter send · Ctrl-J newline · Ctrl-X interrupt",
+    );
+    h.key(KeyCode::F(1));
+    let screen = h.screen();
+    assert_contains(&screen, "interrupt the agent's turn");
+    assert_contains(&screen, "new line (also Alt-Enter, Shift-Enter)");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Tab);
+    assert!(!h.app.typing());
+    assert_contains(&h.screen(), "↑↓ select · Enter expand · d download");
+    h.key(KeyCode::Char('?'));
+    let screen = h.screen();
+    assert_contains(&screen, "expand it; downloads its blob if needed");
+    assert_contains(&screen, "approve / deny the pending approval");
+    h.key(KeyCode::Char('?'));
+    h.key(KeyCode::Char('i'));
+    assert!(h.app.typing());
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+}
+
+#[test]
+fn drafts_survive_leaving_the_session() {
+    let (mut h, id, _) = open_session();
+    h.type_text("half a thought");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    assert_contains(&h.screen(), "│half a thought");
+}
+
+#[test]
+fn offline_composer_says_messages_wait() {
+    let (mut h, _, _) = open_session();
+    h.seam.set_link(Link::Reconnecting {
+        attempt: 1,
+        next_in: Duration::from_secs(5),
+        offline_since: h.t0,
+    });
+    h.sync();
+    assert_contains(&h.screen(), "Message · offline, sends when back online");
+}
+
+#[test]
+fn settings_explain_the_blob_policy() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('s'));
+    let screen = h.screen();
+    assert_contains(&screen, "(•) On demand  a blob downloads when you expand");
+    assert_contains(&screen, "( ) Eager      every blob downloads as soon");
+    h.key(KeyCode::Char('b'));
+    let screen = h.screen();
+    assert_contains(&screen, "( ) On demand");
+    assert_contains(&screen, "(•) Eager");
 }

@@ -3,13 +3,18 @@
 //! overlay, list selection). Keys become core [`Action`]s here; nothing in
 //! this module decides anything about pairing, sync or delivery (D2).
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
-    Action, BlobPolicy, CoreError, Link, LinkRejection, PairingView, Route, Screen, SessionId,
-    SessionListView, ViewState,
+    Action, BlobPolicy, BlobState, BlobView, CoreError, Decision, Entry, Link, LinkRejection,
+    PairingView, Route, Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem,
+    ViewState,
 };
+
+use crate::composer::Composer;
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,6 +194,97 @@ impl CreateInput {
     }
 }
 
+/// Where keys go on the session view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    /// Typing a message.
+    #[default]
+    Composer,
+    /// Scrolling, expanding tool output, answering an approval.
+    Timeline,
+}
+
+/// The timeline's layout in the last frame, recorded by the renderer so
+/// paging and keeping the selection in view know how tall things are. Stale
+/// by at most one frame; the renderer clamps whatever the keys make of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Geometry {
+    /// First line of each timeline item, by timeline index.
+    pub starts: Vec<usize>,
+    /// Lines of the whole timeline.
+    pub total: usize,
+    /// Lines that fit on screen.
+    pub height: usize,
+}
+
+impl Geometry {
+    /// Top line when following the newest item.
+    pub fn bottom(&self) -> usize {
+        self.total.saturating_sub(self.height)
+    }
+
+    /// The top line shown for `scroll`.
+    pub fn top(&self, scroll: Option<usize>) -> usize {
+        scroll.map_or(self.bottom(), |top| top.min(self.bottom()))
+    }
+
+    fn item(&self, index: usize) -> Option<(usize, usize)> {
+        let start = *self.starts.get(index)?;
+        let end = self.starts.get(index + 1).copied().unwrap_or(self.total);
+        Some((start, end))
+    }
+}
+
+/// Presentation state of the open session.
+#[derive(Debug, Clone)]
+pub struct SessionUi {
+    pub id: SessionId,
+    pub focus: Focus,
+    /// Top line of the timeline while the user has scrolled back; `None`
+    /// follows the newest item. New items never move a pinned view.
+    pub scroll: Option<usize>,
+    /// The selected tool call, tool result or approval, by seq so it stays
+    /// put as items arrive.
+    pub selected: Option<Seq>,
+    /// Items whose full content is shown.
+    pub expanded: HashSet<Seq>,
+    pub geometry: RefCell<Geometry>,
+}
+
+impl SessionUi {
+    fn new(id: SessionId) -> SessionUi {
+        SessionUi {
+            id,
+            focus: Focus::Composer,
+            scroll: None,
+            selected: None,
+            expanded: HashSet::new(),
+            geometry: RefCell::default(),
+        }
+    }
+}
+
+/// The blob behind an expandable item, if its content lives in one.
+pub fn item_blob(entry: &Entry) -> Option<&BlobView> {
+    match entry {
+        Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => input.as_ref(),
+        Entry::ToolResult { output, .. } => output.as_ref(),
+        _ => None,
+    }
+}
+
+/// Tool calls, tool results and approvals can be selected and expanded.
+pub fn selectable(item: &TimelineItem) -> Option<Seq> {
+    match item {
+        TimelineItem::Logged {
+            seq,
+            entry: Entry::ToolCall { .. } | Entry::ToolResult { .. } | Entry::Approval { .. },
+            ..
+        } => Some(*seq),
+        _ => None,
+    }
+}
+
 /// Presentation state owned by the head.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -199,6 +295,10 @@ pub struct UiState {
     pub selected: Option<SessionId>,
     /// The open "new session" prompt, if any.
     pub create: Option<CreateInput>,
+    /// The open session's focus, scroll and expanded items.
+    pub session: Option<SessionUi>,
+    /// Unsent messages, per session; drafts are per device (D5).
+    pub drafts: HashMap<SessionId, Composer>,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
     /// When the current [`Link`] value arrived; the retry countdown runs
@@ -225,6 +325,8 @@ impl App {
                 form: PairingForm::default(),
                 selected: None,
                 create: None,
+                session: None,
+                drafts: HashMap::new(),
                 revoked_dismissed: false,
                 link_since: now,
                 error: None,
@@ -233,6 +335,7 @@ impl App {
         };
         app.prefill(&view);
         app.keep_selection(None);
+        app.follow_session();
         app
     }
 
@@ -269,6 +372,32 @@ impl App {
             .and_then(|list| self.selected_index(list));
         self.view = view;
         self.keep_selection(old_index);
+        self.follow_session();
+    }
+
+    /// Fresh session presentation state when another session opens.
+    fn follow_session(&mut self) {
+        match &self.view.screen {
+            Screen::Session(session) => {
+                if self.ui.session.as_ref().is_none_or(|s| s.id != session.id) {
+                    self.ui.session = Some(SessionUi::new(session.id));
+                }
+            }
+            _ => self.ui.session = None,
+        }
+    }
+
+    /// The open session's view and presentation state.
+    pub fn session(&self) -> Option<(&SessionView, &SessionUi)> {
+        match (&self.view.screen, &self.ui.session) {
+            (Screen::Session(view), Some(ui)) if view.id == ui.id => Some((view, ui)),
+            _ => None,
+        }
+    }
+
+    /// The draft for `session`, if one was started.
+    pub fn draft(&self, session: SessionId) -> Option<&Composer> {
+        self.ui.drafts.get(&session)
     }
 
     /// Records the outcome of dispatching an action from [`App::on_key`].
@@ -280,6 +409,12 @@ impl App {
                 self.ui.create = None;
             } else {
                 create.submitted = false;
+            }
+        }
+        for draft in self.ui.drafts.values_mut().filter(|d| d.submitted) {
+            draft.submitted = false;
+            if result.is_ok() {
+                draft.clear();
             }
         }
         self.ui.error = result.err().map(|err| err.to_string());
@@ -341,15 +476,29 @@ impl App {
             && match self.view.screen {
                 Screen::Pairing(_) => true,
                 Screen::SessionList(_) => self.ui.create.is_some(),
+                Screen::Session(_) => self
+                    .ui
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.focus == Focus::Composer),
                 _ => false,
             }
     }
 
     /// Bracketed paste: on the pairing screen a pairing URI fills the whole
     /// form, anything else goes into the focused field; in the new-session
-    /// prompt it goes into the workdir.
+    /// prompt it goes into the workdir; on a session it goes into the
+    /// composer, line breaks included.
     pub fn on_paste(&mut self, text: &str) {
-        if !self.typing() || self.ui.help {
+        if self.ui.help || self.revoked_screen() {
+            return;
+        }
+        if let Some(session) = &mut self.ui.session {
+            session.focus = Focus::Composer;
+            self.ui.drafts.entry(session.id).or_default().insert(text);
+            return;
+        }
+        if !self.typing() {
             return;
         }
         if let Some(create) = &mut self.ui.create {
@@ -426,11 +575,7 @@ impl App {
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
                 _ => None,
             },
-            Screen::Session(_) => match key.code {
-                KeyCode::Char('q') => self.quit(),
-                KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
-                _ => None,
-            },
+            Screen::Session(_) => self.session_key(key, ctrl),
             Screen::Settings(settings) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
@@ -500,6 +645,105 @@ impl App {
         None
     }
 
+    /// Keys on the session view. Ctrl-X, PgUp/PgDn and Tab work in both
+    /// focuses; the rest depends on [`Focus`].
+    fn session_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let Screen::Session(view) = &self.view.screen else {
+            return None;
+        };
+        let session = self.ui.session.as_mut()?;
+        match key.code {
+            KeyCode::Char('x') if ctrl => {
+                return Some(Action::Interrupt {
+                    session_id: view.id,
+                });
+            }
+            KeyCode::PageUp => {
+                session.page(true);
+                return None;
+            }
+            KeyCode::PageDown => {
+                session.page(false);
+                return None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                session.focus = match session.focus {
+                    Focus::Composer => Focus::Timeline,
+                    Focus::Timeline => Focus::Composer,
+                };
+                return None;
+            }
+            _ => {}
+        }
+        match session.focus {
+            Focus::Composer => {
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let draft = self.ui.drafts.entry(view.id).or_default();
+                match key.code {
+                    KeyCode::Esc => session.focus = Focus::Timeline,
+                    KeyCode::Enter if alt || shift => draft.newline(),
+                    KeyCode::Char('j') if ctrl => draft.newline(),
+                    // A blank draft is refused by the core.
+                    KeyCode::Enter => {
+                        draft.submitted = true;
+                        return Some(Action::SendMessage {
+                            session_id: view.id,
+                            text: draft.text().to_owned(),
+                        });
+                    }
+                    KeyCode::Backspace => draft.backspace(),
+                    KeyCode::Delete => draft.delete(),
+                    KeyCode::Left => draft.left(),
+                    KeyCode::Right => draft.right(),
+                    KeyCode::Up => draft.vertical(true),
+                    KeyCode::Down => draft.vertical(false),
+                    KeyCode::Home => draft.home(),
+                    KeyCode::End => draft.end(),
+                    KeyCode::Char('u') if ctrl => draft.clear(),
+                    KeyCode::Char(c) if !ctrl => draft.insert(c.encode_utf8(&mut [0; 4])),
+                    _ => {}
+                }
+                None
+            }
+            Focus::Timeline => match key.code {
+                KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
+                KeyCode::Char('q') => {
+                    self.ui.quit = true;
+                    None
+                }
+                KeyCode::Char('i') | KeyCode::Char('c') => {
+                    session.focus = Focus::Composer;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    session.select(view, true);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    session.select(view, false);
+                    None
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    session.scroll = Some(0);
+                    None
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    session.scroll = None;
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => session.toggle(view),
+                KeyCode::Char('d') => session
+                    .selected_blob(view)
+                    .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
+                    .map(|blob| Action::DownloadBlob(blob.id)),
+                KeyCode::Char('a') => answer(view, Decision::Approve),
+                KeyCode::Char('x') => answer(view, Decision::Deny),
+                _ => None,
+            },
+        }
+    }
+
     fn quit(&mut self) -> Option<Action> {
         self.ui.quit = true;
         None
@@ -516,5 +760,102 @@ impl App {
             self.ui.form.address = address.clone();
             self.ui.form.focus = Field::Code;
         }
+    }
+}
+
+/// Answers the approval the session is blocked on, if any. Whether it may
+/// still be answered is the core's call.
+fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
+    let prompt = view.pending_approval.as_ref()?;
+    Some(Action::ResolveApproval {
+        id: prompt.id,
+        decision,
+    })
+}
+
+impl SessionUi {
+    /// Scrolls a page back (`up`) or forward; reaching the bottom follows
+    /// again.
+    fn page(&mut self, up: bool) {
+        let geometry = self.geometry.borrow();
+        let page = geometry.height.saturating_sub(1).max(1);
+        let top = geometry.top(self.scroll);
+        let top = if up {
+            top.saturating_sub(page)
+        } else {
+            top + page
+        };
+        let scroll = (top < geometry.bottom()).then_some(top);
+        drop(geometry);
+        self.scroll = scroll;
+    }
+
+    /// Moves the selection to the previous (`up`) or next selectable item
+    /// and scrolls it into view. Nothing selected starts from the newest.
+    fn select(&mut self, view: &SessionView, up: bool) {
+        let items: Vec<(usize, Seq)> = view
+            .timeline
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| Some((i, selectable(item)?)))
+            .collect();
+        let Some(&last) = items.last() else {
+            return;
+        };
+        let current = self
+            .selected
+            .and_then(|seq| items.iter().position(|(_, s)| *s == seq));
+        let (index, seq) = match (current, up) {
+            (None, _) => last,
+            (Some(i), true) => items[i.saturating_sub(1)],
+            (Some(i), false) => items[(i + 1).min(items.len() - 1)],
+        };
+        self.selected = Some(seq);
+        self.reveal(index);
+    }
+
+    /// Scrolls so the timeline item at `index` is on screen, its top first
+    /// if it does not fit.
+    fn reveal(&mut self, index: usize) {
+        let geometry = self.geometry.borrow();
+        let Some((start, end)) = geometry.item(index) else {
+            return;
+        };
+        let top = geometry.top(self.scroll);
+        let top = if start < top || end - start > geometry.height {
+            start
+        } else if end > top + geometry.height {
+            end - geometry.height
+        } else {
+            return;
+        };
+        let scroll = (top < geometry.bottom()).then_some(top);
+        drop(geometry);
+        self.scroll = scroll;
+    }
+
+    fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
+        let seq = self.selected?;
+        view.timeline.iter().find_map(|item| match item {
+            TimelineItem::Logged { seq: s, entry, .. } if *s == seq => Some(entry),
+            _ => None,
+        })
+    }
+
+    fn selected_blob<'a>(&self, view: &'a SessionView) -> Option<&'a BlobView> {
+        item_blob(self.selected_entry(view)?)
+    }
+
+    /// Expands or collapses the selected item. Expanding a blob that is not
+    /// here yet asks for it (spec §8: expanding downloads if needed).
+    fn toggle(&mut self, view: &SessionView) -> Option<Action> {
+        let seq = self.selected?;
+        if self.expanded.remove(&seq) {
+            return None;
+        }
+        self.expanded.insert(seq);
+        let blob = self.selected_blob(view)?;
+        matches!(blob.state, BlobState::NotDownloaded { .. })
+            .then_some(Action::DownloadBlob(blob.id))
     }
 }

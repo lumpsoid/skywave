@@ -8,6 +8,7 @@
 //! - [`run`]: the terminal event loop.
 
 pub mod app;
+pub mod composer;
 pub mod ui;
 
 use std::io;
