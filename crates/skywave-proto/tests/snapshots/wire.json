@@ -1,7 +1,7 @@
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "hello": {
-    "protocol_version": 1,
+    "protocol_version": 2,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16
@@ -55,8 +55,14 @@
         "at": "2026-10-29T12:00:00Z",
         "kind": {
           "type": "tool_call",
-          "name": "bash",
-          "summary": "cargo test",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "name": "exec",
+          "display": {
+            "kind": "shell",
+            "title": "cargo test",
+            "detail": "run the test suite",
+            "body": null
+          },
           "input": null
         }
       },
@@ -65,8 +71,22 @@
         "at": "2026-10-29T12:00:00Z",
         "kind": {
           "type": "tool_call",
-          "name": "write",
-          "summary": "src/lib.rs",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "name": "patch",
+          "display": {
+            "kind": "file_edit",
+            "title": "src/lib.rs",
+            "detail": null,
+            "body": {
+              "format": "diff",
+              "preview": "@@ -1 +1 @@\n-old\n+new",
+              "lines": 120,
+              "full": {
+                "id": "01920000-0000-7000-8000-000000000005",
+                "size": 48213
+              }
+            }
+          },
           "input": {
             "id": "01920000-0000-7000-8000-000000000005",
             "size": 48213
@@ -77,8 +97,33 @@
         "session_id": "01920000-0000-7000-8000-000000000001",
         "at": "2026-10-29T12:00:00Z",
         "kind": {
+          "type": "tool_call",
+          "call": null,
+          "name": "put",
+          "display": {
+            "kind": "file_write",
+            "title": "notes.txt",
+            "detail": null,
+            "body": {
+              "format": "text",
+              "preview": "hello",
+              "lines": 1,
+              "full": null
+            }
+          },
+          "input": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
           "type": "tool_result",
-          "summary": "exit 0",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "is_error": false,
+          "status": "exit 0",
+          "preview": "running 3 tests\ntest a ... ok",
+          "lines": 40,
           "output": {
             "id": "01920000-0000-7000-8000-000000000005",
             "size": 48213
@@ -90,7 +135,24 @@
         "at": "2026-10-29T12:00:00Z",
         "kind": {
           "type": "tool_result",
-          "summary": "no output",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "is_error": true,
+          "status": "exit 1",
+          "preview": "error: no such file",
+          "lines": 1,
+          "output": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "tool_result",
+          "call": null,
+          "is_error": false,
+          "status": null,
+          "preview": "",
+          "lines": 0,
           "output": null
         }
       },
@@ -100,7 +162,8 @@
         "kind": {
           "type": "approval_requested",
           "id": "01920000-0000-7000-8000-000000000004",
-          "tool": "bash",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "tool": "exec",
           "summary": "rm -rf target",
           "input": null
         }
@@ -111,7 +174,8 @@
         "kind": {
           "type": "approval_requested",
           "id": "01920000-0000-7000-8000-000000000004",
-          "tool": "write",
+          "call": null,
+          "tool": "put",
           "summary": "src/main.rs",
           "input": {
             "id": "01920000-0000-7000-8000-000000000005",

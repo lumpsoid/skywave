@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, Event, EventBatch, EventKind,
-    SessionState as LogState,
+    SessionState as LogState, ToolCall, ToolResult,
 };
 
 use crate::action::{Action, Route};
@@ -410,6 +410,7 @@ impl Model {
             events.iter().find_map(|(_, event)| match &event.kind {
                 EventKind::ApprovalRequested {
                     id,
+                    call: _,
                     tool,
                     summary,
                     input,
@@ -488,21 +489,25 @@ impl Model {
                 EventKind::AgentMessage { text } => {
                     Some(Entry::AgentMessage { text: text.clone() })
                 }
-                EventKind::ToolCall {
+                EventKind::ToolCall(ToolCall {
                     name,
-                    summary,
+                    display,
                     input,
-                } => Some(Entry::ToolCall {
+                    ..
+                }) => Some(Entry::ToolCall {
                     name: name.clone(),
-                    summary: summary.clone(),
+                    summary: display.title.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
                 }),
-                EventKind::ToolResult { summary, output } => Some(Entry::ToolResult {
-                    summary: summary.clone(),
+                EventKind::ToolResult(ToolResult {
+                    preview, output, ..
+                }) => Some(Entry::ToolResult {
+                    summary: preview.clone(),
                     output: output.as_ref().map(|b| self.blob_view(b)),
                 }),
                 EventKind::ApprovalRequested {
                     id,
+                    call: _,
                     tool,
                     summary,
                     input,
@@ -598,7 +603,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use chrono::{TimeZone, Utc};
-    use skywave_proto::{BlobRef, Decision, RejectReason};
+    use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind};
 
     use super::*;
     use crate::view::LinkRejection;
@@ -936,6 +941,7 @@ mod tests {
                 EventKind::SessionStateChanged(LogState::AgentWorking),
                 EventKind::ApprovalRequested {
                     id: approval,
+                    call: None,
                     tool: "bash".into(),
                     summary: "rm -rf build".into(),
                     input: Some(input.clone()),
@@ -1039,6 +1045,7 @@ mod tests {
             sid,
             vec![EventKind::ApprovalRequested {
                 id: approval,
+                call: None,
                 tool: "edit".into(),
                 summary: "main.rs".into(),
                 input: None,
@@ -1111,15 +1118,25 @@ mod tests {
         f.log(
             sid,
             vec![
-                EventKind::ToolCall {
+                EventKind::ToolCall(ToolCall {
+                    call: None,
                     name: "bash".into(),
-                    summary: "cargo test".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::Other,
+                        title: "cargo test".into(),
+                        detail: None,
+                        body: None,
+                    },
                     input: None,
-                },
-                EventKind::ToolResult {
-                    summary: "40 passed".into(),
+                }),
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "40 passed".into(),
+                    lines: 1,
                     output: Some(output.clone()),
-                },
+                }),
             ],
         );
         f.open(sid);

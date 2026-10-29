@@ -60,7 +60,9 @@ impl Fixture {
     }
 
     fn agent(&mut self, session: SessionId, kind: EventKind) -> Seq {
-        self.log.append(&mut self.storage.db, session, kind).unwrap()
+        self.log
+            .append(&mut self.storage.db, session, kind)
+            .unwrap()
     }
 
     fn start_turn(&mut self, session: SessionId) {
@@ -76,6 +78,7 @@ impl Fixture {
             session,
             EventKind::ApprovalRequested {
                 id,
+                call: None,
                 tool: "Bash".into(),
                 summary: "ls".into(),
                 input: None,
@@ -114,7 +117,12 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
     let session = f.create_session();
     assert_eq!(f.log.head(), Seq(1));
     for i in 0..4 {
-        let seq = f.agent(session, EventKind::AgentMessage { text: i.to_string() });
+        let seq = f.agent(
+            session,
+            EventKind::AgentMessage {
+                text: i.to_string(),
+            },
+        );
         assert_eq!(seq, Seq(2 + i));
     }
     assert_eq!(f.log.head(), Seq(5));
@@ -126,11 +134,17 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
         page.events[1].kind,
         EventKind::AgentMessage { text: "1".into() }
     );
-    let rest = f.log.read(&f.storage.db, page.last().unwrap(), 100).unwrap();
+    let rest = f
+        .log
+        .read(&f.storage.db, page.last().unwrap(), 100)
+        .unwrap();
     assert_eq!(rest.from, Seq(4));
     assert_eq!(rest.events.len(), 2);
 
-    let empty = f.log.read(&f.storage.db, Seq(5), DEFAULT_BATCH_LIMIT).unwrap();
+    let empty = f
+        .log
+        .read(&f.storage.db, Seq(5), DEFAULT_BATCH_LIMIT)
+        .unwrap();
     assert_eq!(empty.from, Seq(6));
     assert!(empty.events.is_empty());
     assert_eq!(empty.last(), None);
@@ -174,7 +188,10 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
     // A resend, even over another connection, gets the same answer.
     let mut other = f.connection();
     for _ in 0..3 {
-        assert_eq!(f.log.handle(&mut other.db, device, &command).unwrap(), first);
+        assert_eq!(
+            f.log.handle(&mut other.db, device, &command).unwrap(),
+            first
+        );
     }
     assert_eq!(f.log.head(), seq);
     assert_eq!(
@@ -224,7 +241,10 @@ fn rejected_results_are_stored_and_stay_stable() {
     };
     let answer = f.log.handle(&mut f.storage.db, device, &late).unwrap();
     assert_eq!(answer, rejected(RejectReason::ApprovalAlreadyResolved));
-    assert_eq!(f.log.handle(&mut f.storage.db, device, &late).unwrap(), answer);
+    assert_eq!(
+        f.log.handle(&mut f.storage.db, device, &late).unwrap(),
+        answer
+    );
     assert_eq!(
         f.log.handle(&mut f.storage.db, device, &command).unwrap(),
         first
@@ -253,10 +273,16 @@ fn concurrent_resends_of_one_command_append_once() {
     });
     assert!(results.iter().all(|r| *r == results[0]));
     assert_eq!(accepted(results[0].clone()), Seq(1));
-    assert_eq!(f.log.read(&setup.db, Seq::ZERO, 100).unwrap().events.len(), 1);
+    assert_eq!(
+        f.log.read(&setup.db, Seq::ZERO, 100).unwrap().events.len(),
+        1
+    );
     assert_eq!(f.log.sessions(&setup.db).unwrap().len(), 1);
     // The handle still works on a connection opened before the race.
-    assert_eq!(f.log.handle(&mut setup.db, device, &create).unwrap(), results[0]);
+    assert_eq!(
+        f.log.handle(&mut setup.db, device, &create).unwrap(),
+        results[0]
+    );
 }
 
 // --- ordering across concurrent writers ------------------------------------
@@ -368,7 +394,10 @@ fn create_session_rejects_workdirs_outside_roots() {
             RejectReason::WorkdirNotAllowed,
         ),
         ("root/project".to_owned(), RejectReason::WorkdirNotAllowed),
-        (workdir(&f.root.join("missing")), RejectReason::WorkdirNotFound),
+        (
+            workdir(&f.root.join("missing")),
+            RejectReason::WorkdirNotFound,
+        ),
         (workdir(&file), RejectReason::WorkdirNotFound),
     ];
     for (dir, reason) in cases {
@@ -461,7 +490,9 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
     );
     assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
     assert_eq!(
-        f.log.cancel_approval(&mut f.storage.db, approval, "late").unwrap(),
+        f.log
+            .cancel_approval(&mut f.storage.db, approval, "late")
+            .unwrap(),
         None
     );
 
@@ -499,12 +530,27 @@ fn interrupt_needs_an_active_turn_and_ends_it() {
     );
 
     f.start_turn(session);
-    assert!(f.log.session(&f.storage.db, session).unwrap().unwrap().turn_active);
+    assert!(
+        f.log
+            .session(&f.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .turn_active
+    );
     let seq = accepted(f.handle(CommandKind::Interrupt {
         session_id: session,
     }));
-    assert_eq!(f.all_kinds()[seq.0 as usize - 1], EventKind::TurnInterrupted);
-    assert!(!f.log.session(&f.storage.db, session).unwrap().unwrap().turn_active);
+    assert_eq!(
+        f.all_kinds()[seq.0 as usize - 1],
+        EventKind::TurnInterrupted
+    );
+    assert!(
+        !f.log
+            .session(&f.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .turn_active
+    );
     // The turn is already interrupted, so a second interrupt has nothing to stop.
     assert_eq!(
         f.handle(CommandKind::Interrupt {
@@ -563,6 +609,7 @@ fn agent_appends_are_checked() {
         session,
         EventKind::ApprovalRequested {
             id: approval,
+            call: None,
             tool: "Bash".into(),
             summary: "again".into(),
             input: None,

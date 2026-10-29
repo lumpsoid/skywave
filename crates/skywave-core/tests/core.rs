@@ -14,7 +14,7 @@ use skywave_core::{
 };
 use skywave_proto::{
     BlobId, BlobRef, CommandKind, CommandResult, DeviceId, Event, EventBatch, EventKind, Seq,
-    SessionId,
+    SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -322,10 +322,14 @@ fn blob_progress_is_persisted_and_shown() {
             event(
                 sid,
                 1,
-                EventKind::ToolResult {
-                    summary: "log".into(),
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "log".into(),
+                    lines: 1,
                     output: Some(blob.clone()),
-                },
+                }),
             ),
         ],
     })

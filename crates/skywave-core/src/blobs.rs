@@ -454,7 +454,7 @@ mod tests {
     use chrono::Utc;
     use skywave_proto::{
         BlobId as ProtoBlobId, BlobRef, Command, CommandResult, Event, EventBatch, EventKind,
-        EventsQuery, HelloResponse, Seq, SessionId,
+        EventsQuery, HelloResponse, Seq, SessionId, ToolResult,
     };
 
     use super::*;
@@ -570,10 +570,14 @@ mod tests {
                     event(EventKind::SessionCreated {
                         workdir: "/srv".into(),
                     }),
-                    event(EventKind::ToolResult {
-                        summary: "big".into(),
+                    event(EventKind::ToolResult(ToolResult {
+                        call: None,
+                        is_error: false,
+                        status: None,
+                        preview: "big".into(),
+                        lines: 1,
                         output: Some(blob.clone()),
-                    }),
+                    })),
                 ],
             })
             .unwrap();

@@ -1,7 +1,10 @@
 //! Maps one session's [`AdapterEvent`]s to log events.
 
 use serde_json::Value;
-use skywave_proto::{ApprovalId, BlobRef, EventKind, Seq, SessionId, SessionState};
+use skywave_proto::{
+    ApprovalId, BlobRef, EventKind, Seq, SessionId, SessionState, ToolCall, ToolDisplay, ToolKind,
+    ToolResult,
+};
 
 use super::{AdapterEvent, AgentRequestId, TurnOutcome, store_resume_handle};
 use crate::error::Result;
@@ -126,14 +129,21 @@ impl EventMapper {
                 seqs.push(self.append(
                     log,
                     storage,
-                    EventKind::ToolCall {
+                    EventKind::ToolCall(ToolCall {
+                        call: None,
                         name,
-                        summary,
+                        display: ToolDisplay {
+                            kind: ToolKind::Other,
+                            title: summary,
+                            detail: None,
+                            body: None,
+                        },
                         input,
-                    },
+                    }),
                 )?);
             }
             AdapterEvent::ToolResult { output, is_error } => {
+                let lines = u32::try_from(output.lines().count()).unwrap_or(u32::MAX);
                 let (mut summary, output) = if output.is_empty() {
                     ("(no output)".to_owned(), None)
                 } else {
@@ -142,7 +152,18 @@ impl EventMapper {
                 if is_error {
                     summary.insert_str(0, "[error] ");
                 }
-                seqs.push(self.append(log, storage, EventKind::ToolResult { summary, output })?);
+                seqs.push(self.append(
+                    log,
+                    storage,
+                    EventKind::ToolResult(ToolResult {
+                        call: None,
+                        is_error,
+                        status: None,
+                        preview: summary,
+                        lines,
+                        output,
+                    }),
+                )?);
             }
             AdapterEvent::ApprovalRequested {
                 request,
@@ -156,6 +177,7 @@ impl EventMapper {
                     storage,
                     EventKind::ApprovalRequested {
                         id,
+                        call: None,
                         tool,
                         summary,
                         input,

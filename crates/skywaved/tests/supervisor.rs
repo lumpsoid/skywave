@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, Seq, SessionId, SessionState,
+    RejectReason, Seq, SessionId, SessionState, ToolResult,
 };
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, Step};
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
@@ -223,7 +223,9 @@ async fn full_turn_through_commands() {
             ..
         }
     ));
-    assert!(matches!(&kinds[5], EventKind::ToolResult { summary, .. } if summary == "written"));
+    assert!(
+        matches!(&kinds[5], EventKind::ToolResult(ToolResult { preview, .. }) if preview == "written")
+    );
     assert_eq!(
         kinds[6],
         EventKind::AgentMessage {

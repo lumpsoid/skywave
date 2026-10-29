@@ -5,7 +5,9 @@
 //! the events, so the projection never runs ahead of or behind the log.
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState};
+use skywave_proto::{
+    ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall, ToolResult,
+};
 
 /// What the session list needs to know about one session.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,10 +75,9 @@ impl SessionSummary {
 /// The blob an event references, if any.
 pub(crate) fn blob_ref(kind: &EventKind) -> Option<&BlobRef> {
     match kind {
-        EventKind::ToolCall { input, .. } | EventKind::ApprovalRequested { input, .. } => {
-            input.as_ref()
-        }
-        EventKind::ToolResult { output, .. } => output.as_ref(),
+        EventKind::ToolCall(ToolCall { input, .. })
+        | EventKind::ApprovalRequested { input, .. } => input.as_ref(),
+        EventKind::ToolResult(ToolResult { output, .. }) => output.as_ref(),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
@@ -120,12 +121,14 @@ mod tests {
             EventKind::SessionStateChanged(SessionState::AgentWorking),
             EventKind::ApprovalRequested {
                 id: a1,
+                call: None,
                 tool: "bash".into(),
                 summary: "ls".into(),
                 input: None,
             },
             EventKind::ApprovalRequested {
                 id: a2,
+                call: None,
                 tool: "bash".into(),
                 summary: "pwd".into(),
                 input: None,

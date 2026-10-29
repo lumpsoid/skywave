@@ -7,7 +7,7 @@ use chrono::{TimeZone, Utc};
 use skywave_core::{BlobPolicy, BlobStatus, OutboxStatus, Settings, Store, StoreError};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
-    DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState,
+    DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState, ToolResult,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -58,16 +58,21 @@ impl Log {
             event(
                 a,
                 3,
-                EventKind::ToolResult {
-                    summary: "ran tests".into(),
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "ran tests".into(),
+                    lines: 1,
                     output: Some(blob.clone()),
-                },
+                }),
             ),
             event(
                 a,
                 4,
                 EventKind::ApprovalRequested {
                     id: approval,
+                    call: None,
                     tool: "bash".into(),
                     summary: "rm -rf target".into(),
                     input: None,

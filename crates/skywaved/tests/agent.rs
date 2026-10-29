@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde_json::json;
 use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, Seq, SessionId, SessionState,
+    RejectReason, Seq, SessionId, SessionState, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step};
 use skywaved::agent::{
@@ -108,8 +108,9 @@ impl Fixture {
 
     fn blob(&self, kind: &EventKind) -> String {
         let blob = match kind {
-            EventKind::ToolCall { input, .. } | EventKind::ApprovalRequested { input, .. } => input,
-            EventKind::ToolResult { output, .. } => output,
+            EventKind::ToolCall(ToolCall { input, .. })
+            | EventKind::ApprovalRequested { input, .. } => input,
+            EventKind::ToolResult(ToolResult { output, .. }) => output,
             other => panic!("no blob in {other:?}"),
         }
         .clone()
@@ -236,23 +237,36 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     // A small input is carried whole in the summary.
     assert_eq!(
         kinds[3],
-        EventKind::ToolCall {
+        EventKind::ToolCall(ToolCall {
+            call: None,
             name: "shell".into(),
-            summary: r#"{"command":"ls -la"}"#.into(),
+            display: ToolDisplay {
+                kind: ToolKind::Other,
+                title: r#"{"command":"ls -la"}"#.into(),
+                detail: None,
+                body: None
+            },
             input: None,
-        }
+        })
     );
     // A large output becomes a blob with a preview summary.
-    let EventKind::ToolResult { summary, output } = &kinds[4] else {
+    let EventKind::ToolResult(ToolResult {
+        preview,
+        lines,
+        output,
+        ..
+    }) = &kinds[4]
+    else {
         panic!("expected ToolResult, got {:?}", kinds[4]);
     };
     assert!(big_output().len() > DEFAULT_BLOB_THRESHOLD);
-    assert_eq!(summary, "line 0000 of the listing… [400 lines, 9.8 KiB]");
+    assert_eq!(preview, "line 0000 of the listing… [400 lines, 9.8 KiB]");
+    assert_eq!(*lines, 400);
     assert_eq!(output.as_ref().unwrap().size, big_output().len() as u64);
     assert_eq!(f.blob(&kinds[4]), big_output());
     assert!(matches!(
         &kinds[5],
-        EventKind::ApprovalRequested { id: a, tool, summary, input: None }
+        EventKind::ApprovalRequested { id: a, call: None, tool, summary, input: None }
             if *a == id && tool == "write" && summary == r#"{"content":"hi","path":"notes.txt"}"#
     ));
     assert!(matches!(
@@ -264,10 +278,14 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     ));
     assert_eq!(
         kinds[7],
-        EventKind::ToolResult {
-            summary: "written".into(),
-            output: None
-        }
+        EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: false,
+            status: None,
+            preview: "written".into(),
+            lines: 1,
+            output: None,
+        })
     );
     assert_eq!(
         kinds[8],
@@ -458,10 +476,14 @@ async fn denied_approval_runs_the_deny_branch() {
     let n = kinds.len();
     assert_eq!(
         kinds[n - 3],
-        EventKind::ToolResult {
-            summary: "[error] denied by user".into(),
-            output: None
-        }
+        EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: true,
+            status: None,
+            preview: "[error] denied by user".into(),
+            lines: 1,
+            output: None,
+        })
     );
     assert_eq!(
         kinds[n - 2],
@@ -610,10 +632,14 @@ async fn exit_with_a_pending_approval_cancels_it() {
     }
     let kinds = f.kinds();
     // Over the lowered threshold: the input is a pretty-printed JSON blob.
-    let EventKind::ToolCall { summary, .. } = &kinds[1] else {
+    let EventKind::ToolCall(ToolCall { display, .. }) = &kinds[1] else {
         panic!("expected ToolCall, got {:?}", kinds[1]);
     };
-    assert!(summary.starts_with(r#"{"content":"a long enough body","path":"a.txt"}…"#));
+    assert!(
+        display
+            .title
+            .starts_with(r#"{"content":"a long enough body","path":"a.txt"}…"#)
+    );
     let blob: serde_json::Value = serde_json::from_str(&f.blob(&kinds[1])).unwrap();
     assert_eq!(blob["path"], "a.txt");
     assert!(f.blob(&kinds[1]).contains('\n'));
@@ -623,10 +649,14 @@ async fn exit_with_a_pending_approval_cancels_it() {
     );
     assert_eq!(
         kinds[3],
-        EventKind::ToolResult {
-            summary: "(no output)".into(),
-            output: None
-        }
+        EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: false,
+            status: None,
+            preview: "(no output)".into(),
+            lines: 0,
+            output: None,
+        })
     );
     assert_eq!(
         kinds[4],

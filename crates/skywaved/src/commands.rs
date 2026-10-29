@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, DeviceId, EventKind, RejectReason, Seq, SessionId,
+    Command, CommandId, CommandKind, CommandResult, DeviceId, EventKind, RejectReason, Seq,
+    SessionId,
 };
 
 use crate::db::Db;
@@ -39,7 +40,12 @@ impl EventLog {
     /// database failed and nothing was recorded, so a resend is still safe.
     ///
     /// Blocking: it runs SQLite and, for `CreateSession`, file system calls.
-    pub fn handle(&self, db: &mut Db, device: DeviceId, command: &Command) -> Result<CommandResult> {
+    pub fn handle(
+        &self,
+        db: &mut Db,
+        device: DeviceId,
+        command: &Command,
+    ) -> Result<CommandResult> {
         let tx = event_log::begin(db)?;
         if let Some(stored) = stored_result(&tx, command.id)? {
             return Ok(stored);

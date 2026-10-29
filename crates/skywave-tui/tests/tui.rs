@@ -16,7 +16,8 @@ use skywave_core::{
     SessionId, ViewState,
 };
 use skywave_proto::{
-    BlobRef, CommandResult, Event, EventBatch, EventKind, SessionState as LogState,
+    BlobRef, CommandResult, Event, EventBatch, EventKind, SessionState as LogState, ToolCall,
+    ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
@@ -604,6 +605,7 @@ fn every_session_state_has_its_own_badge() {
                 5,
                 EventKind::ApprovalRequested {
                     id: ApprovalId::new(),
+                    call: None,
                     tool: "Bash".into(),
                     summary: "rm -rf target".into(),
                     input: None,
@@ -802,19 +804,29 @@ fn every_timeline_entry_renders_distinctly() {
             event(
                 id,
                 3,
-                EventKind::ToolCall {
+                EventKind::ToolCall(ToolCall {
+                    call: None,
                     name: "shell".into(),
-                    summary: "{\"command\":\"ls\"}".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::Other,
+                        title: "{\"command\":\"ls\"}".into(),
+                        detail: None,
+                        body: None,
+                    },
                     input: None,
-                },
+                }),
             ),
             event(
                 id,
                 4,
-                EventKind::ToolResult {
-                    summary: "file-000".into(),
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "file-000".into(),
+                    lines: 1,
                     output: Some(output),
-                },
+                }),
             ),
             event(id, 5, EventKind::TurnInterrupted),
             event(
@@ -939,6 +951,7 @@ fn approval_prompt_answer_and_resolutions() {
             1,
             EventKind::ApprovalRequested {
                 id: first,
+                call: None,
                 tool: "write".into(),
                 summary: "{\"path\":\"a.txt\"}".into(),
                 input: Some(input),
@@ -996,6 +1009,7 @@ fn approval_prompt_answer_and_resolutions() {
             3,
             EventKind::ApprovalRequested {
                 id: second,
+                call: None,
                 tool: "shell".into(),
                 summary: "rm -rf build".into(),
                 input: None,
@@ -1032,6 +1046,7 @@ fn approval_prompt_answer_and_resolutions() {
                 5,
                 EventKind::ApprovalRequested {
                     id: third,
+                    call: None,
                     tool: "net".into(),
                     summary: "curl".into(),
                     input: None,
@@ -1117,19 +1132,29 @@ fn tool_output_expands_through_every_blob_state() {
             event(
                 id,
                 1,
-                EventKind::ToolCall {
+                EventKind::ToolCall(ToolCall {
+                    call: None,
                     name: "shell".into(),
-                    summary: "line a\nline b\nline c".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::Other,
+                        title: "line a\nline b\nline c".into(),
+                        detail: None,
+                        body: None,
+                    },
                     input: None,
-                },
+                }),
             ),
             event(
                 id,
                 2,
-                EventKind::ToolResult {
-                    summary: "file-000".into(),
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "file-000".into(),
+                    lines: 1,
                     output: Some(output),
-                },
+                }),
             ),
         ],
     );
@@ -1204,10 +1229,14 @@ fn large_blobs_are_cut_short_when_shown() {
         vec![event(
             id,
             1,
-            EventKind::ToolResult {
-                summary: "row 0".into(),
+            EventKind::ToolResult(ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "row 0".into(),
+                lines: 1,
                 output: Some(output),
-            },
+            }),
         )],
     );
     h.seam
@@ -1282,11 +1311,17 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
     let mut events = vec![event(
         id,
         1,
-        EventKind::ToolCall {
+        EventKind::ToolCall(ToolCall {
+            call: None,
             name: "early".into(),
-            summary: "first".into(),
+            display: ToolDisplay {
+                kind: ToolKind::Other,
+                title: "first".into(),
+                detail: None,
+                body: None,
+            },
             input: None,
-        },
+        }),
     )];
     events.extend((0..40).map(|i| {
         event(
@@ -1300,11 +1335,17 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
     events.push(event(
         id,
         3,
-        EventKind::ToolCall {
+        EventKind::ToolCall(ToolCall {
+            call: None,
             name: "late".into(),
-            summary: "second".into(),
+            display: ToolDisplay {
+                kind: ToolKind::Other,
+                title: "second".into(),
+                detail: None,
+                body: None,
+            },
             input: None,
-        },
+        }),
     ));
     pull(&mut h, events);
     assert!(!h.screen().contains("tool early"));

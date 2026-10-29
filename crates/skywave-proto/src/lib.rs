@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Wire protocol version. Bump on any incompatible change to these types.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: tool calls carry a [`CallId`] and a bounded [`ToolDisplay`] instead of
+/// a free-form summary; v1 log events still decode (see [`ToolCall`],
+/// [`ToolResult`]).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -54,6 +58,12 @@ uuid_id!(
 uuid_id!(
     /// Identifies a pending approval request.
     ApprovalId
+);
+uuid_id!(
+    /// Identifies one tool call within a session, linking its [`ToolCall`],
+    /// [`ToolResult`] and approval. Minted by the server when it logs the
+    /// call; the agent's own call ids never reach clients (D4).
+    CallId
 );
 uuid_id!(
     /// Identifies a server; reported by `GET /v1/hello`.
@@ -116,19 +126,18 @@ pub enum EventKind {
     AgentMessage {
         text: String,
     },
-    ToolCall {
-        name: String,
-        summary: String,
-        input: Option<BlobRef>,
-    },
-    ToolResult {
-        summary: String,
-        output: Option<BlobRef>,
-    },
-    /// The agent is blocked until a device answers (D8). `input` holds the
-    /// full request when it is too large for `summary`.
+    ToolCall(ToolCall),
+    ToolResult(ToolResult),
+    /// The agent is blocked until a device answers (D8).
+    ///
+    /// `call` is the [`ToolCall`] the approval gates; `summary` is then that
+    /// call's title and `input` is `None` unless the request differs from the
+    /// call's input. `call` is `None` in v1 events and for an approval with
+    /// no logged call.
     ApprovalRequested {
         id: ApprovalId,
+        #[serde(default)]
+        call: Option<CallId>,
         tool: String,
         summary: String,
         input: Option<BlobRef>,
@@ -147,6 +156,206 @@ pub enum EventKind {
     /// The agent's current turn was stopped by an `Interrupt` command.
     TurnInterrupted,
     SessionStateChanged(SessionState),
+}
+
+/// Size caps on the bounded text in tool events. Producers (the server)
+/// enforce them; v1 events decoded for compatibility may exceed them, so
+/// renderers should still clip.
+pub mod limits {
+    /// Longest [`ToolDisplay::title`](crate::ToolDisplay::title), in chars.
+    pub const TITLE_MAX_CHARS: usize = 120;
+    /// Longest [`ToolDisplay::detail`](crate::ToolDisplay::detail), in chars.
+    pub const DETAIL_MAX_CHARS: usize = 120;
+    /// Longest [`ToolResult::status`](crate::ToolResult::status), in chars.
+    pub const STATUS_MAX_CHARS: usize = 60;
+    /// Most lines in a preview ([`Body::preview`](crate::Body::preview),
+    /// [`ToolResult::preview`](crate::ToolResult::preview)).
+    pub const PREVIEW_MAX_LINES: usize = 8;
+    /// Most UTF-8 bytes in a preview.
+    pub const PREVIEW_MAX_BYTES: usize = 512;
+}
+
+/// The agent invoked a tool.
+///
+/// `name` is the agent's own tool name, carried as data for display; clients
+/// must not branch on it, only on [`ToolDisplay::kind`]. `input` is the full
+/// input as a blob, when it is worth fetching.
+///
+/// **v1 compatibility.** A v1 `tool_call` has a free-form `summary` and no
+/// `call` or `display`; it decodes as `call: None` and a display of kind
+/// [`ToolKind::Other`] whose title is the summary. A v2 server always sets
+/// `call`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(try_from = "compat::ToolCallWire")]
+pub struct ToolCall {
+    pub call: Option<CallId>,
+    pub name: String,
+    pub display: ToolDisplay,
+    pub input: Option<BlobRef>,
+}
+
+/// What a client shows for a tool call, decided by the server (D4).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolDisplay {
+    pub kind: ToolKind,
+    /// One line, at most [`limits::TITLE_MAX_CHARS`], e.g. a path or command.
+    pub title: String,
+    /// Optional second line, at most [`limits::DETAIL_MAX_CHARS`].
+    pub detail: Option<String>,
+    /// Content worth showing beneath the title, e.g. a diff.
+    pub body: Option<Body>,
+}
+
+/// What a tool does, for choosing an icon and layout. Agent-agnostic (D3):
+/// the server maps each agent tool onto one of these. An unknown kind from a
+/// newer server decodes as [`ToolKind::Other`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    FileWrite,
+    FileEdit,
+    FileRead,
+    Shell,
+    Search,
+    Fetch,
+    Subagent,
+    #[serde(other)]
+    Other,
+}
+
+/// A bounded preview of some content, with the full content as a blob.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Body {
+    pub format: BodyFormat,
+    /// Head of the content: at most [`limits::PREVIEW_MAX_LINES`] lines and
+    /// [`limits::PREVIEW_MAX_BYTES`] bytes, with real newlines.
+    pub preview: String,
+    /// Line count of the whole content.
+    pub lines: u32,
+    /// The whole content, when `preview` does not hold all of it.
+    pub full: Option<BlobRef>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyFormat {
+    Text,
+    /// A unified diff.
+    Diff,
+}
+
+/// A tool finished.
+///
+/// **v1 compatibility.** A v1 `tool_result` has only `summary` and `output`;
+/// it decodes as `call: None`, `is_error: false`, `status: None`, the summary
+/// verbatim as `preview` and its line count as `lines`. (A v1 server marked
+/// failures with a `[error] ` summary prefix; it stays in the preview rather
+/// than being guessed into `is_error`.)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(try_from = "compat::ToolResultWire")]
+pub struct ToolResult {
+    /// The [`ToolCall`] this answers; `None` in v1 events or when the agent
+    /// reported a result for no logged call.
+    pub call: Option<CallId>,
+    pub is_error: bool,
+    /// Short outcome, at most [`limits::STATUS_MAX_CHARS`], e.g. `created`,
+    /// `exit 1`, `3 matches`.
+    pub status: Option<String>,
+    /// Head of the output: at most [`limits::PREVIEW_MAX_LINES`] lines and
+    /// [`limits::PREVIEW_MAX_BYTES`] bytes, with real newlines.
+    pub preview: String,
+    /// Line count of the whole output.
+    pub lines: u32,
+    /// The whole output, when `preview` does not hold all of it.
+    pub output: Option<BlobRef>,
+}
+
+/// Decoders that accept both v1 and v2 tool events.
+mod compat {
+    use serde::Deserialize;
+
+    use crate::{BlobRef, CallId, ToolCall, ToolDisplay, ToolKind, ToolResult};
+
+    /// A `tool_call` as v1 (`summary`) or v2 (`call`, `display`) wrote it.
+    #[derive(Deserialize)]
+    pub(crate) struct ToolCallWire {
+        #[serde(default)]
+        call: Option<CallId>,
+        name: String,
+        #[serde(default)]
+        display: Option<ToolDisplay>,
+        /// v1 only.
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        input: Option<BlobRef>,
+    }
+
+    impl TryFrom<ToolCallWire> for ToolCall {
+        type Error = &'static str;
+
+        fn try_from(wire: ToolCallWire) -> Result<Self, Self::Error> {
+            let display = match (wire.display, wire.summary) {
+                (Some(display), _) => display,
+                (None, Some(summary)) => ToolDisplay {
+                    kind: ToolKind::Other,
+                    title: summary,
+                    detail: None,
+                    body: None,
+                },
+                (None, None) => return Err("tool_call needs `display` (v2) or `summary` (v1)"),
+            };
+            Ok(ToolCall {
+                call: wire.call,
+                name: wire.name,
+                display,
+                input: wire.input,
+            })
+        }
+    }
+
+    /// A `tool_result` as v1 (`summary`) or v2 (`preview`, `lines`) wrote it.
+    #[derive(Deserialize)]
+    pub(crate) struct ToolResultWire {
+        #[serde(default)]
+        call: Option<CallId>,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        preview: Option<String>,
+        #[serde(default)]
+        lines: Option<u32>,
+        /// v1 only.
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        output: Option<BlobRef>,
+    }
+
+    impl TryFrom<ToolResultWire> for ToolResult {
+        type Error = &'static str;
+
+        fn try_from(wire: ToolResultWire) -> Result<Self, Self::Error> {
+            let (preview, lines) = match (wire.preview, wire.lines, wire.summary) {
+                (Some(preview), Some(lines), _) => (preview, lines),
+                (None, None, Some(summary)) => {
+                    let lines = u32::try_from(summary.lines().count()).unwrap_or(u32::MAX);
+                    (summary, lines)
+                }
+                _ => return Err("tool_result needs `preview` and `lines` (v2) or `summary` (v1)"),
+            };
+            Ok(ToolResult {
+                call: wire.call,
+                is_error: wire.is_error,
+                status: wire.status,
+                preview,
+                lines,
+                output: wire.output,
+            })
+        }
+    }
 }
 
 /// Agent state as recorded in the log.
@@ -202,11 +411,21 @@ pub struct Command {
 pub enum CommandKind {
     /// Start a session in `workdir`, which must lie under one of the
     /// server's configured roots (D14).
-    CreateSession { workdir: String },
-    SendMessage { session_id: SessionId, text: String },
-    ResolveApproval { id: ApprovalId, decision: Decision },
+    CreateSession {
+        workdir: String,
+    },
+    SendMessage {
+        session_id: SessionId,
+        text: String,
+    },
+    ResolveApproval {
+        id: ApprovalId,
+        decision: Decision,
+    },
     /// Stop the agent's current turn in this session.
-    Interrupt { session_id: SessionId },
+    Interrupt {
+        session_id: SessionId,
+    },
 }
 
 /// Response to `POST /v1/commands`. Resending a [`CommandId`] returns the
@@ -298,4 +517,3 @@ pub mod path {
         format!("/v1/blobs/{}", id.0)
     }
 }
-
