@@ -5,7 +5,7 @@
 //! the events, so the projection never runs ahead of or behind the log.
 
 use chrono::{DateTime, Utc};
-use skywave_proto::{ApprovalId, Event, EventKind, Seq, SessionId, SessionState};
+use skywave_proto::{ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState};
 
 /// What the session list needs to know about one session.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +67,23 @@ impl SessionSummary {
     /// The approval the session is blocked on, if any (the oldest one).
     pub fn pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().copied()
+    }
+}
+
+/// The blob an event references, if any.
+pub(crate) fn blob_ref(kind: &EventKind) -> Option<&BlobRef> {
+    match kind {
+        EventKind::ToolCall { input, .. } | EventKind::ApprovalRequested { input, .. } => {
+            input.as_ref()
+        }
+        EventKind::ToolResult { output, .. } => output.as_ref(),
+        EventKind::SessionCreated { .. }
+        | EventKind::UserMessage { .. }
+        | EventKind::AgentMessage { .. }
+        | EventKind::ApprovalResolved { .. }
+        | EventKind::ApprovalCancelled { .. }
+        | EventKind::TurnInterrupted
+        | EventKind::SessionStateChanged(_) => None,
     }
 }
 

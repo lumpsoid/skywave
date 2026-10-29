@@ -14,13 +14,10 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use skywave_proto::{
-    BlobId, BlobRef, Command, CommandId, CommandResult, Event, EventBatch, EventKind, Seq,
-    SessionId,
-};
+use skywave_proto::{BlobId, Command, CommandId, CommandResult, Event, EventBatch, Seq, SessionId};
 use uuid::Uuid;
 
-use crate::projection::SessionSummary;
+use crate::projection::{SessionSummary, blob_ref};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -534,23 +531,6 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
-}
-
-/// The blob an event references, if any.
-fn blob_ref(kind: &EventKind) -> Option<&BlobRef> {
-    match kind {
-        EventKind::ToolCall { input, .. } | EventKind::ApprovalRequested { input, .. } => {
-            input.as_ref()
-        }
-        EventKind::ToolResult { output, .. } => output.as_ref(),
-        EventKind::SessionCreated { .. }
-        | EventKind::UserMessage { .. }
-        | EventKind::AgentMessage { .. }
-        | EventKind::ApprovalResolved { .. }
-        | EventKind::ApprovalCancelled { .. }
-        | EventKind::TurnInterrupted
-        | EventKind::SessionStateChanged(_) => None,
-    }
 }
 
 fn read_cursor(conn: &Connection) -> Result<Seq, StoreError> {
