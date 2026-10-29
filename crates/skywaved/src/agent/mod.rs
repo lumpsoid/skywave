@@ -99,6 +99,10 @@ pub struct ToolDisplay {
     pub detail: Option<String>,
     /// Content worth showing beneath the title, e.g. a diff, in full.
     pub body: Option<DisplayBody>,
+    /// Title, detail and body together show all of the call's input. When
+    /// false (the display leaves fields out), or when the mapper cuts any of
+    /// them, the input is kept as a blob.
+    pub shows_all_input: bool,
 }
 
 /// Full content shown beneath a tool call's title.
@@ -115,6 +119,10 @@ pub struct ResultDisplay {
     pub is_error: bool,
     /// Short outcome, e.g. `exit 1`, `3 matches`; cut to one short line.
     pub status: Option<String>,
+    /// What to preview, uncut, when it is not `output` itself, e.g. the
+    /// tool's own output without notes meant for the model. `None` previews
+    /// `output`. When set and different, `output` is kept as a blob.
+    pub preview: Option<String>,
     /// The whole output.
     pub output: String,
 }

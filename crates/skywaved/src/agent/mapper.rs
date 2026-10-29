@@ -55,9 +55,11 @@ const AGENT_EXITED: &str = "agent exited";
 ///
 /// **Blobs** are made only for content that was cut: a body's text
 /// (`Body::full`) when its preview is shorter; a result's output when its
-/// preview is shorter; a call's input (pretty JSON, or the string itself)
-/// when its display does not show all of it: its title, detail or body was
-/// cut, or the generic display left fields out. Agent text stays inline:
+/// preview does not hold all of it (it was cut, or the adapter previewed
+/// other text, e.g. without notes meant for the model); a call's input
+/// (pretty JSON, or the string itself) when its display does not show all
+/// of it: its title, detail or body was cut, or the display (the adapter's,
+/// by `shows_all_input`, or the generic one) left fields out. Agent text stays inline:
 /// `AgentMessage` has no blob field.
 ///
 /// **Generic display.** A call the adapter gives no display for is shown as
@@ -307,6 +309,7 @@ fn call_display(
 ) -> Result<(proto::ToolDisplay, Option<BlobRef>)> {
     let (display, shown_whole) = match display {
         Some(display) => {
+            let omits_input = !display.shows_all_input;
             let (title, title_cut) = cut_line(&display.title, TITLE_MAX_CHARS);
             let (detail, detail_cut) = match &display.detail {
                 Some(detail) => {
@@ -326,7 +329,10 @@ fn call_display(
                 detail,
                 body,
             };
-            (display, !(title_cut || detail_cut || body_cut))
+            (
+                display,
+                !(omits_input || title_cut || detail_cut || body_cut),
+            )
         }
         None => {
             let (title, shown_whole) = generic_title(input);
@@ -363,15 +369,16 @@ fn display_body(storage: &Storage, body: DisplayBody) -> Result<Body> {
     })
 }
 
-/// A result's preview, with its output as a blob when the preview is
-/// shorter.
+/// A result's preview (of the adapter's preview text, else of the output),
+/// with the output as a blob when the preview does not hold all of it.
 fn tool_result(
     storage: &Storage,
     call: Option<CallId>,
     result: ResultDisplay,
 ) -> Result<ToolResult> {
-    let (preview, cut) = cut_preview(&result.output);
-    let output = if cut {
+    let shown = result.preview.as_deref().unwrap_or(&result.output);
+    let (preview, cut) = cut_preview(shown);
+    let output = if cut || shown != result.output {
         Some(storage.put_blob(result.output.as_bytes())?)
     } else {
         None

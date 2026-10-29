@@ -17,7 +17,8 @@ use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERS
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    ResultDisplay, ResumeHandle, StartSpec, TurnOutcome,
+    BodyFormat, DisplayBody, ResultDisplay, ResumeHandle, StartSpec, ToolDisplay, ToolKind,
+    TurnOutcome,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -148,6 +149,45 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
         .collect()
 }
 
+/// One line per tool call and result: how it is shown.
+fn displays(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ToolCall {
+                display: Some(d), ..
+            } => Some(format!(
+                "{:?} {:?} detail={:?} body={:?}",
+                d.kind,
+                d.title,
+                d.detail,
+                d.body.as_ref().map(|b| (b.format, b.text.lines().count())),
+            )),
+            AdapterEvent::ToolCall { name, .. } => Some(format!("{name}: generic")),
+            AdapterEvent::ToolResult { result, .. } => Some(format!(
+                "error={} status={:?} preview={:?}",
+                result.is_error,
+                result.status,
+                result.preview.as_deref().unwrap_or(&result.output),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// No result preview holds the CLI's notes for the model.
+fn assert_no_model_notes(events: &[AdapterEvent]) {
+    for event in events {
+        if let AdapterEvent::ToolResult { result, .. } = event {
+            let preview = result.preview.as_deref().unwrap_or(&result.output);
+            assert!(
+                !preview.contains("file state is current") && !preview.contains("STOP what"),
+                "a preview with model notes: {preview:?}"
+            );
+        }
+    }
+}
+
 fn uuid(id: &str) -> Uuid {
     Uuid::parse_str(id).unwrap()
 }
@@ -225,6 +265,30 @@ fn replay_permissions_allow_then_deny() {
         matches!(&events[3], AdapterEvent::ApprovalRequested { call: Some(c), .. } if c == call)
     );
     assert!(matches!(&events[4], AdapterEvent::ToolResult { call: Some(c), .. } if c == call));
+
+    // Displays come from the inputs and the structured results.
+    assert_eq!(
+        displays(&events),
+        [
+            r#"FileWrite "/tmp/skywave-t07-scratch/hello.txt" detail=None body=Some((Text, 1))"#,
+            r#"error=false status=Some("created") preview="""#,
+            concat!(
+                r#"Shell "$ cat /tmp/skywave-t07-scratch/hello.txt && rm /tmp/skywave-t07-scratch/hello.txt && ls -la /tmp/skywave-t07-scratch/" "#,
+                r#"detail=Some("Show hello.txt contents, delete it, and list the directory") body=None"#,
+            ),
+            r#"error=true status=Some("denied") preview="The user denied this action.""#,
+        ]
+    );
+    assert_no_model_notes(&events);
+    // The model-facing text, notes and all, stays the output.
+    let AdapterEvent::ToolResult { result, .. } = &events[4] else {
+        panic!("expected a tool result, got {:?}", events[4]);
+    };
+    assert!(
+        result
+            .output
+            .contains("file state is current in your context")
+    );
 }
 
 #[test]
@@ -258,6 +322,13 @@ fn replay_interrupt_while_streaming_and_while_idle() {
             "turn ended: Completed".to_owned(),
         ]
     );
+    assert_eq!(
+        displays(&events),
+        [
+            r#"Shell "$ echo pending-test" detail=Some("Print pending-test string") body=None"#,
+            r#"error=false status=None preview="pending-test""#,
+        ]
+    );
 }
 
 #[test]
@@ -289,6 +360,29 @@ fn replay_interrupt_with_a_pending_approval() {
             "turn ended: Completed".to_owned(),
         ]
     );
+    let write = |name: &str| {
+        format!(r#"FileWrite "/tmp/skywave-t07-scratch/{name}" detail=None body=Some((Text, 1))"#)
+    };
+    assert_eq!(
+        displays(&events),
+        [
+            write("pending.txt"),
+            r#"error=true status=Some("cancelled") preview="User rejected tool use""#.to_owned(),
+            write("pending2.txt"),
+            concat!(
+                r#"error=true status=Some("cancelled") preview="Tool permission request failed: "#,
+                r#"AbortError: Tool permission stream closed before response received""#,
+            )
+            .to_owned(),
+            write("pending2.txt"),
+            concat!(
+                r#"error=true status=Some("cancelled") preview="Tool permission request failed: "#,
+                r#"AbortError: Stream closed""#,
+            )
+            .to_owned(),
+        ]
+    );
+    assert_no_model_notes(&events);
 }
 
 #[test]
@@ -406,12 +500,15 @@ fn text(text: &str) -> AdapterEvent {
 /// The fake CLI's one tool call id.
 const CALL: &str = "toolu_1";
 
-fn tool_result(output: &str, is_error: bool) -> AdapterEvent {
+/// A result as the fake CLI sends it: no structured `tool_use_result`, so
+/// only a failure's text is read, for `status`.
+fn tool_result(output: &str, is_error: bool, status: Option<&str>) -> AdapterEvent {
     AdapterEvent::ToolResult {
         call: Some(CALL.into()),
         result: ResultDisplay {
             is_error,
-            status: None,
+            status: status.map(str::to_owned),
+            preview: None,
             output: output.to_owned(),
         },
     }
@@ -422,7 +519,16 @@ fn write_call() -> AdapterEvent {
         call: Some(CALL.into()),
         name: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
-        display: None,
+        display: Some(ToolDisplay {
+            kind: ToolKind::FileWrite,
+            title: "a.txt".to_owned(),
+            detail: None,
+            body: Some(DisplayBody {
+                format: BodyFormat::Text,
+                text: "hi".to_owned(),
+            }),
+            shows_all_input: true,
+        }),
     }
 }
 
@@ -480,7 +586,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     assert_eq!(
         take(&mut events, 6).await,
         [
-            tool_result("written", false),
+            tool_result("written", false, None),
             text("done writing"),
             COMPLETED,
             AdapterEvent::TurnStarted,
@@ -505,7 +611,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     assert_eq!(
         take(&mut events, 3).await,
         [
-            tool_result("The user denied this action.", true),
+            tool_result("The user denied this action.", true, Some("denied")),
             text("not writing"),
             COMPLETED,
         ]
@@ -528,7 +634,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
                 request: "perm-1".into(),
                 reason: INTERRUPT_REASON.to_owned(),
             },
-            tool_result("rejected", true),
+            tool_result("rejected", true, None),
             INTERRUPTED,
         ]
     );

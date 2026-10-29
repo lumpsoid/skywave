@@ -133,9 +133,11 @@ session across turns.
 the final mapping.
 
 - `assistant` text → agent text.
-- `assistant` `tool_use` → tool call (`id` as the agent call id, `name`;
-  the mapper cuts the display and blobs what was cut).
-- `user` `tool_result` → tool output, correlated by `tool_use_id`.
+- `assistant` `tool_use` → tool call (`id` as the agent call id, `name`, a
+  display from the input, §6b; the mapper cuts the display and blobs what was
+  cut).
+- `user` `tool_result` → tool output, correlated by `tool_use_id`; status and
+  preview from `tool_use_result` (§6b).
 - `can_use_tool` → `ApprovalRequested`.
 - `control_cancel_request` → `ApprovalCancelled`.
 - `result` → turn ended (`is_error` / `terminal_reason` give the outcome).
@@ -341,6 +343,62 @@ notes above:
   control_response so the CLI does not wait on them.
 - The deny message is `The user denied this action.`; the version check
   warns when `claude_code_version` is not `2.1.310`.
+
+## 6b. Tool displays (Tc)
+
+`claude_code/display.rs` maps each `tool_use` onto an agent-agnostic
+`ToolDisplay` from its **input alone**, so an approval for the call (which the
+mapper summarises by the call's title) shows the same thing, an edit's diff
+included, before the tool runs. Content is handed over uncut; the mapper cuts
+it and blobs what was cut. `shows_all_input` is false when the input has a
+non-null field the display does not show (e.g. Bash `timeout`), so the mapper
+keeps the input as a blob.
+
+| tool | kind | title | detail | body |
+|------|------|-------|--------|------|
+| `Write` | `FileWrite` | `file_path` | - | `content` (text) |
+| `Edit` | `FileEdit` | `file_path` | `all occurrences` if `replace_all` | diff of `old_string` → `new_string` |
+| `MultiEdit` | `FileEdit` | `file_path` | `N edits` | the edits' diffs, each after a `@@` line |
+| `Bash` | `Shell` | `$ <command>` | `description` | - |
+| `Read` | `FileRead` | `file_path` | `lines a–b` / `from line a` / `first N lines` | - |
+| `Grep` | `Search` | `pattern` | `path · glob · type` (those given) | - |
+| `Glob` | `Search` | `pattern` | `path` | - |
+| `WebFetch` | `Fetch` | `url` | `prompt` | - |
+| `WebSearch` | `Fetch` | `query` | - | - |
+| `Task` / `Agent` | `Subagent` | `description` | `subagent_type` | `prompt` (text) |
+| anything else, or a known tool missing its title field | generic (`Other`, the mapper's display) | | | |
+
+The diff is a line diff (LCS after trimming common head and tail lines), one
+line each prefixed `-`, `+` or ` `, no hunk headers; past 2^20 line pairs it
+shows all old lines removed and all new ones added.
+
+**Results** are read from the `user` message's structured `tool_use_result`
+(when the message holds one `tool_result`, as the CLI sends them), by the
+tool its `tool_use_id` named. The model-facing `tool_result` content is
+always the whole `output`; the display sets a separate `preview` (and the
+mapper then blobs the output) so notes such as "file state is current in your
+context" or "STOP what you are doing" stay out of the preview.
+
+| `tool_use_result` | status | preview |
+|-------------------|--------|---------|
+| string `"Error: The user denied this action."` (our deny message, §3.3) | `denied` | the message |
+| string `"User rejected tool use"` (interrupt, §4.2) or containing `AbortError` (stdin closed, §6) | `cancelled` | the message |
+| string `"Error: Exit code N\n…"` | `exit N` | the rest |
+| any other string | - | the string without `Error: ` |
+| Bash `{stdout, stderr, interrupted}` | `interrupted` if so | stdout, then stderr |
+| Write/Edit/MultiEdit `type:"create"` | `created` | empty (the call shows the content) |
+| Write/Edit/MultiEdit with `structuredPatch` | `updated +a -b` (lines added/removed in the patch) | empty (the call shows the diff) |
+| Read `{file:{content,numLines}}` | `N lines` | `file.content` (no line numbers) |
+| Grep | `N files` / `N lines` (mode `content`) / `N matches` (mode `count`) | `content`, else `filenames` |
+| Glob | `N files` | `filenames` |
+| WebFetch | `<code> <codeText>` | `result` |
+| other, or no `tool_use_result` | - (an error's text is still read as a string above) | the output |
+
+`is_error` is always the `tool_result`'s own flag. The core shows a denied or
+cancelled approval as the call's outcome, so `denied` / `cancelled` match it.
+Only the Write, Bash and error shapes are confirmed by the fixtures; the
+others follow the CLI's documented result types and fall back to the plain
+output when a field is missing.
 
 ## 7. Not covered (out of MVP scope or not needed by T09)
 
