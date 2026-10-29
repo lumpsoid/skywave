@@ -7,6 +7,7 @@ use skywaved::Storage;
 use skywaved::config::{Config, ProcessEnv};
 use skywaved::devices::{self, Revoke};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
+use skywaved::pairing;
 
 #[derive(Parser)]
 #[command(name = "skywaved", version, about = "Skywave server daemon")]
@@ -22,8 +23,13 @@ struct Cli {
 enum Command {
     /// Run the daemon.
     Serve,
-    /// Print a one-time pairing code and the server certificate fingerprint.
-    Pair,
+    /// Print a one-time pairing code, the server address and the CA
+    /// fingerprint.
+    Pair {
+        /// How long the code stays valid (s, m or h; at most 24h).
+        #[arg(long, default_value = "10m", value_parser = pairing::parse_ttl)]
+        ttl: chrono::Duration,
+    },
     /// Manage paired devices.
     Devices {
         #[command(subcommand)]
@@ -60,14 +66,15 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     let storage = Storage::open(&config.data_dir)?;
     tracing::debug!(data_dir = %storage.dir.root().display(), "opened data dir");
 
+    let hostname = local_hostname();
+    let bootstrap = || {
+        let names = server_names(config.listen, hostname.as_deref(), &config.server_names);
+        ServerIdentity::bootstrap(&storage.dir, &names)
+    };
+
     match cli.command {
         Command::Serve => {
-            let names = server_names(
-                config.listen,
-                local_hostname().as_deref(),
-                &config.server_names,
-            );
-            let identity = ServerIdentity::bootstrap(&storage.dir, &names)?;
+            let identity = bootstrap()?;
             tracing::info!(
                 server_id = %identity.server_id().0,
                 ca_fingerprint = %identity.ca_fingerprint(),
@@ -76,7 +83,25 @@ fn run(cli: Cli) -> skywaved::Result<()> {
             );
             not_implemented("serve");
         }
-        Command::Pair => not_implemented("pair"),
+        Command::Pair { ttl } => {
+            let identity = bootstrap()?;
+            let issued = pairing::issue_code(storage.db.conn(), Utc::now(), ttl)?;
+            let addr =
+                pairing::pair_address(config.listen, hostname.as_deref(), &config.server_names);
+            let fingerprint = identity.ca_fingerprint();
+            let uri = pairing::pair_uri(&addr, &issued.code, fingerprint);
+            println!("{}", pairing::render_qr(&uri)?);
+            println!("{uri}\n");
+            println!("Code:            {}", issued.code);
+            println!("Server address:  {addr}");
+            println!("CA fingerprint:  {fingerprint}");
+            println!(
+                "Expires:         {} (single use)",
+                issued
+                    .expires_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            );
+        }
         Command::Devices {
             command: DevicesCommand::List,
         } => print!(

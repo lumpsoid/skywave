@@ -8,9 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 hex.workspace = true
+qrcode.workspace = true
 rcgen.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -28,3 +31,4 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }

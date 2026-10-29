@@ -169,13 +169,13 @@ impl EventLog {
                 session_id.0
             )));
         }
-        if let EventKind::ApprovalRequested { id, .. } = &kind {
-            if approval_in(&tx, *id)?.is_some() {
-                return Err(Error::InvalidAppend(format!(
-                    "approval {} was already requested",
-                    id.0
-                )));
-            }
+        if let EventKind::ApprovalRequested { id, .. } = &kind
+            && approval_in(&tx, *id)?.is_some()
+        {
+            return Err(Error::InvalidAppend(format!(
+                "approval {} was already requested",
+                id.0
+            )));
         }
         let seq = append_in(&tx, session_id, &kind)?;
         tx.commit()?;

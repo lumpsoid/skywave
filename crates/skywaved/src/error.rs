@@ -53,6 +53,10 @@ pub enum Error {
     InvalidDeviceId(String),
     #[error("no device with id {}", .0.0)]
     UnknownDevice(skywave_proto::DeviceId),
+    #[error("system random number generator: {0}")]
+    Random(getrandom::Error),
+    #[error("QR code: {0}")]
+    Qr(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

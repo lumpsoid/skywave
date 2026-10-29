@@ -13,6 +13,7 @@ pub mod error;
 pub mod event_log;
 pub mod identity;
 pub mod logging;
+pub mod pairing;
 
 use std::io::Read;
 use std::path::PathBuf;

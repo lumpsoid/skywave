@@ -18,6 +18,10 @@
 //! signed by the current CA. Deleting `ca/` creates a new CA, which
 //! invalidates every paired device.
 //!
+//! Bootstrap holds an exclusive lock on `<data_dir>/identity.lock`, so
+//! `serve` and `pair` running for the first time at the same moment agree
+//! on one CA.
+//!
 //! Every file is written atomically (temp file + rename) with mode 0600.
 //! Certificates are valid from 1975 to 4096: revocation goes through the
 //! device registry, not expiry.
@@ -44,6 +48,7 @@ use crate::error::{Error, IoContext, Result};
 const KEY_FILE: &str = "key.pem";
 const CERT_FILE: &str = "cert.pem";
 const SERVER_ID_FILE: &str = "server_id";
+const LOCK_FILE: &str = "identity.lock";
 
 /// SHA-256 of a certificate's DER encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +132,16 @@ impl ServerIdentity {
     /// server certificate covers `server_names` (DNS names or IP addresses,
     /// see [`server_names`]); it is reissued if it covers a different set.
     pub fn bootstrap(dir: &DataDir, server_names: &[String]) -> Result<ServerIdentity> {
+        let lock_path = dir.root().join(LOCK_FILE);
+        let lock = std::fs::File::create(&lock_path)
+            .and_then(|f| f.lock().map(|()| f))
+            .context(|| format!("locking {}", lock_path.display()))?;
+        let identity = Self::bootstrap_locked(dir, server_names);
+        drop(lock);
+        identity
+    }
+
+    fn bootstrap_locked(dir: &DataDir, server_names: &[String]) -> Result<ServerIdentity> {
         let server_id = load_or_create_server_id(&dir.root().join(SERVER_ID_FILE))?;
         let (ca, ca_cert_pem, ca_cert_der) = load_or_create_ca(&dir.ca_dir(), server_id)?;
         let names = normalize_names(server_names);
@@ -473,6 +488,25 @@ mod tests {
         assert_eq!(second.ca_fingerprint(), first.ca_fingerprint());
         assert_eq!(second.server_cert_pem(), first.server_cert_pem());
         assert_eq!(second.server_key_pem(), first.server_key_pem());
+    }
+
+    #[test]
+    fn concurrent_first_bootstraps_agree_on_one_ca() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DataDir::create(tmp.path().join("d")).unwrap();
+        let fingerprints: Vec<Fingerprint> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| ServerIdentity::bootstrap(&dir, &names()).unwrap()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap().ca_fingerprint())
+                .collect()
+        });
+        let on_disk = ServerIdentity::bootstrap(&dir, &names())
+            .unwrap()
+            .ca_fingerprint();
+        assert!(fingerprints.iter().all(|fp| *fp == on_disk));
     }
 
     #[test]
