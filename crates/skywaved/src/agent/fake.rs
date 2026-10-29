@@ -31,12 +31,17 @@
 //! let agent = FakeAgent::new(FakeScript::new().turn([
 //!     Step::text("Listing files"),
 //!     Step::tool_call("shell", serde_json::json!({ "command": "ls" })),
+//!     Step::tool_call("write", serde_json::json!({ "path": "a.txt" })).call("c1"),
 //!     Step::approval("req-1", "write", serde_json::json!({ "path": "a.txt" }))
-//!         .on_approve([Step::tool_result("written")])
+//!         .call("c1")
+//!         .on_approve([Step::tool_result("written").call("c1")])
 //!         .on_deny([Step::text("Not writing it.")]),
 //! ]));
 //! # let _ = agent;
 //! ```
+//!
+//! Tool steps name no call unless given one with [`Step::call`], and carry
+//! no display of their own, so the mapper's generic display applies.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -47,8 +52,8 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use super::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    ResumeHandle, StartSpec, TurnOutcome,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
+    AgentSession, ResultDisplay, ResumeHandle, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -83,6 +88,7 @@ pub enum Step {
     /// Emits `ApprovalRequested` and blocks until it is answered.
     Approval {
         request: AgentRequestId,
+        call: Option<AgentCallId>,
         tool: String,
         input: Value,
         on_approve: Vec<Step>,
@@ -105,22 +111,29 @@ impl Step {
 
     pub fn tool_call(name: impl Into<String>, input: Value) -> Step {
         Step::Emit(AdapterEvent::ToolCall {
+            call: None,
             name: name.into(),
             input,
+            display: None,
         })
     }
 
     pub fn tool_result(output: impl Into<String>) -> Step {
-        Step::Emit(AdapterEvent::ToolResult {
-            output: output.into(),
-            is_error: false,
-        })
+        Step::tool_outcome(output.into(), false)
     }
 
     pub fn tool_error(output: impl Into<String>) -> Step {
+        Step::tool_outcome(output.into(), true)
+    }
+
+    fn tool_outcome(output: String, is_error: bool) -> Step {
         Step::Emit(AdapterEvent::ToolResult {
-            output: output.into(),
-            is_error: true,
+            call: None,
+            result: ResultDisplay {
+                is_error,
+                status: None,
+                output,
+            },
         })
     }
 
@@ -129,11 +142,25 @@ impl Step {
     pub fn approval(request: &str, tool: impl Into<String>, input: Value) -> Step {
         Step::Approval {
             request: request.into(),
+            call: None,
             tool: tool.into(),
             input,
             on_approve: Vec::new(),
             on_deny: Vec::new(),
         }
+    }
+
+    /// Names the agent's call `id` on a tool call, tool result or approval
+    /// step, linking them. No effect on other steps.
+    pub fn call(mut self, id: &str) -> Step {
+        match &mut self {
+            Step::Emit(
+                AdapterEvent::ToolCall { call, .. } | AdapterEvent::ToolResult { call, .. },
+            )
+            | Step::Approval { call, .. } => *call = Some(id.into()),
+            _ => {}
+        }
+        self
     }
 
     /// Steps run after an approval is approved. No effect on other steps.
@@ -418,6 +445,7 @@ impl Runner {
                 }
                 Step::Approval {
                     request,
+                    call,
                     tool,
                     input,
                     on_approve,
@@ -425,6 +453,7 @@ impl Runner {
                 } => {
                     let asked = AdapterEvent::ApprovalRequested {
                         request: request.clone(),
+                        call,
                         tool,
                         input,
                     };

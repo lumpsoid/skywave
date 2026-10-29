@@ -69,8 +69,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, DEFAULT_BLOB_THRESHOLD, EventMapper,
-    StartSpec, load_resume_handle,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, EventMapper, StartSpec,
+    load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -93,15 +93,12 @@ pub struct SupervisorConfig {
     /// How long an agent session with no work is kept before it is shut
     /// down. The next message resumes it.
     pub idle_timeout: Duration,
-    /// Payloads above this many bytes become blobs.
-    pub blob_threshold: usize,
 }
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            blob_threshold: DEFAULT_BLOB_THRESHOLD,
         }
     }
 }
@@ -363,8 +360,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
                 tracing::info!(session = %session_id.0, resumed, "agent started");
-                let mapper =
-                    EventMapper::new(session_id).with_blob_threshold(self.config.blob_threshold);
+                let mapper = EventMapper::new(session_id);
                 self.running.insert(
                     session_id,
                     Running {

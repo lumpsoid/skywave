@@ -25,7 +25,9 @@ use serde_json::{Value, json};
 use skywave_proto::Decision;
 use uuid::Uuid;
 
-use crate::agent::{AdapterEvent, AgentRequestId, ResumeHandle, TurnOutcome};
+use crate::agent::{
+    AdapterEvent, AgentCallId, AgentRequestId, ResultDisplay, ResumeHandle, TurnOutcome,
+};
 
 /// The CLI version the protocol was confirmed against (T07). Another version
 /// is logged as a warning, not refused.
@@ -393,8 +395,14 @@ impl Protocol {
                     reason,
                 });
             }
-            out.events
-                .push(AdapterEvent::ToolResult { output, is_error });
+            out.events.push(AdapterEvent::ToolResult {
+                call: tool_use_id.map(AgentCallId::from),
+                result: ResultDisplay {
+                    is_error,
+                    status: None,
+                    output,
+                },
+            });
         }
     }
 
@@ -420,6 +428,7 @@ impl Protocol {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
+        let call = tool_use_id.as_deref().map(AgentCallId::from);
         self.pending.push(Pending {
             request: request.clone(),
             tool_use_id,
@@ -427,6 +436,7 @@ impl Protocol {
         });
         out.events.push(AdapterEvent::ApprovalRequested {
             request,
+            call,
             tool,
             input,
         });
@@ -536,8 +546,15 @@ fn on_assistant(message: &Value, out: &mut Output) {
                 }
             }
             "tool_use" => out.events.push(AdapterEvent::ToolCall {
+                call: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(AgentCallId::from),
                 name: str_field(block, "name").to_owned(),
                 input: block.get("input").cloned().unwrap_or(Value::Null),
+                // Tool-specific displays come later; the mapper's generic
+                // one applies.
+                display: None,
             }),
             // thinking blocks are opaque.
             _ => {}

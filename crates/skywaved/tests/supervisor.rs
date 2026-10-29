@@ -544,7 +544,6 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     let agent = FakeAgent::new(FakeScript::new());
     let config = SupervisorConfig {
         idle_timeout: Duration::ZERO,
-        ..SupervisorConfig::default()
     };
     let supervisor = f.start_with(&agent, config).await;
 

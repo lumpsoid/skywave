@@ -133,8 +133,8 @@ session across turns.
 the final mapping.
 
 - `assistant` text → agent text.
-- `assistant` `tool_use` → tool call (`id` and `name`; `input` above 4 KiB
-  becomes a blob).
+- `assistant` `tool_use` → tool call (`id` as the agent call id, `name`;
+  the mapper cuts the display and blobs what was cut).
 - `user` `tool_result` → tool output, correlated by `tool_use_id`.
 - `can_use_tool` → `ApprovalRequested`.
 - `control_cancel_request` → `ApprovalCancelled`.

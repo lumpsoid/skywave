@@ -66,7 +66,7 @@ see "resolved on \<device\>". Answering while offline works too: the answer is
 queued like any other command.
 
 ### 📦 Bandwidth for what you read
-Tool outputs over 4 KiB become **blobs**: you get a summary in the timeline
+Large tool inputs and outputs become **blobs**: you get a short preview in the timeline
 and fetch the full content only when you open it. Downloads resume where they
 stopped. Prefer everything up front on a good link? Switch the blob policy
 from `OnDemand` to `Eager`.
