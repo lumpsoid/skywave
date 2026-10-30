@@ -458,12 +458,16 @@ impl Client {
         }
     }
 
+    /// Snapshots older than the call — the delivery thread may not have
+    /// caught up with a dispatch yet — do not count.
     async fn wait(&self, what: &str, done: impl Fn(&Client, &ViewState) -> bool) -> ViewState {
         let mut views = self.views.clone();
         tokio::time::timeout(SOON, async {
+            let mut caught_up = false;
             loop {
                 let view = views.borrow_and_update().clone();
-                if done(self, &view) {
+                caught_up = caught_up || view == self.core.view();
+                if caught_up && done(self, &view) {
                     return view;
                 }
                 views.changed().await.unwrap();

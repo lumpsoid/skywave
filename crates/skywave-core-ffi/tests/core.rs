@@ -246,8 +246,8 @@ fn a_panicking_listener_does_not_wedge_the_core() {
     let (listener, views) = Views::listener();
     core.subscribe(listener).unwrap();
     views.wait("the first snapshot", |_| true);
-    // Nothing listens there: the engine reports the failure from its own
-    // thread, after the dispatch's snapshot from this one.
+    // Nothing listens there: the engine reports the failure after the
+    // dispatch's own snapshot.
     core.dispatch(Action::Pair {
         address: "127.0.0.1:1".into(),
         code: "ABCDE-12345".into(),
@@ -329,10 +329,10 @@ fn shutdown_closes_the_store_so_the_dir_reopens_at_once() {
     assert!(!wal_exists(&dir));
 }
 
-/// `shutdown` from a listener on an engine thread fails instead of
-/// deadlocking or stopping the core from underneath its own engine.
+/// `shutdown` from a listener, on the delivery thread, fails instead of
+/// deadlocking or stopping the core from underneath its own delivery.
 #[test]
-fn shutdown_from_a_listener_on_an_engine_thread_is_reentrant() {
+fn shutdown_from_a_listener_is_reentrant() {
     struct ShutsDown {
         core: Mutex<Option<Arc<SkywaveCore>>>,
         results: Mutex<Sender<(ViewState, Result<(), SkywaveError>)>>,
@@ -354,8 +354,7 @@ fn shutdown_from_a_listener_on_an_engine_thread_is_reentrant() {
     });
     core.subscribe(listener.clone()).unwrap();
     *listener.core.lock().unwrap() = Some(core.clone());
-    // Nothing listens there: the engine reports the failure from its own
-    // thread.
+    // Nothing listens there: the engine reports the failure.
     core.dispatch(Action::Pair {
         address: "127.0.0.1:1".into(),
         code: "ABCDE-12345".into(),
@@ -383,4 +382,51 @@ fn shutdown_from_a_listener_on_an_engine_thread_is_reentrant() {
     listener.core.lock().unwrap().take();
     core.shutdown().unwrap();
     assert!(!wal_exists(&dir));
+}
+
+/// Listeners run on the core's delivery thread, never on the caller's, and
+/// one slow to return holds up no `dispatch`.
+#[test]
+fn listeners_run_on_the_delivery_thread_and_never_hold_up_dispatch() {
+    struct Blocks {
+        threads: Mutex<Sender<Option<String>>>,
+        release: Mutex<Receiver<()>>,
+    }
+    impl ViewListener for Blocks {
+        fn on_view(&self, _: ViewState) {
+            let name = std::thread::current().name().map(str::to_owned);
+            let _ = self.threads.lock().unwrap().send(name);
+            let _ = self.release.lock().unwrap().recv_timeout(SOON);
+        }
+    }
+    let (_dir, core) = open_core();
+    let (threads_tx, threads) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    core.subscribe(Arc::new(Blocks {
+        threads: Mutex::new(threads_tx),
+        release: Mutex::new(release_rx),
+    }))
+    .unwrap();
+    // The first snapshot, now held up by the listener.
+    let thread = threads.recv_timeout(SOON).unwrap();
+    assert_eq!(thread.as_deref(), Some("skywave-deliver"));
+
+    let started = Instant::now();
+    for route in [
+        skywave_core_ffi::action::Route::Settings,
+        skywave_core_ffi::action::Route::SessionList,
+    ] {
+        core.dispatch(Action::Navigate { route }).unwrap();
+    }
+    assert!(
+        started.elapsed() < SOON / 2,
+        "dispatch waited for a listener"
+    );
+    assert!(threads.try_recv().is_err(), "a second call while blocked");
+
+    // Released, the listener hears the latest, on the same thread.
+    drop(release);
+    let thread = threads.recv_timeout(SOON).unwrap();
+    assert_eq!(thread.as_deref(), Some("skywave-deliver"));
+    core.shutdown().unwrap();
 }

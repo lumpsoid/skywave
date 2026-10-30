@@ -46,13 +46,14 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
     let tmux = notify::in_tmux();
     let (tx, rx) = mpsc::channel();
 
-    // Snapshots: the callback only forwards, so it never blocks the core.
+    // Snapshots, from the core's delivery thread: the callback only
+    // forwards, so it never holds up delivery.
     let views = tx.clone();
     let subscription = core.subscribe(move |view| {
         let _ = views.send(Msg::View(Box::new(view)));
     });
     let Ok(Msg::View(first)) = rx.recv() else {
-        unreachable!("subscribe delivers the current snapshot right away");
+        unreachable!("the first message is the snapshot subscribe delivers");
     };
     let mut app = App::new(*first);
 

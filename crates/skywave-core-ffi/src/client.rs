@@ -23,16 +23,13 @@ use crate::view::ViewState;
 
 /// Receives every [`ViewState`] the core publishes.
 ///
-/// There is no dedicated delivery thread: the listener runs on whichever
-/// thread delivers — the caller's own thread inside `subscribe` (the first
-/// snapshot), inside `dispatch` and `unsubscribe` (snapshots published
-/// meanwhile, possibly several), or a core engine thread. So it must be
-/// thread-safe and must not assume a thread (in particular not the main
-/// thread); hand the snapshot on (e.g. to a `MutableStateFlow`) and return
-/// at once, since delivery to every listener, and the call that happened
-/// to deliver, waits for it. Snapshots arrive in order; one may be skipped
-/// in favour of a newer one. The listener may call `dispatch`, but not
-/// `subscribe`, `unsubscribe` or `shutdown` (they fail with
+/// Listeners run on the core's delivery thread (`skywave-deliver`), one at
+/// a time — never on the thread calling `dispatch` or `subscribe`, and not
+/// on the main thread. Hand the snapshot on (e.g. to a `MutableStateFlow`)
+/// and return at once: every later snapshot, to every listener, waits for
+/// it. Snapshots arrive in order; one may be skipped in favour of a newer
+/// one. The listener may call `dispatch`, but not `subscribe`,
+/// `unsubscribe` or `shutdown` (they fail with
 /// `SkywaveException.Reentrant`). An exception it throws is logged and
 /// otherwise ignored: the listener stays subscribed and the core goes on.
 #[uniffi::export(with_foreign)]
@@ -82,14 +79,16 @@ impl SkywaveCore {
     }
 
     /// Applies a user action. When this returns, everything the action
-    /// changed is on disk.
+    /// changed is on disk; listeners hear of it shortly after, on the
+    /// delivery thread.
     pub fn dispatch(&self, action: Action) -> Result<(), SkywaveError> {
         let action = sc::Action::try_from(action)?;
         Ok(self.core()?.dispatch(action)?)
     }
 
-    /// Registers `listener`, calls it with the current snapshot right away,
-    /// then after every change. Returns the id for
+    /// Registers `listener`, calls it with the current snapshot, then after
+    /// every change, all on the delivery thread: this returns without
+    /// waiting for the first call. Returns the id for
     /// [`unsubscribe`](SkywaveCore::unsubscribe).
     pub fn subscribe(&self, listener: Arc<dyn ViewListener>) -> Result<u64, SkywaveError> {
         not_in_listener("subscribe")?;
@@ -109,7 +108,8 @@ impl SkywaveCore {
     }
 
     /// Detaches the listener `id`; once this returns it is not called
-    /// again. Unknown ids, and any id after shutdown, are ignored.
+    /// again (a call in progress is waited for). Unknown ids, and any id
+    /// after shutdown, are ignored.
     pub fn unsubscribe(&self, id: u64) -> Result<(), SkywaveError> {
         not_in_listener("unsubscribe")?;
         let (core, subscription) = {
@@ -292,7 +292,8 @@ fn deliver(listener: &dyn ViewListener, view: sc::ViewState) {
 }
 
 /// Refuses `call` from inside a listener: delivery holds the subscriber
-/// list, which `call` would wait for.
+/// list, which `call` would wait for, and shutdown would wait for the
+/// delivery thread, which is this one.
 fn not_in_listener(call: &str) -> Result<(), SkywaveError> {
     if IN_LISTENER.with(Cell::get) > 0 {
         return Err(SkywaveError::Reentrant {

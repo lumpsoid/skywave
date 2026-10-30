@@ -154,17 +154,19 @@ impl Tui {
     fn open() -> Tui {
         let dir = tempfile::tempdir().unwrap();
         let core = Core::open_with(dir.path(), config()).unwrap();
-        let (tx, mut views) = mpsc::unbounded_channel();
+        let (tx, views) = mpsc::unbounded_channel();
         core.subscribe(move |view| {
             let _ = tx.send(view);
         });
-        let app = App::new(views.try_recv().unwrap());
-        Tui {
+        let app = App::new(core.view());
+        let mut tui = Tui {
             dir,
             core,
             views,
             app,
-        }
+        };
+        tui.settle();
+        tui
     }
 
     fn device(&self) -> DeviceId {
@@ -178,11 +180,30 @@ impl Tui {
         }
     }
 
+    /// Takes snapshots until the app shows what the core did when called:
+    /// the delivery thread hands them on shortly after a change, and a
+    /// user types slower than that.
+    fn settle(&mut self) {
+        let target = self.core.view();
+        let deadline = std::time::Instant::now() + SOON;
+        loop {
+            self.pump();
+            if *self.app.view() == target || *self.app.view() == self.core.view() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the snapshot never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// A key press; its action goes to the core, as the event loop does.
     fn key_event(&mut self, key: KeyEvent) {
         self.pump();
         skywave_tui::handle_key(&mut self.app, &self.core, key);
-        self.pump();
+        self.settle();
     }
 
     fn key(&mut self, code: KeyCode) {
