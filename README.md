@@ -207,7 +207,7 @@ Admin commands work on the database directly, so `serve` can keep running.
 | `skywave-core` | All client logic: local replica, outbox, sync engine, blob downloads, view state |
 | `skywave-tui` | Terminal head built on ratatui; renders the core's view state and nothing else |
 | `skywave-proto` | Versioned, agent-agnostic wire types |
-| `skywave-core-ffi` | UniFFI bindings for future heads (Android is planned) |
+| `skywave-core-ffi` | UniFFI bindings the Android head (`android/`) builds against |
 | `skywave-testkit` | Link harness: a proxy that injects latency, jitter, bandwidth caps and drops |
 
 A few design choices that make it hold up:
@@ -230,17 +230,46 @@ More detail in [`docs/architecture.md`](docs/architecture.md),
 
 ### Android build
 
-With [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk), an Android NDK
-(`ANDROID_NDK_HOME`) and the `aarch64-linux-android` / `x86_64-linux-android`
-Rust targets:
+The Android head lives in [`android/`](android), a Gradle project (Kotlin,
+Jetpack Compose, Material 3) that builds the Rust core as part of the app
+build.
+
+Prerequisites:
+
+- JDK 17 or newer.
+- The Android SDK with the platform the app compiles against (API 37). Gradle
+  finds it through `sdk.dir` in `android/local.properties` or `ANDROID_HOME`.
+- Rust (`cargo` on `PATH`, or `skywave.cargo=/path/to/cargo` in
+  `android/local.properties`) with the Android targets:
+  `rustup target add aarch64-linux-android x86_64-linux-android`.
+- [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
+  `cargo install cargo-ndk`.
+- An Android NDK. `cargo-ndk` builds the `.so`, not Gradle, so the app sets
+  no `ndkVersion`; `cargo-ndk` uses `ANDROID_NDK_HOME` if set, else the newest
+  NDK under `$ANDROID_HOME/ndk`. Any recent NDK (r26+) works.
+
+Build and install:
 
 ```sh
-crates/skywave-core-ffi/build-android.sh <app>/src/main/jniLibs
+cd android
+./gradlew :app:assembleDebug    # app/build/outputs/apk/debug/app-debug.apk
+./gradlew :app:installDebug     # onto the connected device or emulator
 ```
 
-This builds `libskywave_core_ffi.so` for `arm64-v8a` and `x86_64` (API 26)
-with the size-optimised `release-android` profile. Kotlin bindings come from
-`crates/skywave-core-ffi/gen-kotlin.sh`.
+Each variant runs two tasks before compiling:
+
+- `cargoBuildAndroid<Variant>` runs `crates/skywave-core-ffi/build-android.sh`,
+  which builds `libskywave_core_ffi.so` for `arm64-v8a` and `x86_64` (API 26).
+  Debug uses cargo's `dev` profile; release uses the size-optimised
+  `release-android` profile.
+- `generateUniffiBindings<Variant>` runs
+  `crates/skywave-core-ffi/gen-kotlin.sh`, which generates the Kotlin
+  bindings (package `dev.skywave.core`) with the crate's own `uniffi-bindgen`.
+  They are build output and never checked in.
+
+Both tasks are skipped when nothing under `crates/`, `Cargo.toml` or
+`Cargo.lock` has changed. The scripts also work on their own, e.g.
+`crates/skywave-core-ffi/build-android.sh <dir>/jniLibs`.
 
 ## Roadmap
 
