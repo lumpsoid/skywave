@@ -13,10 +13,6 @@ pub enum SkywaveError {
     /// not a UUID.
     #[error("{name} is not a valid id: {input:?}")]
     InvalidId { name: String, input: String },
-    /// An action field `name` holds `input`, which does not fit this
-    /// platform.
-    #[error("{name} is out of range: {input}")]
-    OutOfRange { name: String, input: u64 },
     /// The local store could not be read or written.
     #[error("{reason}")]
     Store { reason: String },
@@ -48,7 +44,6 @@ impl From<ActionError> for SkywaveError {
     fn from(e: ActionError) -> Self {
         match e {
             ActionError::InvalidId { name, input } => SkywaveError::InvalidId { name, input },
-            ActionError::OutOfRange { name, input } => SkywaveError::OutOfRange { name, input },
         }
     }
 }

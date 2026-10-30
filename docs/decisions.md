@@ -99,6 +99,10 @@ Type mapping across the boundary:
 - `Duration` → millis (`u64`)
 - `DateTime<Utc>` → unix-epoch millis (`i64`)
 - `PathBuf` → `String`
+- draft cursor (code points in core) → `cursor_utf16` (`u64`, UTF-16 code
+  units, what Kotlin `TextRange` indexes), converted against the draft
+  text both ways; a unit offset inside a surrogate pair rounds down, past
+  the end clamps. The core and the TUI keep counting code points.
 
 No `Instant` crosses the boundary: a monotonic instant can only be shown as
 wall time by reading a clock at conversion, which makes every snapshot of

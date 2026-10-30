@@ -25,6 +25,25 @@ fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+/// A cursor `chars` code points into `text`, as UTF-16 code units (how
+/// Kotlin/Java strings index). Past the end clamps to the end.
+pub(crate) fn chars_to_utf16(text: &str, chars: usize) -> u64 {
+    count(text.chars().take(chars).map(char::len_utf16).sum())
+}
+
+/// A cursor `units` UTF-16 code units into `text`, as code points (how the
+/// core counts). Inside a surrogate pair rounds down to before the pair;
+/// past the end clamps to the end.
+pub(crate) fn utf16_to_chars(text: &str, units: u64) -> usize {
+    let mut seen = 0u64;
+    text.chars()
+        .take_while(|c| {
+            seen += c.len_utf16() as u64;
+            seen <= units
+        })
+        .count()
+}
+
 fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -735,18 +754,16 @@ impl From<sc::SessionView> for SessionView {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Draft {
     pub text: String,
-    /// Position in `text`, counted in Unicode scalar values (code points),
-    /// not UTF-16 units.
-    pub cursor: u64,
+    /// Position in `text` in UTF-16 code units, ready for a Kotlin
+    /// `TextRange`. The core counts code points; this is converted.
+    pub cursor_utf16: u64,
 }
 
 impl From<sc::Draft> for Draft {
     fn from(d: sc::Draft) -> Self {
         let sc::Draft { text, cursor } = d;
-        Draft {
-            text,
-            cursor: count(cursor),
-        }
+        let cursor_utf16 = chars_to_utf16(&text, cursor);
+        Draft { text, cursor_utf16 }
     }
 }
 
@@ -1720,13 +1737,54 @@ mod tests {
             stop: Some(Outgoing::Accepted { seq: 2 }),
             draft: Some(Draft {
                 text: "héllo".into(),
-                cursor: 2,
+                cursor_utf16: 2,
             }),
             draft_rev: 3,
             last_seq: 9,
             unread_from: Some(5),
             prompts: vec![],
         }
+    }
+
+    #[test]
+    fn a_cursor_crosses_in_utf16_units() {
+        // (text, code points, UTF-16 units)
+        for (text, chars, units) in [
+            ("", 0, 0),
+            ("hello", 3, 3),
+            ("héllo", 2, 2),
+            ("привет", 4, 4),
+            ("a😀b", 1, 1),
+            ("a😀b", 2, 3),
+            ("a😀b", 3, 4),
+            ("😀😀", 2, 4),
+        ] {
+            assert_eq!(chars_to_utf16(text, chars), units, "{text:?} chars {chars}");
+            assert_eq!(utf16_to_chars(text, units), chars, "{text:?} units {units}");
+        }
+    }
+
+    #[test]
+    fn a_utf16_cursor_inside_a_surrogate_pair_rounds_down() {
+        assert_eq!(utf16_to_chars("a😀b", 2), 1);
+        assert_eq!(utf16_to_chars("😀", 1), 0);
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_clamps() {
+        assert_eq!(utf16_to_chars("a😀", 99), 2);
+        assert_eq!(utf16_to_chars("", u64::MAX), 0);
+        assert_eq!(chars_to_utf16("a😀", 99), 3);
+        assert_eq!(chars_to_utf16("", usize::MAX), 0);
+    }
+
+    #[test]
+    fn a_draft_exposes_its_cursor_in_utf16_units() {
+        let draft = Draft::from(sc::Draft {
+            text: "😀 привет".into(),
+            cursor: 3,
+        });
+        assert_eq!(draft.cursor_utf16, 4);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use skywave_core as sc;
 use uuid::Uuid;
 
-use crate::view::{BlobPolicy, Decision, id};
+use crate::view::{BlobPolicy, Decision, chars_to_utf16, id, utf16_to_chars};
 
 /// A user intent for the core.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -35,12 +35,14 @@ pub enum Action {
         session_id: String,
         text: String,
     },
-    /// Keep the session's unsent message; blank text drops it. `cursor`
-    /// counts code points. Save on pause or leave, not per keystroke.
+    /// Keep the session's unsent message; blank text drops it.
+    /// `cursor_utf16` is the position in `text` in UTF-16 code units (a
+    /// Kotlin `TextRange` offset); inside a surrogate pair rounds down, past
+    /// the end clamps. Save on pause or leave, not per keystroke.
     SaveDraft {
         session_id: String,
         text: String,
-        cursor: u64,
+        cursor_utf16: u64,
     },
     /// Take back or dismiss a `discardable` message or session creation.
     Discard {
@@ -118,9 +120,6 @@ pub enum ActionError {
     /// `name` (e.g. `session_id`) holds `input`, which is not a UUID.
     #[error("{name} is not a valid id: {input:?}")]
     InvalidId { name: String, input: String },
-    /// `name` holds `input`, which does not fit this platform.
-    #[error("{name} is out of range: {input}")]
-    OutOfRange { name: String, input: u64 },
 }
 
 fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, ActionError> {
@@ -157,14 +156,11 @@ impl TryFrom<Action> for sc::Action {
             Action::SaveDraft {
                 session_id,
                 text,
-                cursor,
+                cursor_utf16,
             } => sc::Action::SaveDraft {
                 session_id: parse("session_id", session_id)?,
+                cursor: utf16_to_chars(&text, cursor_utf16),
                 text,
-                cursor: usize::try_from(cursor).map_err(|_| ActionError::OutOfRange {
-                    name: "cursor".to_owned(),
-                    input: cursor,
-                })?,
             },
             Action::Discard { command_id } => sc::Action::Discard(parse("command_id", command_id)?),
             Action::EditQueued { command_id } => {
@@ -241,8 +237,8 @@ impl From<sc::Action> for Action {
                 cursor,
             } => Action::SaveDraft {
                 session_id: id(session_id.0),
+                cursor_utf16: chars_to_utf16(&text, cursor),
                 text,
-                cursor: u64::try_from(cursor).unwrap_or(u64::MAX),
             },
             sc::Action::Discard(command_id) => Action::Discard {
                 command_id: id(command_id.0),
@@ -389,6 +385,56 @@ mod tests {
             let mirror = Action::from(action.clone());
             assert_eq!(sc::Action::try_from(mirror), Ok(action));
         }
+    }
+
+    #[test]
+    fn a_utf16_draft_cursor_round_trips_through_core_chars() {
+        let session_id = sc::SessionId::new();
+        let text = "a😀é".to_owned();
+        let core = sc::Action::try_from(Action::SaveDraft {
+            session_id: session_id.0.to_string(),
+            text: text.clone(),
+            cursor_utf16: 3,
+        });
+        assert_eq!(
+            core,
+            Ok(sc::Action::SaveDraft {
+                session_id,
+                text: text.clone(),
+                cursor: 2,
+            })
+        );
+        let draft = crate::view::Draft::from(sc::Draft {
+            text: text.clone(),
+            cursor: 2,
+        });
+        assert_eq!(draft.cursor_utf16, 3);
+        assert_eq!(
+            Action::from(core.unwrap()),
+            Action::SaveDraft {
+                session_id: session_id.0.to_string(),
+                text,
+                cursor_utf16: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_save_draft_cursor_past_the_end_clamps() {
+        let session_id = sc::SessionId::new();
+        let core = sc::Action::try_from(Action::SaveDraft {
+            session_id: session_id.0.to_string(),
+            text: "😀".into(),
+            cursor_utf16: u64::MAX,
+        });
+        assert_eq!(
+            core,
+            Ok(sc::Action::SaveDraft {
+                session_id,
+                text: "😀".into(),
+                cursor: 1,
+            })
+        );
     }
 
     #[test]
