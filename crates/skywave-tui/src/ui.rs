@@ -21,11 +21,12 @@ use ratatui::widgets::{
     Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use skywave_core::{
-    BlobPolicy, Decision, FailReason, Link, LinkRejection, Outgoing, PairingStatus, PairingView,
-    PendingSession, Screen, SessionListView, SessionRow, SessionState, SettingsView,
+    BlobPolicy, CandidateSource, Completion, CompletionStatus, Decision, FailReason, Link,
+    LinkRejection, Outgoing, PairingStatus, PairingView, PendingSession, Screen, SessionListView,
+    SessionRow, SessionState, SettingsView,
 };
 
-use crate::app::{App, Field, Focus, dismissable};
+use crate::app::{App, Field, Focus, POPUP_ROWS, dismissable};
 use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -303,7 +304,74 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
             let x = (inner.x + width).min(inner.right().saturating_sub(1));
             frame.set_cursor_position(Position::new(x, inner.y));
         }
+        if let Some((completion, selected)) = app.completion_popup() {
+            render_completion(frame, area, prompt_area, app, completion, selected);
+        }
     }
+}
+
+/// The workdir candidates, in a popup just above the new-session prompt.
+fn render_completion(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: Rect,
+    app: &App,
+    completion: &Completion,
+    selected: usize,
+) {
+    let rows = completion.candidates.len().clamp(1, POPUP_ROWS) as u16 + 2;
+    let top = prompt.y.saturating_sub(rows).max(area.y);
+    let popup = Rect::new(prompt.x, top, prompt.width, prompt.y - top);
+    let offline = matches!(
+        app.view().link,
+        Link::Reconnecting { .. } | Link::Rejected(_)
+    );
+    let status = match completion.status {
+        CompletionStatus::Loading => Some("listing…"),
+        CompletionStatus::Unavailable if offline => Some("offline · recent only"),
+        CompletionStatus::Unavailable => Some("unavailable · recent only"),
+        CompletionStatus::Ready { truncated: true } => Some("more not shown · keep typing"),
+        CompletionStatus::Ready { truncated: false } => None,
+    };
+    let mut block = Block::bordered().title(" Directories ").cyan();
+    if let Some(status) = status {
+        block = block.title_bottom(Line::from(format!(" {status} ")).dark_gray());
+    }
+    frame.render_widget(Clear, popup);
+    if completion.candidates.is_empty() {
+        let note = if completion.status == CompletionStatus::Loading {
+            ""
+        } else {
+            "no matching directories"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(note).dark_gray()).block(block),
+            popup,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = completion
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let path: String = candidate.path.chars().filter(|c| !c.is_control()).collect();
+            let mut spans = vec![Span::raw(path).reset()];
+            if candidate.source == CandidateSource::Recent {
+                spans.push(Span::raw("  recent").dark_gray());
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+        popup,
+        &mut state,
+    );
 }
 
 /// Width every badge is padded to, so workdirs line up.
@@ -474,8 +542,11 @@ fn footer_keys(app: &App) -> &'static str {
             paired: Some(_), ..
         }) => "Tab next field · Enter next/submit · Esc cancel · F1 help · Ctrl-C quit",
         Screen::Pairing(_) => "Tab next field · Enter next/submit · F1 help · Ctrl-C quit",
+        Screen::SessionList(_) if app.completion_popup().is_some() => {
+            "↑↓ select · Tab/Enter accept · Esc close list · F1 help · Ctrl-C quit"
+        }
         Screen::SessionList(_) if app.ui().create.is_some() => {
-            "Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+            "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_) => {
             "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
@@ -539,10 +610,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Screen::SessionList(_) if app.ui().create.is_some() => lines.extend([
             section("New session"),
             key("type / paste", "the session's directory on the server"),
+            key("Tab", "complete the directory under the roots"),
+            key("↑↓ Tab/Enter", "pick from the list"),
             key("Enter", "create the session"),
             key("Backspace", "delete a character"),
             key("Ctrl-U", "clear"),
-            key("Esc", "cancel"),
+            key("Esc", "close the list, then cancel"),
         ]),
         Screen::SessionList(_) => lines.extend([
             section("Sessions"),

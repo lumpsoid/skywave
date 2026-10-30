@@ -12,11 +12,12 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
-use skywave_proto::{CommandResult, EventBatch};
+use skywave_proto::{CommandResult, DirsResult, EventBatch};
 
 use crate::client::{Core, CoreError, State, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
+use crate::transport::TransportError;
 use crate::view::{BlobId, CommandId, Link, Seq};
 
 /// Work the core asks the engine to do. Sent only after the action that
@@ -40,6 +41,13 @@ pub enum Request {
     BlobPolicyChanged(BlobPolicy),
     /// The user wants the link to stop waiting out its backoff.
     RetryNow,
+    /// List the server directory `dir` (empty: the roots) for workdir
+    /// completion, within a short timeout. Answer with
+    /// [`Seam::dirs_listed`], naming `req`.
+    ListDirs {
+        req: u64,
+        dir: String,
+    },
 }
 
 /// Engine-side handle to a [`Core`]; see the module docs.
@@ -130,6 +138,18 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state| {
                 state.model.set_link(link);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::ListDirs`] `req`. Kept in memory only; an
+    /// answer to an older request than the latest is ignored.
+    pub fn dirs_listed(&self, req: u64, result: Result<DirsResult, TransportError>) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.dirs_listed(req, result);
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});

@@ -26,8 +26,6 @@
 //! shutting the agent down (interrupting a running turn first); what the
 //! agent still reports, such as `TurnEnded(Interrupted)`, is logged as usual.
 
-use std::path::{Path, PathBuf};
-
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, DeviceId, EventKind, RejectReason, Seq,
@@ -35,6 +33,7 @@ use skywave_proto::{
 };
 
 use crate::db::Db;
+use crate::dirs;
 use crate::error::Result;
 use crate::event_log::{self, EventLog};
 
@@ -92,7 +91,7 @@ impl EventLog {
     ) -> Result<Result<Seq, RejectReason>> {
         let (session_id, kind) = match &command.kind {
             CommandKind::CreateSession { workdir } => {
-                match resolve_workdir(self.roots(), workdir) {
+                match dirs::canonical_under_roots(self.roots(), workdir) {
                     Ok(workdir) => (SessionId::new(), EventKind::SessionCreated { workdir }),
                     Err(reason) => return Ok(Err(reason)),
                 }
@@ -154,34 +153,4 @@ fn stored_result(conn: &Connection, id: CommandId) -> Result<Option<CommandResul
         )
         .optional()?;
     Ok(json.as_deref().map(serde_json::from_str).transpose()?)
-}
-
-/// The canonical form of `workdir` if it is an existing directory under one
-/// of `roots` (D14).
-///
-/// Canonicalizing resolves `..` and symlinks before the check, so neither
-/// can escape a root. Roots are canonicalized too; a root that does not
-/// exist admits nothing. A relative `workdir` names no directory on the
-/// server and is not allowed.
-fn resolve_workdir(roots: &[PathBuf], workdir: &str) -> Result<String, RejectReason> {
-    let path = Path::new(workdir);
-    if !path.is_absolute() {
-        return Err(RejectReason::WorkdirNotAllowed);
-    }
-    let canonical = std::fs::canonicalize(path).map_err(|_| RejectReason::WorkdirNotFound)?;
-    if !canonical.is_dir() {
-        return Err(RejectReason::WorkdirNotFound);
-    }
-    let allowed = roots
-        .iter()
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .any(|root| canonical.starts_with(root));
-    if !allowed {
-        return Err(RejectReason::WorkdirNotAllowed);
-    }
-    // The wire carries workdirs as strings; a non-UTF-8 target can't be named.
-    canonical
-        .into_os_string()
-        .into_string()
-        .map_err(|_| RejectReason::WorkdirNotAllowed)
 }

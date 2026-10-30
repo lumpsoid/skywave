@@ -10,16 +10,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
-    BlobRef, Command, CommandKind, CommandResult, Event, EventBatch, EventKind,
+    BlobRef, Command, CommandKind, CommandResult, DirsResult, Event, EventBatch, EventKind,
     SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
+use crate::completion::Completer;
 use crate::projection::{SessionSummary, blob_refs, is_notable};
 use crate::seam::Request;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
+use crate::transport::TransportError;
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
     BodyView, CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link,
@@ -109,6 +111,8 @@ pub(crate) struct Model {
     alerted: HashSet<ApprovalId>,
     /// How often new approvals came in ([`Attention::alerts`]).
     alerts: u64,
+    /// Workdir completion in the new-session prompt; in memory only.
+    completer: Completer,
 }
 
 impl Model {
@@ -133,6 +137,7 @@ impl Model {
             open: None,
             alerted: HashSet::new(),
             alerts: 0,
+            completer: Completer::default(),
         };
         model.reload(snapshot);
         // What was pending before the start is not news.
@@ -183,9 +188,26 @@ impl Model {
                 if workdir.is_empty() {
                     return Vec::new();
                 }
+                self.completer.end();
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
                 })
+            }
+            Action::CompleteWorkdir { input } => {
+                if self.device.is_none() || self.place != Place::SessionList {
+                    return Vec::new();
+                }
+                // While the link is down, recent workdirs stand in.
+                let online = !matches!(self.link, Link::Reconnecting { .. } | Link::Rejected(_));
+                self.completer
+                    .complete(input, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::EndCompletion => {
+                self.completer.end();
+                Vec::new()
             }
             Action::SendMessage { session_id, text } => {
                 if text.trim().is_empty() || self.summary(session_id).is_none() {
@@ -229,6 +251,7 @@ impl Model {
                 }
                 self.place = Place::Session(id);
                 self.open = None;
+                self.completer.end();
                 vec![Effect::LoadSession(id)]
             }
             Action::OpenNextApproval => match self.next_approval() {
@@ -267,6 +290,7 @@ impl Model {
             Action::Navigate(route) => {
                 self.place = route.into();
                 self.open = None;
+                self.completer.end();
                 Vec::new()
             }
         }
@@ -557,6 +581,10 @@ impl Model {
         self.note_new_approvals();
     }
 
+    pub(crate) fn dirs_listed(&mut self, req: u64, result: Result<DirsResult, TransportError>) {
+        self.completer.listed(req, result);
+    }
+
     pub(crate) fn paired(&mut self, device: DeviceId, address: String) {
         self.device = Some(device);
         self.settings.server_address = Some(address);
@@ -692,7 +720,14 @@ impl Model {
                 _ => None,
             })
             .collect();
-        SessionListView { sessions, creating }
+        let completion = self
+            .completer
+            .view(self.sessions.iter().filter_map(|s| s.workdir.as_deref()));
+        SessionListView {
+            sessions,
+            creating,
+            completion,
+        }
     }
 
     fn session_view(&self, id: SessionId) -> Option<SessionView> {
@@ -1088,7 +1123,7 @@ mod tests {
     use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind, ToolResult};
 
     use super::*;
-    use crate::view::LinkRejection;
+    use crate::view::{CandidateSource, Completion, CompletionStatus, LinkRejection};
 
     /// A paired model over an empty replica, plus a log builder.
     struct Fixture {
@@ -1266,6 +1301,7 @@ mod tests {
             Screen::SessionList(SessionListView {
                 sessions: Vec::new(),
                 creating: Vec::new(),
+                completion: None,
             })
         );
 
@@ -2831,5 +2867,171 @@ mod tests {
         assert!(f.dispatch(Action::OpenNextApproval).is_empty());
         assert_eq!(f.model.view().attention.elsewhere, 0);
         assert_eq!(f.session_view().id, s1);
+    }
+
+    fn complete(f: &mut Fixture, input: &str) -> Option<(u64, String)> {
+        let effects = f.dispatch(Action::CompleteWorkdir {
+            input: input.into(),
+        });
+        match effects.as_slice() {
+            [] => None,
+            [Effect::Request(Request::ListDirs { req, dir })] => Some((*req, dir.clone())),
+            other => panic!("expected a listing request, got {other:?}"),
+        }
+    }
+
+    fn completion(f: &Fixture) -> Completion {
+        f.list_view().completion.expect("a completion")
+    }
+
+    fn candidates(f: &Fixture) -> Vec<(String, CandidateSource)> {
+        completion(f)
+            .candidates
+            .into_iter()
+            .map(|c| (c.path, c.source))
+            .collect()
+    }
+
+    fn listed(dir: &str, names: &[&str]) -> Result<DirsResult, TransportError> {
+        Ok(DirsResult::Listed {
+            dir: dir.into(),
+            names: names.iter().map(|&n| n.to_owned()).collect(),
+            truncated: false,
+        })
+    }
+
+    #[test]
+    fn completion_shows_recents_until_the_server_listing_replaces_them() {
+        let mut f = Fixture::paired();
+        f.session("/srv/api");
+        f.session("/srv/app");
+        f.session("/srv/api");
+        f.session("/home/me");
+        assert_eq!(f.list_view().completion, None);
+
+        let (req, dir) = complete(&mut f, "/srv/a").unwrap();
+        assert_eq!(dir, "/srv/");
+        assert_eq!(completion(&f).status, CompletionStatus::Loading);
+        assert_eq!(
+            candidates(&f),
+            vec![
+                ("/srv/api".to_owned(), CandidateSource::Recent),
+                ("/srv/app".to_owned(), CandidateSource::Recent),
+            ],
+            "distinct, most recently active first"
+        );
+
+        f.model
+            .dirs_listed(req, listed("/srv", &[".cache", "api", "app", "apt", "web"]));
+        let done = completion(&f);
+        assert_eq!(done.status, CompletionStatus::Ready { truncated: false });
+        assert_eq!(
+            candidates(&f),
+            ["/srv/api", "/srv/app", "/srv/apt"].map(|p| (p.to_owned(), CandidateSource::Server))
+        );
+        assert_eq!(done.fill().as_deref(), Some("/srv/ap"));
+
+        // Typing within the dir filters the same listing.
+        assert_eq!(complete(&mut f, "/srv/apt"), None);
+        assert_eq!(completion(&f).fill().as_deref(), Some("/srv/apt/"));
+        // Completing the same input again asks again, showing the old
+        // listing meanwhile.
+        let (again, _) = complete(&mut f, "/srv/apt").unwrap();
+        assert!(again > req);
+        assert_eq!(completion(&f).status, CompletionStatus::Loading);
+        assert_eq!(candidates(&f).len(), 1);
+
+        // Closing the prompt forgets everything.
+        assert!(f.dispatch(Action::EndCompletion).is_empty());
+        assert_eq!(f.list_view().completion, None);
+        f.model.dirs_listed(again, listed("/srv", &["apt"]));
+        assert_eq!(f.list_view().completion, None);
+    }
+
+    #[test]
+    fn a_stale_listing_is_ignored() {
+        let mut f = Fixture::paired();
+        let (old, _) = complete(&mut f, "/srv/").unwrap();
+        let (new, dir) = complete(&mut f, "/home/").unwrap();
+        assert_eq!(dir, "/home/");
+        f.model.dirs_listed(old, listed("/srv", &["api"]));
+        assert_eq!(completion(&f).status, CompletionStatus::Loading);
+        assert_eq!(candidates(&f), Vec::new());
+        f.model.dirs_listed(new, listed("/home", &["me"]));
+        assert_eq!(
+            candidates(&f),
+            vec![("/home/me".to_owned(), CandidateSource::Server)]
+        );
+    }
+
+    #[test]
+    fn offline_or_failed_completion_falls_back_to_recents() {
+        let mut f = Fixture::paired();
+        f.session("/srv/api");
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            next_in: Duration::from_secs(1),
+            offline_since: Instant::now(),
+        });
+        assert_eq!(complete(&mut f, "/srv/"), None, "nothing is asked offline");
+        assert_eq!(completion(&f).status, CompletionStatus::Unavailable);
+        assert_eq!(
+            candidates(&f),
+            vec![("/srv/api".to_owned(), CandidateSource::Recent)]
+        );
+
+        // Back online; an old server without the endpoint answers 404.
+        f.model.set_link(Link::Online { latency_ms: 5 });
+        let (req, _) = complete(&mut f, "/srv/").unwrap();
+        f.model.dirs_listed(req, Err(TransportError::NotFound));
+        assert_eq!(completion(&f).status, CompletionStatus::Unavailable);
+        assert_eq!(candidates(&f).len(), 1);
+        // A failed listing is asked for again on the next edit.
+        assert!(complete(&mut f, "/srv/a").is_some());
+    }
+
+    #[test]
+    fn relative_input_and_dirs_outside_the_roots_offer_the_roots() {
+        let mut f = Fixture::paired();
+        f.session("/srv/code/web");
+        let (req, dir) = complete(&mut f, "co").unwrap();
+        assert_eq!(dir, "", "the roots");
+        f.model.dirs_listed(
+            req,
+            Ok(DirsResult::Roots {
+                roots: vec!["/srv/code".into(), "/opt/tools".into()],
+            }),
+        );
+        assert_eq!(
+            candidates(&f),
+            vec![
+                ("/srv/code".to_owned(), CandidateSource::Server),
+                ("/srv/code/web".to_owned(), CandidateSource::Recent),
+            ]
+        );
+
+        let (req, dir) = complete(&mut f, "/s").unwrap();
+        assert_eq!(dir, "/");
+        f.model.dirs_listed(
+            req,
+            Ok(DirsResult::NotAllowed {
+                roots: vec!["/srv/code".into(), "/opt/tools".into()],
+            }),
+        );
+        assert_eq!(completion(&f).fill().as_deref(), Some("/srv/code/"));
+    }
+
+    #[test]
+    fn completion_needs_the_session_list() {
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(complete(&mut f, "/srv/"), None);
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert!(complete(&mut f, "/srv/").is_some());
+        // Creating the session ends the completion.
+        queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/x".into(),
+        }));
+        assert_eq!(f.list_view().completion, None);
     }
 }

@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search;
 use skywave_core::{
-    Action, BlobPolicy, BlobState, CoreError, Decision, Delivery, Entry, Link, LinkRejection,
-    Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView,
-    SessionView, TimelineItem, ToolOutcome, ViewState,
+    Action, BlobPolicy, BlobState, Completion, CompletionStatus, CoreError, Decision, Delivery,
+    Entry, Link, LinkRejection, Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq,
+    SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -195,6 +195,9 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Rows of completion candidates shown at most.
+pub const POPUP_ROWS: usize = 8;
+
 /// The "new session" prompt on the session list: the server workdir being
 /// typed. Whether the path is acceptable is the server's call (D14).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -203,12 +206,48 @@ pub struct CreateInput {
     /// Enter was pressed; the prompt closes once the core takes the action
     /// and stays open with the text if dispatching fails.
     submitted: bool,
+    /// The completion popup is open, showing the core's
+    /// [`Completion`].
+    popup: bool,
+    /// Highlighted candidate in the popup.
+    selected: usize,
+    /// Tab was pressed: once the core's candidates for this input are
+    /// settled, fill in the completion. Any other key cancels it.
+    tab: bool,
 }
 
 impl CreateInput {
     fn insert(&mut self, text: &str) {
         self.workdir
             .extend(text.chars().filter(|c| !c.is_control()));
+    }
+
+    /// The workdir changed: while the popup is open, complete it again.
+    fn edited(&mut self) -> Option<Action> {
+        self.popup.then(|| {
+            self.selected = 0;
+            Action::CompleteWorkdir {
+                input: self.workdir.clone(),
+            }
+        })
+    }
+
+    /// Applies a settled completion Tab asked for: the only candidate fills
+    /// in and the popup closes; several extend the common prefix and stay
+    /// listed.
+    fn settle(&mut self, completion: &Completion) {
+        if !self.tab
+            || completion.input != self.workdir
+            || completion.status == CompletionStatus::Loading
+        {
+            return;
+        }
+        self.tab = false;
+        if let Some(fill) = completion.fill() {
+            self.workdir = fill;
+        }
+        self.popup = completion.candidates.len() != 1;
+        self.selected = 0;
     }
 }
 
@@ -655,6 +694,14 @@ impl App {
             .session()
             .and_then(|(view, ui)| find(view, ui.search.as_ref()?.current?));
         self.view = view;
+        if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.create, &self.view.screen)
+            && let Some(completion) = &list.completion
+        {
+            create.settle(completion);
+            create.selected = create
+                .selected
+                .min(completion.candidates.len().saturating_sub(1));
+        }
         self.keep_selection(old_index);
         self.follow_session();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
@@ -1001,6 +1048,9 @@ impl App {
         }
         if let Some(create) = &mut self.ui.create {
             create.insert(text.trim());
+            // The candidates were for the text before the paste.
+            create.popup = false;
+            create.tab = false;
             return;
         }
         match PairUri::parse(text) {
@@ -1134,11 +1184,54 @@ impl App {
         None
     }
 
-    /// Keys while the new-session prompt is open.
+    /// The completion popup of the new-session prompt, if it is open and
+    /// has something to show, with the highlighted row.
+    pub fn completion_popup(&self) -> Option<(&Completion, usize)> {
+        let create = self.ui.create.as_ref().filter(|c| c.popup)?;
+        let Screen::SessionList(list) = &self.view.screen else {
+            return None;
+        };
+        let completion = list.completion.as_ref()?;
+        Some((completion, create.selected))
+    }
+
+    /// Keys while the new-session prompt is open. Tab completes the
+    /// workdir; while the popup lists candidates, ↑↓ pick one and Tab or
+    /// Enter take it, and every edit completes again.
     fn create_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let candidates = self
+            .completion_popup()
+            .map(|(completion, _)| completion.candidates.clone())
+            .unwrap_or_default();
+        let completing =
+            matches!(&self.view.screen, Screen::SessionList(list) if list.completion.is_some());
         let create = self.ui.create.as_mut()?;
+        create.tab = false;
         match key.code {
-            KeyCode::Esc => self.ui.create = None,
+            KeyCode::Esc if create.popup => create.popup = false,
+            KeyCode::Esc => {
+                self.ui.create = None;
+                return completing.then_some(Action::EndCompletion);
+            }
+            KeyCode::Up if !candidates.is_empty() => {
+                create.selected = create.selected.saturating_sub(1);
+            }
+            KeyCode::Down if !candidates.is_empty() => {
+                create.selected = (create.selected + 1).min(candidates.len() - 1);
+            }
+            KeyCode::Tab | KeyCode::Enter if !candidates.is_empty() => {
+                let chosen = &candidates[create.selected.min(candidates.len() - 1)];
+                create.workdir = format!("{}/", chosen.path);
+                create.popup = false;
+            }
+            KeyCode::Tab => {
+                create.tab = true;
+                create.popup = true;
+                create.selected = 0;
+                return Some(Action::CompleteWorkdir {
+                    input: create.workdir.clone(),
+                });
+            }
             // Blank or unacceptable paths are refused by the core or the
             // server, not here.
             KeyCode::Enter => {
@@ -1149,9 +1242,16 @@ impl App {
             }
             KeyCode::Backspace => {
                 create.workdir.pop();
+                return create.edited();
             }
-            KeyCode::Char('u') if ctrl => create.workdir.clear(),
-            KeyCode::Char(c) if !ctrl => create.insert(c.encode_utf8(&mut [0; 4])),
+            KeyCode::Char('u') if ctrl => {
+                create.workdir.clear();
+                return create.edited();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                create.insert(c.encode_utf8(&mut [0; 4]));
+                return create.edited();
+            }
             _ => {}
         }
         None

@@ -135,8 +135,9 @@ only your server.
 
 ### 3. Work
 
-Press `n` to create a session in a directory under one of your `roots`, then
-start talking to the agent.
+Press `n` to create a session in a directory under one of your `roots`
+(`Tab` completes the path from the server, or from recent workdirs while
+offline), then start talking to the agent.
 
 | Key | Session view |
 |-----|--------------|

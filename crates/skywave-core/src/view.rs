@@ -235,6 +235,73 @@ pub struct SessionListView {
     /// Sessions this device asked for that are not in the replica yet, or
     /// that the server refused. Oldest first.
     pub creating: Vec<PendingSession>,
+    /// Workdir completion for the new-session prompt, while one is open
+    /// ([`Action::CompleteWorkdir`](crate::Action::CompleteWorkdir)).
+    pub completion: Option<Completion>,
+}
+
+/// Directories that complete what the user typed as a workdir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// The input the candidates are for.
+    pub input: String,
+    /// Paths that extend `input`, without a trailing `/`: the server's
+    /// listing once it is known, else recent workdirs from the replica. A
+    /// relative input matches the roots and recent workdirs by any path
+    /// component.
+    pub candidates: Vec<Candidate>,
+    pub status: CompletionStatus,
+}
+
+impl Completion {
+    /// What the input becomes when the user completes it: the only
+    /// candidate with a trailing `/`, or the candidates' longest common
+    /// prefix if it extends the input. `None` when nothing would change.
+    pub fn fill(&self) -> Option<String> {
+        match self.candidates.as_slice() {
+            [] => None,
+            [only] => Some(format!("{}/", only.path)),
+            [first, rest @ ..] => {
+                let mut common = first.path.as_str();
+                for c in rest {
+                    let len = common
+                        .char_indices()
+                        .zip(c.path.chars())
+                        .find(|((_, a), b)| a != b)
+                        .map_or(common.len().min(c.path.len()), |((i, _), _)| i);
+                    common = &common[..len];
+                }
+                (common.len() > self.input.len() && common.starts_with(self.input.as_str()))
+                    .then(|| common.to_owned())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub path: String,
+    pub source: CandidateSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSource {
+    /// Listed by the server just now.
+    Server,
+    /// A workdir of a session in the replica, newest first.
+    Recent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionStatus {
+    /// The server was asked; the candidates may still change.
+    Loading,
+    /// The server answered; `truncated` when it listed only part of a large
+    /// directory.
+    Ready { truncated: bool },
+    /// No listing: offline, refused, timed out, or a server without the
+    /// endpoint. The candidates are recent workdirs only.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -19,7 +19,8 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandResult, EventBatch, EventsQuery, HelloResponse, PROTOCOL_VERSION, path,
+    BlobId, Command, CommandResult, DirsResult, EventBatch, EventsQuery, HelloResponse,
+    PROTOCOL_VERSION, path,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -328,6 +329,15 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    async fn list_dirs(&self, dir: &str) -> Result<DirsResult, TransportError> {
+        let uri = format!("{}?dir={}", path::DIRS, query_escape(dir));
+        let reply = self
+            .http
+            .request(Method::GET, &uri, Bytes::new(), self.http.request_timeout())
+            .await?;
+        ok_json(reply)
+    }
+
     async fn blob(&self, id: BlobId, from: u64) -> Result<BlobDownload, TransportError> {
         let range;
         let headers: &[(header::HeaderName, HeaderValue)] = if from > 0 {
@@ -367,6 +377,21 @@ impl HttpsTransport {
             }),
         })
     }
+}
+
+/// Percent-encodes `value` for a query string: everything but RFC 3986
+/// unreserved characters and `/`.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(char::from(byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// `bytes <first>-<last>/<size>` → (first, size).
@@ -432,6 +457,10 @@ impl Transport for HttpsTransport {
     fn blob(&self, id: BlobId, from: u64) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
         Box::pin(HttpsTransport::blob(self, id, from))
     }
+
+    fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
+        Box::pin(HttpsTransport::list_dirs(self, dir))
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +472,15 @@ mod tests {
         assert_eq!(parse_content_range("bytes 5-9/10"), Some((5, 10)));
         assert_eq!(parse_content_range("bytes */10"), None);
         assert_eq!(parse_content_range("items 1-2/3"), None);
+    }
+
+    #[test]
+    fn query_values_are_escaped() {
+        assert_eq!(query_escape("/srv/a-b_c.d~"), "/srv/a-b_c.d~");
+        assert_eq!(
+            query_escape("/a b&c=d%#+é"),
+            "/a%20b%26c%3Dd%25%23%2B%C3%A9"
+        );
     }
 
     #[test]

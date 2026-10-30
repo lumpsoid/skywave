@@ -9,7 +9,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use skywave_proto::{BlobId, Command, CommandResult, EventBatch, EventsQuery, HelloResponse};
+use skywave_proto::{
+    BlobId, Command, CommandResult, DirsResult, EventBatch, EventsQuery, HelloResponse,
+};
 
 use crate::view::LinkRejection;
 
@@ -37,6 +39,15 @@ pub trait Transport: Send + Sync {
     /// when `from > 0`, so an interrupted download resumes). `from` at or
     /// past the end is [`TransportError::RangeNotSatisfiable`].
     fn blob(&self, id: BlobId, from: u64) -> BoxFuture<'_, Result<BlobDownload, TransportError>>;
+
+    /// `GET /v1/dirs?dir=`: the subdirectories of `dir` for workdir
+    /// completion; an empty `dir` asks for the roots. A server without the
+    /// endpoint answers [`TransportError::NotFound`], which is also what a
+    /// transport that cannot list returns by default.
+    fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
+        let _ = dir;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
 }
 
 /// A blob response whose body is still arriving.

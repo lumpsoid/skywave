@@ -517,6 +517,38 @@ pub struct EventsQuery {
     pub limit: Option<u32>,
 }
 
+/// Query string of `GET /v1/dirs`: which server directory to list for
+/// workdir completion. Additive to v3: an older server answers 404.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirsQuery {
+    /// Absolute directory to list; empty asks for the configured roots.
+    #[serde(default)]
+    pub dir: String,
+}
+
+/// Response to `GET /v1/dirs`, always 200: every outcome is a domain answer.
+///
+/// Only directories under the configured roots are ever named (D14). The
+/// server does no prefix filtering; the client filters what it shows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DirsResult {
+    /// `dir` was empty: the canonical roots that exist.
+    Roots { roots: Vec<String> },
+    /// The subdirectories of `dir` (canonical), sorted. `truncated` when the
+    /// scan or reply cap cut the listing short.
+    Listed {
+        dir: String,
+        names: Vec<String>,
+        truncated: bool,
+    },
+    /// `dir` is relative or outside every root; the roots are offered
+    /// instead.
+    NotAllowed { roots: Vec<String> },
+    /// `dir` does not exist or is not a directory.
+    NotFound,
+}
+
 /// HTTP paths of the v1 API.
 pub mod path {
     use crate::BlobId;
@@ -525,6 +557,7 @@ pub mod path {
     pub const HELLO: &str = "/v1/hello";
     pub const COMMANDS: &str = "/v1/commands";
     pub const EVENTS: &str = "/v1/events";
+    pub const DIRS: &str = "/v1/dirs";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

@@ -11,8 +11,8 @@ use skywave_core::{
     Request, Screen, Transport, TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, EventKind, EventsQuery,
-    PROTOCOL_VERSION, Seq,
+    BlobId, Command, CommandId, CommandKind, CommandResult, DirsResult, EventKind, EventsQuery,
+    HelloResponse, PROTOCOL_VERSION, Seq,
 };
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing::{self, IssuedCode};
@@ -260,12 +260,88 @@ async fn pair_then_talk_to_the_server_until_revoked() {
         TransportError::NotFound
     );
 
+    // Directory listings, with a name that needs escaping in the query.
+    let root = std::fs::canonicalize(fx.tmp.path().join("root")).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir(project.join("my dir %&#")).unwrap();
+    let roots = vec![root.display().to_string()];
+    assert_eq!(
+        transport.list_dirs("").await.unwrap(),
+        DirsResult::Roots {
+            roots: roots.clone()
+        }
+    );
+    assert_eq!(
+        transport
+            .list_dirs(&format!("{}/", project.display()))
+            .await
+            .unwrap(),
+        DirsResult::Listed {
+            dir: project.display().to_string(),
+            names: vec!["my dir %&#".into()],
+            truncated: false,
+        }
+    );
+    assert_eq!(
+        transport
+            .list_dirs(&project.join("my dir %&#").display().to_string())
+            .await
+            .unwrap(),
+        DirsResult::Listed {
+            dir: project.join("my dir %&#").display().to_string(),
+            names: Vec::new(),
+            truncated: false,
+        }
+    );
+    assert_eq!(
+        transport.list_dirs("/").await.unwrap(),
+        DirsResult::NotAllowed { roots }
+    );
+
     // Revocation applies to the next request, even on a pooled connection.
     devices::revoke(fx.storage.db.conn(), stored.device_id(), Utc::now()).unwrap();
     let err = transport.hello().await.unwrap_err();
     assert_eq!(err, TransportError::Revoked);
     assert!(!err.is_retryable());
     assert_eq!(err.rejection(), Some(skywave_core::LinkRejection::Revoked));
+    assert_eq!(
+        transport.list_dirs("").await.unwrap_err(),
+        TransportError::Revoked
+    );
+}
+
+/// A transport that cannot list directories, like an older server without
+/// `GET /v1/dirs` (404), answers `NotFound`: completion falls back to
+/// recent workdirs.
+#[tokio::test]
+async fn list_dirs_defaults_to_not_found() {
+    struct Old;
+    impl Transport for Old {
+        fn hello(&self) -> skywave_core::BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            unimplemented!()
+        }
+        fn send_command<'a>(
+            &'a self,
+            _: &'a Command,
+        ) -> skywave_core::BoxFuture<'a, Result<CommandResult, TransportError>> {
+            unimplemented!()
+        }
+        fn events(
+            &self,
+            _: EventsQuery,
+        ) -> skywave_core::BoxFuture<'_, Result<skywave_proto::EventBatch, TransportError>>
+        {
+            unimplemented!()
+        }
+        fn blob(
+            &self,
+            _: BlobId,
+            _: u64,
+        ) -> skywave_core::BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            unimplemented!()
+        }
+    }
+    assert_eq!(Old.list_dirs("/").await, Err(TransportError::NotFound));
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches

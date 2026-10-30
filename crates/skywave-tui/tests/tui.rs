@@ -18,7 +18,7 @@ use skywave_core::{
     Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    BlobRef, Body, BodyFormat, CallId, CommandResult, Event, EventBatch, EventKind,
+    BlobRef, Body, BodyFormat, CallId, CommandResult, DirsResult, Event, EventBatch, EventKind,
     SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
@@ -812,6 +812,155 @@ fn esc_cancels_the_new_session_prompt() {
     // Out of the prompt, `q` quits again.
     h.key(KeyCode::Char('q'));
     assert!(h.app.ui().quit);
+}
+
+/// The listing the core asked the engine for: its id and directory.
+fn list_dirs_request(h: &Harness) -> (u64, String) {
+    match h.drain_requests().as_slice() {
+        [Request::ListDirs { req, dir }] => (*req, dir.clone()),
+        other => panic!("expected one listing request, got {other:?}"),
+    }
+}
+
+fn answer_listing(h: &mut Harness, req: u64, dir: &str, names: &[&str]) {
+    h.seam.dirs_listed(
+        req,
+        Ok(DirsResult::Listed {
+            dir: dir.into(),
+            names: names.iter().map(|&n| n.to_owned()).collect(),
+            truncated: false,
+        }),
+    );
+    h.sync();
+}
+
+/// The completion popup's lines, empty when it is closed.
+fn popup(screen: &str) -> String {
+    let lines: Vec<&str> = screen
+        .lines()
+        .skip_while(|line| !line.contains("Directories"))
+        .take_while(|line| !line.contains("New session"))
+        .collect();
+    lines.join(
+        "
+",
+    )
+}
+
+fn workdir_input(h: &Harness) -> String {
+    h.app.ui().create.as_ref().unwrap().workdir.clone()
+}
+
+#[test]
+fn tab_fills_in_the_only_directory() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('n'));
+    assert_contains(&h.screen(), "Tab complete");
+    h.type_text("/srv/a");
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/a".into()
+        })
+    );
+    let (req, dir) = list_dirs_request(&h);
+    assert_eq!(dir, "/srv/");
+    assert_contains(&h.screen(), "listing…");
+
+    answer_listing(&mut h, req, "/srv", &[".git", "api", "web"]);
+    assert_eq!(workdir_input(&h), "/srv/api/");
+    let screen = h.screen();
+    assert!(!screen.contains("Directories"), "{screen}");
+    assert_contains(&screen, "> /srv/api/");
+    // Enter creates the session as usual.
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            workdir: "/srv/api/".into()
+        })
+    );
+}
+
+#[test]
+fn several_directories_open_a_popup_to_pick_from() {
+    let mut h = Harness::paired();
+    let [a, b] = std::array::from_fn(|_| SessionId::new());
+    pull(
+        &mut h,
+        vec![created(a, 0, "/srv/project-a"), created(b, 1, "/srv/web")],
+    );
+    h.key(KeyCode::Char('n'));
+    h.type_text("/srv/p");
+    h.key(KeyCode::Tab);
+    let (req, _) = list_dirs_request(&h);
+    // Recent workdirs show at once, while the server is asked.
+    let screen = popup(&h.screen());
+    assert_contains(&line_with(&screen, "/srv/project-a"), "recent");
+    assert_contains(&screen, "listing…");
+    assert!(!screen.contains("/srv/web"), "{screen}");
+
+    answer_listing(&mut h, req, "/srv", &["project-a", "project-b", "web"]);
+    assert_eq!(workdir_input(&h), "/srv/project-", "the common prefix");
+    assert_contains(&h.screen(), "Tab/Enter accept");
+    let screen = popup(&h.screen());
+    assert!(!line_with(&screen, "/srv/project-a").contains("recent"));
+    assert_contains(&screen, "/srv/project-b");
+    assert!(!screen.contains("listing…"));
+
+    // Typing filters the same listing without asking again.
+    assert_eq!(
+        h.key(KeyCode::Char('b')),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/project-b".into()
+        })
+    );
+    assert!(h.drain_requests().is_empty());
+    assert!(!popup(&h.screen()).contains("/srv/project-a"));
+    h.key(KeyCode::Backspace);
+
+    // ↓ then Enter takes the second row and does not create anything.
+    h.key(KeyCode::Down);
+    assert_contains(&line_with(&popup(&h.screen()), "/srv/project-b"), "> ");
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(workdir_input(&h), "/srv/project-b/");
+    assert!(!h.screen().contains("Directories"));
+    assert!(h.seam.pending_outbox().unwrap().is_empty());
+}
+
+#[test]
+fn esc_closes_the_popup_then_the_prompt() {
+    let mut h = Harness::paired();
+    let [a, b] = std::array::from_fn(|_| SessionId::new());
+    pull(
+        &mut h,
+        vec![created(a, 0, "/srv/one"), created(b, 1, "/srv/two")],
+    );
+    h.seam.set_link(Link::Reconnecting {
+        attempt: 1,
+        next_in: Duration::from_secs(5),
+        offline_since: Instant::now(),
+    });
+    h.sync();
+    h.key(KeyCode::Char('n'));
+    h.type_text("/srv/o");
+    h.key(KeyCode::Tab);
+    assert!(h.drain_requests().is_empty(), "nothing is asked offline");
+    // Offline, recent workdirs are all there is: the only match fills in.
+    assert_eq!(workdir_input(&h), "/srv/one/");
+
+    h.key_with(ctrl('u'));
+    h.type_text("/srv/");
+    h.key(KeyCode::Tab);
+    let screen = popup(&h.screen());
+    assert_contains(&screen, "offline · recent only");
+    assert_contains(&line_with(&screen, "/srv/two"), "recent");
+    assert_contains(&line_with(&screen, "/srv/one"), "recent");
+
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(!h.screen().contains("Directories"));
+    assert_eq!(workdir_input(&h), "/srv/");
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::EndCompletion));
+    assert!(h.app.ui().create.is_none());
 }
 
 // ---- session view -----------------------------------------------------------
