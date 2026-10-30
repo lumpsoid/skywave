@@ -15,7 +15,7 @@ pub use skywave_proto::{
     ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Seq, SessionId, ToolKind,
 };
 
-use crate::store::{BlobPolicy, BlobRecord, BlobStatus, OutboxStatus};
+use crate::store::{BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -81,6 +81,35 @@ impl From<&OutboxStatus> for Outgoing {
             OutboxStatus::Done(CommandResult::Accepted { seq }) => Outgoing::Accepted(*seq),
             OutboxStatus::Done(CommandResult::Rejected { reason }) => Outgoing::Failed(*reason),
         }
+    }
+}
+
+/// How one of this device's commands went out. Every time is this device's
+/// clock, so the waits between them hold whatever the server's clock says;
+/// the server's own time is the item's `at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivery {
+    /// When the command was queued: the time in its UUIDv7 id.
+    pub queued_at: DateTime<Utc>,
+    /// When it was first claimed for sending; `None` before that, and for
+    /// commands sent before this was recorded (`tries` is then 1).
+    pub first_sent_at: Option<DateTime<Utc>>,
+    /// When the server's answer was recorded.
+    pub answered_at: Option<DateTime<Utc>>,
+    /// How often it was claimed for sending; more than once means resends.
+    pub tries: u32,
+}
+
+impl Delivery {
+    /// `None` for a command whose id carries no time (not a UUIDv7).
+    pub(crate) fn of(entry: &OutboxEntry) -> Option<Self> {
+        let (secs, nanos) = entry.command.id.0.get_timestamp()?.to_unix();
+        Some(Delivery {
+            queued_at: DateTime::from_timestamp(i64::try_from(secs).ok()?, nanos)?,
+            first_sent_at: entry.first_sent_at,
+            answered_at: entry.answered_at,
+            tries: entry.tries,
+        })
     }
 }
 
@@ -251,6 +280,7 @@ pub enum TimelineItem {
         /// [`Action::EditQueued`](crate::Action::EditQueued) take it back:
         /// the server never saw it, or refused it.
         discardable: bool,
+        delivery: Option<Delivery>,
     },
 }
 
@@ -266,6 +296,8 @@ pub enum Entry {
         own: bool,
         /// Delivery state when this device sent it.
         outgoing: Option<Outgoing>,
+        /// How it went out, when this device sent it.
+        delivery: Option<Delivery>,
     },
     AgentMessage {
         text: String,
@@ -406,6 +438,7 @@ pub struct ApprovalPrompt {
 pub struct Answer {
     pub decision: Decision,
     pub outgoing: Outgoing,
+    pub delivery: Option<Delivery>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

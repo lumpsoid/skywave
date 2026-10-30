@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
-    Action, BlobPolicy, BlobState, CoreError, Decision, Entry, Link, LinkRejection, Outgoing,
-    PairingView, PendingSession, Route, Screen, Seq, SessionId, SessionListView, SessionView,
-    TimelineItem, ToolOutcome, ViewState,
+    Action, BlobPolicy, BlobState, CoreError, Decision, Delivery, Entry, Link, LinkRejection,
+    Outgoing, PairingView, PendingSession, Route, Screen, Seq, SessionId, SessionListView,
+    SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::composer::Composer;
 use crate::timeline::{
-    ItemKey, discardable, find, gated_item, sections, selectable, starts_turn, wanted_blob,
+    ItemKey, delivery, discardable, find, gated_item, sections, selectable, starts_turn,
+    wanted_blob,
 };
 
 /// How old the first unsaved composer edit gets before the draft is saved
@@ -461,16 +462,31 @@ impl App {
         }
     }
 
-    /// The screen shows a clock that runs: a tool call's elapsed time.
+    /// The screen shows a clock that runs: a tool call's elapsed time, or
+    /// how long an unanswered own message (selected, so its delivery line
+    /// shows) or approval answer has waited.
     pub fn live(&self) -> bool {
-        self.session().is_some_and(|(view, _)| {
-            view.timeline.iter().any(|item| {
+        let waiting = |delivery: &Delivery| delivery.answered_at.is_none();
+        self.session().is_some_and(|(view, ui)| {
+            let running = view.timeline.iter().any(|item| {
                 matches!(
                     item,
                     TimelineItem::Logged { entry: Entry::Tool(tool), .. }
                         if matches!(tool.outcome, ToolOutcome::Running { .. })
                 )
-            })
+            });
+            let selected = ui.focus == Focus::Timeline
+                && ui
+                    .selected
+                    .and_then(|key| find(view, key))
+                    .and_then(|index| delivery(&view.timeline[index]))
+                    .is_some_and(|(_, d)| waiting(&d));
+            let answer = view
+                .pending_approval
+                .as_ref()
+                .and_then(|p| p.answer.as_ref()?.delivery.as_ref())
+                .is_some_and(waiting);
+            running || selected || answer
         })
     }
 

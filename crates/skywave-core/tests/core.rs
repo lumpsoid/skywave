@@ -8,7 +8,7 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, Core, CoreError, Draft, Entry, Link, Outgoing,
+    Action, BlobState, BlobStatus, Core, CoreError, Delivery, Draft, Entry, Link, Outgoing,
     PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView, Store, StoreError,
     TimelineItem, ViewState,
 };
@@ -211,13 +211,17 @@ fn offline_send_is_persisted_first_and_appears_once() {
     );
     let view = views.last();
     assert_eq!(view.queued, 1);
+    let timeline = &session_view(&view).timeline;
+    let queued = delivery(&timeline[0]);
+    assert_eq!((queued.tries, queued.first_sent_at), (0, None));
     assert_eq!(
-        session_view(&view).timeline,
+        *timeline,
         vec![TimelineItem::Pending {
             command_id: command.id,
             text: "fix the build".into(),
             outgoing: Outgoing::Queued,
             discardable: true,
+            delivery: Some(queued),
         }]
     );
 
@@ -250,8 +254,16 @@ fn offline_send_is_persisted_first_and_appears_once() {
     .unwrap();
     let live = views.last();
     assert_eq!(live.queued, 0);
+    let timeline = &session_view(&live).timeline;
+    // Sent once, answered after; all by this device's clock.
+    let done = delivery(&timeline[0]);
+    let (Some(sent), Some(answered)) = (done.first_sent_at, done.answered_at) else {
+        panic!("sent and answered: {done:?}");
+    };
+    assert_eq!(done.tries, 1);
+    assert!(done.queued_at <= sent && sent <= answered);
     assert_eq!(
-        session_view(&live).timeline,
+        *timeline,
         vec![TimelineItem::Logged {
             seq: Seq(2),
             at: event(sid, 1, EventKind::TurnInterrupted).at,
@@ -261,6 +273,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
                 from: device,
                 own: true,
                 outgoing: Some(Outgoing::Accepted(Seq(2))),
+                delivery: Some(done),
             },
         }]
     );
@@ -272,6 +285,25 @@ fn offline_send_is_persisted_first_and_appears_once() {
     let cold = core.view();
     assert_eq!(cold.screen, live.screen);
     assert_eq!(cold.link, Link::Connecting);
+}
+
+/// An own message's delivery, pending or logged.
+fn delivery(item: &TimelineItem) -> Delivery {
+    match item {
+        TimelineItem::Pending {
+            delivery: Some(delivery),
+            ..
+        }
+        | TimelineItem::Logged {
+            entry:
+                Entry::UserMessage {
+                    delivery: Some(delivery),
+                    ..
+                },
+            ..
+        } => *delivery,
+        other => panic!("expected an own message with its delivery, got {other:?}"),
+    }
 }
 
 #[test]

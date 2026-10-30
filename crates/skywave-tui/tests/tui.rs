@@ -13,9 +13,9 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
-    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, DeviceId, Draft,
-    FailReason, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam, Seq,
-    SessionId, ViewState,
+    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, Delivery,
+    DeviceId, Draft, Entry, FailReason, Link, LinkRejection, PairedCredentials, Request, Route,
+    Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, Event, EventBatch, EventKind,
@@ -23,7 +23,7 @@ use skywave_proto::{
 };
 use skywave_tui::App;
 use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri};
-use skywave_tui::timeline::ItemKey;
+use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
 
 const FP: &str = "ab:cd:ef";
@@ -2624,4 +2624,261 @@ fn dismiss_refused_creation() {
         .map(|e| e.command.id)
         .collect();
     assert_eq!(left, [waiting]);
+}
+
+// ---- delivery detail --------------------------------------------------------
+
+/// The delivery of the own message `key` names, as the core shows it.
+fn delivery_of(h: &Harness, key: ItemKey) -> Delivery {
+    let (view, _) = h.app.session().unwrap();
+    let index = find(view, key).unwrap();
+    delivery(&view.timeline[index]).unwrap().1
+}
+
+/// The app's view with the delivery of `key`'s message replaced, so the
+/// times on screen are fixed.
+fn with_delivery(h: &Harness, key: ItemKey, new: Delivery) -> ViewState {
+    let mut view = h.app.view().clone();
+    let Screen::Session(session) = &mut view.screen else {
+        panic!("no session open");
+    };
+    let index = find(session, key).unwrap();
+    match &mut session.timeline[index] {
+        TimelineItem::Pending { delivery, .. }
+        | TimelineItem::Logged {
+            entry: Entry::UserMessage { delivery, .. },
+            ..
+        } => *delivery = Some(new),
+        other => panic!("not a message: {other:?}"),
+    }
+    view
+}
+
+/// The screen line after the one line containing `needle`, without the
+/// border and indent.
+fn line_after(screen: &str, needle: &str) -> String {
+    let line = line_with(screen, needle);
+    let mut lines = screen.lines().skip_while(|l| *l != line);
+    lines.next();
+    let next = lines.next().unwrap_or_default();
+    next.trim_matches(|c: char| c == '│' || c.is_whitespace())
+        .to_owned()
+}
+
+fn ms(ms: i64) -> chrono::Duration {
+    chrono::Duration::milliseconds(ms)
+}
+
+#[test]
+fn selected_own_message_shows_delivery_detail() {
+    let (mut h, id, me) = open_session();
+    let phone = DeviceId::new();
+    pull(&mut h, vec![event(id, 1, user(phone, "from the phone"))]);
+    h.type_text("hello");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.seam.command_sending(command).unwrap();
+    let seq = Seq(h.seam.cursor().unwrap().0 + 1);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq })
+        .unwrap();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::UserMessage {
+                command_id: command,
+                device_id: me,
+                text: "hello".into(),
+            },
+        )],
+    );
+    // Only a selected message shows it.
+    assert!(!h.screen().contains("queued"), "{}", h.screen());
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Logged(seq)));
+    let real = delivery_of(&h, ItemKey::Logged(seq));
+    assert_eq!(real.tries, 1);
+    assert!(real.first_sent_at.is_some() && real.answered_at.is_some());
+    assert!(line_after(&h.screen(), "you [accepted]: hello").starts_with("queued "));
+
+    // What each step took, from the queueing, by this device's clock.
+    let queued_at = at_s(2, 11);
+    let resent = Delivery {
+        queued_at,
+        first_sent_at: Some(queued_at + ms(3200)),
+        answered_at: Some(queued_at + ms(8100)),
+        tries: 2,
+    };
+    let view = with_delivery(&h, ItemKey::Logged(seq), resent);
+    h.app.set_view(view, h.t0);
+    assert_eq!(
+        line_after(&h.screen(), "you [accepted]: hello"),
+        "queued 12:02:11 · sent +3.2s · 2 tries · answered +8.1s"
+    );
+    // Sent before send times were recorded: no time for it.
+    let old = Delivery {
+        first_sent_at: None,
+        tries: 1,
+        ..resent
+    };
+    let view = with_delivery(&h, ItemKey::Logged(seq), old);
+    h.app.set_view(view, h.t0);
+    assert_eq!(
+        line_after(&h.screen(), "you [accepted]: hello"),
+        "queued 12:02:11 · sent · answered +8.1s"
+    );
+
+    // Another device's message has none.
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:01 ");
+    assert!(!h.screen().contains("queued"), "{}", h.screen());
+
+    // A refused message says how long the refusal took.
+    h.key(KeyCode::Tab);
+    h.type_text("again");
+    h.key(KeyCode::Enter);
+    let refused = last_command(&h);
+    h.seam.command_sending(refused).unwrap();
+    h.seam
+        .command_result(
+            refused,
+            &CommandResult::Rejected {
+                reason: FailReason::UnknownSession,
+            },
+        )
+        .unwrap();
+    h.sync();
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Down);
+    h.key(KeyCode::Down);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(refused)));
+    let quick = Delivery {
+        queued_at: at_s(3, 0),
+        first_sent_at: Some(at_s(3, 0) + ms(500)),
+        answered_at: Some(at_s(3, 0) + ms(2100)),
+        tries: 1,
+    };
+    let view = with_delivery(&h, ItemKey::Pending(refused), quick);
+    h.app.set_view(view, h.t0);
+    assert_eq!(
+        line_after(&h.screen(), "]: again"),
+        "queued 12:03:00 · sent +0.5s · refused +2.1s"
+    );
+}
+
+#[test]
+fn pending_message_shows_try_count() {
+    let (mut h, _, _) = open_session();
+    h.type_text("hello");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    let key = ItemKey::Pending(command);
+    assert_eq!(selected(&h), Some(key));
+    let later = delivery_of(&h, key).queued_at + chrono::Duration::seconds(130);
+    let screen = trimmed(&h.frame(100, 24, later));
+    assert_eq!(
+        line_after(&screen, "you [queued]: hello"),
+        "queued 2m10s ago"
+    );
+
+    for _ in 0..3 {
+        assert!(h.seam.command_sending(command).unwrap());
+    }
+    h.sync();
+    let screen = trimmed(&h.frame(100, 24, later));
+    assert_eq!(
+        line_after(&screen, "you [sending]: hello"),
+        "queued 2m10s ago · sending, try 3"
+    );
+}
+
+#[test]
+fn attempted_queued_message_says_sent_once() {
+    let (mut h, _, _) = open_session();
+    h.type_text("hello");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.seam.command_sending(command).unwrap();
+    // A restart puts it back in the queue, sent once.
+    let mut h = h.restart();
+    h.key(KeyCode::Enter);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    let key = ItemKey::Pending(command);
+    assert_eq!(selected(&h), Some(key));
+    let later = delivery_of(&h, key).queued_at + chrono::Duration::seconds(7);
+    let screen = trimmed(&h.frame(100, 24, later));
+    assert_eq!(
+        line_after(&screen, "you [queued]: hello"),
+        "queued 7s ago · sent once, waiting for the server"
+    );
+    // Which is why it can no longer be taken back.
+    assert!(!footer(&h).contains("e edit"), "{}", footer(&h));
+}
+
+#[test]
+fn delivery_line_ticks_while_selected() {
+    let (mut h, _, _) = open_session();
+    h.type_text("hello");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    assert!(!h.app.live(), "nothing selected, nothing counts");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    let key = ItemKey::Pending(command);
+    assert_eq!(selected(&h), Some(key));
+    assert!(h.app.live(), "the event loop ticks for the count");
+    let queued_at = delivery_of(&h, key).queued_at;
+    for seconds in [10, 20] {
+        let wall = queued_at + chrono::Duration::seconds(seconds);
+        assert_eq!(
+            line_after(&trimmed(&h.frame(100, 24, wall)), "you [queued]: hello"),
+            format!("queued {seconds}s ago")
+        );
+    }
+    // Not shown while typing: nothing to count.
+    h.key(KeyCode::Tab);
+    assert!(!h.app.live());
+    h.key(KeyCode::Tab);
+    assert!(h.app.live());
+    // Answered: the times are final.
+    let seq = Seq(h.seam.cursor().unwrap().0 + 1);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq })
+        .unwrap();
+    h.sync();
+    assert!(!h.app.live());
+}
+
+#[test]
+fn approval_answer_says_how_long_it_waited() {
+    let (mut h, _, _, _) = gated(
+        Vec::new(),
+        call(CallId::new(), "Bash", ToolKind::Shell, "cargo test"),
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('a'));
+    let command = last_command(&h);
+    assert!(h.app.live(), "the answer's wait counts up");
+    let answer = |h: &Harness| {
+        let (view, _) = h.app.session().unwrap();
+        view.pending_approval.as_ref().unwrap().answer.unwrap()
+    };
+    let queued_at = answer(&h).delivery.unwrap().queued_at;
+    let wall = queued_at + chrono::Duration::seconds(40);
+    assert_contains(
+        &trimmed(&h.frame(100, 30, wall)),
+        "you approved · queued 40s ago",
+    );
+    h.seam.command_sending(command).unwrap();
+    h.sync();
+    assert_contains(
+        &trimmed(&h.frame(100, 30, wall)),
+        "you approved · queued 40s ago · sending",
+    );
 }
