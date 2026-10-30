@@ -41,7 +41,12 @@
 //! [`Backoff::delay`] and connects again, still showing `Reconnecting`
 //! until `hello` succeeds (`RetryNow` ends the wait early and moves
 //! `retry_at` to match, without touching the bookkeeping). Both times are
-//! wall clock, read once per failure; the wait itself is monotonic. The attempt count and `offline_since` reset once
+//! wall clock ([`EngineConfig::wall_clock`]), read once per failure. The
+//! wait ends once either clock says the delay has passed: the monotonic
+//! clock stops while a device sleeps, so the link also checks the wall
+//! clock every [`WALL_CHECK`] and retries soon after the `retry_at` it
+//! showed, and a `RetryNow` after a long sleep retries at once. The
+//! attempt count and `offline_since` reset once
 //! a pull succeeds, so a server that answers `hello` and then fails keeps
 //! backing off.
 //!
@@ -82,6 +87,12 @@ use crate::view::{Link, LinkRejection};
 pub const DEFAULT_WAIT_SECS: u32 = 30;
 /// Longest a directory listing for completion may take, connecting included.
 pub const DIRS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest the link sleeps in a reconnect wait before it looks at the wall
+/// clock again. The monotonic clock stops while a device sleeps (Android's
+/// deep sleep), so after waking the attempt comes at most this long after
+/// the `retry_at` the view shows. Only waits longer than this tick more
+/// than once, and only while the device is awake.
+pub const WALL_CHECK: Duration = Duration::from_secs(5);
 
 /// How the sync engine talks to the server; [`Default`] is what heads use.
 #[derive(Debug, Clone)]
@@ -98,6 +109,8 @@ pub struct EngineConfig {
     pub device_name: Option<String>,
     /// Builds the transport for the paired server.
     pub connector: Connector,
+    /// Where the link reads wall time.
+    pub wall_clock: WallClock,
 }
 
 impl Default for EngineConfig {
@@ -109,6 +122,7 @@ impl Default for EngineConfig {
             backoff: Backoff::default(),
             device_name: None,
             connector: Connector::https(),
+            wall_clock: WallClock::system(),
         }
     }
 }
@@ -160,6 +174,33 @@ impl Connector {
 impl fmt::Debug for Connector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Connector")
+    }
+}
+
+/// The wall clock the link stamps `Link::Reconnecting` with and checks its
+/// wait against. [`WallClock::system`] by default; tests inject one that
+/// moves with tokio's paused clock, or jumps as if the device had slept.
+#[derive(Clone)]
+pub struct WallClock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
+
+impl WallClock {
+    /// [`Utc::now`].
+    pub fn system() -> WallClock {
+        WallClock::new(Utc::now)
+    }
+
+    pub fn new(now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> WallClock {
+        WallClock(Arc::new(now))
+    }
+
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for WallClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WallClock")
     }
 }
 
@@ -478,37 +519,72 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             return rejection;
         }
         retry.attempt = retry.attempt.saturating_add(1);
-        // The wait runs on the monotonic clock; the view gets the same
-        // moments as wall time, read once here so every snapshot of this
-        // wait carries the same values.
+        // The view gets the failure and the deadline as wall time, read once
+        // here so every snapshot of this wait carries the same values. The
+        // wait ends when either clock says the delay has passed: the
+        // monotonic one survives wall-clock changes, the wall one keeps
+        // counting while the device sleeps.
         let failed_at = tokio::time::Instant::now();
-        let failed_wall = Utc::now();
+        let failed_wall = ctx.config.wall_clock.now();
         let offline_since = *retry.offline_since.get_or_insert(failed_wall);
-        let retry_at = |wake: tokio::time::Instant| {
-            failed_wall + TimeDelta::from_std(wake - failed_at).unwrap_or(TimeDelta::MAX)
-        };
         let next_in = ctx.config.backoff.delay(retry.attempt);
         tracing::debug!(%error, attempt = retry.attempt, ?next_in, "link down");
-        let mut wake = failed_at + next_in;
+        let mut wait = Wait {
+            failed_at,
+            failed_wall,
+            delay: next_in,
+        };
         reporter.set(Link::Reconnecting {
             attempt: retry.attempt,
-            retry_at: retry_at(wake),
+            retry_at: wait.retry_at(),
             offline_since,
         });
-        tokio::select! {
-            () = tokio::time::sleep_until(wake) => {}
-            () = ctx.retry_now.notified() => {
-                wake = wake.min(failed_at + Backoff::RETRY_NOW_MIN);
-                tracing::debug!(after = ?wake - failed_at, "retrying now");
-                reporter.set(Link::Reconnecting {
-                    attempt: retry.attempt,
-                    retry_at: retry_at(wake),
-                    offline_since,
-                });
+        let retry_now = ctx.retry_now.notified();
+        tokio::pin!(retry_now);
+        let mut pressed = false;
+        loop {
+            let left = wait.left(ctx.config.wall_clock.now());
+            if left.is_zero() {
+                break;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(left.min(WALL_CHECK)) => {}
                 // Further presses are ignored until the attempt fails.
-                tokio::time::sleep_until(wake).await;
+                () = &mut retry_now, if !pressed => {
+                    pressed = true;
+                    wait.delay = wait.delay.min(Backoff::RETRY_NOW_MIN);
+                    tracing::debug!(after = ?wait.delay, "retrying now");
+                    reporter.set(Link::Reconnecting {
+                        attempt: retry.attempt,
+                        retry_at: wait.retry_at(),
+                        offline_since,
+                    });
+                }
             }
         }
+    }
+}
+
+/// A reconnect wait: `delay` after a failure seen at `failed_at` on the
+/// monotonic clock and `failed_wall` on the wall clock.
+struct Wait {
+    failed_at: tokio::time::Instant,
+    failed_wall: DateTime<Utc>,
+    delay: Duration,
+}
+
+impl Wait {
+    /// When the next attempt is due, on the wall clock.
+    fn retry_at(&self) -> DateTime<Utc> {
+        self.failed_wall + TimeDelta::from_std(self.delay).unwrap_or(TimeDelta::MAX)
+    }
+
+    /// How much longer to wait, given the wall time `now`: the delay less
+    /// what the further ahead of the two clocks says has passed.
+    fn left(&self, now: DateTime<Utc>) -> Duration {
+        let monotonic = self.failed_at.elapsed();
+        let wall = (now - self.failed_wall).to_std().unwrap_or_default();
+        self.delay.saturating_sub(monotonic.max(wall))
     }
 }
 
@@ -685,6 +761,38 @@ mod tests {
         }
     }
 
+    /// A wall clock that moves with tokio's paused clock, plus a handle to
+    /// push it ahead on its own, as a sleeping device's wall clock does
+    /// while its monotonic clock stands still.
+    fn paused_wall() -> (WallClock, Arc<Mutex<TimeDelta>>) {
+        let start_wall = Utc::now();
+        let start = tokio::time::Instant::now();
+        let slept = Arc::new(Mutex::new(TimeDelta::zero()));
+        let jump = slept.clone();
+        let clock = WallClock::new(move || {
+            start_wall + TimeDelta::from_std(start.elapsed()).unwrap() + *jump.lock().unwrap()
+        });
+        (clock, slept)
+    }
+
+    /// The `attempt` of every `Reconnecting` published so far.
+    fn attempts(links: &[Link]) -> Vec<u32> {
+        links
+            .iter()
+            .filter_map(|l| match l {
+                Link::Reconnecting { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits (on the paused clock) until `server` has seen `n` hellos.
+    async fn hellos(server: &FlakyServer, n: usize) {
+        while server.hellos.load(Ordering::SeqCst) < n {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn paired_seam(dir: &std::path::Path) -> Seam {
         let core = Core::open_detached(dir).unwrap();
         let seam = core.seam();
@@ -746,7 +854,8 @@ mod tests {
     /// Reconnect delays double per attempt up to the cap, with the injected
     /// jitter, on tokio's paused clock; a successful pull resets them. The
     /// view's `retry_at` is the wall-clock failure plus that delay and
-    /// `offline_since` the first failure, fixed for the whole outage.
+    /// `offline_since` the first failure, fixed for the whole outage. Waits
+    /// longer than `WALL_CHECK` still end on time.
     #[tokio::test(start_paused = true)]
     async fn backoff_progresses_and_resets_on_the_paused_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -758,6 +867,7 @@ mod tests {
 
         let server = Arc::new(FlakyServer::default());
         let fake = server.clone();
+        let (wall_clock, _) = paused_wall();
         let config = EngineConfig {
             backoff: Backoff {
                 base: Duration::from_secs(1),
@@ -766,6 +876,7 @@ mod tests {
             },
             connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
             wait_secs: 5,
+            wall_clock,
             ..EngineConfig::default()
         };
         let ctx = LinkCtx {
@@ -779,10 +890,9 @@ mod tests {
         };
         let link = tokio::spawn(run_link(ctx));
 
-        // The paused clock skips the waits but the wall clock does not, so
-        // `retry_at - offline_since` is this attempt's delay plus the few
-        // real milliseconds the previous attempts took: whole seconds of it
-        // are the delay.
+        // The wall clock moves with the paused one and a failing `hello`
+        // takes no time, so each failure lands on the previous `retry_at`:
+        // `retry_at - offline_since` is the sum of the delays so far.
         let reconnects = |links: &[Link]| -> Vec<(u32, i64)> {
             links
                 .iter()
@@ -791,7 +901,7 @@ mod tests {
                         attempt,
                         retry_at,
                         offline_since,
-                    } => Some((*attempt, (*retry_at - *offline_since).num_seconds())),
+                    } => Some((*attempt, (*retry_at - *offline_since).num_milliseconds())),
                     _ => None,
                 })
                 .collect()
@@ -820,7 +930,14 @@ mod tests {
         wait_for(6).await;
         assert_eq!(
             reconnects(&links.lock().unwrap())[..6],
-            [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (6, 8)]
+            [
+                (1, 1_000),
+                (2, 3_000),
+                (3, 7_000),
+                (4, 15_000),
+                (5, 23_000),
+                (6, 31_000)
+            ]
         );
         let first = outages(&links.lock().unwrap());
         assert!(
@@ -849,7 +966,7 @@ mod tests {
         wait_for(before + 2).await;
         assert_eq!(
             reconnects(&links.lock().unwrap())[before..before + 2],
-            [(1, 1), (2, 2)]
+            [(1, 1_000), (2, 3_000)]
         );
         let second = outages(&links.lock().unwrap())[before].1;
         assert!(second > first[0].1, "offline_since starts over");
@@ -982,6 +1099,131 @@ mod tests {
         let held = server.hellos.load(Ordering::SeqCst) - start;
         assert!((4..=6).contains(&held), "{held} attempts in 5 s");
         link.abort();
+    }
+
+    /// A config whose link waits 30 s per attempt against a server that is
+    /// down, on a wall clock that moves with the paused one; with the
+    /// server and the handle that jumps the wall clock.
+    fn long_waits() -> (Arc<FlakyServer>, Arc<Mutex<TimeDelta>>, EngineConfig) {
+        let server = Arc::new(FlakyServer::default());
+        let fake = server.clone();
+        let (wall_clock, slept) = paused_wall();
+        let config = EngineConfig {
+            backoff: Backoff {
+                base: Backoff::MAX,
+                cap: Backoff::MAX,
+                jitter: Jitter::fixed(1.0),
+            },
+            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            wall_clock,
+            ..EngineConfig::default()
+        };
+        (server, slept, config)
+    }
+
+    fn link_ctx(seam: &Seam, config: EngineConfig, retry_now: Arc<Notify>) -> LinkCtx {
+        LinkCtx {
+            seam: seam.clone(),
+            config: Arc::new(config),
+            outbox: Arc::new(Notify::new()),
+            retry_now,
+            blobs: Arc::new(BlobQueue::default()),
+            address: "srv:7443".into(),
+            identity: seam.identity().unwrap(),
+        }
+    }
+
+    /// Without a sleep the full delay is waited out, `WALL_CHECK` ticks and
+    /// all; after a sleep that stopped the monotonic clock but not the wall
+    /// clock, the attempt comes within `WALL_CHECK` of waking, not after the
+    /// monotonic remainder.
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_past_retry_at_retries_within_the_wall_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let (server, slept, config) = long_waits();
+        // The first `hello` fails at once, on the paused clock.
+        let failed = tokio::time::Instant::now();
+        let link = tokio::spawn(run_link(link_ctx(&seam, config, Arc::new(Notify::new()))));
+
+        tokio::time::sleep_until(failed + Backoff::MAX - Duration::from_millis(1)).await;
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 1, "full wait kept");
+        tokio::time::sleep_until(failed + Backoff::MAX).await;
+        tokio::task::yield_now().await;
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 2, "on time");
+
+        // Asleep through the whole delay: only the wall clock moved.
+        let woke = tokio::time::Instant::now();
+        *slept.lock().unwrap() += TimeDelta::from_std(Backoff::MAX).unwrap();
+        tokio::time::sleep_until(woke + WALL_CHECK).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            server.hellos.load(Ordering::SeqCst),
+            3,
+            "retried within WALL_CHECK of waking"
+        );
+        link.abort();
+    }
+
+    /// `RetryNow` after a sleep longer than its floor retries at once: the
+    /// floor counts from the failure on the wall clock too.
+    #[tokio::test(start_paused = true)]
+    async fn retry_now_after_a_sleep_retries_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let (server, slept, config) = long_waits();
+        let retry_now = Arc::new(Notify::new());
+        let link = tokio::spawn(run_link(link_ctx(&seam, config, retry_now.clone())));
+
+        hellos(&server, 1).await;
+        // Let the link reach its wait before pressing.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        *slept.lock().unwrap() += TimeDelta::seconds(10);
+        let woke = tokio::time::Instant::now();
+        retry_now.notify_waiters();
+        hellos(&server, 2).await;
+        let waited = woke.elapsed();
+        assert!(
+            waited < Backoff::RETRY_NOW_MIN,
+            "retried {waited:?} after the press"
+        );
+        link.abort();
+    }
+
+    /// `resume` restarts the link from `Connecting` at once, so a head that
+    /// resumes after a sleep never sits on a passed `retry_at`.
+    #[tokio::test(start_paused = true)]
+    async fn resume_after_a_sleep_connects_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let sink = links.clone();
+        seam.core
+            .subscribe(move |view| sink.lock().unwrap().push(view.link));
+        let (server, slept, config) = long_waits();
+        let (_requests, requests_rx) = mpsc::unbounded_channel();
+        let (suspended, suspended_rx) = watch::channel(false);
+        let engine =
+            tokio::spawn(Engine::new(seam.clone(), config, requests_rx, suspended_rx).run());
+
+        hellos(&server, 1).await;
+        while attempts(&links.lock().unwrap()) != [1] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        suspended.send_replace(true);
+        *slept.lock().unwrap() += TimeDelta::from_std(Backoff::MAX).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        links.lock().unwrap().clear();
+        let woke = tokio::time::Instant::now();
+        suspended.send_replace(false);
+        hellos(&server, 2).await;
+        let waited = woke.elapsed();
+        assert!(
+            waited < Backoff::RETRY_NOW_MIN,
+            "connected {waited:?} after resume"
+        );
+        assert_eq!(links.lock().unwrap().first(), Some(&Link::Connecting));
+        engine.abort();
     }
 
     /// Answers every command, first noting the `tries` its outbox row has

@@ -81,8 +81,8 @@ pub enum Link {
         /// Failed attempts in this outage, 1 for the first failure.
         attempt: u32,
         /// When the next attempt is due: the failure plus the backoff
-        /// delay, or less after a `RetryNow`. The engine's own timer is
-        /// monotonic, so after a sleep the attempt may come a little later.
+        /// delay, or less after a `RetryNow`. After a sleep the attempt
+        /// comes at most [`WALL_CHECK`](crate::WALL_CHECK) after it.
         retry_at: DateTime<Utc>,
         /// When the link first went down in this outage; kept across
         /// attempts until a pull succeeds.
