@@ -21,7 +21,9 @@
 //! writes nothing. The request's `permission_suggestions` worth offering
 //! ([`rules::offered`]) ride along as rule suggestions; an approval granting
 //! one sends that update back as `updatedPermissions`, so the CLI keeps the
-//! rule where it said it would.
+//! rule where it said it would. One the CLI keeps in its process only is
+//! also added to the resume handle ([`rules::keep`]), reported anew, so a
+//! resumed process is started with it again.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -55,19 +57,32 @@ pub struct Output {
     pub events: Vec<AdapterEvent>,
 }
 
-/// The resume handle naming CLI session `session_id`.
-pub fn resume_handle(session_id: Uuid) -> ResumeHandle {
-    ResumeHandle(json!({ "session_id": session_id.to_string() }))
+/// The resume handle naming CLI session `session_id` and the granted
+/// permission updates its process keeps (`rules`, left out when empty).
+pub fn resume_handle(session_id: Uuid, rules: &[Value]) -> ResumeHandle {
+    let mut handle = json!({ "session_id": session_id.to_string() });
+    if !rules.is_empty() {
+        handle["rules"] = json!(rules);
+    }
+    ResumeHandle(handle)
 }
 
-/// The CLI session id in a handle made by [`resume_handle`].
-pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<Uuid, String> {
-    handle
+/// The CLI session id and the kept permission updates in a handle made by
+/// [`resume_handle`].
+pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<(Uuid, Vec<Value>), String> {
+    let session_id = handle
         .0
         .get("session_id")
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
-        .ok_or_else(|| format!("not a resume handle of this adapter: {}", handle.0))
+        .ok_or_else(|| format!("not a resume handle of this adapter: {}", handle.0))?;
+    let rules = handle
+        .0
+        .get("rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok((session_id, rules))
 }
 
 /// A user message: starts a turn.
@@ -155,6 +170,8 @@ struct Pending {
 pub struct Protocol {
     session_id: Uuid,
     resumed: bool,
+    /// Granted permission updates the process keeps only in itself.
+    session_rules: Vec<Value>,
     next_request: u64,
     initialize_id: Option<String>,
     ready: bool,
@@ -183,6 +200,7 @@ impl Protocol {
         Protocol {
             session_id,
             resumed,
+            session_rules: Vec::new(),
             next_request: 0,
             initialize_id: None,
             ready: false,
@@ -200,6 +218,12 @@ impl Protocol {
         }
     }
 
+    /// The process was started with `rules`, the updates kept so far.
+    pub fn with_session_rules(mut self, rules: Vec<Value>) -> Protocol {
+        self.session_rules = rules;
+        self
+    }
+
     /// The first step: the initialize handshake and, for a fresh session,
     /// the resume handle (known up front from `--session-id`).
     pub fn start(&mut self) -> Output {
@@ -211,7 +235,7 @@ impl Protocol {
         self.initialize_id = Some(id);
         if !self.resumed {
             out.events
-                .push(AdapterEvent::ResumeHandle(resume_handle(self.session_id)));
+                .push(AdapterEvent::ResumeHandle(self.resume_handle()));
         }
         out
     }
@@ -274,17 +298,20 @@ impl Protocol {
         };
         let pending = self.pending.remove(index);
         let update = rule.and_then(|rule| pending.updates.get(usize::from(rule)));
+        let mut out = Output::default();
         let write = match (decision, update) {
             (Decision::Approve, Some(update)) => {
+                if rules::keep(&mut self.session_rules, update) {
+                    out.events
+                        .push(AdapterEvent::ResumeHandle(self.resume_handle()));
+                }
                 allow_always_response(&pending.request.0, &pending.input, update)
             }
             (Decision::Approve, None) => allow_response(&pending.request.0, &pending.input),
             (Decision::Deny, _) => deny_response(&pending.request.0, DENY_MESSAGE),
         };
-        Output {
-            writes: vec![write],
-            events: Vec::new(),
-        }
+        out.writes.push(write);
+        out
     }
 
     /// Stops the current turn; nothing when idle or already interrupting.
@@ -341,6 +368,10 @@ impl Protocol {
         out
     }
 
+    fn resume_handle(&self) -> ResumeHandle {
+        resume_handle(self.session_id, &self.session_rules)
+    }
+
     fn request_id(&mut self) -> String {
         self.next_request += 1;
         format!("skywave_{}", self.next_request)
@@ -391,7 +422,7 @@ impl Protocol {
             tracing::info!(session_id = %id, "agent runs under another session id; keeping it");
             self.session_id = id;
             out.events
-                .push(AdapterEvent::ResumeHandle(resume_handle(id)));
+                .push(AdapterEvent::ResumeHandle(self.resume_handle()));
         }
     }
 

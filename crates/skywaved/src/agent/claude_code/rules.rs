@@ -14,6 +14,12 @@
 //! Labels read after "always allow": `Bash(cargo test)`, `file edits`,
 //! `access to /srv/data`. They are handed over uncut; the mapper applies the
 //! protocol's caps.
+//!
+//! **Session rules outlive the process.** The CLI keeps a granted update
+//! with destination `session` or `cliArg` in its process only, but the rule
+//! was granted for the Skywave session, which outlives it (an idle shutdown,
+//! a daemon restart). [`keep`] collects those updates for the resume handle;
+//! [`cli_args`] grants them again to the resumed process as flags.
 
 use serde_json::Value;
 
@@ -35,6 +41,56 @@ pub fn offered(suggestions: Option<&Value>) -> Vec<(RuleSuggestion, Value)> {
             Some((suggestion, update.clone()))
         })
         .collect()
+}
+
+/// Adds granted `update` to `kept`, the updates that die with the process,
+/// when it is one of them; a later mode replaces an earlier one. Whether
+/// `kept` changed.
+pub fn keep(kept: &mut Vec<Value>, update: &Value) -> bool {
+    if scope(update) != Some(RuleScope::Session) || kept.contains(update) {
+        return false;
+    }
+    if is_mode(update) {
+        kept.retain(|k| !is_mode(k));
+    }
+    kept.push(update.clone());
+    true
+}
+
+/// The CLI flags that grant `kept` again, in order. Updates that allow
+/// nothing more are skipped, so a stored handle cannot narrow the process.
+pub fn cli_args(kept: &[Value]) -> Vec<String> {
+    let mut args = Vec::new();
+    for update in kept.iter().filter(|u| label(u).is_some()) {
+        let (flag, values): (&str, Vec<String>) = match update["type"].as_str() {
+            Some("setMode") => ("--permission-mode", strings(&update["mode"])),
+            Some("addRules") => (
+                "--allowedTools",
+                items(update, "rules").filter_map(rule).collect(),
+            ),
+            Some("addDirectories") => (
+                "--add-dir",
+                items(update, "directories").flat_map(strings).collect(),
+            ),
+            _ => continue,
+        };
+        for value in values {
+            args.extend([flag.to_owned(), value]);
+        }
+    }
+    args
+}
+
+fn is_mode(update: &Value) -> bool {
+    update["type"] == "setMode"
+}
+
+fn items<'a>(update: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    update[key].as_array().into_iter().flatten()
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    value.as_str().map(str::to_owned).into_iter().collect()
 }
 
 /// What granting `update` allows, or `None` when it allows nothing more.
@@ -137,6 +193,50 @@ mod tests {
         assert!(labels(suggestions).is_empty());
         assert!(offered(None).is_empty());
         assert!(offered(Some(&json!({"type":"setMode"}))).is_empty());
+    }
+
+    #[test]
+    fn only_updates_the_process_keeps_are_kept_once_and_the_latest_mode_wins() {
+        let edits = json!({"type":"setMode","mode":"acceptEdits","destination":"session"});
+        let every = json!({"type":"setMode","mode":"bypassPermissions","destination":"cliArg"});
+        let dir =
+            json!({"type":"addDirectories","directories":["/srv/data"],"destination":"session"});
+        let project = json!({"type":"addRules","rules":[{"toolName":"Read"}],"behavior":"allow","destination":"localSettings"});
+        let mut kept = Vec::new();
+        assert!(keep(&mut kept, &edits));
+        assert!(keep(&mut kept, &dir));
+        assert!(!keep(&mut kept, &edits));
+        assert!(!keep(&mut kept, &project));
+        assert!(keep(&mut kept, &every));
+        assert_eq!(kept, [dir, every]);
+    }
+
+    #[test]
+    fn kept_updates_become_cli_flags() {
+        let kept = [
+            json!({"type":"setMode","mode":"acceptEdits","destination":"session"}),
+            json!({"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo test"},{"toolName":"Read"}],
+                   "behavior":"allow","destination":"session"}),
+            json!({"type":"addDirectories","directories":["/srv/a","/srv/b"],"destination":"session"}),
+            // Allows less: never granted again.
+            json!({"type":"setMode","mode":"plan","destination":"session"}),
+            json!({"type":"addRules","rules":[{"toolName":"Bash"}],"behavior":"deny","destination":"session"}),
+        ];
+        assert_eq!(
+            cli_args(&kept),
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Bash(cargo test)",
+                "--allowedTools",
+                "Read",
+                "--add-dir",
+                "/srv/a",
+                "--add-dir",
+                "/srv/b",
+            ]
+        );
     }
 
     #[test]

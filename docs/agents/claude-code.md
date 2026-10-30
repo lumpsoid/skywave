@@ -244,6 +244,25 @@ keeps the rule at the suggestion's `destination`. **[U]** shape from the SDK's
 Result: the tool runs, `tool_result` follows, and
 `tool_result_meta[].permission_decision` is `{"decision":"accept","source":"user_temporary"}`.
 
+A granted update with destination `session` or `cliArg` lives in the CLI
+process only: `--resume` restores the conversation, not the permission
+mode or rules. The adapter therefore adds each one it grants to its resume
+handle (`{"session_id":…, "rules":[<update>, …]}`; a later `setMode`
+replaces an earlier one) and starts a resumed process with them as flags,
+before `--resume`:
+
+| update | flags |
+|--------|-------|
+| `setMode` `acceptEdits` / `bypassPermissions` | `--permission-mode <mode>` |
+| `addRules` (`allow`) | `--allowedTools <Tool(content)>` per rule |
+| `addDirectories` | `--add-dir <dir>` per directory |
+
+**[C]** with 2.1.310: after `--resume` with `--permission-mode acceptEdits`,
+`system/init` reports `permissionMode:"acceptEdits"` and a Write runs
+without `can_use_tool`; `--add-dir` shows in `additional_directories`;
+two `--allowedTools 'Bash(touch x)'` flags both apply (the same command
+without one asks). `bypassPermissions` on resume is **[U]**.
+
 ### 3.3 Deny (stdin → CLI) [C]
 
 ```json

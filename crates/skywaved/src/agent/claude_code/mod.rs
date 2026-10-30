@@ -6,13 +6,15 @@
 //!
 //! ```text
 //! <agent.command> -p --input-format stream-json --output-format stream-json \
-//!   --verbose --permission-prompt-tool stdio \
+//!   --verbose --permission-prompt-tool stdio [<session rules>] \
 //!   (--session-id <uuid> | --resume <uuid>) <agent.args...>
 //! ```
 //!
 //! A fresh session gets a new UUID as `--session-id`, reported at once as the
 //! [`ResumeHandle`] `{"session_id": "<uuid>"}`; a restart passes it back with
-//! `--resume`. [`AgentAdapter::start`] returns after the CLI answers the
+//! `--resume`. Rules granted for the session that the CLI keeps only in its
+//! process are added to the handle as `"rules"` and passed to the resumed
+//! process as flags ([`rules::cli_args`]), so they survive a restart. [`AgentAdapter::start`] returns after the CLI answers the
 //! initialize handshake; a CLI that fails before that is a start error, or a
 //! resume error when it does not know the session.
 //!
@@ -106,19 +108,32 @@ impl ClaudeCodeAdapter {
         self
     }
 
-    /// The CLI arguments for session `session_id`: the required flags,
-    /// `--session-id` (or `--resume` when `resumed`), then `agent.args`.
-    pub fn command_args(&self, session_id: Uuid, resumed: bool) -> Vec<String> {
+    /// The CLI arguments for session `session_id`: the required flags, the
+    /// flags granting `session_rules`, `--session-id` (or `--resume` when
+    /// `resumed`), then `agent.args`.
+    pub fn command_args(
+        &self,
+        session_id: Uuid,
+        resumed: bool,
+        session_rules: &[Value],
+    ) -> Vec<String> {
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+        args.extend(rules::cli_args(session_rules));
         args.push(if resumed { "--resume" } else { "--session-id" }.to_owned());
         args.push(session_id.to_string());
         args.extend(self.config.args.iter().cloned());
         args
     }
 
-    fn spawn(&self, workdir: &Path, session_id: Uuid, resumed: bool) -> Result<Child, AgentError> {
+    fn spawn(
+        &self,
+        workdir: &Path,
+        session_id: Uuid,
+        resumed: bool,
+        session_rules: &[Value],
+    ) -> Result<Child, AgentError> {
         Command::new(&self.config.command)
-            .args(self.command_args(session_id, resumed))
+            .args(self.command_args(session_id, resumed, session_rules))
             .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -142,16 +157,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &self,
         spec: StartSpec,
     ) -> Result<(ClaudeCodeSession, AdapterEvents), AgentError> {
-        let (agent_session, resumed) = match &spec.resume {
-            Some(handle) => (
-                protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?,
-                true,
-            ),
-            None => (Uuid::new_v4(), false),
+        let (agent_session, session_rules, resumed) = match &spec.resume {
+            Some(handle) => {
+                let (id, rules) =
+                    protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?;
+                (id, rules, true)
+            }
+            None => (Uuid::new_v4(), Vec::new(), false),
         };
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
-        let mut process = Process::new(self.spawn(&spec.workdir, agent_session, resumed)?, &span)?;
-        let mut protocol = Protocol::new(agent_session, resumed);
+        let child = self.spawn(&spec.workdir, agent_session, resumed, &session_rules)?;
+        let mut process = Process::new(child, &span)?;
+        let mut protocol = Protocol::new(agent_session, resumed).with_session_rules(session_rules);
 
         let mut early = Vec::new();
         let handshake = handshake(&mut process, &mut protocol, &mut early).instrument(span.clone());
