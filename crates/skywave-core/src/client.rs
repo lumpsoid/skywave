@@ -2,10 +2,12 @@
 //! pure [`Model`] and pushes a full [`ViewState`] to subscribers after every
 //! change.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::runtime::Runtime;
@@ -38,13 +40,14 @@ pub enum CoreError {
 /// Why [`Core::shutdown`] could not close the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ShutdownError {
-    /// Called on a thread of an async runtime (an engine thread, e.g. from a
-    /// subscriber callback), where it cannot block. The core was dropped
-    /// instead: the engine stops in the background.
+    /// Called on a thread of an async runtime (an engine thread, say),
+    /// where it cannot block. The core was dropped instead: the engine
+    /// stops in the background.
     #[error("cannot shut the core down from inside an async runtime")]
     InsideRuntime,
     /// The engine is stopped, but another handle still holds the store —
-    /// a clone of the core or a [`Seam`] — so it closes when that goes.
+    /// a clone of the core, a [`Seam`], or a delivery thread still inside
+    /// a callback — so it closes when that goes.
     #[error("the core is still in use elsewhere; its store stays open")]
     InUse,
 }
@@ -92,15 +95,26 @@ impl Requests {
     }
 }
 
-/// The running engine: its runtime and its suspend switch.
+/// The running engine: its runtime, its suspend switch and the thread
+/// that delivers snapshots.
 struct EngineHandle {
     /// `None` once [`Core::shutdown`] stopped it.
     runtime: Mutex<Option<Runtime>>,
     suspended: watch::Sender<bool>,
+    /// `None` once [`Core::shutdown`] stopped it.
+    deliverer: Mutex<Option<Deliverer>>,
 }
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
+        let deliverer = self
+            .deliverer
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(deliverer) = deliverer.take() {
+            // Does not wait: this may run inside a callback on that thread.
+            deliverer.stop(None);
+        }
         let runtime = self
             .runtime
             .get_mut()
@@ -112,6 +126,59 @@ impl Drop for EngineHandle {
     }
 }
 
+/// An engine core's delivery thread, which alone runs subscriber callbacks
+/// while it lives.
+struct Deliverer {
+    shared: Arc<Shared>,
+    thread: JoinHandle<()>,
+    /// Disconnects when the thread ends.
+    exited: Receiver<()>,
+}
+
+impl Deliverer {
+    /// Name of the delivery thread, for logs and debuggers.
+    const NAME: &str = "skywave-deliver";
+
+    fn start(shared: &Arc<Shared>) -> std::io::Result<Deliverer> {
+        lock(&shared.delivery.pending).threaded = true;
+        let (alive, exited) = mpsc::channel::<()>();
+        let run = shared.clone();
+        let spawned = thread::Builder::new()
+            .name(Deliverer::NAME.into())
+            .spawn(move || {
+                let _alive = alive;
+                run.deliver_until_stopped();
+            });
+        match spawned {
+            Ok(thread) => Ok(Deliverer {
+                shared: shared.clone(),
+                thread,
+                exited,
+            }),
+            Err(err) => {
+                lock(&shared.delivery.pending).threaded = false;
+                Err(err)
+            }
+        }
+    }
+
+    /// Stops the thread: from now on whoever publishes delivers. With a
+    /// `timeout`, waits that long for a callback in progress to return,
+    /// unless this is the delivery thread itself.
+    fn stop(self, timeout: Option<Duration>) {
+        lock(&self.shared.delivery.pending).threaded = false;
+        self.shared.delivery.wake.notify_all();
+        let Some(timeout) = timeout else { return };
+        if thread::current().id() == self.thread.thread().id() {
+            return;
+        }
+        if let Err(RecvTimeoutError::Disconnected) = self.exited.recv_timeout(timeout) {
+            // A callback's panic was contained, so this is always `Ok`.
+            let _ = self.thread.join();
+        }
+    }
+}
+
 pub(crate) struct State {
     pub(crate) store: Store,
     pub(crate) model: Model,
@@ -119,8 +186,7 @@ pub(crate) struct State {
     /// Bumped whenever pairing with another server resets the replica; a
     /// [`Seam`] bound to an older one may no longer write.
     pub(crate) server_epoch: u64,
-    /// Bumped for every published snapshot, so delivery never goes back in
-    /// time.
+    /// Bumped for every change, so delivery never goes back in time.
     version: u64,
 }
 
@@ -143,6 +209,7 @@ impl Core {
             .enable_all()
             .build()
             .map_err(CoreError::Runtime)?;
+        let deliverer = Deliverer::start(&shared).map_err(CoreError::Runtime)?;
         let (suspended, suspended_rx) = watch::channel(false);
         let seam = Seam::new(Core {
             shared: shared.clone(),
@@ -154,6 +221,7 @@ impl Core {
             engine: Some(Arc::new(EngineHandle {
                 runtime: Mutex::new(Some(runtime)),
                 suspended,
+                deliverer: Mutex::new(Some(deliverer)),
             })),
         })
     }
@@ -161,6 +229,10 @@ impl Core {
     /// Opens the core without a sync engine: nothing touches the network,
     /// and requests wait in [`Seam::take_requests`] for whoever plays the
     /// engine (tests).
+    ///
+    /// Nor has it a delivery thread: whoever changes the core delivers the
+    /// new snapshot before the call returns (see
+    /// [`subscribe`](Core::subscribe)), which keeps such tests synchronous.
     pub fn open_detached(data_dir: &Path) -> Result<Core, CoreError> {
         let (requests, request_rx) = mpsc::channel();
         let shared = Shared::open(data_dir, Requests::Detached(requests), Some(request_rx))?;
@@ -237,47 +309,51 @@ impl Core {
         })
     }
 
-    /// Registers `callback`, calls it with the current snapshot right away,
-    /// then again after every change. Snapshots arrive in order; one may be
-    /// skipped in favour of a newer one. Callbacks may call
-    /// [`dispatch`](Core::dispatch) but must not call `subscribe` or
-    /// `unsubscribe`.
+    /// Registers `callback`, calls it with the current snapshot, then
+    /// again after every change. Snapshots arrive in order; one may be
+    /// skipped in favour of a newer one (the first, too, if a change
+    /// overtakes it). Callbacks may call [`dispatch`](Core::dispatch) but
+    /// must not call `subscribe`, `unsubscribe` or
+    /// [`shutdown`](Core::shutdown), which would wait for themselves.
     ///
-    /// There is no delivery thread: whichever thread publishes a change, or
-    /// finds one waiting, runs every callback. That is this thread for the
-    /// first snapshot (inside `subscribe`), the thread calling `dispatch` or
-    /// `unsubscribe`, or an engine thread. A callback must therefore be
-    /// thread-safe and return quickly — every other subscriber, and the
-    /// caller that happened to deliver, waits for it.
+    /// An engine core ([`open`](Core::open)) runs every callback on its
+    /// delivery thread, `skywave-deliver`, one at a time — the first
+    /// snapshot too, so this returns without waiting for it. `dispatch`
+    /// and the engine only mark a change and return; the delivery thread
+    /// renders the latest snapshot and hands it on, skipping those that a
+    /// newer change overtook. A slow callback delays only later snapshots.
+    ///
+    /// A detached core ([`open_detached`](Core::open_detached)) has no
+    /// delivery thread: whoever changes the core — or calls `subscribe` or
+    /// `unsubscribe` — runs the callbacks before returning, unless another
+    /// thread is delivering already, which then delivers its snapshot too.
     pub fn subscribe(&self, callback: impl FnMut(ViewState) + Send + 'static) -> SubscriptionId {
-        let delivery = &self.shared.delivery;
         let id = {
-            let mut subs = lock(&delivery.subscribers);
-            let (version, view) = lock(&self.shared.state).snapshot();
+            let mut subs = lock(&self.shared.delivery.subscribers);
             let id = SubscriptionId(subs.next_id);
             subs.next_id += 1;
-            let mut callback: Callback = Box::new(callback);
-            callback(view);
             subs.list.push(Subscriber {
                 id,
-                last: version,
-                callback,
+                last: None,
+                callback: Box::new(callback),
             });
             id
         };
-        // Snapshots published while we held the list are still waiting.
-        delivery.drain();
+        // Nothing changed, but this subscriber has seen nothing yet.
+        self.shared.publish();
         id
     }
 
     /// Detaches the callback `id`; once this returns it is not called
-    /// again. Like [`subscribe`](Core::subscribe), it must not be called
-    /// from a callback.
+    /// again, since it waits for a callback in progress to return. Like
+    /// [`subscribe`](Core::subscribe), it must not be called from a
+    /// callback.
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        let delivery = &self.shared.delivery;
-        lock(&delivery.subscribers).list.retain(|s| s.id != id);
+        lock(&self.shared.delivery.subscribers)
+            .list
+            .retain(|s| s.id != id);
         // Snapshots published while we held the list are still waiting.
-        delivery.drain();
+        self.shared.deliver_inline();
     }
 
     /// The current snapshot, for heads that poll instead of subscribing.
@@ -286,24 +362,29 @@ impl Core {
     }
 
     /// Stops the core for good and closes its store, so the same data dir
-    /// can be opened again at once. Blocks until every engine task has
-    /// stopped — at most `timeout` for work in the middle of a step — and
-    /// then drops the store, unless another handle still holds it.
+    /// can be opened again at once. Blocks until every engine task and the
+    /// delivery thread have stopped — at most `timeout` in all for work in
+    /// the middle of a step or a callback — and then drops the store,
+    /// unless another handle still holds it.
     ///
     /// The engine stops even while other clones exist; they keep working
-    /// against the local store, but nothing syncs. With other clones (or a
-    /// [`Seam`]) alive, or engine work still running after `timeout`, the
-    /// store closes when the last of them goes and this returns
-    /// [`ShutdownError::InUse`]. It must not be called on a thread of an
-    /// async runtime — including from a subscriber callback on an engine
-    /// thread — where it would block a runtime thread or wait for itself:
-    /// there it only drops this handle and returns
-    /// [`ShutdownError::InsideRuntime`].
+    /// against the local store, but nothing syncs, and as in a detached
+    /// core their changes are delivered by whoever makes them. With other
+    /// clones (or a [`Seam`]) alive, or engine work or a callback still
+    /// running after `timeout`, the store closes when the last of them goes
+    /// and this returns [`ShutdownError::InUse`]. It must not be called on
+    /// a thread of an async runtime, where it would block a runtime thread
+    /// or wait for itself: there it only drops this handle and returns
+    /// [`ShutdownError::InsideRuntime`]. Nor should a callback call it: it
+    /// cannot wait for the delivery thread it runs on, so the store stays
+    /// open until the callback returns, and this returns
+    /// [`ShutdownError::InUse`].
     pub fn shutdown(self, timeout: Duration) -> Result<(), ShutdownError> {
         if tokio::runtime::Handle::try_current().is_ok() {
             // Dropping `self` is the non-blocking fallback.
             return Err(ShutdownError::InsideRuntime);
         }
+        let deadline = Instant::now() + timeout;
         let Core { shared, engine } = self;
         if let Some(engine) = engine {
             let runtime = lock(&engine.runtime).take();
@@ -311,6 +392,11 @@ impl Core {
                 // Drops every task, and with them the engine's handles on
                 // `shared`.
                 runtime.shutdown_timeout(timeout);
+            }
+            let deliverer = lock(&engine.deliverer).take();
+            if let Some(deliverer) = deliverer {
+                // Its handle on `shared` goes when it ends.
+                deliverer.stop(Some(deadline.saturating_duration_since(Instant::now())));
             }
         }
         // The last handle closes the store (and its SQLite connection) here.
@@ -351,16 +437,17 @@ impl Shared {
     }
 
     /// Runs `change` under the state lock, hands its requests to the engine
-    /// and publishes the new snapshot — also after an error, since the
-    /// model may have been resynced.
+    /// and publishes the change — also after an error, since the model may
+    /// have been resynced. The snapshot is rendered at delivery, not here.
     pub(crate) fn update<R, E>(
         &self,
         change: impl FnOnce(&mut State) -> Result<(R, Vec<Request>), E>,
     ) -> Result<R, E> {
-        let (result, (version, view)) = {
+        let result = {
             let mut state = lock(&self.state);
             let result = change(&mut state);
-            (result, state.snapshot())
+            state.version += 1;
+            result
         };
         let outcome = result.map(|(value, requests)| {
             for request in requests {
@@ -368,17 +455,120 @@ impl Shared {
             }
             value
         });
-        self.delivery.publish(version, view);
+        self.publish();
         outcome
+    }
+
+    /// Marks a snapshot due and has it delivered: by the delivery thread
+    /// if there is one, else right here.
+    fn publish(&self) {
+        let threaded = {
+            let mut pending = lock(&self.delivery.pending);
+            pending.due = true;
+            pending.threaded
+        };
+        if threaded {
+            self.delivery.wake.notify_one();
+        } else {
+            self.drain(false);
+        }
+    }
+
+    /// Delivers what is due here, unless a delivery thread does.
+    fn deliver_inline(&self) {
+        if !lock(&self.delivery.pending).threaded {
+            self.drain(false);
+        }
+    }
+
+    /// The delivery thread's loop. Once stopped, it delivers what is left
+    /// if nobody else is delivering, as any publisher would.
+    fn deliver_until_stopped(&self) {
+        let delivery = &self.delivery;
+        loop {
+            {
+                let mut pending = lock(&delivery.pending);
+                while !pending.due && pending.threaded {
+                    pending = delivery
+                        .wake
+                        .wait(pending)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                if !pending.threaded {
+                    break;
+                }
+                pending.due = false;
+            }
+            // One round per hold of the list, so a stream of changes does
+            // not keep `subscribe` and `unsubscribe` waiting.
+            self.hand_out(&mut lock(&delivery.subscribers), true);
+        }
+        self.drain(true);
+    }
+
+    /// Delivers what is due if nobody else holds the subscriber list; the
+    /// holder delivers it otherwise.
+    fn drain(&self, contain: bool) {
+        let subs = match self.delivery.subscribers.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        self.deliver(subs, contain);
+    }
+
+    /// Hands out snapshots until nothing is due, then lets go of the list.
+    fn deliver(&self, mut subs: MutexGuard<'_, Subscribers>, contain: bool) {
+        loop {
+            {
+                let mut pending = lock(&self.delivery.pending);
+                if !pending.due {
+                    // Release the list while `pending` is still locked, so
+                    // a publisher either sees us holding nothing or marked
+                    // its change before we looked.
+                    drop(subs);
+                    return;
+                }
+                pending.due = false;
+            }
+            self.hand_out(&mut subs, contain);
+        }
+    }
+
+    /// Renders the latest snapshot and hands it to every subscriber that
+    /// has not seen it. With `contain`, a panicking callback is logged and
+    /// skipped, so it cannot end the delivery thread.
+    fn hand_out(&self, subs: &mut Subscribers, contain: bool) {
+        let seen = |sub: &Subscriber, version| sub.last.is_some_and(|last| last >= version);
+        let (version, view) = {
+            let state = lock(&self.state);
+            if subs.list.iter().all(|sub| seen(sub, state.version)) {
+                // Nobody to render it for.
+                return;
+            }
+            (state.version, state.model.view())
+        };
+        for sub in subs.list.iter_mut() {
+            if seen(sub, version) {
+                continue;
+            }
+            sub.last = Some(version);
+            let call = AssertUnwindSafe(|| (sub.callback)(view.clone()));
+            if !contain {
+                call();
+            } else if let Err(panic) = catch_unwind(call) {
+                let reason = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                tracing::error!(reason, "subscriber callback panicked");
+            }
+        }
     }
 }
 
 impl State {
-    fn snapshot(&mut self) -> (u64, ViewState) {
-        self.version += 1;
-        (self.version, self.model.view())
-    }
-
     /// Rebuilds the model from the store after a failed write, so it never
     /// shows what was not persisted. Best effort: if the store cannot be
     /// read either, the model keeps its state.
@@ -396,8 +586,9 @@ impl State {
 
 struct Subscriber {
     id: SubscriptionId,
-    /// Version of the last snapshot this subscriber saw.
-    last: u64,
+    /// Version of the last snapshot this subscriber saw; `None` before the
+    /// first.
+    last: Option<u64>,
     callback: Callback,
 }
 
@@ -409,51 +600,22 @@ struct Subscribers {
 
 /// Hands snapshots to subscribers in version order without holding the state
 /// lock, so a callback may dispatch. Whoever holds the subscriber list
-/// delivers; others leave their snapshot in `pending` for it.
+/// delivers: the delivery thread while it runs, else whoever marked the
+/// change; others leave it marked for the holder.
 #[derive(Default)]
 struct Delivery {
-    pending: Mutex<Option<(u64, ViewState)>>,
+    pending: Mutex<Pending>,
+    /// Wakes the delivery thread.
+    wake: Condvar,
     subscribers: Mutex<Subscribers>,
 }
 
-impl Delivery {
-    fn publish(&self, version: u64, view: ViewState) {
-        {
-            let mut pending = lock(&self.pending);
-            if pending.as_ref().is_none_or(|(v, _)| *v < version) {
-                *pending = Some((version, view));
-            }
-        }
-        self.drain();
-    }
-
-    fn drain(&self) {
-        loop {
-            let mut subs = match self.subscribers.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                // The holder delivers what we left in `pending`.
-                Err(TryLockError::WouldBlock) => return,
-            };
-            let (version, view) = {
-                let mut pending = lock(&self.pending);
-                match pending.take() {
-                    Some(next) => next,
-                    None => {
-                        // Release the list while `pending` is still locked,
-                        // so a publisher either sees us holding nothing or
-                        // left its snapshot where we just looked.
-                        drop(subs);
-                        return;
-                    }
-                }
-            };
-            for sub in subs.list.iter_mut().filter(|s| s.last < version) {
-                sub.last = version;
-                (sub.callback)(view.clone());
-            }
-        }
-    }
+#[derive(Default)]
+struct Pending {
+    /// Some subscriber may not have seen the latest snapshot.
+    due: bool,
+    /// A delivery thread runs and alone delivers.
+    threaded: bool,
 }
 
 /// Locks a mutex, carrying on after a panic elsewhere: every critical
@@ -543,5 +705,287 @@ mod tests {
             assert!(Instant::now() < deadline, "the store never closed");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // ---- delivery ----------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Polls `done` until it holds.
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Every snapshot a subscriber received.
+    #[derive(Clone, Default)]
+    struct Views(Arc<Mutex<Vec<ViewState>>>);
+
+    impl Views {
+        fn subscribe(core: &Core) -> (Views, SubscriptionId) {
+            let views = Views::default();
+            let sink = views.clone();
+            let id = core.subscribe(move |view| lock(&sink.0).push(view));
+            (views, id)
+        }
+
+        fn count(&self) -> usize {
+            lock(&self.0).len()
+        }
+
+        fn last(&self) -> Option<ViewState> {
+            lock(&self.0).last().cloned()
+        }
+
+        /// Waits until this subscriber has seen what the core shows now.
+        fn caught_up(&self, core: &Core) {
+            eventually("the latest snapshot", || {
+                self.last().is_some_and(|last| last == core.view())
+            });
+        }
+    }
+
+    /// A callback that, while armed, reports its thread and then blocks
+    /// until released.
+    struct Gate {
+        armed: AtomicBool,
+        entered: Mutex<Sender<Option<String>>>,
+        release: Mutex<Receiver<()>>,
+        calls: AtomicUsize,
+        returned: AtomicUsize,
+    }
+
+    impl Gate {
+        fn new() -> (Arc<Gate>, Receiver<Option<String>>, Sender<()>) {
+            let (entered, entered_rx) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let gate = Arc::new(Gate {
+                armed: AtomicBool::new(true),
+                entered: Mutex::new(entered),
+                release: Mutex::new(release_rx),
+                calls: AtomicUsize::new(0),
+                returned: AtomicUsize::new(0),
+            });
+            (gate, entered_rx, release)
+        }
+
+        fn subscribe(self: &Arc<Gate>, core: &Core) -> SubscriptionId {
+            let gate = self.clone();
+            core.subscribe(move |_| gate.call())
+        }
+
+        fn call(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let name = thread::current().name().map(str::to_owned);
+            let _ = lock(&self.entered).send(name);
+            if self.armed.load(Ordering::SeqCst) {
+                let _ = lock(&self.release).recv_timeout(TIMEOUT);
+            }
+            self.returned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dispatch_returns_while_a_callback_blocks_the_delivery_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let (gate, entered, release) = Gate::new();
+        gate.subscribe(&core);
+        // The first snapshot goes out on the delivery thread too, which the
+        // gate now holds.
+        let thread = entered.recv_timeout(TIMEOUT).unwrap();
+        assert_eq!(thread.as_deref(), Some(Deliverer::NAME));
+
+        let started = Instant::now();
+        let dispatcher = thread::spawn({
+            let core = core.clone();
+            move || {
+                for _ in 0..10 {
+                    navigate(&core);
+                }
+            }
+        });
+        dispatcher.join().unwrap();
+        navigate(&core);
+        assert!(
+            started.elapsed() < TIMEOUT / 2,
+            "dispatch waited for delivery"
+        );
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+
+        // Once released, the latest snapshot follows, on the same thread.
+        gate.armed.store(false, Ordering::SeqCst);
+        release.send(()).unwrap();
+        let (views, _) = Views::subscribe(&core);
+        views.caught_up(&core);
+        eventually("the gate's second call", || {
+            gate.returned.load(Ordering::SeqCst) >= 2
+        });
+        for thread in entered.try_iter() {
+            assert_eq!(thread.as_deref(), Some(Deliverer::NAME));
+        }
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn every_subscriber_ends_on_the_latest_snapshot_under_concurrent_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let seam = core.seam();
+        let (watching, _) = Views::subscribe(&core);
+        // A callback that dispatches from the delivery thread, through a
+        // handle that does not keep the engine alive.
+        let (reacting, reacting_id) = {
+            let views = Views::default();
+            let sink = views.clone();
+            let handle = Core {
+                shared: core.shared.clone(),
+                engine: None,
+            };
+            let id = core.subscribe(move |view| {
+                let mut seen = lock(&sink.0);
+                seen.push(view);
+                if seen.len() <= 3 {
+                    drop(seen);
+                    navigate(&handle);
+                }
+            });
+            (views, id)
+        };
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let seam = seam.clone();
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        seam.set_link(crate::view::Link::Online {
+                            latency_ms: t * 1000 + i,
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        // Each of the callback's own dispatches is heard.
+        eventually("the callback's dispatches", || reacting.count() > 3);
+        watching.caught_up(&core);
+        reacting.caught_up(&core);
+        // Its handle on the core goes with it.
+        core.unsubscribe(reacting_id);
+        drop(seam);
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn unsubscribe_waits_for_a_callback_in_progress_and_ends_the_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let (gate, entered, release) = Gate::new();
+        let id = gate.subscribe(&core);
+        entered.recv_timeout(TIMEOUT).unwrap();
+
+        let (done_tx, done) = mpsc::channel();
+        let unsubscriber = thread::spawn({
+            let core = core.clone();
+            move || {
+                core.unsubscribe(id);
+                let _ = done_tx.send(());
+            }
+        });
+        assert!(
+            done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "unsubscribe returned during the callback"
+        );
+        release.send(()).unwrap();
+        done.recv_timeout(TIMEOUT).unwrap();
+        unsubscriber.join().unwrap();
+        assert_eq!(gate.returned.load(Ordering::SeqCst), 1);
+
+        // Changes after it reach the others, never the gate.
+        gate.armed.store(false, Ordering::SeqCst);
+        let (views, _) = Views::subscribe(&core);
+        views.caught_up(&core);
+        let before = views.count();
+        navigate(&core);
+        eventually("the change", || views.count() > before);
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_callback_in_progress_and_joins_the_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        navigate(&core);
+        let (gate, entered, release) = Gate::new();
+        gate.subscribe(&core);
+        entered.recv_timeout(TIMEOUT).unwrap();
+        let shared = Arc::downgrade(&core.shared);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+        assert_eq!(gate.returned.load(Ordering::SeqCst), 1);
+        assert!(shared.upgrade().is_none());
+        assert!(!wal_exists(dir.path()));
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_stuck_callback_and_the_store_closes_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        navigate(&core);
+        let (gate, entered, release) = Gate::new();
+        gate.subscribe(&core);
+        entered.recv_timeout(TIMEOUT).unwrap();
+        let shared = Arc::downgrade(&core.shared);
+        let started = Instant::now();
+        let outcome = core.shutdown(Duration::from_millis(100));
+        assert!(started.elapsed() < TIMEOUT / 2);
+        assert_eq!(outcome, Err(ShutdownError::InUse));
+        assert!(wal_exists(dir.path()));
+        release.send(()).unwrap();
+        // The delivery thread drops the last handle as it ends.
+        eventually("the store to close", || !wal_exists(dir.path()));
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_panicking_callback_does_not_end_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        core.subscribe(|_| panic!("callback blew up"));
+        let (views, _) = Views::subscribe(&core);
+        views.caught_up(&core);
+        let before = views.count();
+        navigate(&core);
+        eventually("a later snapshot", || views.count() > before);
+        views.caught_up(&core);
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn a_detached_core_delivers_before_the_call_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        let caller = thread::current().id();
+        let on_caller = Arc::new(AtomicBool::new(true));
+        let flag = on_caller.clone();
+        let views = Views::default();
+        let sink = views.clone();
+        core.subscribe(move |view| {
+            flag.fetch_and(thread::current().id() == caller, Ordering::SeqCst);
+            lock(&sink.0).push(view);
+        });
+        assert_eq!(views.count(), 1);
+        navigate(&core);
+        assert_eq!(views.last(), Some(core.view()));
+        assert!(on_caller.load(Ordering::SeqCst));
     }
 }

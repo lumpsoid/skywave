@@ -121,13 +121,13 @@ conversion layer is the one place the boundary is visible.
 - The Android `Application` opens and owns the single `SkywaveCore` for the
   process lifetime; activities and view models never open their own.
 - `ViewState` reaches Kotlin through a Kotlin-implemented callback interface
-  passed to `subscribe`. The core has no delivery thread: the listener runs
-  on whichever thread delivers — the caller's own inside `subscribe`,
-  `dispatch` and `unsubscribe` (on Android, the IO coroutine that consumes
-  actions), or an engine thread. So it must be thread-safe and must not
-  block: it only hands the snapshot to a `MutableStateFlow`, which is
-  thread-safe and conflates (the core may already skip snapshots, so
-  conflation loses nothing).
+  passed to `subscribe`. The core owns one delivery thread
+  (`skywave-deliver`) that renders the latest snapshot and runs every
+  listener, one at a time; `dispatch` only persists the action and returns,
+  so a busy catch-up never holds the IO coroutine that consumes actions
+  behind snapshot conversions. The listener must not block: it only hands
+  the snapshot to a `MutableStateFlow`, which is thread-safe and conflates
+  (the core may already skip snapshots, so conflation loses nothing).
 - The device name is passed at open (`EngineConfig::device_name`):
   `Settings.Global.DEVICE_NAME` if set, else `Build.MODEL`. The core's
   host-name default is meaningless on Android.
