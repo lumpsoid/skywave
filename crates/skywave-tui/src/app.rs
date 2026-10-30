@@ -1179,12 +1179,18 @@ impl App {
         Some((since + DRAFT_SAVE_AFTER).saturating_duration_since(now))
     }
 
-    /// Records the outcome of dispatching a [`App::draft_save`] action. Only
-    /// an error matters: the composer is not a submitted message and must
-    /// not be cleared like one.
-    pub fn draft_saved(&mut self, result: Result<(), CoreError>) {
+    /// Records the outcome, at `now`, of dispatching a [`App::draft_save`]
+    /// action. Only an error matters: the composer is not a submitted
+    /// message and must not be cleared like one, and its edits are unsaved
+    /// again, due one [`DRAFT_SAVE_AFTER`] from `now` so a save that keeps
+    /// failing is retried at that pace. An edit made since the save was
+    /// taken has marked them unsaved already and keeps its own time.
+    pub fn draft_saved(&mut self, now: Instant, result: Result<(), CoreError>) {
         if let Err(err) = result {
             self.ui.error = Some(err.to_string());
+            if let Some(session) = self.ui.session.as_mut() {
+                session.composer.dirty_since.get_or_insert(now);
+            }
         }
     }
 
