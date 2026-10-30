@@ -81,10 +81,4 @@
     <string name="sessions_archived_empty">No archived sessions</string>
     <string name="sessions_open_archived">Archived sessions</string>
     <string name="sessions_open_settings">Settings</string>
-
-    <!-- Session -->
-    <plurals name="session_items">
-        <item quantity="one">%1$d item</item>
-        <item quantity="other">%1$d items</item>
-    </plurals>
 </resources>
