@@ -9,7 +9,8 @@
 //! - `ResolveApproval` → `ApprovalResolved`;
 //! - `Interrupt` → `TurnInterrupted`;
 //! - `StopSession` → `SessionStopped`;
-//! - `RenameSession` → `SessionRenamed` with the normalised name.
+//! - `RenameSession` → `SessionRenamed` with the normalised name;
+//! - `SetSessionArchived` → `SessionArchived`.
 //!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
@@ -33,6 +34,12 @@
 //! order wins on every device. The name is logged as
 //! [`skywave_proto::normalise_session_name`] leaves it; one that ends up
 //! empty restores the default title.
+//!
+//! **SetSessionArchived.** Accepted for any known session, even one already
+//! so: the event carries the absolute value, never a toggle, so a repeat
+//! changes nothing. The server keeps no archived flag (nothing here reads
+//! it); clients fold [`EventKind::archived_effect`], under which a later
+//! message brings the session back. Archiving does not stop the agent.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
@@ -155,6 +162,19 @@ impl EventLog {
                     name: name
                         .as_deref()
                         .and_then(skywave_proto::normalise_session_name),
+                    by: device,
+                };
+                (*session_id, kind)
+            }
+            CommandKind::SetSessionArchived {
+                session_id,
+                archived,
+            } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let kind = EventKind::SessionArchived {
+                    archived: *archived,
                     by: device,
                 };
                 (*session_id, kind)

@@ -36,6 +36,10 @@ pub struct SessionSummary {
     /// First line of the session's first message, at most
     /// [`FIRST_PROMPT_MAX_CHARS`]; the default title's first choice.
     pub first_prompt: Option<String>,
+    /// Hidden from the active list, as the log's last
+    /// [`archived_effect`](EventKind::archived_effect) left it: archived by
+    /// `SessionArchived`, back with the next message.
+    pub archived: bool,
 }
 
 /// Longest [`SessionSummary::first_prompt`] kept, in chars. The store's
@@ -58,6 +62,7 @@ impl SessionSummary {
             notable: 0,
             name: None,
             first_prompt: None,
+            archived: false,
         };
         summary.apply(seq, event);
         summary
@@ -65,14 +70,21 @@ impl SessionSummary {
 
     /// Folds one event of this session into the summary.
     ///
-    /// A rename only sets the name: it is not activity, so it moves neither
-    /// `last_seq` nor `last_activity` and the session keeps its place in
-    /// the list.
+    /// A rename only sets the name and an archive only the archived flag:
+    /// neither is activity, so they move neither `last_seq` nor
+    /// `last_activity` and the session keeps its place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
-        if let EventKind::SessionRenamed { name, .. } = &event.kind {
-            self.name = name.clone();
-            return;
+        if let Some(archived) = event.kind.archived_effect() {
+            self.archived = archived;
+        }
+        match &event.kind {
+            EventKind::SessionRenamed { name, .. } => {
+                self.name = name.clone();
+                return;
+            }
+            EventKind::SessionArchived { .. } => return,
+            _ => {}
         }
         self.last_seq = seq;
         self.last_activity = event.at;
@@ -102,7 +114,8 @@ impl SessionSummary {
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
             | EventKind::TurnInterrupted
-            | EventKind::SessionRenamed { .. } => {}
+            | EventKind::SessionRenamed { .. }
+            | EventKind::SessionArchived { .. } => {}
         }
     }
 
@@ -164,7 +177,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
         | EventKind::SessionStopped
-        | EventKind::SessionRenamed { .. } => false,
+        | EventKind::SessionRenamed { .. }
+        | EventKind::SessionArchived { .. } => false,
     }
 }
 
@@ -186,6 +200,7 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::TurnInterrupted
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
+        | EventKind::SessionArchived { .. }
         | EventKind::SessionStateChanged(_) => (None, None),
     };
     first.into_iter().chain(second)
@@ -345,6 +360,38 @@ mod tests {
             event(sid, 0, EventKind::TurnInterrupted).at
         );
         assert_eq!(summary.notable, 0);
+    }
+
+    #[test]
+    fn archiving_is_not_activity_and_a_message_brings_it_back() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        assert!(!summary.archived);
+        let archive = |archived| EventKind::SessionArchived {
+            archived,
+            by: DeviceId::new(),
+        };
+        assert!(!is_notable(&archive(true)));
+        summary.apply(Seq(5), &event(sid, 10, archive(true)));
+        assert!(summary.archived);
+        assert_eq!(summary.last_seq, Seq(1));
+        assert_eq!(summary.notable, 0);
+        summary.apply(Seq(6), &event(sid, 11, archive(true)));
+        assert!(summary.archived, "absolute: a repeat does not flip it");
+        let message = EventKind::UserMessage {
+            command_id: skywave_proto::CommandId::new(),
+            device_id: DeviceId::new(),
+            text: "back".into(),
+        };
+        summary.apply(Seq(7), &event(sid, 12, message));
+        assert!(!summary.archived);
+        assert_eq!(summary.last_seq, Seq(7));
+        summary.apply(Seq(8), &event(sid, 13, archive(true)));
+        summary.apply(Seq(9), &event(sid, 14, archive(false)));
+        assert!(!summary.archived);
     }
 
     #[test]

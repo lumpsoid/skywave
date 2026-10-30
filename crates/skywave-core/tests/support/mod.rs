@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, ApprovalStatus, Backoff, Core, DeviceId, EngineConfig, Entry, Jitter, Link,
+    Action, ApprovalStatus, Backoff, Core, DeviceId, EngineConfig, Entry, Jitter, Link, ListKind,
     OutboxEntry, OutboxStatus, Screen, Seam, SessionRow, SessionView, TimelineItem,
     TransportConfig, ViewState,
 };
@@ -368,11 +368,23 @@ impl Client {
 
     /// The session list as the head renders it.
     pub async fn session_list(&self) -> Vec<SessionRow> {
-        self.dispatch(Action::Navigate(skywave_core::Route::SessionList));
+        self.list(skywave_core::Route::SessionList, ListKind::Active)
+            .await
+    }
+
+    /// The archived sessions as the head renders them.
+    pub async fn archived_list(&self) -> Vec<SessionRow> {
+        self.list(skywave_core::Route::ArchivedSessions, ListKind::Archived)
+            .await
+    }
+
+    async fn list(&self, route: skywave_core::Route, kind: ListKind) -> Vec<SessionRow> {
+        self.dispatch(Action::Navigate(route));
         let view = self
-            .wait("the session list", |_, view| {
-                matches!(view.screen, Screen::SessionList(_))
-            })
+            .wait(
+                "the session list",
+                |_, view| matches!(&view.screen, Screen::SessionList(list) if list.kind == kind),
+            )
             .await;
         let Screen::SessionList(list) = view.screen else {
             unreachable!()
@@ -619,6 +631,11 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                     },
                     Entry::Renamed { name, by, .. } => Entry::Renamed {
                         name,
+                        by,
+                        own: false,
+                    },
+                    Entry::Archived { archived, by, .. } => Entry::Archived {
+                        archived,
                         by,
                         own: false,
                     },

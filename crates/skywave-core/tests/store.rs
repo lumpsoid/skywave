@@ -515,6 +515,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);
@@ -562,6 +563,72 @@ fn drop_titles(dir: &Path) {
          ALTER TABLE sessions DROP COLUMN first_prompt;",
     )
     .unwrap();
+}
+
+fn drop_archived(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN archived;")
+        .unwrap();
+}
+
+#[test]
+fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/x".into(),
+            },
+        )
+    };
+    let archived = |id, minute, archived| {
+        event(
+            id,
+            minute,
+            EventKind::SessionArchived {
+                archived,
+                by: DeviceId::new(),
+            },
+        )
+    };
+    // `a` stays archived; `b` is brought back by a message.
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(a, 0),
+            created(b, 1),
+            archived(a, 2, true),
+            archived(b, 3, true),
+            event(
+                b,
+                4,
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: DeviceId::new(),
+                    text: "back".into(),
+                },
+            ),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch).unwrap();
+    let summary = |store: &Store, id| store.session(id).unwrap().unwrap();
+    let a_summary = summary(&store, a);
+    assert!(a_summary.archived);
+    assert_eq!(a_summary.last_seq, Seq(1), "archiving is not activity");
+    assert!(!summary(&store, b).archived);
+    drop(store);
+
+    // A replica from before the column (protocol v3: it holds no archive
+    // events): everything starts active.
+    drop_archived(&dir);
+    set_user_version(&dir, 6);
+    let store = Store::open(&dir).unwrap();
+    assert!(!summary(&store, a).archived);
+    assert_eq!(summary(&store, a).last_seq, Seq(1));
 }
 
 #[test]
@@ -632,6 +699,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
 
     // A replica from before the columns (protocol v3: it holds no renames):
     // the migration derives the first prompts from the log like the fold.
+    drop_archived(&dir);
     drop_titles(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
@@ -716,6 +784,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
     set_user_version(&dir, 4);
@@ -819,6 +888,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);

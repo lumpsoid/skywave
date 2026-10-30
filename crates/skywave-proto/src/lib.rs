@@ -17,7 +17,8 @@ use uuid::Uuid;
 /// v3: `CommandKind::StopSession` and `EventKind::SessionStopped`; a v2
 /// client cannot decode the new event.
 ///
-/// v4: `CommandKind::RenameSession` and `EventKind::SessionRenamed`. One v4
+/// v4: `CommandKind::RenameSession` and `EventKind::SessionRenamed`;
+/// `CommandKind::SetSessionArchived` and `EventKind::SessionArchived`. One v4
 /// carries every wire change of its release; no compatibility layer: the
 /// exact version check at `hello` rejects older clients.
 pub const PROTOCOL_VERSION: u32 = 4;
@@ -173,7 +174,39 @@ pub enum EventKind {
         name: Option<String>,
         by: DeviceId,
     },
+    /// The session was archived or brought back by a `SetSessionArchived`
+    /// command. It carries the absolute value, never a toggle; see
+    /// [`EventKind::archived_effect`] for the whole rule. Archiving is not
+    /// activity and does not stop the agent.
+    SessionArchived {
+        archived: bool,
+        by: DeviceId,
+    },
     SessionStateChanged(SessionState),
+}
+
+impl EventKind {
+    /// What the event does to its session's archived flag, the one rule the
+    /// server and every client fold: `SessionArchived` sets it, a
+    /// `UserMessage` from any device brings the session back, anything else
+    /// leaves it alone (`None`).
+    pub fn archived_effect(&self) -> Option<bool> {
+        match self {
+            EventKind::SessionArchived { archived, .. } => Some(*archived),
+            EventKind::UserMessage { .. } => Some(false),
+            EventKind::SessionCreated { .. }
+            | EventKind::AgentMessage { .. }
+            | EventKind::ToolCall(_)
+            | EventKind::ToolResult(_)
+            | EventKind::ApprovalRequested { .. }
+            | EventKind::ApprovalResolved { .. }
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped
+            | EventKind::SessionRenamed { .. }
+            | EventKind::SessionStateChanged(_) => None,
+        }
+    }
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -463,6 +496,13 @@ pub enum CommandKind {
         session_id: SessionId,
         name: Option<String>,
     },
+    /// Archive the session (`true`) or bring it back (`false`). Absolute,
+    /// so a resend or a repeat cannot flip it twice; accepted for any known
+    /// session, even when it is already so.
+    SetSessionArchived {
+        session_id: SessionId,
+        archived: bool,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -601,5 +641,38 @@ pub mod path {
     /// Concrete path for downloading one blob.
     pub fn blob(id: BlobId) -> String {
         format!("/v1/blobs/{}", id.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archived_effect_sets_on_archive_and_clears_on_a_message() {
+        let by = DeviceId::new();
+        for archived in [true, false] {
+            assert_eq!(
+                EventKind::SessionArchived { archived, by }.archived_effect(),
+                Some(archived)
+            );
+        }
+        let message = EventKind::UserMessage {
+            command_id: CommandId::new(),
+            device_id: by,
+            text: "back".into(),
+        };
+        assert_eq!(message.archived_effect(), Some(false));
+        for kind in [
+            EventKind::AgentMessage { text: "x".into() },
+            EventKind::SessionStopped,
+            EventKind::SessionRenamed {
+                name: Some("x".into()),
+                by,
+            },
+            EventKind::SessionStateChanged(SessionState::Idle),
+        ] {
+            assert_eq!(kind.archived_effect(), None, "{kind:?}");
+        }
     }
 }

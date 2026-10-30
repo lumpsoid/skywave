@@ -4228,3 +4228,146 @@ fn a_new_approval_alerts_once_naming_the_session_only() {
     assert!(out.is_empty());
     assert_contains(&h.banner(), "1 approval elsewhere (^G)");
 }
+
+#[test]
+fn a_archives_the_selected_session_and_shift_a_switches_lists() {
+    let mut h = Harness::paired();
+    let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+    pull(
+        &mut h,
+        vec![
+            created(a, 0, "/srv/a"),
+            created(b, 1, "/srv/b"),
+            created(c, 2, "/srv/c"),
+        ],
+    );
+    assert_contains(&h.screen(), "a archive · A archived");
+    h.key(KeyCode::Down);
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+
+    // The row leaves at once; the selection moves to its neighbour.
+    assert_eq!(
+        h.key(KeyCode::Char('a')),
+        Some(Action::SetSessionArchived {
+            session_id: b,
+            archived: true,
+        })
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "Sessions (2) · 1 archived");
+    assert!(!screen.contains("/srv/b"), "{screen}");
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/a"));
+
+    // `A` shows the archived list; `n` makes no session there.
+    assert_eq!(
+        h.key(KeyCode::Char('A')),
+        Some(Action::Navigate(Route::ArchivedSessions))
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "Archived (1) · 2 active");
+    assert_contains(&screen, "a unarchive");
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert!(h.app.ui().prompt.is_none());
+
+    // It opens and works as usual, tagged; Esc goes back to its list.
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(b)));
+    assert_contains(&h.screen(), "· archived · a message brings it back");
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::ArchivedSessions))
+    );
+    // Esc on the archived list goes back to the active one, and `A` too.
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+    h.key(KeyCode::Char('A'));
+    assert_eq!(
+        h.key(KeyCode::Char('A')),
+        Some(Action::Navigate(Route::SessionList))
+    );
+
+    // `a` on the archived list brings it back, in its old place.
+    h.key(KeyCode::Char('A'));
+    assert_eq!(
+        h.key(KeyCode::Char('a')),
+        Some(Action::SetSessionArchived {
+            session_id: b,
+            archived: false,
+        })
+    );
+    assert_contains(&h.screen(), "No archived sessions.");
+    assert_eq!(h.key(KeyCode::Char('a')), None, "nothing selected");
+    h.key(KeyCode::Esc);
+    let screen = h.screen();
+    assert_contains(&screen, "Sessions (3)");
+    let row = |dir: &str| screen.find(dir).unwrap();
+    assert!(row("/srv/c") < row("/srv/b") && row("/srv/b") < row("/srv/a"));
+}
+
+#[test]
+fn a_message_brings_an_archived_session_back() {
+    let (mut h, id, _) = open_session();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::SessionArchived {
+                archived: true,
+                by: phone,
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "· archived · a message brings it back");
+    assert_contains(&screen, &format!("archived by device …{}", tail(phone)));
+    h.type_text("one more thing");
+    assert!(matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::SendMessage { .. })
+    ));
+    assert!(!h.screen().contains("· archived ·"), "{}", h.screen());
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+    // On the active list, which no longer counts it as archived.
+    let screen = h.screen();
+    assert_contains(&screen, "Sessions (1) ");
+    assert_contains(&screen, "/srv/work");
+    assert!(!screen.contains("1 archived"), "{screen}");
+}
+
+#[test]
+fn an_approval_in_an_archived_session_still_shows() {
+    let mut h = Harness::paired();
+    h.seam.set_link(Link::Online { latency_ms: 5 });
+    let (a, b) = (SessionId::new(), SessionId::new());
+    pull(
+        &mut h,
+        vec![
+            created(a, 0, "/srv/a"),
+            created(b, 1, "/srv/b"),
+            event(
+                a,
+                2,
+                EventKind::SessionArchived {
+                    archived: true,
+                    by: DeviceId::new(),
+                },
+            ),
+            approval(a, 3, ApprovalId::new(), "ls"),
+        ],
+    );
+    assert_eq!(h.banner(), "online · 5 ms · 1 approval elsewhere (^G)");
+    assert_contains(&h.screen(), "Sessions (1) · 1 archived");
+    h.key(KeyCode::Char('A'));
+    assert_contains(&line_with(&h.screen(), "/srv/a"), "! 1 approval pending");
+    assert_eq!(h.key_with(ctrl('g')), Some(Action::OpenNextApproval));
+    assert_eq!(open_id(&h), Some(a));
+}

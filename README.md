@@ -142,6 +142,12 @@ first line of its first message until you name it: `r` on the session list
 (or `R` on the timeline) renames it on every device, and an empty name brings
 the default title back.
 
+`a` on the session list archives the selected session on every device, and
+`A` switches between the active and the archived sessions (`a` there brings
+one back). An archived session keeps running, opens and works as usual, and
+a message to it from any device brings it back; its pending approvals still
+alert and still count for `Ctrl-G`.
+
 | Key | Session view |
 |-----|--------------|
 | `i` / `c` | Focus the composer |

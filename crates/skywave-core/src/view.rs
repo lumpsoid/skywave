@@ -230,14 +230,32 @@ pub enum PairingStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionListView {
-    /// Most recently active first.
+    /// Which of the two lists this is.
+    pub kind: ListKind,
+    /// The sessions of this list, most recently active first. Archiving
+    /// moves a session between the lists without reordering either.
     pub sessions: Vec<SessionRow>,
+    /// How many sessions the other list holds.
+    pub other_count: usize,
     /// Sessions this device asked for that are not in the replica yet, or
-    /// that the server refused. Oldest first.
+    /// that the server refused. Oldest first. Always empty on the archived
+    /// list: a new session is active.
     pub creating: Vec<PendingSession>,
     /// Workdir completion for the new-session prompt, while one is open
-    /// ([`Action::CompleteWorkdir`](crate::Action::CompleteWorkdir)).
+    /// ([`Action::CompleteWorkdir`](crate::Action::CompleteWorkdir)); only
+    /// on the active list.
     pub completion: Option<Completion>,
+}
+
+/// The session list's two halves: [`Route::SessionList`](crate::Route) and
+/// [`Route::ArchivedSessions`](crate::Route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Active,
+    /// Sessions archived with
+    /// [`Action::SetSessionArchived`](crate::Action::SetSessionArchived)
+    /// and not brought back since. They open and work as usual.
+    Archived,
 }
 
 /// Directories that complete what the user typed as a workdir.
@@ -348,6 +366,9 @@ pub struct SessionView {
     pub named: bool,
     /// As [`SessionRow::rename`].
     pub rename: Option<Outgoing>,
+    /// The session is on the archived list, this device's own archiving
+    /// or message on its way included. A message brings it back.
+    pub archived: bool,
     pub workdir: Option<String>,
     pub state: SessionState,
     /// Log order; this device's messages not yet in the log come last.
@@ -483,6 +504,14 @@ pub enum Entry {
         name: Option<String>,
         by: DeviceId,
         /// Renamed from this device.
+        own: bool,
+    },
+    /// The session was archived (`true`) or brought back from the archive.
+    /// A message brings it back too, without an entry of its own.
+    Archived {
+        archived: bool,
+        by: DeviceId,
+        /// From this device.
         own: bool,
     },
     /// The agent reported an error.
@@ -645,6 +674,7 @@ mod tests {
             title: "x".into(),
             named: false,
             rename: None,
+            archived: false,
             workdir: None,
             state: SessionState::Idle,
             timeline: vec![

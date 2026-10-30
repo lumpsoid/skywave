@@ -22,8 +22,8 @@ use ratatui::widgets::{
 };
 use skywave_core::{
     BlobPolicy, CandidateSource, Completion, CompletionStatus, Decision, FailReason, Link,
-    LinkRejection, Outgoing, PairingStatus, PairingView, PendingSession, Screen, SessionListView,
-    SessionRow, SessionState, SettingsView,
+    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, Screen,
+    SessionListView, SessionRow, SessionState, SettingsView,
 };
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
@@ -248,12 +248,21 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
     ])
     .areas(area);
 
-    let block = Block::bordered().title(format!(" Sessions ({}) ", list.sessions.len()));
+    let count = list.sessions.len();
+    let title = match (list.kind, list.other_count) {
+        (ListKind::Active, 0) => format!(" Sessions ({count}) "),
+        (ListKind::Active, archived) => format!(" Sessions ({count}) · {archived} archived "),
+        (ListKind::Archived, active) => format!(" Archived ({count}) · {active} active "),
+    };
+    let block = Block::bordered().title(title);
     if list.sessions.is_empty() {
-        let hint = if list.creating.is_empty() {
-            "No sessions yet. Press n to start one."
-        } else {
-            "No sessions yet."
+        let hint = match list.kind {
+            ListKind::Archived => "No archived sessions. Press A or Esc for the active ones.",
+            ListKind::Active if !list.creating.is_empty() => "No sessions yet.",
+            ListKind::Active if list.other_count > 0 => {
+                "No active sessions. Press n to start one, A for the archived ones."
+            }
+            ListKind::Active => "No sessions yet. Press n to start one.",
         };
         frame.render_widget(
             Paragraph::new(Line::from(hint).dark_gray()).block(block),
@@ -579,8 +588,12 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::SessionList(_) if app.ui().prompt.is_some() => {
             "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
+        Screen::SessionList(list) if list.kind == ListKind::Archived => {
+            "↑↓ select · Enter open · a unarchive · r rename · A/Esc active sessions · ? help · q quit"
+        }
         Screen::SessionList(_) => {
-            "↑↓ select · Enter open · n new session · r rename · s settings · ? help · q quit"
+            // `↑↓ select` makes way for the archive keys in 100 columns.
+            "Enter open · n new session · r rename · a archive · A archived · s settings · ? help · q quit"
         }
         Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
             // A pending message only takes these keys while the core says it
@@ -670,6 +683,9 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("Enter", "open session"),
             key("n", "new session in a server directory"),
             key("r", "rename the selected session"),
+            key("a", "archive it (on the archived list: bring it back)"),
+            key("A", "switch between active and archived sessions"),
+            key("Esc", "from the archived list: back to the active one"),
             key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
             Line::from(""),
@@ -680,6 +696,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("[error]", "agent reported an error"),
             key("[stopped]", "agent stopped; a message restarts it"),
             key("! N pending", "approvals waiting for an answer"),
+            Line::from(""),
+            section("Archive"),
+            Line::from("  Archived sessions open and work as usual; a message from any"),
+            Line::from("  device brings one back. Archiving does not stop the agent."),
         ]),
         Screen::Session(_) => {
             lines.extend([
