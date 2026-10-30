@@ -16,11 +16,13 @@ use skywave_proto::{
 
 use crate::action::{Action, Route};
 use crate::completion::Completer;
+use crate::identity::Identity;
 use crate::projection::{SessionSummary, blob_refs, is_notable};
 use crate::seam::Request;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
+use crate::tls::{self, Fingerprint};
 use crate::transport::TransportError;
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
@@ -94,9 +96,29 @@ struct OpenSession {
     unread_from: Option<Seq>,
 }
 
+/// Who this device is paired as, taken from its identity when it is
+/// loaded or saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Paired {
+    pub(crate) device: DeviceId,
+    /// The pinned server CA's fingerprint; `None` if its PEM holds no
+    /// certificate.
+    pub(crate) server: Option<Fingerprint>,
+}
+
+impl Paired {
+    pub(crate) fn of(identity: &impl Identity) -> Paired {
+        Paired {
+            device: identity.device_id(),
+            server: tls::first_cert_der(identity.ca_cert_pem()).map(|ca| Fingerprint::of_der(&ca)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Model {
-    device: Option<DeviceId>,
+    /// Who this device is paired as; `None` while unpaired.
+    paired: Option<Paired>,
     pairing: PairingStatus,
     link: Link,
     place: Place,
@@ -134,13 +156,17 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    /// The model after a (cold) start: the replica as stored, `device` from
+    fn device(&self) -> Option<DeviceId> {
+        self.paired.map(|p| p.device)
+    }
+
+    /// The model after a (cold) start: the replica as stored, `paired` from
     /// the identity if the device is paired.
-    pub(crate) fn new(snapshot: Snapshot, device: Option<DeviceId>) -> Model {
+    pub(crate) fn new(snapshot: Snapshot, paired: Option<Paired>) -> Model {
         let mut model = Model {
-            device,
+            paired,
             pairing: PairingStatus::Idle,
-            link: match device {
+            link: match paired {
                 Some(_) => Link::Connecting,
                 None => Link::Unpaired,
             },
@@ -217,7 +243,7 @@ impl Model {
                 })
             }
             Action::CompleteWorkdir { input } => {
-                if self.device.is_none() || self.place != Place::SessionList {
+                if self.device().is_none() || self.place != Place::SessionList {
                     return Vec::new();
                 }
                 // While the link is down, recent workdirs stand in.
@@ -296,7 +322,7 @@ impl Model {
                 vec![Effect::DeleteLocally(session_id)]
             }
             Action::OpenSession(id) => {
-                if self.device.is_none() || self.summary(id).is_none() {
+                if self.device().is_none() || self.summary(id).is_none() {
                     return Vec::new();
                 }
                 self.place = Place::Session(id);
@@ -354,7 +380,7 @@ impl Model {
     /// leaves the app. Follows [`Model::screen`]: an unpaired device sees
     /// pairing, a session gone from the replica shows the active list.
     fn back(&self) -> Option<Route> {
-        self.device?;
+        self.device()?;
         match self.place {
             Place::SessionList => None,
             Place::Archived | Place::Settings | Place::Pairing => Some(Route::SessionList),
@@ -398,7 +424,7 @@ impl Model {
     /// Queues a command under a fresh UUIDv7 id. Commands need a paired
     /// device: without one there is nobody to send them to.
     fn enqueue(&mut self, kind: CommandKind) -> Vec<Effect> {
-        if self.device.is_none() {
+        if self.device().is_none() {
             return Vec::new();
         }
         let command = Command {
@@ -673,7 +699,7 @@ impl Model {
     /// A logged user message is this device's own if it is still in the
     /// outbox (`sent`) or carries this device's id.
     fn is_own_message(&self, sent: bool, device_id: DeviceId) -> bool {
-        sent || self.device == Some(device_id)
+        sent || self.device() == Some(device_id)
     }
 
     /// Mirrors [`Store::delete_session_locally`](crate::Store::delete_session_locally),
@@ -747,8 +773,8 @@ impl Model {
         }
     }
 
-    pub(crate) fn paired(&mut self, device: DeviceId, address: String) {
-        self.device = Some(device);
+    pub(crate) fn paired(&mut self, paired: Paired, address: String) {
+        self.paired = Some(paired);
         self.settings.server_address = Some(address);
         self.pairing = PairingStatus::Idle;
         self.place = Place::SessionList;
@@ -822,7 +848,7 @@ impl Model {
     }
 
     fn screen(&self) -> Screen {
-        if self.device.is_none() {
+        if self.device().is_none() {
             return Screen::Pairing(self.pairing_view());
         }
         match self.place {
@@ -830,7 +856,8 @@ impl Model {
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
                 server_address: self.settings.server_address.clone(),
-                device_id: self.device,
+                device_id: self.device(),
+                server_fingerprint: self.paired.and_then(|p| p.server),
             }),
             Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
@@ -843,7 +870,7 @@ impl Model {
 
     fn pairing_view(&self) -> PairingView {
         PairingView {
-            paired: self.device.map(|device_id| PairedInfo {
+            paired: self.device().map(|device_id| PairedInfo {
                 device_id,
                 server_address: self.settings.server_address.clone(),
             }),
@@ -1181,7 +1208,7 @@ impl Model {
                     by,
                     rule,
                 } => {
-                    let by_me = self.device == Some(*by);
+                    let by_me = self.device() == Some(*by);
                     let status = ApprovalStatus::Resolved {
                         decision: *decision,
                         by: *by,
@@ -1208,12 +1235,12 @@ impl Model {
                 EventKind::SessionRenamed { name, by } => Some(Entry::Renamed {
                     name: name.clone(),
                     by: *by,
-                    own: self.device == Some(*by),
+                    own: self.device() == Some(*by),
                 }),
                 EventKind::SessionArchived { archived, by } => Some(Entry::Archived {
                     archived: *archived,
                     by: *by,
-                    own: self.device == Some(*by),
+                    own: self.device() == Some(*by),
                 }),
                 EventKind::SessionStateChanged(state) => {
                     // Every state change ends a turn or starts the next.
@@ -1459,6 +1486,14 @@ mod tests {
     use super::*;
     use crate::view::{CandidateSource, Completion, CompletionStatus, LinkRejection};
 
+    /// Paired as `device` with a server CA whose DER is `b"ca"`.
+    fn paired_as(device: DeviceId) -> Paired {
+        Paired {
+            device,
+            server: Some(Fingerprint::of_der(b"ca")),
+        }
+    }
+
     /// A paired model over an empty replica, plus a log builder.
     struct Fixture {
         model: Model,
@@ -1470,7 +1505,7 @@ mod tests {
         fn paired() -> Fixture {
             let me = DeviceId::new();
             Fixture {
-                model: Model::new(empty_snapshot(), Some(me)),
+                model: Model::new(empty_snapshot(), Some(paired_as(me))),
                 me,
                 events: Vec::new(),
             }
@@ -1631,7 +1666,7 @@ mod tests {
 
         assert_eq!(model.dispatch(pair).len(), 1);
         let device = DeviceId::new();
-        model.paired(device, "host:7443".into());
+        model.paired(paired_as(device), "host:7443".into());
         let view = model.view();
         assert_eq!(view.link, Link::Connecting);
         assert_eq!(
@@ -2557,7 +2592,7 @@ mod tests {
         assert!(f.dispatch(Action::OpenSession(gone)).is_empty());
 
         // And a restart keeps it gone.
-        let mut model = Model::new(snapshot(&f.model), Some(f.me));
+        let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
         model.apply_batch(&EventBatch {
             from: Seq(6),
             events: vec![Event {
@@ -2801,6 +2836,10 @@ mod tests {
         };
         assert_eq!(settings(&f).blob_policy, BlobPolicy::OnDemand);
         assert_eq!(settings(&f).device_id, Some(f.me));
+        assert_eq!(
+            settings(&f).server_fingerprint,
+            Some(Fingerprint::of_der(b"ca"))
+        );
         assert!(
             f.dispatch(Action::SetBlobPolicy(BlobPolicy::OnDemand))
                 .is_empty()
@@ -3722,7 +3761,7 @@ mod tests {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/app");
         f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
-        let mut model = Model::new(snapshot(&f.model), Some(f.me));
+        let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
         model.set_link(ONLINE);
         let attention = model.view().attention;
         assert_eq!(attention.alerts, 0);

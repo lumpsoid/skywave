@@ -17,6 +17,7 @@ use skywave_proto::{CommandResult, DirsResult, EventBatch};
 use crate::blobs::remove_all_blob_files;
 use crate::client::{Core, CoreError, State, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
+use crate::model::Paired;
 use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
 use crate::transport::TransportError;
 use crate::view::{BlobId, CommandId, Link, Seq};
@@ -227,7 +228,9 @@ impl Seam {
                 }
             }
             let identity = FileIdentity::save(&data_dir, credentials)?;
-            state.model.paired(identity.device_id(), address.to_owned());
+            state
+                .model
+                .paired(Paired::of(&identity), address.to_owned());
             state.identity = Some(Arc::new(identity));
             requests.push(Request::Connect);
             Ok(((), requests))

@@ -13,6 +13,7 @@ import androidx.compose.ui.test.performTouchInput
 import dev.skywave.android.ui.screens.AboutInfo
 import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.android.ui.screens.SettingsScreen
+import dev.skywave.android.ui.screens.fingerprintRows
 import dev.skywave.core.Action
 import dev.skywave.core.BlobPolicy
 import dev.skywave.core.Route
@@ -80,6 +81,7 @@ class SettingsScreenTest {
         show(SettingsSamples.unpaired)
         text("Not paired").assertExists()
         text("Device ID").assertDoesNotExist()
+        text("Server fingerprint").assertDoesNotExist()
         text("Pair with a server").performScrollTo().performClick()
         assertEquals(listOf<Action>(Action.Navigate(Route.PAIRING)), dispatched)
     }
@@ -113,5 +115,45 @@ class SettingsScreenTest {
         compose.waitForIdle()
         assertEquals(id, clipboard.primaryClip?.getItemAt(0)?.text)
         assertEquals(emptyList<Action>(), dispatched)
+    }
+
+    @Test
+    fun fingerprintShowsInRowsOfEightPairs() {
+        val fingerprint = SettingsSamples.paired.serverFingerprint!!
+        assertEquals(
+            listOf(
+                "3F:A1:09:C4:7E:22:B8:5D",
+                "91:0C:E6:4A:F3:18:77:2B",
+                "D0:5E:89:A2:4C:13:FB:66",
+                "0E:9D:C7:31:58:AF:24:E0",
+            ),
+            fingerprintRows(fingerprint).lines(),
+        )
+        show(SettingsSamples.paired)
+        text("Server fingerprint").assertExists()
+        text(fingerprintRows(fingerprint)).assertExists()
+    }
+
+    @Test
+    fun tappingOrLongPressingTheFingerprintCopiesItWhole() {
+        val clipboard = compose.activity.getSystemService(ClipboardManager::class.java)
+        show(SettingsSamples.paired)
+        val fingerprint = SettingsSamples.paired.serverFingerprint!!
+        text(fingerprintRows(fingerprint)).performScrollTo().performClick()
+        compose.waitForIdle()
+        assertEquals(fingerprint, clipboard.primaryClip?.getItemAt(0)?.text)
+
+        clipboard.clearPrimaryClip()
+        text(fingerprintRows(fingerprint)).performTouchInput { longClick() }
+        compose.waitForIdle()
+        assertEquals(fingerprint, clipboard.primaryClip?.getItemAt(0)?.text)
+        assertEquals(emptyList<Action>(), dispatched)
+    }
+
+    @Test
+    fun pairedWithoutAKnownFingerprintLeavesItOut() {
+        show(SettingsSamples.paired.copy(serverFingerprint = null))
+        text("Device ID").assertExists()
+        text("Server fingerprint").assertDoesNotExist()
     }
 }

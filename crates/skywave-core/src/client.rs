@@ -14,8 +14,8 @@ use tokio::sync::{mpsc as async_mpsc, watch};
 use crate::action::Action;
 use crate::blobs::remove_blob_files;
 use crate::engine::{Engine, EngineConfig};
-use crate::identity::{FileIdentity, Identity, IdentityError};
-use crate::model::{Effect, Model};
+use crate::identity::{FileIdentity, IdentityError};
+use crate::model::{Effect, Model, Paired};
 use crate::seam::{Request, Seam};
 use crate::store::{Store, StoreError};
 use crate::view::ViewState;
@@ -334,7 +334,7 @@ impl Shared {
     ) -> Result<Arc<Shared>, CoreError> {
         let store = Store::open(data_dir)?;
         let identity = FileIdentity::load(data_dir)?.map(Arc::new);
-        let model = Model::new(store.load()?, identity.as_ref().map(|i| i.device_id()));
+        let model = Model::new(store.load()?, identity.as_deref().map(Paired::of));
         Ok(Arc::new(Shared {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State {

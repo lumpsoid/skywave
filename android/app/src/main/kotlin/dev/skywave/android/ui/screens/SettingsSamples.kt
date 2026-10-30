@@ -16,9 +16,16 @@ internal object SettingsSamples {
         blobPolicy = BlobPolicy.ON_DEMAND,
         serverAddress = "skywave.home.arpa:7443",
         deviceId = "0192f3a4-7b1c-7d2e-9f30-4a5b6c7d8e9f",
+        serverFingerprint = "3F:A1:09:C4:7E:22:B8:5D:91:0C:E6:4A:F3:18:77:2B:" +
+            "D0:5E:89:A2:4C:13:FB:66:0E:9D:C7:31:58:AF:24:E0",
     )
 
-    val unpaired = SettingsView(blobPolicy = BlobPolicy.ON_DEMAND, serverAddress = null, deviceId = null)
+    val unpaired = SettingsView(
+        blobPolicy = BlobPolicy.ON_DEMAND,
+        serverAddress = null,
+        deviceId = null,
+        serverFingerprint = null,
+    )
 
     val noChrome = ShellChrome(banners = {}, snackbarHost = {}, onUp = {})
 }

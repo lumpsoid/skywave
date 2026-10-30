@@ -1193,6 +1193,9 @@ pub struct SettingsView {
     pub blob_policy: BlobPolicy,
     pub server_address: Option<String>,
     pub device_id: Option<String>,
+    /// The pinned server CA's fingerprint as `skywaved` prints it:
+    /// uppercase hex pairs joined by colons.
+    pub server_fingerprint: Option<String>,
 }
 
 impl From<sc::SettingsView> for SettingsView {
@@ -1201,11 +1204,13 @@ impl From<sc::SettingsView> for SettingsView {
             blob_policy,
             server_address,
             device_id,
+            server_fingerprint,
         } = s;
         SettingsView {
             blob_policy: blob_policy.into(),
             server_address,
             device_id: device_id.map(|d| id(d.0)),
+            server_fingerprint: server_fingerprint.map(|f| f.to_string()),
         }
     }
 }
@@ -1909,6 +1914,7 @@ mod tests {
                 blob_policy: sc::BlobPolicy::Eager,
                 server_address: None,
                 device_id: Some(device),
+                server_fingerprint: Some(sc::Fingerprint::of_der(b"ca")),
             }),
         ]);
         assert_eq!(
@@ -1964,6 +1970,7 @@ mod tests {
                         blob_policy: BlobPolicy::Eager,
                         server_address: None,
                         device_id: Some(s(device.0)),
+                        server_fingerprint: Some(sc::Fingerprint::of_der(b"ca").to_string()),
                     }
                 },
             ]

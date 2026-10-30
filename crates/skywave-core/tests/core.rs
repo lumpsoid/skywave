@@ -8,9 +8,9 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, Core, CoreError, Delivery, Draft, Entry, Link, Outgoing,
-    PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView, Store, StoreError,
-    TimelineItem, ViewState,
+    Action, BlobState, BlobStatus, Core, CoreError, Delivery, Draft, Entry, Fingerprint, Link,
+    Outgoing, PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView,
+    SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
     BlobId, BlobRef, CommandKind, CommandResult, DeviceId, Event, EventBatch, EventKind, Seq,
@@ -171,6 +171,51 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
         seam.settings().unwrap().server_address.as_deref(),
         Some("srv:7443")
     );
+}
+
+fn settings_view(core: &Core) -> SettingsView {
+    core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    match core.view().screen {
+        Screen::Settings(view) => view,
+        other => panic!("expected settings, got {other:?}"),
+    }
+}
+
+#[test]
+fn settings_show_the_pinned_server_fingerprint_also_after_restart() {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let ca = rcgen::CertificateParams::new(Vec::new())
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let expected = Fingerprint::of_der(ca.der());
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
+    let seam = core.seam();
+    let credentials = PairedCredentials {
+        ca_cert_pem: ca.pem(),
+        ..credentials()
+    };
+    seam.pairing_succeeded("srv:7443", credentials).unwrap();
+    assert_eq!(settings_view(&core).server_fingerprint, Some(expected));
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    let settings = settings_view(&core);
+    assert_eq!(settings.server_fingerprint, Some(expected));
+    assert_eq!(
+        settings.server_fingerprint.unwrap().to_string(),
+        expected.to_string(),
+        "the colon-separated form skywaved prints"
+    );
+}
+
+#[test]
+fn a_pinned_pem_without_a_certificate_has_no_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, _device) = paired_core(dir.path());
+    assert_eq!(settings_view(&core).server_fingerprint, None);
 }
 
 #[test]
