@@ -35,10 +35,12 @@ class PairingScreenTest {
         if (uri == GOOD_URI) PairInput.Details("10.0.2.2:7443", CODE, FP) else PairInput.Unreadable("not a skywave:// link")
     }
 
-    private fun show(screen: Screen) {
+    private fun show(screen: Screen.Pairing) {
+        // The core reports Unpaired until the first pairing succeeds.
+        val link = if (screen.view.paired == null) Link.Unpaired else Link.Connecting
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
-                AppShell(Samples.state(Link.Connecting, screen), dispatch = { dispatched += it }, inbox, SettingsSamples.about)
+                AppShell(Samples.state(link, screen), dispatch = { dispatched += it }, inbox, SettingsSamples.about)
             }
         }
     }

@@ -140,7 +140,10 @@ impl Model {
         let mut model = Model {
             device,
             pairing: PairingStatus::Idle,
-            link: Link::Connecting,
+            link: match device {
+                Some(_) => Link::Connecting,
+                None => Link::Unpaired,
+            },
             place: Place::SessionList,
             settings: Settings::default(),
             cursor: Seq::ZERO,
@@ -1570,6 +1573,9 @@ mod tests {
         };
         assert_eq!(pairing(&model).status, PairingStatus::Idle);
         assert_eq!(pairing(&model).paired, None);
+        // No server to connect to, so nothing claims to be connecting.
+        assert_eq!(model.view().link, Link::Unpaired);
+        assert!(model.dispatch(Action::RetryNow).is_empty());
 
         // Navigation and commands go nowhere without an identity.
         model.dispatch(Action::Navigate(Route::Settings));
@@ -3058,6 +3064,7 @@ mod tests {
     fn retry_now_only_while_reconnecting() {
         let mut f = Fixture::paired();
         for link in [
+            Link::Unpaired,
             Link::Connecting,
             Link::Online { latency_ms: 5 },
             Link::Rejected(LinkRejection::Revoked),

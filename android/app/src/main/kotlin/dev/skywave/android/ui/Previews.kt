@@ -103,15 +103,15 @@ private fun ConnectingPreview() = ShellPreview(Samples.state(Link.Connecting))
 
 @Preview(name = "Pairing")
 @Composable
-private fun PairingIdlePreview() = ShellPreview(Samples.state(Link.Connecting, Samples.unpaired))
+private fun PairingIdlePreview() = ShellPreview(Samples.state(Link.Unpaired, Samples.unpaired))
 
 @Preview(name = "Pairing in progress")
 @Composable
-private fun PairingInProgressPreview() = ShellPreview(Samples.state(Link.Connecting, Samples.pairingInProgress))
+private fun PairingInProgressPreview() = ShellPreview(Samples.state(Link.Unpaired, Samples.pairingInProgress))
 
 @Preview(name = "Pairing failed")
 @Composable
-private fun PairingFailedPreview() = ShellPreview(Samples.state(Link.Connecting, Samples.pairingFailed))
+private fun PairingFailedPreview() = ShellPreview(Samples.state(Link.Unpaired, Samples.pairingFailed))
 
 @Preview(name = "Pair again")
 @Composable

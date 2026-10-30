@@ -73,6 +73,7 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 
 ```rust
 enum Link {
+    Unpaired,                        // never paired: nothing to connect to
     Connecting,
     Online { latency_ms: u32 },
     CatchingUp { have: Seq, server: Seq },
@@ -106,6 +107,7 @@ enum BlobState {
 
 | Situation | Presentation |
 |-----------|--------------|
+| `Unpaired` | No banner; the pairing screen. |
 | `Reconnecting` with queued items | Banner: offline · N queued · retry in Xs. Input stays enabled. |
 | `CatchingUp` | Render local replica immediately, subtle syncing indicator. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |

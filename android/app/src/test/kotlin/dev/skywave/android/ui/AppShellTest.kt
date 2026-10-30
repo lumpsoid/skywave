@@ -62,8 +62,8 @@ class AppShellTest {
     }
 
     @Test
-    fun unpairedPairingHidesTheLink() {
-        show(Samples.state(Link.Connecting, Samples.unpaired))
+    fun unpairedShowsNoLinkBanner() {
+        show(Samples.state(Link.Unpaired, Samples.unpaired))
         text("Pair with a server").assertExists()
         text("Connecting…").assertDoesNotExist()
     }

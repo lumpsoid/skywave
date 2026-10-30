@@ -292,6 +292,9 @@ fn last_command(h: &Harness) -> CommandId {
 #[test]
 fn pairing_form_dispatches_pair_then_shows_progress_and_success() {
     let mut h = Harness::new();
+    // Unpaired: nothing to connect to, so the banner claims nothing.
+    assert_eq!(h.app.view().link, Link::Unpaired);
+    assert_eq!(h.banner(), "");
     let screen = h.screen();
     assert_contains(&screen, "Pair this device");
     assert_contains(&screen, "Address:");

@@ -38,6 +38,49 @@ async fn proxy(daemon: &Daemon) -> LinkProxy {
 
 // ---- tests ------------------------------------------------------------------
 
+/// A fresh device is `Unpaired`, not connecting to nothing; pairing starts
+/// the link, which goes on to `Online`, and it never claims `Unpaired`
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpaired_device_is_unpaired_until_it_pairs() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    assert_eq!(client.core.view().link, Link::Unpaired);
+    client.dispatch(Action::RetryNow);
+    assert_eq!(client.core.view().link, Link::Unpaired);
+
+    let links = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = links.clone();
+    client
+        .core
+        .subscribe(move |view| sink.lock().unwrap().push(view.link));
+    daemon.pair(&client, &proxy.address()).await;
+
+    let links = links.lock().unwrap().clone();
+    assert_eq!(links.first(), Some(&Link::Unpaired));
+    let paired = links
+        .iter()
+        .position(|link| *link != Link::Unpaired)
+        .unwrap();
+    assert!(
+        links[paired..].iter().all(|link| *link != Link::Unpaired),
+        "{links:?}"
+    );
+    assert!(
+        matches!(
+            links[paired],
+            Link::Connecting | Link::CatchingUp { .. } | Link::Online { .. }
+        ),
+        "{links:?}"
+    );
+    assert!(
+        matches!(links.last(), Some(Link::Online { .. })),
+        "{links:?}"
+    );
+}
+
 /// F8: commands made while the server is unreachable stay `Queued`, then
 /// drain oldest first once it is back, each exactly once in the log.
 #[tokio::test(flavor = "multi_thread")]
