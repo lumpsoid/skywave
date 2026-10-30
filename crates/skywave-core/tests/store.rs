@@ -349,10 +349,14 @@ fn outbox_survives_restart() {
         }
         // Re-enqueuing the same id is a no-op.
         store.enqueue(&commands[0]).unwrap();
-        store.mark_sending(commands[0].id).unwrap();
-        store.mark_sending(commands[1].id).unwrap();
+        assert!(store.claim_send(commands[0].id, Utc::now()).unwrap());
+        assert!(store.claim_send(commands[1].id, Utc::now()).unwrap());
         store
-            .record_result(commands[1].id, &CommandResult::Accepted { seq: Seq(42) })
+            .record_result(
+                commands[1].id,
+                &CommandResult::Accepted { seq: Seq(42) },
+                Utc::now(),
+            )
             .unwrap();
 
         let statuses: Vec<_> = store
@@ -394,20 +398,142 @@ fn outbox_survives_restart() {
     let rejected = CommandResult::Rejected {
         reason: RejectReason::UnknownSession,
     };
-    store.record_result(commands[2].id, &rejected).unwrap();
     store
-        .record_result(commands[2].id, &CommandResult::Accepted { seq: Seq(43) })
+        .record_result(commands[2].id, &rejected, Utc::now())
         .unwrap();
-    store.mark_sending(commands[2].id).unwrap();
+    store
+        .record_result(
+            commands[2].id,
+            &CommandResult::Accepted { seq: Seq(43) },
+            Utc::now(),
+        )
+        .unwrap();
     assert_eq!(
         store.outbox().unwrap()[2].status,
         OutboxStatus::Done(rejected)
     );
 
     let unknown = CommandId::new();
-    assert!(
-        matches!(store.mark_sending(unknown), Err(StoreError::UnknownCommand(id)) if id == unknown)
+    assert!(matches!(
+        store.record_result(unknown, &CommandResult::Accepted { seq: Seq(1) }, Utc::now()),
+        Err(StoreError::UnknownCommand(id)) if id == unknown
+    ));
+}
+
+fn at(second: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 30, 9, 0, second).unwrap()
+}
+
+#[test]
+fn claim_send_counts_tries_and_keeps_first_time() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let command = send(SessionId::new(), "hi");
+    store.enqueue(&command).unwrap();
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(
+        (entry.tries, entry.first_sent_at, entry.answered_at),
+        (0, None, None)
     );
+
+    assert!(store.claim_send(command.id, at(1)).unwrap());
+    assert!(store.claim_send(command.id, at(2)).unwrap());
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(entry.status, OutboxStatus::Sending);
+    assert_eq!(
+        (entry.tries, entry.first_sent_at, entry.answered_at),
+        (2, Some(at(1)), None)
+    );
+
+    let accepted = CommandResult::Accepted { seq: Seq(7) };
+    store.record_result(command.id, &accepted, at(3)).unwrap();
+    // A later answer changes neither the result nor its time.
+    store
+        .record_result(command.id, &CommandResult::Accepted { seq: Seq(8) }, at(4))
+        .unwrap();
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(entry.status, OutboxStatus::Done(accepted));
+    assert_eq!(
+        (entry.tries, entry.first_sent_at, entry.answered_at),
+        (2, Some(at(1)), Some(at(3)))
+    );
+}
+
+#[test]
+fn claim_send_refuses_answered_or_missing_rows() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let command = send(SessionId::new(), "hi");
+    store.enqueue(&command).unwrap();
+    assert!(store.claim_send(command.id, at(1)).unwrap());
+    let rejected = CommandResult::Rejected {
+        reason: RejectReason::UnknownSession,
+    };
+    store.record_result(command.id, &rejected, at(2)).unwrap();
+
+    assert!(!store.claim_send(command.id, at(3)).unwrap());
+    assert!(!store.claim_send(CommandId::new(), at(3)).unwrap());
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(entry.status, OutboxStatus::Done(rejected));
+    assert_eq!(entry.tries, 1, "a refused claim counts nothing");
+}
+
+#[test]
+fn tries_survive_restart() {
+    let (_tmp, dir) = data_dir();
+    let command = send(SessionId::new(), "hi");
+    {
+        let store = Store::open(&dir).unwrap();
+        store.enqueue(&command).unwrap();
+        assert!(store.claim_send(command.id, at(1)).unwrap());
+    }
+    // `Sending` goes back to `Queued`, but the attempt is remembered.
+    let store = Store::open(&dir).unwrap();
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!(entry.status, OutboxStatus::Queued);
+    assert_eq!((entry.tries, entry.first_sent_at), (1, Some(at(1))));
+
+    assert!(store.claim_send(command.id, at(2)).unwrap());
+    let entry = &store.outbox().unwrap()[0];
+    assert_eq!((entry.tries, entry.first_sent_at), (2, Some(at(1))));
+}
+
+#[test]
+fn migration_marks_existing_rows_attempted() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let (queued, answered) = (send(session, "one"), send(session, "two"));
+    {
+        let store = Store::open(&dir).unwrap();
+        store.enqueue(&queued).unwrap();
+        store.enqueue(&answered).unwrap();
+        store
+            .record_result(answered.id, &CommandResult::Accepted { seq: Seq(1) }, at(1))
+            .unwrap();
+    }
+    // A replica from before the columns.
+    drop_outbox_delivery_columns(&dir);
+    set_user_version(&dir, 2);
+
+    let store = Store::open(&dir).unwrap();
+    let outbox = store.outbox().unwrap();
+    // Either may have reached the server, so neither counts as never sent.
+    assert!(outbox.iter().all(|e| e.tries == 1));
+    assert!(
+        outbox
+            .iter()
+            .all(|e| e.first_sent_at.is_none() && e.answered_at.is_none())
+    );
+}
+
+fn drop_outbox_delivery_columns(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE outbox DROP COLUMN tries;
+         ALTER TABLE outbox DROP COLUMN first_sent_at;
+         ALTER TABLE outbox DROP COLUMN answered_at;",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -469,6 +595,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN stopped")
         .unwrap();
     drop(conn);
+    drop_outbox_delivery_columns(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));

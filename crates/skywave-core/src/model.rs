@@ -242,6 +242,9 @@ impl Model {
         self.outbox.push(OutboxEntry {
             command: command.clone(),
             status: OutboxStatus::Queued,
+            tries: 0,
+            first_sent_at: None,
+            answered_at: None,
         });
         vec![
             Effect::Enqueue(command),
@@ -298,16 +301,25 @@ impl Model {
         }
     }
 
-    pub(crate) fn command_sending(&mut self, id: CommandId) {
+    /// Mirrors [`Store::claim_send`](crate::Store::claim_send).
+    pub(crate) fn command_sending(&mut self, id: CommandId, now: DateTime<Utc>) {
         if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
             entry.status = OutboxStatus::Sending;
+            entry.tries += 1;
+            entry.first_sent_at.get_or_insert(now);
         }
     }
 
     /// The first result is final, as in the store.
-    pub(crate) fn command_result(&mut self, id: CommandId, result: CommandResult) {
+    pub(crate) fn command_result(
+        &mut self,
+        id: CommandId,
+        result: CommandResult,
+        now: DateTime<Utc>,
+    ) {
         if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
             entry.status = OutboxStatus::Done(result);
+            entry.answered_at = Some(now);
         }
     }
 
@@ -1004,11 +1016,14 @@ mod tests {
         assert_eq!(f.session_view().timeline, pending(Outgoing::Queued));
         assert_eq!(f.model.view().queued, 1);
 
-        f.model.command_sending(command.id);
+        f.model.command_sending(command.id, Utc::now());
         assert_eq!(f.session_view().timeline, pending(Outgoing::Sending));
 
-        f.model
-            .command_result(command.id, CommandResult::Accepted { seq: Seq(2) });
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(2) },
+            Utc::now(),
+        );
         assert_eq!(
             f.session_view().timeline,
             pending(Outgoing::Accepted(Seq(2)))
@@ -1066,10 +1081,14 @@ mod tests {
             CommandResult::Rejected {
                 reason: RejectReason::UnknownSession,
             },
+            Utc::now(),
         );
         // A later result never overrides the first.
-        f.model
-            .command_result(command.id, CommandResult::Accepted { seq: Seq(9) });
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(9) },
+            Utc::now(),
+        );
         f.log(
             sid,
             vec![EventKind::UserMessage {
@@ -1174,6 +1193,7 @@ mod tests {
             CommandResult::Rejected {
                 reason: RejectReason::ApprovalAlreadyResolved,
             },
+            Utc::now(),
         );
         let phone = DeviceId::new();
         f.log(
@@ -1229,8 +1249,11 @@ mod tests {
         f.open(sid);
         let command = queued(&f.dispatch(Action::Interrupt { session_id: sid }));
         assert_eq!(f.session_view().interrupt, Some(Outgoing::Queued));
-        f.model
-            .command_result(command.id, CommandResult::Accepted { seq: Seq(3) });
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
         assert_eq!(f.session_view().interrupt, Some(Outgoing::Accepted(Seq(3))));
 
         f.log(
@@ -1407,8 +1430,11 @@ mod tests {
                 outgoing: Outgoing::Queued,
             }]
         );
-        f.model
-            .command_result(command.id, CommandResult::Accepted { seq: Seq(2) });
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(2) },
+            Utc::now(),
+        );
         assert_eq!(creating(&f)[0].outgoing, Outgoing::Accepted(Seq(2)));
 
         let new = f.session("/srv/new");

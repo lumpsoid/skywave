@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use chrono::Utc;
 use skywave_proto::{CommandResult, EventBatch};
 
 use crate::client::{Core, CoreError, State, lock};
@@ -98,20 +99,28 @@ impl Seam {
         })
     }
 
-    /// The command was handed to the transport.
-    pub fn command_sending(&self, id: CommandId) -> Result<(), CoreError> {
+    /// Claims the command for the transport, durably, before it is sent
+    /// ([`Store::claim_send`](crate::Store::claim_send)). `false` means it
+    /// must not be sent: it is gone from the outbox or already answered.
+    /// Shares the state lock with `Core::dispatch`, so a claim and a later
+    /// discard of the same command are serialized.
+    pub fn command_sending(&self, id: CommandId) -> Result<bool, CoreError> {
+        let now = Utc::now();
         self.update(|state| {
-            state.store.mark_sending(id)?;
-            state.model.command_sending(id);
-            Ok(((), Vec::new()))
+            let claimed = state.store.claim_send(id, now)?;
+            if claimed {
+                state.model.command_sending(id, now);
+            }
+            Ok((claimed, Vec::new()))
         })
     }
 
     /// The server answered the command; the first answer is final.
     pub fn command_result(&self, id: CommandId, result: &CommandResult) -> Result<(), CoreError> {
+        let now = Utc::now();
         self.update(|state| {
-            state.store.record_result(id, result)?;
-            state.model.command_result(id, result.clone());
+            state.store.record_result(id, result, now)?;
+            state.model.command_result(id, result.clone(), now);
             Ok(((), Vec::new()))
         })
     }

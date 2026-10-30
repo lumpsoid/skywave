@@ -224,7 +224,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     seam.set_link(Link::Online { latency_ms: 80 });
     let pending = seam.pending_outbox().unwrap();
     assert_eq!(pending.len(), 1);
-    seam.command_sending(command.id).unwrap();
+    assert!(seam.command_sending(command.id).unwrap());
     assert!(matches!(
         session_view(&views.last()).timeline[0],
         TimelineItem::Pending {
