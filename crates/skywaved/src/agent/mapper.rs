@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
+    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, RULE_LABEL_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, ApprovalId, BlobRef, Body, BodyFormat, CallId, EventKind, Seq, SessionId,
@@ -48,7 +49,9 @@ const AGENT_EXITED: &str = "agent exited";
 ///
 /// **Bounds.** Every event is cut to `skywave_proto::limits`, whatever the
 /// adapter handed over: a title, detail or status to its first non-blank
-/// line and its char cap (a cut one ends in `…`); a body or result preview
+/// line and its char cap (a cut one ends in `…`), and so is a rule
+/// suggestion's label, of which only the first [`RULE_SUGGESTIONS_MAX`]
+/// are kept (the indices the adapter knows them by stay); a body or result preview
 /// to its first [`PREVIEW_MAX_LINES`] lines and [`PREVIEW_MAX_BYTES`] bytes.
 /// Cuts fall on char boundaries; `lines` counts the whole content. Failure
 /// is `is_error`, never a marker in the text. A cut title of a display with
@@ -193,6 +196,7 @@ impl EventMapper {
                 call,
                 tool,
                 input,
+                suggestions,
             } => {
                 let (call, summary, input) = match self.linked(call.as_ref()) {
                     Some(logged) => {
@@ -223,6 +227,7 @@ impl EventMapper {
                         tool,
                         summary,
                         input,
+                        suggestions: bounded_suggestions(suggestions),
                     },
                 )?);
                 self.approvals.push((request, id));
@@ -461,6 +466,16 @@ fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
         out.push('…');
     }
     (out, cut)
+}
+
+/// The first [`RULE_SUGGESTIONS_MAX`] suggestions, labels cut to one line
+/// of [`RULE_LABEL_MAX_CHARS`]. Cutting the end keeps every index valid.
+fn bounded_suggestions(mut suggestions: Vec<proto::RuleSuggestion>) -> Vec<proto::RuleSuggestion> {
+    suggestions.truncate(RULE_SUGGESTIONS_MAX);
+    for suggestion in &mut suggestions {
+        suggestion.label = cut_line(&suggestion.label, RULE_LABEL_MAX_CHARS).0;
+    }
+    suggestions
 }
 
 /// The head of `text`: at most [`PREVIEW_MAX_LINES`] lines and

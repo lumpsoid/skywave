@@ -198,7 +198,12 @@ impl EventLog {
         reason: &str,
     ) -> Result<Option<Seq>> {
         let tx = begin(db)?;
-        let Some((session_id, None)) = approval_in(&tx, id)? else {
+        let Some(ApprovalRow {
+            session_id,
+            closed: None,
+            ..
+        }) = approval_in(&tx, id)?
+        else {
             return Ok(None);
         };
         let kind = EventKind::ApprovalCancelled {
@@ -308,10 +313,16 @@ pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKi
                 [&session],
             )?;
         }
-        EventKind::ApprovalRequested { id, .. } => {
+        EventKind::ApprovalRequested {
+            id, suggestions, ..
+        } => {
             conn.execute(
-                "INSERT INTO approvals (id, session_id) VALUES (?1, ?2)",
-                params![id.0.to_string(), session],
+                "INSERT INTO approvals (id, session_id, rules) VALUES (?1, ?2, ?3)",
+                params![
+                    id.0.to_string(),
+                    session,
+                    i64::try_from(suggestions.len()).unwrap_or(i64::MAX)
+                ],
             )?;
         }
         EventKind::ApprovalResolved { id, .. } | EventKind::ApprovalCancelled { id, .. } => {
@@ -356,21 +367,33 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
         .optional()?)
 }
 
-/// The session of approval `id` and, once an `ApprovalResolved` or
-/// `ApprovalCancelled` closed it, that event's seq. `None` if unknown.
-pub(crate) fn approval_in(
-    conn: &Connection,
-    id: ApprovalId,
-) -> Result<Option<(SessionId, Option<Seq>)>> {
-    let row: Option<(String, Option<i64>)> = conn
+/// What the log says of one approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApprovalRow {
+    pub session_id: SessionId,
+    /// Seq of the `ApprovalResolved` or `ApprovalCancelled` that closed it.
+    pub closed: Option<Seq>,
+    /// How many rule suggestions the request offers.
+    pub rules: usize,
+}
+
+/// Approval `id` as the log has it; `None` if unknown.
+pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<ApprovalRow>> {
+    let row: Option<(String, Option<i64>, i64)> = conn
         .query_row(
-            "SELECT session_id, closed_seq FROM approvals WHERE id = ?1",
+            "SELECT session_id, closed_seq, rules FROM approvals WHERE id = ?1",
             [id.0.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    row.map(|(session, closed)| Ok((parse_id(&session)?, closed.map(seq_from_sql).transpose()?)))
-        .transpose()
+    row.map(|(session, closed, rules)| {
+        Ok(ApprovalRow {
+            session_id: parse_id(&session)?,
+            closed: closed.map(seq_from_sql).transpose()?,
+            rules: usize::try_from(rules).unwrap_or(0),
+        })
+    })
+    .transpose()
 }
 
 fn kind_name(kind: &EventKind) -> &'static str {

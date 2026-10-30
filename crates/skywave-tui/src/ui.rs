@@ -22,8 +22,8 @@ use ratatui::widgets::{
 };
 use skywave_core::{
     BlobPolicy, CandidateSource, Completion, CompletionStatus, Decision, FailReason, Link,
-    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, Screen,
-    SessionListView, SessionRow, SessionState, SettingsView,
+    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RuleScope,
+    RuleSuggestion, Screen, SessionListView, SessionRow, SessionState, SettingsView,
 };
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
@@ -598,12 +598,22 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
             // A pending message only takes these keys while the core says it
             // can be taken back.
+            Some((view, ui, Focus::Timeline)) if ui.rule_pick(view).is_some() => {
+                "↑↓ choose · Enter approve and always allow · Esc back to a/x · ? help"
+            }
             Some((view, ui, Focus::Timeline)) => match discardable(view, ui.selected) {
                 Some((_, Outgoing::Failed(_))) => {
                     "e edit · Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 Some(_) => {
                     "e edit · Del cancel · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
+                None if view
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|p| !p.suggestions.is_empty()) =>
+                {
+                    "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
                     "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
@@ -710,6 +720,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                 key("Tab", "switch between message and timeline"),
                 Line::from(""),
             ]);
+            lines.extend(rules_lines(app));
             // One focus at a time, so the overlay fits a small terminal.
             match app.session().map(|(_, ui)| ui.focus) {
                 Some(Focus::Timeline) => lines.extend([
@@ -729,6 +740,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                         "cancel your never-sent message, or dismiss a refused one",
                     ),
                     key("a / x", "approve / deny the pending approval"),
+                    key("A", "approve, always allowing a rule the agent offers"),
+                    key("", "(several: ↑↓ Enter pick one, Esc back to a / x)"),
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
                     key("R", "rename the session"),
@@ -760,6 +773,28 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("Esc", "back to sessions"),
         ]),
     }
+    lines
+}
+
+/// The rules granted in the open session, read-only: Skywave sees only
+/// those granted through it, and cannot take them back.
+fn rules_lines(app: &App) -> Vec<Line<'static>> {
+    let Some((view, _)) = app.session() else {
+        return Vec::new();
+    };
+    if view.rules.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from("Rules granted in this session").bold()];
+    lines.extend(
+        view.rules
+            .iter()
+            .map(|rule| Line::from(format!("  {}", rule_text(rule)))),
+    );
+    lines.extend([
+        Line::from("  Granted here only; the agent's settings may hold more.").dark_gray(),
+        Line::from(""),
+    ]);
     lines
 }
 
@@ -819,6 +854,7 @@ fn fail_reason(reason: FailReason) -> &'static str {
         FailReason::UnknownApproval => "the server does not know this approval",
         FailReason::ApprovalAlreadyResolved => "already answered on another device",
         FailReason::NoActiveTurn => "the agent was not working",
+        FailReason::UnknownRule => "the agent did not offer that rule",
     }
 }
 
@@ -827,4 +863,30 @@ pub(crate) fn decision_label(decision: Decision) -> &'static str {
         Decision::Approve => "approved",
         Decision::Deny => "denied",
     }
+}
+
+/// An answer in words: `approved always` when it granted a rule.
+pub(crate) fn answer_words(decision: Decision, rule: Option<&RuleSuggestion>) -> &'static str {
+    match rule {
+        Some(_) => "approved always",
+        None => decision_label(decision),
+    }
+}
+
+/// How far a rule reaches, in words.
+fn scope_label(scope: RuleScope) -> &'static str {
+    match scope {
+        RuleScope::Session => "session",
+        RuleScope::Project => "project",
+        RuleScope::User => "user",
+    }
+}
+
+/// A rule as listed: its label, then how far it reaches.
+pub(crate) fn rule_text(rule: &RuleSuggestion) -> String {
+    format!(
+        "{} ({})",
+        timeline::clean(&rule.label),
+        scope_label(rule.scope)
+    )
 }

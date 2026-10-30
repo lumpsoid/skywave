@@ -48,9 +48,13 @@ pub enum Action {
     /// what the draft held, to edit and send again. The session view's
     /// `draft_rev` changes so heads refill their composer.
     EditQueued(CommandId),
+    /// Answer an approval. `rule` grants the prompt's suggestion with that
+    /// index along with an approval; with a denial, or an index the prompt
+    /// does not offer, the action is a no-op.
     ResolveApproval {
         id: ApprovalId,
         decision: Decision,
+        rule: Option<u8>,
     },
     /// Stop the agent's current turn.
     Interrupt {

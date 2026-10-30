@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    SessionState as LogState, ToolCall,
+    RuleSuggestion, SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -238,11 +238,12 @@ impl Model {
             } => self.save_draft(session_id, text, cursor),
             Action::Discard(id) => self.withdraw(id, false),
             Action::EditQueued(id) => self.withdraw(id, true),
-            Action::ResolveApproval { id, decision } => {
-                if !self.can_answer(id) {
+            Action::ResolveApproval { id, decision, rule } => {
+                let granted = |rule| decision == Decision::Approve && self.offers(id, rule);
+                if !self.can_answer(id) || rule.is_some_and(|rule| !granted(rule)) {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::ResolveApproval { id, decision })
+                self.enqueue(CommandKind::ResolveApproval { id, decision, rule })
             }
             Action::Interrupt { session_id } => {
                 if self.summary(session_id).is_none() {
@@ -474,9 +475,20 @@ impl Model {
             .iter()
             .any(|s| s.pending_approvals.contains(&id));
         let answered = self
-            .local_answer(id)
+            .local_answer(id, &[])
             .is_some_and(|answer| !matches!(answer.outgoing, Outgoing::Failed(_)));
         pending && !answered
+    }
+
+    /// Whether approval `id`, requested in the open session, offers a rule
+    /// at index `rule`.
+    fn offers(&self, id: ApprovalId, rule: u8) -> bool {
+        self.open.as_ref().is_some_and(|open| {
+            open.events.iter().any(|(_, event)| {
+                matches!(&event.kind, EventKind::ApprovalRequested { id: requested, suggestions, .. }
+                    if *requested == id && usize::from(rule) < suggestions.len())
+            })
+        })
     }
 
     /// The session of the approval [`Action::OpenNextApproval`] goes to.
@@ -531,7 +543,7 @@ impl Model {
         let mut new = false;
         for id in pending {
             // One answered here was seen; it is never news.
-            if self.alerted.insert(id) && self.local_answer(id).is_none() {
+            if self.alerted.insert(id) && self.local_answer(id, &[]).is_none() {
                 new = true;
             }
         }
@@ -794,13 +806,15 @@ impl Model {
                     tool,
                     summary,
                     input,
+                    suggestions,
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
                     call: *call,
                     tool: tool.clone(),
                     summary: summary.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
-                    answer: self.local_answer(*id),
+                    suggestions: suggestions.clone(),
+                    answer: self.local_answer(*id, suggestions),
                 }),
                 _ => None,
             })
@@ -812,6 +826,7 @@ impl Model {
             |kind| matches!(kind, CommandKind::StopSession { session_id } if *session_id == id),
         );
         let title = self.title(summary);
+        let (timeline, rules) = self.timeline(id, events);
         Some(SessionView {
             id,
             title: title.text,
@@ -820,8 +835,9 @@ impl Model {
             archived: self.archived(summary),
             workdir: summary.workdir.clone(),
             state: session_state(summary),
-            timeline: self.timeline(id, events),
+            timeline,
             pending_approval,
+            rules,
             interrupt,
             stop,
             draft: self.drafts.get(&id).cloned(),
@@ -898,7 +914,12 @@ impl Model {
             .filter(|outgoing| !self.in_replica(*outgoing))
     }
 
-    fn timeline(&self, id: SessionId, events: &[(Seq, Event)]) -> Vec<TimelineItem> {
+    /// The session's timeline and the rules granted in it, in log order.
+    fn timeline(
+        &self,
+        id: SessionId,
+        events: &[(Seq, Event)],
+    ) -> (Vec<TimelineItem>, Vec<RuleSuggestion>) {
         let outbox: HashMap<CommandId, &OutboxEntry> =
             self.outbox.iter().map(|e| (e.command.id, e)).collect();
         let mut logged = HashSet::new();
@@ -996,7 +1017,8 @@ impl Model {
                     tool,
                     summary,
                     input,
-                } => match tools.call(&mut items, *call) {
+                    suggestions,
+                } => match tools.offer(*id, suggestions).call(&mut items, *call) {
                     Some((item, view, _)) if view.approval.is_none() => {
                         view.approval = Some(ToolApproval {
                             id: *id,
@@ -1016,12 +1038,18 @@ impl Model {
                         })
                     }
                 },
-                EventKind::ApprovalResolved { id, decision, by } => {
+                EventKind::ApprovalResolved {
+                    id,
+                    decision,
+                    by,
+                    rule,
+                } => {
                     let by_me = self.device == Some(*by);
                     let status = ApprovalStatus::Resolved {
                         decision: *decision,
                         by: *by,
                         by_me,
+                        rule: tools.grant(*id, *decision, *rule),
                     };
                     let ends = (*decision == Decision::Deny)
                         .then_some(ToolOutcome::Denied { by: *by, by_me });
@@ -1087,14 +1115,16 @@ impl Model {
             }
             _ => None,
         }));
-        items
+        (items, tools.granted)
     }
 
-    /// This device's latest answer to an approval.
-    fn local_answer(&self, approval: ApprovalId) -> Option<Answer> {
+    /// This device's latest answer to an approval, its rule read from what
+    /// the approval `offered`.
+    fn local_answer(&self, approval: ApprovalId, offered: &[RuleSuggestion]) -> Option<Answer> {
         self.outbox.iter().rev().find_map(|e| match e.command.kind {
-            CommandKind::ResolveApproval { id, decision } if id == approval => Some(Answer {
+            CommandKind::ResolveApproval { id, decision, rule } if id == approval => Some(Answer {
                 decision,
+                rule: rule.and_then(|rule| offered.get(usize::from(rule)).cloned()),
                 outgoing: Outgoing::from(&e.status),
                 delivery: Delivery::of(e),
             }),
@@ -1152,9 +1182,37 @@ struct ToolIndex {
     approvals: HashMap<ApprovalId, usize>,
     /// Items of the calls made since the last turn boundary.
     open: Vec<usize>,
+    /// The rules each approval offers.
+    offered: HashMap<ApprovalId, Vec<RuleSuggestion>>,
+    /// The rules granted so far, in log order.
+    granted: Vec<RuleSuggestion>,
 }
 
 impl ToolIndex {
+    /// Approval `id` offers `suggestions`.
+    fn offer(&mut self, id: ApprovalId, suggestions: &[RuleSuggestion]) -> &mut Self {
+        if !suggestions.is_empty() {
+            self.offered.insert(id, suggestions.to_vec());
+        }
+        self
+    }
+
+    /// The rule an answer to approval `id` grants, noted as granted: one it
+    /// offered, with an approval.
+    fn grant(
+        &mut self,
+        id: ApprovalId,
+        decision: Decision,
+        rule: Option<u8>,
+    ) -> Option<RuleSuggestion> {
+        if decision != Decision::Approve {
+            return None;
+        }
+        let rule = self.offered.get(&id)?.get(usize::from(rule?))?.clone();
+        self.granted.push(rule.clone());
+        Some(rule)
+    }
+
     /// The linked call `call` names: its item, view and time.
     fn call<'a>(
         &self,
@@ -1243,7 +1301,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use chrono::{TimeDelta, TimeZone, Utc};
-    use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind, ToolResult};
+    use skywave_proto::{
+        BlobRef, Decision, RejectReason, RuleScope, ToolDisplay, ToolKind, ToolResult,
+    };
 
     use super::*;
     use crate::view::{CandidateSource, Completion, CompletionStatus, LinkRejection};
@@ -1655,6 +1715,7 @@ mod tests {
                     tool: "bash".into(),
                     summary: "rm -rf build".into(),
                     input: Some(input.clone()),
+                    suggestions: Vec::new(),
                 },
             ],
         );
@@ -1677,6 +1738,7 @@ mod tests {
                 tool: "bash".into(),
                 summary: "rm -rf build".into(),
                 input: Some(blob.clone()),
+                suggestions: Vec::new(),
                 answer: None,
             })
         );
@@ -1685,13 +1747,15 @@ mod tests {
         assert!(
             f.dispatch(Action::ResolveApproval {
                 id: ApprovalId::new(),
-                decision: Decision::Approve
+                decision: Decision::Approve,
+                rule: None,
             })
             .is_empty()
         );
         let answer = Action::ResolveApproval {
             id: approval,
             decision: Decision::Approve,
+            rule: None,
         };
         let command = queued(&f.dispatch(answer.clone()));
         assert!(f.dispatch(answer.clone()).is_empty());
@@ -1700,6 +1764,7 @@ mod tests {
             prompt.answer,
             Some(Answer {
                 decision: Decision::Approve,
+                rule: None,
                 outgoing: Outgoing::Queued,
                 delivery: f.model.outbox.last().and_then(Delivery::of),
             })
@@ -1721,6 +1786,7 @@ mod tests {
                     id: approval,
                     decision: Decision::Deny,
                     by: phone,
+                    rule: None,
                 },
                 EventKind::SessionStateChanged(LogState::Idle),
             ],
@@ -1740,6 +1806,7 @@ mod tests {
                     decision: Decision::Deny,
                     by: phone,
                     by_me: false,
+                    rule: None,
                 },
             },
         }));
@@ -1747,6 +1814,110 @@ mod tests {
             f.dispatch(answer).is_empty(),
             "resolved approvals are closed"
         );
+    }
+
+    #[test]
+    fn a_granted_rule_shows_on_every_device_and_counts() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (first, second) = (ApprovalId::new(), ApprovalId::new());
+        let edits = RuleSuggestion {
+            label: "all edits".into(),
+            scope: RuleScope::Session,
+        };
+        let ls = RuleSuggestion {
+            label: "bash(ls)".into(),
+            scope: RuleScope::Project,
+        };
+        let request = |id, suggestions| EventKind::ApprovalRequested {
+            id,
+            call: None,
+            tool: "bash".into(),
+            summary: "ls".into(),
+            input: None,
+            suggestions,
+        };
+        f.log(sid, vec![request(first, vec![ls.clone(), edits.clone()])]);
+        f.open(sid);
+        let prompt = f.session_view().pending_approval.unwrap();
+        assert_eq!(prompt.suggestions, [ls.clone(), edits.clone()]);
+
+        // A rule with a denial, or one not offered, is not sent.
+        for (decision, rule) in [(Decision::Deny, Some(0)), (Decision::Approve, Some(2))] {
+            assert!(
+                f.dispatch(Action::ResolveApproval {
+                    id: first,
+                    decision,
+                    rule
+                })
+                .is_empty(),
+                "{decision:?} {rule:?}"
+            );
+        }
+        // This device's answer shows the rule while it is on its way.
+        queued(&f.dispatch(Action::ResolveApproval {
+            id: first,
+            decision: Decision::Approve,
+            rule: Some(1),
+        }));
+        let answer = f.session_view().pending_approval.unwrap().answer.unwrap();
+        assert_eq!(answer.rule, Some(edits.clone()));
+        assert!(
+            f.session_view().rules.is_empty(),
+            "not granted until logged"
+        );
+
+        // Logged: here, then another device grants one too.
+        let phone = DeviceId::new();
+        let me = f.me;
+        f.log(
+            sid,
+            vec![
+                EventKind::ApprovalResolved {
+                    id: first,
+                    decision: Decision::Approve,
+                    by: me,
+                    rule: Some(1),
+                },
+                request(second, vec![ls.clone()]),
+                EventKind::ApprovalResolved {
+                    id: second,
+                    decision: Decision::Approve,
+                    by: phone,
+                    rule: Some(0),
+                },
+            ],
+        );
+        let view = f.session_view();
+        let statuses: Vec<&ApprovalStatus> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: Entry::Approval { status, .. },
+                    ..
+                } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                &ApprovalStatus::Resolved {
+                    decision: Decision::Approve,
+                    by: me,
+                    by_me: true,
+                    rule: Some(edits.clone()),
+                },
+                &ApprovalStatus::Resolved {
+                    decision: Decision::Approve,
+                    by: phone,
+                    by_me: false,
+                    rule: Some(ls.clone()),
+                },
+            ]
+        );
+        assert_eq!(view.rules, [edits, ls]);
     }
 
     #[test]
@@ -1762,6 +1933,7 @@ mod tests {
                 tool: "edit".into(),
                 summary: "main.rs".into(),
                 input: None,
+                suggestions: Vec::new(),
             }],
         );
         f.open(sid);
@@ -2674,6 +2846,7 @@ mod tests {
             tool: "agent-tool".into(),
             summary: "the call's title".into(),
             input: None,
+            suggestions: Vec::new(),
         }
     }
 
@@ -2784,6 +2957,7 @@ mod tests {
                     id: approval,
                     decision: Decision::Approve,
                     by: f.me,
+                    rule: None,
                 },
                 EventKind::ToolResult(ToolResult {
                     call: Some(call),
@@ -2803,6 +2977,7 @@ mod tests {
                     decision: Decision::Approve,
                     by: f.me,
                     by_me: true,
+                    rule: None,
                 },
             }),
             outcome: ToolOutcome::Done {
@@ -2875,6 +3050,7 @@ mod tests {
                     id: approval,
                     decision: Decision::Deny,
                     by: phone,
+                    rule: None,
                 },
                 tool_result(Some(call), true, "the user denied this"),
                 EventKind::SessionStateChanged(LogState::Idle),
@@ -2900,6 +3076,7 @@ mod tests {
                     decision: Decision::Deny,
                     by: phone,
                     by_me: false,
+                    rule: None,
                 },
             })
         );
@@ -2996,6 +3173,7 @@ mod tests {
                     id: approval,
                     decision: Decision::Deny,
                     by: f.me,
+                    rule: None,
                 },
                 tool_result(None, false, "[error] denied"),
                 // A result for a call that is not in the log.
@@ -3021,6 +3199,7 @@ mod tests {
                         decision: Decision::Deny,
                         by: f.me,
                         by_me: true,
+                        rule: None,
                     },
                 },
                 Entry::ToolResult {
@@ -3201,6 +3380,7 @@ mod tests {
             id,
             decision: Decision::Approve,
             by: DeviceId::new(),
+            rule: None,
         }
     }
 
@@ -3300,6 +3480,7 @@ mod tests {
         queued(&f.dispatch(Action::ResolveApproval {
             id,
             decision: Decision::Deny,
+            rule: None,
         }));
         f.model.set_link(ONLINE);
         let attention = f.model.view().attention;

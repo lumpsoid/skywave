@@ -28,6 +28,9 @@
 //!   [`AdapterEvent::TurnEnded`]. A message sent while a turn runs is queued
 //!   by the agent and starts the next turn.
 //! - An approval blocks the agent until [`AgentSession::answer_approval`] (D8).
+//!   It may offer lasting rules ([`RuleSuggestion`]s, labelled by the
+//!   adapter); an approval can grant one of them by its index, which only
+//!   the adapter maps back to what its agent understands.
 //!   [`AgentSession::interrupt`] ends the current turn; approvals pending at
 //!   that point are reported as [`AdapterEvent::ApprovalCancelled`] (or are
 //!   cancelled by the mapper when the turn ends), followed by
@@ -49,6 +52,7 @@ use std::path::PathBuf;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{Decision, SessionId};
+pub use skywave_proto::{RuleScope, RuleSuggestion};
 use tokio::sync::mpsc;
 
 use crate::db::Db;
@@ -178,11 +182,14 @@ pub enum AdapterEvent {
     },
     /// The agent is blocked until [`AgentSession::answer_approval`] for
     /// `request` (D8). `call` is the tool call the approval gates, if known.
+    /// `suggestions` are the lasting rules the agent offers to grant with an
+    /// approval, labelled uncut; an answer names one by its index.
     ApprovalRequested {
         request: AgentRequestId,
         call: Option<AgentCallId>,
         tool: String,
         input: serde_json::Value,
+        suggestions: Vec<RuleSuggestion>,
     },
     /// The agent withdrew `request`; an answer to it is no longer read.
     ApprovalCancelled {
@@ -239,12 +246,15 @@ pub trait AgentSession: Send + 'static {
     fn send_message(&mut self, text: String)
     -> impl Future<Output = Result<(), AgentError>> + Send;
 
-    /// Answers approval `request`. An answer to a request that is no longer
-    /// pending is dropped by the adapter.
+    /// Answers approval `request`; with an approval, `rule` grants the
+    /// request's suggestion with that index too (the log only holds a rule
+    /// the request offered, never with a denial). An answer to a request
+    /// that is no longer pending is dropped by the adapter.
     fn answer_approval(
         &mut self,
         request: AgentRequestId,
         decision: Decision,
+        rule: Option<u8>,
     ) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the current turn, if any; a no-op when idle.

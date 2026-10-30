@@ -441,10 +441,12 @@ async fn first_answer_wins_across_devices() {
     a.dispatch(Action::ResolveApproval {
         id: approval,
         decision: Decision::Approve,
+        rule: None,
     });
     b.dispatch(Action::ResolveApproval {
         id: approval,
         decision: Decision::Deny,
+        rule: None,
     });
     for client in [&a, &b] {
         assert!(
@@ -470,9 +472,9 @@ async fn first_answer_wins_across_devices() {
     let resolutions: Vec<(Decision, skywave_core::DeviceId)> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::ApprovalResolved { id, decision, by } if *id == approval => {
-                Some((*decision, *by))
-            }
+            EventKind::ApprovalResolved {
+                id, decision, by, ..
+            } if *id == approval => Some((*decision, *by)),
             _ => None,
         })
         .collect();
@@ -526,7 +528,10 @@ async fn first_answer_wins_across_devices() {
         .into_iter()
         .filter(|input| matches!(input, FakeInput::Answer(..)))
         .collect();
-    assert_eq!(answers, vec![FakeInput::Answer("req-1".into(), decision)]);
+    assert_eq!(
+        answers,
+        vec![FakeInput::Answer("req-1".into(), decision, None)]
+    );
     let followed = match decision {
         Decision::Approve => count(&events, |k| matches!(k, EventKind::ToolResult { .. })),
         Decision::Deny => count(
@@ -559,6 +564,7 @@ async fn first_answer_wins_across_devices() {
                 decision,
                 by,
                 by_me: client.device() == by,
+                rule: None,
             }]
         );
     }
@@ -701,6 +707,7 @@ async fn soak_two_devices_random_links() {
                         client.dispatch(Action::ResolveApproval {
                             id: approval,
                             decision,
+                            rule: None,
                         });
                     }
                 }
@@ -746,6 +753,7 @@ async fn soak_two_devices_random_links() {
             a.dispatch(Action::ResolveApproval {
                 id: approval,
                 decision: Decision::Approve,
+                rule: None,
             });
         }
         // Wait for the log to move before checking again.

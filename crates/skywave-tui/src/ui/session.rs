@@ -11,8 +11,8 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, SessionState, SessionView,
-    TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, SessionState,
+    SessionView, TimelineItem, ToolView,
 };
 
 use super::timeline::{
@@ -20,7 +20,8 @@ use super::timeline::{
     item_lines, preview_lines, rule_index, title_spans, wall_ms,
 };
 use super::{
-    decision_label, outgoing_badge, outgoing_label, rename_badge, render_prompt, state_badge,
+    answer_words, outgoing_badge, outgoing_label, rename_badge, render_prompt, rule_text,
+    state_badge,
 };
 use crate::app::{App, Focus, Geometry, SessionUi};
 use crate::timeline::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -61,6 +62,7 @@ pub(super) fn render(
             p,
             session,
             ui.focus,
+            ui.rule_pick(session),
             inner.width.saturating_sub(2) as usize,
             approval_rows,
             wall_ms(wall),
@@ -110,6 +112,12 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
     if let Some(stop) = &session.stop {
         spans.push(Span::raw(" · stop ").dark_gray());
         spans.push(Span::styled(outgoing_label(stop), outgoing_badge(stop).1));
+    }
+    // Read-only: only what was granted here; `?` lists them.
+    match session.rules.len() {
+        0 => {}
+        1 => spans.push(Span::raw(" · 1 rule").dark_gray()),
+        n => spans.push(Span::raw(format!(" · {n} rules")).dark_gray()),
     }
     if ui.shown_scroll().is_some() {
         spans.push(Span::raw(" · scrolled back, End follows").dark_gray());
@@ -177,26 +185,32 @@ fn render_timeline(
 
 /// The prompt above the composer while the agent is blocked: the call it
 /// gates as the timeline shows it (kind, title, detail), what it will do
-/// (at most `max_rows` rows of it), then the keys.
+/// (at most `max_rows` rows of it), the lasting rule `A` grants, then the
+/// keys. While the rules offered are listed (`pick`, the highlighted one),
+/// the list takes the place of what the call will do, under the same cap.
 fn approval_lines(
     prompt: &ApprovalPrompt,
     session: &SessionView,
     focus: Focus,
+    pick: Option<usize>,
     width: usize,
     max_rows: usize,
     wall_ms: i64,
 ) -> Vec<Line<'static>> {
-    let mut lines = match gated_item(session) {
+    let (mut lines, content) = match gated_item(session) {
         Some((
             _,
             TimelineItem::Logged {
                 entry: Entry::Tool(view),
                 ..
             },
-        )) => gated_call(view, width, max_rows),
+        )) => (
+            gated_call(view, width),
+            gated_content(&tool_sections(view), width, max_rows),
+        ),
         _ => {
             let (_, style) = approval_state(&ApprovalStatus::Pending);
-            let mut lines = head_lines(
+            let lines = head_lines(
                 Vec::new(),
                 Span::styled("?", style),
                 title_spans(&prompt.tool, &prompt.summary),
@@ -212,10 +226,27 @@ fn approval_lines(
                 input: prompt.input.clone(),
                 status: ApprovalStatus::Pending,
             };
-            lines.extend(gated_content(&sections(&entry), width, max_rows));
-            lines
+            let content = gated_content(&sections(&entry), width, max_rows);
+            (lines, content)
         }
     };
+    if let Some(selected) = pick {
+        lines.extend(rule_list(&prompt.suggestions, selected, max_rows));
+        lines.push(
+            Line::from("↑↓ choose · Enter approve and always allow · Esc back to a/x")
+                .yellow()
+                .bold(),
+        );
+        return lines;
+    }
+    lines.extend(content);
+    let answered = prompt
+        .answer
+        .as_ref()
+        .is_some_and(|a| !matches!(a.outgoing, Outgoing::Failed(_)));
+    if !answered {
+        lines.extend(always_line(&prompt.suggestions));
+    }
     let keys = match focus {
         Focus::Composer => "Esc, then a approve · x deny",
         Focus::Timeline => "a approve · x deny",
@@ -230,8 +261,15 @@ fn approval_lines(
                 }
                 _ => outgoing_label(&answer.outgoing),
             };
+            let rule = answer
+                .rule
+                .as_ref()
+                .map_or_else(String::new, |rule| format!(" · {}", rule_text(rule)));
             let mut spans = vec![
-                Span::raw(format!("you {} · ", decision_label(answer.decision))),
+                Span::raw(format!(
+                    "you {}{rule} · ",
+                    answer_words(answer.decision, answer.rule.as_ref())
+                )),
                 Span::styled(label, outgoing_badge(&answer.outgoing).1),
             ];
             if matches!(answer.outgoing, Outgoing::Failed(_)) {
@@ -243,9 +281,39 @@ fn approval_lines(
     lines
 }
 
-/// The call an approval gates: glyph, name and title, its detail, then
-/// what it will do (the diff, the content written, the whole command).
-fn gated_call(view: &ToolView, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+/// What `A` does, when the agent offers lasting rules: grant the one it
+/// offers, or list them to pick one.
+fn always_line(offered: &[RuleSuggestion]) -> Option<Line<'static>> {
+    let what = match offered {
+        [] => return None,
+        [rule] => rule_text(rule),
+        rules => format!("choose one of {} rules", rules.len()),
+    };
+    Some(Line::from(format!("A  always allow · {what}")).yellow())
+}
+
+/// The rules offered, the `selected` one marked, at most `max_rows` of them
+/// with the selected one in view.
+fn rule_list(offered: &[RuleSuggestion], selected: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let rows = max_rows.max(1);
+    let first = (selected + 1).saturating_sub(rows);
+    offered
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, rule)| {
+            if i == selected {
+                Line::from(format!("› {}", rule_text(rule))).reversed()
+            } else {
+                Line::from(format!("  {}", rule_text(rule)))
+            }
+        })
+        .collect()
+}
+
+/// The call an approval gates: glyph, name and title, then its detail.
+fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
     let (_, style) = approval_state(&ApprovalStatus::Pending);
     let mut lines = head_lines(
         Vec::new(),
@@ -257,7 +325,6 @@ fn gated_call(view: &ToolView, width: usize, max_rows: usize) -> Vec<Line<'stati
     if let Some(detail) = &view.detail {
         lines.extend(detail_lines(detail, 2, width, None));
     }
-    lines.extend(gated_content(&tool_sections(view), width, max_rows));
     lines
 }
 

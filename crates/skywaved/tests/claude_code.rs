@@ -17,8 +17,8 @@ use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERS
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, ResultDisplay, ResumeHandle, StartSpec, ToolDisplay, ToolKind,
-    TurnOutcome,
+    BodyFormat, DisplayBody, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
+    ToolDisplay, ToolKind, TurnOutcome,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -77,7 +77,7 @@ fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec
                             _ => Decision::Deny,
                         };
                         let request = response["request_id"].as_str().unwrap();
-                        protocol.answer(&AgentRequestId::from(request), decision)
+                        protocol.answer(&AgentRequestId::from(request), decision, None)
                     }
                     other => panic!("{name}: unexpected stdin record {other:?}"),
                 };
@@ -288,6 +288,111 @@ fn replay_permissions_allow_then_deny() {
         result
             .output
             .contains("file state is current in your context")
+    );
+}
+
+/// The recorded `can_use_tool` requests of fixture `name`, in order.
+fn permission_requests(name: &str) -> Vec<Value> {
+    fixture(name)
+        .into_iter()
+        .filter(|r| r["dir"] == "out" && r["msg"]["request"]["subtype"] == "can_use_tool")
+        .map(|r| r["msg"].clone())
+        .collect()
+}
+
+#[test]
+fn replay_permission_suggestions_are_offered_as_rules() {
+    let events = replay(
+        "permissions",
+        uuid("7d7945cf-3afb-478c-b0e7-a1e6b4dff356"),
+        false,
+        &[],
+    );
+    let suggestions: Vec<&Vec<RuleSuggestion>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ApprovalRequested { suggestions, .. } => Some(suggestions),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        suggestions,
+        [
+            &vec![RuleSuggestion {
+                label: "all edits".to_owned(),
+                scope: RuleScope::Session,
+            }],
+            &vec![
+                RuleSuggestion {
+                    label: "Bash(cat /tmp/skywave-t07-scratch/hello.txt && rm /tmp/skywave-t07-scratch/hello.txt && ls -la /tmp/skywave-t07-scratch/)".to_owned(),
+                    scope: RuleScope::Project,
+                },
+                RuleSuggestion {
+                    label: "access to /tmp/skywave-t07-scratch".to_owned(),
+                    scope: RuleScope::Session,
+                },
+                RuleSuggestion {
+                    label: "all edits".to_owned(),
+                    scope: RuleScope::Session,
+                },
+            ],
+        ]
+    );
+}
+
+#[test]
+fn granting_a_rule_sends_its_suggestion_as_updated_permissions() {
+    for (n, request) in permission_requests("permissions").into_iter().enumerate() {
+        let mut protocol = Protocol::new(Uuid::new_v4(), false);
+        let request_id = AgentRequestId::from(request["request_id"].as_str().unwrap());
+        let out = protocol.on_line(&serde_json::to_string(&request).unwrap());
+        let [AdapterEvent::ApprovalRequested { suggestions, .. }] = &out.events[..] else {
+            panic!("request #{n}: {:?}", out.events);
+        };
+        // The last one offered: every recorded suggestion is offered.
+        let last = suggestions.len() - 1;
+        let out = protocol.answer(&request_id, Decision::Approve, Some(last as u8));
+        let suggestion = &request["request"]["permission_suggestions"][last];
+        assert_eq!(
+            out.writes,
+            [json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id.0,
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": request["request"]["input"],
+                        "updatedPermissions": [suggestion],
+                    },
+                },
+            })],
+            "request #{n}"
+        );
+    }
+}
+
+#[test]
+fn a_rule_the_request_did_not_offer_or_a_denial_grants_nothing() {
+    let request = permission_requests("permissions").remove(0);
+    let request_id = AgentRequestId::from(request["request_id"].as_str().unwrap());
+    let input = &request["request"]["input"];
+    let line = serde_json::to_string(&request).unwrap();
+
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    protocol.on_line(&line);
+    let out = protocol.answer(&request_id, Decision::Approve, Some(5));
+    assert_eq!(out.writes, [protocol::allow_response(&request_id.0, input)]);
+
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    protocol.on_line(&line);
+    let out = protocol.answer(&request_id, Decision::Deny, Some(0));
+    assert_eq!(
+        out.writes,
+        [protocol::deny_response(
+            &request_id.0,
+            protocol::DENY_MESSAGE
+        )]
     );
 }
 
@@ -538,6 +643,7 @@ fn write_approval() -> AdapterEvent {
         call: Some(CALL.into()),
         tool: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
+        suggestions: Vec::new(),
     }
 }
 
@@ -576,11 +682,11 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     );
     session.send_message("queued".to_owned()).await.unwrap();
     session
-        .answer_approval("not-pending".into(), Decision::Approve)
+        .answer_approval("not-pending".into(), Decision::Approve, None)
         .await
         .unwrap();
     session
-        .answer_approval("perm-1".into(), Decision::Approve)
+        .answer_approval("perm-1".into(), Decision::Approve, None)
         .await
         .unwrap();
     assert_eq!(
@@ -605,7 +711,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         [AdapterEvent::TurnStarted, write_call(), write_approval()]
     );
     session
-        .answer_approval("perm-1".into(), Decision::Deny)
+        .answer_approval("perm-1".into(), Decision::Deny, None)
         .await
         .unwrap();
     assert_eq!(

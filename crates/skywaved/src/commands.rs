@@ -6,7 +6,7 @@
 //! - `CreateSession` → `SessionCreated` with the canonical workdir and a new
 //!   [`SessionId`];
 //! - `SendMessage` → `UserMessage`;
-//! - `ResolveApproval` → `ApprovalResolved`;
+//! - `ResolveApproval` → `ApprovalResolved`, echoing the granted `rule`;
 //! - `Interrupt` → `TurnInterrupted`;
 //! - `StopSession` → `SessionStopped`;
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
@@ -35,6 +35,11 @@
 //! [`skywave_proto::normalise_session_name`] leaves it; one that ends up
 //! empty restores the default title.
 //!
+//! **ResolveApproval.** The first answer wins (D5); a cancelled approval is
+//! closed too. A `rule` must come with an approval and index one of the
+//! request's suggestions, else the answer is `UnknownRule`: the log never
+//! claims a rule the agent was not offered.
+//!
 //! **SetSessionArchived.** Accepted for any known session, even one already
 //! so: the event carries the absolute value, never a toggle, so a repeat
 //! changes nothing. The server keeps no archived flag (nothing here reads
@@ -43,8 +48,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, DeviceId, EventKind, RejectReason, Seq,
-    SessionId,
+    Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind, RejectReason,
+    Seq, SessionId,
 };
 
 use crate::db::Db;
@@ -122,21 +127,26 @@ impl EventLog {
                 };
                 (*session_id, kind)
             }
-            CommandKind::ResolveApproval { id, decision } => {
+            CommandKind::ResolveApproval { id, decision, rule } => {
                 // A cancelled approval is closed too: no answer can win it.
-                let session_id = match event_log::approval_in(tx, *id)? {
+                let approval = match event_log::approval_in(tx, *id)? {
                     None => return Ok(Err(RejectReason::UnknownApproval)),
-                    Some((_, Some(_closed))) => {
+                    Some(approval) if approval.closed.is_some() => {
                         return Ok(Err(RejectReason::ApprovalAlreadyResolved));
                     }
-                    Some((session_id, None)) => session_id,
+                    Some(approval) => approval,
                 };
+                let offered = |rule: u8| usize::from(rule) < approval.rules;
+                if rule.is_some_and(|rule| *decision == Decision::Deny || !offered(rule)) {
+                    return Ok(Err(RejectReason::UnknownRule));
+                }
                 let kind = EventKind::ApprovalResolved {
                     id: *id,
                     decision: *decision,
                     by: device,
+                    rule: *rule,
                 };
-                (session_id, kind)
+                (approval.session_id, kind)
             }
             CommandKind::Interrupt { session_id } => {
                 match event_log::session_in(tx, *session_id)? {

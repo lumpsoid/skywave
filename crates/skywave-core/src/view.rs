@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 
 pub use skywave_proto::RejectReason as FailReason;
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Seq, SessionId, ToolKind,
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, RuleScope,
+    RuleSuggestion, Seq, SessionId, ToolKind,
 };
 
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
@@ -375,6 +376,10 @@ pub struct SessionView {
     pub timeline: Vec<TimelineItem>,
     /// The approval the agent is blocked on, if any.
     pub pending_approval: Option<ApprovalPrompt>,
+    /// The lasting rules granted with approvals in this session, by any
+    /// device, in log order. Only what was granted through Skywave: rules
+    /// the agent keeps elsewhere are not seen.
+    pub rules: Vec<RuleSuggestion>,
     /// This device's latest interrupt of the session, until its effect is in
     /// the replica.
     pub interrupt: Option<Outgoing>,
@@ -593,10 +598,12 @@ pub enum ToolOutcome {
 pub enum ApprovalStatus {
     Pending,
     /// First answer wins (D5); `by_me` is false when another device answered.
+    /// `rule` is the lasting rule granted with an approval, if any.
     Resolved {
         decision: Decision,
         by: DeviceId,
         by_me: bool,
+        rule: Option<RuleSuggestion>,
     },
     Cancelled {
         reason: String,
@@ -613,13 +620,19 @@ pub struct ApprovalPrompt {
     pub tool: String,
     pub summary: String,
     pub input: Option<BlobView>,
+    /// Lasting rules the agent offers to grant with an approval; an answer
+    /// names one by its index
+    /// ([`Action::ResolveApproval::rule`](crate::Action::ResolveApproval)).
+    pub suggestions: Vec<RuleSuggestion>,
     /// This device's answer, if it gave one; queued like any command.
     pub answer: Option<Answer>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub decision: Decision,
+    /// The rule granted with the approval, if any.
+    pub rule: Option<RuleSuggestion>,
     pub outgoing: Outgoing,
     pub delivery: Option<Delivery>,
 }
@@ -688,6 +701,7 @@ mod tests {
                 pending("queued"),
             ],
             pending_approval: None,
+            rules: Vec::new(),
             interrupt: None,
             stop: None,
             draft: None,

@@ -224,6 +224,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     accepted(f.handle(CommandKind::ResolveApproval {
         id,
         decision: Decision::Approve,
+        rule: None,
     }));
     let request = mapper
         .take_approval(id)
@@ -231,7 +232,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     assert_eq!(request.0, "req-1");
     assert_eq!(mapper.take_approval(id), None);
     session
-        .answer_approval(request, Decision::Approve)
+        .answer_approval(request, Decision::Approve, None)
         .await
         .unwrap();
     let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
@@ -295,8 +296,8 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     // The approval names its call and drops the input it shares with it.
     assert!(matches!(
         &kinds[6],
-        EventKind::ApprovalRequested { id: a, call: Some(c), tool, summary, input: None }
-            if *a == id && *c == write && tool == "write" && summary == "hi"
+        EventKind::ApprovalRequested { id: a, call: Some(c), tool, summary, input: None, suggestions, }
+            if *a == id && *c == write && tool == "write" && summary == "hi" && suggestions.is_empty()
     ));
     assert!(matches!(
         kinds[7],
@@ -337,7 +338,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         [
             FakeInput::Started { resumed: false },
             FakeInput::Message("look around".into()),
-            FakeInput::Answer("req-1".into(), Decision::Approve),
+            FakeInput::Answer("req-1".into(), Decision::Approve, None),
         ]
     );
     session.shutdown().await.unwrap();
@@ -400,7 +401,8 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
     assert_eq!(
         f.handle(CommandKind::ResolveApproval {
             id,
-            decision: Decision::Approve
+            decision: Decision::Approve,
+            rule: None,
         }),
         CommandResult::Rejected {
             reason: RejectReason::ApprovalAlreadyResolved
@@ -409,7 +411,7 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
 
     // A stale answer is ignored and the next message runs the next turn.
     session
-        .answer_approval("req-7".into(), Decision::Approve)
+        .answer_approval("req-7".into(), Decision::Approve, None)
         .await
         .unwrap();
     session.send_message("go on".into()).await.unwrap();
@@ -494,10 +496,11 @@ async fn denied_approval_runs_the_deny_branch() {
     accepted(f.handle(CommandKind::ResolveApproval {
         id,
         decision: Decision::Deny,
+        rule: None,
     }));
     let request = mapper.take_approval(id).unwrap();
     session
-        .answer_approval(request, Decision::Deny)
+        .answer_approval(request, Decision::Deny, None)
         .await
         .unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
@@ -606,10 +609,11 @@ async fn failures_and_exits_mark_the_session_errored() {
     accepted(f.handle(CommandKind::ResolveApproval {
         id,
         decision: Decision::Approve,
+        rule: None,
     }));
     let request = mapper.take_approval(id).unwrap();
     session
-        .answer_approval(request, Decision::Approve)
+        .answer_approval(request, Decision::Approve, None)
         .await
         .unwrap();
     let tail = f
@@ -636,6 +640,54 @@ async fn failures_and_exits_mark_the_session_errored() {
     ));
 }
 
+#[test]
+fn rule_suggestions_are_cut_to_the_protocol_caps() {
+    use skywave_proto::limits::{RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX};
+    use skywaved::agent::{RuleScope, RuleSuggestion};
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id);
+    let long = "x".repeat(RULE_LABEL_MAX_CHARS + 10);
+    let mut suggestions = vec![
+        RuleSuggestion {
+            label: format!("{long}\nsecond line"),
+            scope: RuleScope::Project,
+        },
+        RuleSuggestion {
+            label: "two\nlines".into(),
+            scope: RuleScope::User,
+        },
+    ];
+    suggestions.extend((0..RULE_SUGGESTIONS_MAX).map(|n| RuleSuggestion {
+        label: format!("rule {n}"),
+        scope: RuleScope::Session,
+    }));
+    for event in [
+        AdapterEvent::TurnStarted,
+        AdapterEvent::ApprovalRequested {
+            request: "q".into(),
+            call: None,
+            tool: "write".into(),
+            input: json!("short"),
+            suggestions,
+        },
+    ] {
+        mapper.apply(&f.log, &mut f.storage, event).unwrap();
+    }
+    let kinds = f.kinds();
+    let EventKind::ApprovalRequested { suggestions, .. } = &kinds[1] else {
+        panic!("expected ApprovalRequested, got {:?}", kinds[1]);
+    };
+    // The first ones kept, in order, so the adapter's indices still hold.
+    assert_eq!(suggestions.len(), RULE_SUGGESTIONS_MAX);
+    assert_eq!(suggestions[0].label.chars().count(), RULE_LABEL_MAX_CHARS);
+    assert!(suggestions[0].label.ends_with('…'));
+    assert_eq!(suggestions[0].scope, RuleScope::Project);
+    assert_eq!(suggestions[1].label, "two…");
+    assert_eq!(suggestions[2].label, "rule 0");
+    assert_eq!(suggestions[7].label, "rule 5");
+}
+
 #[tokio::test]
 async fn exit_with_a_pending_approval_cancels_it() {
     let mut f = Fixture::new();
@@ -653,6 +705,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
             call: None,
             tool: "write".into(),
             input: json!("short"),
+            suggestions: Vec::new(),
         },
         AdapterEvent::ToolResult {
             call: None,
@@ -758,6 +811,7 @@ fn large_content_gives_small_events_and_blobs() {
                 call: None,
                 tool: "shell".into(),
                 input: input.clone(),
+                suggestions: Vec::new(),
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1006,12 +1060,14 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 call: Some("c1".into()),
                 tool: "write".into(),
                 input: write.clone(),
+                suggestions: Vec::new(),
             },
             AdapterEvent::ApprovalRequested {
                 request: "q2".into(),
                 call: Some("c1".into()),
                 tool: "write".into(),
                 input: edited.clone(),
+                suggestions: Vec::new(),
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),

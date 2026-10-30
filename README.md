@@ -158,6 +158,7 @@ alert and still count for `Ctrl-G`.
 | `d` | Download a blob |
 | `y` / `Y` | Copy the selected output, diff, file or message / its command |
 | `a` / `x` | Approve / deny a pending request |
+| `A` | Approve and always allow a rule the agent offers (timeline); with several, pick one with `↑↓` `Enter` |
 | `Ctrl-X` | Interrupt the agent's turn |
 | `S` | Stop the agent (timeline); the next message restarts it |
 | `R` | Rename the session (timeline); empty restores the default title |

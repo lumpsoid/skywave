@@ -78,6 +78,7 @@ impl Log {
                     tool: "bash".into(),
                     summary: "rm -rf target".into(),
                     input: None,
+                    suggestions: Vec::new(),
                 },
             ),
             event(
@@ -96,6 +97,7 @@ impl Log {
                     id: approval,
                     decision: Decision::Approve,
                     by: DeviceId::new(),
+                    rule: None,
                 },
             ),
         ];
@@ -757,6 +759,7 @@ fn notable_count_is_projected_and_backfilled() {
                     tool: "bash".into(),
                     summary: "ls".into(),
                     input: None,
+                    suggestions: Vec::new(),
                 },
             ),
             event(

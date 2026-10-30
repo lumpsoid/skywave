@@ -127,6 +127,20 @@ fn all_event_kinds() -> Vec<EventKind> {
             tool: "exec".into(),
             summary: "rm -rf target".into(),
             input: None,
+            suggestions: vec![
+                RuleSuggestion {
+                    label: "allow exec(rm -rf target)".into(),
+                    scope: RuleScope::Project,
+                },
+                RuleSuggestion {
+                    label: "allow all edits".into(),
+                    scope: RuleScope::Session,
+                },
+                RuleSuggestion {
+                    label: "allow exec(cargo:*)".into(),
+                    scope: RuleScope::User,
+                },
+            ],
         },
         EventKind::ApprovalRequested {
             id: approval(),
@@ -134,16 +148,25 @@ fn all_event_kinds() -> Vec<EventKind> {
             tool: "put".into(),
             summary: "src/main.rs".into(),
             input: Some(blob()),
+            suggestions: Vec::new(),
         },
         EventKind::ApprovalResolved {
             id: approval(),
             decision: Decision::Approve,
             by: device(),
+            rule: None,
+        },
+        EventKind::ApprovalResolved {
+            id: approval(),
+            decision: Decision::Approve,
+            by: device(),
+            rule: Some(1),
         },
         EventKind::ApprovalResolved {
             id: approval(),
             decision: Decision::Deny,
             by: device(),
+            rule: None,
         },
         EventKind::ApprovalCancelled {
             id: approval(),
@@ -187,10 +210,17 @@ fn all_command_kinds() -> Vec<CommandKind> {
         CommandKind::ResolveApproval {
             id: approval(),
             decision: Decision::Approve,
+            rule: None,
+        },
+        CommandKind::ResolveApproval {
+            id: approval(),
+            decision: Decision::Approve,
+            rule: Some(0),
         },
         CommandKind::ResolveApproval {
             id: approval(),
             decision: Decision::Deny,
+            rule: None,
         },
         CommandKind::Interrupt {
             session_id: session(),
@@ -227,6 +257,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
             RejectReason::NoActiveTurn,
+            RejectReason::UnknownRule,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -393,6 +424,42 @@ fn v1_approval_requested_decodes_without_a_call() {
             tool: "exec".into(),
             summary: "rm -rf target".into(),
             input: None,
+            suggestions: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn v3_approval_events_decode_without_suggestions_or_rule() {
+    let kind = decode(
+        r#"{"type":"approval_requested","id":"01920000-0000-7000-8000-000000000004","call":"01920000-0000-7000-8000-000000000007","tool":"exec","summary":"rm -rf target","input":null}"#,
+    );
+    assert!(
+        matches!(&kind, EventKind::ApprovalRequested { call: Some(c), suggestions, .. } if *c == call() && suggestions.is_empty()),
+        "{kind:?}"
+    );
+    let kind = decode(
+        r#"{"type":"approval_resolved","id":"01920000-0000-7000-8000-000000000004","decision":"approve","by":"01920000-0000-7000-8000-000000000003"}"#,
+    );
+    assert_eq!(
+        kind,
+        EventKind::ApprovalResolved {
+            id: approval(),
+            decision: Decision::Approve,
+            by: device(),
+            rule: None,
+        }
+    );
+    let command: CommandKind = serde_json::from_str(
+        r#"{"type":"resolve_approval","id":"01920000-0000-7000-8000-000000000004","decision":"deny"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        command,
+        CommandKind::ResolveApproval {
+            id: approval(),
+            decision: Decision::Deny,
+            rule: None,
         }
     );
 }
@@ -415,6 +482,8 @@ fn display_caps() {
     assert_eq!(limits::STATUS_MAX_CHARS, 60);
     assert_eq!(limits::PREVIEW_MAX_LINES, 8);
     assert_eq!(limits::PREVIEW_MAX_BYTES, 512);
+    assert_eq!(limits::RULE_LABEL_MAX_CHARS, 120);
+    assert_eq!(limits::RULE_SUGGESTIONS_MAX, 8);
 }
 
 #[test]

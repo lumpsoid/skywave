@@ -171,9 +171,14 @@ ignore `stream_event` entirely and get correct output, only less live.
 - The `assistant` `tool_use` with the same `tool_use_id` comes **before** the
   request.
 - The `description` for Bash is the tool's own description string.
-- `permission_suggestions` can be ignored in the MVP. It holds `addRules`,
-  `addDirectories` and `setMode` entries, which the SDK uses to offer "always
-  allow". **[C]** seen; using them is out of scope.
+- `permission_suggestions` holds `addRules`, `addDirectories` and `setMode`
+  entries, which the SDK uses to offer "always allow". **[C]** seen, e.g.
+  `{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"…"}],"behavior":"allow","destination":"localSettings"}`
+  and `{"type":"addDirectories","directories":["/tmp/x"],"destination":"session"}`.
+  The adapter (`claude_code::rules`) offers the ones that allow more as
+  agent-agnostic rule suggestions (label, and scope from `destination`:
+  `session`/`cliArg` → session, `localSettings`/`projectSettings` →
+  project, `userSettings` → user); see §3.2 for granting one.
 - Not every tool call asks. Read-only commands such as `echo` were allowed
   without a prompt (`tool_result_meta.permission_decision.source:"config"`).
   **[C]** Only calls that would need a prompt produce `can_use_tool`.
@@ -187,6 +192,11 @@ ignore `stream_event` entirely and get correct output, only less live.
 
 Pass the original `input` back as `updatedInput`. Omitting `updatedInput` was
 not tested, so send it every time. **[U]**
+
+To grant a suggestion with the approval ("always allow"), the response also
+carries it, verbatim, as `"updatedPermissions":[<suggestion>]`; the CLI then
+keeps the rule at the suggestion's `destination`. **[U]** shape from the SDK's
+`PermissionResult`; not recorded.
 Result: the tool runs, `tool_result` follows, and
 `tool_result_meta[].permission_decision` is `{"decision":"accept","source":"user_temporary"}`.
 
@@ -403,7 +413,8 @@ output when a field is missing.
 ## 7. Not covered (out of MVP scope or not needed by T09)
 
 - Images and attachments in `user.content`
-- `permission_suggestions` and "always allow"
+- removing rules granted with "always allow" (they live in the CLI's
+  settings, out of Skywave's sight)
 - hooks over the control channel
 - `set_permission_mode`
 - MCP over stdio

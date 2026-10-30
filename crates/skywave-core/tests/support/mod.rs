@@ -539,11 +539,13 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     CommandKind::ResolveApproval {
                         id: approval,
                         decision,
+                        rule: None,
                     },
                     EventKind::ApprovalResolved {
                         id: resolved,
                         decision: logged,
                         by,
+                        rule: None,
                     },
                 ) => {
                     assert_eq!((resolved, logged, by), (approval, decision, &device));
@@ -627,6 +629,7 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                             decision,
                             by,
                             by_me: false,
+                            rule: None,
                         },
                     },
                     Entry::Renamed { name, by, .. } => Entry::Renamed {
