@@ -7,13 +7,14 @@
 //! `tests/support/fake-claude.sh`, a stand-in that replies only to what it
 //! reads, so they are deterministic.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{Decision, SessionId};
 use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
+use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
@@ -50,13 +51,29 @@ fn normalized(message: &Value) -> Value {
 /// Replays fixture `name` through a fresh protocol for CLI session
 /// `session_id` and returns the events it reported. The `n`th recorded stdin
 /// line (0-based) must be what the protocol writes for the matching request,
-/// except those listed in `dropped`, for which it must write nothing.
+/// except those listed in `dropped`, for which it must write nothing. A
+/// recorded allow that grants a rule is answered by granting the offered
+/// rule that is its `updatedPermissions`. The CLI must be the pinned version.
 fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec<AdapterEvent> {
+    let (events, version) = replay_any_version(name, session_id, resumed, dropped);
+    assert_eq!(version.as_deref(), Some(PINNED_VERSION));
+    events
+}
+
+/// [`replay`] for a CLI of any version; returns the version it reported.
+fn replay_any_version(
+    name: &str,
+    session_id: Uuid,
+    resumed: bool,
+    dropped: &[usize],
+) -> (Vec<AdapterEvent>, Option<String>) {
     let mut protocol = Protocol::new(session_id, resumed);
     let start = protocol.start();
     let mut events = start.events;
     let mut written: VecDeque<Value> = start.writes.into();
     let mut n_in = 0;
+    // The `permission_suggestions` of each recorded `can_use_tool`, by id.
+    let mut offers: HashMap<String, Value> = HashMap::new();
     for record in fixture(name) {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
@@ -77,7 +94,8 @@ fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec
                             _ => Decision::Deny,
                         };
                         let request = response["request_id"].as_str().unwrap();
-                        protocol.answer(&AgentRequestId::from(request), decision, None)
+                        let rule = granted_rule(&offers, request, &response["response"]);
+                        protocol.answer(&AgentRequestId::from(request), decision, rule)
                     }
                     other => panic!("{name}: unexpected stdin record {other:?}"),
                 };
@@ -97,6 +115,12 @@ fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec
                 n_in += 1;
             }
             "out" => {
+                if msg["request"]["subtype"] == "can_use_tool" {
+                    offers.insert(
+                        msg["request_id"].as_str().unwrap().to_owned(),
+                        msg["request"]["permission_suggestions"].clone(),
+                    );
+                }
                 let line = serde_json::to_string(msg).unwrap();
                 let out = protocol.on_line(&line);
                 assert!(
@@ -111,8 +135,22 @@ fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec
     }
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
-    assert_eq!(protocol.version(), Some(PINNED_VERSION));
-    events
+    (events, protocol.version().map(str::to_owned))
+}
+
+/// The rule a recorded allow `response` to request `request` grants: the
+/// index, among the rules the request offered, of its `updatedPermissions`.
+fn granted_rule(offers: &HashMap<String, Value>, request: &str, response: &Value) -> Option<u8> {
+    let granted = response.get("updatedPermissions")?;
+    let [update] = granted.as_array().map(Vec::as_slice).unwrap_or_default() else {
+        panic!("request {request}: expected one granted update, got {granted}");
+    };
+    let offered = rules::offered(offers.get(request));
+    let index = offered
+        .iter()
+        .position(|(_, u)| u == update)
+        .unwrap_or_else(|| panic!("request {request}: {update} was not offered"));
+    Some(u8::try_from(index).unwrap())
 }
 
 /// One line per event, cut short, for readable expectations.
@@ -503,6 +541,87 @@ fn a_rule_the_request_did_not_offer_or_a_denial_grants_nothing() {
             protocol::DENY_MESSAGE
         )]
     );
+}
+
+/// The fixture `rules_granted.ndjson` is to be recorded with the runbook in
+/// docs/agents/claude-code.md §3.5: one CLI process in which a tool rule
+/// (`addRules`), a directory (`addDirectories`) and file edits (`setMode`
+/// `acceptEdits`) are each granted with an approval, each followed by a
+/// call of the same tool that the grant covers.
+#[test]
+#[ignore = "needs real capture, task d29758"]
+fn replay_granted_rules_are_applied_by_the_cli() {
+    const NAME: &str = "rules_granted";
+    let records = fixture(NAME);
+    let argv: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["text"].as_str()?.strip_prefix("argv: "))
+        .collect();
+    let [argv] = argv[..] else {
+        panic!("{NAME}: expected one CLI process, got {argv:?}");
+    };
+    let session = argv
+        .split(' ')
+        .skip_while(|a| *a != "--session-id")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{NAME}: no --session-id in {argv}"));
+
+    // (a) Every stdin line is what the adapter writes, a rule grant
+    // included: the update offered, unchanged, as `updatedPermissions`.
+    let (events, version) = replay_any_version(NAME, uuid(session), false, &[]);
+    assert!(version.is_some(), "{NAME}: no claude_code_version");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ApprovalRequested { suggestions, .. } if !suggestions.is_empty()))
+    );
+
+    let requests: HashMap<&str, &Value> = records
+        .iter()
+        .filter(|r| r["dir"] == "out" && r["msg"]["request"]["subtype"] == "can_use_tool")
+        .map(|r| {
+            (
+                r["msg"]["request_id"].as_str().unwrap(),
+                &r["msg"]["request"],
+            )
+        })
+        .collect();
+    let mut kinds = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let response = &record["msg"]["response"];
+        let Some(granted) = response["response"].get("updatedPermissions") else {
+            continue;
+        };
+        let request = requests[response["request_id"].as_str().unwrap()];
+        let update = &granted[0];
+        assert!(
+            request["permission_suggestions"]
+                .as_array()
+                .unwrap()
+                .contains(update),
+            "{NAME}: {update} is not one of the request's suggestions"
+        );
+        kinds.push(match update["type"].as_str().unwrap() {
+            "setMode" => format!("setMode {}", update["mode"].as_str().unwrap()),
+            other => other.to_owned(),
+        });
+
+        // (b) The next call of the same tool runs without a prompt.
+        let tool = request["tool_name"].as_str().unwrap();
+        let next = records[at + 1..]
+            .iter()
+            .filter(|r| r["dir"] == "out" && r["msg"]["type"] == "assistant")
+            .flat_map(|r| r["msg"]["message"]["content"].as_array().unwrap())
+            .find(|c| c["type"] == "tool_use" && c["name"] == tool)
+            .unwrap_or_else(|| panic!("{NAME}: no {tool} call after granting {update}"));
+        assert!(
+            !requests.values().any(|r| r["tool_use_id"] == next["id"]),
+            "{NAME}: {tool} call {} asked again after granting {update}",
+            next["id"]
+        );
+    }
+    kinds.sort();
+    assert_eq!(kinds, ["addDirectories", "addRules", "setMode acceptEdits"]);
 }
 
 #[test]
