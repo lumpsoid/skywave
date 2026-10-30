@@ -10,6 +10,9 @@ plugins {
 android {
     namespace = "dev.skywave.android"
     compileSdk = 37
+    // The NDK cargo-ndk builds the Rust core with (see "Rust core" below).
+    // Pinned to one already in the SDK so AGP never downloads one.
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "dev.skywave.android"
@@ -82,13 +85,33 @@ dependencies {
 val repoRoot: Directory = rootProject.layout.projectDirectory.dir("..")
 val ffiCrate: Directory = repoRoot.dir("crates/skywave-core-ffi")
 
-// Optional `skywave.cargo=/path/to/cargo` in local.properties; otherwise
-// `cargo` is taken from PATH.
-val cargoOverride: Provider<String> =
+/** A non-empty value from local.properties, if the file and key exist. */
+fun localProperty(key: String): Provider<String> =
     providers.fileContents(rootProject.layout.projectDirectory.file("local.properties"))
         .asText
-        .map { text -> Properties().apply { load(text.reader()) }.getProperty("skywave.cargo") ?: "" }
-        .orElse("")
+        .map { text -> Properties().apply { load(text.reader()) }.getProperty(key).orEmpty() }
+        .filter { it.isNotEmpty() }
+
+// Optional `skywave.cargo=/path/to/cargo` in local.properties; otherwise
+// `cargo` is taken from PATH.
+val cargoOverride: Provider<String> = localProperty("skywave.cargo").orElse("")
+
+// The NDK handed to cargo-ndk as ANDROID_NDK_HOME, first match wins:
+//   1. ANDROID_NDK_HOME in the environment
+//   2. `skywave.ndk=/path/to/ndk` in local.properties
+//   3. the SDK's NDK matching `android.ndkVersion` (AGP finds it via sdk.dir)
+// So no NDK environment variable is needed, e.g. when Android Studio is
+// started from a desktop entry. AGP is only asked when 1 and 2 are unset, so
+// an override works even if the pinned NDK is not installed. (Not `ndk.dir`:
+// AGP reads that key itself and rejects one that disagrees with ndkVersion.)
+val ndkEnv: Provider<String> = providers.environmentVariable("ANDROID_NDK_HOME")
+val ndkLocal: Provider<String> = localProperty("skywave.ndk")
+val ndkSdk: Provider<Directory> = androidComponents.sdkComponents.ndkDirectory
+val ndkDir: Provider<String> = providers.provider {
+    ndkEnv.orNull?.takeIf { it.isNotEmpty() }
+        ?: ndkLocal.orNull
+        ?: ndkSdk.get().asFile.absolutePath
+}
 
 val rustInputs: FileTree =
     fileTree(repoRoot.dir("crates")) {
@@ -115,7 +138,10 @@ abstract class RustScriptTask @Inject constructor(
     @get:Input
     abstract val cargo: Property<String>
 
-    /** The NDK cargo-ndk picks up; tracked so switching NDKs rebuilds. */
+    /**
+     * The NDK passed to the script as ANDROID_NDK_HOME (unset for scripts that
+     * need none). Tracked by path so switching NDKs rebuilds.
+     */
     @get:Input
     @get:Optional
     abstract val ndkHome: Property<String>
@@ -128,8 +154,11 @@ abstract class RustScriptTask @Inject constructor(
         val out = outputDir.get().asFile
         out.deleteRecursively()
         out.mkdirs()
+        val ndk = ndkHome.orNull
+        if (ndk != null) logger.lifecycle("Using NDK $ndk")
         execOps.exec {
             commandLine("sh", script.get().asFile.absolutePath, out.absolutePath, profile.get())
+            if (ndk != null) environment("ANDROID_NDK_HOME", ndk)
             val cargoPath = cargo.get()
             if (cargoPath.isNotEmpty()) {
                 val dir = File(cargoPath).absoluteFile.parent
@@ -153,7 +182,7 @@ androidComponents {
             profile.set(nativeProfile)
             rustSources.from(rustInputs)
             cargo.set(cargoOverride)
-            ndkHome.set(providers.environmentVariable("ANDROID_NDK_HOME"))
+            ndkHome.set(ndkDir)
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(cargoBuild, RustScriptTask::outputDir)
 
