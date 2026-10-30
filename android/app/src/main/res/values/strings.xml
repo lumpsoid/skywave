@@ -52,9 +52,25 @@
     <!-- Pairing -->
     <string name="pairing_title">Pair with a server</string>
     <string name="pairing_title_repair">Pair again</string>
-    <string name="pairing_unpaired">Not paired yet</string>
+    <string name="pairing_instructions">Run “skywaved pair” on the server, then scan its QR code or type what it printed.</string>
+    <string name="pairing_scan">Scan QR code</string>
+    <string name="pairing_scan_prompt">Point the camera at the QR code skywaved pair printed</string>
+    <string name="pairing_unreadable">Not a Skywave pairing code: %1$s</string>
+    <string name="pairing_address">Server address</string>
+    <string name="pairing_address_hint">host:port</string>
+    <string name="pairing_code">Pairing code</string>
+    <string name="pairing_code_hint">XXXXX-XXXXX</string>
+    <string name="pairing_fingerprint">Server fingerprint</string>
+    <string name="pairing_fingerprint_hint">AB:CD:EF:…</string>
+    <string name="pairing_check_fingerprint">Check that the fingerprint matches the one skywaved pair printed, then tap Pair.</string>
+    <string name="pairing_pair">Pair</string>
     <string name="pairing_paired">Paired as %1$s</string>
     <string name="pairing_paired_with">Paired as %1$s with %2$s</string>
+    <string name="pairing_replaces_data">Pairing with a different server deletes the sessions stored on this device and replaces them with that server\'s.</string>
+    <string name="pairing_confirm_title">Pair with another server?</string>
+    <string name="pairing_confirm_body">If %1$s is not the server this device is paired with now, the sessions stored on this device are deleted.</string>
+    <string name="pairing_confirm_pair">Pair</string>
+    <string name="pairing_confirm_cancel">Cancel</string>
     <string name="pairing_in_progress">Pairing with %1$s…</string>
     <string name="pairing_failed">Pairing with %1$s failed: %2$s</string>
 

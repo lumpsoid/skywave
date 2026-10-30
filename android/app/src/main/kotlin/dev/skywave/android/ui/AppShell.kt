@@ -24,9 +24,12 @@ import dev.skywave.core.Route
 import dev.skywave.core.Screen
 import dev.skywave.core.ViewState
 
-/** [AppShell] fed from [client]: its snapshots, its actions, its failures as snackbars. */
+/**
+ * [AppShell] fed from [client]: its snapshots, its actions, its failures as
+ * snackbars. [pairInbox] carries pairing links opened from outside.
+ */
 @Composable
-fun SkywaveRoot(client: CoreClient) {
+fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox) {
     val state by client.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val resources = LocalResources.current
@@ -35,7 +38,7 @@ fun SkywaveRoot(client: CoreClient) {
         client.messages.collect { snackbar.showSnackbar(it.text(resources)) }
     }
     val dispatch = remember(client) { { action: Action -> client.dispatch(action) } }
-    AppShell(state, dispatch, snackbar)
+    AppShell(state, dispatch, pairInbox, snackbar)
 }
 
 /**
@@ -48,6 +51,7 @@ fun SkywaveRoot(client: CoreClient) {
 fun AppShell(
     state: ViewState,
     dispatch: (Action) -> Unit,
+    pairInbox: PairInbox,
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
     val screen = state.screen
@@ -76,21 +80,26 @@ fun AppShell(
     // navigates away from is the one showing.
     BackHandler(enabled = goBack != null) { goBack?.invoke() }
 
+    // Before the first pairing there is no server to link to, so the link's
+    // state ("Connecting…") would only mislead.
+    val unpaired = screen is Screen.Pairing && screen.view.paired == null
     val chrome = ShellChrome(
         banners = {
-            LinkBanner(
-                link = state.link,
-                queued = state.queued,
-                onRetryNow = { dispatch(Action.RetryNow) },
-                onPairAgain = if (onPairing) null else pairAgain,
-            )
+            if (!unpaired) {
+                LinkBanner(
+                    link = state.link,
+                    queued = state.queued,
+                    onRetryNow = { dispatch(Action.RetryNow) },
+                    onPairAgain = if (onPairing) null else pairAgain,
+                )
+            }
             AttentionBanner(state.attention, onOpenNext = { dispatch(Action.OpenNextApproval) })
         },
         snackbarHost = snackbarHost,
         onUp = goBack,
     )
     when (screen) {
-        is Screen.Pairing -> PairingScreen(screen.view, chrome, dispatch)
+        is Screen.Pairing -> PairingScreen(screen.view, chrome, dispatch, pairInbox)
         is Screen.SessionList -> SessionListScreen(screen.view, chrome, dispatch)
         is Screen.Session -> SessionScreen(screen.view, chrome, dispatch)
         is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch)

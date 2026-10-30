@@ -1,11 +1,13 @@
 package dev.skywave.android.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.tooling.preview.Preview
 import dev.skywave.core.Attention
 import dev.skywave.core.Link
 import dev.skywave.core.LinkRejection
 import dev.skywave.core.ListKind
+import dev.skywave.core.PairedInfo
 import dev.skywave.core.PairingStatus
 import dev.skywave.core.PairingView
 import dev.skywave.core.PendingApprovalRef
@@ -55,6 +57,24 @@ internal object Samples {
 
     val unpaired = Screen.Pairing(PairingView(paired = null, status = PairingStatus.Idle))
 
+    val pairingInProgress =
+        Screen.Pairing(PairingView(paired = null, status = PairingStatus.InProgress(address = "10.0.2.2:7443")))
+
+    val pairingFailed = Screen.Pairing(
+        PairingView(
+            paired = null,
+            status = PairingStatus.Failed(address = "10.0.2.2:7443", reason = "the server's fingerprint does not match"),
+        ),
+    )
+
+    /** Paired already, e.g. after the device was revoked. */
+    val repair = Screen.Pairing(
+        PairingView(
+            paired = PairedInfo(deviceId = "dev-7f3a", serverAddress = "skywave.home.arpa:7443"),
+            status = PairingStatus.Idle,
+        ),
+    )
+
     /** Third attempt, due 4 s after [nowMs], offline for the last 10 minutes. */
     fun reconnecting(nowMs: Long = System.currentTimeMillis()) =
         Link.Reconnecting(attempt = 3u, retryAtMs = nowMs + 4_000, offlineSinceMs = nowMs - 600_000)
@@ -69,12 +89,29 @@ internal object Samples {
 
 @Composable
 private fun ShellPreview(state: ViewState) {
-    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}) }
+    val inbox = remember { PairInbox { PairInput.Unreadable("previews read no links") } }
+    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox) }
 }
 
 @Preview(name = "Connecting")
 @Composable
-private fun ConnectingPreview() = ShellPreview(Samples.state(Link.Connecting, Samples.unpaired))
+private fun ConnectingPreview() = ShellPreview(Samples.state(Link.Connecting))
+
+@Preview(name = "Pairing")
+@Composable
+private fun PairingIdlePreview() = ShellPreview(Samples.state(Link.Connecting, Samples.unpaired))
+
+@Preview(name = "Pairing in progress")
+@Composable
+private fun PairingInProgressPreview() = ShellPreview(Samples.state(Link.Connecting, Samples.pairingInProgress))
+
+@Preview(name = "Pairing failed")
+@Composable
+private fun PairingFailedPreview() = ShellPreview(Samples.state(Link.Connecting, Samples.pairingFailed))
+
+@Preview(name = "Pair again")
+@Composable
+private fun RepairPreview() = ShellPreview(Samples.state(Link.Online(latencyMs = 42u), Samples.repair))
 
 @Preview(name = "Online")
 @Composable
@@ -95,7 +132,7 @@ private fun RevokedPreview() = ShellPreview(Samples.state(Link.Rejected(LinkReje
 @Preview(name = "Rejected: revoked, on pairing")
 @Composable
 private fun RevokedOnPairingPreview() =
-    ShellPreview(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.unpaired))
+    ShellPreview(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.repair))
 
 @Preview(name = "Rejected: protocol mismatch")
 @Composable
