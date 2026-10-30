@@ -93,8 +93,12 @@ pub fn banner_text(link: &Link, queued: usize, link_age: Duration) -> String {
             let retry = if left.is_zero() {
                 "retrying…".to_owned()
             } else {
-                // Round up: "retry in 1s" until the retry actually happens.
-                format!("retry in {}s", left.as_millis().div_ceil(1000))
+                // Round up: "retry in 01s" until the retry actually happens. Two
+                // digits (the cap is 30s) keep the banner from shifting.
+                format!(
+                    "retry in {:02}s · Ctrl-R now",
+                    left.as_millis().div_ceil(1000)
+                )
             };
             format!("offline{queued_part} · {retry} (attempt {attempt})")
         }
@@ -416,6 +420,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         key("F1 / ?", "toggle this help (? only outside text fields)"),
         key("q", "quit (outside text fields)"),
         key("Ctrl-C", "quit"),
+        key("Ctrl-R", "retry now while offline"),
         Line::from(""),
     ];
     if app.revoked_screen() {

@@ -579,6 +579,9 @@ impl App {
             self.ui.help = true;
             return None;
         }
+        if ctrl && key.code == KeyCode::Char('r') {
+            return Some(Action::RetryNow);
+        }
         if self.revoked_screen() {
             return match key.code {
                 KeyCode::Char('p') | KeyCode::Enter => Some(Action::Navigate(Route::Pairing)),

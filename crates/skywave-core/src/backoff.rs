@@ -23,6 +23,11 @@ impl Backoff {
     /// The spec's ceiling for any reconnect delay (§7).
     pub const MAX: Duration = Duration::from_secs(30);
 
+    /// The shortest wait a manual retry (`RetryNow`) may cut a delay down
+    /// to, counted from the failure: a held retry key reconnects about once
+    /// a second, not once per key repeat.
+    pub const RETRY_NOW_MIN: Duration = Duration::from_secs(1);
+
     /// The delay before reconnect attempt `attempt` (1 for the first
     /// retry): `min(cap, base · 2^(attempt-1))`, scaled by a jitter factor
     /// in `[0.5, 1]`.
