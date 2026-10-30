@@ -397,7 +397,7 @@ fn footer_hint(app: &App) -> &'static str {
         }
         Screen::Session(_) => match app.session().map(|(_, ui)| ui.focus) {
             Some(Focus::Timeline) => {
-                "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · Tab write · Esc back · ? help"
+                "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
             }
             _ => {
                 "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
@@ -457,6 +457,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("[working]", "agent busy with a turn"),
             key("[approval]", "agent blocked on an approval"),
             key("[error]", "agent reported an error"),
+            key("[stopped]", "agent stopped; a message restarts it"),
             key("! N pending", "approvals waiting for an answer"),
         ]),
         Screen::Session(_) => {
@@ -476,6 +477,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("Enter / Space", "expand it; downloads its blob if needed"),
                     key("d", "download the selected blob"),
                     key("a / x", "approve / deny the pending approval"),
+                    key("S", "stop the agent; a message restarts it"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("i", "write a message"),
                     key("Esc", "back to sessions"),
@@ -525,6 +527,7 @@ pub(crate) fn state_badge(state: &SessionState) -> (&'static str, Style) {
         SessionState::AgentWorking => ("working", Style::new().cyan().bold()),
         SessionState::AwaitingApproval(_) => ("approval", Style::new().yellow().bold()),
         SessionState::Errored(_) => ("error", Style::new().red().bold()),
+        SessionState::Stopped => ("stopped", Style::new().dark_gray()),
     }
 }
 

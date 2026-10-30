@@ -15,6 +15,11 @@
 //!   `TurnEnded(Interrupted)` and the mapper cancels leftover approvals and
 //!   appends `SessionStateChanged(Idle)`. An interrupt aimed at an earlier
 //!   turn (that already ended) is ignored, so it can't stop a later one.
+//! - `SessionStopped` → [`AgentSession::interrupt`] if a turn runs, then
+//!   [`AgentSession::shutdown`]. The agent reports `TurnEnded(Interrupted)`
+//!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
+//!   session whose agent is not running is left alone. Like an idle
+//!   shutdown, the next `UserMessage` resumes the agent.
 //!
 //! Everything the agent reports goes through the session's [`EventMapper`].
 //! An agent that exits on its own (crash) is logged by the mapper (`Errored`
@@ -302,6 +307,20 @@ impl<A: AgentAdapter> Supervisor<A> {
                 {
                     tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
                 }
+            }
+            EventKind::SessionStopped => {
+                let Some(running) = self.running.get_mut(&session_id) else {
+                    return Ok(());
+                };
+                // Shutting down mid-turn would log the turn as lost; end it
+                // as interrupted instead.
+                if running.turn_started.is_some()
+                    && let Err(error) = running.session.interrupt().await
+                {
+                    tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
+                }
+                tracing::info!(session = %session_id.0, "stopping agent on request");
+                self.stop_session(session_id, true).await?;
             }
             _ => {}
         }

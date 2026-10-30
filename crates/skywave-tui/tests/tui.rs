@@ -1139,6 +1139,30 @@ fn interrupt_key_and_its_delivery_state() {
 }
 
 #[test]
+fn stop_key_and_its_delivery_state() {
+    let (mut h, id, _) = open_session();
+    // A capital S in the composer is text, not a stop.
+    assert_eq!(h.key(KeyCode::Char('S')), None);
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key(KeyCode::Char('S')),
+        Some(Action::StopSession { session_id: id })
+    );
+    assert_contains(&h.screen(), "stop queued");
+    let command = last_command(&h);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(1) })
+        .unwrap();
+    pull(&mut h, vec![event(id, 1, EventKind::SessionStopped)]);
+    let screen = h.screen();
+    assert_contains(&screen, "stopped · the agent was shut down");
+    assert_contains(&screen, "agent stopped · a message restarts it");
+    assert!(!screen.contains("stop accepted"), "{screen}");
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), "[stopped]");
+}
+
+#[test]
 fn tool_output_expands_through_every_blob_state() {
     let (mut h, id, _) = open_session();
     let (blob_id, output) = blob(10_000);

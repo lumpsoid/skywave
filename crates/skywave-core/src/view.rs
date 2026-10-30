@@ -92,6 +92,8 @@ pub enum SessionState {
     /// Blocked until some device answers this approval (D8).
     AwaitingApproval(ApprovalId),
     Errored(ErrorInfo),
+    /// Idle with its agent shut down on request; the next message starts it.
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +207,9 @@ pub struct SessionView {
     /// This device's latest interrupt of the session, until its effect is in
     /// the replica.
     pub interrupt: Option<Outgoing>,
+    /// This device's latest stop of the session, until its effect is in the
+    /// replica.
+    pub stop: Option<Outgoing>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,6 +268,8 @@ pub enum Entry {
     },
     /// The agent's turn was stopped by an interrupt.
     Interrupted,
+    /// The session's agent was shut down on request.
+    Stopped,
     /// The agent reported an error.
     AgentErrored {
         message: String,

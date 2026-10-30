@@ -75,6 +75,7 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
         SessionState::AwaitingApproval(_) => Span::raw("agent waiting for an approval").yellow(),
         SessionState::Errored(info) => Span::raw(format!("agent error: {}", info.message)).red(),
+        SessionState::Stopped => Span::raw("agent stopped · a message restarts it").dark_gray(),
     }];
     if let Some(interrupt) = &session.interrupt {
         spans.push(Span::raw(" · interrupt ").dark_gray());
@@ -82,6 +83,10 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
             outgoing_label(interrupt),
             outgoing_badge(interrupt).1,
         ));
+    }
+    if let Some(stop) = &session.stop {
+        spans.push(Span::raw(" · stop ").dark_gray());
+        spans.push(Span::styled(outgoing_label(stop), outgoing_badge(stop).1));
     }
     if ui.scroll.is_some() {
         spans.push(Span::raw(" · scrolled back, End follows").dark_gray());

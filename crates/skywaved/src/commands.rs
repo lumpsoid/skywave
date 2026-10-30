@@ -7,7 +7,8 @@
 //!   [`SessionId`];
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`;
-//! - `Interrupt` → `TurnInterrupted`.
+//! - `Interrupt` → `TurnInterrupted`;
+//! - `StopSession` → `SessionStopped`.
 //!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
@@ -18,6 +19,12 @@
 //! event by interrupting the agent, cancels approvals the agent abandons
 //! with [`EventLog::cancel_approval`], and appends
 //! `SessionStateChanged(Idle)` once the agent has stopped.
+//!
+//! **StopSession.** Accepted for any known session: whether its agent runs
+//! is the supervisor's business, not the log's, and stopping an agent that
+//! is not running does nothing. The supervisor reacts to `SessionStopped` by
+//! shutting the agent down (interrupting a running turn first); what the
+//! agent still reports, such as `TurnEnded(Interrupted)`, is logged as usual.
 
 use std::path::{Path, PathBuf};
 
@@ -126,6 +133,12 @@ impl EventLog {
                     Some(_) => {}
                 }
                 (*session_id, EventKind::TurnInterrupted)
+            }
+            CommandKind::StopSession { session_id } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                (*session_id, EventKind::SessionStopped)
             }
         };
         Ok(Ok(event_log::append_in(tx, session_id, &kind)?))

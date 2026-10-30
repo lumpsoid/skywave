@@ -28,6 +28,10 @@ pub enum Action {
     Interrupt {
         session_id: SessionId,
     },
+    /// Shut down the session's agent; the next message starts it again.
+    StopSession {
+        session_id: SessionId,
+    },
     OpenSession(SessionId),
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),

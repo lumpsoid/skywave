@@ -13,7 +13,8 @@
 //! - the agent supervisor (T10) appends agent events with
 //!   [`EventLog::append`] and [`EventLog::cancel_approval`]. It learns about
 //!   new commands from the log itself: every accepted command is an event
-//!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionCreated`),
+//!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
+//!   `SessionCreated`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -155,7 +156,8 @@ impl EventLog {
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
-            | EventKind::TurnInterrupted => {
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -316,10 +318,12 @@ pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKi
                 params![id.0.to_string(), sql_seq],
             )?;
         }
+        // A stopped turn ends with the state change the agent reports.
         EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
         | EventKind::ToolCall { .. }
-        | EventKind::ToolResult { .. } => {}
+        | EventKind::ToolResult { .. }
+        | EventKind::SessionStopped => {}
     }
     Ok(seq)
 }
@@ -374,6 +378,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ApprovalResolved { .. } => "ApprovalResolved",
         EventKind::ApprovalCancelled { .. } => "ApprovalCancelled",
         EventKind::TurnInterrupted => "TurnInterrupted",
+        EventKind::SessionStopped => "SessionStopped",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
     }
 }

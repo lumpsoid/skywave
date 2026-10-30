@@ -103,6 +103,15 @@ impl Fixture {
         )
     }
 
+    fn stop(&mut self) -> CommandResult {
+        self.handle(
+            DeviceId::new(),
+            CommandKind::StopSession {
+                session_id: self.session_id,
+            },
+        )
+    }
+
     /// The session's log after `SessionCreated`.
     fn kinds(&self) -> Vec<EventKind> {
         self.log
@@ -572,6 +581,84 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
             message("two"),
             FakeInput::Shutdown,
         ]
+    );
+}
+
+#[tokio::test]
+async fn stop_mid_turn_interrupts_shuts_down_and_resumes() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(approval_script());
+    let supervisor = f.start(&agent).await;
+
+    f.send("write notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    let id = f.approval_id();
+    accepted(f.stop());
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+
+    // Interrupted, not lost: no `Errored`.
+    let tail = &kinds[kinds.len() - 3..];
+    assert_eq!(
+        tail,
+        [
+            EventKind::SessionStopped,
+            EventKind::ApprovalCancelled {
+                id,
+                reason: INTERRUPT_REASON.into()
+            },
+            state(SessionState::Idle),
+        ]
+    );
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+
+    f.send("again");
+    let kinds = f.wait_count("second idle", 2, is_idle).await;
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        text: "echo: again".into()
+    }));
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started { resumed: false },
+            message("write notes"),
+            FakeInput::Interrupt,
+            FakeInput::Shutdown,
+            FakeInput::Started { resumed: true },
+            message("again"),
+            FakeInput::Shutdown,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stop_without_a_running_agent_does_nothing() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+
+    accepted(f.stop());
+    f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started { resumed: false },
+            message("one"),
+            FakeInput::Shutdown,
+        ]
+    );
+    assert_eq!(
+        f.handle(
+            DeviceId::new(),
+            CommandKind::StopSession {
+                session_id: SessionId::new()
+            }
+        ),
+        CommandResult::Rejected {
+            reason: RejectReason::UnknownSession
+        }
     );
 }
 

@@ -25,6 +25,8 @@ pub struct SessionSummary {
     pub last_activity: DateTime<Utc>,
     /// Seq of the session's newest event.
     pub last_seq: Seq,
+    /// The agent was stopped on request and no message has come since.
+    pub stopped: bool,
 }
 
 impl SessionSummary {
@@ -37,6 +39,7 @@ impl SessionSummary {
             pending_approvals: Vec::new(),
             last_activity: event.at,
             last_seq: seq,
+            stopped: false,
         };
         summary.apply(seq, event);
         summary
@@ -58,8 +61,10 @@ impl SessionSummary {
             EventKind::ApprovalResolved { id, .. } | EventKind::ApprovalCancelled { id, .. } => {
                 self.pending_approvals.retain(|pending| pending != id);
             }
-            EventKind::UserMessage { .. }
-            | EventKind::AgentMessage { .. }
+            // The next message starts the agent again.
+            EventKind::UserMessage { .. } => self.stopped = false,
+            EventKind::SessionStopped => self.stopped = true,
+            EventKind::AgentMessage { .. }
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
             | EventKind::TurnInterrupted => {}
@@ -88,6 +93,7 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ApprovalResolved { .. }
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
+        | EventKind::SessionStopped
         | EventKind::SessionStateChanged(_) => (None, None),
     };
     first.into_iter().chain(second)
