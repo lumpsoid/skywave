@@ -330,6 +330,9 @@ pub struct Geometry {
     /// Where the search's current match is in its blob's content, if that
     /// line is laid out: the match's item, and the line of the timeline.
     pub matched: Option<(ItemKey, usize)>,
+    /// The item `v` was revealing when this frame was laid out
+    /// ([`SessionUi::reveal`]), so its height here is the expanded one.
+    pub reveal: Option<ItemKey>,
 }
 
 impl Geometry {
@@ -361,6 +364,12 @@ impl Geometry {
     pub fn match_scroll(&self, key: ItemKey) -> Option<Option<Anchor>> {
         let (_, line) = self.matched.filter(|(on, _)| *on == key)?;
         Some(self.pin(line.saturating_sub(self.height / 3)))
+    }
+
+    /// `scroll`, or following when the line it pins is on screen at the
+    /// bottom anyway.
+    pub fn follow_at_bottom(&self, scroll: Option<Anchor>) -> Option<Anchor> {
+        scroll.filter(|anchor| self.line(*anchor).is_none_or(|line| line < self.bottom()))
     }
 
     /// The line `anchor` stands for, if its item is still there.
@@ -431,6 +440,10 @@ pub struct SessionUi {
     marked: Option<(Seq, Instant)>,
     /// The search through the timeline (`/`), while one is open or kept.
     pub search: Option<Search>,
+    /// The item `v` revealed, scrolled to its top, while that waits for a
+    /// frame to lay it out expanded: if it then fits at the bottom, the
+    /// timeline keeps following ([`Geometry::follow_at_bottom`]).
+    pub reveal: Option<ItemKey>,
     /// The list of rules `A` opened in the approval prompt; see
     /// [`SessionUi::rule_pick`].
     rule_pick: Option<RulePick>,
@@ -631,6 +644,7 @@ impl SessionUi {
             opening: view.unread_from.is_some(),
             marked: None,
             search: None,
+            reveal: None,
             rule_pick: None,
         }
     }
@@ -711,7 +725,19 @@ impl SessionUi {
         if self.opening {
             self.geometry.borrow().opening()
         } else {
-            self.pinned_scroll().unwrap_or(self.scroll)
+            self.pinned_scroll()
+                .unwrap_or_else(|| self.revealed_scroll())
+        }
+    }
+
+    /// The scroll state, settled to following if the last frame laid out
+    /// the item `v` revealed and it fits at the bottom.
+    fn revealed_scroll(&self) -> Option<Anchor> {
+        let geometry = self.geometry.borrow();
+        if self.reveal.is_some() && geometry.reveal == self.reveal {
+            geometry.follow_at_bottom(self.scroll)
+        } else {
+            self.scroll
         }
     }
 
@@ -740,6 +766,11 @@ impl SessionUi {
             if let Some(search) = &mut self.search {
                 search.pin = false;
             }
+        }
+        if self.reveal.is_some() && self.geometry.borrow().reveal == self.reveal {
+            self.scroll = self.revealed_scroll();
+            self.reveal = None;
+            self.geometry.borrow_mut().reveal = None;
         }
     }
 
@@ -1605,6 +1636,8 @@ impl App {
         let session = self.ui.session.as_mut()?;
         // Keys move from where the opening scrolled to.
         session.settle();
+        // Not laid out yet: the revealed item stays at the top.
+        session.reveal = None;
         if let Some(search) = &mut session.search {
             search.wrapped = false;
             if search.editing {
@@ -1968,7 +2001,8 @@ impl SessionUi {
     }
 
     /// Selects and expands the item the pending approval gates and scrolls
-    /// its top into view. Downloads nothing: what is not here says so.
+    /// its top into view; if it then fits at the bottom, the timeline keeps
+    /// following. Downloads nothing: what is not here says so.
     fn reveal_gated(&mut self, view: &SessionView) {
         let Some((_, item)) = gated_item(view) else {
             return;
@@ -1984,6 +2018,7 @@ impl SessionUi {
             key: ItemKey::of(item),
             offset: 0,
         });
+        self.reveal = Some(ItemKey::of(item));
     }
 
     /// Opens an empty search prompt; `n`/`N` then work on the timeline.

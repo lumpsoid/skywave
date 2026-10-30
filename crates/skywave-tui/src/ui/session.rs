@@ -210,10 +210,12 @@ fn render_timeline(
         top: ui.geometry.borrow().top,
         rule,
         matched,
+        reveal: ui.reveal,
     };
     // While the opening is not settled, show the scroll state it will
     // settle on, from this frame's layout; likewise the one that shows a
-    // search match in a blob, while that waits.
+    // search match in a blob, while that waits; and following, while the
+    // item `v` revealed waits, if it fits at the bottom.
     let pinned = ui
         .search
         .as_ref()
@@ -221,6 +223,8 @@ fn render_timeline(
         .and_then(|search| geometry.match_scroll(search.current?));
     let scroll = if ui.opening {
         geometry.opening()
+    } else if ui.reveal.is_some() {
+        pinned.unwrap_or(geometry.follow_at_bottom(ui.scroll))
     } else {
         pinned.unwrap_or(ui.scroll)
     };
