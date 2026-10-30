@@ -1120,7 +1120,7 @@ fn spans_width(spans: &[Span]) -> usize {
 
 /// `content` in rows of at most `width` columns, each after its prefix:
 /// `first` on the first row, `rest` on the others.
-fn wrap(
+pub(super) fn wrap(
     first: Vec<Span<'static>>,
     rest: Vec<Span<'static>>,
     content: Vec<Span<'static>>,

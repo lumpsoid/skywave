@@ -2,8 +2,9 @@
 //! the wall clock) is passed in so the retry countdown and running tools'
 //! clocks render deterministically. The only state written is the timeline
 //! geometry the session view records for paging
-//! ([`Geometry`](crate::app::Geometry)); the only I/O is reading downloaded
-//! blobs to show them.
+//! ([`Geometry`](crate::app::Geometry)) and how far the help overlay can
+//! scroll ([`UiState::help_end`](crate::app::UiState::help_end)); the only
+//! I/O is reading downloaded blobs to show them.
 
 mod session;
 mod timeline;
@@ -647,7 +648,10 @@ fn footer_keys(app: &App) -> &'static str {
 /// Every key binding, grouped by where it applies.
 fn help_lines(app: &App) -> Vec<Line<'static>> {
     let section = |title: &'static str| Line::from(title).bold();
-    let key = |keys: &'static str, what: &'static str| Line::from(format!("  {keys:<14}{what}"));
+    // Two spans, so a long description wraps under itself ([`fit`]).
+    let key = |keys: &'static str, what: &'static str| {
+        Line::from(vec![Span::raw(format!("  {keys:<14}")), Span::raw(what)])
+    };
     let mut lines = vec![
         section("Everywhere"),
         key("F1 / ?", "toggle this help (? only outside text fields)"),
@@ -823,20 +827,73 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// Widest the help overlay gets, borders included.
+const HELP_WIDTH: u16 = 62;
+
+/// The help overlay, centred. Long lines wrap; when the lines do not all
+/// fit, it scrolls from [`UiState::help_top`](crate::app::UiState::help_top)
+/// and its bottom border says which way there is more.
 fn render_help(frame: &mut Frame, app: &App) {
-    let lines = help_lines(app);
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let width = HELP_WIDTH.min(frame.area().width);
+    let lines: Vec<Line> = help_lines(app)
+        .into_iter()
+        .flat_map(|line| fit(line, usize::from(width.saturating_sub(2))))
+        .collect();
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(frame.area().height);
     let [area] = Layout::vertical([Constraint::Length(height)])
         .flex(Flex::Center)
         .areas(frame.area());
-    let [area] = Layout::horizontal([Constraint::Length(62)])
+    let [area] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
+    let end = lines
+        .len()
+        .saturating_sub(usize::from(height.saturating_sub(2)));
+    app.ui().help_end.set(end);
+    let top = app.ui().help_top.min(end);
+    let more = match (top > 0, top < end) {
+        (false, false) => None,
+        (false, true) => Some(" ↓ more below · j/k scroll "),
+        (true, true) => Some(" ↑↓ more above and below · j/k scroll "),
+        (true, false) => Some(" ↑ more above · j/k scroll "),
+    };
+    let mut block = Block::bordered().title(" Keys ");
+    if let Some(more) = more {
+        block = block.title_bottom(Line::from(more).right_aligned());
+    }
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Keys ")),
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
         area,
     );
+}
+
+/// `line` in rows of at most `width` columns: a key's description wraps
+/// under itself, other text under its own indent.
+fn fit(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if line.width() <= width {
+        return vec![line];
+    }
+    let style = line.style;
+    let mut spans = line.spans;
+    let (first, rest) = if spans.len() > 1 {
+        let head = spans.remove(0);
+        let hang = Span::raw(" ".repeat(head.width()));
+        (vec![head], vec![hang])
+    } else {
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let indent = text.len() - text.trim_start_matches(' ').len();
+        (Vec::new(), vec![Span::raw(" ".repeat(indent))])
+    };
+    timeline::wrap(first, rest, spans, width)
+        .into_iter()
+        .map(|row| row.style(style))
+        .collect()
 }
 
 /// Short text and colour for a session state; the text alone tells them
