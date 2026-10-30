@@ -10,14 +10,16 @@ use chrono::{DateTime, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, DeviceId,
     FailReason, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam, Seq,
     SessionId, ViewState,
 };
 use skywave_proto::{
-    BlobRef, CallId, CommandResult, Event, EventBatch, EventKind, SessionState as LogState,
-    ToolCall, ToolDisplay, ToolKind, ToolResult,
+    BlobRef, Body, BodyFormat, CallId, CommandResult, Event, EventBatch, EventKind,
+    SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
@@ -118,17 +120,19 @@ impl Harness {
     fn screen_at(&self, now: Instant) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| ui::render(frame, &self.app, now))
+            .draw(|frame| ui::render_at(frame, &self.app, now, mockup_now().into()))
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                out.push_str(buffer[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
+        text(terminal.backend().buffer())
+    }
+
+    /// A `width` × `height` frame with the wall clock at `wall`, so running
+    /// calls' clocks are fixed.
+    fn frame(&self, width: u16, height: u16, wall: DateTime<Utc>) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| ui::render_at(frame, &self.app, self.t0, wall.into()))
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     fn screen(&self) -> String {
@@ -156,6 +160,18 @@ fn credentials() -> PairedCredentials {
         device_cert_pem: "CERT".into(),
         ca_cert_pem: "CA".into(),
     }
+}
+
+/// A frame's text, one line per row, trailing blanks kept.
+fn text(buffer: &Buffer) -> String {
+    let mut out = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            out.push_str(buffer[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn assert_contains(screen: &str, needle: &str) {
@@ -845,11 +861,11 @@ fn every_timeline_entry_renders_distinctly() {
     );
     assert_contains(&screen, "12:02 agent: Looking.");
     assert_contains(&screen, "        Second line");
-    assert_contains(&screen, "12:03 ▸ tool shell: {\"command\":\"ls\"}");
-    assert_contains(
-        &screen,
-        "12:04 ▸ result: file-000 [full 9.8 KiB · not downloaded]",
-    );
+    // Standalone (v1) calls and results, in the tool block style.
+    assert_contains(&screen, "12:03 • shell {\"command\":\"ls\"}");
+    assert_contains(&screen, "12:04 ↳ result ");
+    assert_contains(&screen, "        │ file-000 ");
+    assert_contains(&screen, "        │ … full 9.8 KiB · not downloaded ");
     assert_contains(&screen, "12:05 interrupted · the agent stopped its turn");
     assert_contains(&screen, "12:06 agent error: agent crashed");
     assert_contains(&screen, "/srv/work · error");
@@ -953,17 +969,17 @@ fn approval_prompt_answer_and_resolutions() {
                 id: first,
                 call: None,
                 tool: "write".into(),
-                summary: "{\"path\":\"a.txt\"}".into(),
+                summary: "a.txt".into(),
                 input: Some(input),
             },
         )],
     );
     let screen = h.screen();
     assert_contains(&screen, "Approval needed");
-    assert_contains(&screen, "The agent wants to use write");
+    assert_contains(&screen, "│? write a.txt ");
     assert_contains(&screen, "Esc, then a approve · x deny");
-    assert_contains(&screen, "[full 5.9 KiB · not downloaded]");
-    assert_contains(&screen, "approval write [waiting for an answer]");
+    assert_contains(&screen, "full input 5.9 KiB · select it in the timeline");
+    assert_contains(&line_with(&screen, "needs approval"), "12:01 ? write a.txt");
     // In the composer `a` is text.
     assert_eq!(h.key(KeyCode::Char('a')), None);
     h.key(KeyCode::Backspace);
@@ -997,7 +1013,7 @@ fn approval_prompt_answer_and_resolutions() {
     );
     let screen = h.screen();
     assert!(!screen.contains("Approval needed"), "{screen}");
-    assert_contains(&screen, "approval write [approved here]");
+    assert_contains(&line_with(&screen, "? write a.txt"), "approved here");
 
     // Answered on another device: named, and the controls are gone.
     let other = DeviceId::new();
@@ -1016,7 +1032,7 @@ fn approval_prompt_answer_and_resolutions() {
             },
         )],
     );
-    assert_contains(&h.screen(), "The agent wants to use shell");
+    assert_contains(&h.screen(), "│? shell rm -rf build ");
     pull(
         &mut h,
         vec![event(
@@ -1032,8 +1048,8 @@ fn approval_prompt_answer_and_resolutions() {
     let screen = h.screen();
     assert!(!screen.contains("a approve"), "{screen}");
     assert_contains(
-        &screen,
-        &format!("approval shell [denied on device …{}]", tail(other)),
+        &line_with(&screen, "? shell rm -rf build"),
+        &format!("denied on device …{}", tail(other)),
     );
     assert_eq!(h.key(KeyCode::Char('x')), None, "nothing left to answer");
 
@@ -1063,7 +1079,7 @@ fn approval_prompt_answer_and_resolutions() {
         ],
     );
     let screen = h.screen();
-    assert_contains(&screen, "approval net [cancelled: interrupted]");
+    assert_contains(&line_with(&screen, "? net curl"), "cancelled: interrupted");
     assert!(!screen.contains("Approval needed"));
 }
 
@@ -1158,11 +1174,15 @@ fn tool_output_expands_through_every_blob_state() {
             ),
         ],
     );
-    assert_contains(&h.screen(), "tool shell: line a (+2 lines)");
+    // A v1 call's further summary lines sit under the gutter.
+    let screen = h.screen();
+    assert_contains(&screen, "12:01 • shell line a ");
+    assert_contains(&screen, "        │ line c ");
+    assert_contains(&screen, "        │ … full 9.8 KiB · not downloaded ");
     h.key(KeyCode::Esc);
-    // Selection starts at the newest tool item.
+    // Selection starts at the newest item.
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), "> 12:02 ▸ result: file-000");
+    assert_contains(&h.screen(), "> 12:02 ↳ result");
     assert_eq!(
         h.key(KeyCode::Char('d')),
         Some(Action::DownloadBlob(blob_id))
@@ -1188,8 +1208,11 @@ fn tool_output_expands_through_every_blob_state() {
         .unwrap();
     h.sync();
     let screen = h.screen();
-    assert_contains(&screen, "[downloading 40%]");
-    assert_contains(&screen, "downloading · 4.0 KiB of 9.8 KiB (40%)");
+    assert_contains(&screen, "│ downloading · 4.0 KiB of 9.8 KiB (40%)");
+    // Collapsed, the footer follows the download.
+    h.key(KeyCode::Enter);
+    assert_contains(&h.screen(), "│ … downloading 40%");
+    h.key(KeyCode::Enter);
 
     // Content arrives; invalid UTF-8 and control bytes are shown safely.
     let path = dir.path().join("blob");
@@ -1200,20 +1223,21 @@ fn tool_output_expands_through_every_blob_state() {
         .unwrap();
     h.sync();
     let screen = h.screen();
-    assert_contains(&screen, "▾ result: file-000 [downloaded]");
-    assert_contains(&screen, "          file-000");
-    assert_contains(&screen, "          file-001    x");
-    assert_contains(&screen, "          ��broken");
+    assert_contains(&screen, "        │ file-000 ");
+    assert_contains(&screen, "        │ file-001    x ");
+    assert_contains(&screen, "        │ ��broken ");
+    assert!(!screen.contains("not downloaded"), "{screen}");
     assert_eq!(h.key(KeyCode::Char('d')), None, "already here");
 
-    // Collapse; the inline tool call expands to its whole summary.
+    // Collapse: the preview and that the whole is here.
     h.key(KeyCode::Enter);
-    assert!(!h.screen().contains("file-001"));
+    let screen = h.screen();
+    assert!(!screen.contains("file-001"));
+    assert_contains(&screen, "│ … downloaded ");
+    // A call with nothing behind its summary has nothing to expand.
     h.key(KeyCode::Char('k'));
     assert_eq!(h.key(KeyCode::Char(' ')), None);
-    let screen = h.screen();
-    assert_contains(&screen, "▾ tool shell: line a");
-    assert_contains(&screen, "          line c");
+    assert_contains(&h.screen(), "        │ line c ");
 }
 
 #[test]
@@ -1348,16 +1372,23 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
         }),
     ));
     pull(&mut h, events);
-    assert!(!h.screen().contains("tool early"));
+    assert!(!h.screen().contains("early first"));
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), "> 12:03 ▸ tool late");
-    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:03 • late second");
+    // Agent messages are selectable too: 40 of them in between.
+    for _ in 0..41 {
+        h.key(KeyCode::Up);
+    }
     let screen = h.screen();
-    assert_contains(&screen, "> 12:01 ▸ tool early");
-    assert!(!screen.contains("tool late"));
+    assert_contains(&screen, "> 12:01 • early first");
+    assert!(!screen.contains("late second"));
     h.key(KeyCode::Down);
-    assert_contains(&h.screen(), "> 12:03 ▸ tool late");
+    assert_contains(&h.screen(), "> 12:02 agent: chatter 0");
+    for _ in 0..40 {
+        h.key(KeyCode::Down);
+    }
+    assert_contains(&h.screen(), "> 12:03 • late second");
 }
 
 #[test]
@@ -1481,9 +1512,495 @@ fn a_grouped_tool_call_shows_its_approval_and_result() {
         ],
     );
     let screen = h.screen();
-    assert_contains(&screen, "12:01 ▸ tool Write: a.txt");
-    assert_contains(&screen, "approval Write [approved here]");
-    assert_contains(&screen, "result: wrote 1 line");
+    assert_contains(
+        &line_with(&screen, "12:01 ✎ Write a.txt"),
+        "created · approved here · 3m00s",
+    );
+    assert_contains(&screen, "        │ wrote 1 line ");
     assert!(!screen.contains("12:02"), "folded into the call: {screen}");
     assert!(!screen.contains("12:04"), "folded into the call: {screen}");
+}
+
+// ---- the tool timeline mock-up (review "tool timeline redesign") ----------
+
+fn at_s(minute: u32, second: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, second)
+        .unwrap()
+}
+
+fn call(call: CallId, name: &str, kind: ToolKind, title: &str) -> ToolCall {
+    ToolCall {
+        call: Some(call),
+        name: name.into(),
+        display: ToolDisplay {
+            kind,
+            title: title.into(),
+            detail: None,
+            body: None,
+        },
+        input: None,
+    }
+}
+
+fn body(format: BodyFormat, text: &str) -> Option<Body> {
+    Some(Body {
+        format,
+        preview: text.into(),
+        lines: text.lines().count() as u32,
+        full: None,
+    })
+}
+
+/// A linked result; `lines` counts the preview's, as when it holds all.
+fn result(call: CallId, is_error: bool, status: &str, preview: &str) -> ToolResult {
+    ToolResult {
+        call: Some(call),
+        is_error,
+        status: (!status.is_empty()).then(|| status.into()),
+        preview: preview.into(),
+        lines: preview.lines().count() as u32,
+        output: None,
+    }
+}
+
+fn user(device: DeviceId, text: &str) -> EventKind {
+    EventKind::UserMessage {
+        command_id: CommandId::new(),
+        device_id: device,
+        text: text.into(),
+    }
+}
+
+fn agent(text: &str) -> EventKind {
+    EventKind::AgentMessage { text: text.into() }
+}
+
+/// What the wall clock reads in the mock-up: 42 s into the running call.
+fn mockup_now() -> DateTime<Utc> {
+    at_s(8, 42)
+}
+
+/// The review's mock-up session: a Write creating a file, a Bash with its
+/// exit status, an Edit with a diff, a failed call, a denied one, a
+/// cancelled one, and a running call beside one waiting for its approval.
+/// Returns the other device, the Write's file blob and the failed call's
+/// output blob.
+fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
+    let (mut h, id, me) = open_session();
+    // Fixed, so the snapshot names it.
+    let other: DeviceId = serde_json::from_str("\"0192c8a0-0000-7000-8000-0000c0ffee42\"").unwrap();
+    let ev = |minute, second, kind| Event {
+        session_id: id,
+        at: at_s(minute, second),
+        kind,
+    };
+    let ids: Vec<CallId> = (0..8).map(|_| CallId::new()).collect();
+    let approvals: Vec<ApprovalId> = (0..5).map(|_| ApprovalId::new()).collect();
+    let (file_blob, file) = blob(400);
+    let (output_blob, output) = blob(2048);
+
+    let mut write = call(ids[0], "Write", ToolKind::FileWrite, "src/bin/hello.rs");
+    write.display.body = Some(Body {
+        format: BodyFormat::Text,
+        preview: "//! Says hello.\n\nuse std::io::Write;\n\nfn main() {\n    let mut out = std::io::stdout();\n    writeln!(out, \"Hello, world!\").unwrap();\n    out.flush().unwrap();\n".into(),
+        lines: 10,
+        full: Some(file),
+    });
+    let mut bash = call(ids[1], "Bash", ToolKind::Shell, "$ cargo run --bin hello");
+    bash.display.detail = Some("Build and run the new binary".into());
+    let mut edit = call(ids[2], "Edit", ToolKind::FileEdit, "src/main.rs");
+    edit.display.body = body(
+        BodyFormat::Diff,
+        " fn main() {\n-    run();\n+    let code = run();\n+    std::process::exit(code);\n }\n",
+    );
+    let failing = call(ids[3], "Bash", ToolKind::Shell, "$ cargo test");
+    let mut denied = call(ids[4], "Bash", ToolKind::Shell, "$ rm -rf target");
+    denied.display.detail = Some("Clean the build directory".into());
+    let cancelled = call(ids[5], "Write", ToolKind::FileWrite, "NOTES.md");
+    let running = call(
+        ids[6],
+        "Bash",
+        ToolKind::Shell,
+        "$ cargo test -- --nocapture",
+    );
+    let mut pending = call(ids[7], "Edit", ToolKind::FileEdit, "src/lib.rs");
+    pending.display.body = body(
+        BodyFormat::Diff,
+        "-    assert_eq!(add(2, 2), 5);\n+    assert_eq!(add(2, 2), 4);\n",
+    );
+    let request = |approval: ApprovalId, call: CallId, tool: &str, summary: &str| {
+        EventKind::ApprovalRequested {
+            id: approval,
+            call: Some(call),
+            tool: tool.into(),
+            summary: summary.into(),
+            input: None,
+        }
+    };
+    let resolve =
+        |approval: ApprovalId, decision: Decision, by: DeviceId| EventKind::ApprovalResolved {
+            id: approval,
+            decision,
+            by,
+        };
+
+    pull(
+        &mut h,
+        vec![
+            // Turn 1: a file written, run, edited.
+            ev(1, 0, user(me, "add a hello binary and wire it into main")),
+            ev(1, 2, EventKind::SessionStateChanged(LogState::AgentWorking)),
+            ev(
+                1,
+                5,
+                agent("I'll add the binary, run it, then use it from main."),
+            ),
+            ev(1, 6, EventKind::ToolCall(write)),
+            ev(
+                1,
+                6,
+                request(approvals[0], ids[0], "Write", "src/bin/hello.rs"),
+            ),
+            ev(1, 9, resolve(approvals[0], Decision::Approve, me)),
+            ev(
+                1,
+                9,
+                EventKind::ToolResult(ToolResult {
+                    lines: 1,
+                    ..result(ids[0], false, "created", "")
+                }),
+            ),
+            ev(1, 10, EventKind::ToolCall(bash)),
+            ev(
+                1,
+                13,
+                EventKind::ToolResult(result(
+                    ids[1],
+                    false,
+                    "exit 0",
+                    "   Compiling hello v0.1.0 (/srv/work)\n    Finished `dev` profile in 2.98s\n     Running `target/debug/hello`\nHello, world!\n",
+                )),
+            ),
+            ev(2, 1, EventKind::ToolCall(edit)),
+            ev(2, 1, request(approvals[1], ids[2], "Edit", "src/main.rs")),
+            ev(2, 20, resolve(approvals[1], Decision::Approve, other)),
+            ev(
+                2,
+                21,
+                EventKind::ToolResult(ToolResult {
+                    lines: 1,
+                    ..result(ids[2], false, "updated +2 -1", "")
+                }),
+            ),
+            ev(
+                2,
+                25,
+                agent(
+                    "Done: main now exits with run()'s code. A long reply wraps under its own column instead of falling back to the left edge.",
+                ),
+            ),
+            ev(2, 26, EventKind::SessionStateChanged(LogState::Idle)),
+            // Turn 2: a failure and a denial.
+            ev(4, 0, user(other, "run the tests and clean up")),
+            ev(4, 1, EventKind::SessionStateChanged(LogState::AgentWorking)),
+            ev(4, 2, EventKind::ToolCall(failing)),
+            ev(
+                4,
+                14,
+                EventKind::ToolResult(ToolResult {
+                    lines: 23,
+                    output: Some(output),
+                    ..result(
+                        ids[3],
+                        true,
+                        "exit 101",
+                        "running 3 tests\ntest tests::adds ... FAILED\ntest tests::greets ... ok\n",
+                    )
+                }),
+            ),
+            ev(4, 15, EventKind::ToolCall(denied)),
+            ev(
+                4,
+                15,
+                request(approvals[2], ids[4], "Bash", "$ rm -rf target"),
+            ),
+            ev(4, 30, resolve(approvals[2], Decision::Deny, me)),
+            ev(
+                4,
+                30,
+                EventKind::ToolResult(result(ids[4], true, "denied", "The user denied this call.")),
+            ),
+            ev(4, 32, agent("One test fails; I left target/ alone.")),
+            ev(4, 33, EventKind::SessionStateChanged(LogState::Idle)),
+            // Turn 3: interrupted while an approval waited.
+            ev(6, 0, user(me, "write it up in NOTES.md")),
+            ev(6, 1, EventKind::SessionStateChanged(LogState::AgentWorking)),
+            ev(6, 3, EventKind::ToolCall(cancelled)),
+            ev(6, 3, request(approvals[3], ids[5], "Write", "NOTES.md")),
+            ev(
+                6,
+                9,
+                EventKind::ApprovalCancelled {
+                    id: approvals[3],
+                    reason: "interrupted".into(),
+                },
+            ),
+            ev(6, 9, EventKind::TurnInterrupted),
+            ev(6, 10, EventKind::SessionStateChanged(LogState::Idle)),
+            // Turn 4: still going.
+            ev(8, 0, user(me, "fix the failing test")),
+            ev(8, 0, EventKind::SessionStateChanged(LogState::AgentWorking)),
+            ev(8, 0, EventKind::ToolCall(running)),
+            ev(8, 5, EventKind::ToolCall(pending)),
+            ev(8, 5, request(approvals[4], ids[7], "Edit", "src/lib.rs")),
+        ],
+    );
+    (h, other, file_blob, output_blob)
+}
+
+/// A frame's text without trailing blanks.
+fn trimmed(buffer: &Buffer) -> String {
+    text(buffer)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The foreground colour of the first cell of `needle` in the frame.
+fn colour_of(buffer: &Buffer, needle: &str) -> Color {
+    let screen = text(buffer);
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"));
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    buffer[(x as u16, y as u16)].fg
+}
+
+/// The mock-up at 90 × 58, trailing blanks trimmed.
+const MOCKUP: &str = r#"connecting…
+┌ /srv/work · approval ──────────────────────────────────────────────────────────────────┐
+│agent waiting for an approval                                                           │
+│  12:01 you: add a hello binary and wire it into main                                   │
+│        agent: I'll add the binary, run it, then use it from main.                      │
+│        ✎ Write src/bin/hello.rs                          created · approved here · 3.0s│
+│        │  1 //! Says hello.                                                            │
+│        │  2                                                                            │
+│        │  3 use std::io::Write;                                                        │
+│        │  4                                                                            │
+│        │  5 fn main() {                                                                │
+│        │  6     let mut out = std::io::stdout();                                       │
+│        │  7     writeln!(out, "Hello, world!").unwrap();                               │
+│        │  8     out.flush().unwrap();                                                  │
+│        │ … +2 lines · full 400 B · not downloaded                                      │
+│        ❯ Bash $ cargo run --bin hello                                     exit 0 · 3.0s│
+│          Build and run the new binary                                                  │
+│        │    Compiling hello v0.1.0 (/srv/work)                                         │
+│        │     Finished `dev` profile in 2.98s                                           │
+│        │      Running `target/debug/hello`                                             │
+│        │ Hello, world!                                                                 │
+│  12:02 ± Edit src/main.rs            updated +2 -1 · approved on device …c0ffee42 · 20s│
+│        │  fn main() {                                                                  │
+│        │ -    run();                                                                   │
+│        │ +    let code = run();                                                        │
+│        │ +    std::process::exit(code);                                                │
+│        │  }                                                                            │
+│        agent: Done: main now exits with run()'s code. A long reply wraps under its own │
+│        column instead of falling back to the left edge.                                │
+│────────────────────────────────────────────────────────────────────────────────────────│
+│  12:04 device …c0ffee42: run the tests and clean up                                    │
+│        ❯ Bash $ cargo test                                               exit 101 · 12s│
+│        │ running 3 tests                                                               │
+│        │ test tests::adds ... FAILED                                                   │
+│        │ test tests::greets ... ok                                                     │
+│        │ … +20 lines · full 2.0 KiB · not downloaded                                   │
+│        ❯ Bash $ rm -rf target                                               denied here│
+│          Clean the build directory                                                     │
+│        agent: One test fails; I left target/ alone.                                    │
+│────────────────────────────────────────────────────────────────────────────────────────│
+│  12:06 you: write it up in NOTES.md                                                    │
+│        ✎ Write NOTES.md                                          cancelled: interrupted│
+│        interrupted · the agent stopped its turn                                        │
+│────────────────────────────────────────────────────────────────────────────────────────│
+│  12:08 you: fix the failing test                                                       │
+│        ❯ Bash $ cargo test -- --nocapture                                   running 42s│
+│        ± Edit src/lib.rs                                                 needs approval│
+│        │ -    assert_eq!(add(2, 2), 5);                                                │
+│        │ +    assert_eq!(add(2, 2), 4);                                                │
+│┌ Approval needed ─────────────────────────────────────────────────────────────────────┐│
+││± Edit src/lib.rs                                                                     ││
+││Esc, then a approve · x deny                                                          ││
+│└──────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Message ─────────────────────────────────────────────────────────────────────────────┐│
+││Write to the agent…                                                                   ││
+│└──────────────────────────────────────────────────────────────────────────────────────┘│
+└────────────────────────────────────────────────────────────────────────────────────────┘
+Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"#;
+
+#[test]
+fn tool_timeline_mockup_at_90_columns() {
+    let (h, other, _, _) = mockup();
+    let frame = h.frame(90, 58, mockup_now());
+    let screen = trimmed(&frame);
+    assert_eq!(screen, MOCKUP, "\n{screen}");
+    assert!(screen.contains(&tail(other)));
+
+    // Colour carries the state: glyph, state and gutter alike.
+    for (needle, colour) in [
+        ("✎ Write src/bin/hello.rs", Color::Green),
+        ("created · approved here", Color::Green),
+        ("❯ Bash $ cargo test  ", Color::Red),
+        ("exit 101", Color::Red),
+        ("│ running 3 tests", Color::Red),
+        ("denied here", Color::Magenta),
+        ("cancelled: interrupted", Color::DarkGray),
+        ("running 42s", Color::Cyan),
+        ("needs approval", Color::Yellow),
+    ] {
+        assert_eq!(colour_of(&frame, needle), colour, "{needle}");
+    }
+    // Diffs are red and green by line; the error's output is red.
+    assert_eq!(colour_of(&frame, "+    let code"), Color::Green);
+    assert_eq!(colour_of(&frame, "-    run();"), Color::Red);
+    assert_eq!(colour_of(&frame, "test tests::adds"), Color::Red);
+    assert_eq!(colour_of(&frame, "Hello, world!"), Color::Reset);
+
+    // The approval box names the call; no raw JSON.
+    let start = screen.find("Approval needed").unwrap();
+    let approval = &screen[start..screen.find(" Message ").unwrap()];
+    assert!(approval.contains("± Edit src/lib.rs"), "{approval}");
+    assert!(
+        !approval.contains('{') && !approval.contains('"'),
+        "{approval}"
+    );
+}
+
+#[test]
+fn a_running_call_counts_up() {
+    let (h, _, _, _) = mockup();
+    let later = mockup_now() + chrono::Duration::seconds(83);
+    assert_contains(&trimmed(&h.frame(90, 58, later)), "running 2m05s");
+    assert!(h.app.live(), "the event loop ticks for the clock");
+}
+
+/// From the newest item, `[` goes to the start of its turn, then back a
+/// turn at a time; each lands on the turn's first selectable item with the
+/// turn at the top.
+fn select_the_write(h: &mut Harness) {
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), ">       ± Edit src/lib.rs");
+    h.key(KeyCode::Char('['));
+    assert_contains(&h.screen(), ">       ❯ Bash $ cargo test -- --nocapture");
+    h.key(KeyCode::Char('['));
+    assert_contains(&h.screen(), ">       ✎ Write NOTES.md");
+    h.key(KeyCode::Char('['));
+    h.key(KeyCode::Char('['));
+    let screen = h.screen();
+    assert_contains(&screen, ">       agent: I'll add the binary");
+    assert!(
+        screen
+            .lines()
+            .nth(3)
+            .unwrap()
+            .starts_with("│  12:01 you: add a hello binary"),
+        "the turn is at the top:\n{screen}"
+    );
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), ">       ✎ Write src/bin/hello.rs");
+}
+
+#[test]
+fn turns_step_and_agent_messages_select() {
+    let (mut h, _, _, _) = mockup();
+    select_the_write(&mut h);
+    h.key(KeyCode::Char(']'));
+    let screen = h.screen();
+    assert_contains(&screen, ">       ❯ Bash $ cargo test");
+    assert_contains(screen.lines().nth(3).unwrap(), "────");
+    // Agent messages expand to nothing.
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), ">       agent: Done:");
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+}
+
+#[test]
+fn an_expanded_file_shows_every_line_numbered() {
+    let (mut h, _, file_blob, _) = mockup();
+    select_the_write(&mut h);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::DownloadBlob(file_blob)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hello.rs");
+    let content: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, content).unwrap();
+    h.seam
+        .blob_status(file_blob, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    let screen = trimmed(&h.frame(90, 58, mockup_now()));
+    assert_contains(&screen, "│  1 line 1 ");
+    assert_contains(&screen, "│ 10 line 10 ");
+    assert!(!screen.contains("+2 lines"), "{screen}");
+}
+
+#[test]
+fn expanding_above_the_screen_keeps_the_view_still() {
+    let (mut h, _, file_blob, _) = mockup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hello.rs");
+    let content: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, content).unwrap();
+    h.seam
+        .blob_status(file_blob, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    select_the_write(&mut h);
+    h.key(KeyCode::PageDown);
+    let before = h.screen();
+    assert!(!before.contains("✎ Write src/bin/hello.rs"), "{before}");
+    assert_contains(&before, "scrolled back");
+    let total = h.app.ui().session.as_ref().unwrap().geometry.borrow().total;
+    h.key(KeyCode::Enter);
+    let after = h.screen();
+    let grown = h.app.ui().session.as_ref().unwrap().geometry.borrow().total;
+    assert!(grown > total, "the Write grew: {total} → {grown}");
+    // The Write's last line is cut by the top edge: that row now shows its
+    // new end; everything from the next item down stays where it was.
+    let rows = |screen: &str| {
+        screen
+            .lines()
+            .skip(4)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&after), rows(&before), "{after}");
+    assert_contains(after.lines().nth(3).unwrap(), "│ 30 line 30");
+}
+
+#[test]
+fn wrapped_text_hangs_under_its_column() {
+    let (h, _, _, _) = mockup();
+    let screen = trimmed(&h.frame(60, 70, mockup_now()));
+    // A message wraps under its text, a title under the title, a detail
+    // and a preview line under their own columns.
+    assert_contains(
+        &screen,
+        "│        agent: I'll add the binary, run it, then use it ",
+    );
+    assert_contains(&screen, "│        from main. ");
+    // A title too long beside its state wraps under the title.
+    assert_contains(
+        &screen,
+        "│        ✎ Write             created · approved here · 3.0s│",
+    );
+    assert_contains(&screen, "│          src/bin/hello.rs ");
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.starts_with("│instead") || line.starts_with("│column")),
+        "{screen}"
+    );
 }

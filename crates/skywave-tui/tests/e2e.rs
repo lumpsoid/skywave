@@ -319,6 +319,16 @@ fn line_with<'a>(screen: &'a str, needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"))
 }
 
+/// The approval prompt's row for the fake agent's `write` of `a.txt`.
+const PROMPT: &str = "││? write a.txt";
+
+/// The timeline has a standalone `write` approval of `a.txt` in `state`.
+fn write_approval(screen: &str, state: &str) -> bool {
+    screen
+        .lines()
+        .any(|l| l.contains("? write a.txt") && l.contains(state))
+}
+
 /// The agent said `text` and the turn is over.
 fn turn_done(events: &[Event], text: &str) -> bool {
     let said = events
@@ -332,14 +342,15 @@ fn turn_done(events: &[Event], text: &str) -> bool {
 
 // ---- flows ------------------------------------------------------------------
 
-/// F5: a message goes out; agent text and a tool call arrive; the tool's
-/// large output shows as a summary with its blob not downloaded (OnDemand).
+/// F5: a message goes out; agent text and a tool call arrive; the call and
+/// its result are one block whose large output shows as a preview with its
+/// blob not downloaded (OnDemand).
 #[tokio::test(flavor = "multi_thread")]
 async fn f5_converse() {
     let daemon = Daemon::start(FakeScript::new().turn([
         Step::text("Listing files"),
-        Step::tool_call("shell", json!({ "command": "ls" })),
-        Step::tool_result(listing()),
+        Step::tool_call("shell", json!({ "command": "ls" })).call("c1"),
+        Step::tool_result(listing()).call("c1"),
     ]))
     .await;
     let mut tui = Tui::open();
@@ -349,20 +360,27 @@ async fn f5_converse() {
     tui.send("hello agent");
     let screen = tui
         .wait("the turn", |_, s| {
-            s.contains("result: file-000.txt") && s.contains("agent idle")
+            s.contains("│ file-000.txt") && s.contains("agent idle")
         })
         .await;
     assert!(screen.contains("you [accepted]: hello agent"), "{screen}");
     assert!(screen.contains("agent: Listing files"), "{screen}");
-    assert!(screen.contains("tool shell: ls"), "{screen}");
-    let result = line_with(&screen, "result: file-000.txt");
+    // Done: the state shows its duration, no "no result".
+    let head = line_with(&screen, "• shell ls");
     assert!(
-        result.contains("[full 5.1 KiB · not downloaded]"),
-        "{result}"
+        head.trim_end_matches('│').trim_end().ends_with('s'),
+        "{head}"
     );
     assert!(
-        !screen.contains("file-001.txt"),
-        "only the summary: {screen}"
+        !screen.contains("↳ result"),
+        "folded into the call: {screen}"
+    );
+    let more = line_with(&screen, "│ … +392 lines");
+    assert!(more.contains("full 5.1 KiB · not downloaded"), "{more}");
+    assert!(screen.contains("│ file-007.txt"), "{screen}");
+    assert!(
+        !screen.contains("file-008.txt"),
+        "only the preview: {screen}"
     );
 }
 
@@ -392,18 +410,19 @@ async fn f6_approvals() {
 
     // Approve here; the other device sees who answered.
     a.send("one");
-    a.wait_for("The agent wants to use write").await;
-    b.wait_for("The agent wants to use write").await;
+    // The prompt names the call, as the timeline does.
+    a.wait_for(PROMPT).await;
+    b.wait_for(PROMPT).await;
     a.key(KeyCode::Esc);
     a.key(KeyCode::Char('a'));
     let screen = a
         .wait("approved", |_, s| {
-            s.contains("approval write [approved here]") && s.contains("agent: written")
+            write_approval(s, "approved here") && s.contains("agent: written")
         })
         .await;
     assert!(!screen.contains("Approval needed"), "{screen}");
-    let on_a = format!("approval write [approved on device …{}]", tail(a.device()));
-    let screen = b.wait_for(&on_a).await;
+    let on_a = format!("approved on device …{}", tail(a.device()));
+    let screen = b.wait(&on_a, |_, s| write_approval(s, &on_a)).await;
     assert!(!screen.contains("a approve"), "{screen}");
 
     // Deny here.
@@ -416,7 +435,7 @@ async fn f6_approvals() {
     a.key(KeyCode::Esc);
     a.key(KeyCode::Char('x'));
     a.wait("denied", |_, s| {
-        s.contains("approval write [denied here]") && s.contains("agent: not writing")
+        write_approval(s, "denied here") && s.contains("agent: not writing")
     })
     .await;
 
@@ -427,10 +446,10 @@ async fn f6_approvals() {
     a.wait_for("Approval needed").await;
     b.key(KeyCode::Esc);
     b.key(KeyCode::Char('a'));
-    let on_b = format!("approval write [approved on device …{}]", tail(b.device()));
+    let on_b = format!("approved on device …{}", tail(b.device()));
     let screen = a
         .wait("resolved elsewhere", |_, s| {
-            s.contains(&on_b)
+            write_approval(s, &on_b)
                 && !s.contains("Approval needed")
                 && lines_with(s, "agent: written") == 2
         })
@@ -558,8 +577,9 @@ async fn f9_drop_mid_stream() {
         "you [accepted]: go",
         "agent: part one",
         "agent: part two",
-        "tool shell",
-        "result: file-000.txt",
+        "• shell ls",
+        "↳ result",
+        "│ file-000.txt",
         "agent: part three",
     ] {
         assert_eq!(lines_with(&screen, needle), 1, "{needle:?} once: {screen}");
@@ -597,11 +617,11 @@ async fn f11_blob_on_demand() {
     tui.send("list");
     let screen = tui
         .wait("the result", |_, s| {
-            s.contains("result: file-000.txt") && s.contains("agent idle")
+            s.contains("│ file-000.txt") && s.contains("agent idle")
         })
         .await;
     assert!(
-        line_with(&screen, "result: file-000.txt").contains("· not downloaded]"),
+        line_with(&screen, "│ … full").contains("· not downloaded"),
         "{screen}"
     );
 
@@ -615,11 +635,9 @@ async fn f11_blob_on_demand() {
     .await;
     tui.key(KeyCode::Home);
     let screen = tui.screen();
-    let head = line_with(&screen, "result: file-000.txt");
-    assert!(
-        head.contains("▾") && head.contains("[downloaded]"),
-        "{screen}"
-    );
-    assert!(screen.contains("          file-001.txt"), "{screen}");
+    // The result's head, then the whole content in place of the preview.
+    assert!(screen.contains("↳ result"), "{screen}");
+    assert!(screen.contains("        │ file-001.txt"), "{screen}");
+    assert!(!screen.contains("downloaded"), "{screen}");
     assert!(!screen.contains("cut short"), "{screen}");
 }
