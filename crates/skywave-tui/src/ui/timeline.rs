@@ -8,22 +8,23 @@
 //! expanded. Colour carries the state (the glyph, the state and the
 //! gutter), never the item's type.
 
-use std::fs::File;
-use std::io::Read;
+use std::cell::Cell;
+use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
+use skywave_core::search::BlobLine;
 use skywave_core::{
-    ApprovalStatus, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing, Query,
-    RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing,
+    Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use unicode_width::UnicodeWidthChar;
 
 use super::{answer_words, decision_label, outgoing_badge, outgoing_label};
-use crate::app::SessionUi;
+use crate::app::{Search, SessionUi};
 use crate::timeline::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
 };
@@ -32,6 +33,9 @@ use crate::timeline::{
 pub const SHOW_BYTES: u64 = 64 * 1024;
 /// Most lines of a blob shown when expanded.
 pub const SHOW_LINES: usize = 400;
+/// Lines shown above a search match deep in a blob, past what shows of
+/// its head.
+const MATCH_ABOVE: usize = 3;
 
 /// Columns before an item's text: the selection marker and the time.
 const LEAD: usize = 8;
@@ -42,36 +46,51 @@ const MIN_TITLE: usize = 8;
 
 /// Every timeline item's lines at `width` columns, in timeline order, with
 /// the search's matches marked. `wall` is what running calls' elapsed time
-/// and a selected own message's wait count to.
+/// and a selected own message's wait count to. Also where the search's
+/// current match is in its blob, if that line is laid out: the item's
+/// timeline index and the line within the item.
 pub(super) fn item_lines(
     session: &SessionView,
     ui: &SessionUi,
     focused: bool,
     width: usize,
     wall: SystemTime,
-) -> Vec<Vec<Line<'static>>> {
+) -> (Vec<Vec<Line<'static>>>, Option<(usize, usize)>) {
+    let current_line = ui
+        .search
+        .as_ref()
+        .and_then(|search| search.current_line(session));
     let layout = Layout {
         ui,
         focused,
         width: width.max(TITLE + MIN_TITLE),
         wall_ms: wall_ms(wall),
         rule: rule_index(session),
-        search: ui
-            .search
-            .as_ref()
-            .map(|search| (&search.query, search.hits.as_slice())),
+        search: ui.search.as_ref(),
         current: ui
             .search
             .as_ref()
             .and_then(|search| find(session, search.current?)),
+        current_line: current_line.map(|(_, line)| line),
+        matched: Cell::new(None),
     };
     let mut minute = None;
-    session
+    let mut matched = None;
+    let items = session
         .timeline
         .iter()
         .enumerate()
-        .map(|(index, item)| layout.item(index, item, &mut minute))
-        .collect()
+        .map(|(index, item)| {
+            let lines = layout.item(index, item, &mut minute);
+            if let Some(row) = layout.matched.take()
+                && current_line.is_some_and(|(at, _)| at == index)
+            {
+                matched = Some((index, row));
+            }
+            lines
+        })
+        .collect();
+    (items, matched)
 }
 
 /// The timeline item the `── new ──` rule goes above: the first logged one
@@ -91,11 +110,14 @@ struct Layout<'a> {
     wall_ms: i64,
     /// Index of the item the `── new ──` rule goes above.
     rule: Option<usize>,
-    /// What the search marks, and in which items: the matches by timeline
-    /// index, oldest first.
-    search: Option<(&'a Query, &'a [usize])>,
+    /// The search: what it marks, and in which items.
+    search: Option<&'a Search>,
     /// Index of the search's current match.
     current: Option<usize>,
+    /// The line of its blob the current match is on, if it is in one.
+    current_line: Option<BlobLine>,
+    /// The row of the item being laid out that `current_line` landed on.
+    matched: Cell<Option<usize>>,
 }
 
 /// Marks a search's matches in an item's text.
@@ -173,9 +195,9 @@ impl Layout<'_> {
         }
         let key = selectable(item);
         let selected = self.focused && key.is_some() && key == self.ui.selected;
-        let mark = self.search.and_then(|(query, hits)| {
-            hits.binary_search(&index).ok().map(|_| Mark {
-                query,
+        let mark = self.search.and_then(|search| {
+            search.hit(index).map(|_| Mark {
+                query: &search.query,
                 current: self.current == Some(index),
             })
         });
@@ -198,12 +220,16 @@ impl Layout<'_> {
             TimelineItem::Pending { .. } => Span::raw("      "),
         };
         let lead = vec![marker, time];
+        let above = out.len();
         out.extend(match item {
             TimelineItem::Pending { text, outgoing, .. } => {
                 self.message(lead, you(Some(outgoing)), text, mark)
             }
             TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded, mark),
         });
+        if let Some(row) = self.matched.get() {
+            self.matched.set(Some(above + row));
+        }
         if selected && let Some((outgoing, delivery)) = delivery(item) {
             out.extend(wrap(
                 vec![indent(LEAD)],
@@ -367,7 +393,11 @@ impl Layout<'_> {
         };
         for section in sections(entry) {
             if expanded || !section.hidden {
-                out.extend(self.section(&section, expanded, gutter, mark));
+                let (lines, matched) = self.section(&section, expanded, gutter, mark);
+                if let Some(row) = matched {
+                    self.matched.set(Some(out.len() + row));
+                }
+                out.extend(lines);
             }
         }
         out
@@ -402,44 +432,46 @@ impl Layout<'_> {
 
     /// One section under the gutter: its preview's head and what more there
     /// is while collapsed; all of it (the blob once here) while expanded.
+    /// Also the row the search's current match landed on, if it is in this
+    /// section's blob.
     fn section(
         &self,
         section: &Section,
         expanded: bool,
         gutter: Style,
         mark: Option<Mark>,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, Option<usize>) {
         let preview = content_lines(section.text);
         let mut note: Option<Span<'static>> = None;
+        // Lines of the blob left out above what is shown.
+        let mut skipped = 0;
+        // Which content line the current match is on.
+        let mut matched = None;
         let content: Vec<String> = if expanded {
-            match section.blob.map(|blob| &blob.state) {
-                Some(BlobState::Available { path }) => match read_head(path) {
-                    Ok((text, size)) => {
-                        let lines = content_lines(&text);
-                        if lines.len() > SHOW_LINES || size > SHOW_BYTES {
-                            note = Some(
-                                Span::raw(format!(
-                                    "… cut short: {} of {} shown; the whole file is {}",
-                                    if lines.len() > SHOW_LINES {
-                                        format!("{SHOW_LINES} lines")
-                                    } else {
-                                        bytes(SHOW_BYTES)
-                                    },
-                                    bytes(size),
-                                    path.display()
-                                ))
-                                .dark_gray(),
-                            );
+            match section.blob.map(|blob| (blob.id, &blob.state)) {
+                Some((id, BlobState::Available { path })) => {
+                    let line = self
+                        .current_line
+                        .filter(|line| line.id == id)
+                        .map(|line| line.line);
+                    match self.blob_part(path, id, line) {
+                        Ok(part) => {
+                            note = part.cut.map(|cut| Span::raw(cut).dark_gray());
+                            skipped = part.from;
+                            matched = line
+                                .and_then(|line| line.checked_sub(part.from))
+                                .filter(|&at| at < part.lines.len());
+                            part.lines
                         }
-                        lines.into_iter().take(SHOW_LINES).map(clean).collect()
+                        Err(err) => {
+                            note = Some(
+                                Span::raw(format!("cannot read {}: {err}", path.display())).red(),
+                            );
+                            preview.into_iter().map(clean).collect()
+                        }
                     }
-                    Err(err) => {
-                        note =
-                            Some(Span::raw(format!("cannot read {}: {err}", path.display())).red());
-                        preview.into_iter().map(clean).collect()
-                    }
-                },
-                Some(BlobState::NotDownloaded { size }) => {
+                }
+                Some((_, BlobState::NotDownloaded { size })) => {
                     note = Some(
                         Span::raw(format!(
                             "not downloaded · {} · press d to download",
@@ -449,14 +481,14 @@ impl Layout<'_> {
                     );
                     preview.into_iter().map(clean).collect()
                 }
-                Some(BlobState::Requested { size }) => {
+                Some((_, BlobState::Requested { size })) => {
                     note = Some(
                         Span::raw(format!("requested · waiting for a slot · {}", bytes(*size)))
                             .cyan(),
                     );
                     preview.into_iter().map(clean).collect()
                 }
-                Some(BlobState::Downloading { got, size, paused }) => {
+                Some((_, BlobState::Downloading { got, size, paused })) => {
                     let progress = format!(
                         "downloading · {} of {} ({}%)",
                         bytes(*got),
@@ -470,7 +502,7 @@ impl Layout<'_> {
                     });
                     preview.into_iter().map(clean).collect()
                 }
-                Some(BlobState::Failed { size, reason }) => {
+                Some((_, BlobState::Failed { size, reason })) => {
                     note = Some(
                         Span::raw(format!(
                             "download failed: {reason} · {} · d retries",
@@ -485,7 +517,7 @@ impl Layout<'_> {
         } else if preview.is_empty() {
             // Nothing worth a line, e.g. a write's output beside its status;
             // `lines` then counts what the agent was told, not content.
-            return Vec::new();
+            return (Vec::new(), None);
         } else {
             let shown: Vec<String> = preview
                 .iter()
@@ -530,15 +562,112 @@ impl Layout<'_> {
         };
 
         let bar = || vec![indent(LEAD), Span::styled("│ ", gutter)];
-        let mut out: Vec<Line<'static>> = content_rows(section, content, &bar, self.width, mark)
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if skipped > 0 {
+            let above = format!(
+                "… {skipped} {} above",
+                if skipped == 1 { "line" } else { "lines" }
+            );
+            out.extend(wrap(
+                bar(),
+                bar(),
+                vec![Span::raw(above).dark_gray()],
+                self.width,
+            ));
+        }
+        let mut row = None;
+        for (i, rows) in content_rows(section, content, skipped, &bar, self.width, mark)
             .into_iter()
-            .flatten()
-            .collect();
+            .enumerate()
+        {
+            if matched == Some(i) {
+                row = Some(out.len());
+            }
+            out.extend(rows);
+        }
         if let Some(note) = note {
             out.extend(wrap(bar(), bar(), vec![note], self.width));
         }
-        out
+        (out, row)
     }
+
+    /// What an expanded section shows of its downloaded blob: its head, or,
+    /// when the search's current match is on a `line` past that, the part
+    /// from a few lines above it, out of what the search read.
+    fn blob_part(&self, path: &Path, id: BlobId, line: Option<usize>) -> io::Result<BlobPart> {
+        let searched = line
+            .zip(self.search.and_then(|search| search.blob_text(id)))
+            .filter(|(line, searched)| {
+                let head = content_lines(head_of(&searched.text, SHOW_BYTES as usize));
+                *line >= head.len().min(SHOW_LINES)
+            });
+        let Some((line, searched)) = searched else {
+            let (text, size) = read_head(path, SHOW_BYTES)?;
+            let lines = content_lines(&text);
+            let cut = (lines.len() > SHOW_LINES || size > SHOW_BYTES).then(|| {
+                format!(
+                    "… cut short: {} of {} shown; the whole file is {}",
+                    if lines.len() > SHOW_LINES {
+                        format!("{SHOW_LINES} lines")
+                    } else {
+                        bytes(SHOW_BYTES)
+                    },
+                    bytes(size),
+                    path.display()
+                )
+            });
+            return Ok(BlobPart {
+                lines: lines.into_iter().take(SHOW_LINES).map(clean).collect(),
+                from: 0,
+                cut,
+            });
+        };
+        let text: &str = &searched.text;
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        // A few lines above the match, as long as it still fits.
+        let mut from = line.saturating_sub(MATCH_ABOVE);
+        while from < line && starts[line] - starts[from] > SHOW_BYTES as usize / 2 {
+            from += 1;
+        }
+        let rest = &text[starts[from]..];
+        let shown = head_of(rest, SHOW_BYTES as usize);
+        let lines = content_lines(shown);
+        let cut =
+            (lines.len() > SHOW_LINES || shown.len() < rest.len() || searched.cut).then(|| {
+                let size = std::fs::metadata(path).map_or(String::new(), |m| bytes(m.len()));
+                format!(
+                    "… cut short: lines {}–{} of {size} shown; the whole file is {}",
+                    from + 1,
+                    from + lines.len().min(SHOW_LINES),
+                    path.display()
+                )
+            });
+        Ok(BlobPart {
+            lines: lines.into_iter().take(SHOW_LINES).map(clean).collect(),
+            from,
+            cut,
+        })
+    }
+}
+
+/// The lines an expanded section shows of a blob.
+struct BlobPart {
+    lines: Vec<String>,
+    /// Index of the first line shown; lines above it are left out.
+    from: usize,
+    /// What was left out below, if anything.
+    cut: Option<String>,
+}
+
+/// The first `max` bytes of `text`, cut back to a char boundary.
+fn head_of(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// While collapsed, the state of an item's blob when no section on screen
@@ -585,7 +714,7 @@ pub(super) fn preview_lines(
     let max_rows = max_rows.max(1);
     let mut out = Vec::new();
     let mut shown = 0;
-    for rows in content_rows(section, content, &bar, width, None) {
+    for rows in content_rows(section, content, 0, &bar, width, None) {
         if out.len() + rows.len() > max_rows {
             // A line taller than the cap shows its head.
             if shown == 0 {
@@ -620,11 +749,13 @@ pub(super) fn preview_lines(
     out
 }
 
-/// Each content line's rows after `bar`: numbered if the section is,
-/// coloured by [`line_style`], search matches marked, wrapped to `width`.
+/// Each content line's rows after `bar`: numbered (from `skipped` + 1) if
+/// the section is, coloured by [`line_style`], search matches marked,
+/// wrapped to `width`.
 fn content_rows(
     section: &Section,
     content: Vec<String>,
+    skipped: usize,
     bar: &dyn Fn() -> Vec<Span<'static>>,
     width: usize,
     mark: Option<Mark>,
@@ -633,7 +764,7 @@ fn content_rows(
         let last = section
             .lines
             .map_or(0, |lines| lines as usize)
-            .max(content.len());
+            .max(skipped + content.len());
         last.max(1).to_string().len()
     } else {
         0
@@ -645,7 +776,7 @@ fn content_rows(
             let mut first = bar();
             let mut rest = bar();
             if section.numbered {
-                first.push(Span::raw(format!("{:>digits$} ", i + 1)).dark_gray());
+                first.push(Span::raw(format!("{:>digits$} ", skipped + i + 1)).dark_gray());
                 rest.push(indent(digits + 1));
             }
             let style = line_style(section, &line);
@@ -1068,16 +1199,6 @@ fn group(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
         spans.push(Span::styled(text, style));
     }
     spans
-}
-
-/// The first [`SHOW_BYTES`] of the file as text (invalid UTF-8 replaced),
-/// and the file's size.
-fn read_head(path: &Path) -> std::io::Result<(String, u64)> {
-    let file = File::open(path)?;
-    let size = file.metadata()?.len();
-    let mut head = Vec::new();
-    file.take(SHOW_BYTES).read_to_end(&mut head)?;
-    Ok((String::from_utf8_lossy(&head).into_owned(), size))
 }
 
 /// Another device, by the end of its id: the start of a UUIDv7 is a

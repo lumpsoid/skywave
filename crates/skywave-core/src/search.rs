@@ -2,13 +2,16 @@
 //! and where in a text. Heads keep the query and which match is current;
 //! the rules are here so every head matches alike.
 //!
-//! Only what the view already holds is searched: messages (pending ones
-//! too), errors, tool names, titles, details, statuses and the bounded
-//! previews. Blob content is not.
+//! What the view holds is searched: messages (pending ones too), errors,
+//! tool names, titles, details, statuses and the bounded previews. So is
+//! the content of the blobs behind the timeline that are already
+//! downloaded, as far as the head reads them ([`BlobText`]); a search
+//! never downloads one, and says how many it could not search.
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use crate::view::{Entry, TimelineItem, ToolOutcome};
+use crate::view::{BlobId, BlobState, BlobView, Entry, TimelineItem, ToolOutcome};
 
 /// What is searched for. Smart case: case is ignored unless the query has
 /// an upper-case letter. An empty query matches nothing.
@@ -61,6 +64,19 @@ impl Query {
     pub fn matches(&self, text: &str) -> bool {
         !self.ranges(text).is_empty()
     }
+
+    /// The first line of `text` (0 the first, lines split at `\n`) the
+    /// query matches in. Line by line, so a long text is not folded whole.
+    pub fn first_line(&self, text: &str) -> Option<usize> {
+        if self.text.is_empty() {
+            return None;
+        }
+        if self.folded.is_none() {
+            let at = text.find(self.text.as_str())?;
+            return Some(text[..at].bytes().filter(|&b| b == b'\n').count());
+        }
+        text.split('\n').position(|line| self.matches(line))
+    }
 }
 
 /// Where `needle` (lower case) occurs in `text` lower-cased. A char may
@@ -93,17 +109,110 @@ fn folded_ranges(text: &str, needle: &[char]) -> Vec<Range<usize>> {
     out
 }
 
-/// The indices of the timeline items `query` matches, oldest first.
-pub fn find(timeline: &[TimelineItem], query: &Query) -> Vec<usize> {
+/// A downloaded blob's text as a search reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobText {
+    /// The head of the content; how much of it a head reads is its own.
+    pub text: Arc<str>,
+    /// The content goes on past `text`: only its head was searched.
+    pub cut: bool,
+}
+
+/// A line of a blob's content where a query matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobLine {
+    pub id: BlobId,
+    /// 0 the first line, lines split at `\n`.
+    pub line: usize,
+}
+
+/// A timeline item a query matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    /// The item's timeline index.
+    pub index: usize,
+    /// The first match in the content of the item's downloaded blobs, in
+    /// [`blobs`] order; `None` if it matches only in what the view holds.
+    pub blob: Option<BlobLine>,
+}
+
+/// What a search found, and how much content it could not search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    /// The matching items, oldest first.
+    pub hits: Vec<Hit>,
+    /// Blobs behind the timeline that are not downloaded (any state short
+    /// of [`BlobState::Available`]), so their content was not searched.
+    pub not_downloaded: usize,
+    /// Downloaded blobs searched only in their head ([`BlobText::cut`]).
+    pub cut: usize,
+}
+
+/// The timeline items `query` matches, oldest first. `blob_text` gives a
+/// downloaded blob's text: it is called only for blobs that are
+/// [`BlobState::Available`], and a blob it gives nothing for (its file
+/// cannot be read) is skipped.
+pub fn find(
+    timeline: &[TimelineItem],
+    query: &Query,
+    blob_text: &mut dyn FnMut(&BlobView) -> Option<BlobText>,
+) -> Found {
+    let mut found = Found::default();
     if query.is_empty() {
-        return Vec::new();
+        return found;
     }
-    timeline
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| texts(item).into_iter().any(|text| query.matches(text)))
-        .map(|(index, _)| index)
-        .collect()
+    for (index, item) in timeline.iter().enumerate() {
+        let mut blob = None;
+        if let TimelineItem::Logged { entry, .. } = item {
+            for view in blobs(entry) {
+                if !matches!(view.state, BlobState::Available { .. }) {
+                    found.not_downloaded += 1;
+                    continue;
+                }
+                let Some(text) = blob_text(view) else {
+                    continue;
+                };
+                found.cut += usize::from(text.cut);
+                if blob.is_none() {
+                    blob = query
+                        .first_line(&text.text)
+                        .map(|line| BlobLine { id: view.id, line });
+                }
+            }
+        }
+        if blob.is_some() || texts(item).into_iter().any(|text| query.matches(text)) {
+            found.hits.push(Hit { index, blob });
+        }
+    }
+    found
+}
+
+/// The blobs whose content an entry shows, in the order it shows them: a
+/// call's body and output, and its whole input only when it has neither
+/// (the input is then all there is to see).
+pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
+    match entry {
+        Entry::Tool(view) => {
+            let mut out: Vec<&BlobView> = Vec::new();
+            out.extend(view.body.as_ref().and_then(|body| body.full.as_ref()));
+            if let ToolOutcome::Done {
+                output: Some(output),
+                ..
+            } = &view.outcome
+            {
+                out.push(output);
+            }
+            if out.is_empty() {
+                out.extend(view.input.as_ref());
+            }
+            out
+        }
+        Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => {
+            input.as_ref().into_iter().collect()
+        }
+        Entry::ToolResult { output, .. } => output.as_ref().into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The texts of an item a search looks through.
@@ -148,6 +257,15 @@ mod tests {
     use crate::view::{
         BodyFormat, BodyView, CallId, CommandId, DeviceId, Outgoing, Seq, ToolKind, ToolView,
     };
+
+    /// The matching items' indices, no blob downloaded.
+    fn indices(timeline: &[TimelineItem], query: &Query) -> Vec<usize> {
+        find(timeline, query, &mut |_| panic!("nothing is downloaded"))
+            .hits
+            .iter()
+            .map(|hit| hit.index)
+            .collect()
+    }
 
     fn logged(entry: Entry) -> TimelineItem {
         TimelineItem::Logged {
@@ -202,7 +320,7 @@ mod tests {
     fn an_empty_query_matches_nothing() {
         let query = Query::new("");
         assert!(query.ranges("anything").is_empty());
-        assert!(find(&[logged(Entry::AgentMessage { text: "x".into() })], &query).is_empty());
+        assert!(indices(&[logged(Entry::AgentMessage { text: "x".into() })], &query).is_empty());
     }
 
     #[test]
@@ -266,7 +384,7 @@ mod tests {
                 delivery: None,
             },
         ];
-        let hit = |q: &str| find(&timeline, &Query::new(q));
+        let hit = |q: &str| indices(&timeline, &Query::new(q));
         assert_eq!(hit("user"), [0]);
         assert_eq!(hit("reply"), [1]);
         assert_eq!(hit("rate limited"), [2]);
@@ -295,7 +413,125 @@ mod tests {
         let timeline = vec![logged(Entry::Tool(Box::new(tool(ToolOutcome::Running {
             since: DateTime::UNIX_EPOCH,
         }))))];
-        assert_eq!(find(&timeline, &Query::new("cargo test")), [0]);
-        assert!(find(&timeline, &Query::new("exit")).is_empty());
+        assert_eq!(indices(&timeline, &Query::new("cargo test")), [0]);
+        assert!(indices(&timeline, &Query::new("exit")).is_empty());
+    }
+
+    fn blob(state: BlobState) -> BlobView {
+        BlobView {
+            id: BlobId::new(),
+            state,
+        }
+    }
+
+    fn result(output: BlobView) -> TimelineItem {
+        logged(Entry::ToolResult {
+            summary: "output".into(),
+            output: Some(output),
+        })
+    }
+
+    #[test]
+    fn blob_callback_not_called_for_undownloaded_blobs() {
+        let available = blob(BlobState::Available {
+            path: "/data/blobs/x".into(),
+        });
+        let timeline = vec![
+            result(blob(BlobState::NotDownloaded { size: 10 })),
+            result(blob(BlobState::Requested { size: 10 })),
+            result(blob(BlobState::Downloading {
+                got: 1,
+                size: 10,
+                paused: true,
+            })),
+            result(blob(BlobState::Failed {
+                size: 10,
+                reason: "size mismatch".into(),
+            })),
+            result(available.clone()),
+        ];
+        let mut asked = Vec::new();
+        let found = find(&timeline, &Query::new("needle"), &mut |view| {
+            asked.push(view.id);
+            Some(BlobText {
+                text: "hay\nhay\nthe NEEDLE\n".into(),
+                cut: false,
+            })
+        });
+        assert_eq!(asked, [available.id]);
+        assert_eq!(found.not_downloaded, 4);
+        assert_eq!(found.cut, 0);
+        assert_eq!(
+            found.hits,
+            [Hit {
+                index: 4,
+                blob: Some(BlobLine {
+                    id: available.id,
+                    line: 2
+                }),
+            }]
+        );
+        // An empty query reads nothing and counts nothing.
+        let found = find(&timeline, &Query::new(""), &mut |_| panic!("read"));
+        assert_eq!(found, Found::default());
+    }
+
+    #[test]
+    fn blob_content_is_searched_in_the_order_it_shows() {
+        let path = || BlobState::Available {
+            path: "/data/blobs/x".into(),
+        };
+        let (body, output, input) = (blob(path()), blob(path()), blob(path()));
+        let mut view = tool(ToolOutcome::Done {
+            is_error: false,
+            status: None,
+            preview: String::new(),
+            lines: 40,
+            output: Some(output.clone()),
+            took: Duration::from_secs(1),
+        });
+        view.body.as_mut().unwrap().full = Some(body.clone());
+        // The whole input is not shown beside a body or an output.
+        view.input = Some(input.clone());
+        let timeline = vec![logged(Entry::Tool(Box::new(view)))];
+        let texts = [
+            (body.id, "fn main() {}\n"),
+            (output.id, "ok\nok\nwarning: unused\n"),
+            (input.id, "warning"),
+        ];
+        let mut cut = |view: &BlobView| {
+            let (_, text) = texts.iter().find(|(id, _)| *id == view.id).unwrap();
+            Some(BlobText {
+                text: (*text).into(),
+                cut: view.id == output.id,
+            })
+        };
+        let found = find(&timeline, &Query::new("Warning"), &mut cut);
+        assert!(found.hits.is_empty(), "case matches: {found:?}");
+        let found = find(&timeline, &Query::new("warning"), &mut cut);
+        assert_eq!(
+            found.hits[0].blob,
+            Some(BlobLine {
+                id: output.id,
+                line: 2
+            })
+        );
+        assert_eq!((found.not_downloaded, found.cut), (0, 1));
+        // A match in the view's own text has no blob line.
+        let found = find(&timeline, &Query::new("cargo"), &mut cut);
+        assert_eq!(found.hits[0].blob, None);
+        // An unreadable blob is skipped.
+        let found = find(&timeline, &Query::new("warning"), &mut |_| None);
+        assert!(found.hits.is_empty());
+    }
+
+    #[test]
+    fn first_line_counts_lines_either_way() {
+        let text = "one\ntwo\nThree\nthree";
+        assert_eq!(Query::new("three").first_line(text), Some(2));
+        assert_eq!(Query::new("three").first_line("x\r\nthree"), Some(1));
+        assert_eq!(Query::new("Three").first_line(text), Some(2));
+        assert_eq!(Query::new("tHree").first_line(text), None);
+        assert_eq!(Query::new("").first_line(text), None);
     }
 }

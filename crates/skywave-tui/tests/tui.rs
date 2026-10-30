@@ -3973,6 +3973,203 @@ fn a_match_only_in_hidden_output_expands_its_item() {
     assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
 }
 
+/// A shell call `command` whose output is `output`, its preview `preview`.
+fn shell_output(
+    id: SessionId,
+    minute: u32,
+    command: &str,
+    preview: &str,
+    output: BlobRef,
+) -> [Event; 2] {
+    let shell = CallId::new();
+    let mut done = result(shell, false, "exit 0", preview);
+    done.output = Some(output);
+    [
+        event(
+            id,
+            minute,
+            EventKind::ToolCall(call(shell, "Bash", ToolKind::Shell, command)),
+        ),
+        event(id, minute, EventKind::ToolResult(done)),
+    ]
+}
+
+/// Writes `content` to `name` in `dir` and reports blob `id` downloaded
+/// there.
+fn downloaded(h: &mut Harness, dir: &tempfile::TempDir, name: &str, id: BlobId, content: &[u8]) {
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).unwrap();
+    h.seam
+        .blob_status(id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+}
+
+/// How many of the open session's items are expanded.
+fn expanded(h: &Harness) -> usize {
+    h.app.ui().session.as_ref().unwrap().expanded.len()
+}
+
+#[test]
+fn search_finds_downloaded_blob_text_and_expands() {
+    let (mut h, id, _) = open_session();
+    let dir = tempfile::tempdir().unwrap();
+    let log: String = (0..30)
+        .map(|i| match i {
+            20 => "test parser::nested ... FAILED\n".to_owned(),
+            i => format!("test case_{i:02} ... ok\n"),
+        })
+        .collect();
+    let (log_id, log_ref) = blob(log.len() as u64);
+    let build = "   Compiling nested v0.1.0\n";
+    let (build_id, build_ref) = blob(build.len() as u64);
+    let mut events = shell_output(id, 1, "$ cargo test", "running 30 tests", log_ref).to_vec();
+    events.extend(shell_output(id, 2, "$ cargo build", "Compiling", build_ref));
+    events.push(event(id, 3, agent("one test fails")));
+    pull(&mut h, events);
+    downloaded(&mut h, &dir, "log", log_id, log.as_bytes());
+    h.drain_requests();
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("nested");
+    // The build output is not here: said, and never fetched.
+    assert_contains(
+        &h.screen(),
+        "/nested▏ · 1 match · 1 output not downloaded · Enter jump",
+    );
+    h.key(KeyCode::Enter);
+    assert_eq!(expanded(&h), 1);
+    let screen = h.screen();
+    assert_contains(&screen, "/nested · 1 of 1 · 1 output not downloaded");
+    assert_contains(&screen, "│ test parser::nested ... FAILED");
+    assert_eq!(h.drain_requests(), []);
+
+    // Downloaded mid-search: searched at once.
+    downloaded(&mut h, &dir, "build", build_id, build.as_bytes());
+    let screen = h.screen();
+    assert_contains(&screen, "/nested · 1 of 2");
+    assert!(!screen.contains("not downloaded"), "{screen}");
+    h.key(KeyCode::Char('N'));
+    assert_eq!(expanded(&h), 2);
+    let screen = h.screen();
+    assert_contains(&screen, "/nested · 2 of 2");
+    assert_contains(&screen, "│    Compiling nested v0.1.0");
+}
+
+#[test]
+fn status_counts_undownloaded_outputs() {
+    let (mut h, id, _) = open_session();
+    let dir = tempfile::tempdir().unwrap();
+    let (waiting, waiting_ref) = blob(100);
+    let (_, idle_ref) = blob(100);
+    let (failed, failed_ref) = blob(100);
+    let (coming, coming_ref) = blob(100);
+    let (big, big_ref) = blob(1_200_000);
+    let mut events = two_turns(id);
+    for (minute, output) in [waiting_ref, idle_ref, failed_ref, coming_ref, big_ref]
+        .into_iter()
+        .enumerate()
+    {
+        events.extend(shell_output(
+            id,
+            4 + minute as u32,
+            "$ make",
+            "make: ok",
+            output,
+        ));
+    }
+    pull(&mut h, events);
+    h.core.dispatch(Action::DownloadBlob(waiting)).unwrap();
+    h.seam.blob_failed(failed, "blob size mismatch").unwrap();
+    h.seam
+        .blob_status(
+            coming,
+            BlobStatus::Downloading {
+                got: 10,
+                path: dir.path().join("coming.part"),
+            },
+        )
+        .unwrap();
+    // Past the head a search reads; the needle only past it.
+    let mut content = vec![b'x'; 1_100_000];
+    content.extend(b"\nneedle\n");
+    downloaded(&mut h, &dir, "big", big, &content);
+    h.drain_requests();
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("make");
+    h.key(KeyCode::Enter);
+    let status = status_line(&h, 200);
+    assert!(
+        status.contains(
+            "/make · 5 of 5 · 4 outputs not downloaded · 1 output searched only in its first 1.0 MiB"
+        ),
+        "{status:?}"
+    );
+    // The usage summary keeps to the right of it.
+    assert!(status.ends_with("session $1.27 · model-a"), "{status:?}");
+    h.key(KeyCode::Char('/'));
+    h.type_text("needle");
+    assert_contains(
+        &h.screen(),
+        "/needle▏ · no matches · 4 outputs not downloaded",
+    );
+    assert_eq!(h.drain_requests(), []);
+}
+
+#[test]
+fn a_jump_into_a_tall_blob_pins_the_matching_line() {
+    let (mut h, id, _) = open_session();
+    let dir = tempfile::tempdir().unwrap();
+    let rows = |n: usize, needle: usize| -> String {
+        (0..n)
+            .map(|i| match i == needle {
+                true => format!("row {i} needle\n"),
+                false => format!("row {i}\n"),
+            })
+            .collect()
+    };
+    // In what an expanded item shows, far below its top.
+    let near = rows(200, 150);
+    let (near_id, near_ref) = blob(near.len() as u64);
+    // Past the 400 lines it shows.
+    let far = rows(1000, 700);
+    let (far_id, far_ref) = blob(far.len() as u64);
+    let mut events = shell_output(id, 1, "$ seq near", "row 0", near_ref).to_vec();
+    events.extend(shell_output(id, 2, "$ seq far", "row 0", far_ref));
+    events.push(event(id, 3, agent("done")));
+    pull(&mut h, events);
+    downloaded(&mut h, &dir, "near", near_id, near.as_bytes());
+    downloaded(&mut h, &dir, "far", far_id, far.as_bytes());
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("needle");
+    h.key(KeyCode::Enter);
+    // The newest match first: the far one, shown from a few lines above.
+    let screen = h.screen();
+    assert_contains(&screen, "/needle · 2 of 2");
+    assert_contains(&screen, "│ … 697 lines above");
+    assert_contains(&screen, "│ row 700 needle");
+    assert!(!screen.contains("$ seq near"), "{screen}");
+    // The next key keeps it there.
+    h.key(KeyCode::Char('x'));
+    assert_contains(&h.screen(), "│ row 700 needle");
+
+    h.key(KeyCode::Char('n'));
+    let screen = h.screen();
+    assert_contains(&screen, "/needle · 1 of 2");
+    assert_contains(&screen, "│ row 150 needle");
+    assert!(
+        !screen.contains("$ seq near"),
+        "scrolled past the top: {screen}"
+    );
+    // The far one is back to its head.
+    assert!(!screen.contains("lines above"), "{screen}");
+}
+
 // ---- copying ----------------------------------------------------------------
 
 /// A session holding `events`, with the newest item selected.

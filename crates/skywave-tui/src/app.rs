@@ -4,16 +4,16 @@
 //! this module decides anything about pairing, sync or delivery (D2).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use skywave_core::search;
+use skywave_core::search::{self, BlobLine, BlobText, Found, Hit};
 use skywave_core::{
-    Action, ApprovalId, ApprovalPrompt, BlobPolicy, BlobState, Completion, CompletionStatus,
-    CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind, Outgoing, PairingView,
-    PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView, SessionRow, SessionView,
-    TimelineItem, ToolOutcome, ViewState,
+    Action, ApprovalId, ApprovalPrompt, BlobId, BlobPolicy, BlobState, BlobView, Completion,
+    CompletionStatus, CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind,
+    Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView,
+    SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -34,6 +34,9 @@ pub const DRAFT_SAVE_AFTER: Duration = Duration::from_secs(1);
 /// new items: an agent streaming many small batches must not cost a durable
 /// write each. Leaving the session or quitting marks at once.
 pub const READ_MARK_EVERY: Duration = Duration::from_secs(2);
+
+/// Most of a downloaded blob a search reads: the head of a longer one.
+pub const SEARCH_BYTES: u64 = 1024 * 1024;
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -324,6 +327,9 @@ pub struct Geometry {
     pub top: usize,
     /// Line of the `── new ──` rule, if the timeline has one.
     pub rule: Option<usize>,
+    /// Where the search's current match is in its blob's content, if that
+    /// line is laid out: the match's item, and the line of the timeline.
+    pub matched: Option<(ItemKey, usize)>,
 }
 
 impl Geometry {
@@ -347,6 +353,14 @@ impl Geometry {
         (self.total.saturating_sub(rule) > self.height)
             .then(|| self.pin(rule))
             .flatten()
+    }
+
+    /// The scroll state that shows the search's current match in its blob
+    /// (`key` its item) a third down the screen, if the last frame laid
+    /// that line out.
+    pub fn match_scroll(&self, key: ItemKey) -> Option<Option<Anchor>> {
+        let (_, line) = self.matched.filter(|(on, _)| *on == key)?;
+        Some(self.pin(line.saturating_sub(self.height / 3)))
     }
 
     /// The line `anchor` stands for, if its item is still there.
@@ -438,13 +452,22 @@ pub struct Search {
     pub query: Query,
     /// The prompt is open: keys edit the query.
     pub editing: bool,
-    /// Timeline indices of the matching items, oldest first.
-    pub hits: Vec<usize>,
+    /// The matching items, oldest first, and how much blob content went
+    /// unsearched.
+    pub found: Found,
     /// The match jumped to last, by key so it stays put as items arrive.
     pub current: Option<ItemKey>,
     /// The last jump went round an end of the timeline; said until the
     /// next key.
     pub wrapped: bool,
+    /// The current match's line in its blob waits to be scrolled to: the
+    /// next frame shows it ([`Geometry::match_scroll`]), the next key
+    /// keeps that scroll state.
+    pub pin: bool,
+    /// The heads of the downloaded blobs read so far (at most
+    /// [`SEARCH_BYTES`] each), so a search reads each file once; `None`
+    /// for one that could not be read.
+    blob_cache: HashMap<BlobId, Option<BlobText>>,
 }
 
 impl Search {
@@ -452,10 +475,44 @@ impl Search {
         Search {
             query: Query::new(""),
             editing: true,
-            hits: Vec::new(),
+            found: Found::default(),
             current: None,
             wrapped: false,
+            pin: false,
+            blob_cache: HashMap::new(),
         }
+    }
+
+    /// The matching items, oldest first.
+    pub fn hits(&self) -> &[Hit] {
+        &self.found.hits
+    }
+
+    /// The match on the item at timeline index `index`, if it matches.
+    pub fn hit(&self, index: usize) -> Option<&Hit> {
+        let at = self
+            .found
+            .hits
+            .binary_search_by_key(&index, |hit| hit.index)
+            .ok()?;
+        Some(&self.found.hits[at])
+    }
+
+    /// What the search read of a downloaded blob, if it did.
+    pub fn blob_text(&self, id: BlobId) -> Option<&BlobText> {
+        self.blob_cache.get(&id)?.as_ref()
+    }
+
+    /// Finds the matches in `view`, reading the downloaded blobs not read
+    /// yet; a blob that became downloaded since is read now.
+    fn find(&mut self, view: &SessionView) {
+        let cache = &mut self.blob_cache;
+        self.found = search::find(&view.timeline, &self.query, &mut |blob| {
+            cache
+                .entry(blob.id)
+                .or_insert_with(|| read_blob(blob))
+                .clone()
+        });
     }
 
     /// Edits the query and finds its matches again.
@@ -463,20 +520,24 @@ impl Search {
         let mut text = self.query.as_str().to_owned();
         edit(&mut text);
         self.query = Query::new(&text);
-        self.hits = search::find(&view.timeline, &self.query);
+        self.find(view);
         self.current = None;
+        self.pin = false;
     }
 
     /// Finds the matches in a new snapshot. The current match stays on its
     /// item; if that is gone, the match nearest its old index `old` is.
     fn refresh(&mut self, view: &SessionView, old: Option<usize>) {
-        self.hits = search::find(&view.timeline, &self.query);
+        self.find(view);
         let Some(key) = self.current else {
             return;
         };
         let index = find(view, key).or_else(|| {
             let old = old?;
-            self.hits.iter().copied().min_by_key(|&i| i.abs_diff(old))
+            self.hits()
+                .iter()
+                .map(|hit| hit.index)
+                .min_by_key(|&i| i.abs_diff(old))
         });
         self.current = index.map(|i| ItemKey::of(&view.timeline[i]));
     }
@@ -484,13 +545,40 @@ impl Search {
     /// The current match's place among the matches, 1 the oldest.
     pub fn position(&self, view: &SessionView) -> Option<usize> {
         let index = find(view, self.current?)?;
-        Some(self.hits.iter().position(|&i| i == index)? + 1)
+        Some(self.hits().iter().position(|hit| hit.index == index)? + 1)
+    }
+
+    /// The current match's line in its blob, with its timeline index.
+    pub fn current_line(&self, view: &SessionView) -> Option<(usize, BlobLine)> {
+        let index = find(view, self.current?)?;
+        Some((index, self.hit(index)?.blob?))
+    }
+
+    /// What the search could not look through, if anything: `3 outputs not
+    /// downloaded`, `1 output searched only in its first 1.0 MiB`.
+    pub fn partial(&self) -> Option<String> {
+        let outputs = |n: usize| if n == 1 { "output" } else { "outputs" };
+        let mut out = Vec::new();
+        match self.found.not_downloaded {
+            0 => {}
+            n => out.push(format!("{n} {} not downloaded", outputs(n))),
+        }
+        match self.found.cut {
+            0 => {}
+            n => out.push(format!(
+                "{n} {} searched only in {} first {}",
+                outputs(n),
+                if n == 1 { "its" } else { "their" },
+                bytes(SEARCH_BYTES)
+            )),
+        }
+        (!out.is_empty()).then(|| out.join(" · "))
     }
 
     /// How the search stands: `3 of 17`, `17 matches` before a jump, `no
     /// matches`.
     pub fn count(&self, view: &SessionView) -> String {
-        match (self.hits.len(), self.position(view)) {
+        match (self.hits().len(), self.position(view)) {
             (0, _) => "no matches".to_owned(),
             (of, Some(at)) => format!("{at} of {of}"),
             (1, None) => "1 match".to_owned(),
@@ -502,6 +590,19 @@ impl Search {
     pub fn status(&self, view: &SessionView) -> String {
         format!("/{} · {}", self.query.as_str(), self.count(view))
     }
+}
+
+/// A downloaded blob's head as a search reads it; `None` if its file
+/// cannot be read.
+fn read_blob(blob: &BlobView) -> Option<BlobText> {
+    let BlobState::Available { path } = &blob.state else {
+        return None;
+    };
+    let (text, size) = skywave_core::read_head(path, SEARCH_BYTES).ok()?;
+    Some(BlobText {
+        text: text.into(),
+        cut: size > SEARCH_BYTES,
+    })
 }
 
 /// Browsing [`SessionView::prompts`] in the composer.
@@ -604,20 +705,41 @@ impl SessionUi {
     }
 
     /// The scroll state shown: while [`SessionUi::opening`], the one the
-    /// opening will settle on.
+    /// opening will settle on; while a search match waits to be scrolled
+    /// to ([`Search::pin`]), the one that shows it.
     pub fn shown_scroll(&self) -> Option<Anchor> {
         if self.opening {
             self.geometry.borrow().opening()
         } else {
-            self.scroll
+            self.pinned_scroll().unwrap_or(self.scroll)
         }
     }
 
-    /// Applies the opening scroll once a frame has laid the timeline out.
-    fn settle_opening(&mut self) {
-        if self.opening && self.geometry.borrow().height > 0 {
+    /// While [`Search::pin`]: the scroll state that shows the current
+    /// match's line in its blob, if the last frame laid it out.
+    pub fn pinned_scroll(&self) -> Option<Option<Anchor>> {
+        let search = self.search.as_ref().filter(|s| s.pin)?;
+        self.geometry.borrow().match_scroll(search.current?)
+    }
+
+    /// Applies the opening scroll, or the one showing a search match in a
+    /// blob, once a frame has laid the timeline out.
+    fn settle(&mut self) {
+        if self.geometry.borrow().height == 0 {
+            return;
+        }
+        if self.opening {
             self.scroll = self.geometry.borrow().opening();
             self.opening = false;
+        }
+        if self.search.as_ref().is_some_and(|s| s.pin) {
+            // Not laid out (cut by the file's end, say): the item's top.
+            if let Some(scroll) = self.pinned_scroll() {
+                self.scroll = scroll;
+            }
+            if let Some(search) = &mut self.search {
+                search.pin = false;
+            }
         }
     }
 
@@ -1044,7 +1166,7 @@ impl App {
             return None;
         };
         let session = self.ui.session.as_mut().filter(|s| s.id == view.id)?;
-        session.settle_opening();
+        session.settle();
         if !session.unmarked(view) {
             return None;
         }
@@ -1482,7 +1604,7 @@ impl App {
         };
         let session = self.ui.session.as_mut()?;
         // Keys move from where the opening scrolled to.
-        session.settle_opening();
+        session.settle();
         if let Some(search) = &mut session.search {
             search.wrapped = false;
             if search.editing {
@@ -1897,12 +2019,13 @@ impl SessionUi {
     /// current one, round the ends of the timeline; with no current match,
     /// or `None`, to the nearest one at or above (newer: below) where the
     /// user is. The match is selected if it can be, expanded if it shows
-    /// only expanded, and scrolled into view.
+    /// only expanded, and scrolled into view: to its line, for a match in
+    /// a blob's content.
     fn jump(&mut self, view: &SessionView, older: Option<bool>) {
         let Some(search) = &self.search else {
             return;
         };
-        let hits = &search.hits;
+        let hits: Vec<usize> = search.hits().iter().map(|hit| hit.index).collect();
         let (Some(&oldest), Some(&newest)) = (hits.first(), hits.last()) else {
             return;
         };
@@ -1928,20 +2051,28 @@ impl SessionUi {
             .copied()
             .unwrap_or(if newer { oldest } else { newest });
         let query = search.query.clone();
+        let in_blob = search.hit(target).and_then(|hit| hit.blob).is_some();
         let item = &view.timeline[target];
+        let hidden = match item {
+            TimelineItem::Logged { seq, entry, .. } if match_hidden(entry, &query) => {
+                Some(self.expanded.insert(*seq))
+            }
+            _ => None,
+        };
         if let Some(search) = &mut self.search {
             search.current = Some(ItemKey::of(item));
             search.wrapped = wrapped;
+            // A match deep in a blob is scrolled to by the next frame,
+            // which lays its line out.
+            search.pin = hidden.is_some() && in_blob;
         }
         // Items that cannot be selected (an agent error) only scroll.
         if let Some(key) = selectable(item) {
             self.selected = Some(key);
         }
-        if let TimelineItem::Logged { seq, entry, .. } = item
-            && match_hidden(entry, &query)
-            && self.expanded.insert(*seq)
-        {
-            // It grows by expanding: anchored to its top, as `v` does.
+        if hidden == Some(true) || (hidden.is_some() && in_blob) {
+            // It grows by expanding: anchored to its top, as `v` does,
+            // until the match's line is laid out.
             self.scroll = Some(Anchor {
                 key: ItemKey::of(item),
                 offset: 0,
