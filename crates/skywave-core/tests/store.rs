@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    BlobPolicy, BlobStatus, Draft, OutboxStatus, ReadMark, Settings, Store, StoreError,
+    BlobPolicy, BlobStatus, Core, Draft, OutboxStatus, PairedCredentials, ReadMark, Settings,
+    Store, StoreError,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
@@ -1333,4 +1334,120 @@ fn cursor_stays_contiguous_after_local_delete() {
     whole.apply_batch(&log.batch(1, 7)).unwrap();
     assert_eq!(whole.session_events(log.b).unwrap(), b_events);
     assert_eq!(whole.session(log.b).unwrap(), store.session(log.b).unwrap());
+}
+
+/// A CA certificate as pairing stores it: a fresh self-signed PEM, so
+/// every call is another server.
+fn ca_pem() -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    rcgen::CertificateParams::new(vec!["skywave ca".to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap()
+        .pem()
+}
+
+fn paired_with(ca_cert_pem: &str) -> PairedCredentials {
+    PairedCredentials {
+        device_id: DeviceId::new(),
+        device_key_pem: "KEY".into(),
+        device_cert_pem: "CERT".into(),
+        ca_cert_pem: ca_cert_pem.to_owned(),
+    }
+}
+
+/// Rows in each table that pairing with another server must empty.
+fn server_rows(dir: &Path) -> Vec<(&'static str, i64)> {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    [
+        "events",
+        "sessions",
+        "outbox",
+        "blobs",
+        "drafts",
+        "read_marks",
+        "deleted_sessions",
+    ]
+    .into_iter()
+    .map(|table| {
+        let rows = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (table, rows)
+    })
+    .collect()
+}
+
+#[test]
+fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let ca = ca_pem();
+    let core = Core::open_detached(&dir).unwrap();
+    let seam = core.seam();
+    seam.pairing_succeeded("old.example:7443", paired_with(&ca))
+        .unwrap();
+    seam.apply_events(&log.batch(1, 7)).unwrap();
+
+    // Something in every table, and a downloaded blob.
+    let blob_file = skywave_core::blob_dir(&dir).join(log.blob.id.0.to_string());
+    std::fs::create_dir_all(blob_file.parent().unwrap()).unwrap();
+    std::fs::write(&blob_file, "content").unwrap();
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .set_blob_status(
+            log.blob.id,
+            &BlobStatus::Available {
+                path: blob_file.clone(),
+            },
+        )
+        .unwrap();
+    store.enqueue(&send(log.b, "queued")).unwrap();
+    let draft = Draft {
+        text: "unsent".into(),
+        cursor: 0,
+    };
+    store.set_draft(log.a, Some(&draft)).unwrap();
+    let mark = ReadMark {
+        seq: Seq(3),
+        notable: 1,
+    };
+    store.set_read_mark(log.a, mark).unwrap();
+    store
+        .delete_session_locally(SessionId::new(), at(0))
+        .unwrap();
+    store.set_blob_policy(BlobPolicy::Eager).unwrap();
+    let before = store.load().unwrap();
+    let rows = server_rows(&dir);
+    assert!(rows.iter().all(|(_, n)| *n > 0), "{rows:?}");
+
+    // Again with the same server, e.g. after a revocation: all kept.
+    seam.pairing_succeeded("old.example:7443", paired_with(&ca))
+        .unwrap();
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(server_rows(&dir), rows);
+    assert!(blob_file.exists());
+
+    // Another server: nothing of the old one is left.
+    seam.pairing_succeeded("new.example:7443", paired_with(&ca_pem()))
+        .unwrap();
+    let rows = server_rows(&dir);
+    assert!(rows.iter().all(|(_, n)| *n == 0), "{rows:?}");
+    let after = store.load().unwrap();
+    assert_eq!(after.cursor, Seq::ZERO);
+    assert_eq!(
+        after.settings,
+        Settings {
+            blob_policy: BlobPolicy::Eager,
+            server_address: Some("new.example:7443".into()),
+        },
+        "the blob policy is this device's"
+    );
+    assert!(!blob_file.exists(), "blob files go with their rows");
+
+    // The new server's log starts from the beginning.
+    let applied = seam.apply_events(&log.batch(1, 2)).unwrap();
+    assert_eq!((applied.cursor, applied.new_events), (Seq(2), 2));
 }

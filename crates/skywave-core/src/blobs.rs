@@ -306,11 +306,14 @@ enum FetchError {
 
 impl FetchError {
     /// The blob left the replica mid-download (its session was deleted from
-    /// this device): nothing to retry, and its files must go.
+    /// this device, or the device paired with another server): nothing to
+    /// retry, and its files must go.
     fn is_purged(&self) -> bool {
         matches!(
             self,
-            FetchError::Core(CoreError::Store(crate::store::StoreError::UnknownBlob(_)))
+            FetchError::Core(
+                CoreError::Store(crate::store::StoreError::UnknownBlob(_)) | CoreError::Superseded
+            )
         )
     }
 
@@ -331,7 +334,9 @@ async fn give_up(ctx: &BlobCtx, id: BlobId, error: &FetchError) {
     let part = part_path(&blob_dir(&ctx.seam.data_dir()), id);
     let _ = tokio::fs::remove_file(&part).await;
     match ctx.seam.blob_failed(id, error.to_string()) {
-        Ok(()) | Err(CoreError::Store(crate::store::StoreError::UnknownBlob(_))) => {}
+        Ok(())
+        | Err(CoreError::Store(crate::store::StoreError::UnknownBlob(_)) | CoreError::Superseded) =>
+            {}
         Err(error) => tracing::warn!(?id, %error, "cannot reset the blob's status"),
     }
 }
@@ -350,6 +355,16 @@ pub(crate) fn remove_blob_files(data_dir: &Path, id: BlobId) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!(?id, %error, "cannot remove a blob file"),
         }
+    }
+}
+
+/// Removes every blob file, complete and partial, from `data_dir`; a
+/// directory already gone is no error.
+pub(crate) fn remove_all_blob_files(data_dir: &Path) {
+    match std::fs::remove_dir_all(blob_dir(data_dir)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "cannot remove the blob files"),
     }
 }
 

@@ -523,6 +523,40 @@ impl Store {
         Ok(blobs)
     }
 
+    /// Makes the replica a fresh one for the server at `address`, in one
+    /// transaction: the event log, session summaries, cursor, outbox and
+    /// blob rows the old server's log produced go, and so does what this
+    /// device kept beside them — drafts, read marks and locally deleted
+    /// sessions. Of the settings, the server address becomes `address`;
+    /// the blob policy, a preference of this device, stays, as do keys a
+    /// newer build wrote. Returns the blobs that were known, whose files
+    /// the caller removes.
+    pub fn reset_for_server(&mut self, address: &str) -> Result<Vec<BlobId>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let blobs = {
+            let mut stmt = tx.prepare("SELECT id FROM blobs ORDER BY id")?;
+            let rows = stmt.query_map([], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute_batch(
+            "DELETE FROM events;
+             DELETE FROM sessions;
+             UPDATE cursor SET seq = 0 WHERE id = 0;
+             DELETE FROM outbox;
+             DELETE FROM blobs;
+             DELETE FROM drafts;
+             DELETE FROM read_marks;
+             DELETE FROM deleted_sessions;",
+        )?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![KEY_SERVER_ADDRESS, address],
+        )?;
+        tx.commit()?;
+        Ok(blobs)
+    }
+
     /// The session's events in log order.
     pub fn session_events(&self, id: SessionId) -> Result<Vec<(Seq, Event)>, StoreError> {
         let mut stmt = self

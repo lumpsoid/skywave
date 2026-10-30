@@ -668,6 +668,23 @@ impl Model {
         self.completer.listed(req, result);
     }
 
+    /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
+    /// which left the replica as `snapshot`: nothing of the previous
+    /// server's log shows any more, nor what was kept in memory for it —
+    /// download requests and failures, alerted approvals, listed
+    /// directories. Heads replace the drafts they hold.
+    pub(crate) fn replica_reset(&mut self, snapshot: Snapshot) {
+        let had_drafts = !self.drafts.is_empty();
+        self.reload(snapshot);
+        self.wanted.clear();
+        self.failed.clear();
+        self.alerted.clear();
+        self.completer = Completer::default();
+        if had_drafts {
+            self.draft_rev += 1;
+        }
+    }
+
     pub(crate) fn paired(&mut self, device: DeviceId, address: String) {
         self.device = Some(device);
         self.settings.server_address = Some(address);

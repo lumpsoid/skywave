@@ -49,6 +49,12 @@
 //! resent later with the same id; an interrupted blob resumes from its
 //! partial file) and [`Core::resume`](crate::Core::resume) starts them
 //! again from `Connecting`. Pairing runs regardless.
+//!
+//! Pairing with another server resets the replica
+//! ([`Seam::pairing_succeeded`]) while a link to the old one may still be
+//! running; the link and downloader write through a [`Seam`] bound to the
+//! server they started for, which refuses their writes from then on, until
+//! the `Connect` that follows restarts them.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -324,10 +330,12 @@ impl Engine {
         if *self.suspended.borrow() || *self.rejected.borrow() {
             return;
         }
-        let Some(identity) = self.seam.identity() else {
+        // Bound: if the device pairs with another server, this link and
+        // downloader can no longer write to the replica.
+        let Some((seam, identity)) = self.seam.bind() else {
             return;
         };
-        let address = match self.seam.settings() {
+        let address = match seam.settings() {
             Ok(settings) => settings.server_address,
             Err(error) => {
                 tracing::warn!(%error, "cannot read the server address; not connecting");
@@ -338,7 +346,7 @@ impl Engine {
             return;
         };
         let downloader = tokio::spawn(run_downloader(BlobCtx {
-            seam: self.seam.clone(),
+            seam: seam.clone(),
             config: self.config.clone(),
             address: address.clone(),
             identity: identity.clone(),
@@ -347,7 +355,7 @@ impl Engine {
         let stop_downloader = downloader.abort_handle();
         self.downloader = Some(downloader);
         let ctx = LinkCtx {
-            seam: self.seam.clone(),
+            seam,
             config: self.config.clone(),
             outbox: self.outbox.clone(),
             retry_now: self.retry_now.clone(),
@@ -685,6 +693,48 @@ mod tests {
         )
         .unwrap();
         seam
+    }
+
+    /// A link still running for the old server cannot write once the
+    /// device pairs with another one.
+    #[test]
+    fn a_link_bound_to_the_old_server_cannot_write_after_pairing_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let (bound, _) = seam.bind().unwrap();
+        let batch = |from| EventBatch {
+            from: Seq(from),
+            events: vec![skywave_proto::Event {
+                session_id: SessionId::new(),
+                at: chrono::Utc::now(),
+                kind: skywave_proto::EventKind::SessionCreated {
+                    workdir: "/srv".into(),
+                },
+            }],
+        };
+        bound.apply_events(&batch(1)).unwrap();
+
+        seam.pairing_succeeded(
+            "other:7443",
+            PairedCredentials {
+                device_id: DeviceId::new(),
+                device_key_pem: "KEY".into(),
+                device_cert_pem: "CERT".into(),
+                ca_cert_pem: "ANOTHER CA".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            bound.apply_events(&batch(1)),
+            Err(CoreError::Superseded)
+        ));
+        bound.set_link(Link::Online { latency_ms: 1 });
+        assert_eq!(seam.cursor().unwrap(), Seq::ZERO);
+        assert_eq!(seam.core.view().link, Link::Connecting);
+
+        let (fresh, _) = seam.bind().unwrap();
+        fresh.apply_events(&batch(1)).unwrap();
+        assert_eq!(seam.cursor().unwrap(), Seq(1));
     }
 
     /// Reconnect delays double per attempt up to the cap, with the injected

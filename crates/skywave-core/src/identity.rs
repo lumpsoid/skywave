@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use skywave_proto::DeviceId;
 use uuid::Uuid;
 
+use crate::tls::{self, Fingerprint};
+
 /// A paired device's credentials.
 pub trait Identity: Send + Sync {
     /// The id the server assigned to this device at pairing.
@@ -43,6 +45,22 @@ pub struct PairedCredentials {
     pub device_key_pem: String,
     pub device_cert_pem: String,
     pub ca_cert_pem: String,
+}
+
+impl PairedCredentials {
+    /// Whether `other` pins the same server: the first certificates of the
+    /// two CA PEMs have the same [`Fingerprint`]. A CA that holds no
+    /// readable certificate is compared by its text instead.
+    pub fn same_server(&self, other: &PairedCredentials) -> bool {
+        match (
+            tls::first_cert_der(&self.ca_cert_pem),
+            tls::first_cert_der(&other.ca_cert_pem),
+        ) {
+            (Some(a), Some(b)) => Fingerprint::of_der(&a) == Fingerprint::of_der(&b),
+            (None, None) => self.ca_cert_pem.trim() == other.ca_cert_pem.trim(),
+            _ => false,
+        }
+    }
 }
 
 /// An identity stored as files in `<data_dir>/identity/`.
@@ -129,6 +147,10 @@ impl FileIdentity {
         }
         fs::rename(&staging, &dir).map_err(io_err(&dir))?;
         Ok(FileIdentity { credentials })
+    }
+
+    pub(crate) fn credentials(&self) -> &PairedCredentials {
+        &self.credentials
     }
 }
 
