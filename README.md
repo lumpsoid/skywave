@@ -228,6 +228,20 @@ More detail in [`docs/architecture.md`](docs/architecture.md),
 [`docs/mvp-spec.md`](docs/mvp-spec.md) and
 [`docs/decisions.md`](docs/decisions.md).
 
+### Android build
+
+With [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk), an Android NDK
+(`ANDROID_NDK_HOME`) and the `aarch64-linux-android` / `x86_64-linux-android`
+Rust targets:
+
+```sh
+crates/skywave-core-ffi/build-android.sh <app>/src/main/jniLibs
+```
+
+This builds `libskywave_core_ffi.so` for `arm64-v8a` and `x86_64` (API 26)
+with the size-optimised `release-android` profile. Kotlin bindings come from
+`crates/skywave-core-ffi/gen-kotlin.sh`.
+
 ## License
 
 Licensed under either of [MIT](https://opensource.org/licenses/MIT) or

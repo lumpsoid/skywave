@@ -1595,6 +1595,8 @@ dependencies = [
  "skywave-core",
  "tempfile",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
  "uniffi",
  "uuid",
 ]

@@ -19,10 +19,24 @@
 //!     generate --library target/debug/libskywave_core_ffi.so \
 //!     --language kotlin --out-dir <out-dir>
 //! ```
+//!
+//! Build the Android libraries with
+//! `crates/skywave-core-ffi/build-android.sh <jniLibs-dir> [profile]`, which
+//! for the default size-optimised `release-android` profile runs:
+//!
+//! ```sh
+//! cargo ndk --platform 26 -t arm64-v8a -t x86_64 -o <jniLibs-dir> \
+//!     build -p skywave-core-ffi --lib --profile release-android
+//! ```
+//!
+//! Call [`logging::init_logging`] once at startup: on Android the core's
+//! `tracing` output then shows in logcat under tag `skywave`, elsewhere on
+//! stderr.
 
 uniffi::setup_scaffolding!();
 
 pub mod action;
+pub mod logging;
 pub mod view;
 
 /// The crate version and the wire protocol it speaks, e.g. `"0.1.0 (protocol 1)"`.
