@@ -221,6 +221,13 @@ impl Core {
     /// skipped in favour of a newer one. Callbacks may call
     /// [`dispatch`](Core::dispatch) but must not call `subscribe` or
     /// `unsubscribe`.
+    ///
+    /// There is no delivery thread: whichever thread publishes a change, or
+    /// finds one waiting, runs every callback. That is this thread for the
+    /// first snapshot (inside `subscribe`), the thread calling `dispatch` or
+    /// `unsubscribe`, or an engine thread. A callback must therefore be
+    /// thread-safe and return quickly — every other subscriber, and the
+    /// caller that happened to deliver, waits for it.
     pub fn subscribe(&self, callback: impl FnMut(ViewState) + Send + 'static) -> SubscriptionId {
         let delivery = &self.shared.delivery;
         let id = {
@@ -242,10 +249,14 @@ impl Core {
         id
     }
 
+    /// Detaches the callback `id`; once this returns it is not called
+    /// again. Like [`subscribe`](Core::subscribe), it must not be called
+    /// from a callback.
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        lock(&self.shared.delivery.subscribers)
-            .list
-            .retain(|s| s.id != id);
+        let delivery = &self.shared.delivery;
+        lock(&delivery.subscribers).list.retain(|s| s.id != id);
+        // Snapshots published while we held the list are still waiting.
+        delivery.drain();
     }
 
     /// The current snapshot, for heads that poll instead of subscribing.
