@@ -67,6 +67,10 @@ pub struct PendingApprovalRef {
 /// State of the connection to the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Link {
+    /// The device has never paired: there is no server to connect to.
+    /// Pairing moves it to `Connecting`; it never comes back, as a paired
+    /// device stays paired (a revoked one is `Rejected`).
+    Unpaired,
     Connecting,
     Online {
         latency_ms: u32,

@@ -83,19 +83,14 @@ fun AppShell(
     // navigates away from is the one showing.
     BackHandler(enabled = state.canGoBack) { dispatch(Action.Back) }
 
-    // Before the first pairing there is no server to link to, so the link's
-    // state ("Connecting…") would only mislead.
-    val unpaired = screen is Screen.Pairing && screen.view.paired == null
     val chrome = ShellChrome(
         banners = {
-            if (!unpaired) {
-                LinkBanner(
-                    link = state.link,
-                    queued = state.queued,
-                    onRetryNow = { dispatch(Action.RetryNow) },
-                    onPairAgain = if (onPairing) null else pairAgain,
-                )
-            }
+            LinkBanner(
+                link = state.link,
+                queued = state.queued,
+                onRetryNow = { dispatch(Action.RetryNow) },
+                onPairAgain = if (onPairing) null else pairAgain,
+            )
             AttentionBanner(state.attention, onOpenNext = { dispatch(Action.OpenNextApproval) })
         },
         snackbarHost = snackbarHost,

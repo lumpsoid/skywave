@@ -155,6 +155,8 @@ impl From<sc::PendingApprovalRef> for PendingApprovalRef {
 /// State of the connection to the server.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum Link {
+    /// Never paired: there is no server to connect to.
+    Unpaired,
     Connecting,
     Online {
         latency_ms: u32,
@@ -183,6 +185,7 @@ pub enum Link {
 impl From<sc::Link> for Link {
     fn from(l: sc::Link) -> Self {
         match l {
+            sc::Link::Unpaired => Link::Unpaired,
             sc::Link::Connecting => Link::Connecting,
             sc::Link::Online { latency_ms } => Link::Online { latency_ms },
             sc::Link::CatchingUp { have, server } => Link::CatchingUp {
@@ -1476,6 +1479,7 @@ mod tests {
     #[test]
     fn link_converts_every_variant() {
         let converted: Vec<Link> = convert(vec![
+            sc::Link::Unpaired,
             sc::Link::Connecting,
             sc::Link::Online { latency_ms: 42 },
             sc::Link::CatchingUp {
@@ -1487,6 +1491,7 @@ mod tests {
         assert_eq!(
             converted,
             [
+                Link::Unpaired,
                 Link::Connecting,
                 Link::Online { latency_ms: 42 },
                 Link::CatchingUp { have: 3, server: 9 },

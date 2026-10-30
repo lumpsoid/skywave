@@ -106,6 +106,7 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
     let views = Views::subscribe(&core);
     assert_eq!(views.count(), 1, "current snapshot right away");
     assert!(matches!(views.last().screen, Screen::Pairing(_)));
+    assert_eq!(views.last().link, Link::Unpaired);
 
     let seam = core.seam();
     let requests = seam.take_requests().unwrap();
@@ -126,6 +127,10 @@ fn pairing_runs_through_the_seam_and_survives_restart() {
             fingerprint: "ab:cd".into(),
         }]
     );
+    // Nothing to retry while unpaired, even mid-pairing.
+    core.dispatch(Action::RetryNow).unwrap();
+    assert!(drain(&requests).is_empty());
+    assert_eq!(views.last().link, Link::Unpaired);
     let pairing_status = |view: ViewState| match view.screen {
         Screen::Pairing(pairing) => pairing.status,
         other => panic!("expected pairing, got {other:?}"),

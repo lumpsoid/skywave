@@ -41,7 +41,8 @@ import java.time.ZoneId
 
 /**
  * The connection's state, under the top bar of every screen. Quiet while
- * online; [onPairAgain] is null where pairing is already on screen.
+ * online, absent while unpaired (there is no server to link to);
+ * [onPairAgain] is null where pairing is already on screen.
  */
 @Composable
 fun LinkBanner(
@@ -52,7 +53,7 @@ fun LinkBanner(
     modifier: Modifier = Modifier,
 ) {
     when (link) {
-        is Link.Online -> Unit
+        Link.Unpaired, is Link.Online -> Unit
         Link.Connecting -> QuietLine(stringResource(R.string.link_connecting), modifier) {
             CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp)
         }

@@ -110,6 +110,8 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
     let queued_part = (queued > 0).then(|| format!(" · {queued} queued"));
     let queued_part = queued_part.as_deref().unwrap_or("");
     match link {
+        // Nothing to connect to: the pairing screen says what to do.
+        Link::Unpaired => String::new(),
         Link::Connecting => format!("connecting…{queued_part}"),
         Link::Online { latency_ms } => format!("online · {latency_ms} ms{queued_part}"),
         Link::CatchingUp { have, server } => {
@@ -142,6 +144,7 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
 
 fn banner_style(link: &Link) -> Style {
     let (fg, bg) = match link {
+        Link::Unpaired => return Style::new(),
         Link::Online { .. } => (Color::Black, Color::Green),
         Link::Connecting | Link::CatchingUp { .. } => (Color::Black, Color::Cyan),
         Link::Reconnecting { .. } => (Color::Black, Color::Yellow),
