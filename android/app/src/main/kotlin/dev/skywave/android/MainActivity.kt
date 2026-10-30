@@ -15,24 +15,45 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.skywave.android.core.CoreStartup
+import dev.skywave.android.core.label
+import dev.skywave.core.ViewState
 import dev.skywave.core.coreVersion
 
-/** Single Activity (D18). Placeholder until A07 renders `ViewState.screen`. */
+/**
+ * Single Activity (D18). The core lives in [SkywaveApp], so recreating this
+ * Activity (rotation) only re-collects its state. Placeholder until A08.
+ */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val version = coreVersion()
+        val startup = (application as SkywaveApp).core
         setContent {
             SkywaveTheme {
-                Placeholder(version)
+                when (startup) {
+                    is CoreStartup.Ready -> {
+                        val view by startup.repository.state.collectAsStateWithLifecycle()
+                        Placeholder(version, view.toLines())
+                    }
+                    is CoreStartup.Failed -> Placeholder(version, listOf("Could not start", startup.reason))
+                }
             }
         }
     }
 }
+
+private fun ViewState.toLines(): List<String> = listOf(
+    "screen ${screen.label()}",
+    "link ${link.label()}",
+    "queued $queued",
+)
 
 @Composable
 private fun SkywaveTheme(content: @Composable () -> Unit) {
@@ -43,7 +64,7 @@ private fun SkywaveTheme(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun Placeholder(version: String) {
+private fun Placeholder(version: String, lines: List<String>) {
     Scaffold { padding ->
         Column(
             modifier = Modifier.fillMaxSize().padding(padding),
@@ -52,6 +73,7 @@ private fun Placeholder(version: String) {
         ) {
             Text("Skywave", style = MaterialTheme.typography.headlineLarge)
             Text("core $version", style = MaterialTheme.typography.bodyMedium)
+            lines.forEach { Text(it, style = MaterialTheme.typography.bodyLarge) }
         }
     }
 }
@@ -59,5 +81,5 @@ private fun Placeholder(version: String) {
 @Preview
 @Composable
 private fun PlaceholderPreview() {
-    SkywaveTheme { Placeholder("0.0.0 (protocol 0)") }
+    SkywaveTheme { Placeholder("0.0.0 (protocol 0)", listOf("screen Pairing", "link Connecting", "queued 0")) }
 }
