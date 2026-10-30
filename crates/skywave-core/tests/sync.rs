@@ -507,3 +507,76 @@ async fn renames_converge_on_the_last_in_log_order() {
     }
     assert_same_view(&a, &b).await;
 }
+
+/// One device archives a session online while the other is offline; the
+/// offline one archives another session and writes to both. Each shows its
+/// own changes at once, then both converge: the messages, logged after the
+/// archiving, bring both sessions back, and archiving alone never reorders
+/// the list.
+#[tokio::test(flavor = "multi_thread")]
+async fn archiving_converges_and_a_message_brings_a_session_back() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let older = a.create_session(&daemon).await;
+    let newer = a.create_session(&daemon).await;
+    let kept = a.create_session(&daemon).await;
+    daemon.settle(&[&a, &b], SOON).await;
+    let ids = |rows: Vec<SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+    let archive = |session_id| Action::SetSessionArchived {
+        session_id,
+        archived: true,
+    };
+    let archived =
+        |events: &[Event]| count(events, |k| matches!(k, EventKind::SessionArchived { .. }));
+
+    // A archives online: both devices move it, and nothing else moves.
+    a.dispatch(archive(older));
+    assert_eq!(ids(a.archived_list().await), vec![older], "shown at once");
+    daemon
+        .wait_log("a's archiving", |events| archived(events) == 1)
+        .await;
+    daemon.settle(&[&a, &b], SOON).await;
+    for client in [&a, &b] {
+        assert_eq!(ids(client.session_list().await), vec![kept, newer]);
+        assert_eq!(ids(client.archived_list().await), vec![older]);
+    }
+
+    // B, offline, archives `newer` and then writes to it and to `older`.
+    proxy_b.down();
+    b.wait("b offline", |_, view| is_reconnecting(&view.link))
+        .await;
+    b.dispatch(archive(newer));
+    assert_eq!(ids(b.archived_list().await), vec![newer, older]);
+    for session_id in [newer, older] {
+        b.dispatch(Action::SendMessage {
+            session_id,
+            text: "back to work".into(),
+        });
+    }
+    assert!(
+        b.archived_list().await.is_empty(),
+        "the messages win locally"
+    );
+    assert_eq!(ids(b.session_list().await), vec![kept, newer, older]);
+    proxy_b.up();
+    daemon
+        .wait_log("b's commands", |events| {
+            archived(events) == 2 && user_messages(events).len() == 2
+        })
+        .await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    for client in [&a, &b] {
+        assert!(client.archived_list().await.is_empty());
+        let mut active = ids(client.session_list().await);
+        active.sort_by_key(|id| id.0);
+        let mut all = vec![older, newer, kept];
+        all.sort_by_key(|id| id.0);
+        assert_eq!(active, all);
+    }
+    assert_same_view(&a, &b).await;
+}

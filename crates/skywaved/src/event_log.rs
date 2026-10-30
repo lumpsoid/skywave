@@ -14,7 +14,7 @@
 //!   [`EventLog::append`] and [`EventLog::cancel_approval`]. It learns about
 //!   new commands from the log itself: every accepted command is an event
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
-//!   `SessionRenamed`, `SessionCreated`),
+//!   `SessionRenamed`, `SessionArchived`, `SessionCreated`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -158,7 +158,8 @@ impl EventLog {
             | EventKind::ApprovalCancelled { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
-            | EventKind::SessionRenamed { .. } => {
+            | EventKind::SessionRenamed { .. }
+            | EventKind::SessionArchived { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -319,13 +320,16 @@ pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKi
                 params![id.0.to_string(), sql_seq],
             )?;
         }
-        // A stopped turn ends with the state change the agent reports.
+        // A stopped turn ends with the state change the agent reports. No
+        // archived flag is kept: nothing on the server reads it, clients
+        // fold `EventKind::archived_effect` themselves.
         EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
         | EventKind::ToolCall { .. }
         | EventKind::ToolResult { .. }
         | EventKind::SessionStopped
-        | EventKind::SessionRenamed { .. } => {}
+        | EventKind::SessionRenamed { .. }
+        | EventKind::SessionArchived { .. } => {}
     }
     Ok(seq)
 }
@@ -382,6 +386,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::TurnInterrupted => "TurnInterrupted",
         EventKind::SessionStopped => "SessionStopped",
         EventKind::SessionRenamed { .. } => "SessionRenamed",
+        EventKind::SessionArchived { .. } => "SessionArchived",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
     }
 }

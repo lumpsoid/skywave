@@ -11,8 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search;
 use skywave_core::{
     Action, BlobPolicy, BlobState, Completion, CompletionStatus, CoreError, Decision, Delivery,
-    Entry, Link, LinkRejection, Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq,
-    SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome, ViewState,
+    Entry, Link, LinkRejection, ListKind, Outgoing, PairingView, PendingSession, Query, Route,
+    Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -1172,9 +1172,26 @@ impl App {
                 KeyCode::Enter => self
                     .selected_index(list)
                     .map(|i| Action::OpenSession(list.sessions[i].id)),
-                KeyCode::Char('n') => {
+                // A new session is active: created from the active list.
+                KeyCode::Char('n') if list.kind == ListKind::Active => {
                     self.ui.prompt = Some(Prompt::new(PromptKind::Create, String::new()));
                     None
+                }
+                // The row leaves the list; the selection moves to its
+                // neighbour (`keep_selection`).
+                KeyCode::Char('a') => {
+                    let row = &list.sessions[self.selected_index(list)?];
+                    Some(Action::SetSessionArchived {
+                        session_id: row.id,
+                        archived: list.kind == ListKind::Active,
+                    })
+                }
+                KeyCode::Char('A') => Some(Action::Navigate(match list.kind {
+                    ListKind::Active => Route::ArchivedSessions,
+                    ListKind::Archived => Route::SessionList,
+                })),
+                KeyCode::Esc if list.kind == ListKind::Archived => {
+                    Some(Action::Navigate(Route::SessionList))
                 }
                 KeyCode::Char('r') => {
                     let row = &list.sessions[self.selected_index(list)?];
@@ -1428,6 +1445,8 @@ impl App {
                     session.search = None;
                     None
                 }
+                // Back to the list the session is on.
+                KeyCode::Esc if view.archived => Some(Action::Navigate(Route::ArchivedSessions)),
                 KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
                 KeyCode::Char('/') => {
                     session.open_search();

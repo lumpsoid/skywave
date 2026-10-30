@@ -68,6 +68,14 @@ pub enum Action {
         session_id: SessionId,
         name: String,
     },
+    /// Move the session to the archived list (`true`) or back (`false`).
+    /// Absolute, never a toggle, so a resend cannot flip it twice. It moves
+    /// at once; a message sent to it later brings it back on every device.
+    /// Archiving does not stop the agent.
+    SetSessionArchived {
+        session_id: SessionId,
+        archived: bool,
+    },
     OpenSession(SessionId),
     /// Open the session of the next approval in
     /// [`Attention::approvals`](crate::Attention::approvals) outside the
@@ -97,7 +105,11 @@ pub enum Action {
 /// [`Action::OpenSession`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
+    /// The active sessions.
     SessionList,
+    /// The archived sessions, shown as a
+    /// [`ListKind::Archived`](crate::ListKind::Archived) session list.
+    ArchivedSessions,
     Settings,
     Pairing,
 }

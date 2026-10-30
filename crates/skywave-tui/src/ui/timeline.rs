@@ -277,6 +277,21 @@ impl Layout<'_> {
                 spans.push(Span::raw(what).dark_gray());
                 return vec![Line::from(spans)];
             }
+            Entry::Archived { archived, by, own } => {
+                let who = if *own {
+                    "you".to_owned()
+                } else {
+                    device_label(*by)
+                };
+                let what = if *archived {
+                    format!("archived by {who}")
+                } else {
+                    format!("brought back from the archive by {who}")
+                };
+                let mut spans = lead;
+                spans.push(Span::raw(what).dark_gray());
+                return vec![Line::from(spans)];
+            }
             Entry::AgentErrored { message } => {
                 return self.message(
                     lead,

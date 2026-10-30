@@ -159,6 +159,14 @@ fn all_event_kinds() -> Vec<EventKind> {
             name: None,
             by: device(),
         },
+        EventKind::SessionArchived {
+            archived: true,
+            by: device(),
+        },
+        EventKind::SessionArchived {
+            archived: false,
+            by: device(),
+        },
         EventKind::SessionStateChanged(SessionState::Idle),
         EventKind::SessionStateChanged(SessionState::AgentWorking),
         EventKind::SessionStateChanged(SessionState::Errored {
@@ -197,6 +205,14 @@ fn all_command_kinds() -> Vec<CommandKind> {
         CommandKind::RenameSession {
             session_id: session(),
             name: None,
+        },
+        CommandKind::SetSessionArchived {
+            session_id: session(),
+            archived: true,
+        },
+        CommandKind::SetSessionArchived {
+            session_id: session(),
+            archived: false,
         },
     ]
 }

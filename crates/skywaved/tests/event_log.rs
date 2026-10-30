@@ -659,6 +659,83 @@ fn rename_needs_a_known_session_and_dedups_resends() {
     assert_eq!(again, seq.next());
 }
 
+// --- SetSessionArchived -----------------------------------------------------
+
+/// The archived flag of the fixture's one session, folded from the log as
+/// clients fold it.
+fn archived(f: &Fixture) -> bool {
+    f.all_kinds().iter().fold(false, |archived, kind| {
+        kind.archived_effect().unwrap_or(archived)
+    })
+}
+
+#[test]
+fn archive_logs_the_absolute_value_and_a_message_brings_it_back() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let set = |archived| Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSessionArchived {
+            session_id: session,
+            archived,
+        },
+    };
+    // Twice the same value: both logged, neither flips it back.
+    for _ in 0..2 {
+        accepted(f.log.handle(&mut f.storage.db, device, &set(true)).unwrap());
+        assert_eq!(
+            f.all_kinds().last().unwrap(),
+            &EventKind::SessionArchived {
+                archived: true,
+                by: device
+            }
+        );
+        assert!(archived(&f));
+    }
+    // A message from any device brings it back, by the shared rule.
+    accepted(f.handle(CommandKind::SendMessage {
+        session_id: session,
+        text: "again".into(),
+    }));
+    assert!(!archived(&f));
+    accepted(f.log.handle(&mut f.storage.db, device, &set(true)).unwrap());
+    accepted(
+        f.log
+            .handle(&mut f.storage.db, device, &set(false))
+            .unwrap(),
+    );
+    assert!(!archived(&f));
+}
+
+#[test]
+fn archive_needs_a_known_session_and_dedups_resends() {
+    let mut f = Fixture::new();
+    assert_eq!(
+        f.handle(CommandKind::SetSessionArchived {
+            session_id: SessionId::new(),
+            archived: true,
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+    };
+    let first = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+    let seq = accepted(first.clone());
+    assert_eq!(
+        f.log.handle(&mut f.storage.db, device, &command).unwrap(),
+        first
+    );
+    assert_eq!(f.log.head(), seq, "a resend appends nothing");
+}
+
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
@@ -681,6 +758,10 @@ fn agent_appends_are_checked() {
         },
         EventKind::SessionRenamed {
             name: Some("x".into()),
+            by: DeviceId::new(),
+        },
+        EventKind::SessionArchived {
+            archived: true,
             by: DeviceId::new(),
         },
     ] {

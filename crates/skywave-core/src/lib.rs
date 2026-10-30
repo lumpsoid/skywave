@@ -66,7 +66,7 @@ pub use view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
     BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId, Completion,
     CompletionStatus, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, FailReason, Link,
-    LinkRejection, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
+    LinkRejection, ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
     PendingSession, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView,
     SettingsView, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, ViewState,
 };

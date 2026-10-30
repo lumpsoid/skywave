@@ -136,6 +136,11 @@ UPDATE sessions SET first_prompt = (
     ORDER BY seq
     LIMIT 1);
 "#,
+    r#"
+-- `SessionSummary::archived`. A replica from before this holds no archive
+-- events, so every session starts active: nothing to backfill.
+ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -798,7 +803,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt";
+    stopped, notable, name, first_prompt, archived";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -813,7 +818,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
         ),
         params![
             summary.id.0.to_string(),
@@ -826,6 +831,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             u64_sql(summary.notable)?,
             summary.name,
             summary.first_prompt,
+            summary.archived,
         ],
     )?;
     Ok(())
@@ -847,6 +853,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         notable: u64_col(row, 7)?,
         name: row.get(8)?,
         first_prompt: row.get(9)?,
+        archived: row.get(10)?,
     })
 }
 

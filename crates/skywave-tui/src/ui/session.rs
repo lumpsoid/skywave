@@ -45,6 +45,9 @@ pub(super) fn render(
         title.push(Span::raw(format!(" · {}", clean(workdir))).dark_gray());
     }
     title.push(Span::raw(format!(" · {} ", state_badge(&session.state).0)));
+    if session.archived {
+        title.push(Span::raw("· archived · a message brings it back ").dark_gray());
+    }
     let block = Block::bordered().title(Line::from(title));
     let inner = block.inner(area);
     frame.render_widget(block, area);

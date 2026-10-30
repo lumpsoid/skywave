@@ -25,8 +25,8 @@ use crate::transport::TransportError;
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
     BodyView, CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link,
-    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen,
-    Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView,
+    ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession,
+    Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView,
     TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
@@ -64,6 +64,7 @@ struct Title {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
     SessionList,
+    Archived,
     Settings,
     Pairing,
     Session(SessionId),
@@ -73,6 +74,7 @@ impl From<Route> for Place {
     fn from(route: Route) -> Self {
         match route {
             Route::SessionList => Place::SessionList,
+            Route::ArchivedSessions => Place::Archived,
             Route::Settings => Place::Settings,
             Route::Pairing => Place::Pairing,
         }
@@ -261,6 +263,18 @@ impl Model {
                 // As the server will log it, so the title shows it unchanged.
                 let name = skywave_proto::normalise_session_name(&name);
                 self.enqueue(CommandKind::RenameSession { session_id, name })
+            }
+            Action::SetSessionArchived {
+                session_id,
+                archived,
+            } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SetSessionArchived {
+                    session_id,
+                    archived,
+                })
             }
             Action::OpenSession(id) => {
                 if self.device.is_none() || self.summary(id).is_none() {
@@ -686,10 +700,11 @@ impl Model {
                 server_address: self.settings.server_address.clone(),
                 device_id: self.device,
             }),
-            Place::SessionList => Screen::SessionList(self.session_list()),
+            Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
+            Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
             Place::Session(id) => match self.session_view(id) {
                 Some(view) => Screen::Session(Box::new(view)),
-                None => Screen::SessionList(self.session_list()),
+                None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
         }
     }
@@ -704,10 +719,13 @@ impl Model {
         }
     }
 
-    fn session_list(&self) -> SessionListView {
-        let sessions = self
+    fn session_list(&self, kind: ListKind) -> SessionListView {
+        let (listed, other): (Vec<_>, Vec<_>) = self
             .sessions
             .iter()
+            .partition(|s| self.archived(s) == (kind == ListKind::Archived));
+        let sessions = listed
+            .into_iter()
             .map(|s| {
                 let title = self.title(s);
                 SessionRow {
@@ -727,6 +745,15 @@ impl Model {
                 }
             })
             .collect();
+        if kind == ListKind::Archived {
+            return SessionListView {
+                kind,
+                sessions,
+                other_count: other.len(),
+                creating: Vec::new(),
+                completion: None,
+            };
+        }
         let creating = self
             .outbox
             .iter()
@@ -747,7 +774,9 @@ impl Model {
             .completer
             .view(self.sessions.iter().filter_map(|s| s.workdir.as_deref()));
         SessionListView {
+            kind,
             sessions,
+            other_count: other.len(),
             creating,
             completion,
         }
@@ -788,6 +817,7 @@ impl Model {
             title: title.text,
             named: title.named,
             rename: title.rename,
+            archived: self.archived(summary),
             workdir: summary.workdir.clone(),
             state: session_state(summary),
             timeline: self.timeline(id, events),
@@ -825,6 +855,36 @@ impl Model {
             named: name.is_some(),
             rename: rename.map(|(_, outgoing)| outgoing),
         }
+    }
+
+    /// Whether a session is on the archived list: the replica's flag, unless
+    /// this device's latest archiving of it is on its way (and has not
+    /// failed); either way a message queued here after that brings it back,
+    /// as it will in the log.
+    fn archived(&self, summary: &SessionSummary) -> bool {
+        let id = summary.id;
+        let on_its_way = |e: &OutboxEntry| {
+            let outgoing = Outgoing::from(&e.status);
+            !self.in_replica(outgoing) && !matches!(outgoing, Outgoing::Failed(_))
+        };
+        let latest = self.outbox.iter().rposition(|e| {
+            matches!(e.command.kind, CommandKind::SetSessionArchived { session_id, .. } if session_id == id)
+        });
+        let archived = match latest.map(|i| &self.outbox[i]) {
+            Some(e) if on_its_way(e) => {
+                matches!(
+                    e.command.kind,
+                    CommandKind::SetSessionArchived { archived: true, .. }
+                )
+            }
+            _ => summary.archived,
+        };
+        let after = latest.map_or(0, |i| i + 1);
+        let message = self.outbox[after..].iter().any(|e| {
+            on_its_way(e)
+                && matches!(&e.command.kind, CommandKind::SendMessage { session_id, .. } if *session_id == id)
+        });
+        archived && !message
     }
 
     /// The latest outbox command matching `kind`, until its effect is in the
@@ -982,6 +1042,11 @@ impl Model {
                 EventKind::SessionStopped => Some(Entry::Stopped),
                 EventKind::SessionRenamed { name, by } => Some(Entry::Renamed {
                     name: name.clone(),
+                    by: *by,
+                    own: self.device == Some(*by),
+                }),
+                EventKind::SessionArchived { archived, by } => Some(Entry::Archived {
+                    archived: *archived,
                     by: *by,
                     own: self.device == Some(*by),
                 }),
@@ -1357,7 +1422,9 @@ mod tests {
         assert_eq!(
             view.screen,
             Screen::SessionList(SessionListView {
+                kind: ListKind::Active,
                 sessions: Vec::new(),
+                other_count: 0,
                 creating: Vec::new(),
                 completion: None,
             })
@@ -1927,6 +1994,181 @@ mod tests {
         // The alert names the session by its title too.
         f.log(old, vec![approval_requested(ApprovalId::new(), None)]);
         assert_eq!(f.model.view().attention.approvals[0].title, "oldest");
+    }
+
+    fn archive(session_id: SessionId, archived: bool) -> Action {
+        Action::SetSessionArchived {
+            session_id,
+            archived,
+        }
+    }
+
+    fn archived_event(archived: bool, by: DeviceId) -> EventKind {
+        EventKind::SessionArchived { archived, by }
+    }
+
+    /// The active and the archived list, each most recently active first.
+    fn lists(f: &mut Fixture) -> (Vec<SessionId>, Vec<SessionId>) {
+        let ids = |view: SessionListView| view.sessions.iter().map(|r| r.id).collect::<Vec<_>>();
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        let archived = f.list_view();
+        assert_eq!(archived.kind, ListKind::Archived);
+        f.dispatch(Action::Navigate(Route::SessionList));
+        let active = f.list_view();
+        assert_eq!(active.kind, ListKind::Active);
+        assert_eq!(active.other_count, archived.sessions.len());
+        assert_eq!(archived.other_count, active.sessions.len());
+        (ids(active), ids(archived))
+    }
+
+    #[test]
+    fn archiving_moves_the_row_at_once_and_settles_from_the_log() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let new = f.session("/srv/new");
+        let command = queued(&f.dispatch(archive(old, true)));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetSessionArchived {
+                session_id: old,
+                archived: true,
+            }
+        );
+        assert_eq!(lists(&mut f), (vec![new], vec![old]));
+        f.model.command_sending(command.id, Utc::now());
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
+        // Accepted but not pulled yet: still newer than the replica.
+        assert_eq!(lists(&mut f), (vec![new], vec![old]));
+        f.log(old, vec![archived_event(true, f.me)]);
+        assert_eq!(lists(&mut f), (vec![new], vec![old]));
+
+        // An archived session opens and works as usual, and says so.
+        f.open(old);
+        assert!(f.session_view().archived);
+        assert_eq!(
+            entries(&f),
+            vec![Entry::Archived {
+                archived: true,
+                by: f.me,
+                own: true,
+            }]
+        );
+        f.open(new);
+        assert!(!f.session_view().archived);
+
+        // Brought back from the archived list.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        queued(&f.dispatch(archive(old, false)));
+        assert_eq!(lists(&mut f), (vec![new, old], vec![]));
+        assert!(
+            f.dispatch(archive(SessionId::new(), true)).is_empty(),
+            "unknown here"
+        );
+    }
+
+    #[test]
+    fn a_failed_archive_reverts() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        let command = queued(&f.dispatch(archive(sid, true)));
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        // The replica's value stands: archived elsewhere, still archived.
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+    }
+
+    #[test]
+    fn a_later_message_brings_the_session_back() {
+        let send = |sid: SessionId, text: &str| Action::SendMessage {
+            session_id: sid,
+            text: text.into(),
+        };
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        // Archive, then a message, both still queued: active, as the log
+        // will have it.
+        queued(&f.dispatch(archive(sid, true)));
+        let sent = queued(&f.dispatch(send(sid, "more")));
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        // A failed message brings nothing back.
+        f.model.command_result(
+            sent.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+
+        // Archived by another device: a message queued here brings it back
+        // at once.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+        queued(&f.dispatch(send(sid, "back")));
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        f.open(sid);
+        assert!(!f.session_view().archived);
+
+        // A message from any device in the log does the same.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        f.log(sid, vec![message("from the phone")]);
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        // Archiving after a message queued earlier wins.
+        queued(&f.dispatch(send(sid, "first")));
+        queued(&f.dispatch(archive(sid, true)));
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+    }
+
+    #[test]
+    fn archiving_keeps_the_order_is_not_unread_and_approvals_still_count() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let mid = f.session("/srv/mid");
+        let new = f.session("/srv/new");
+        f.log(old, vec![agent("done")]);
+        f.log(new, vec![agent("done")]);
+        assert_eq!(lists(&mut f).0, vec![new, old, mid]);
+        let other = DeviceId::new();
+        f.log(old, vec![archived_event(true, other)]);
+        f.log(mid, vec![archived_event(true, other)]);
+        assert_eq!(lists(&mut f), (vec![new], vec![old, mid]));
+        assert_eq!(unread(&f, new), 1);
+        f.log(old, vec![archived_event(false, other)]);
+        assert_eq!(
+            lists(&mut f),
+            (vec![new, old], vec![mid]),
+            "archiving is not activity"
+        );
+        assert_eq!(unread(&f, old), 1, "nor news");
+
+        // An approval in an archived session still alerts, and Ctrl-G opens
+        // it; its row carries the count.
+        let approval = ApprovalId::new();
+        f.log(mid, vec![approval_requested(approval, None)]);
+        assert_eq!(lists(&mut f).1, vec![mid]);
+        let attention = f.model.view().attention;
+        assert_eq!(attention.approvals[0].session_id, mid);
+        assert_eq!(attention.elsewhere, 1);
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        assert_eq!(row(&f, mid).pending_approvals, 1);
+        f.dispatch(Action::OpenNextApproval);
+        assert_eq!(f.model.open_session(), Some(mid));
     }
 
     #[test]
