@@ -26,6 +26,11 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
   --setting-sources project --strict-mcp-config  [scenario flags]
 ```
 
+New recordings are made with `tests/support/record-claude.sh`, which sits
+between skywaved and the real CLI and writes this format; `--scrub` applies
+the scrubbing below. `rules_granted.ndjson` (rule grants, task d29758) is
+not recorded yet; the runbook is in `docs/agents/claude-code.md` §3.5.
+
 ## Scrubbing
 
 - `account.email` became `user@example.com`, and `account.organization` became `<scrubbed-organization>`. Both are in the `initialize` control_response.
