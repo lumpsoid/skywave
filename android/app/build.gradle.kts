@@ -47,6 +47,19 @@ android {
     }
 }
 
+composeCompiler {
+    // The core's generated types are immutable snapshots; see the file.
+    stabilityConfigurationFiles.add(layout.projectDirectory.file("compose-stability.conf"))
+
+    // Off by default. `./gradlew :app:assembleDebug -Pskywave.composeReports`
+    // writes the compiler's stability reports and metrics (which composables
+    // are skippable, which parameters are unstable) to build/compose_compiler.
+    if (providers.gradleProperty("skywave.composeReports").isPresent) {
+        reportsDestination.set(layout.buildDirectory.dir("compose_compiler"))
+        metricsDestination.set(layout.buildDirectory.dir("compose_compiler"))
+    }
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
