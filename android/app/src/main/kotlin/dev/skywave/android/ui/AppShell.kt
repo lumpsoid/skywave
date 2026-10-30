@@ -14,6 +14,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalResources
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.skywave.android.core.CoreClient
+import dev.skywave.android.ui.screens.AboutInfo
 import dev.skywave.android.ui.screens.PairingScreen
 import dev.skywave.android.ui.screens.SessionListScreen
 import dev.skywave.android.ui.screens.SessionScreen
@@ -26,10 +27,11 @@ import dev.skywave.core.ViewState
 
 /**
  * [AppShell] fed from [client]: its snapshots, its actions, its failures as
- * snackbars. [pairInbox] carries pairing links opened from outside.
+ * snackbars. [pairInbox] carries pairing links opened from outside; [about]
+ * is what Settings shows of this build and device.
  */
 @Composable
-fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox) {
+fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox, about: AboutInfo) {
     val state by client.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val resources = LocalResources.current
@@ -38,7 +40,7 @@ fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox) {
         client.messages.collect { snackbar.showSnackbar(it.text(resources)) }
     }
     val dispatch = remember(client) { { action: Action -> client.dispatch(action) } }
-    AppShell(state, dispatch, pairInbox, snackbar)
+    AppShell(state, dispatch, pairInbox, about, snackbar)
 }
 
 /**
@@ -52,6 +54,7 @@ fun AppShell(
     state: ViewState,
     dispatch: (Action) -> Unit,
     pairInbox: PairInbox,
+    about: AboutInfo,
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
     val screen = state.screen
@@ -102,6 +105,6 @@ fun AppShell(
         is Screen.Pairing -> PairingScreen(screen.view, chrome, dispatch, pairInbox)
         is Screen.SessionList -> SessionListScreen(screen.view, chrome, dispatch)
         is Screen.Session -> SessionScreen(screen.view, chrome, dispatch)
-        is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch)
+        is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch, about)
     }
 }

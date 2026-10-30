@@ -3,6 +3,7 @@ package dev.skywave.android.ui
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.tooling.preview.Preview
+import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.core.Attention
 import dev.skywave.core.Link
 import dev.skywave.core.LinkRejection
@@ -90,7 +91,7 @@ internal object Samples {
 @Composable
 private fun ShellPreview(state: ViewState) {
     val inbox = remember { PairInbox { PairInput.Unreadable("previews read no links") } }
-    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox) }
+    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about) }
 }
 
 @Preview(name = "Connecting")

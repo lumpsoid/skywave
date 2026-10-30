@@ -50,7 +50,7 @@ class SkywaveApp : Application() {
                 // not load ends at the Failed screen. Routes the core's
                 // tracing to logcat; null keeps the default filter.
                 initLogging(null)
-                SkywaveCore.open(dataDir.path, deviceName())
+                SkywaveCore.open(dataDir.path, deviceName)
             },
             scope = appScope,
             dispatchContext = Dispatchers.IO,
@@ -63,11 +63,15 @@ class SkywaveApp : Application() {
         return startup
     }
 
-    /** D17: the user-visible device name if set, else the model. */
-    private fun deviceName(): String =
+    /**
+     * D17: the user-visible device name if set, else the model. Read once,
+     * so the name Settings shows is the one this process pairs with.
+     */
+    val deviceName: String by lazy {
         Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME)
             ?.takeIf { it.isNotBlank() }
             ?: Build.MODEL
+    }
 
     private companion object {
         const val TAG = "SkywaveApp"
