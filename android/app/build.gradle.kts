@@ -67,6 +67,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.work.runtime)
     // ImmutableList: composable parameters the Compose compiler can trust as stable.
     implementation(libs.kotlinx.collections.immutable)
     implementation(platform(libs.compose.bom))
@@ -84,6 +85,7 @@ dependencies {
     testImplementation(platform(libs.compose.bom))
     testImplementation(libs.compose.ui.test.junit4)
     testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.work.testing)
 }
 
 // --- Rust core -------------------------------------------------------------

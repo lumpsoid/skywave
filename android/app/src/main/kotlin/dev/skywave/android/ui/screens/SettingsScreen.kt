@@ -12,14 +12,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
@@ -31,6 +35,7 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.skywave.android.R
 import dev.skywave.android.ui.ScreenScaffold
 import dev.skywave.android.ui.ShellChrome
@@ -38,6 +43,7 @@ import dev.skywave.core.Action
 import dev.skywave.core.BlobPolicy
 import dev.skywave.core.Route
 import dev.skywave.core.SettingsView
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -56,12 +62,30 @@ data class AboutInfo(
 )
 
 /**
+ * "Stay connected" (A15): keep the link up in the background for live
+ * approval alerts. This device's choice, with no rule in it, so it is not in
+ * [SettingsView] (D2); [set] also starts or stops what it controls.
+ */
+@Stable
+interface StayConnectedSetting {
+    val on: StateFlow<Boolean>
+
+    fun set(on: Boolean)
+}
+
+/**
  * Settings (D2: the core owns every rule). Picking a download policy only
  * tells the core; what switching starts or drops is the core's business,
  * and the choice shown is always the one in [view].
  */
 @Composable
-fun SettingsScreen(view: SettingsView, chrome: ShellChrome, dispatch: (Action) -> Unit, about: AboutInfo) {
+fun SettingsScreen(
+    view: SettingsView,
+    chrome: ShellChrome,
+    dispatch: (Action) -> Unit,
+    about: AboutInfo,
+    stayConnected: StayConnectedSetting,
+) {
     ScreenScaffold(title = stringResource(R.string.settings_title), chrome = chrome) { padding ->
         Column(
             Modifier
@@ -80,7 +104,10 @@ fun SettingsScreen(view: SettingsView, chrome: ShellChrome, dispatch: (Action) -
                     R.string.settings_downloads_eager, R.string.settings_downloads_eager_body,
                 )
             }
-            // A15: the background-sync toggle belongs here, under Downloads.
+
+            HorizontalDivider()
+            SectionHeader(R.string.settings_section_background)
+            StayConnectedToggle(stayConnected)
 
             HorizontalDivider()
             SectionHeader(R.string.settings_section_server)
@@ -129,6 +156,18 @@ private fun PolicyOption(
             role = Role.RadioButton,
             onClick = { if (!selected) dispatch(Action.SetBlobPolicy(policy)) },
         ),
+    )
+}
+
+/** The switch shows the stored choice; the row is the control. */
+@Composable
+private fun StayConnectedToggle(setting: StayConnectedSetting) {
+    val on by setting.on.collectAsStateWithLifecycle()
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.settings_stay_connected)) },
+        supportingContent = { Text(stringResource(R.string.settings_stay_connected_body)) },
+        trailingContent = { Switch(checked = on, onCheckedChange = null) },
+        modifier = Modifier.toggleable(value = on, role = Role.Switch, onValueChange = setting::set),
     )
 }
 

@@ -5,4 +5,14 @@
     <string name="notif_channel_approvals_description">An agent is waiting for you to approve a tool call</string>
     <string name="notif_approval_title">Approval needed</string>
     <string name="notif_untitled_session">A session</string>
+
+    <!-- Stay connected (A15): the ongoing notification while the service runs -->
+    <string name="notif_channel_connection">Connection</string>
+    <string name="notif_channel_connection_description">Shown while Skywave stays connected for live approval alerts</string>
+    <string name="connection_title">Staying connected</string>
+    <string name="connection_connected">Connected</string>
+    <string name="connection_connecting">Connecting…</string>
+    <string name="connection_offline">Offline · retry in</string>
+    <string name="connection_refused">The server refused this device</string>
+    <string name="connection_not_paired">Not paired</string>
 </resources>

@@ -167,11 +167,24 @@ handling proves inadequate.
 The head calls `suspend()` when the app goes to the background
 (`ProcessLifecycleOwner` `ON_STOP`) and `resume()` on `ON_START`. Actions
 taken while suspended still persist and queue (D7).
-**Open (A15):** how a new approval reaches the user while the app is in the
-background. Options:
-- periodic WorkManager catch-up (resume, pull, notify, suspend);
-- opt-in foreground service keeping the link up;
-- both (WorkManager by default, foreground service as a setting).
+**Resolved (A15, 2026-10-30): both.** One owner (`CoreAwake`) decides:
+the link runs while any holder needs it (the visible app, a catch-up, the
+service) and the core is suspended once none does.
+- By default, a periodic WorkManager catch-up every 15 minutes (the
+  minimum) with a network constraint, scheduled once paired: it resumes
+  the core, waits up to 60 s for `Online` reached after the resume (or
+  `Unpaired`/`Rejected`), gives the approval notifier 2 s to post, and lets
+  go. A timeout is not retried: the next period is the retry.
+- Opt-in "Stay connected" in Settings, a head-local preference (no rule in
+  it, so not in `SettingsView`; D2): a foreground service of type
+  `specialUse` (API 34+; `dataSync` is capped at 6 h a day on API 35+ and
+  does not describe a standing connection) that holds the link up so
+  alerts arrive within seconds, with an ongoing low-importance
+  "Connection" notification. Started only from the foreground (the toggle,
+  or the app coming to the foreground with it on); not restarted on boot.
+- No wakelocks beyond WorkManager's and no polling in Kotlin: the core's
+  long-poll is the only traffic. The core still decides which approvals
+  are new; the notifier posts one notification per approval.
 
 ## D22. Android device key in app-private `filesDir`
 MVP per D9: the core's data dir, including the device key, lives under

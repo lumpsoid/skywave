@@ -70,7 +70,7 @@ class MainActivity : ComponentActivity() {
                         LocalBlobHeadReader provides coreBlobHeadReader,
                         LocalTimelineSearcher provides startup.repository.searcher,
                     ) {
-                        SkywaveRoot(startup.repository, pairInbox, remember { about(app) })
+                        SkywaveRoot(startup.repository, pairInbox, remember { about(app) }, app.stayConnected)
                     }
                     is CoreStartup.Failed -> StartupFailedScreen(startup.reason, appVersion())
                 }

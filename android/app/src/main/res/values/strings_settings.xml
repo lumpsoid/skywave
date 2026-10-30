@@ -9,6 +9,11 @@
     <string name="settings_downloads_on_demand">Download when opened</string>
     <string name="settings_downloads_on_demand_body">Fetches an attachment when you open it; saves data and storage.</string>
 
+    <!-- Background (A15) -->
+    <string name="settings_section_background">Background</string>
+    <string name="settings_stay_connected">Stay connected</string>
+    <string name="settings_stay_connected_body">Alerts within seconds while agents work, with an ongoing notification; uses more battery. Off, Skywave checks for approvals about every 15 minutes.</string>
+
     <!-- Server -->
     <string name="settings_section_server">Server</string>
     <string name="settings_server_address">Server address</string>

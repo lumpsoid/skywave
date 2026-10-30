@@ -168,6 +168,23 @@ class CoreRepositoryTest {
     }
 
     @Test
+    fun onlineAfterAResumeIsStaleUntilTheRestartedLinkReports() = runTest {
+        val core = FakeCore(viewState(link = Link.Online(5u)))
+        val repo = repository(core)
+        assertEquals(LinkStatus(Link.Online(5u), stale = false), repo.linkStatus.value)
+        repo.suspend()
+        repo.resume()
+        assertEquals(LinkStatus(Link.Online(5u), stale = true), repo.linkStatus.value)
+        // A snapshot for something else still carries the old link.
+        core.publish(viewState(link = Link.Online(5u), queued = 1u))
+        assertTrue(repo.linkStatus.value.stale)
+        core.publish(viewState(link = Link.Connecting))
+        assertEquals(LinkStatus(Link.Connecting, stale = false), repo.linkStatus.value)
+        core.publish(viewState(link = Link.Online(9u)))
+        assertEquals(LinkStatus(Link.Online(9u), stale = false), repo.linkStatus.value)
+    }
+
+    @Test
     fun openFailureBecomesFailedStartup() = runTest {
         val startup = startCore(
             open = { throw SkywaveException.Store("database is locked") },
