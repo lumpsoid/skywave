@@ -399,9 +399,25 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
     );
 }
 
-/// Key hints for the footer, and where the composer is while it shows an
-/// earlier prompt.
+/// Key hints for the footer, the search prompt while it is open, and where
+/// the composer is while it shows an earlier prompt.
 fn footer_hint(app: &App) -> Cow<'static, str> {
+    if !app.ui().help
+        && let Some((view, ui)) = app.session()
+        && let Some(search) = &ui.search
+    {
+        if search.editing {
+            return format!(
+                "/{}▏ · {} · Enter jump · Esc cancel",
+                search.query.as_str(),
+                search.count(view)
+            )
+            .into();
+        }
+        if ui.focus == Focus::Timeline {
+            return "n/N older/newer match · / new search · Esc clear search · ↑↓ select · Enter expand · Tab write · ? help".into();
+        }
+    }
     if !app.ui().help
         && let Some((_, ui)) = app.session()
         && ui.focus == Focus::Composer
@@ -442,10 +458,10 @@ fn footer_keys(app: &App) -> &'static str {
                     "e edit · Del cancel · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
-                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · / search · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
             },
             _ => {
@@ -515,6 +531,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             lines.extend([
                 section("Session"),
                 key("Ctrl-X", "interrupt the agent's turn"),
+                key("Ctrl-F", "search the timeline (also / on it)"),
                 key("PgUp / PgDn", "scroll the timeline"),
                 key("Tab", "switch between message and timeline"),
                 Line::from(""),
@@ -539,8 +556,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
+                    key("/", "search; an upper-case letter matches case"),
+                    key("n / N", "older / newer match, round the ends"),
                     key("i", "write a message"),
-                    key("Esc", "back to sessions"),
+                    key("Esc", "clear the search, else back to sessions"),
                 ]),
                 _ => lines.extend([
                     section("Message (Esc or Tab: timeline keys)"),

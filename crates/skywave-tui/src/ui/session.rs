@@ -103,6 +103,13 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
     if ui.shown_scroll().is_some() {
         spans.push(Span::raw(" · scrolled back, End follows").dark_gray());
     }
+    // While the prompt is open, the footer shows it instead.
+    if let Some(search) = ui.search.as_ref().filter(|s| !s.editing) {
+        spans.push(Span::raw(format!(" · {}", search.status(session))).yellow());
+        if search.wrapped {
+            spans.push(Span::raw(" · search wrapped").yellow().bold());
+        }
+    }
     Line::from(spans)
 }
 
@@ -182,7 +189,7 @@ fn approval_lines(
                 Vec::new(),
                 Span::styled("?", style),
                 title_spans(&prompt.tool, &prompt.summary),
-                None,
+                Vec::new(),
                 width,
             );
             // An approval with no logged call (a v1 one): the rest of its
@@ -233,11 +240,11 @@ fn gated_call(view: &ToolView, width: usize, max_rows: usize) -> Vec<Line<'stati
         Vec::new(),
         Span::styled(glyph(view.kind), style),
         title_spans(&view.name, &view.title),
-        None,
+        Vec::new(),
         width,
     );
     if let Some(detail) = &view.detail {
-        lines.extend(detail_lines(detail, 2, width));
+        lines.extend(detail_lines(detail, 2, width, None));
     }
     lines.extend(gated_content(&tool_sections(view), width, max_rows));
     lines

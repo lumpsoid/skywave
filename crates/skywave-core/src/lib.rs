@@ -18,6 +18,7 @@
 //!   errors; [`HttpsTransport`] is the mTLS implementation.
 //! - blob downloads ([`blob_dir`]) follow the [`BlobPolicy`] apart from
 //!   event sync.
+//! - [`search`]: what a search of the open session's timeline matches.
 //! - [`pairing`]: the pairing client, plus code, fingerprint and pairing
 //!   URI parsing for heads.
 
@@ -33,6 +34,7 @@ mod model;
 pub mod pairing;
 pub mod projection;
 pub mod seam;
+pub mod search;
 pub mod store;
 mod tls;
 pub mod transport;
@@ -51,6 +53,7 @@ pub use pairing::{
 };
 pub use projection::SessionSummary;
 pub use seam::{Request, Seam};
+pub use search::Query;
 pub use skywave_proto::PROTOCOL_VERSION;
 pub use store::{
     Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings,

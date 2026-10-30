@@ -8,16 +8,17 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use skywave_core::search;
 use skywave_core::{
     Action, BlobPolicy, BlobState, CoreError, Decision, Delivery, Entry, Link, LinkRejection,
-    Outgoing, PairingView, PendingSession, Route, Screen, Seq, SessionId, SessionListView,
+    Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView,
     SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::composer::Composer;
 use crate::timeline::{
-    ItemKey, delivery, discardable, find, gated_item, sections, selectable, starts_turn,
-    wanted_blob,
+    ItemKey, delivery, discardable, find, gated_item, match_hidden, sections, selectable,
+    starts_turn, wanted_blob,
 };
 
 /// How old the first unsaved composer edit gets before the draft is saved
@@ -339,6 +340,82 @@ pub struct SessionUi {
     pub opening: bool,
     /// What the last [`App::read_mark`] marked read through, and when.
     marked: Option<(Seq, Instant)>,
+    /// The search through the timeline (`/`), while one is open or kept.
+    pub search: Option<Search>,
+}
+
+/// A search through the open session's timeline. What matches is the
+/// core's ([`skywave_core::search`]); the query and which match is current
+/// are presentation state.
+#[derive(Debug, Clone)]
+pub struct Search {
+    pub query: Query,
+    /// The prompt is open: keys edit the query.
+    pub editing: bool,
+    /// Timeline indices of the matching items, oldest first.
+    pub hits: Vec<usize>,
+    /// The match jumped to last, by key so it stays put as items arrive.
+    pub current: Option<ItemKey>,
+    /// The last jump went round an end of the timeline; said until the
+    /// next key.
+    pub wrapped: bool,
+}
+
+impl Search {
+    fn new() -> Search {
+        Search {
+            query: Query::new(""),
+            editing: true,
+            hits: Vec::new(),
+            current: None,
+            wrapped: false,
+        }
+    }
+
+    /// Edits the query and finds its matches again.
+    fn edit(&mut self, view: &SessionView, edit: impl FnOnce(&mut String)) {
+        let mut text = self.query.as_str().to_owned();
+        edit(&mut text);
+        self.query = Query::new(&text);
+        self.hits = search::find(&view.timeline, &self.query);
+        self.current = None;
+    }
+
+    /// Finds the matches in a new snapshot. The current match stays on its
+    /// item; if that is gone, the match nearest its old index `old` is.
+    fn refresh(&mut self, view: &SessionView, old: Option<usize>) {
+        self.hits = search::find(&view.timeline, &self.query);
+        let Some(key) = self.current else {
+            return;
+        };
+        let index = find(view, key).or_else(|| {
+            let old = old?;
+            self.hits.iter().copied().min_by_key(|&i| i.abs_diff(old))
+        });
+        self.current = index.map(|i| ItemKey::of(&view.timeline[i]));
+    }
+
+    /// The current match's place among the matches, 1 the oldest.
+    pub fn position(&self, view: &SessionView) -> Option<usize> {
+        let index = find(view, self.current?)?;
+        Some(self.hits.iter().position(|&i| i == index)? + 1)
+    }
+
+    /// How the search stands: `3 of 17`, `17 matches` before a jump, `no
+    /// matches`.
+    pub fn count(&self, view: &SessionView) -> String {
+        match (self.hits.len(), self.position(view)) {
+            (0, _) => "no matches".to_owned(),
+            (of, Some(at)) => format!("{at} of {of}"),
+            (1, None) => "1 match".to_owned(),
+            (of, None) => format!("{of} matches"),
+        }
+    }
+
+    /// The query and how it stands: `/foo · 3 of 17`.
+    pub fn status(&self, view: &SessionView) -> String {
+        format!("/{} · {}", self.query.as_str(), self.count(view))
+    }
 }
 
 /// Browsing [`SessionView::prompts`] in the composer.
@@ -366,6 +443,7 @@ impl SessionUi {
             history: None,
             opening: view.unread_from.is_some(),
             marked: None,
+            search: None,
         }
     }
 
@@ -540,12 +618,18 @@ impl App {
         let old_item = self
             .session()
             .and_then(|(view, ui)| find(view, ui.selected?));
+        let old_match = self
+            .session()
+            .and_then(|(view, ui)| find(view, ui.search.as_ref()?.current?));
         self.view = view;
         self.keep_selection(old_index);
         self.follow_session();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
             session.follow_draft(view);
+            if let Some(search) = &mut session.search {
+                search.refresh(view, old_match);
+            }
         }
     }
 
@@ -769,11 +853,9 @@ impl App {
             && match self.view.screen {
                 Screen::Pairing(_) => true,
                 Screen::SessionList(_) => self.ui.create.is_some(),
-                Screen::Session(_) => self
-                    .ui
-                    .session
-                    .as_ref()
-                    .is_some_and(|s| s.focus == Focus::Composer),
+                Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| {
+                    s.focus == Focus::Composer || s.search.as_ref().is_some_and(|s| s.editing)
+                }),
                 _ => false,
             }
     }
@@ -781,9 +863,19 @@ impl App {
     /// Bracketed paste: on the pairing screen a pairing URI fills the whole
     /// form, anything else goes into the focused field; in the new-session
     /// prompt it goes into the workdir; on a session it goes into the
-    /// composer, line breaks included.
+    /// search prompt while that is open, else into the composer, line
+    /// breaks included.
     pub fn on_paste(&mut self, text: &str) {
         if self.ui.help || self.revoked_screen() {
+            return;
+        }
+        if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session)
+            && let Some(search) = session.search.as_mut().filter(|s| s.editing)
+        {
+            search.edit(view, |query| {
+                query.extend(text.chars().map(|c| if c == '\n' { ' ' } else { c }));
+                query.retain(|c| !c.is_control());
+            });
             return;
         }
         if let Some(session) = &mut self.ui.session {
@@ -943,8 +1035,9 @@ impl App {
         None
     }
 
-    /// Keys on the session view. Ctrl-X, PgUp/PgDn and Tab work in both
-    /// focuses; the rest depends on [`Focus`].
+    /// Keys on the session view. An open search prompt takes every key;
+    /// otherwise Ctrl-F, Ctrl-X, PgUp/PgDn and Tab work in both focuses and
+    /// the rest depends on [`Focus`].
     fn session_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
         let Screen::Session(view) = &self.view.screen else {
             return None;
@@ -952,7 +1045,18 @@ impl App {
         let session = self.ui.session.as_mut()?;
         // Keys move from where the opening scrolled to.
         session.settle_opening();
+        if let Some(search) = &mut session.search {
+            search.wrapped = false;
+            if search.editing {
+                session.search_key(view, key, ctrl);
+                return None;
+            }
+        }
         match key.code {
+            KeyCode::Char('f') if ctrl => {
+                session.open_search();
+                return None;
+            }
             KeyCode::Char('x') if ctrl => {
                 return Some(Action::Interrupt {
                     session_id: view.id,
@@ -1021,7 +1125,24 @@ impl App {
                 None
             }
             Focus::Timeline => match key.code {
+                // A kept search goes first; the next Esc leaves.
+                KeyCode::Esc if session.search.is_some() => {
+                    session.search = None;
+                    None
+                }
                 KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
+                KeyCode::Char('/') => {
+                    session.open_search();
+                    None
+                }
+                KeyCode::Char('n') => {
+                    session.jump(view, Some(true));
+                    None
+                }
+                KeyCode::Char('N') => {
+                    session.jump(view, Some(false));
+                    None
+                }
                 KeyCode::Char('q') => {
                     self.ui.quit = true;
                     None
@@ -1269,6 +1390,106 @@ impl SessionUi {
             key: ItemKey::of(item),
             offset: 0,
         });
+    }
+
+    /// Opens an empty search prompt; `n`/`N` then work on the timeline.
+    fn open_search(&mut self) {
+        self.search = Some(Search::new());
+        self.focus = Focus::Timeline;
+    }
+
+    /// Keys while the search prompt is open: matches follow every edit.
+    /// Enter keeps the search and jumps to the nearest match; with nothing
+    /// typed it closes the prompt, like Esc.
+    fn search_key(&mut self, view: &SessionView, key: KeyEvent, ctrl: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.search = None,
+            KeyCode::Enter if search.query.is_empty() => self.search = None,
+            KeyCode::Enter => {
+                search.editing = false;
+                self.jump(view, None);
+            }
+            KeyCode::Backspace => search.edit(view, |query| {
+                query.pop();
+            }),
+            KeyCode::Char('u') if ctrl => search.edit(view, String::clear),
+            KeyCode::Char(c) if !ctrl => search.edit(view, |query| query.push(c)),
+            _ => {}
+        }
+    }
+
+    /// Jumps to the next older (`Some(true)`) or newer match from the
+    /// current one, round the ends of the timeline; with no current match,
+    /// or `None`, to the nearest one at or above (newer: below) where the
+    /// user is. The match is selected if it can be, expanded if it shows
+    /// only expanded, and scrolled into view.
+    fn jump(&mut self, view: &SessionView, older: Option<bool>) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let hits = &search.hits;
+        let (Some(&oldest), Some(&newest)) = (hits.first(), hits.last()) else {
+            return;
+        };
+        let current = search
+            .current
+            .and_then(|key| find(view, key))
+            .filter(|_| older.is_some());
+        let newer = older == Some(false);
+        let target = match current {
+            Some(at) if newer => hits.iter().find(|&&i| i > at),
+            Some(at) => hits.iter().rev().find(|&&i| i < at),
+            None => {
+                let from = self.search_from(view);
+                if newer {
+                    hits.iter().find(|&&i| i >= from)
+                } else {
+                    hits.iter().rev().find(|&&i| i <= from)
+                }
+            }
+        };
+        let wrapped = target.is_none();
+        let target = target
+            .copied()
+            .unwrap_or(if newer { oldest } else { newest });
+        let query = search.query.clone();
+        let item = &view.timeline[target];
+        if let Some(search) = &mut self.search {
+            search.current = Some(ItemKey::of(item));
+            search.wrapped = wrapped;
+        }
+        // Items that cannot be selected (an agent error) only scroll.
+        if let Some(key) = selectable(item) {
+            self.selected = Some(key);
+        }
+        if let TimelineItem::Logged { seq, entry, .. } = item
+            && match_hidden(entry, &query)
+            && self.expanded.insert(*seq)
+        {
+            // It grows by expanding: anchored to its top, as `v` does.
+            self.scroll = Some(Anchor {
+                key: ItemKey::of(item),
+                offset: 0,
+            });
+        } else {
+            self.reveal(target);
+        }
+    }
+
+    /// Where a search starts from: the selected item, else the last item
+    /// on screen, so matches already in view come first.
+    fn search_from(&self, view: &SessionView) -> usize {
+        self.selected
+            .and_then(|key| find(view, key))
+            .or_else(|| {
+                let geometry = self.geometry.borrow();
+                let bottom = geometry.top(self.scroll) + geometry.height;
+                geometry.index_at(bottom.min(geometry.total).checked_sub(1)?)
+            })
+            .unwrap_or(view.timeline.len().saturating_sub(1))
     }
 
     /// The selected logged item's entry; a pending message has none.
