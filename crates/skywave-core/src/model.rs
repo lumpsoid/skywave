@@ -1423,7 +1423,7 @@ fn session_state(summary: &SessionSummary) -> SessionState {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{
@@ -2671,8 +2671,8 @@ mod tests {
         assert_eq!(output_state(&f), downloading(false));
         f.model.set_link(Link::Reconnecting {
             attempt: 1,
-            next_in: Duration::from_secs(1),
-            offline_since: Instant::now(),
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
         });
         assert_eq!(output_state(&f), downloading(true));
         f.model.set_link(Link::CatchingUp {
@@ -3021,8 +3021,8 @@ mod tests {
 
         let reconnecting = Link::Reconnecting {
             attempt: 3,
-            next_in: Duration::from_secs(4),
-            offline_since: Instant::now(),
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(4),
+            offline_since: chrono::Utc::now(),
         };
         f.model.set_link(reconnecting.clone());
         assert_eq!(f.model.view().link, reconnecting);
@@ -3044,8 +3044,8 @@ mod tests {
         }
         f.model.set_link(Link::Reconnecting {
             attempt: 2,
-            next_in: Duration::from_secs(30),
-            offline_since: Instant::now(),
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(30),
+            offline_since: chrono::Utc::now(),
         });
         assert_eq!(
             f.dispatch(Action::RetryNow),
@@ -3927,8 +3927,8 @@ mod tests {
         f.session("/srv/api");
         f.model.set_link(Link::Reconnecting {
             attempt: 1,
-            next_in: Duration::from_secs(1),
-            offline_since: Instant::now(),
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
         });
         assert_eq!(complete(&mut f, "/srv/"), None, "nothing is asked offline");
         assert_eq!(completion(&f).status, CompletionStatus::Unavailable);

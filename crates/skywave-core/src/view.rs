@@ -6,7 +6,7 @@
 //! snapshot can cross threads and, later, the FFI boundary (D13).
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
@@ -72,10 +72,21 @@ pub enum Link {
         have: Seq,
         server: Seq,
     },
+    /// The link is down and waits to try again. Both times are wall-clock
+    /// instants fixed when the attempt failed, so every snapshot of one
+    /// wait carries the same value; a head counts down to `retry_at`
+    /// against its own clock. Wall time, unlike a monotonic clock, keeps
+    /// counting while a device sleeps.
     Reconnecting {
+        /// Failed attempts in this outage, 1 for the first failure.
         attempt: u32,
-        next_in: Duration,
-        offline_since: Instant,
+        /// When the next attempt is due: the failure plus the backoff
+        /// delay, or less after a `RetryNow`. The engine's own timer is
+        /// monotonic, so after a sleep the attempt may come a little later.
+        retry_at: DateTime<Utc>,
+        /// When the link first went down in this outage; kept across
+        /// attempts until a pull succeeds.
+        offline_since: DateTime<Utc>,
     },
     /// The server refused this device for good; retries stop until the user
     /// re-pairs. Local data stays readable.

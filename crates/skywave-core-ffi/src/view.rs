@@ -3,14 +3,13 @@
 //!
 //! Mapping: ids → `String` (hyphenated UUID), `Seq` → `u64`, counts
 //! (`usize`) → `u64`, `Duration` → `u64` millis, `DateTime<Utc>` → `i64`
-//! unix-epoch millis, `Instant` → `i64` unix-epoch millis at conversion time,
-//! `PathBuf` → `String`. Fields holding millis carry a `_ms` suffix. Tuple
+//! unix-epoch millis, `PathBuf` → `String`. Fields holding millis carry a `_ms` suffix. Tuple
 //! variants become named fields so Kotlin reads `screen.view`, not
 //! `screen.v1`. No logic lives here (D2): every value is copied, never
 //! derived.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_core as sc;
@@ -32,19 +31,6 @@ fn duration_ms(d: Duration) -> u64 {
 
 fn epoch_ms(at: DateTime<Utc>) -> i64 {
     at.timestamp_millis()
-}
-
-fn system_time_ms(at: SystemTime) -> i64 {
-    match at.duration_since(UNIX_EPOCH) {
-        Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
-        Err(before) => i64::try_from(before.duration().as_millis()).map_or(i64::MIN, |ms| -ms),
-    }
-}
-
-/// The wall-clock time `at` stood for: now minus how long ago it was.
-fn instant_ms(at: Instant) -> i64 {
-    let now = SystemTime::now();
-    system_time_ms(now.checked_sub(at.elapsed()).unwrap_or(UNIX_EPOCH))
 }
 
 fn path(p: PathBuf) -> String {
@@ -154,10 +140,14 @@ pub enum Link {
         have: u64,
         server: u64,
     },
+    /// Both times are unix-epoch millis, fixed by the core when the
+    /// attempt failed: every snapshot of one wait carries the same values.
+    /// A head counts down to `retry_at_ms` against its own wall clock.
     Reconnecting {
         attempt: u32,
-        next_in_ms: u64,
-        /// Unix-epoch millis, fixed when the snapshot crossed the FFI.
+        /// When the next attempt is due.
+        retry_at_ms: i64,
+        /// When the link first went down in this outage.
         offline_since_ms: i64,
     },
     /// Refused for good until the user re-pairs.
@@ -177,12 +167,12 @@ impl From<sc::Link> for Link {
             },
             sc::Link::Reconnecting {
                 attempt,
-                next_in,
+                retry_at,
                 offline_since,
             } => Link::Reconnecting {
                 attempt,
-                next_in_ms: duration_ms(next_in),
-                offline_since_ms: instant_ms(offline_since),
+                retry_at_ms: epoch_ms(retry_at),
+                offline_since_ms: epoch_ms(offline_since),
             },
             sc::Link::Rejected(rejection) => Link::Rejected {
                 rejection: rejection.into(),
@@ -1375,7 +1365,7 @@ impl From<BlobPolicy> for sc::BlobPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use chrono::{DateTime, Utc};
 
@@ -1461,19 +1451,8 @@ mod tests {
         values.into_iter().map(M::from).collect()
     }
 
-    fn now_ms() -> i64 {
-        i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap()
-    }
-
     #[test]
     fn link_converts_every_variant() {
-        let offline_since = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
         let converted: Vec<Link> = convert(vec![
             sc::Link::Connecting,
             sc::Link::Online { latency_ms: 42 },
@@ -1495,25 +1474,24 @@ mod tests {
             ]
         );
 
-        let before = now_ms();
-        let reconnecting = Link::from(sc::Link::Reconnecting {
+        let core = sc::Link::Reconnecting {
             attempt: 4,
-            next_in: Duration::from_millis(2500),
-            offline_since,
-        });
-        let after = now_ms();
-        let Link::Reconnecting {
-            attempt,
-            next_in_ms,
-            offline_since_ms,
-        } = reconnecting
-        else {
-            panic!("not reconnecting: {reconnecting:?}");
+            retry_at: at() + chrono::Duration::milliseconds(2500),
+            offline_since: at(),
         };
-        assert_eq!((attempt, next_in_ms), (4, 2500));
-        // Five seconds before now, give or take the clock reads around it.
-        assert!(offline_since_ms >= before - 5000 - 50, "{offline_since_ms}");
-        assert!(offline_since_ms <= after - 5000 + 50, "{offline_since_ms}");
+        let reconnecting = Link::from(core.clone());
+        assert_eq!(
+            reconnecting,
+            Link::Reconnecting {
+                attempt: 4,
+                retry_at_ms: at().timestamp_millis() + 2500,
+                offline_since_ms: at().timestamp_millis(),
+            }
+        );
+        // No clock is read on the way: the same link converted later is
+        // the same value.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(Link::from(core), reconnecting);
     }
 
     #[test]

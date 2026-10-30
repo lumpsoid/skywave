@@ -1,6 +1,6 @@
-//! Rendering: draws an [`App`] into a frame. `now` (and, for [`render_at`],
-//! the wall clock) is passed in so the retry countdown and running tools'
-//! clocks render deterministically. The only state written is the timeline
+//! Rendering: draws an [`App`] into a frame. [`render_at`] takes the wall
+//! clock, so the retry countdown and running tools' clocks render
+//! deterministically. The only state written is the timeline
 //! geometry the session view records for paging
 //! ([`Geometry`](crate::app::Geometry)) and how far the help overlay can
 //! scroll ([`UiState::help_end`](crate::app::UiState::help_end)); the only
@@ -9,10 +9,11 @@
 mod session;
 mod timeline;
 
+use timeline::wall_ms;
 pub use timeline::{SHOW_BYTES, SHOW_LINES, bytes};
 
 use std::borrow::Cow;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
@@ -32,13 +33,13 @@ use crate::notify;
 use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
-pub fn render(frame: &mut Frame, app: &App, now: Instant) {
-    render_at(frame, app, now, SystemTime::now());
+pub fn render(frame: &mut Frame, app: &App) {
+    render_at(frame, app, SystemTime::now());
 }
 
-/// [`render`] with the wall clock given: `wall` is what a running tool
-/// call's elapsed time counts to.
-pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
+/// [`render`] with the wall clock given: `wall` is what the retry
+/// countdown and a running tool call's elapsed time count to.
+pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
     let [banner, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -47,13 +48,12 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
     .areas(frame.area());
 
     let view = app.view();
-    let link_age = now.saturating_duration_since(app.ui().link_since);
     frame.render_widget(
         Paragraph::new(banner_text(
             &view.link,
             view.queued,
             view.attention.elsewhere,
-            link_age,
+            wall_ms(wall),
         ))
         .style(banner_style(&view.link)),
         banner,
@@ -94,10 +94,10 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
 }
 
 /// The link banner's text, then how many approvals wait outside the open
-/// session (`elsewhere`). `link_age` is how long ago the current `Link`
-/// arrived; the retry countdown is `next_in` minus that.
-pub fn banner_text(link: &Link, queued: usize, elsewhere: usize, link_age: Duration) -> String {
-    let mut text = link_text(link, queued, link_age);
+/// session (`elsewhere`). `wall_ms` is the wall clock in unix-epoch millis;
+/// the retry countdown runs from it to the link's `retry_at`.
+pub fn banner_text(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> String {
+    let mut text = link_text(link, queued, wall_ms);
     match elsewhere {
         0 => {}
         1 => text.push_str(" · 1 approval elsewhere (^G)"),
@@ -106,7 +106,7 @@ pub fn banner_text(link: &Link, queued: usize, elsewhere: usize, link_age: Durat
     text
 }
 
-fn link_text(link: &Link, queued: usize, link_age: Duration) -> String {
+fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
     let queued_part = (queued > 0).then(|| format!(" · {queued} queued"));
     let queued_part = queued_part.as_deref().unwrap_or("");
     match link {
@@ -116,17 +116,17 @@ fn link_text(link: &Link, queued: usize, link_age: Duration) -> String {
             format!("syncing · {}/{}{queued_part}", have.0, server.0)
         }
         Link::Reconnecting {
-            attempt, next_in, ..
+            attempt, retry_at, ..
         } => {
-            let left = next_in.saturating_sub(link_age);
-            let retry = if left.is_zero() {
+            let left_ms = retry_at.timestamp_millis().saturating_sub(wall_ms);
+            let retry = if left_ms <= 0 {
                 "retrying…".to_owned()
             } else {
                 // Round up: "retry in 01s" until the retry actually happens. Two
                 // digits (the cap is 30s) keep the banner from shifting.
                 format!(
                     "retry in {:02}s · Ctrl-R now",
-                    left.as_millis().div_ceil(1000)
+                    left_ms.unsigned_abs().div_ceil(1000)
                 )
             };
             format!("offline{queued_part} · {retry} (attempt {attempt})")

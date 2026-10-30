@@ -1,7 +1,10 @@
 package dev.skywave.android.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
@@ -68,7 +71,7 @@ class AppShellTest {
 
     @Test
     fun reconnectingShowsQueuedCountdownAndRetries() {
-        show(Samples.state(Samples.reconnecting, queued = 3u))
+        show(Samples.state(Samples.reconnecting(), queued = 3u))
         text("Offline · 3 queued · retry in", substring = true).assertExists()
         text("attempt 3", substring = true).assertExists()
         text("since ", substring = true).assertExists()
@@ -76,9 +79,51 @@ class AppShellTest {
         assertEquals(listOf<Action>(Action.RetryNow), dispatched)
     }
 
+    /**
+     * The countdown runs on the wall clock to the snapshot's `retryAtMs`: a
+     * later snapshot carrying the same link (built anew, equal by value) and
+     * a recreated banner, as after rotation, both pick up where it stood.
+     */
+    @Test
+    fun countdownRunsToTheDeadlineAcrossSnapshotsAndRecreation() {
+        var nowMs = 1_700_000_000_000
+        val clock = { nowMs }
+        val first = Link.Reconnecting(attempt = 3u, retryAtMs = nowMs + 10_000, offlineSinceMs = nowMs - 60_000)
+        var state by mutableStateOf(Samples.state(first))
+        var generation by mutableIntStateOf(0)
+        compose.mainClock.autoAdvance = false
+        compose.setContent {
+            CompositionLocalProvider(LocalWallClock provides clock) {
+                SkywaveTheme(dynamicColor = false) { key(generation) { AppShell(state, dispatch = {}) } }
+            }
+        }
+        compose.mainClock.advanceTimeByFrame()
+        text("Offline · retry in 10s").assertExists()
+
+        nowMs += 3_000
+        compose.mainClock.advanceTimeBy(3_000)
+        text("Offline · retry in 7s").assertExists()
+
+        val again = Link.Reconnecting(attempt = 3u, retryAtMs = first.retryAtMs, offlineSinceMs = first.offlineSinceMs)
+        assertEquals(first, again)
+        state = Samples.state(again, queued = 1u)
+        compose.waitForIdle()
+        compose.mainClock.advanceTimeByFrame()
+        text("Offline · 1 queued · retry in 7s").assertExists()
+
+        generation++
+        compose.waitForIdle()
+        compose.mainClock.advanceTimeByFrame()
+        text("Offline · 1 queued · retry in 7s").assertExists()
+
+        nowMs += 7_000
+        compose.mainClock.advanceTimeBy(7_000)
+        text("Offline · 1 queued · retrying…").assertExists()
+    }
+
     @Test
     fun reconnectingWithNothingQueuedLeavesTheCountOut() {
-        show(Samples.state(Samples.reconnecting))
+        show(Samples.state(Samples.reconnecting()))
         text("queued", substring = true).assertDoesNotExist()
         text("Offline · retry in", substring = true).assertExists()
     }
@@ -120,12 +165,14 @@ class AppShellTest {
         text("3 items").assertDoesNotExist()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
+        compose.mainClock.advanceTimeByFrame()
         assertEquals(emptyList<Action>(), dispatched)
         text("3 items").assertExists() // the session, not the list behind it
         text("This device was revoked").assertExists() // now as a banner
         // With the full screen gone, back navigates again.
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
+        compose.mainClock.advanceTimeByFrame()
         assertEquals(listOf<Action>(Action.Navigate(Route.SESSION_LIST)), dispatched)
     }
 
@@ -168,6 +215,7 @@ class AppShellTest {
         compose.onNodeWithContentDescription("Back").performClick()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
+        compose.mainClock.advanceTimeByFrame()
         assertEquals(List(2) { Action.Navigate(Route.SESSION_LIST) }, dispatched)
     }
 

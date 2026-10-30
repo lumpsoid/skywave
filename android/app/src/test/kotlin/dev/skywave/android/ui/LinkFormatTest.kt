@@ -7,34 +7,42 @@ import java.time.ZoneOffset
 import java.util.Locale
 
 class LinkFormatTest {
+    private val now = 1_700_000_000_000
+
     @Test
     fun countdownRoundsUpToWholeSeconds() {
-        assertEquals(Countdown(0, 4), countdown(4_000u, 0))
-        assertEquals(Countdown(0, 4), countdown(4_000u, 1))
-        assertEquals(Countdown(0, 3), countdown(4_000u, 1_000))
-        assertEquals(Countdown(0, 1), countdown(4_000u, 3_999))
+        assertEquals(Countdown(0, 4), countdown(now + 4_000, now))
+        assertEquals(Countdown(0, 4), countdown(now + 4_000, now + 1))
+        assertEquals(Countdown(0, 3), countdown(now + 4_000, now + 1_000))
+        assertEquals(Countdown(0, 1), countdown(now + 4_000, now + 3_999))
     }
 
     @Test
     fun countdownStopsAtZero() {
-        assertTrue(countdown(4_000u, 4_000).isOver)
-        assertTrue(countdown(4_000u, 60_000).isOver)
-        assertTrue(countdown(0u, 0).isOver)
+        assertTrue(countdown(now + 4_000, now + 4_000).isOver)
+        assertTrue(countdown(now + 4_000, now + 60_000).isOver)
+        assertTrue(countdown(now, now).isOver)
+        assertTrue(countdown(Long.MIN_VALUE, Long.MAX_VALUE).isOver)
     }
 
     @Test
     fun countdownSplitsMinutes() {
-        assertEquals(Countdown(1, 5), countdown(65_000u, 0))
-        assertEquals(Countdown(2, 0), countdown(119_001u, 0))
+        assertEquals(Countdown(1, 5), countdown(now + 65_000, now))
+        assertEquals(Countdown(2, 0), countdown(now + 119_001, now))
+    }
+
+    @Test
+    fun countdownDoesNotOverflowAtTheExtremes() {
+        assertTrue(countdown(Long.MAX_VALUE, Long.MIN_VALUE).minutes > 0)
     }
 
     @Test
     fun nextTickLandsOnTheNextSecondBoundary() {
-        assertEquals(1_000, nextTickInMs(4_000u, 0))
-        assertEquals(500, nextTickInMs(4_000u, 500))
-        assertEquals(1, nextTickInMs(4_000u, 3_999))
-        assertEquals(0, nextTickInMs(4_000u, 4_000))
-        assertEquals(0, nextTickInMs(4_000u, 9_000))
+        assertEquals(1_000, nextTickInMs(now + 4_000, now))
+        assertEquals(500, nextTickInMs(now + 4_000, now + 500))
+        assertEquals(1, nextTickInMs(now + 4_000, now + 3_999))
+        assertEquals(0, nextTickInMs(now + 4_000, now + 4_000))
+        assertEquals(0, nextTickInMs(now + 4_000, now + 9_000))
     }
 
     @Test

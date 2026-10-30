@@ -864,9 +864,6 @@ pub struct UiState {
     pub session: Option<SessionUi>,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
-    /// When the current [`Link`] value arrived; the retry countdown runs
-    /// from here.
-    pub link_since: Instant,
     /// The last failed dispatch, shown in the footer until the next key.
     pub error: Option<String>,
     /// What happened to the last key's request, e.g. a copy; shown in the
@@ -895,7 +892,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(view: ViewState, now: Instant) -> App {
+    pub fn new(view: ViewState) -> App {
         let mut app = App {
             view: view.clone(),
             ui: UiState {
@@ -908,7 +905,6 @@ impl App {
                 delete: None,
                 session: None,
                 revoked_dismissed: false,
-                link_since: now,
                 error: None,
                 notice: None,
                 copy: None,
@@ -932,11 +928,8 @@ impl App {
         &self.ui
     }
 
-    /// Takes a new snapshot from the core, received at `now`.
-    pub fn set_view(&mut self, view: ViewState, now: Instant) {
-        if view.link != self.view.link {
-            self.ui.link_since = now;
-        }
+    /// Takes a new snapshot from the core.
+    pub fn set_view(&mut self, view: ViewState) {
         if !matches!(view.link, Link::Rejected(LinkRejection::Revoked)) {
             self.ui.revoked_dismissed = false;
         }

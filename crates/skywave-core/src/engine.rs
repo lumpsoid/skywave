@@ -37,10 +37,11 @@
 //! no part: metadata synced counts as synced (D6). Any failure ends the
 //! connection: a rejection (401/403, protocol mismatch) shows
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
-//! else shows `Reconnecting { attempt, next_in, offline_since }`, waits
+//! else shows `Reconnecting { attempt, retry_at, offline_since }`, waits
 //! [`Backoff::delay`] and connects again, still showing `Reconnecting`
-//! until `hello` succeeds (`RetryNow` ends the wait early, without
-//! touching the bookkeeping). The attempt count and `offline_since` reset once
+//! until `hello` succeeds (`RetryNow` ends the wait early and moves
+//! `retry_at` to match, without touching the bookkeeping). Both times are
+//! wall clock, read once per failure; the wait itself is monotonic. The attempt count and `offline_since` reset once
 //! a pull succeeds, so a server that answers `hello` and then fails keeps
 //! backing off.
 //!
@@ -59,8 +60,9 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use chrono::{DateTime, TimeDelta, Utc};
 use skywave_proto::{EventsQuery, Seq};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -434,7 +436,7 @@ impl LinkReporter {
 #[derive(Default)]
 struct Retry {
     attempt: u32,
-    offline_since: Option<Instant>,
+    offline_since: Option<DateTime<Utc>>,
 }
 
 impl Retry {
@@ -476,27 +478,31 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             return rejection;
         }
         retry.attempt = retry.attempt.saturating_add(1);
-        let offline_since = *retry
-            .offline_since
-            .get_or_insert_with(|| tokio::time::Instant::now().into_std());
+        // The wait runs on the monotonic clock; the view gets the same
+        // moments as wall time, read once here so every snapshot of this
+        // wait carries the same values.
         let failed_at = tokio::time::Instant::now();
+        let failed_wall = Utc::now();
+        let offline_since = *retry.offline_since.get_or_insert(failed_wall);
+        let retry_at = |wake: tokio::time::Instant| {
+            failed_wall + TimeDelta::from_std(wake - failed_at).unwrap_or(TimeDelta::MAX)
+        };
         let next_in = ctx.config.backoff.delay(retry.attempt);
         tracing::debug!(%error, attempt = retry.attempt, ?next_in, "link down");
+        let mut wake = failed_at + next_in;
         reporter.set(Link::Reconnecting {
             attempt: retry.attempt,
-            next_in,
+            retry_at: retry_at(wake),
             offline_since,
         });
-        let mut wake = failed_at + next_in;
         tokio::select! {
             () = tokio::time::sleep_until(wake) => {}
             () = ctx.retry_now.notified() => {
                 wake = wake.min(failed_at + Backoff::RETRY_NOW_MIN);
                 tracing::debug!(after = ?wake - failed_at, "retrying now");
-                // The banner counts down from when this value arrives.
                 reporter.set(Link::Reconnecting {
                     attempt: retry.attempt,
-                    next_in: wake.saturating_duration_since(tokio::time::Instant::now()),
+                    retry_at: retry_at(wake),
                     offline_since,
                 });
                 // Further presses are ignored until the attempt fails.
@@ -738,7 +744,9 @@ mod tests {
     }
 
     /// Reconnect delays double per attempt up to the cap, with the injected
-    /// jitter, on tokio's paused clock; a successful pull resets them.
+    /// jitter, on tokio's paused clock; a successful pull resets them. The
+    /// view's `retry_at` is the wall-clock failure plus that delay and
+    /// `offline_since` the first failure, fixed for the whole outage.
     #[tokio::test(start_paused = true)]
     async fn backoff_progresses_and_resets_on_the_paused_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -771,13 +779,32 @@ mod tests {
         };
         let link = tokio::spawn(run_link(ctx));
 
-        let reconnects = |links: &[Link]| -> Vec<(u32, u64)> {
+        // The paused clock skips the waits but the wall clock does not, so
+        // `retry_at - offline_since` is this attempt's delay plus the few
+        // real milliseconds the previous attempts took: whole seconds of it
+        // are the delay.
+        let reconnects = |links: &[Link]| -> Vec<(u32, i64)> {
             links
                 .iter()
                 .filter_map(|l| match l {
                     Link::Reconnecting {
-                        attempt, next_in, ..
-                    } => Some((*attempt, next_in.as_secs())),
+                        attempt,
+                        retry_at,
+                        offline_since,
+                    } => Some((*attempt, (*retry_at - *offline_since).num_seconds())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let outages = |links: &[Link]| -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+            links
+                .iter()
+                .filter_map(|l| match l {
+                    Link::Reconnecting {
+                        retry_at,
+                        offline_since,
+                        ..
+                    } => Some((*retry_at, *offline_since)),
                     _ => None,
                 })
                 .collect()
@@ -795,18 +822,19 @@ mod tests {
             reconnects(&links.lock().unwrap())[..6],
             [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (6, 8)]
         );
-        let offline: Vec<Instant> = links
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|l| match l {
-                Link::Reconnecting { offline_since, .. } => Some(*offline_since),
-                _ => None,
-            })
-            .collect();
+        let first = outages(&links.lock().unwrap());
         assert!(
-            offline.windows(2).all(|w| w[0] == w[1]),
+            first[..6].windows(2).all(|w| w[0].1 == w[1].1),
             "offline_since is kept"
+        );
+        assert!(
+            first[..6].windows(2).all(|w| w[0].0 < w[1].0),
+            "each failure moves retry_at"
+        );
+        assert_eq!(
+            first[0].0 - first[0].1,
+            TimeDelta::seconds(1),
+            "the first retry is the failure plus its delay"
         );
 
         // Back up: online, and the next drop starts over at attempt 1.
@@ -823,6 +851,8 @@ mod tests {
             reconnects(&links.lock().unwrap())[before..before + 2],
             [(1, 1), (2, 2)]
         );
+        let second = outages(&links.lock().unwrap())[before].1;
+        assert!(second > first[0].1, "offline_since starts over");
         link.abort();
     }
 
@@ -861,7 +891,7 @@ mod tests {
         };
         let link = tokio::spawn(run_link(ctx));
 
-        let reconnecting = |links: &[Link]| -> Vec<(u32, Instant)> {
+        let reconnecting = |links: &[Link]| -> Vec<(u32, DateTime<Utc>)> {
             links
                 .iter()
                 .filter_map(|l| match l {
@@ -874,13 +904,11 @@ mod tests {
                 })
                 .collect()
         };
-        let reconnecting_next_in = |links: &[Link]| -> Vec<(u32, Duration)> {
+        let retry_ats = |links: &[Link]| -> Vec<DateTime<Utc>> {
             links
                 .iter()
                 .filter_map(|l| match l {
-                    Link::Reconnecting {
-                        attempt, next_in, ..
-                    } => Some((*attempt, *next_in)),
+                    Link::Reconnecting { retry_at, .. } => Some(*retry_at),
                     _ => None,
                 })
                 .collect()
@@ -894,14 +922,48 @@ mod tests {
             }
         };
         wait_for(1).await;
+        // Another snapshot later in the same wait (here: a queued command)
+        // carries the very same link value.
+        let published = links.lock().unwrap().len();
+        seam.core
+            .dispatch(crate::Action::CreateSession {
+                workdir: "/srv".into(),
+            })
+            .unwrap();
+        while links.lock().unwrap().len() == published {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let mut links = links.lock().unwrap();
+            assert_eq!(
+                links[published - 1],
+                links[published],
+                "same wait, same link"
+            );
+            // One entry per link value from here on.
+            links.truncate(published);
+        }
         let failed = tokio::time::Instant::now();
         retry_now.notify_waiters();
-        // The shortened countdown is reported; then the floor is kept.
+        // The shortened deadline is reported, counted from the failure;
+        // then the floor is kept.
         wait_for(2).await;
-        assert!(matches!(
-            reconnecting_next_in(&links.lock().unwrap()).last(),
-            Some(&(1, d)) if d <= Backoff::RETRY_NOW_MIN
-        ));
+        let seen = reconnecting(&links.lock().unwrap());
+        let failed_wall = seen[0].1;
+        let full = Backoff {
+            base: Duration::from_secs(60),
+            cap: Duration::from_secs(60),
+            jitter: Jitter::fixed(1.0),
+        }
+        .delay(1);
+        assert_eq!(seen[1].0, 1, "still the first wait");
+        assert_eq!(
+            retry_ats(&links.lock().unwrap())[..2],
+            [
+                failed_wall + TimeDelta::from_std(full).unwrap(),
+                failed_wall + TimeDelta::from_std(Backoff::RETRY_NOW_MIN).unwrap(),
+            ]
+        );
         wait_for(3).await;
         let waited = failed.elapsed();
         assert!(waited >= Backoff::RETRY_NOW_MIN, "floor kept: {waited:?}");
