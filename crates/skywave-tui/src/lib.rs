@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod composer;
+pub mod timeline;
 pub mod ui;
 
 use std::io;
@@ -22,7 +23,8 @@ use skywave_core::{Core, Link, ViewState};
 
 pub use app::App;
 
-/// How often the screen refreshes while a retry countdown is running.
+/// How often the screen refreshes while a retry countdown or a running
+/// tool's clock is shown.
 const TICK: Duration = Duration::from_millis(250);
 
 enum Msg {
@@ -71,7 +73,7 @@ pub fn run(core: &Core) -> io::Result<()> {
         execute!(io::stdout(), EnableBracketedPaste)?;
         loop {
             terminal.draw(|frame| ui::render(frame, &app, Instant::now()))?;
-            let tick = matches!(app.view().link, Link::Reconnecting { .. });
+            let tick = matches!(app.view().link, Link::Reconnecting { .. }) || app.live();
             let first = if tick {
                 match rx.recv_timeout(TICK) {
                     Ok(msg) => Some(msg),

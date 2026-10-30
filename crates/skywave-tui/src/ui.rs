@@ -1,14 +1,16 @@
-//! Rendering: draws an [`App`] into a frame. `now` is passed in so the
-//! retry countdown renders deterministically. The only state written is the
-//! timeline geometry the session view records for paging
+//! Rendering: draws an [`App`] into a frame. `now` (and, for [`render_at`],
+//! the wall clock) is passed in so the retry countdown and running tools'
+//! clocks render deterministically. The only state written is the timeline
+//! geometry the session view records for paging
 //! ([`Geometry`](crate::app::Geometry)); the only I/O is reading downloaded
 //! blobs to show them.
 
 mod session;
+mod timeline;
 
-pub use session::{SHOW_BYTES, SHOW_LINES, bytes};
+pub use timeline::{SHOW_BYTES, SHOW_LINES, bytes};
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
@@ -26,6 +28,12 @@ use crate::app::{App, Field, Focus};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
 pub fn render(frame: &mut Frame, app: &App, now: Instant) {
+    render_at(frame, app, now, SystemTime::now());
+}
+
+/// [`render`] with the wall clock given: `wall` is what a running tool
+/// call's elapsed time counts to.
+pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
     let [banner, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -49,7 +57,7 @@ pub fn render(frame: &mut Frame, app: &App, now: Instant) {
             Screen::SessionList(list) => render_session_list(frame, body, app, list),
             Screen::Session(_) => {
                 if let Some((session, ui)) = app.session() {
-                    session::render(frame, body, app, session, ui);
+                    session::render(frame, body, app, session, ui, wall);
                 }
             }
             Screen::Settings(settings) => render_settings(frame, body, settings),
@@ -389,7 +397,7 @@ fn footer_hint(app: &App) -> &'static str {
         }
         Screen::Session(_) => match app.session().map(|(_, ui)| ui.focus) {
             Some(Focus::Timeline) => {
-                "↑↓ select · Enter expand · d download · a/x approve/deny · PgUp/PgDn · Tab write · Esc back · ? help"
+                "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · Tab write · Esc back · ? help"
             }
             _ => {
                 "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
@@ -463,7 +471,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             match app.session().map(|(_, ui)| ui.focus) {
                 Some(Focus::Timeline) => lines.extend([
                     section("Timeline (Tab or i: message keys)"),
-                    key("↑↓ / k j", "select a tool call, result or approval"),
+                    key("↑↓ / k j", "select a tool call or agent message"),
+                    key("[ / ]", "previous / next turn"),
                     key("Enter / Space", "expand it; downloads its blob if needed"),
                     key("d", "download the selected blob"),
                     key("a / x", "approve / deny the pending approval"),

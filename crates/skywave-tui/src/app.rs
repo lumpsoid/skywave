@@ -9,12 +9,13 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
-    Action, BlobPolicy, BlobState, BlobView, CoreError, Decision, Entry, Link, LinkRejection,
-    PairingView, Route, Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem,
-    ToolOutcome, ToolView, ViewState,
+    Action, BlobPolicy, BlobState, CoreError, Decision, Entry, Link, LinkRejection, PairingView,
+    Route, Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome,
+    ViewState,
 };
 
 use crate::composer::Composer;
+use crate::timeline::{ItemKey, sections, selectable, starts_turn, wanted_blob};
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,17 +205,34 @@ pub enum Focus {
     Timeline,
 }
 
+/// Where the timeline is scrolled back to, relative to an item, so the view
+/// stays put when items above it grow (an expanded call) or below it arrive.
+/// The item is the first one starting at or below the top line, so even an
+/// item cut by the top edge can grow without moving what follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub key: ItemKey,
+    /// Lines from the item's first line to the top line: negative when the
+    /// top line is above the item, positive only inside the last item.
+    pub offset: isize,
+}
+
 /// The timeline's layout in the last frame, recorded by the renderer so
 /// paging and keeping the selection in view know how tall things are. Stale
 /// by at most one frame; the renderer clamps whatever the keys make of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Geometry {
+    /// Each timeline item, by timeline index.
+    pub keys: Vec<ItemKey>,
     /// First line of each timeline item, by timeline index.
     pub starts: Vec<usize>,
     /// Lines of the whole timeline.
     pub total: usize,
     /// Lines that fit on screen.
     pub height: usize,
+    /// Top line shown in the last frame; where an anchor whose item is gone
+    /// falls back to.
+    pub top: usize,
 }
 
 impl Geometry {
@@ -224,8 +242,42 @@ impl Geometry {
     }
 
     /// The top line shown for `scroll`.
-    pub fn top(&self, scroll: Option<usize>) -> usize {
-        scroll.map_or(self.bottom(), |top| top.min(self.bottom()))
+    pub fn top(&self, scroll: Option<Anchor>) -> usize {
+        match scroll {
+            None => self.bottom(),
+            Some(anchor) => self.line(anchor).unwrap_or(self.top).min(self.bottom()),
+        }
+    }
+
+    /// The line `anchor` stands for, if its item is still there.
+    fn line(&self, anchor: Anchor) -> Option<usize> {
+        let index = self.keys.iter().position(|key| *key == anchor.key)?;
+        let start = *self.starts.get(index)?;
+        Some(start.saturating_add_signed(anchor.offset))
+    }
+
+    /// The scroll state that puts `line` at the top: following when that is
+    /// the bottom anyway.
+    fn pin(&self, line: usize) -> Option<Anchor> {
+        if line >= self.bottom() {
+            return None;
+        }
+        let index = self
+            .starts
+            .partition_point(|&start| start < line)
+            .min(self.starts.len().checked_sub(1)?);
+        let offset = line as isize - self.starts[index] as isize;
+        Some(Anchor {
+            key: self.keys[index],
+            offset,
+        })
+    }
+
+    /// The item `line` belongs to.
+    fn index_at(&self, line: usize) -> Option<usize> {
+        self.starts
+            .partition_point(|&start| start <= line)
+            .checked_sub(1)
     }
 
     fn item(&self, index: usize) -> Option<(usize, usize)> {
@@ -240,11 +292,11 @@ impl Geometry {
 pub struct SessionUi {
     pub id: SessionId,
     pub focus: Focus,
-    /// Top line of the timeline while the user has scrolled back; `None`
-    /// follows the newest item. New items never move a pinned view.
-    pub scroll: Option<usize>,
-    /// The selected tool call, tool result or approval, by seq so it stays
-    /// put as items arrive.
+    /// Where the user scrolled back to; `None` follows the newest item. New
+    /// items never move a pinned view.
+    pub scroll: Option<Anchor>,
+    /// The selected tool item or agent message, by seq so it stays put as
+    /// items arrive.
     pub selected: Option<Seq>,
     /// Items whose full content is shown.
     pub expanded: HashSet<Seq>,
@@ -261,44 +313,6 @@ impl SessionUi {
             expanded: HashSet::new(),
             geometry: RefCell::default(),
         }
-    }
-}
-
-/// The blob behind an expandable item, if its content lives in one.
-pub fn item_blob(entry: &Entry) -> Option<&BlobView> {
-    match entry {
-        Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => input.as_ref(),
-        Entry::ToolResult { output, .. } => output.as_ref(),
-        Entry::Tool(view) => tool_blob(view),
-        _ => None,
-    }
-}
-
-/// A grouped call's blob: its output once done, else its body, else its
-/// input.
-fn tool_blob(view: &ToolView) -> Option<&BlobView> {
-    let output = match &view.outcome {
-        ToolOutcome::Done { output, .. } => output.as_ref(),
-        _ => None,
-    };
-    output
-        .or_else(|| view.body.as_ref().and_then(|body| body.full.as_ref()))
-        .or(view.input.as_ref())
-}
-
-/// Tool calls, tool results and approvals can be selected and expanded.
-pub fn selectable(item: &TimelineItem) -> Option<Seq> {
-    match item {
-        TimelineItem::Logged {
-            seq,
-            entry:
-                Entry::Tool(_)
-                | Entry::ToolCall { .. }
-                | Entry::ToolResult { .. }
-                | Entry::Approval { .. },
-            ..
-        } => Some(*seq),
-        _ => None,
     }
 }
 
@@ -410,6 +424,19 @@ impl App {
             (Screen::Session(view), Some(ui)) if view.id == ui.id => Some((view, ui)),
             _ => None,
         }
+    }
+
+    /// The screen shows a clock that runs: a tool call's elapsed time.
+    pub fn live(&self) -> bool {
+        self.session().is_some_and(|(view, _)| {
+            view.timeline.iter().any(|item| {
+                matches!(
+                    item,
+                    TimelineItem::Logged { entry: Entry::Tool(tool), .. }
+                        if matches!(tool.outcome, ToolOutcome::Running { .. })
+                )
+            })
+        })
     }
 
     /// The draft for `session`, if one was started.
@@ -742,7 +769,15 @@ impl App {
                     None
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    session.scroll = Some(0);
+                    session.scroll = session.geometry.borrow().pin(0);
+                    None
+                }
+                KeyCode::Char('[') => {
+                    session.step_turn(view, true);
+                    None
+                }
+                KeyCode::Char(']') => {
+                    session.step_turn(view, false);
                     None
                 }
                 KeyCode::End | KeyCode::Char('G') => {
@@ -751,7 +786,8 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => session.toggle(view),
                 KeyCode::Char('d') => session
-                    .selected_blob(view)
+                    .selected_entry(view)
+                    .and_then(wanted_blob)
                     .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
                     .map(|blob| Action::DownloadBlob(blob.id)),
                 KeyCode::Char('a') => answer(view, Decision::Approve),
@@ -802,7 +838,7 @@ impl SessionUi {
         } else {
             top + page
         };
-        let scroll = (top < geometry.bottom()).then_some(top);
+        let scroll = geometry.pin(top);
         drop(geometry);
         self.scroll = scroll;
     }
@@ -846,9 +882,63 @@ impl SessionUi {
         } else {
             return;
         };
-        let scroll = (top < geometry.bottom()).then_some(top);
+        let scroll = geometry.pin(top);
         drop(geometry);
         self.scroll = scroll;
+    }
+
+    /// Moves to the start of the previous (`back`) or next turn: its first
+    /// line goes to the top and its first selectable item is selected.
+    /// Steps from the selected item, else from the top of the screen.
+    fn step_turn(&mut self, view: &SessionView, back: bool) {
+        let geometry = self.geometry.borrow();
+        let current = self
+            .selected
+            .and_then(|seq| {
+                view.timeline
+                    .iter()
+                    .position(|item| selectable(item) == Some(seq))
+            })
+            .or_else(|| geometry.index_at(geometry.top))
+            .unwrap_or(0);
+        // First item of each turn; what comes before the first message is
+        // a turn too.
+        let mut turns: Vec<usize> = view
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| *i == 0 || starts_turn(item))
+            .map(|(i, _)| i)
+            .collect();
+        turns.push(view.timeline.len());
+        let Some(here) = turns.iter().rposition(|&start| start <= current) else {
+            return;
+        };
+        let first_selectable = |turn: usize| {
+            (turns[turn]..turns[turn + 1]).find(|&i| selectable(&view.timeline[i]).is_some())
+        };
+        // Back from inside a turn goes to its start, from its start to the
+        // turn before.
+        let target = if back {
+            match first_selectable(here) {
+                Some(first) if first < current => Some(here),
+                _ => here.checked_sub(1),
+            }
+        } else {
+            (here + 2 < turns.len()).then_some(here + 1)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let Some(&line) = geometry.starts.get(turns[target]) else {
+            return;
+        };
+        let scroll = geometry.pin(line);
+        drop(geometry);
+        self.scroll = scroll;
+        if let Some(first) = first_selectable(target) {
+            self.selected = selectable(&view.timeline[first]);
+        }
     }
 
     fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
@@ -859,10 +949,6 @@ impl SessionUi {
         })
     }
 
-    fn selected_blob<'a>(&self, view: &'a SessionView) -> Option<&'a BlobView> {
-        item_blob(self.selected_entry(view)?)
-    }
-
     /// Expands or collapses the selected item. Expanding a blob that is not
     /// here yet asks for it (spec §8: expanding downloads if needed).
     fn toggle(&mut self, view: &SessionView) -> Option<Action> {
@@ -870,8 +956,12 @@ impl SessionUi {
         if self.expanded.remove(&seq) {
             return None;
         }
+        let entry = self.selected_entry(view)?;
+        if sections(entry).is_empty() {
+            return None;
+        }
         self.expanded.insert(seq);
-        let blob = self.selected_blob(view)?;
+        let blob = wanted_blob(entry)?;
         matches!(blob.state, BlobState::NotDownloaded { .. })
             .then_some(Action::DownloadBlob(blob.id))
     }

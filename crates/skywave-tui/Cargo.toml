@@ -12,6 +12,9 @@ skywave-core.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+# Cell widths for laying out wrapped timeline text; already in the tree
+# through ratatui.
+unicode-width = "0.2"
 
 [dev-dependencies]
 # Tests play the engine through `core.seam()`, which speaks proto types.
