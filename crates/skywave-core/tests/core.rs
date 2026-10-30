@@ -217,6 +217,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             command_id: command.id,
             text: "fix the build".into(),
             outgoing: Outgoing::Queued,
+            discardable: true,
         }]
     );
 

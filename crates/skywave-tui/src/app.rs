@@ -9,13 +9,15 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
-    Action, BlobPolicy, BlobState, CoreError, Decision, Entry, Link, LinkRejection, PairingView,
-    Route, Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome,
-    ViewState,
+    Action, BlobPolicy, BlobState, CoreError, Decision, Entry, Link, LinkRejection, Outgoing,
+    PairingView, PendingSession, Route, Screen, Seq, SessionId, SessionListView, SessionView,
+    TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::composer::Composer;
-use crate::timeline::{ItemKey, find, gated_item, sections, selectable, starts_turn, wanted_blob};
+use crate::timeline::{
+    ItemKey, discardable, find, gated_item, sections, selectable, starts_turn, wanted_blob,
+};
 
 /// How old the first unsaved composer edit gets before the draft is saved
 /// anyway: at most this much typing is lost to a crash. Saves are durable
@@ -306,9 +308,12 @@ pub struct SessionUi {
     pub expanded: HashSet<Seq>,
     pub geometry: RefCell<Geometry>,
     /// The message being written. Filled from the core's draft (D5: per
-    /// device) when the session opens; later snapshots never touch it, the
-    /// core only hears of it through [`App::draft_save`].
+    /// device) when the session opens, and again only when the core
+    /// rewrites the draft itself (`draft_rev`, e.g. a queued message taken
+    /// back to edit); the core hears of it through [`App::draft_save`].
     pub composer: Composer,
+    /// The core's [`SessionView::draft_rev`] the composer was filled at.
+    draft_rev: u64,
 }
 
 impl SessionUi {
@@ -320,13 +325,26 @@ impl SessionUi {
             selected: None,
             expanded: HashSet::new(),
             geometry: RefCell::default(),
-            composer: view
-                .draft
-                .as_ref()
-                .map(|d| Composer::from_draft(d.text.clone(), d.cursor))
-                .unwrap_or_default(),
+            composer: composer_of(view),
+            draft_rev: view.draft_rev,
         }
     }
+
+    /// Refills the composer, focused, when the core rewrote the draft.
+    fn follow_draft(&mut self, view: &SessionView) {
+        if view.draft_rev != self.draft_rev {
+            self.draft_rev = view.draft_rev;
+            self.composer = composer_of(view);
+            self.focus = Focus::Composer;
+        }
+    }
+}
+
+fn composer_of(view: &SessionView) -> Composer {
+    view.draft
+        .as_ref()
+        .map(|d| Composer::from_draft(d.text.clone(), d.cursor))
+        .unwrap_or_default()
 }
 
 /// Presentation state owned by the head.
@@ -419,6 +437,7 @@ impl App {
         self.follow_session();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
+            session.follow_draft(view);
         }
     }
 
@@ -676,6 +695,7 @@ impl App {
                     None
                 }
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
+                KeyCode::Delete => dismissable(list).map(|p| Action::Discard(p.command_id)),
                 _ => None,
             },
             Screen::Session(_) => self.session_key(key, ctrl),
@@ -849,6 +869,14 @@ impl App {
                     .and_then(wanted_blob)
                     .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
                     .map(|blob| Action::DownloadBlob(blob.id)),
+                // Only what the core marks discardable; anything else (it
+                // may have reached the server) is left alone.
+                KeyCode::Char('e') => {
+                    discardable(view, session.selected).map(|(id, _)| Action::EditQueued(id))
+                }
+                KeyCode::Delete => {
+                    discardable(view, session.selected).map(|(id, _)| Action::Discard(id))
+                }
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
                 KeyCode::Char('v') => {
@@ -881,6 +909,14 @@ impl App {
             self.ui.form.focus = Field::Code;
         }
     }
+}
+
+/// The refused session creation `Delete` dismisses from the list: the
+/// oldest.
+pub fn dismissable(list: &SessionListView) -> Option<&PendingSession> {
+    list.creating
+        .iter()
+        .find(|p| p.discardable && matches!(p.outgoing, Outgoing::Failed(_)))
 }
 
 /// Answers the approval the session is blocked on, if any. Whether it may

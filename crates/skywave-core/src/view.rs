@@ -195,6 +195,9 @@ pub struct PendingSession {
     pub command_id: CommandId,
     pub workdir: String,
     pub outgoing: Outgoing,
+    /// [`Action::Discard`](crate::Action::Discard) takes it back: the server
+    /// never saw it, or refused it.
+    pub discardable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +217,11 @@ pub struct SessionView {
     pub stop: Option<Outgoing>,
     /// This device's unsent message, as last saved.
     pub draft: Option<Draft>,
+    /// Changes when the core itself rewrites a draft (e.g.
+    /// [`Action::EditQueued`](crate::Action::EditQueued)): a head that
+    /// keeps its own copy of the text being written replaces it with
+    /// `draft` then.
+    pub draft_rev: u64,
 }
 
 /// A message being written on this device, kept in the local store and never
@@ -239,6 +247,10 @@ pub enum TimelineItem {
         command_id: CommandId,
         text: String,
         outgoing: Outgoing,
+        /// [`Action::Discard`](crate::Action::Discard) and
+        /// [`Action::EditQueued`](crate::Action::EditQueued) take it back:
+        /// the server never saw it, or refused it.
+        discardable: bool,
     },
 }
 

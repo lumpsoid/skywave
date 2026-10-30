@@ -24,7 +24,8 @@ use skywave_core::{
     PendingSession, Screen, SessionListView, SessionRow, SessionState, SettingsView,
 };
 
-use crate::app::{App, Field, Focus};
+use crate::app::{App, Field, Focus, dismissable};
+use crate::timeline::discardable;
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
 pub fn render(frame: &mut Frame, app: &App, now: Instant) {
@@ -253,8 +254,13 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
 
     if !list.creating.is_empty() {
         let lines: Vec<Line> = list.creating.iter().map(pending_session_line).collect();
+        let title = if dismissable(list).is_some() {
+            " Creating · Del dismiss "
+        } else {
+            " Creating "
+        };
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Creating ")),
+            Paragraph::new(lines).block(Block::bordered().title(title)),
             creating_area,
         );
     }
@@ -402,13 +408,23 @@ fn footer_hint(app: &App) -> &'static str {
         Screen::SessionList(_) => {
             "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
         }
-        Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui.focus)) {
-            Some((view, Focus::Timeline)) if view.pending_approval.is_some() => {
-                "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
-            }
-            Some((_, Focus::Timeline)) => {
-                "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
-            }
+        Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
+            // A pending message only takes these keys while the core says it
+            // can be taken back.
+            Some((view, ui, Focus::Timeline)) => match discardable(view, ui.selected) {
+                Some((_, Outgoing::Failed(_))) => {
+                    "e edit · Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
+                Some(_) => {
+                    "e edit · Del cancel · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
+                None if view.pending_approval.is_some() => {
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
+                None => {
+                    "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                }
+            },
             _ => {
                 "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
             }
@@ -461,6 +477,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("↑↓ / k j", "select"),
             key("Enter", "open session"),
             key("n", "new session in a server directory"),
+            key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
             Line::from(""),
             section("Badges"),
@@ -489,6 +506,11 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key(
                         "d",
                         "download the selected blob; a long command's text before its output",
+                    ),
+                    key("e", "edit your never-sent or refused message"),
+                    key(
+                        "Del",
+                        "cancel your never-sent message, or dismiss a refused one",
                     ),
                     key("a / x", "approve / deny the pending approval"),
                     key("v", "select and expand the call it gates"),

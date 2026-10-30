@@ -128,6 +128,10 @@ pub enum StoreError {
     OutOfRange(u64),
     #[error("command {0:?} is not in the outbox")]
     UnknownCommand(CommandId),
+    /// [`Store::withdraw`] found no row it may delete: the command is gone,
+    /// was accepted, or may have reached the server.
+    #[error("command {0:?} cannot be withdrawn")]
+    NotWithdrawable(CommandId),
     #[error("blob {0:?} is not known")]
     UnknownBlob(BlobId),
     #[error("path {0} is not valid UTF-8")]
@@ -181,6 +185,23 @@ pub struct OutboxEntry {
     pub first_sent_at: Option<DateTime<Utc>>,
     /// When the server's answer was recorded.
     pub answered_at: Option<DateTime<Utc>>,
+}
+
+impl OutboxEntry {
+    /// Whether the user may take the command back ([`Store::withdraw`]): a
+    /// message or session creation the server never saw (`tries == 0`) or
+    /// refused. A command that may have reached the server and has no
+    /// answer never is: withdrawing it could not stop it.
+    pub fn discardable(&self) -> bool {
+        let kind = matches!(
+            self.command.kind,
+            CommandKind::SendMessage { .. } | CommandKind::CreateSession { .. }
+        );
+        kind && match &self.status {
+            OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
+            OutboxStatus::Queued | OutboxStatus::Sending => self.tries == 0,
+        }
+    }
 }
 
 /// Local state of one blob.
@@ -488,6 +509,35 @@ impl Store {
         Ok(())
     }
 
+    /// Takes a command back: deletes it from the outbox if it was never
+    /// attempted or the server refused it, and keeps `draft` as its
+    /// session's draft, in one transaction, so a crash keeps the text in
+    /// exactly one place. Any other row stays and the call fails with
+    /// [`StoreError::NotWithdrawable`], writing nothing: it may have reached
+    /// the server, and only its answer can settle it.
+    pub fn withdraw(
+        &self,
+        id: CommandId,
+        draft: Option<(SessionId, &Draft)>,
+    ) -> Result<(), StoreError> {
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM outbox WHERE command_id = ?1
+                AND (tries = 0 AND result IS NULL
+                    OR json_extract(result, '$.result') = 'rejected')",
+            [id.0.to_string()],
+        )?;
+        if deleted == 0 {
+            return Err(StoreError::NotWithdrawable(id));
+        }
+        if let Some((session_id, draft)) = draft {
+            upsert_draft(&tx, session_id, draft)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn require_command(&self, id: CommandId) -> Result<(), StoreError> {
         let known = self
             .conn
@@ -563,18 +613,16 @@ impl Store {
         session_id: SessionId,
         draft: Option<&Draft>,
     ) -> Result<(), StoreError> {
-        let id = session_id.0.to_string();
         match draft {
-            Some(draft) => self.conn.execute(
-                "INSERT INTO drafts (session_id, text, cursor) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (session_id) DO UPDATE SET text = excluded.text, cursor = excluded.cursor",
-                params![id, draft.text, u64_sql(draft.cursor as u64)?],
-            )?,
-            None => self
-                .conn
-                .execute("DELETE FROM drafts WHERE session_id = ?1", [id])?,
-        };
-        Ok(())
+            Some(draft) => upsert_draft(&self.conn, session_id, draft),
+            None => {
+                self.conn.execute(
+                    "DELETE FROM drafts WHERE session_id = ?1",
+                    [session_id.0.to_string()],
+                )?;
+                Ok(())
+            }
+        }
     }
 
     // ---- settings -----------------------------------------------------------
@@ -657,6 +705,19 @@ fn read_cursor(conn: &Connection) -> Result<Seq, StoreError> {
             seq_col(row, 0)
         })?,
     )
+}
+
+fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO drafts (session_id, text, cursor) VALUES (?1, ?2, ?3)
+         ON CONFLICT (session_id) DO UPDATE SET text = excluded.text, cursor = excluded.cursor",
+        params![
+            session_id.0.to_string(),
+            draft.text,
+            u64_sql(draft.cursor as u64)?
+        ],
+    )?;
+    Ok(())
 }
 
 const SESSION_COLUMNS: &str =

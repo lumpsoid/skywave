@@ -171,6 +171,11 @@ impl Core {
                     Effect::Enqueue(command) => state.store.enqueue(&command),
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
                     Effect::SaveDraft(id, draft) => state.store.set_draft(id, draft.as_ref()),
+                    // Refused when the store disagrees with the model; the
+                    // resync below then shows what the store holds.
+                    Effect::Withdraw { id, draft } => state
+                        .store
+                        .withdraw(id, draft.as_ref().map(|(session, d)| (*session, d))),
                     Effect::LoadSession(id) => state
                         .store
                         .session_events(id)

@@ -5,8 +5,8 @@
 //! screen shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, CommandId, Entry, Seq, SessionView, TimelineItem, ToolKind,
-    ToolOutcome, ToolView,
+    BlobState, BlobView, BodyFormat, CommandId, Entry, Outgoing, Seq, SessionView, TimelineItem,
+    ToolKind, ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -69,6 +69,23 @@ pub fn find(view: &SessionView, key: ItemKey) -> Option<usize> {
                 } if *command_id == command
             )
         })
+    })
+}
+
+/// The pending message `selected` names, with its delivery state, if the
+/// core marks it discardable: what `e` and `Delete` take back.
+pub fn discardable(view: &SessionView, selected: Option<ItemKey>) -> Option<(CommandId, Outgoing)> {
+    let Some(ItemKey::Pending(id)) = selected else {
+        return None;
+    };
+    view.timeline.iter().find_map(|item| match item {
+        TimelineItem::Pending {
+            command_id,
+            outgoing,
+            discardable: true,
+            ..
+        } if *command_id == id => Some((id, *outgoing)),
+        _ => None,
     })
 }
 
