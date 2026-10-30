@@ -7,14 +7,17 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.remember
 import dev.skywave.android.core.CoreClient
 import dev.skywave.android.core.CoreStartup
+import dev.skywave.android.core.coreBlobHeadReader
 import dev.skywave.android.core.corePairUriParser
 import dev.skywave.android.ui.PairInbox
 import dev.skywave.android.ui.SkywaveRoot
 import dev.skywave.android.ui.pairLinkInput
 import dev.skywave.android.ui.screens.AboutInfo
+import dev.skywave.android.ui.screens.LocalBlobHeadReader
 import dev.skywave.core.Action
 import dev.skywave.core.Route
 import dev.skywave.core.coreVersion
@@ -46,7 +49,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             SkywaveTheme {
                 when (startup) {
-                    is CoreStartup.Ready -> SkywaveRoot(startup.repository, pairInbox, remember { about(app) })
+                    // The core reads blob previews: native, so only once it is Ready.
+                    is CoreStartup.Ready -> CompositionLocalProvider(LocalBlobHeadReader provides coreBlobHeadReader) {
+                        SkywaveRoot(startup.repository, pairInbox, remember { about(app) })
+                    }
                     is CoreStartup.Failed -> StartupFailedScreen(startup.reason, appVersion())
                 }
             }

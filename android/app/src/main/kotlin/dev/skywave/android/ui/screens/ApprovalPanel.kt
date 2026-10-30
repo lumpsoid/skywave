@@ -85,7 +85,8 @@ internal class GatedApproval(val prompt: ApprovalPrompt, val open: () -> Unit)
  *
  * [tool] is the call the approval gates, null for one with no logged call.
  * Whether an answer is still taken is the core's call (D2); the panel only
- * stops offering one the replica shows settled.
+ * stops offering one the replica shows settled. The whole of a cut body or
+ * input is a blob, fetched and opened through [blobs].
  */
 @Composable
 internal fun ApprovalPanel(
@@ -94,6 +95,7 @@ internal fun ApprovalPanel(
     open: Boolean,
     onOpen: (Boolean) -> Unit,
     onAnswer: (Decision, UByte?) -> Unit,
+    blobs: BlobActions = BlobActions.None,
 ) {
     val colors = MaterialTheme.colorScheme
     if (!open) {
@@ -161,8 +163,12 @@ internal fun ApprovalPanel(
                     }
                 }
                 val full = (body as? ApprovalBody.Diff)?.full ?: (body as? ApprovalBody.Content)?.full
-                full?.let { Minor(stringResource(R.string.sv_tool_full, blobText(it))) }
-                    ?: prompt.input?.let { Minor(stringResource(R.string.sv_tool_input, blobText(it))) }
+                val of = tool?.title ?: prompt.summary
+                if (full != null) {
+                    BlobRow(stringResource(R.string.blob_full), full, blobs, viewerTitle(R.string.blob_full, of))
+                } else {
+                    prompt.input?.let { BlobRow(stringResource(R.string.blob_input), it, blobs, viewerTitle(R.string.blob_input, of)) }
+                }
 
                 if (settled != null) {
                     Text(

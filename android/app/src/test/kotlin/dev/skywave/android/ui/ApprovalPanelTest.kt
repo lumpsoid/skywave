@@ -101,7 +101,8 @@ class ApprovalPanelTest {
         inPanel("notes/plan.md").assertExists()
         inPanel("Line 1 of the plan").assertExists()
         inPanel("Line 14 of the plan").assertExists()
-        inPanel("Full content: 2.0 kB, not downloaded").assertExists()
+        inPanel("Full content · 2.0 kB").assertExists()
+        inPanel("Download (2.0 kB)").assertExists()
         tag(ApprovalTags.MORE).assert(hasText("Show more")).performClick()
         tag(ApprovalTags.MORE).assert(hasText("Show less"))
     }

@@ -89,7 +89,10 @@ internal object SessionTags {
  */
 @Composable
 fun SessionScreen(view: SessionView, attention: Attention, chrome: ShellChrome, dispatch: (Action) -> Unit) {
-    key(view.id) { SessionContent(view, attention, chrome, dispatch) }
+    // A Box, so the blob viewer stacks over the session.
+    Box(Modifier.fillMaxSize()) {
+        key(view.id) { SessionContent(view, attention, chrome, dispatch) }
+    }
 }
 
 @Composable
@@ -102,6 +105,12 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
     var approvalOpen by rememberSaveable(prompt?.id) { mutableStateOf(true) }
     val gated = remember(prompt) { prompt?.let { GatedApproval(it) { approvalOpen = true } } }
     val gatedKey = remember(rows, prompt) { gatedRowKey(rows, prompt) }
+    // The blob open in the viewer: presentation only (not a core route),
+    // saved so rotation keeps it open.
+    var viewing by rememberSaveable(stateSaver = OpenBlob.Saver) { mutableStateOf<OpenBlob?>(null) }
+    val blobs = remember(dispatch) {
+        BlobActions(download = { dispatch(Action.DownloadBlob(it)) }, open = { viewing = it })
+    }
 
     ScreenScaffold(
         title = view.title,
@@ -120,6 +129,7 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
                         open = approvalOpen,
                         onOpen = { approvalOpen = it },
                         onAnswer = { decision, rule -> dispatch(Action.ResolveApproval(prompt.id, decision, rule)) },
+                        blobs = blobs,
                     )
                 }
                 ComposerBar(composer, remember(view.prompts) { view.prompts.take(50) })
@@ -136,11 +146,15 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
                         modifier = Modifier.align(Alignment.Center).padding(24.dp),
                     )
                 } else {
-                    Timeline(view, rows, dispatch, composer, gated, gatedKey)
+                    Timeline(view, rows, dispatch, composer, gated, gatedKey, blobs)
                 }
             }
         }
     }
+
+    // Over the session, which stays composed below: closing it comes back
+    // to the timeline where it was.
+    viewing?.let { BlobViewer(it, onClose = { viewing = null }) }
 
     if (renaming) {
         RenameDialog(
@@ -168,6 +182,7 @@ private fun Timeline(
     composer: ComposerState,
     gated: GatedApproval?,
     gatedKey: String?,
+    blobs: BlobActions,
 ) {
     val divider = remember { rows.indexOf(TimelineRow.Divider) }
     // Opens on the divider when there is news, else at the end; LazyColumn
@@ -200,7 +215,7 @@ private fun Timeline(
     val scope = rememberCoroutineScope()
     val clipLabel = stringResource(R.string.sv_clip_label)
     val copied = stringResource(R.string.sv_copied)
-    val actions = remember(composer, dispatch) {
+    val actions = remember(composer, dispatch, blobs) {
         ItemActions(
             copy = { text ->
                 scope.launch {
@@ -213,6 +228,7 @@ private fun Timeline(
             },
             discard = { dispatch(Action.Discard(it)) },
             edit = composer::editQueued,
+            blobs = blobs,
         )
     }
 

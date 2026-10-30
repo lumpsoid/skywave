@@ -116,10 +116,11 @@ class SessionScreenTest {
         seeAt("s:9", "Subagent", "Cancelled: turn ended")
         seeAt("s:10", "Tool Frobnicate", "No result")
         seeAt("s:11", "Running since")
-        // Expanding shows the line count and the output blob's state (A13 fetches it).
+        // Expanding shows the line count and the output blob, with its download.
         list.performScrollToKey("s:5")
         tag(TimelineTags.item("s:5")).performClick()
-        text("Output: 4.1 kB, not downloaded").assertExists()
+        text("Output · 4.1 kB").assertExists()
+        text("Download (4.1 kB)").assertExists()
         text("40 lines in all").assertExists()
     }
 

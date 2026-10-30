@@ -36,6 +36,17 @@
                 <data android:scheme="skywave" android:host="pair" />
             </intent-filter>
         </activity>
+        <!-- Hands downloaded blobs to other apps (share, open with), read-only
+             and only to an app granted one URI; paths in blob_paths.xml. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.blobs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/blob_paths" />
+        </provider>
         <!-- The QR scanner turns with the device instead of staying in the
              library's default landscape. This lifts a fixed orientation, which
              is what the DiscouragedApi check asks for, so it is ignored here. -->

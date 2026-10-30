@@ -42,8 +42,8 @@ class CoreRepository internal constructor(
     private val actions = Channel<Action>(Channel.UNLIMITED)
 
     init {
-        // Calls back at once with the current snapshot, so nothing between
-        // view() above and here is lost.
+        // The first snapshot arrives later, on the core's delivery thread;
+        // until then the value is view() above, so nothing is lost.
         core.subscribe(
             object : ViewListener {
                 override fun onView(view: ViewState) {

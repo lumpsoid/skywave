@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the blobs FileProvider may hand out: only the core's blob files,
+     <filesDir>/skywave/blobs (the data dir is <filesDir>/skywave, D22; the
+     core keeps blobs in <data_dir>/blobs, spec §7). The core owns them;
+     other apps get read-only grants, one URI at a time. -->
+<paths>
+    <files-path name="blobs" path="skywave/blobs/" />
+</paths>
