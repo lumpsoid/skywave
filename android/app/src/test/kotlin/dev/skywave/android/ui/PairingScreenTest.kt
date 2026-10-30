@@ -12,6 +12,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import dev.skywave.android.ui.screens.PairingTags
+import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.core.Action
 import dev.skywave.core.Link
 import dev.skywave.core.Screen
@@ -37,7 +38,7 @@ class PairingScreenTest {
     private fun show(screen: Screen) {
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
-                AppShell(Samples.state(Link.Connecting, screen), dispatch = { dispatched += it }, inbox)
+                AppShell(Samples.state(Link.Connecting, screen), dispatch = { dispatched += it }, inbox, SettingsSamples.about)
             }
         }
     }

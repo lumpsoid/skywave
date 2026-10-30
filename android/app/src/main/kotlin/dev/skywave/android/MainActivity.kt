@@ -7,14 +7,17 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.remember
 import dev.skywave.android.core.CoreClient
 import dev.skywave.android.core.CoreStartup
 import dev.skywave.android.core.corePairUriParser
 import dev.skywave.android.ui.PairInbox
 import dev.skywave.android.ui.SkywaveRoot
 import dev.skywave.android.ui.pairLinkInput
+import dev.skywave.android.ui.screens.AboutInfo
 import dev.skywave.core.Action
 import dev.skywave.core.Route
+import dev.skywave.core.coreVersion
 import dev.skywave.android.ui.SkywaveTheme
 import dev.skywave.android.ui.StartupFailedScreen
 
@@ -29,7 +32,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val startup = (application as SkywaveApp).core
+        val app = application as SkywaveApp
+        val startup = app.core
         if (startup is CoreStartup.Ready) {
             if (savedInstanceState != null) {
                 pairInbox.restoreFrom(savedInstanceState)
@@ -42,7 +46,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             SkywaveTheme {
                 when (startup) {
-                    is CoreStartup.Ready -> SkywaveRoot(startup.repository, pairInbox)
+                    is CoreStartup.Ready -> SkywaveRoot(startup.repository, pairInbox, remember { about(app) })
                     is CoreStartup.Failed -> StartupFailedScreen(startup.reason, appVersion())
                 }
             }
@@ -66,6 +70,10 @@ class MainActivity : ComponentActivity() {
         pairInbox.offer(input)
         client.dispatch(Action.Navigate(Route.PAIRING))
     }
+
+    /** What Settings shows of this build. Call only once the core is Ready: [coreVersion] is native. */
+    private fun about(app: SkywaveApp) =
+        AboutInfo(appVersion = appVersion(), coreVersion = coreVersion(), deviceName = app.deviceName)
 
     /** This app's version name; no native call, the core may not have loaded. */
     private fun appVersion(): String? =

@@ -87,14 +87,4 @@
         <item quantity="one">%1$d item</item>
         <item quantity="other">%1$d items</item>
     </plurals>
-
-    <!-- Settings -->
-    <string name="settings_title">Settings</string>
-    <string name="settings_server">Server</string>
-    <string name="settings_device">Device</string>
-    <string name="settings_unknown">Not paired</string>
-    <string name="settings_downloads">Downloads</string>
-    <string name="settings_downloads_eager">Fetch attachments right away</string>
-    <string name="settings_downloads_on_demand">Fetch attachments when opened</string>
-    <string name="settings_pair">Pair with a server</string>
 </resources>

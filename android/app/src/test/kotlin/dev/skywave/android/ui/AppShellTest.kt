@@ -16,6 +16,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import dev.skywave.android.core.CoreClient
 import dev.skywave.android.core.CoreMessage
+import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.core.Action
 import dev.skywave.core.BlobPolicy
 import dev.skywave.core.Link
@@ -44,7 +45,7 @@ class AppShellTest {
     private val inbox = PairInbox { PairInput.Unreadable("no links in these tests") }
 
     private fun show(state: ViewState) {
-        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox, SettingsSamples.about) } }
     }
 
     private fun text(s: String, substring: Boolean = false) = compose.onNodeWithText(s, substring = substring)
@@ -105,7 +106,7 @@ class AppShellTest {
         compose.mainClock.autoAdvance = false
         compose.setContent {
             CompositionLocalProvider(LocalWallClock provides clock) {
-                SkywaveTheme(dynamicColor = false) { key(generation) { AppShell(state, dispatch = {}, inbox) } }
+                SkywaveTheme(dynamicColor = false) { key(generation) { AppShell(state, dispatch = {}, inbox, SettingsSamples.about) } }
             }
         }
         compose.mainClock.advanceTimeByFrame()
@@ -233,7 +234,7 @@ class AppShellTest {
     @Test
     fun sessionStubShowsTitleAndItemCount() {
         var state by mutableStateOf(Samples.state(Link.Online(5u), Screen.Session(sessionView(archived = true, items = 3))))
-        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox, SettingsSamples.about) } }
         text("Fix the sync bug").assertExists()
         text("3 items").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
@@ -253,7 +254,7 @@ class AppShellTest {
                 dispatched += action
             }
         }
-        compose.setContent { SkywaveTheme(dynamicColor = false) { SkywaveRoot(client, inbox) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { SkywaveRoot(client, inbox, SettingsSamples.about) } }
         messages.trySend(CoreMessage.Storage("disk full"))
         compose.waitUntil(5_000) {
             compose.onAllNodesWithText("Storage error: disk full").fetchSemanticsNodes().isNotEmpty()
