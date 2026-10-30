@@ -178,7 +178,7 @@ pub fn alert(app: &mut App, out: &mut impl Write, notify: Notify, tmux: bool) {
 /// Saves the open session's draft if [`App::draft_save`] has one for `now`.
 pub fn save_draft(app: &mut App, core: &Core, now: Instant, force: bool) {
     if let Some(action) = app.draft_save(now, force) {
-        app.draft_saved(core.dispatch(action));
+        app.draft_saved(now, core.dispatch(action));
     }
 }
 

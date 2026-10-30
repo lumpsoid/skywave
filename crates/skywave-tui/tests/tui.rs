@@ -98,6 +98,19 @@ impl Harness {
         .unwrap();
     }
 
+    /// Makes every draft save fail (`true`), as a full disk would, or work
+    /// again.
+    fn fail_draft_save(&self, fail: bool) {
+        let db = self.dir.path().join(skywave_core::store::DB_FILE);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch(if fail {
+            "CREATE TRIGGER full_drafts BEFORE INSERT ON drafts BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+        } else {
+            "DROP TRIGGER full_drafts"
+        })
+        .unwrap();
+    }
+
     /// The draft the core keeps for the open session.
     fn core_draft(&self) -> Option<Draft> {
         match self.core.view().screen {
@@ -2124,6 +2137,73 @@ fn failed_send_keeps_the_text() {
     h.key(KeyCode::Enter);
     assert_eq!(h.app.composer().unwrap().text(), "");
     assert_eq!(h.core_draft(), None);
+}
+
+#[test]
+fn failed_draft_save_is_retried_on_the_idle_cadence() {
+    let (mut h, _, _) = open_session();
+    h.type_text("abc");
+    h.fail_draft_save(true);
+    let t = Instant::now() + DRAFT_SAVE_AFTER;
+    skywave_tui::save_draft(&mut h.app, &h.core, t, false);
+    h.sync();
+    assert!(h.app.ui().error.is_some());
+    assert_eq!(h.core_draft(), None);
+
+    // Still unsaved, due one cadence after the failure, not at once.
+    assert_eq!(h.app.draft_due_in(t), Some(DRAFT_SAVE_AFTER));
+    assert_eq!(h.app.draft_save(t, false), None, "no tight retry");
+    let just_before = t + DRAFT_SAVE_AFTER - Duration::from_millis(1);
+    assert_eq!(h.app.draft_save(just_before, false), None);
+
+    // Failing again pushes the next try one more cadence out.
+    let t2 = t + DRAFT_SAVE_AFTER;
+    skywave_tui::save_draft(&mut h.app, &h.core, t2, false);
+    assert_eq!(h.app.draft_due_in(t2), Some(DRAFT_SAVE_AFTER));
+
+    // Once saving works, the retry saves and the draft is clean.
+    h.fail_draft_save(false);
+    let t3 = t2 + DRAFT_SAVE_AFTER;
+    skywave_tui::save_draft(&mut h.app, &h.core, t3, false);
+    h.sync();
+    assert_eq!(
+        h.core_draft(),
+        Some(Draft {
+            text: "abc".into(),
+            cursor: 3
+        })
+    );
+    assert_eq!(h.app.draft_due_in(t3), None);
+    assert_eq!(h.app.draft_save(t3, true), None, "nothing left to save");
+}
+
+#[test]
+fn edit_during_a_draft_save_is_not_lost() {
+    let (mut h, _, _) = open_session();
+    let later = Instant::now() + 10 * DRAFT_SAVE_AFTER;
+
+    // A save that works does not mark the later edit saved.
+    h.type_text("ab");
+    let save = h.app.draft_save(later, false).unwrap();
+    h.type_text("c");
+    h.app.draft_saved(later, h.core.dispatch(save));
+    h.sync();
+    assert_eq!(h.core_draft().map(|d| d.text), Some("ab".into()));
+    assert!(h.app.draft_due_in(Instant::now()).unwrap() <= DRAFT_SAVE_AFTER);
+
+    // A save that fails keeps the edit's own due time, not the failure's.
+    h.fail_draft_save(true);
+    let save = h.app.draft_save(later, false).unwrap();
+    h.type_text("d");
+    h.app.draft_saved(later, h.core.dispatch(save));
+    assert!(h.app.ui().error.is_some());
+    assert!(h.app.draft_due_in(Instant::now()).unwrap() <= DRAFT_SAVE_AFTER);
+
+    h.fail_draft_save(false);
+    skywave_tui::save_draft(&mut h.app, &h.core, later, false);
+    h.sync();
+    assert_eq!(h.core_draft().map(|d| d.text), Some("abcd".into()));
+    assert_eq!(h.app.draft_due_in(later), None);
 }
 
 /// [`open_session`] with `prompts` in the log, oldest first, sent from this
