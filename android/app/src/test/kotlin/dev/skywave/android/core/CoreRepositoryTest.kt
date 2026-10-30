@@ -32,7 +32,7 @@ private fun viewState(link: Link = Link.Connecting, queued: ULong = 0u) = ViewSt
 
 private val reconnecting = Link.Reconnecting(attempt = 3u, retryAtMs = 4_000, offlineSinceMs = 0)
 
-private fun draft(i: Int) = Action.SaveDraft(sessionId = "s", text = "t$i", cursor = 0u)
+private fun draft(i: Int) = Action.SaveDraft(sessionId = "s", text = "t$i", cursorUtf16 = 0u)
 
 /** Stands in for `SkywaveCore` without loading the native library. */
 private class FakeCore(initial: ViewState) : SkywaveCoreInterface {
