@@ -9,7 +9,7 @@ sealed interface CoreStartup {
     data class Ready(val repository: CoreRepository) : CoreStartup
 
     /** The core could not open (e.g. an unreadable store); nothing else works. */
-    data class Failed(val reason: String) : CoreStartup
+    data class Failed(val reason: CoreMessage) : CoreStartup
 }
 
 /**

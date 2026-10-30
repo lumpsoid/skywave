@@ -119,7 +119,7 @@ class CoreRepositoryTest {
         repo.dispatch(draft(1)) // must not throw
         repo.dispatch(draft(2))
         runCurrent()
-        assertEquals("Storage error: disk full", repo.messages.first())
+        assertEquals(CoreMessage.Storage("disk full"), repo.messages.first())
         assertEquals(listOf(draft(2)), core.dispatched)
     }
 
@@ -131,7 +131,7 @@ class CoreRepositoryTest {
         repo.dispatch(draft(1))
         repo.dispatch(draft(2))
         runCurrent()
-        assertEquals("boom", repo.messages.first())
+        assertEquals(CoreMessage.Other("boom"), repo.messages.first())
         assertEquals(listOf(draft(2)), core.dispatched)
     }
 
@@ -169,7 +169,7 @@ class CoreRepositoryTest {
             scope = backgroundScope,
             dispatchContext = StandardTestDispatcher(testScheduler),
         )
-        assertEquals(CoreStartup.Failed("Storage error: database is locked"), startup)
+        assertEquals(CoreStartup.Failed(CoreMessage.Storage("database is locked")), startup)
     }
 
     @Test
@@ -177,15 +177,5 @@ class CoreRepositoryTest {
         val hydrated = viewState(queued = 2u)
         val startup = startCore({ FakeCore(hydrated) }, backgroundScope, StandardTestDispatcher(testScheduler))
         assertSame(hydrated, (startup as CoreStartup.Ready).repository.state.value)
-    }
-}
-
-class LabelsTest {
-    @Test
-    fun linkLabels() {
-        assertEquals("Connecting", Link.Connecting.label())
-        assertEquals("Online 42 ms", Link.Online(42u).label())
-        assertEquals("Reconnecting #3", reconnecting.label())
-        assertEquals("Pairing", viewState().screen.label())
     }
 }
