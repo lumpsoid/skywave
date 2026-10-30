@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, ResultDisplay, ResumeHandle, StartSpec, TurnOutcome,
+    AgentSession, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -91,6 +91,7 @@ pub enum Step {
         call: Option<AgentCallId>,
         tool: String,
         input: Value,
+        suggestions: Vec<RuleSuggestion>,
         on_approve: Vec<Step>,
         on_deny: Vec<Step>,
     },
@@ -146,9 +147,22 @@ impl Step {
             call: None,
             tool: tool.into(),
             input,
+            suggestions: Vec::new(),
             on_approve: Vec::new(),
             on_deny: Vec::new(),
         }
+    }
+
+    /// Offers a lasting rule with an approval step. No effect on other
+    /// steps.
+    pub fn suggest(mut self, label: &str, scope: RuleScope) -> Step {
+        if let Step::Approval { suggestions, .. } = &mut self {
+            suggestions.push(RuleSuggestion {
+                label: label.to_owned(),
+                scope,
+            });
+        }
+        self
     }
 
     /// Names the agent's call `id` on a tool call, tool result or approval
@@ -205,9 +219,12 @@ impl Default for Gate {
 /// A request a fake session received, as recorded by [`FakeAgent::inputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeInput {
-    Started { resumed: bool },
+    Started {
+        resumed: bool,
+    },
     Message(String),
-    Answer(AgentRequestId, Decision),
+    /// An answer and the rule it grants, if any.
+    Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
     Shutdown,
 }
@@ -342,8 +359,9 @@ impl AgentSession for FakeSession {
         &mut self,
         request: AgentRequestId,
         decision: Decision,
+        rule: Option<u8>,
     ) -> Result<(), AgentError> {
-        self.request(FakeInput::Answer(request, decision))
+        self.request(FakeInput::Answer(request, decision, rule))
     }
 
     async fn interrupt(&mut self) -> Result<(), AgentError> {
@@ -449,6 +467,7 @@ impl Runner {
                     call,
                     tool,
                     input,
+                    suggestions,
                     on_approve,
                     on_deny,
                 } => {
@@ -457,6 +476,7 @@ impl Runner {
                         call,
                         tool,
                         input,
+                        suggestions,
                     };
                     if !self.emit(asked).await {
                         return Flow::Exit(None);
@@ -516,7 +536,7 @@ impl Runner {
     async fn wait_answer(&mut self, request: &AgentRequestId) -> Result<Decision, Stop> {
         loop {
             match self.commands.recv().await {
-                Some(FakeInput::Answer(answered, decision)) if answered == *request => {
+                Some(FakeInput::Answer(answered, decision, _)) if answered == *request => {
                     return Ok(decision);
                 }
                 input => self.during_turn(input)?,

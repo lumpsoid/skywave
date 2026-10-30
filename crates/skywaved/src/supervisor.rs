@@ -285,7 +285,9 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.store_cursor()?;
                 self.deliver(session_id, text).await?;
             }
-            EventKind::ApprovalResolved { id, decision, .. } => {
+            EventKind::ApprovalResolved {
+                id, decision, rule, ..
+            } => {
                 let Some(running) = self.running.get_mut(&session_id) else {
                     return Ok(());
                 };
@@ -294,7 +296,11 @@ impl<A: AgentAdapter> Supervisor<A> {
                 let Some(request) = running.mapper.take_approval(id) else {
                     return Ok(());
                 };
-                if let Err(error) = running.session.answer_approval(request, decision).await {
+                if let Err(error) = running
+                    .session
+                    .answer_approval(request, decision, rule)
+                    .await
+                {
                     tracing::warn!(session = %session_id.0, %error, "cannot answer approval");
                 }
             }

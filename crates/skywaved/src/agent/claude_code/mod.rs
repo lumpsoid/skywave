@@ -29,6 +29,7 @@
 
 pub mod display;
 pub mod protocol;
+pub mod rules;
 
 use std::path::Path;
 use std::process::Stdio;
@@ -250,8 +251,9 @@ impl AgentSession for ClaudeCodeSession {
         &mut self,
         request: AgentRequestId,
         decision: Decision,
+        rule: Option<u8>,
     ) -> Result<(), AgentError> {
-        self.request(Request::Answer(request, decision))
+        self.request(Request::Answer(request, decision, rule))
     }
 
     async fn interrupt(&mut self) -> Result<(), AgentError> {
@@ -271,7 +273,7 @@ impl AgentSession for ClaudeCodeSession {
 #[derive(Debug)]
 enum Request {
     Message(String),
-    Answer(AgentRequestId, Decision),
+    Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
     Shutdown,
 }
@@ -406,8 +408,8 @@ impl Driver {
                 request = self.requests.recv() => {
                     let out = match request {
                         Some(Request::Message(text)) => self.protocol.send_message(text),
-                        Some(Request::Answer(request, decision)) => {
-                            self.protocol.answer(&request, decision)
+                        Some(Request::Answer(request, decision, rule)) => {
+                            self.protocol.answer(&request, decision, rule)
                         }
                         Some(Request::Interrupt) => self.protocol.interrupt(),
                         Some(Request::Shutdown) | None => break self.shutdown().await,

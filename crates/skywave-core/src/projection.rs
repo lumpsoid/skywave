@@ -243,6 +243,7 @@ mod tests {
                 tool: "bash".into(),
                 summary: "ls".into(),
                 input: None,
+                suggestions: Vec::new(),
             },
             EventKind::ApprovalRequested {
                 id: a2,
@@ -250,6 +251,7 @@ mod tests {
                 tool: "bash".into(),
                 summary: "pwd".into(),
                 input: None,
+                suggestions: Vec::new(),
             },
         ];
         for (i, kind) in steps.into_iter().enumerate() {
@@ -264,6 +266,7 @@ mod tests {
             id: a1,
             decision: Decision::Approve,
             by: DeviceId::new(),
+            rule: None,
         };
         summary.apply(Seq(5), &event(sid, 5, resolved));
         assert_eq!(summary.pending_approval(), Some(a2));

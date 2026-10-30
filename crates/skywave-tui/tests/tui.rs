@@ -19,7 +19,8 @@ use skywave_core::{
 };
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult,
+    RuleScope, RuleSuggestion, SessionState as LogState, ToolCall, ToolDisplay, ToolKind,
+    ToolResult,
 };
 use skywave_tui::App;
 use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
@@ -673,6 +674,7 @@ fn every_session_state_has_its_own_badge() {
                     tool: "Bash".into(),
                     summary: "rm -rf target".into(),
                     input: None,
+                    suggestions: Vec::new(),
                 },
             ),
             event(
@@ -1178,6 +1180,7 @@ fn approval_prompt_answer_and_resolutions() {
                 tool: "write".into(),
                 summary: "a.txt".into(),
                 input: Some(input),
+                suggestions: Vec::new(),
             },
         )],
     );
@@ -1197,6 +1200,7 @@ fn approval_prompt_answer_and_resolutions() {
         Some(Action::ResolveApproval {
             id: first,
             decision: Decision::Approve,
+            rule: None,
         })
     );
     assert_contains(&h.screen(), "you approved · queued");
@@ -1215,6 +1219,7 @@ fn approval_prompt_answer_and_resolutions() {
                 id: first,
                 decision: Decision::Approve,
                 by: me,
+                rule: None,
             },
         )],
     );
@@ -1236,6 +1241,7 @@ fn approval_prompt_answer_and_resolutions() {
                 tool: "shell".into(),
                 summary: "rm -rf build".into(),
                 input: None,
+                suggestions: Vec::new(),
             },
         )],
     );
@@ -1249,6 +1255,7 @@ fn approval_prompt_answer_and_resolutions() {
                 id: second,
                 decision: Decision::Deny,
                 by: other,
+                rule: None,
             },
         )],
     );
@@ -1273,6 +1280,7 @@ fn approval_prompt_answer_and_resolutions() {
                     tool: "net".into(),
                     summary: "curl".into(),
                     input: None,
+                    suggestions: Vec::new(),
                 },
             ),
             event(
@@ -2311,6 +2319,7 @@ fn a_grouped_tool_call_shows_its_approval_and_result() {
                     tool: "Write".into(),
                     summary: "a.txt".into(),
                     input: None,
+                    suggestions: Vec::new(),
                 },
             ),
             event(
@@ -2320,6 +2329,7 @@ fn a_grouped_tool_call_shows_its_approval_and_result() {
                     id: approval,
                     decision: Decision::Approve,
                     by: me,
+                    rule: None,
                 },
             ),
             event(
@@ -2460,6 +2470,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
             tool: tool.into(),
             summary: summary.into(),
             input: None,
+            suggestions: Vec::new(),
         }
     };
     let resolve =
@@ -2467,6 +2478,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
             id: approval,
             decision,
             by,
+            rule: None,
         };
 
     pull(
@@ -2846,6 +2858,15 @@ fn wrapped_text_hangs_under_its_column() {
 /// `before` events, then `tool` gated by a pending approval; the open
 /// session's harness and id, the approval and the call's seq.
 fn gated(before: Vec<EventKind>, tool: ToolCall) -> (Harness, SessionId, ApprovalId, Seq) {
+    gated_offering(before, tool, Vec::new())
+}
+
+/// As [`gated`], the approval offering `suggestions`.
+fn gated_offering(
+    before: Vec<EventKind>,
+    tool: ToolCall,
+    suggestions: Vec<RuleSuggestion>,
+) -> (Harness, SessionId, ApprovalId, Seq) {
     let (mut h, id, _) = open_session();
     let approval = ApprovalId::new();
     let call = tool.call;
@@ -2859,6 +2880,7 @@ fn gated(before: Vec<EventKind>, tool: ToolCall) -> (Harness, SessionId, Approva
         tool: name,
         summary,
         input: None,
+        suggestions,
     });
     let seq = Seq(h.seam.cursor().unwrap().0 + kinds.len() as u64 - 1);
     let events: Vec<Event> = kinds.into_iter().map(|kind| event(id, 1, kind)).collect();
@@ -2934,6 +2956,176 @@ fn approval_panel_caps_rows() {
     assert_contains(&rows[7], "│ … +24 lines · v shows all");
 }
 
+fn rule(label: &str, scope: RuleScope) -> RuleSuggestion {
+    RuleSuggestion {
+        label: label.into(),
+        scope,
+    }
+}
+
+fn granted(approval: ApprovalId, by: DeviceId, rule: u8) -> EventKind {
+    EventKind::ApprovalResolved {
+        id: approval,
+        decision: Decision::Approve,
+        by,
+        rule: Some(rule),
+    }
+}
+
+#[test]
+fn shift_a_grants_the_one_rule_offered() {
+    let bash = call(CallId::new(), "Bash", ToolKind::Shell, "cargo test");
+    let offered = vec![rule("Bash(cargo test)", RuleScope::Project)];
+    let (mut h, id, approval, _) = gated_offering(vec![], bash, offered);
+    let rows = panel(&h.screen());
+    assert_contains(&rows[1], "A  always allow · Bash(cargo test) (project)");
+    assert_contains(&rows[2], "Esc, then a approve · x deny");
+    // Typed into the message, not an answer.
+    assert_eq!(h.key(KeyCode::Char('A')), None);
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Esc);
+    assert_contains(
+        &h.screen(),
+        "a/x approve/deny · A always allow · v show the call",
+    );
+
+    assert_eq!(
+        h.key(KeyCode::Char('A')),
+        Some(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: Some(0),
+        })
+    );
+    let rows = panel(&h.screen());
+    assert_contains(
+        rows.last().unwrap(),
+        "you approved always · Bash(cargo test) (project) · queued",
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("A  always allow")),
+        "{rows:#?}"
+    );
+
+    // Logged: said on the call, counted in the status line, listed in help.
+    let me = h.seam.identity().unwrap().device_id();
+    pull(&mut h, vec![event(id, 2, granted(approval, me, 0))]);
+    let screen = h.screen();
+    assert!(!screen.contains("Approval needed"), "{screen}");
+    assert_contains(&screen, "approved always here · Bash(cargo test)");
+    assert_contains(&screen, "agent idle · 1 rule");
+    h.key(KeyCode::Char('?'));
+    let screen = text(&h.frame(100, 60, mockup_now()));
+    assert_contains(&screen, "Rules granted in this session");
+    assert_contains(&screen, "  Bash(cargo test) (project)");
+    assert_contains(
+        &screen,
+        "Granted here only; the agent's settings may hold more.",
+    );
+    assert_contains(&screen, "A             approve, always allowing a rule");
+}
+
+#[test]
+fn shift_a_lists_several_rules_to_pick_one() {
+    let bash = call(CallId::new(), "Bash", ToolKind::Shell, "cargo test");
+    let before = (0..30).map(|i| agent(&format!("message {i}"))).collect();
+    let offered = vec![
+        rule("Bash(cargo test)", RuleScope::Project),
+        rule("all edits", RuleScope::Session),
+        rule("access to /srv/data", RuleScope::User),
+    ];
+    let (mut h, _, approval, _) = gated_offering(before, bash, offered);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    let selected = h.app.ui().session.as_ref().unwrap().selected;
+    assert!(selected.is_some());
+    assert_contains(
+        &panel(&h.screen())[1],
+        "A  always allow · choose one of 3 rules",
+    );
+
+    // Esc goes back to a / x, nothing answered.
+    assert_eq!(h.key(KeyCode::Char('A')), None);
+    let rows = panel(&h.screen());
+    assert_contains(&rows[1], "› Bash(cargo test) (project)");
+    assert_contains(&rows[2], "  all edits (session)");
+    assert_contains(&rows[3], "  access to /srv/data (user)");
+    assert_contains(
+        &rows[4],
+        "↑↓ choose · Enter approve and always allow · Esc back to a/x",
+    );
+    assert_contains(
+        &h.screen(),
+        "↑↓ choose · Enter approve and always allow · Esc back to a/x · ? help",
+    );
+    assert_eq!(h.key(KeyCode::Esc), None);
+    let rows = panel(&h.screen());
+    assert_contains(&rows[1], "A  always allow · choose one of 3 rules");
+    assert_contains(&rows[2], "a approve · x deny");
+    assert!(
+        h.app.session().is_some(),
+        "Esc closed the list, not the session"
+    );
+
+    // ↑↓ pick in the list, clamped at its ends; the timeline stays put.
+    h.key(KeyCode::Char('A'));
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Up] {
+        assert_eq!(h.key(code), None);
+    }
+    assert_eq!(h.app.ui().session.as_ref().unwrap().selected, selected);
+    assert_contains(&panel(&h.screen())[2], "› all edits (session)");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: Some(1),
+        })
+    );
+    assert_contains(
+        panel(&h.screen()).last().unwrap(),
+        "you approved always · all edits (session) · queued",
+    );
+}
+
+#[test]
+fn the_rule_list_keeps_to_the_panel_row_cap() {
+    let bash = call(CallId::new(), "Bash", ToolKind::Shell, "cargo test");
+    let offered = (0..8)
+        .map(|i| rule(&format!("rule {i}"), RuleScope::Session))
+        .collect();
+    let (mut h, _, _, _) = gated_offering(vec![], bash, offered);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('A'));
+    // 20 rows inside: six rows of rules, the highlighted one in view.
+    let rows = panel(&h.screen());
+    assert_eq!(rows.len(), 1 + 6 + 1, "{rows:#?}");
+    for _ in 0..7 {
+        h.key(KeyCode::Down);
+    }
+    let rows = panel(&h.screen());
+    assert_contains(&rows[1], "  rule 2 (session)");
+    assert_contains(&rows[6], "› rule 7 (session)");
+}
+
+#[test]
+fn a_rule_granted_elsewhere_shows_with_the_device() {
+    let bash = call(CallId::new(), "Bash", ToolKind::Shell, "cargo test");
+    let offered = vec![rule("Bash(cargo test)", RuleScope::Project)];
+    let (mut h, id, approval, _) = gated_offering(vec![], bash, offered);
+    let phone = DeviceId::new();
+    pull(&mut h, vec![event(id, 2, granted(approval, phone, 0))]);
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        &format!(
+            "approved always on device …{} · Bash(cargo test)",
+            tail(phone)
+        ),
+    );
+    assert_contains(&screen, "· 1 rule");
+}
+
 #[test]
 fn v_reveals_gated_call() {
     let mut edit = call(CallId::new(), "Edit", ToolKind::FileEdit, "src/lib.rs");
@@ -2965,6 +3157,7 @@ fn v_reveals_gated_call() {
                 id: approval,
                 decision: Decision::Approve,
                 by: DeviceId::new(),
+                rule: None,
             },
         )],
     );
@@ -3512,7 +3705,12 @@ fn approval_answer_says_how_long_it_waited() {
     assert!(h.app.live(), "the answer's wait counts up");
     let answer = |h: &Harness| {
         let (view, _) = h.app.session().unwrap();
-        view.pending_approval.as_ref().unwrap().answer.unwrap()
+        view.pending_approval
+            .as_ref()
+            .unwrap()
+            .answer
+            .clone()
+            .unwrap()
     };
     let queued_at = answer(&h).delivery.unwrap().queued_at;
     let wall = queued_at + chrono::Duration::seconds(40);
@@ -4107,6 +4305,7 @@ fn approval(session_id: SessionId, minute: u32, id: ApprovalId, summary: &str) -
             tool: "shell".into(),
             summary: summary.into(),
             input: None,
+            suggestions: Vec::new(),
         },
     )
 }
@@ -4119,6 +4318,7 @@ fn approved(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
             id,
             decision: Decision::Approve,
             by: DeviceId::new(),
+            rule: None,
         },
     )
 }
@@ -4165,6 +4365,7 @@ fn ctrl_g_opens_approvals_elsewhere_counted_in_the_banner() {
         Some(Action::ResolveApproval {
             id: ids[1],
             decision: Decision::Approve,
+            rule: None,
         })
     );
     // Cycles back.

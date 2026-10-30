@@ -165,7 +165,21 @@
           "call": "01920000-0000-7000-8000-000000000007",
           "tool": "exec",
           "summary": "rm -rf target",
-          "input": null
+          "input": null,
+          "suggestions": [
+            {
+              "label": "allow exec(rm -rf target)",
+              "scope": "project"
+            },
+            {
+              "label": "allow all edits",
+              "scope": "session"
+            },
+            {
+              "label": "allow exec(cargo:*)",
+              "scope": "user"
+            }
+          ]
         }
       },
       {
@@ -180,7 +194,8 @@
           "input": {
             "id": "01920000-0000-7000-8000-000000000005",
             "size": 48213
-          }
+          },
+          "suggestions": []
         }
       },
       {
@@ -190,7 +205,19 @@
           "type": "approval_resolved",
           "id": "01920000-0000-7000-8000-000000000004",
           "decision": "approve",
-          "by": "01920000-0000-7000-8000-000000000003"
+          "by": "01920000-0000-7000-8000-000000000003",
+          "rule": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "approval_resolved",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "decision": "approve",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "rule": 1
         }
       },
       {
@@ -200,7 +227,8 @@
           "type": "approval_resolved",
           "id": "01920000-0000-7000-8000-000000000004",
           "decision": "deny",
-          "by": "01920000-0000-7000-8000-000000000003"
+          "by": "01920000-0000-7000-8000-000000000003",
+          "rule": null
         }
       },
       {
@@ -310,7 +338,8 @@
       "kind": {
         "type": "resolve_approval",
         "id": "01920000-0000-7000-8000-000000000004",
-        "decision": "approve"
+        "decision": "approve",
+        "rule": null
       }
     },
     {
@@ -318,7 +347,17 @@
       "kind": {
         "type": "resolve_approval",
         "id": "01920000-0000-7000-8000-000000000004",
-        "decision": "deny"
+        "decision": "approve",
+        "rule": 0
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "resolve_approval",
+        "id": "01920000-0000-7000-8000-000000000004",
+        "decision": "deny",
+        "rule": null
       }
     },
     {
@@ -396,6 +435,10 @@
     {
       "result": "rejected",
       "reason": "no_active_turn"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_rule"
     }
   ]
 }

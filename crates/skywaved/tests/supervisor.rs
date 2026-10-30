@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, Seq, SessionId, SessionState, ToolResult,
+    RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState, ToolResult,
 };
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, Step};
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
@@ -91,7 +91,17 @@ impl Fixture {
     }
 
     fn resolve(&mut self, device: DeviceId, id: ApprovalId, decision: Decision) -> CommandResult {
-        self.handle(device, CommandKind::ResolveApproval { id, decision })
+        self.resolve_rule(device, id, decision, None)
+    }
+
+    fn resolve_rule(
+        &mut self,
+        device: DeviceId,
+        id: ApprovalId,
+        decision: Decision,
+        rule: Option<u8>,
+    ) -> CommandResult {
+        self.handle(device, CommandKind::ResolveApproval { id, decision, rule })
     }
 
     fn interrupt(&mut self) -> CommandResult {
@@ -248,13 +258,74 @@ async fn full_turn_through_commands() {
         [
             FakeInput::Started { resumed: false },
             message("write notes"),
-            FakeInput::Answer("req-1".into(), Decision::Approve),
+            FakeInput::Answer("req-1".into(), Decision::Approve, None),
         ]
     );
     // The resume handle was stored for later restarts.
     assert_eq!(
         skywaved::agent::load_resume_handle(&f.storage.db, f.session_id).unwrap(),
         Some(FakeAgent::resume_handle(f.session_id))
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_granted_rule_is_logged_and_reaches_the_agent() {
+    let mut f = Fixture::new();
+    let script =
+        FakeScript::new().turn([
+            Step::approval("req-1", "write", json!({ "path": "notes.txt" }))
+                .suggest("write(notes.txt)", RuleScope::Project)
+                .suggest("all edits", RuleScope::Session)
+                .on_approve([Step::tool_result("written")]),
+        ]);
+    let agent = FakeAgent::new(script);
+    let supervisor = f.start(&agent).await;
+
+    f.send("write notes");
+    let kinds = f.wait_count("approval", 1, is_approval_requested).await;
+    let offered: Vec<_> = kinds
+        .iter()
+        .find_map(|k| match k {
+            EventKind::ApprovalRequested { suggestions, .. } => Some(suggestions.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        offered,
+        [
+            RuleSuggestion {
+                label: "write(notes.txt)".into(),
+                scope: RuleScope::Project,
+            },
+            RuleSuggestion {
+                label: "all edits".into(),
+                scope: RuleScope::Session,
+            },
+        ]
+    );
+    let id = f.approval_id();
+    let device = DeviceId::new();
+    accepted(f.resolve_rule(device, id, Decision::Approve, Some(1)));
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.contains(&EventKind::ApprovalResolved {
+        id,
+        decision: Decision::Approve,
+        by: device,
+        rule: Some(1),
+    }));
+    let answers: Vec<_> = agent
+        .inputs(f.session_id)
+        .into_iter()
+        .filter(|i| matches!(i, FakeInput::Answer(..)))
+        .collect();
+    assert_eq!(
+        answers,
+        [FakeInput::Answer(
+            "req-1".into(),
+            Decision::Approve,
+            Some(1)
+        )]
     );
     supervisor.shutdown().await.unwrap();
 }
@@ -287,7 +358,8 @@ async fn first_of_two_devices_answering_wins() {
         [&EventKind::ApprovalResolved {
             id,
             decision: Decision::Deny,
-            by: phone
+            by: phone,
+            rule: None,
         }]
     );
     assert!(kinds.contains(&EventKind::AgentMessage {
@@ -298,7 +370,10 @@ async fn first_of_two_devices_answering_wins() {
         .into_iter()
         .filter(|i| matches!(i, FakeInput::Answer(..)))
         .collect();
-    assert_eq!(answers, [FakeInput::Answer("req-1".into(), Decision::Deny)]);
+    assert_eq!(
+        answers,
+        [FakeInput::Answer("req-1".into(), Decision::Deny, None)]
+    );
     supervisor.shutdown().await.unwrap();
 }
 

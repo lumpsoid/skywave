@@ -18,11 +18,11 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::{
     ApprovalStatus, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing, Query,
-    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 use unicode_width::UnicodeWidthChar;
 
-use super::{decision_label, outgoing_badge, outgoing_label};
+use super::{answer_words, decision_label, outgoing_badge, outgoing_label};
 use crate::app::SessionUi;
 use crate::timeline::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -769,11 +769,8 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
             decision,
             by,
             by_me,
-        }) => Some(format!(
-            "{} {}",
-            decision_label(*decision),
-            where_(*by, *by_me)
-        )),
+            rule,
+        }) => Some(resolved_label(*decision, *by, *by_me, rule.as_ref())),
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
@@ -838,8 +835,9 @@ pub(super) fn approval_state(status: &ApprovalStatus) -> (String, Style) {
             decision,
             by,
             by_me,
+            rule,
         } => (
-            format!("{} {}", decision_label(*decision), where_(*by, *by_me)),
+            resolved_label(*decision, *by, *by_me, rule.as_ref()),
             match decision {
                 Decision::Approve => Style::new().green(),
                 Decision::Deny => Style::new().magenta(),
@@ -849,6 +847,19 @@ pub(super) fn approval_state(status: &ApprovalStatus) -> (String, Style) {
             (format!("cancelled: {reason}"), Style::new().dark_gray())
         }
     }
+}
+
+/// How an approval was answered and where, with the rule it granted:
+/// `approved always on <device> · <rule>`.
+fn resolved_label(
+    decision: Decision,
+    by: DeviceId,
+    by_me: bool,
+    rule: Option<&RuleSuggestion>,
+) -> String {
+    let words = answer_words(decision, rule);
+    let rule = rule.map_or_else(String::new, |rule| format!(" · {}", clean(&rule.label)));
+    format!("{words} {}{rule}", where_(by, by_me))
 }
 
 /// Who answered an approval: "here" or the other device.

@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search;
 use skywave_core::{
-    Action, BlobPolicy, BlobState, Completion, CompletionStatus, CoreError, Decision, Delivery,
-    Entry, Link, LinkRejection, ListKind, Outgoing, PairingView, PendingSession, Query, Route,
-    Screen, Seq, SessionId, SessionListView, SessionView, TimelineItem, ToolOutcome, ViewState,
+    Action, ApprovalId, ApprovalPrompt, BlobPolicy, BlobState, Completion, CompletionStatus,
+    CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind, Outgoing, PairingView,
+    PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView, SessionView,
+    TimelineItem, ToolOutcome, ViewState,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -416,6 +417,17 @@ pub struct SessionUi {
     marked: Option<(Seq, Instant)>,
     /// The search through the timeline (`/`), while one is open or kept.
     pub search: Option<Search>,
+    /// The list of rules `A` opened in the approval prompt; see
+    /// [`SessionUi::rule_pick`].
+    rule_pick: Option<RulePick>,
+}
+
+/// The rules an approval offers, listed to grant one: which approval, and
+/// which rule is highlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RulePick {
+    approval: ApprovalId,
+    selected: usize,
 }
 
 /// A search through the open session's timeline. What matches is the
@@ -518,6 +530,76 @@ impl SessionUi {
             opening: view.unread_from.is_some(),
             marked: None,
             search: None,
+            rule_pick: None,
+        }
+    }
+
+    /// The highlighted rule while the list `A` opened is up: only while its
+    /// approval is still the one waiting here unanswered.
+    pub fn rule_pick(&self, view: &SessionView) -> Option<usize> {
+        let pick = self.rule_pick?;
+        let prompt = view.pending_approval.as_ref()?;
+        (prompt.id == pick.approval && unanswered(prompt)).then_some(pick.selected)
+    }
+
+    /// `A`: approve and grant the rule the approval offers; with several,
+    /// list them to pick one first.
+    fn allow_always(&mut self, view: &SessionView) -> Option<Action> {
+        let prompt = view.pending_approval.as_ref().filter(|p| unanswered(p))?;
+        match prompt.suggestions.len() {
+            0 => None,
+            1 => Some(Action::ResolveApproval {
+                id: prompt.id,
+                decision: Decision::Approve,
+                rule: Some(0),
+            }),
+            _ => {
+                self.rule_pick = Some(RulePick {
+                    approval: prompt.id,
+                    selected: 0,
+                });
+                None
+            }
+        }
+    }
+
+    /// Keys while the rule list is up: ↑↓ pick, Enter grants, Esc goes back
+    /// to a/x, which still answer. Nothing else reaches the timeline.
+    fn rule_pick_key(&mut self, view: &SessionView, key: KeyCode) -> Option<Action> {
+        let selected = self.rule_pick(view)?;
+        let prompt = view.pending_approval.as_ref()?;
+        let last = prompt.suggestions.len().saturating_sub(1);
+        let mut pick = |selected| {
+            if let Some(pick) = &mut self.rule_pick {
+                pick.selected = selected;
+            }
+            None
+        };
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => pick(selected.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => pick((selected + 1).min(last)),
+            KeyCode::Enter => {
+                self.rule_pick = None;
+                Some(Action::ResolveApproval {
+                    id: prompt.id,
+                    decision: Decision::Approve,
+                    rule: u8::try_from(selected).ok(),
+                })
+            }
+            KeyCode::Esc => {
+                self.rule_pick = None;
+                None
+            }
+            KeyCode::Char('a') | KeyCode::Char('x') => {
+                self.rule_pick = None;
+                let decision = if key == KeyCode::Char('a') {
+                    Decision::Approve
+                } else {
+                    Decision::Deny
+                };
+                answer(view, decision)
+            }
+            _ => None,
         }
     }
 
@@ -1439,6 +1521,9 @@ impl App {
                 }
                 None
             }
+            Focus::Timeline if session.rule_pick(view).is_some() => {
+                session.rule_pick_key(view, key.code)
+            }
             Focus::Timeline => match key.code {
                 // A kept search goes first; the next Esc leaves.
                 KeyCode::Esc if session.search.is_some() => {
@@ -1517,6 +1602,8 @@ impl App {
                 }
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
+                // Shifted, so a stray key does not grant a lasting rule.
+                KeyCode::Char('A') => session.allow_always(view),
                 KeyCode::Char('v') => {
                     session.reveal_gated(view);
                     None
@@ -1573,7 +1660,16 @@ fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
     Some(Action::ResolveApproval {
         id: prompt.id,
         decision,
+        rule: None,
     })
+}
+
+/// This device has not answered `prompt`, or its answer was refused.
+fn unanswered(prompt: &ApprovalPrompt) -> bool {
+    prompt
+        .answer
+        .as_ref()
+        .is_none_or(|answer| matches!(answer.outgoing, Outgoing::Failed(_)))
 }
 
 impl SessionUi {

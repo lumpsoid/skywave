@@ -17,7 +17,10 @@
 //! withdraws it (`control_cancel_request`, or an error `tool_result` for its
 //! tool call), or the turn ends; the last two are reported as
 //! `ApprovalCancelled`. An answer to a request that is no longer pending
-//! writes nothing.
+//! writes nothing. The request's `permission_suggestions` worth offering
+//! ([`rules::offered`]) ride along as rule suggestions; an approval granting
+//! one sends that update back as `updatedPermissions`, so the CLI keeps the
+//! rule where it said it would.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -25,7 +28,7 @@ use serde_json::{Value, json};
 use skywave_proto::Decision;
 use uuid::Uuid;
 
-use super::display;
+use super::{display, rules};
 use crate::agent::{AdapterEvent, AgentCallId, AgentRequestId, ResumeHandle, TurnOutcome};
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -103,6 +106,16 @@ pub fn allow_response(request_id: &str, input: &Value) -> Value {
     )
 }
 
+/// Allows permission request `request_id` as [`allow_response`] does and
+/// applies `update`, one of the request's `permission_suggestions`, as its
+/// `updatedPermissions`.
+pub fn allow_always_response(request_id: &str, input: &Value, update: &Value) -> Value {
+    control_success(
+        request_id,
+        json!({ "behavior": "allow", "updatedInput": input, "updatedPermissions": [update] }),
+    )
+}
+
 /// Denies permission request `request_id`; the model sees `message`.
 pub fn deny_response(request_id: &str, message: &str) -> Value {
     control_success(
@@ -132,6 +145,8 @@ struct Pending {
     request: AgentRequestId,
     tool_use_id: Option<String>,
     input: Value,
+    /// The permission update behind each suggestion offered, by index.
+    updates: Vec<Value>,
 }
 
 /// The protocol state of one CLI process.
@@ -240,16 +255,27 @@ impl Protocol {
         }
     }
 
-    /// Answers approval `request`; nothing if it is no longer pending.
-    pub fn answer(&mut self, request: &AgentRequestId, decision: Decision) -> Output {
+    /// Answers approval `request`; nothing if it is no longer pending. An
+    /// approval granting `rule` applies the update offered at that index; an
+    /// index the request did not offer is only an approval.
+    pub fn answer(
+        &mut self,
+        request: &AgentRequestId,
+        decision: Decision,
+        rule: Option<u8>,
+    ) -> Output {
         let Some(index) = self.pending.iter().position(|p| p.request == *request) else {
             tracing::debug!(request = %request.0, "dropping an answer to an approval that is not pending");
             return Output::default();
         };
         let pending = self.pending.remove(index);
-        let write = match decision {
-            Decision::Approve => allow_response(&pending.request.0, &pending.input),
-            Decision::Deny => deny_response(&pending.request.0, DENY_MESSAGE),
+        let update = rule.and_then(|rule| pending.updates.get(usize::from(rule)));
+        let write = match (decision, update) {
+            (Decision::Approve, Some(update)) => {
+                allow_always_response(&pending.request.0, &pending.input, update)
+            }
+            (Decision::Approve, None) => allow_response(&pending.request.0, &pending.input),
+            (Decision::Deny, _) => deny_response(&pending.request.0, DENY_MESSAGE),
         };
         Output {
             writes: vec![write],
@@ -466,18 +492,23 @@ impl Protocol {
             .get("tool_use_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let (suggestions, updates) = rules::offered(request.get("permission_suggestions"))
+            .into_iter()
+            .unzip();
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
         self.pending.push(Pending {
             request: request.clone(),
             tool_use_id,
             input: input.clone(),
+            updates,
         });
         out.events.push(AdapterEvent::ApprovalRequested {
             request,
             call,
             tool,
             input,
+            suggestions,
         });
     }
 

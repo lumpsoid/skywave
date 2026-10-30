@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, Seq, SessionId, SessionState,
+    RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState,
 };
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
 use skywaved::{Error, EventLog, Storage};
@@ -73,6 +73,14 @@ impl Fixture {
     }
 
     fn request_approval(&mut self, session: SessionId) -> ApprovalId {
+        self.request_approval_offering(session, Vec::new())
+    }
+
+    fn request_approval_offering(
+        &mut self,
+        session: SessionId,
+        suggestions: Vec<RuleSuggestion>,
+    ) -> ApprovalId {
         let id = ApprovalId::new();
         self.agent(
             session,
@@ -82,6 +90,7 @@ impl Fixture {
                 tool: "Bash".into(),
                 summary: "ls".into(),
                 input: None,
+                suggestions,
             },
         );
         id
@@ -229,6 +238,7 @@ fn rejected_results_are_stored_and_stay_stable() {
         kind: CommandKind::ResolveApproval {
             id: approval,
             decision: Decision::Approve,
+            rule: None,
         },
     };
     accepted(f.log.handle(&mut f.storage.db, device, &resolve).unwrap());
@@ -237,6 +247,7 @@ fn rejected_results_are_stored_and_stay_stable() {
         kind: CommandKind::ResolveApproval {
             id: approval,
             decision: Decision::Deny,
+            rule: None,
         },
     };
     let answer = f.log.handle(&mut f.storage.db, device, &late).unwrap();
@@ -456,7 +467,8 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
     assert_eq!(
         f.handle(CommandKind::ResolveApproval {
             id: ApprovalId::new(),
-            decision: Decision::Approve
+            decision: Decision::Approve,
+            rule: None,
         }),
         rejected(RejectReason::UnknownApproval)
     );
@@ -475,6 +487,7 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
         kind: CommandKind::ResolveApproval {
             id: approval,
             decision: Decision::Deny,
+            rule: None,
         },
     };
     let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
@@ -485,7 +498,8 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
         EventKind::ApprovalResolved {
             id: approval,
             decision: Decision::Deny,
-            by: device
+            by: device,
+            rule: None,
         }
     );
     assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
@@ -506,9 +520,69 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
     assert_eq!(
         f.handle(CommandKind::ResolveApproval {
             id: cancelled,
-            decision: Decision::Approve
+            decision: Decision::Approve,
+            rule: None,
         }),
         rejected(RejectReason::ApprovalAlreadyResolved)
+    );
+}
+
+#[test]
+fn an_approval_grants_an_offered_rule_and_the_log_echoes_it() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let offered = vec![
+        RuleSuggestion {
+            label: "Bash(ls)".into(),
+            scope: RuleScope::Project,
+        },
+        RuleSuggestion {
+            label: "all edits".into(),
+            scope: RuleScope::Session,
+        },
+    ];
+    let approval = f.request_approval_offering(session, offered);
+    let resolve = |decision, rule| CommandKind::ResolveApproval {
+        id: approval,
+        decision,
+        rule,
+    };
+    // A denial grants nothing; an index past the offer names nothing.
+    for (decision, rule) in [(Decision::Deny, Some(0)), (Decision::Approve, Some(2))] {
+        assert_eq!(
+            f.handle(resolve(decision, rule)),
+            rejected(RejectReason::UnknownRule),
+            "{decision:?} {rule:?}"
+        );
+    }
+    assert_eq!(f.log.pending_approvals(&f.storage.db).unwrap().len(), 1);
+
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: resolve(Decision::Approve, Some(1)),
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    let event = &f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0];
+    assert_eq!(
+        event.kind,
+        EventKind::ApprovalResolved {
+            id: approval,
+            decision: Decision::Approve,
+            by: device,
+            rule: Some(1),
+        }
+    );
+
+    // A request offering nothing takes no rule.
+    let bare = f.request_approval(session);
+    assert_eq!(
+        f.handle(CommandKind::ResolveApproval {
+            id: bare,
+            decision: Decision::Approve,
+            rule: Some(0),
+        }),
+        rejected(RejectReason::UnknownRule)
     );
 }
 
@@ -780,6 +854,7 @@ fn agent_appends_are_checked() {
             tool: "Bash".into(),
             summary: "again".into(),
             input: None,
+            suggestions: Vec::new(),
         },
     );
     assert!(matches!(duplicate, Err(Error::InvalidAppend(_))));

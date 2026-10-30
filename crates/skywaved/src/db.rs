@@ -101,6 +101,13 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     INSERT INTO supervisor_cursor (id, seq) SELECT 1, COALESCE(MAX(seq), 0) FROM events;
     "#,
+    // v4: what `ResolveApproval.rule` is checked against (protocol v4).
+    r#"
+    -- How many rule suggestions the request offers; an answer's rule must
+    -- index one. Requests logged before v4 offered none.
+    ALTER TABLE approvals ADD COLUMN
+        rules INTEGER NOT NULL DEFAULT 0 CHECK (rules >= 0);
+    "#,
 ];
 
 /// Schema version this build creates and understands.

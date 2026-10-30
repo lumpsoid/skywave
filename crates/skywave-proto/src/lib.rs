@@ -18,9 +18,12 @@ use uuid::Uuid;
 /// client cannot decode the new event.
 ///
 /// v4: `CommandKind::RenameSession` and `EventKind::SessionRenamed`;
-/// `CommandKind::SetSessionArchived` and `EventKind::SessionArchived`. One v4
-/// carries every wire change of its release; no compatibility layer: the
-/// exact version check at `hello` rejects older clients.
+/// `CommandKind::SetSessionArchived` and `EventKind::SessionArchived`;
+/// `suggestions` on `EventKind::ApprovalRequested`, the `rule` granted with
+/// `CommandKind::ResolveApproval` and `EventKind::ApprovalResolved`, and
+/// `RejectReason::UnknownRule`. One v4 carries every wire change of its
+/// release; no compatibility layer: the exact version check at `hello`
+/// rejects older clients.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 macro_rules! uuid_id {
@@ -149,12 +152,20 @@ pub enum EventKind {
         tool: String,
         summary: String,
         input: Option<BlobRef>,
+        /// Lasting rules the agent offers to grant with an approval, at most
+        /// [`limits::RULE_SUGGESTIONS_MAX`]; an answer names one by its
+        /// index. Empty in events from before v4.
+        #[serde(default)]
+        suggestions: Vec<RuleSuggestion>,
     },
-    /// First answer wins (D5).
+    /// First answer wins (D5). `rule` is the index of the suggestion of the
+    /// request granted along with an approval; never set with a denial.
     ApprovalResolved {
         id: ApprovalId,
         decision: Decision,
         by: DeviceId,
+        #[serde(default)]
+        rule: Option<u8>,
     },
     /// The request can no longer be answered, e.g. the daemon restarted.
     ApprovalCancelled {
@@ -226,6 +237,34 @@ pub mod limits {
     pub const PREVIEW_MAX_BYTES: usize = 512;
     /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
     pub const SESSION_NAME_MAX_CHARS: usize = 80;
+    /// Longest [`RuleSuggestion::label`](crate::RuleSuggestion::label), in
+    /// chars.
+    pub const RULE_LABEL_MAX_CHARS: usize = 120;
+    /// Most [`RuleSuggestion`](crate::RuleSuggestion)s on one approval.
+    pub const RULE_SUGGESTIONS_MAX: usize = 8;
+}
+
+/// A lasting permission rule an agent offers to grant along with an
+/// approval, e.g. "allow edits this session". Agent-agnostic (D3): the
+/// server mints the label from what the agent offers; clients show it and
+/// never parse it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuleSuggestion {
+    /// One line, at most [`limits::RULE_LABEL_MAX_CHARS`].
+    pub label: String,
+    pub scope: RuleScope,
+}
+
+/// How far a granted rule reaches.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleScope {
+    /// This session only.
+    Session,
+    /// Every session in the project (the workdir) on the server.
+    Project,
+    /// Every session of the server's user.
+    User,
 }
 
 /// The agent invoked a tool.
@@ -474,9 +513,14 @@ pub enum CommandKind {
         session_id: SessionId,
         text: String,
     },
+    /// Answer an approval. `rule` grants the request's suggestion with
+    /// that index along with an approval; the server refuses it with a
+    /// denial or an index the request does not offer.
     ResolveApproval {
         id: ApprovalId,
         decision: Decision,
+        #[serde(default)]
+        rule: Option<u8>,
     },
     /// Stop the agent's current turn in this session.
     Interrupt {
@@ -546,6 +590,9 @@ pub enum RejectReason {
     ApprovalAlreadyResolved,
     /// `Interrupt` arrived while the session had no running turn.
     NoActiveTurn,
+    /// `ResolveApproval.rule` came with a denial, or names no suggestion of
+    /// the approval.
+    UnknownRule,
 }
 
 /// Body of `POST /v1/pair`, the only endpoint reachable without a client
