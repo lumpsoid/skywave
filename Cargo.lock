@@ -1593,8 +1593,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "skywave-core",
+ "skywaved",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uniffi",

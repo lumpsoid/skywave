@@ -8,7 +8,15 @@
 //!
 //! [`view`] mirrors `ViewState` and everything reachable from it (core →
 //! FFI); [`action`] mirrors `Action` and `Route` (FFI → core, failing on a
-//! bad id). Both follow the type mapping of D16.
+//! bad id). Both follow the type mapping of D16. A completion's `fill` and
+//! a session's `prompts` are computed by the core during the conversion, so
+//! the head holds no logic of its own (D2).
+//!
+//! [`client::SkywaveCore`] is the core itself: `open` it once per process
+//! with the device name, `subscribe` a [`client::ViewListener`] for its
+//! snapshots, `dispatch` actions, `suspend`/`resume` with the app, and
+//! `shutdown` when done (D17). [`helpers`] holds the few pure functions a
+//! head needs besides; every failure is a [`error::SkywaveError`].
 //!
 //! Generate Kotlin with `crates/skywave-core-ffi/gen-kotlin.sh <out-dir> [profile]`,
 //! which for the default `debug` profile runs:
@@ -36,6 +44,9 @@
 uniffi::setup_scaffolding!();
 
 pub mod action;
+pub mod client;
+pub mod error;
+pub mod helpers;
 pub mod logging;
 pub mod view;
 

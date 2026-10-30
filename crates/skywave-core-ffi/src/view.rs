@@ -522,10 +522,15 @@ pub struct Completion {
     pub input: String,
     pub candidates: Vec<Candidate>,
     pub status: CompletionStatus,
+    /// What the input becomes when the user completes it (Tab): the only
+    /// candidate with a trailing `/`, or the candidates' longest common
+    /// prefix if it extends the input. `None` when nothing would change.
+    pub fill: Option<String>,
 }
 
 impl From<sc::Completion> for Completion {
     fn from(c: sc::Completion) -> Self {
+        let fill = c.fill();
         let sc::Completion {
             input,
             candidates,
@@ -535,6 +540,7 @@ impl From<sc::Completion> for Completion {
             input,
             candidates: vec(candidates),
             status: status.into(),
+            fill,
         }
     }
 }
@@ -684,10 +690,15 @@ pub struct SessionView {
     /// Seq of the session's newest event, for `Action.MarkRead`.
     pub last_seq: u64,
     pub unread_from: Option<u64>,
+    /// The messages sent into the session, newest first, for recalling into
+    /// the composer: every device's logged messages, then this device's not
+    /// yet logged, a message repeated back to back listed once.
+    pub prompts: Vec<String>,
 }
 
 impl From<sc::SessionView> for SessionView {
     fn from(s: sc::SessionView) -> Self {
+        let prompts = s.prompts().into_iter().map(str::to_owned).collect();
         let sc::SessionView {
             id: session,
             title,
@@ -725,6 +736,7 @@ impl From<sc::SessionView> for SessionView {
             draft_rev,
             last_seq: last_seq.0,
             unread_from: unread_from.map(|seq| seq.0),
+            prompts,
         }
     }
 }
@@ -1735,7 +1747,68 @@ mod tests {
             draft_rev: 3,
             last_seq: 9,
             unread_from: Some(5),
+            prompts: vec![],
         }
+    }
+
+    #[test]
+    fn session_view_carries_the_prompts_newest_first() {
+        let user = |text: &str| sc::TimelineItem::Logged {
+            seq: sc::Seq(1),
+            at: at(),
+            entry: sc::Entry::UserMessage {
+                command_id: sc::CommandId::new(),
+                text: text.into(),
+                from: sc::DeviceId::new(),
+                own: false,
+                outgoing: None,
+                delivery: None,
+            },
+        };
+        let mut view = session_view(sc::SessionId::new());
+        view.timeline = vec![
+            user("first"),
+            user("again"),
+            user("again"),
+            sc::TimelineItem::Logged {
+                seq: sc::Seq(2),
+                at: at(),
+                entry: sc::Entry::AgentMessage { text: "ok".into() },
+            },
+            sc::TimelineItem::Pending {
+                command_id: sc::CommandId::new(),
+                text: "queued".into(),
+                outgoing: sc::Outgoing::Queued,
+                discardable: true,
+                delivery: None,
+            },
+        ];
+        let expected: Vec<String> = view.prompts().into_iter().map(str::to_owned).collect();
+        assert_eq!(expected, ["queued", "again", "first"]);
+        assert_eq!(SessionView::from(view).prompts, expected);
+    }
+
+    #[test]
+    fn completion_carries_its_fill() {
+        let completion = |input: &str, paths: &[&str]| sc::Completion {
+            input: input.into(),
+            candidates: paths
+                .iter()
+                .map(|p| sc::Candidate {
+                    path: (*p).into(),
+                    source: sc::CandidateSource::Recent,
+                })
+                .collect(),
+            status: sc::CompletionStatus::Ready { truncated: false },
+        };
+        let fill = |c: sc::Completion| Completion::from(c).fill;
+        assert_eq!(fill(completion("/w", &[])), None);
+        assert_eq!(fill(completion("/w", &["/w/a"])), Some("/w/a/".into()));
+        assert_eq!(
+            fill(completion("/w", &["/w/abc", "/w/abd"])),
+            Some("/w/ab".into())
+        );
+        assert_eq!(fill(completion("/w/ab", &["/w/abc", "/w/abd"])), None);
     }
 
     #[test]
@@ -1835,6 +1908,7 @@ mod tests {
                                 source: CandidateSource::Server,
                             }],
                             status: CompletionStatus::Loading,
+                            fill: Some("/w/a/".into()),
                         }),
                     }
                 },
