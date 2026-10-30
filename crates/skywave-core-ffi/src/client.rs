@@ -9,9 +9,11 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 use skywave_core as sc;
 
@@ -43,14 +45,24 @@ pub trait ViewListener: Send + Sync {
 #[derive(uniffi::Object)]
 pub struct SkywaveCore {
     inner: Mutex<Inner>,
+    /// Signalled when `in_flight` drops to zero and when shutdown finishes.
+    changed: Condvar,
 }
 
 struct Inner {
-    /// `None` once shut down.
+    /// `None` once shutdown has begun.
     core: Option<sc::Core>,
     subscriptions: HashMap<u64, sc::SubscriptionId>,
     next_id: u64,
+    /// Calls holding a handle on the core ([`Call`]); shutdown waits for
+    /// them, since the store stays open while any handle lives.
+    in_flight: usize,
+    /// Shutdown has finished: the core is stopped and its store closed.
+    stopped: bool,
 }
+
+/// How long shutdown gives engine work in the middle of a step to finish.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[uniffi::export]
 impl SkywaveCore {
@@ -105,9 +117,12 @@ impl SkywaveCore {
             let Some(subscription) = inner.subscriptions.remove(&id) else {
                 return Ok(());
             };
-            (inner.core.clone(), subscription)
+            // In the same critical section: a shutdown that starts later
+            // waits for this call, one that started earlier took the
+            // subscription with it.
+            (self.enter(&mut inner), subscription)
         };
-        if let Some(core) = core {
+        if let Ok(core) = core {
             core.unsubscribe(subscription);
         }
         Ok(())
@@ -134,10 +149,13 @@ impl SkywaveCore {
         }
     }
 
-    /// Detaches every listener and stops the sync engine. Later calls fail
-    /// with `SkywaveException.ShutDown` (`suspend`, `resume`, `unsubscribe`
-    /// and a second `shutdown` do nothing). A `dispatch` already running
-    /// completes first; what it wrote stays on disk.
+    /// Detaches every listener, stops the sync engine and closes the
+    /// store, blocking until all of it is done: the same data dir can then
+    /// be opened again at once. Calls already running (a `dispatch` on
+    /// another thread, say) finish first; what they wrote stays on disk.
+    /// Later calls fail with `SkywaveException.ShutDown` (`suspend`,
+    /// `resume` and `unsubscribe` do nothing; a second `shutdown` waits for
+    /// the first, then does nothing).
     pub fn shutdown(&self) -> Result<(), SkywaveError> {
         not_in_listener("shutdown")?;
         let (core, subscriptions) = {
@@ -145,14 +163,67 @@ impl SkywaveCore {
             let subscriptions: Vec<_> = inner.subscriptions.drain().map(|(_, s)| s).collect();
             (inner.core.take(), subscriptions)
         };
-        if let Some(core) = core {
-            for subscription in subscriptions {
-                core.unsubscribe(subscription);
+        let Some(core) = core else {
+            // Another shutdown took the core; return once it is done.
+            let mut inner = self.lock();
+            while !inner.stopped {
+                inner = self.wait(inner);
             }
-            // The engine stops with the last clone of the core.
-            drop(core);
+            return Ok(());
+        };
+        // Marks the shutdown done even if stopping panics, so a second
+        // `shutdown` never waits forever.
+        let _done = Stopped(self);
+        for subscription in subscriptions {
+            core.unsubscribe(subscription);
+        }
+        // No new call gets the core now; wait out those that have it.
+        let mut inner = self.lock();
+        while inner.in_flight > 0 {
+            inner = self.wait(inner);
+        }
+        drop(inner);
+        // This is the last handle, and this thread is no listener (checked
+        // above), so not a runtime thread: this closes the store.
+        if let Err(err) = core.shutdown(SHUTDOWN_TIMEOUT) {
+            tracing::error!("core shutdown incomplete: {err}");
         }
         Ok(())
+    }
+}
+
+/// A handle on the core for the length of one call; shutdown waits until
+/// none is left.
+struct Call<'a> {
+    owner: &'a SkywaveCore,
+    core: sc::Core,
+}
+
+impl Deref for Call<'_> {
+    type Target = sc::Core;
+
+    fn deref(&self) -> &sc::Core {
+        &self.core
+    }
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.owner.lock();
+        inner.in_flight -= 1;
+        if inner.in_flight == 0 {
+            self.owner.changed.notify_all();
+        }
+    }
+}
+
+/// Sets [`Inner::stopped`] when the shutdown that owns it ends.
+struct Stopped<'a>(&'a SkywaveCore);
+
+impl Drop for Stopped<'_> {
+    fn drop(&mut self) {
+        self.0.lock().stopped = true;
+        self.0.changed.notify_all();
     }
 }
 
@@ -163,14 +234,31 @@ impl SkywaveCore {
                 core: Some(core),
                 subscriptions: HashMap::new(),
                 next_id: 1,
+                in_flight: 0,
+                stopped: false,
             }),
+            changed: Condvar::new(),
         }
     }
 
     /// A handle on the core, taken without holding our lock through the
     /// call: a listener's `dispatch` runs inside another call's delivery.
-    fn core(&self) -> Result<sc::Core, SkywaveError> {
-        self.lock().core.clone().ok_or(SkywaveError::ShutDown)
+    fn core(&self) -> Result<Call<'_>, SkywaveError> {
+        self.enter(&mut self.lock())
+    }
+
+    /// [`core`](SkywaveCore::core) under a lock the caller already holds.
+    /// The [`Call`] must outlive the guard, since dropping it locks again.
+    fn enter(&self, inner: &mut Inner) -> Result<Call<'_>, SkywaveError> {
+        let core = inner.core.clone().ok_or(SkywaveError::ShutDown)?;
+        inner.in_flight += 1;
+        Ok(Call { owner: self, core })
+    }
+
+    fn wait<'a>(&self, guard: MutexGuard<'a, Inner>) -> MutexGuard<'a, Inner> {
+        self.changed
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -359,6 +447,97 @@ mod tests {
             views.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    /// SQLite removes the write-ahead log when its last connection closes.
+    fn wal_exists(dir: &Path) -> bool {
+        dir.join(format!("{}-wal", sc::store::DB_FILE)).exists()
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_dispatch_on_another_thread_then_closes_the_store() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        /// Blocks in delivery once armed, until released.
+        struct Blocks {
+            armed: AtomicBool,
+            entered: Mutex<mpsc::Sender<()>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl ViewListener for Blocks {
+            fn on_view(&self, _: ViewState) {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let _ = self.entered.lock().unwrap().send(());
+                    let _ = self.release.lock().unwrap().recv_timeout(SOON);
+                }
+            }
+        }
+
+        let (dir, core) = detached();
+        let core = Arc::new(core);
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let listener = Arc::new(Blocks {
+            armed: AtomicBool::new(false),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        core.subscribe(listener.clone()).unwrap();
+        listener.armed.store(true, Ordering::SeqCst);
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatcher = thread::spawn({
+            let (core, dispatched) = (core.clone(), dispatched.clone());
+            move || {
+                let navigate = Action::Navigate {
+                    route: crate::action::Route::Settings,
+                };
+                let outcome = core.dispatch(navigate);
+                dispatched.store(true, Ordering::SeqCst);
+                outcome
+            }
+        });
+        entered.recv_timeout(SOON).unwrap();
+        assert!(wal_exists(dir.path()));
+
+        let (stopped_tx, stopped) = mpsc::channel();
+        let stopper = thread::spawn({
+            let (core, dispatched) = (core.clone(), dispatched.clone());
+            move || {
+                core.shutdown().unwrap();
+                // The dispatch had finished, and the store is closed.
+                let _ = stopped_tx.send(());
+                dispatched.load(Ordering::SeqCst)
+            }
+        });
+        // Shutdown does not return while the dispatch is still running.
+        assert!(stopped.recv_timeout(Duration::from_millis(200)).is_err());
+        release.send(()).unwrap();
+        assert_eq!(dispatcher.join().unwrap(), Ok(()));
+        assert!(stopper.join().unwrap(), "shutdown returned before dispatch");
+        assert!(!wal_exists(dir.path()));
+
+        // The dir opens again at once.
+        let again = SkywaveCore::with_core(sc::Core::open_detached(dir.path()).unwrap());
+        again.view().unwrap();
+        again.shutdown().unwrap();
+        assert!(!wal_exists(dir.path()));
+    }
+
+    #[test]
+    fn a_second_shutdown_returns_once_the_first_is_done() {
+        let (dir, core) = detached();
+        let core = Arc::new(core);
+        let both: Vec<_> = (0..2)
+            .map(|_| {
+                let core = core.clone();
+                std::thread::spawn(move || core.shutdown())
+            })
+            .collect();
+        for shutdown in both {
+            assert_eq!(shutdown.join().unwrap(), Ok(()));
+            assert!(!wal_exists(dir.path()));
+        }
     }
 
     #[test]

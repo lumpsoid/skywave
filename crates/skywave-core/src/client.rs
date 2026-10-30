@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::Duration;
 
 use chrono::Utc;
 use tokio::runtime::Runtime;
@@ -34,6 +35,20 @@ pub enum CoreError {
     Superseded,
 }
 
+/// Why [`Core::shutdown`] could not close the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShutdownError {
+    /// Called on a thread of an async runtime (an engine thread, e.g. from a
+    /// subscriber callback), where it cannot block. The core was dropped
+    /// instead: the engine stops in the background.
+    #[error("cannot shut the core down from inside an async runtime")]
+    InsideRuntime,
+    /// The engine is stopped, but another handle still holds the store —
+    /// a clone of the core or a [`Seam`] — so it closes when that goes.
+    #[error("the core is still in use elsewhere; its store stays open")]
+    InUse,
+}
+
 /// Handle returned by [`Core::subscribe`], for [`Core::unsubscribe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
@@ -41,7 +56,8 @@ pub struct SubscriptionId(u64);
 type Callback = Box<dyn FnMut(ViewState) + Send>;
 
 /// The client core. Cheap to clone; every clone is the same core. The sync
-/// engine stops when the last clone is dropped.
+/// engine stops when the last clone is dropped, in the background; use
+/// [`shutdown`](Core::shutdown) to wait for it.
 #[derive(Clone)]
 pub struct Core {
     pub(crate) shared: Arc<Shared>,
@@ -78,13 +94,18 @@ impl Requests {
 
 /// The running engine: its runtime and its suspend switch.
 struct EngineHandle {
-    runtime: Option<Runtime>,
+    /// `None` once [`Core::shutdown`] stopped it.
+    runtime: Mutex<Option<Runtime>>,
     suspended: watch::Sender<bool>,
 }
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
+        let runtime = self
+            .runtime
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(runtime) = runtime.take() {
             // Does not block, so it is safe inside another runtime too.
             runtime.shutdown_background();
         }
@@ -131,7 +152,7 @@ impl Core {
         Ok(Core {
             shared,
             engine: Some(Arc::new(EngineHandle {
-                runtime: Some(runtime),
+                runtime: Mutex::new(Some(runtime)),
                 suspended,
             })),
         })
@@ -262,6 +283,40 @@ impl Core {
     /// The current snapshot, for heads that poll instead of subscribing.
     pub fn view(&self) -> ViewState {
         lock(&self.shared.state).model.view()
+    }
+
+    /// Stops the core for good and closes its store, so the same data dir
+    /// can be opened again at once. Blocks until every engine task has
+    /// stopped — at most `timeout` for work in the middle of a step — and
+    /// then drops the store, unless another handle still holds it.
+    ///
+    /// The engine stops even while other clones exist; they keep working
+    /// against the local store, but nothing syncs. With other clones (or a
+    /// [`Seam`]) alive, or engine work still running after `timeout`, the
+    /// store closes when the last of them goes and this returns
+    /// [`ShutdownError::InUse`]. It must not be called on a thread of an
+    /// async runtime — including from a subscriber callback on an engine
+    /// thread — where it would block a runtime thread or wait for itself:
+    /// there it only drops this handle and returns
+    /// [`ShutdownError::InsideRuntime`].
+    pub fn shutdown(self, timeout: Duration) -> Result<(), ShutdownError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Dropping `self` is the non-blocking fallback.
+            return Err(ShutdownError::InsideRuntime);
+        }
+        let Core { shared, engine } = self;
+        if let Some(engine) = engine {
+            let runtime = lock(&engine.runtime).take();
+            if let Some(runtime) = runtime {
+                // Drops every task, and with them the engine's handles on
+                // `shared`.
+                runtime.shutdown_timeout(timeout);
+            }
+        }
+        // The last handle closes the store (and its SQLite connection) here.
+        Arc::try_unwrap(shared)
+            .map(drop)
+            .map_err(|_| ShutdownError::InUse)
     }
 
     /// The engine-side API (T13 transport and pairing, T14 sync, T15
@@ -407,4 +462,86 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::action::Route;
+    use crate::store::DB_FILE;
+    use crate::view::Screen;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// SQLite removes the write-ahead log when its last connection closes.
+    fn wal_exists(dir: &Path) -> bool {
+        dir.join(format!("{DB_FILE}-wal")).exists()
+    }
+
+    fn navigate(core: &Core) {
+        core.dispatch(Action::Navigate(Route::Settings)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_closes_the_store_so_the_dir_reopens_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            let core = Core::open(dir.path()).unwrap();
+            navigate(&core);
+            let shared = Arc::downgrade(&core.shared);
+            assert!(wal_exists(dir.path()));
+            assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+            // The engine's tasks, and their handles on the store, are gone.
+            assert!(shared.upgrade().is_none());
+            assert!(!wal_exists(dir.path()));
+        }
+    }
+
+    #[test]
+    fn shutdown_of_a_detached_core_closes_its_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        navigate(&core);
+        let shared = Arc::downgrade(&core.shared);
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+        assert!(shared.upgrade().is_none());
+        assert!(!wal_exists(dir.path()));
+    }
+
+    #[test]
+    fn shutdown_stops_the_engine_but_leaves_the_store_to_a_live_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let clone = core.clone();
+        let engine = Arc::downgrade(clone.engine.as_ref().unwrap());
+        let shared = Arc::downgrade(&core.shared);
+        assert_eq!(core.shutdown(TIMEOUT), Err(ShutdownError::InUse));
+        assert!(lock(&engine.upgrade().unwrap().runtime).is_none());
+        // The clone still works on the local store; the last one closes it.
+        navigate(&clone);
+        assert!(matches!(clone.view().screen, Screen::Pairing(_)));
+        drop(clone);
+        assert!(shared.upgrade().is_none());
+        assert!(!wal_exists(dir.path()));
+    }
+
+    #[test]
+    fn shutdown_inside_a_runtime_falls_back_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let shared = Arc::downgrade(&core.shared);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(async { core.shutdown(TIMEOUT) });
+        assert_eq!(outcome, Err(ShutdownError::InsideRuntime));
+        // The background stop still lets go of the store soon after.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the store never closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }

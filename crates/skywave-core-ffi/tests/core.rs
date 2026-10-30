@@ -285,3 +285,102 @@ fn a_bad_id_is_a_typed_error_and_shutdown_is_final() {
     // The object outliving shutdown (Kotlin GC) is harmless.
     drop(core);
 }
+
+/// SQLite removes the write-ahead log when its last connection closes.
+fn wal_exists(dir: &TempDir) -> bool {
+    dir.path()
+        .join(format!("{}-wal", skywave_core::store::DB_FILE))
+        .exists()
+}
+
+fn wait_online(views: &Views) {
+    views.wait("paired and online", |view| {
+        is_session_list(view) && matches!(view.link, Link::Online { .. })
+    });
+}
+
+/// A paired, online core shuts down completely: the store is closed when
+/// `shutdown` returns, and the same dir opens and connects again at once.
+#[test]
+fn shutdown_closes_the_store_so_the_dir_reopens_at_once() {
+    let daemon = Daemon::start(FakeAgent::new(FakeScript::new()));
+    let (dir, mut core) = open_core();
+    let (listener, views) = Views::listener();
+    core.subscribe(listener).unwrap();
+    let pair = parse_pair_uri(daemon.pair_uri()).unwrap();
+    core.dispatch(Action::Pair {
+        address: pair.address,
+        code: pair.code,
+        fingerprint: pair.fingerprint,
+    })
+    .unwrap();
+    wait_online(&views);
+    for _ in 0..3 {
+        assert!(wal_exists(&dir));
+        core.shutdown().unwrap();
+        assert!(!wal_exists(&dir), "the old store is still open");
+        core =
+            SkywaveCore::open(dir.path().display().to_string(), Some("ffi test".into())).unwrap();
+        let (listener, views) = Views::listener();
+        core.subscribe(listener).unwrap();
+        wait_online(&views);
+    }
+    core.shutdown().unwrap();
+    assert!(!wal_exists(&dir));
+}
+
+/// `shutdown` from a listener on an engine thread fails instead of
+/// deadlocking or stopping the core from underneath its own engine.
+#[test]
+fn shutdown_from_a_listener_on_an_engine_thread_is_reentrant() {
+    struct ShutsDown {
+        core: Mutex<Option<Arc<SkywaveCore>>>,
+        results: Mutex<Sender<(ViewState, Result<(), SkywaveError>)>>,
+    }
+    impl ViewListener for ShutsDown {
+        fn on_view(&self, view: ViewState) {
+            let core = self.core.lock().unwrap().clone();
+            if let Some(core) = core {
+                let result = core.shutdown();
+                let _ = self.results.lock().unwrap().send((view, result));
+            }
+        }
+    }
+    let (dir, core) = open_core();
+    let (tx, results) = mpsc::channel();
+    let listener = Arc::new(ShutsDown {
+        core: Mutex::new(None),
+        results: Mutex::new(tx),
+    });
+    core.subscribe(listener.clone()).unwrap();
+    *listener.core.lock().unwrap() = Some(core.clone());
+    // Nothing listens there: the engine reports the failure from its own
+    // thread.
+    core.dispatch(Action::Pair {
+        address: "127.0.0.1:1".into(),
+        code: "ABCDE-12345".into(),
+        fingerprint: ["AB"; 32].join(":"),
+    })
+    .unwrap();
+    let deadline = Instant::now() + SOON;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (view, result) = results.recv_timeout(left).expect("no failed pairing");
+        assert_eq!(
+            result,
+            Err(SkywaveError::Reentrant {
+                call: "shutdown".into()
+            })
+        );
+        if matches!(&view.screen, Screen::Pairing { view }
+            if matches!(view.status, PairingStatus::Failed { .. }))
+        {
+            break;
+        }
+    }
+    core.view().unwrap();
+    // Break the listener's cycle back to the core, then stop it for real.
+    listener.core.lock().unwrap().take();
+    core.shutdown().unwrap();
+    assert!(!wal_exists(&dir));
+}
