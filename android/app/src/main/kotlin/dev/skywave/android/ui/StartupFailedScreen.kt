@@ -18,9 +18,12 @@ import androidx.compose.ui.unit.dp
 import dev.skywave.android.R
 import dev.skywave.android.core.CoreMessage
 
-/** The core could not open; nothing else can work, so say why and stop. */
+/**
+ * The core could not open; nothing else can work, so say why and stop.
+ * Calls nothing native: the reason may be that the library did not load.
+ */
 @Composable
-fun StartupFailedScreen(reason: CoreMessage, coreVersion: String) {
+fun StartupFailedScreen(reason: CoreMessage, appVersion: String?) {
     Scaffold { padding ->
         Column(
             modifier = Modifier.fillMaxSize().padding(padding).padding(32.dp),
@@ -29,7 +32,9 @@ fun StartupFailedScreen(reason: CoreMessage, coreVersion: String) {
         ) {
             Text(stringResource(R.string.startup_failed_title), style = MaterialTheme.typography.headlineSmall)
             Text(reason.text(LocalResources.current), style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
-            Text(stringResource(R.string.startup_core_version, coreVersion), style = MaterialTheme.typography.bodySmall)
+            if (appVersion != null) {
+                Text(stringResource(R.string.startup_app_version, appVersion), style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }
@@ -38,6 +43,6 @@ fun StartupFailedScreen(reason: CoreMessage, coreVersion: String) {
 @Composable
 private fun StartupFailedPreview() {
     SkywaveTheme(dynamicColor = false) {
-        StartupFailedScreen(CoreMessage.Storage("database is locked"), "0.1.0 (protocol 7)")
+        StartupFailedScreen(CoreMessage.Storage("database is locked"), "0.1.0")
     }
 }

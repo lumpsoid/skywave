@@ -16,6 +16,13 @@ interface CoreClient {
     /** One-shot failures (a refused action), each delivered to one collector. */
     val messages: Flow<CoreMessage>
 
-    /** Queues [action]; actions reach the core in the order they were queued. */
+    /**
+     * Queues [action]; actions reach the core in the order they were queued.
+     *
+     * Not durable on return: the action sits in process memory until it is
+     * handed to the core, which writes it to its store before accepting it.
+     * Only then does it survive the process dying. Queued actions are lost if
+     * the process is killed first; a refused one is reported on [messages].
+     */
     fun dispatch(action: Action)
 }

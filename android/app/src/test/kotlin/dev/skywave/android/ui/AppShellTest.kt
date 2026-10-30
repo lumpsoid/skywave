@@ -115,6 +115,21 @@ class AppShellTest {
     }
 
     @Test
+    fun systemBackOnRevokedKeepsReadingInsteadOfNavigating() {
+        show(Samples.state(Link.Rejected(LinkRejection.Revoked), Screen.Session(sessionView(archived = false, items = 3))))
+        text("3 items").assertDoesNotExist()
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.waitForIdle()
+        assertEquals(emptyList<Action>(), dispatched)
+        text("3 items").assertExists() // the session, not the list behind it
+        text("This device was revoked").assertExists() // now as a banner
+        // With the full screen gone, back navigates again.
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.waitForIdle()
+        assertEquals(listOf<Action>(Action.Navigate(Route.SESSION_LIST)), dispatched)
+    }
+
+    @Test
     fun revokedOnPairingIsOnlyABanner() {
         show(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.unpaired))
         text("Not paired yet").assertExists()

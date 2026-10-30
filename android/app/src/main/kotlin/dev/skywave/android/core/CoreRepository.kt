@@ -1,7 +1,6 @@
 package dev.skywave.android.core
 
 import dev.skywave.core.Action
-import dev.skywave.core.Link
 import dev.skywave.core.SkywaveCoreInterface
 import dev.skywave.core.ViewListener
 import dev.skywave.core.ViewState
@@ -70,12 +69,12 @@ class CoreRepository internal constructor(
     fun resume() = core.resume()
 
     /**
-     * A network became the default. If the link is waiting out a backoff,
-     * try now instead of when the timer fires.
+     * A network became the default: if the link is waiting out a backoff, it
+     * tries now instead of when the timer fires. The core ignores
+     * [Action.RetryNow] unless it is reconnecting, so no check here (one
+     * read from the callback thread could be stale anyway).
      */
-    fun onNetworkAvailable() {
-        if (views.value.link is Link.Reconnecting) dispatch(Action.RetryNow)
-    }
+    fun onNetworkAvailable() = dispatch(Action.RetryNow)
 
     private fun apply(action: Action) {
         try {
