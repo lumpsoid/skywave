@@ -3,7 +3,7 @@
 //! overlay, list selection). Keys become core [`Action`]s here; nothing in
 //! this module decides anything about pairing, sync or delivery (D2).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -846,6 +846,11 @@ fn composer_of(view: &SessionView) -> Composer {
 #[derive(Debug, Clone)]
 pub struct UiState {
     pub help: bool,
+    /// The first line the help overlay shows; `j`/`k` scroll it.
+    pub help_top: usize,
+    /// The highest [`help_top`](Self::help_top) the last frame could use:
+    /// the overlay records it so scrolling stops at the last line.
+    pub help_end: Cell<usize>,
     pub form: PairingForm,
     /// Selected session on the session list, by id so it stays put when
     /// rows arrive or reorder.
@@ -895,6 +900,8 @@ impl App {
             view: view.clone(),
             ui: UiState {
                 help: false,
+                help_top: 0,
+                help_end: Cell::new(0),
                 form: PairingForm::default(),
                 selected: None,
                 prompt: None,
@@ -1380,17 +1387,28 @@ impl App {
             return matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
                 .then_some(Action::DeleteSessionLocally { session_id: id });
         }
+        // Help takes every key: none reaches the screen beneath.
         if self.ui.help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('q')
-            ) {
-                self.ui.help = false;
+            let end = self.ui.help_end.get();
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    self.ui.help = false;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.ui.help_top = (self.ui.help_top + 1).min(end);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.ui.help_top = self.ui.help_top.min(end).saturating_sub(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.ui.help_top = 0,
+                KeyCode::End | KeyCode::Char('G') => self.ui.help_top = end,
+                _ => {}
             }
             return None;
         }
         if key.code == KeyCode::F(1) || (!self.typing() && key.code == KeyCode::Char('?')) {
             self.ui.help = true;
+            self.ui.help_top = 0;
             return None;
         }
         if ctrl && key.code == KeyCode::Char('r') {

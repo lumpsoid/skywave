@@ -567,13 +567,227 @@ fn help_overlay_lists_keys_and_closes() {
     let screen = h.screen();
     assert_contains(&screen, "open session");
     assert_contains(&screen, "new session in a server directory");
-    assert_contains(&screen, "agent blocked on an approval");
     assert_contains(&screen, "Ctrl-C");
+    // Too long for 24 rows: the rest is a scroll away.
+    h.key(KeyCode::Char('G'));
+    assert_contains(&h.screen(), "agent blocked on an approval");
     // Keys do nothing else while help is open.
     assert_eq!(h.key(KeyCode::Char('s')), None);
     h.key(KeyCode::Char('?'));
     assert!(!h.app.ui().help);
     assert!(!h.screen().contains("open session"));
+}
+
+/// The help overlay in an 80×24 frame: its rows inside the border, and
+/// its bottom border.
+fn help_box(h: &Harness) -> (Vec<String>, String) {
+    let screen = text(&h.frame(80, 24, mockup_now()));
+    let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let top = lines
+        .iter()
+        .position(|l| l.iter().collect::<String>().contains("┌ Keys "))
+        .unwrap_or_else(|| panic!("no help overlay:\n{screen}"));
+    let left = lines[top].iter().position(|&c| c == '┌').unwrap();
+    let right = left + lines[top][left..].iter().position(|&c| c == '┐').unwrap();
+    let bottom = top + lines[top..].iter().position(|l| l[left] == '└').unwrap();
+    let rows = lines[top + 1..bottom]
+        .iter()
+        .map(|l| l[left + 1..right].iter().collect::<String>())
+        .collect();
+    (rows, lines[bottom][left..=right].iter().collect())
+}
+
+/// Opens help with F1, scrolls it to its end with `j`, closes it with Esc:
+/// every line it showed, in order. Each `j` scrolls one line until the
+/// last line is shown, so nothing is skipped, and the border says when
+/// there is more below.
+fn read_help(h: &mut Harness) -> Vec<String> {
+    h.key(KeyCode::F(1));
+    assert!(h.app.ui().help);
+    let (mut rows, mut border) = help_box(h);
+    assert_contains(&rows[0], "Everywhere");
+    let mut seen = rows.clone();
+    loop {
+        assert_eq!(h.key(KeyCode::Char('j')), None);
+        let (next, next_border) = help_box(h);
+        if next == rows {
+            assert!(!border.contains("below"), "{border}");
+            break;
+        }
+        assert_contains(&border, "below · j/k scroll");
+        assert_eq!(next[..next.len() - 1], rows[1..], "one line at a time");
+        assert_contains(&next_border, "more above");
+        seen.push(next.last().unwrap().clone());
+        (rows, border) = (next, next_border);
+    }
+    h.key(KeyCode::Esc);
+    assert!(!h.app.ui().help);
+    seen
+}
+
+/// `keys` each start a line of `help`, so the key is there with its words.
+fn assert_keys(help: &[String], keys: &[&str]) {
+    for key in keys {
+        assert!(
+            help.iter().any(|l| l.starts_with(&format!("  {key:<14}"))),
+            "{key:?} not in help:\n{}",
+            help.join("\n")
+        );
+    }
+}
+
+#[test]
+fn every_help_key_is_reachable_on_an_80x24_terminal() {
+    let everywhere = ["F1 / ?", "q / Ctrl-C", "Ctrl-R", "Ctrl-G"];
+
+    let mut h = Harness::new();
+    let help = read_help(&mut h);
+    assert_keys(&help, &everywhere);
+    assert_keys(&help, &["Tab / ↓", "paste", "Esc"]);
+
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    pull(&mut h, vec![created(id, 0, "/srv/work")]);
+    let help = read_help(&mut h);
+    assert_keys(&help, &everywhere);
+    assert_keys(
+        &help,
+        &["↑↓ / k j", "D", "Del", "s", "[stopped]", "! N pending"],
+    );
+    assert_contains(
+        &help.join("\n"),
+        "command from this device: answer or cancel",
+    );
+
+    h.key(KeyCode::Char('n'));
+    assert_keys(
+        &read_help(&mut h),
+        &["Tab", "↑↓ Tab/Enter", "Ctrl-U", "Esc"],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('r'));
+    assert_keys(&read_help(&mut h), &["type / paste", "Enter", "Esc"]);
+    h.key(KeyCode::Esc);
+    assert!(h.app.ui().prompt.is_none());
+
+    h.key(KeyCode::Char('s'));
+    assert_keys(&read_help(&mut h), &["b", "p", "Esc"]);
+    h.key(KeyCode::Esc);
+
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    let help = read_help(&mut h);
+    assert_keys(
+        &help,
+        &["Ctrl-X", "Ctrl-F", "Tab", "Ctrl-J", "Ctrl-P / N", "Esc"],
+    );
+    // A long description wraps under itself instead of being cut.
+    assert_contains(&help.join("\n"), "first line, ↓ on the last");
+    assert_contains(&help.join("\n"), "session cost; model");
+
+    h.key(KeyCode::Tab);
+    assert!(!h.app.typing());
+    let help = read_help(&mut h);
+    assert!(help.len() > 22, "the timeline's help scrolls at 80×24");
+    assert_keys(
+        &help,
+        &[
+            "↑↓ / k j",
+            "[ / ]",
+            "d",
+            "y / Y",
+            "A",
+            "Home g/End G",
+            "/",
+            "n / N",
+            "i",
+            "Esc",
+        ],
+    );
+    assert_contains(&help.join("\n"), "command's text before its output");
+
+    let mut h = Harness::paired();
+    h.seam.set_link(Link::Rejected(LinkRejection::Revoked));
+    h.sync();
+    let help = read_help(&mut h);
+    assert_keys(&help, &everywhere);
+    assert_keys(&help, &["p / Enter", "Esc"]);
+}
+
+#[test]
+fn keys_in_help_scroll_it_and_reach_nothing_beneath() {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    let mut events = vec![created(id, 0, "/srv/work")];
+    events.extend(agent_messages(id, "news", 5));
+    pull(&mut h, events);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    let before = selected(&h);
+    assert!(before.is_some());
+
+    h.key(KeyCode::Char('?'));
+    let (first, border) = help_box(&h);
+    assert_contains(&border, "↓ more below · j/k scroll");
+    for code in [
+        KeyCode::Char('j'),
+        KeyCode::Char('j'),
+        KeyCode::Down,
+        KeyCode::Char('k'),
+        KeyCode::Up,
+        KeyCode::Char('i'),
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::PageUp,
+    ] {
+        assert_eq!(h.key(code), None, "{code:?}");
+        assert!(h.app.ui().help);
+    }
+    assert_eq!(selected(&h), before);
+    assert!(!h.app.typing(), "still on the timeline");
+    let (rows, border) = help_box(&h);
+    assert_eq!(rows[0], first[1], "scrolled one line");
+    assert_contains(&border, "↑↓ more above and below · j/k scroll");
+
+    // G/End to the end, g/Home back to the top; past the ends stays put.
+    h.key(KeyCode::Char('G'));
+    let (end, border) = help_box(&h);
+    assert_contains(&border, "↑ more above · j/k scroll");
+    h.key(KeyCode::Char('j'));
+    assert_eq!(help_box(&h).0, end);
+    h.key(KeyCode::Char('k'));
+    assert_eq!(help_box(&h).0[1..], end[..end.len() - 1]);
+    h.key(KeyCode::Home);
+    assert_eq!(help_box(&h).0, first);
+    h.key(KeyCode::Char('k'));
+    assert_eq!(help_box(&h).0, first);
+    h.key(KeyCode::End);
+    assert_eq!(help_box(&h).0, end);
+
+    // Each closing key closes it as before, and does nothing else; it
+    // opens again at the top.
+    for close in [
+        KeyCode::Esc,
+        KeyCode::F(1),
+        KeyCode::Char('?'),
+        KeyCode::Char('q'),
+    ] {
+        assert_eq!(h.key(close), None);
+        assert!(!h.app.ui().help, "{close:?}");
+        assert!(!h.app.ui().quit);
+        assert_eq!(selected(&h), before);
+        assert!(matches!(h.app.view().screen, Screen::Session(_)));
+        h.key(KeyCode::Char('?'));
+        assert_eq!(help_box(&h).0, first);
+    }
+    h.key(KeyCode::Esc);
+
+    // With help closed, j moves the selection again.
+    h.key(KeyCode::Char('j'));
+    assert_ne!(selected(&h), before);
 }
 
 #[test]
@@ -1866,7 +2080,8 @@ fn session_keys_are_in_help_and_footer() {
     h.key(KeyCode::Char('?'));
     let screen = h.screen();
     assert_contains(&screen, "expand it; downloads its blob if needed");
-    assert_contains(&screen, "approve / deny the pending approval");
+    h.key(KeyCode::Char('G'));
+    assert_contains(&h.screen(), "approve / deny the pending approval");
     h.key(KeyCode::Char('?'));
     h.key(KeyCode::Char('i'));
     assert!(h.app.typing());
