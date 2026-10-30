@@ -98,7 +98,7 @@ internal fun NewDivider() {
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions) {
+internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions, gated: GatedApproval? = null) {
     val item = row.item
     var expanded by rememberSaveable(row.key) { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
@@ -136,7 +136,7 @@ internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions) {
                 onDiscard = { actions.discard(item.commandId) },
                 onEdit = { actions.edit(item.commandId) },
             )
-            is TimelineItem.Logged -> LoggedEntry(item, expanded)
+            is TimelineItem.Logged -> LoggedEntry(item, expanded, gated)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             if (text != null) {
@@ -169,7 +169,7 @@ internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions) {
 }
 
 @Composable
-private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean) {
+private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: GatedApproval?) {
     when (val e = item.entry) {
         is Entry.UserMessage -> MessageBubble(
             text = e.text,
@@ -182,7 +182,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean) {
             onEdit = {},
         )
         is Entry.AgentMessage -> AgentText(e.text)
-        is Entry.Tool -> ToolItem(e.tool, expanded)
+        is Entry.Tool -> ToolItem(e.tool, expanded, gated)
         is Entry.ToolCall -> Column {
             Label(stringResource(R.string.sv_tool_call, e.name, e.summary))
             e.input?.let { Minor(stringResource(R.string.sv_tool_input, blobText(it))) }
@@ -193,7 +193,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean) {
         }
         is Entry.Approval -> Column {
             Label(stringResource(R.string.sv_approval, e.tool, e.summary))
-            Minor(approvalText(e.status))
+            ApprovalLine(e.status, gated)
         }
         Entry.Interrupted -> SystemLine(stringResource(R.string.sv_interrupted))
         Entry.Stopped -> SystemLine(stringResource(R.string.sv_stopped))
@@ -330,7 +330,7 @@ private fun proseWithInlineCode(text: String, codeBg: Color): AnnotatedString = 
 }
 
 @Composable
-private fun CodeBox(text: String, color: Color? = null, maxLines: Int = Int.MAX_VALUE) {
+internal fun CodeBox(text: String, color: Color? = null, maxLines: Int = Int.MAX_VALUE, wrap: Boolean = false) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(6.dp),
@@ -341,8 +341,8 @@ private fun CodeBox(text: String, color: Color? = null, maxLines: Int = Int.MAX_
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.bodySmall,
             color = color ?: MaterialTheme.colorScheme.onSurfaceVariant,
-            softWrap = false,
-            modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
+            softWrap = wrap,
+            modifier = (if (wrap) Modifier else Modifier.horizontalScroll(rememberScrollState())).padding(8.dp),
         )
     }
 }
@@ -363,7 +363,7 @@ internal fun firstLines(text: String, max: Int): String {
 
 /** A diff with added and removed lines coloured. */
 @Composable
-private fun DiffBox(text: String, maxLines: Int) {
+internal fun DiffBox(text: String, maxLines: Int = Int.MAX_VALUE) {
     val added = MaterialTheme.colorScheme.primary
     val removed = MaterialTheme.colorScheme.error
     val styled = remember(text, maxLines, added, removed) {
@@ -403,7 +403,7 @@ private fun DiffBox(text: String, maxLines: Int) {
 
 /** The label of a tool kind (D3: the kind decides, the name is only shown). */
 @Composable
-private fun kindLabel(tool: ToolView): String = when (tool.kind) {
+internal fun kindLabel(tool: ToolView): String = when (tool.kind) {
     ToolKind.FILE_WRITE -> stringResource(R.string.sv_kind_write)
     ToolKind.FILE_EDIT -> stringResource(R.string.sv_kind_edit)
     ToolKind.FILE_READ -> stringResource(R.string.sv_kind_read)
@@ -424,7 +424,7 @@ private fun outputShownCollapsed(tool: ToolView, done: ToolOutcome.Done): Boolea
 
 /** One tool call: kind and title, body preview, outcome; tap shows everything. */
 @Composable
-private fun ToolItem(tool: ToolView, expanded: Boolean) {
+private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?) {
     val colors = MaterialTheme.colorScheme
     val outcome = tool.outcome
     val failed = (outcome is ToolOutcome.Done && outcome.isError) || outcome is ToolOutcome.Denied
@@ -470,7 +470,9 @@ private fun ToolItem(tool: ToolView, expanded: Boolean) {
                     maxLines = if (expanded) Int.MAX_VALUE else PREVIEW_LINES,
                 )
             }
-            tool.approval?.let { Minor(approvalText(it.status)) }
+            // A denial is the outcome line's to say, unless it granted more.
+            tool.approval?.takeUnless { outcome is ToolOutcome.Denied && it.status.isPlainDenial() }
+                ?.let { ApprovalLine(it.status, gated) }
             Text(
                 outcomeText(outcome),
                 style = MaterialTheme.typography.labelMedium,
@@ -502,24 +504,36 @@ private fun outcomeText(outcome: ToolOutcome): String = when (outcome) {
             else -> stringResource(R.string.sv_tool_done, took)
         }
     }
-    is ToolOutcome.Denied ->
-        stringResource(if (outcome.byMe) R.string.sv_tool_denied_me else R.string.sv_tool_denied_other)
+    is ToolOutcome.Denied -> if (outcome.byMe) {
+        stringResource(R.string.sv_tool_denied_me)
+    } else {
+        stringResource(R.string.sv_tool_denied_other, shortDevice(outcome.by))
+    }
     is ToolOutcome.Cancelled -> stringResource(R.string.sv_tool_cancelled, outcome.reason)
     ToolOutcome.NoResult -> stringResource(R.string.sv_tool_no_result)
 }
 
-/** An approval's status as text; answering it is the approvals UI's (A12). */
+private fun ApprovalStatus.isPlainDenial() =
+    this is ApprovalStatus.Resolved && decision == Decision.DENY && rule == null
+
+/**
+ * An approval's status as text. Another device is named by its id: the
+ * view carries no device names yet (e4d763).
+ */
 @Composable
 internal fun approvalText(status: ApprovalStatus): String = when (status) {
     ApprovalStatus.Pending -> stringResource(R.string.sv_approval_pending)
     is ApprovalStatus.Resolved -> {
-        val base = stringResource(
-            when (status.decision) {
-                Decision.APPROVE -> if (status.byMe) R.string.sv_approval_approved_me else R.string.sv_approval_approved_other
-                Decision.DENY -> if (status.byMe) R.string.sv_approval_denied_me else R.string.sv_approval_denied_other
-            },
-        )
-        base + (status.rule?.let { stringResource(R.string.sv_approval_rule, it.label) } ?: "")
+        val base = when {
+            status.byMe -> stringResource(
+                if (status.decision == Decision.APPROVE) R.string.sv_approval_approved_me else R.string.sv_approval_denied_me,
+            )
+            else -> stringResource(
+                if (status.decision == Decision.APPROVE) R.string.sv_approval_approved_other else R.string.sv_approval_denied_other,
+                shortDevice(status.by),
+            )
+        }
+        base + (status.rule?.let { stringResource(R.string.sv_approval_rule, ruleText(it)) } ?: "")
     }
     is ApprovalStatus.Cancelled -> stringResource(R.string.sv_approval_cancelled, status.reason)
 }
@@ -542,7 +556,7 @@ internal fun blobText(blob: BlobView): String = when (val s = blob.state) {
 private fun Label(text: String) = Text(text, style = MaterialTheme.typography.bodyMedium)
 
 @Composable
-private fun Minor(text: String, color: Color? = null) = Text(
+internal fun Minor(text: String, color: Color? = null) = Text(
     text,
     style = MaterialTheme.typography.bodySmall,
     color = color ?: MaterialTheme.colorScheme.onSurfaceVariant,

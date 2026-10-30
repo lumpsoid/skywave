@@ -1,8 +1,15 @@
 package dev.skywave.android.ui.screens
 
+import dev.skywave.core.Answer
+import dev.skywave.core.ApprovalPrompt
+import dev.skywave.core.BlobView
+import dev.skywave.core.BodyFormat
 import dev.skywave.core.Entry
+import dev.skywave.core.Outgoing
 import dev.skywave.core.TimelineItem
+import dev.skywave.core.ToolKind
 import dev.skywave.core.ToolOutcome
+import dev.skywave.core.ToolView
 import dev.skywave.core.TurnUsage
 import java.util.Locale
 
@@ -53,6 +60,76 @@ internal fun timelineRows(timeline: List<TimelineItem>, unreadFrom: ULong?): Lis
     }
     return rows
 }
+
+/**
+ * Whether the timeline [item] is the one [prompt] gates: its tool call
+ * (spec §7: `pending_approval.call` names it), else, for an approval with
+ * no logged call, the standalone approval entry.
+ */
+internal fun gates(prompt: ApprovalPrompt, item: TimelineItem): Boolean {
+    val entry = (item as? TimelineItem.Logged)?.entry ?: return false
+    return when (entry) {
+        is Entry.Tool -> prompt.call != null && entry.tool.call == prompt.call
+        is Entry.Approval -> prompt.call == null && entry.id == prompt.id
+        else -> false
+    }
+}
+
+/** The key of the row [prompt] gates, or null when it is not in [rows]. */
+internal fun gatedRowKey(rows: List<TimelineRow>, prompt: ApprovalPrompt?): String? {
+    prompt ?: return null
+    return rows.firstOrNull { it is TimelineRow.Item && gates(prompt, it.item) }?.key
+}
+
+/** The tool call [prompt] gates, if it is a logged one. */
+internal fun gatedTool(timeline: List<TimelineItem>, prompt: ApprovalPrompt): ToolView? =
+    timeline.firstOrNull { gates(prompt, it) }
+        ?.let { ((it as TimelineItem.Logged).entry as? Entry.Tool)?.tool }
+
+/** What an approval asks to do, as the panel shows it. */
+internal sealed interface ApprovalBody {
+    /** A unified diff, e.g. an edit. */
+    data class Diff(val text: String, val lines: UInt, val full: BlobView?) : ApprovalBody
+
+    /** A file's content, or any other text the call carries. */
+    data class Content(val text: String, val lines: UInt, val full: BlobView?) : ApprovalBody
+
+    /** A shell command, whole. */
+    data class Command(val text: String) : ApprovalBody
+
+    /** Nothing more than the title says. */
+    data object None : ApprovalBody
+}
+
+/**
+ * The body of the panel for [tool] (null for an approval with no logged
+ * call, whose [prompt] summary is all there is). The server puts a command
+ * too long for the title in the body (D4), so a shell's body wins over its
+ * title; a shell's title carries a "$ " the command does not.
+ */
+internal fun approvalBody(prompt: ApprovalPrompt, tool: ToolView?): ApprovalBody {
+    val body = tool?.body
+    return when {
+        tool == null -> prompt.summary.takeIf { it.isNotBlank() }?.let { ApprovalBody.Content(it, it.lineCount(), null) }
+            ?: ApprovalBody.None
+        body != null && body.format == BodyFormat.DIFF -> ApprovalBody.Diff(body.preview, body.lines, body.full)
+        body != null && tool.kind == ToolKind.SHELL && body.full == null -> ApprovalBody.Command(body.preview)
+        body != null -> ApprovalBody.Content(body.preview, body.lines, body.full)
+        tool.kind == ToolKind.SHELL -> ApprovalBody.Command(tool.title.removePrefix("$ "))
+        else -> ApprovalBody.None
+    }
+}
+
+private fun String.lineCount(): UInt = (count { it == '\n' } + 1).toUInt()
+
+/**
+ * Whether this device's [answer] still stands: given and not refused. A
+ * refused answer leaves the approval to answer again.
+ */
+internal fun answered(answer: Answer?): Boolean = answer != null && answer.outgoing !is Outgoing.Failed
+
+/** A device id short enough for a status line: its random tail. */
+internal fun shortDevice(id: String): String = "…" + id.filter { it != '-' }.takeLast(6)
 
 /** A piece of agent text: prose, or a fenced code block. */
 internal sealed interface TextBlock {

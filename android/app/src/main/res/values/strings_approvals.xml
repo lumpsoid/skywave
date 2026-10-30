@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Approval panel above the composer -->
+    <string name="ap_title">Approval needed</string>
+    <string name="ap_collapse">Hide the approval</string>
+    <string name="ap_strip">Approval needed: %1$s %2$s</string>
+    <string name="ap_answer">Answer</string>
+    <string name="ap_show">Show</string>
+    <string name="ap_approve">Approve</string>
+    <string name="ap_deny">Deny</string>
+    <string name="ap_show_more">Show more</string>
+    <string name="ap_show_less">Show less</string>
+    <string name="ap_always_allow">Always allow: %1$s</string>
+    <string name="ap_rule">%1$s (%2$s)</string>
+    <string name="ap_scope_session">this session</string>
+    <string name="ap_scope_project">this project</string>
+    <string name="ap_scope_user">all your sessions</string>
+
+    <!-- This device's answer and its delivery -->
+    <string name="ap_you_approved">You approved</string>
+    <string name="ap_you_denied">You denied</string>
+    <string name="ap_you_approved_rule">You approved, always allowing %1$s</string>
+    <string name="ap_out_queued">queued, goes out when back online</string>
+    <string name="ap_out_sending">sending…</string>
+    <string name="ap_out_accepted">sent, waiting for the agent</string>
+    <string name="ap_out_failed">refused: %1$s. Answer again.</string>
+
+    <!-- The gated item in the timeline -->
+    <string name="ap_waiting_you">Waiting for your approval</string>
+
+    <!-- Session toolbar -->
+    <plurals name="ap_next">
+        <item quantity="one">Next approval, %1$d waiting in another session</item>
+        <item quantity="other">Next approval, %1$d waiting in other sessions</item>
+    </plurals>
+</resources>
