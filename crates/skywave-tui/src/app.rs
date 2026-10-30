@@ -988,6 +988,7 @@ impl App {
         self.follow_session();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
+            session.keep_scroll(view);
             session.follow_draft(view);
             if let Some(search) = &mut session.search {
                 search.refresh(view, old_match);
@@ -1924,6 +1925,18 @@ impl SessionUi {
             after.or_else(|| (0..old).rfind(|&i| selectable(&view.timeline[i]).is_some()))
         });
         self.selected = index.and_then(|i| selectable(&view.timeline[i]));
+    }
+
+    /// Keeps the scroll anchor on its item as the timeline changes: on a
+    /// pending message, it moves to the logged message that message became,
+    /// at the same offset, so the view stays put. An anchor whose item is
+    /// gone stays, for the renderer to fall back from.
+    fn keep_scroll(&mut self, view: &SessionView) {
+        if let Some(anchor) = &mut self.scroll
+            && let Some(index) = find(view, anchor.key)
+        {
+            anchor.key = ItemKey::of(&view.timeline[index]);
+        }
     }
 
     /// Scrolls so the timeline item at `index` is on screen, its top first

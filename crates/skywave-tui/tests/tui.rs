@@ -3330,6 +3330,65 @@ fn selection_follows_pending_to_logged() {
     assert_contains(&h.screen(), "> 12:01 agent: ready");
 }
 
+/// Which `pending NN` message each screen row shows, if any; the session
+/// title, named after the first one, aside.
+fn pending_rows(screen: &str) -> Vec<Option<String>> {
+    screen
+        .lines()
+        .map(|line| {
+            let at = line.find(": pending ")? + 2;
+            line.get(at..at + "pending 00".len()).map(str::to_owned)
+        })
+        .collect()
+}
+
+#[test]
+fn scroll_follows_pending_to_logged() {
+    let (mut h, id, me) = open_session();
+    let sent: Vec<CommandId> = (0..40)
+        .map(|i| {
+            h.type_text(&format!("pending {i:02}"));
+            h.key(KeyCode::Enter);
+            last_command(&h)
+        })
+        .collect();
+    h.key(KeyCode::Esc);
+    h.screen();
+    h.key(KeyCode::PageUp);
+    let before = pending_rows(&h.screen());
+    let anchor = scroll(&h).expect("scrolled back");
+    let ItemKey::Pending(command) = anchor.key else {
+        panic!("anchored to {anchor:?}, not a pending message");
+    };
+    let at = sent.iter().position(|c| *c == command).unwrap();
+
+    // Logged after a reply that lands above them all: the rows they show
+    // move down in the timeline, and the view moves with them.
+    let first = h.seam.cursor().unwrap().0 + 1;
+    let mut events = vec![event(id, 2, agent("reply"))];
+    events.extend(sent.iter().enumerate().map(|(i, command)| {
+        event(
+            id,
+            3,
+            EventKind::UserMessage {
+                command_id: *command,
+                device_id: me,
+                text: format!("pending {i:02}"),
+            },
+        )
+    }));
+    pull(&mut h, events);
+    let screen = h.screen();
+    assert_eq!(pending_rows(&screen), before, "{screen}");
+    assert_eq!(
+        scroll(&h),
+        Some(Anchor {
+            key: ItemKey::Logged(Seq(first + 1 + at as u64)),
+            offset: anchor.offset,
+        })
+    );
+}
+
 /// The app's view with `key` taken out of the open session's timeline, as
 /// if the message were discarded.
 fn without(h: &Harness, key: ItemKey) -> ViewState {
