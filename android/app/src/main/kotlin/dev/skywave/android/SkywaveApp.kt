@@ -3,16 +3,26 @@ package dev.skywave.android
 import android.app.Application
 import android.net.ConnectivityManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
+import dev.skywave.android.background.BackgroundHost
+import dev.skywave.android.background.CatchUpWorker
+import dev.skywave.android.background.CoreAwake
+import dev.skywave.android.background.StayConnectedPreference
+import dev.skywave.android.background.StayConnectedService
 import dev.skywave.android.core.CoreLifecycleObserver
+import dev.skywave.android.core.CoreRepository
 import dev.skywave.android.core.CoreStartup
+import dev.skywave.android.core.LinkStatus
 import dev.skywave.android.core.NetworkWatcher
 import dev.skywave.android.core.startCore
 import dev.skywave.android.notifications.AndroidNotifications
 import dev.skywave.android.notifications.ApprovalNotifier
+import dev.skywave.core.Link
 import dev.skywave.core.SkywaveCore
 import dev.skywave.core.ViewState
 import dev.skywave.core.initLogging
@@ -20,6 +30,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -28,7 +39,7 @@ import java.io.File
  * activities read [core] and never open their own, so a configuration
  * change reuses the same core.
  */
-class SkywaveApp : Application() {
+class SkywaveApp : Application(), BackgroundHost {
     /** Lives as long as the process, like the core. */
     private val appScope = CoroutineScope(SupervisorJob())
 
@@ -39,15 +50,26 @@ class SkywaveApp : Application() {
      */
     val core: CoreStartup by lazy { openCore() }
 
+    /** Who keeps the core's link up: the visible app, a catch-up, the service (D21, A15). */
+    override val awake = CoreAwake()
+
+    /** The "Stay connected" choice; this device's, not the core's (A15). */
+    override val stayConnected: StayConnectedPreference by lazy { StayConnectedPreference.from(this) }
+
+    override fun openLinks(): StateFlow<LinkStatus>? = (core as? CoreStartup.Ready)?.repository?.linkStatus
+
     /** The approval notifications' shade; usable before the core opens (A15). */
     private val notifications: AndroidNotifications by lazy { AndroidNotifications(this, MainActivity::class.java) }
 
     override fun onCreate() {
         super.onCreate()
         notifications.createChannel()
-        // Registered before any activity starts, so the first ON_START is seen.
+        StayConnectedService.createChannel(this)
+        // Registered before any activity starts, so the first ON_START is
+        // seen. Coming to the foreground is the one moment the service may
+        // be started from besides the toggle (Android 12+).
         ProcessLifecycleOwner.get().lifecycle.addObserver(
-            CoreLifecycleObserver { (core as? CoreStartup.Ready)?.repository },
+            CoreLifecycleObserver(awake, onForeground = { stayConnected.onForeground() }),
         )
     }
 
@@ -69,6 +91,11 @@ class SkywaveApp : Application() {
             is CoreStartup.Ready -> {
                 NetworkWatcher(startup.repository).register(getSystemService(ConnectivityManager::class.java))
                 followApprovals(startup.repository.state)
+                // On the main thread, after this one's work: an activity
+                // opening the core gets its ON_START in first, so a core
+                // about to be shown is not suspended and resumed at once.
+                Handler(Looper.getMainLooper()).post { awake.attach(startup.repository) }
+                scheduleCatchUpOncePaired(startup.repository)
             }
             is CoreStartup.Failed -> Log.e(TAG, "core failed to open: ${startup.reason}")
         }
@@ -86,6 +113,14 @@ class SkywaveApp : Application() {
         }
         notifier.onView(state.value)
         appScope.launch(Dispatchers.Main) { notifier.follow(state) }
+    }
+
+    /** Background catch-ups (A15) from the first time the device is paired; every start re-checks. */
+    private fun scheduleCatchUpOncePaired(repository: CoreRepository) {
+        appScope.launch {
+            repository.state.first { it.link !is Link.Unpaired }
+            CatchUpWorker.schedule(this@SkywaveApp)
+        }
     }
 
     /**

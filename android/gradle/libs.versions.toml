@@ -11,6 +11,7 @@ collections-immutable = "0.5.2"
 junit = "4.13.2"
 robolectric = "4.17"
 zxing-embedded = "4.3.0"
+work = "2.12.0"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
@@ -32,6 +33,9 @@ compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
 compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 # D20: QR scanning without Play Services; brings ZXing core and its own camera handling.
 zxing-android-embedded = { module = "com.journeyapps:zxing-android-embedded", version.ref = "zxing-embedded" }
+# A15: the periodic background catch-up.
+androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
+androidx-work-testing = { module = "androidx.work:work-testing", version.ref = "work" }
 robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 # Used with `@aar` (see app/build.gradle.kts): the AAR carries the Android
 # libjnidispatch.so that UniFFI's generated bindings load through JNA.

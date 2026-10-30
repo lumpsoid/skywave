@@ -3,6 +3,8 @@ package dev.skywave.android.ui
 import android.content.ClipboardManager
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
@@ -11,6 +13,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import dev.skywave.android.ui.screens.AboutInfo
+import dev.skywave.android.ui.screens.InMemoryStayConnected
 import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.android.ui.screens.SettingsScreen
 import dev.skywave.android.ui.screens.fingerprintRows
@@ -32,15 +35,43 @@ class SettingsScreenTest {
 
     private val dispatched = mutableListOf<Action>()
 
+    private val stayConnected = InMemoryStayConnected(false)
+
     private fun show(view: SettingsView, about: AboutInfo = SettingsSamples.about) {
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
-                SettingsScreen(view, SettingsSamples.noChrome, dispatch = { dispatched += it }, about = about)
+                SettingsScreen(
+                    view,
+                    SettingsSamples.noChrome,
+                    dispatch = { dispatched += it },
+                    about = about,
+                    stayConnected = stayConnected,
+                )
             }
         }
     }
 
     private fun text(t: String) = compose.onNodeWithText(t)
+
+    @Test
+    fun stayConnectedTogglesTheDeviceChoiceAndTellsTheCoreNothing() {
+        show(SettingsSamples.paired)
+        val toggle = text("Stay connected").performScrollTo()
+        toggle.assertIsOff()
+        toggle.performClick()
+        toggle.assertIsOn()
+        toggle.performClick()
+        toggle.assertIsOff()
+        assertEquals(listOf(true, false), stayConnected.changes)
+        assertEquals(emptyList<Action>(), dispatched)
+    }
+
+    @Test
+    fun stayConnectedShowsTheStoredChoice() {
+        stayConnected.on.value = true
+        show(SettingsSamples.unpaired)
+        text("Stay connected").performScrollTo().assertIsOn()
+    }
 
     @Test
     fun showsTheViewsPolicy() {

@@ -94,7 +94,7 @@ internal object Samples {
 @Composable
 private fun ShellPreview(state: ViewState) {
     val inbox = remember { PairInbox { PairInput.Unreadable("previews read no links") } }
-    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about) }
+    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about, stayConnected = SettingsSamples.stayConnected) }
 }
 
 @Preview(name = "Connecting")

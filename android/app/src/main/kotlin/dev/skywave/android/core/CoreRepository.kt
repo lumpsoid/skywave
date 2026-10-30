@@ -1,7 +1,9 @@
 package dev.skywave.android.core
 
+import dev.skywave.android.background.Wakeable
 import dev.skywave.android.ui.screens.TimelineSearcher
 import dev.skywave.core.Action
+import dev.skywave.core.Link
 import dev.skywave.core.SkywaveCoreInterface
 import dev.skywave.core.ViewListener
 import dev.skywave.core.ViewState
@@ -13,8 +15,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.coroutines.CoroutineContext
+
+/**
+ * The link as last reported, and whether it may predate the last
+ * [CoreRepository.resume]: a suspended core keeps showing the link it had
+ * (often `Online`) until the restarted link reports, and that first report
+ * is never `Online`. So an `Online` with [stale] false is one reached after
+ * the resume: caught up and alerted for (A15).
+ */
+data class LinkStatus(val link: Link, val stale: Boolean)
 
 /**
  * The process's bridge to its one core (D17).
@@ -33,9 +45,14 @@ class CoreRepository internal constructor(
     private val core: SkywaveCoreInterface,
     scope: CoroutineScope,
     dispatchContext: CoroutineContext,
-) : CoreClient {
+) : CoreClient, Wakeable {
     private val views = MutableStateFlow(core.view())
     override val state: StateFlow<ViewState> = views.asStateFlow()
+
+    private val links = MutableStateFlow(LinkStatus(views.value.link, stale = false))
+
+    /** [LinkStatus] of every snapshot, unconflated at the source: see [suspend] and [resume]. */
+    val linkStatus: StateFlow<LinkStatus> = links.asStateFlow()
 
     private val errors = Channel<CoreMessage>(capacity = MESSAGE_BUFFER, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     override val messages: Flow<CoreMessage> = errors.receiveAsFlow()
@@ -48,6 +65,8 @@ class CoreRepository internal constructor(
         core.subscribe(
             object : ViewListener {
                 override fun onView(view: ViewState) {
+                    // Any link but Online is the restarted link's own report.
+                    links.update { LinkStatus(view.link, stale = it.stale && view.link is Link.Online) }
                     views.value = view
                 }
             },
@@ -66,11 +85,14 @@ class CoreRepository internal constructor(
     /** Searches the open session's timeline through this core. */
     val searcher: TimelineSearcher = CoreTimelineSearcher(core)
 
-    /** App went to the background (D21): pause the network, keep the replica. */
-    fun suspend() = core.suspend()
+    /** Nothing needs the link any more (D21, `CoreAwake`): pause the network, keep the replica. */
+    override fun suspend() = core.suspend()
 
-    /** App came back to the foreground (D21). */
-    fun resume() = core.resume()
+    /** Something needs the link again (D21, `CoreAwake`); the link it shows is stale until it reports. */
+    override fun resume() {
+        links.update { it.copy(stale = true) }
+        core.resume()
+    }
 
     /**
      * A network became the default: if the link is waiting out a backoff, it

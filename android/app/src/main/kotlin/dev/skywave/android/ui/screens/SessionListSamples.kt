@@ -115,7 +115,7 @@ private fun ListPreview(
 ) {
     val inbox = remember { PairInbox { PairInput.Unreadable("previews read no links") } }
     val state = ViewState(link = link, queued = queued, attention = Samples.noAttention, screen = screen, canGoBack = canGoBack)
-    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about) }
+    SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about, stayConnected = SettingsSamples.stayConnected) }
 }
 
 @Preview(name = "Sessions")

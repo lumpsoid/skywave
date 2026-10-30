@@ -19,6 +19,7 @@ import dev.skywave.android.ui.screens.PairingScreen
 import dev.skywave.android.ui.screens.SessionListScreen
 import dev.skywave.android.ui.screens.SessionScreen
 import dev.skywave.android.ui.screens.SettingsScreen
+import dev.skywave.android.ui.screens.StayConnectedSetting
 import dev.skywave.core.Action
 import dev.skywave.core.Link
 import dev.skywave.core.Route
@@ -28,10 +29,11 @@ import dev.skywave.core.ViewState
 /**
  * [AppShell] fed from [client]: its snapshots, its actions, its failures as
  * snackbars. [pairInbox] carries pairing links opened from outside; [about]
- * is what Settings shows of this build and device.
+ * is what Settings shows of this build and device; [stayConnected] is the
+ * device-local choice Settings toggles.
  */
 @Composable
-fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox, about: AboutInfo) {
+fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox, about: AboutInfo, stayConnected: StayConnectedSetting) {
     val state by client.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val resources = LocalResources.current
@@ -40,7 +42,7 @@ fun SkywaveRoot(client: CoreClient, pairInbox: PairInbox, about: AboutInfo) {
         client.messages.collect { snackbar.showSnackbar(it.text(resources)) }
     }
     val dispatch = remember(client) { { action: Action -> client.dispatch(action) } }
-    AppShell(state, dispatch, pairInbox, about, snackbar)
+    AppShell(state, dispatch, pairInbox, about, stayConnected, snackbar)
 }
 
 /**
@@ -55,6 +57,7 @@ fun AppShell(
     dispatch: (Action) -> Unit,
     pairInbox: PairInbox,
     about: AboutInfo,
+    stayConnected: StayConnectedSetting,
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
     val screen = state.screen
@@ -100,6 +103,6 @@ fun AppShell(
         is Screen.Pairing -> PairingScreen(screen.view, chrome, dispatch, pairInbox)
         is Screen.SessionList -> SessionListScreen(screen.view, chrome, dispatch)
         is Screen.Session -> SessionScreen(screen.view, state.attention, chrome, dispatch)
-        is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch, about)
+        is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch, about, stayConnected)
     }
 }

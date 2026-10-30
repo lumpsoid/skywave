@@ -77,6 +77,7 @@ class SessionListScreenTest {
                     },
                     inbox,
                     SettingsSamples.about,
+                    SettingsSamples.stayConnected,
                 )
             }
         }

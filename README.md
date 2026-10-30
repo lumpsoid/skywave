@@ -197,6 +197,24 @@ skywaved devices revoke <id>
 
 Admin commands work on the database directly, so `serve` can keep running.
 
+### Approval alerts on Android
+
+The Android app posts one notification per approval (tap it to open the
+session), including when it is in the background or not running:
+
+- **By default**, the app stops its connection when you leave it and checks
+  in about every 15 minutes while a network is up (WorkManager, so Android
+  batches the wake-up with other apps'). Each check takes seconds: it
+  connects, catches up, posts what is new and disconnects. In Doze Android
+  may stretch the interval.
+- **Settings → Stay connected** keeps the connection open while the app is in
+  the background, so alerts arrive within seconds while agents work. It shows
+  an ongoing "Staying connected" notification (on its own low-importance
+  "Connection" channel, which you can silence) and costs more battery: the
+  phone holds one long-poll to your server open. It keeps running when you
+  swipe the app away; after a reboot it comes back the next time you open the
+  app. Turn it off in the same place.
+
 ---
 
 ## Under the hood

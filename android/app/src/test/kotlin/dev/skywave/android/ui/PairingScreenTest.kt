@@ -40,7 +40,7 @@ class PairingScreenTest {
         val link = if (screen.view.paired == null) Link.Unpaired else Link.Connecting
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
-                AppShell(Samples.state(link, screen), dispatch = { dispatched += it }, inbox, SettingsSamples.about)
+                AppShell(Samples.state(link, screen), dispatch = { dispatched += it }, inbox, SettingsSamples.about, SettingsSamples.stayConnected)
             }
         }
     }
