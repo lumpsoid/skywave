@@ -428,7 +428,7 @@ fn replay_permission_suggestions_are_offered_as_rules() {
         suggestions,
         [
             &vec![RuleSuggestion {
-                label: "all edits".to_owned(),
+                label: "file edits".to_owned(),
                 scope: RuleScope::Session,
             }],
             &vec![
@@ -441,7 +441,7 @@ fn replay_permission_suggestions_are_offered_as_rules() {
                     scope: RuleScope::Session,
                 },
                 RuleSuggestion {
-                    label: "all edits".to_owned(),
+                    label: "file edits".to_owned(),
                     scope: RuleScope::Session,
                 },
             ],

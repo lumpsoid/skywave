@@ -3048,7 +3048,7 @@ fn shift_a_lists_several_rules_to_pick_one() {
     assert_eq!(h.key(KeyCode::Char('A')), None);
     let rows = panel(&h.screen());
     assert_contains(&rows[1], "› Bash(cargo test) (project)");
-    assert_contains(&rows[2], "  all edits (session)");
+    assert_contains(&rows[2], "  all edits (this session)");
     assert_contains(&rows[3], "  access to /srv/data (user)");
     assert_contains(
         &rows[4],
@@ -3073,7 +3073,7 @@ fn shift_a_lists_several_rules_to_pick_one() {
         assert_eq!(h.key(code), None);
     }
     assert_eq!(h.app.ui().session.as_ref().unwrap().selected, selected);
-    assert_contains(&panel(&h.screen())[2], "› all edits (session)");
+    assert_contains(&panel(&h.screen())[2], "› all edits (this session)");
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::ResolveApproval {
@@ -3084,7 +3084,7 @@ fn shift_a_lists_several_rules_to_pick_one() {
     );
     assert_contains(
         panel(&h.screen()).last().unwrap(),
-        "you approved always · all edits (session) · queued",
+        "you approved always · all edits (this session) · queued",
     );
 }
 
@@ -3104,8 +3104,8 @@ fn the_rule_list_keeps_to_the_panel_row_cap() {
         h.key(KeyCode::Down);
     }
     let rows = panel(&h.screen());
-    assert_contains(&rows[1], "  rule 2 (session)");
-    assert_contains(&rows[6], "› rule 7 (session)");
+    assert_contains(&rows[1], "  rule 2 (this session)");
+    assert_contains(&rows[6], "› rule 7 (this session)");
 }
 
 #[test]

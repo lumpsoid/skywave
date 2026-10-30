@@ -11,7 +11,7 @@
 //! or ask, modes that allow less, unknown shapes or destinations) is not
 //! offered.
 //!
-//! Labels read after "always allow": `Bash(cargo test)`, `all edits`,
+//! Labels read after "always allow": `Bash(cargo test)`, `file edits`,
 //! `access to /srv/data`. They are handed over uncut; the mapper applies the
 //! protocol's caps.
 
@@ -50,7 +50,7 @@ fn label(update: &Value) -> Option<String> {
             (!rules.is_empty()).then(|| rules.join(", "))
         }
         "setMode" => match update.get("mode")?.as_str()? {
-            "acceptEdits" => Some("all edits".to_owned()),
+            "acceptEdits" => Some("file edits".to_owned()),
             "bypassPermissions" => Some("every tool".to_owned()),
             _ => None,
         },
@@ -114,7 +114,7 @@ mod tests {
             labels(suggestions),
             [
                 ("Bash(cargo test), Read".to_owned(), RuleScope::Project),
-                ("all edits".to_owned(), RuleScope::Session),
+                ("file edits".to_owned(), RuleScope::Session),
                 ("every tool".to_owned(), RuleScope::Session),
                 ("access to /srv/data".to_owned(), RuleScope::User),
                 ("Write".to_owned(), RuleScope::Project),
