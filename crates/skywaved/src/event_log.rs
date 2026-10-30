@@ -14,7 +14,7 @@
 //!   [`EventLog::append`] and [`EventLog::cancel_approval`]. It learns about
 //!   new commands from the log itself: every accepted command is an event
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
-//!   `SessionCreated`),
+//!   `SessionRenamed`, `SessionCreated`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -157,7 +157,8 @@ impl EventLog {
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
             | EventKind::TurnInterrupted
-            | EventKind::SessionStopped => {
+            | EventKind::SessionStopped
+            | EventKind::SessionRenamed { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -323,7 +324,8 @@ pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKi
         | EventKind::AgentMessage { .. }
         | EventKind::ToolCall { .. }
         | EventKind::ToolResult { .. }
-        | EventKind::SessionStopped => {}
+        | EventKind::SessionStopped
+        | EventKind::SessionRenamed { .. } => {}
     }
     Ok(seq)
 }
@@ -379,6 +381,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ApprovalCancelled { .. } => "ApprovalCancelled",
         EventKind::TurnInterrupted => "TurnInterrupted",
         EventKind::SessionStopped => "SessionStopped",
+        EventKind::SessionRenamed { .. } => "SessionRenamed",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
     }
 }

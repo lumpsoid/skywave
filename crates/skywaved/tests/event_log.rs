@@ -577,6 +577,88 @@ fn interrupt_needs_an_active_turn_and_ends_it() {
     }
 }
 
+// --- RenameSession -----------------------------------------------------------
+
+#[test]
+fn rename_normalises_the_name_and_records_who() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let long = "é".repeat(100);
+    let cases = [
+        (
+            Some("  fix\nthe\ttests \u{7}  "),
+            Some("fixthetests".to_owned()),
+        ),
+        (Some(long.as_str()), Some("é".repeat(80))),
+        (Some(" \n\t "), None),
+        (Some(""), None),
+        (None, None),
+    ];
+    for (name, expected) in cases {
+        let command = Command {
+            id: CommandId::new(),
+            kind: CommandKind::RenameSession {
+                session_id: session,
+                name: name.map(str::to_owned),
+            },
+        };
+        accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+        assert_eq!(
+            f.all_kinds().last().unwrap(),
+            &EventKind::SessionRenamed {
+                name: expected,
+                by: device
+            },
+            "{name:?}"
+        );
+    }
+    // A cut that lands after a space leaves no trailing whitespace.
+    let spaced = format!("{} tail", "a".repeat(79));
+    accepted(f.handle(CommandKind::RenameSession {
+        session_id: session,
+        name: Some(spaced),
+    }));
+    assert!(matches!(
+        f.all_kinds().last().unwrap(),
+        EventKind::SessionRenamed { name: Some(name), .. } if *name == "a".repeat(79)
+    ));
+}
+
+#[test]
+fn rename_needs_a_known_session_and_dedups_resends() {
+    let mut f = Fixture::new();
+    assert_eq!(
+        f.handle(CommandKind::RenameSession {
+            session_id: SessionId::new(),
+            name: Some("x".into()),
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RenameSession {
+            session_id: session,
+            name: Some("x".into()),
+        },
+    };
+    let first = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+    let seq = accepted(first.clone());
+    assert_eq!(
+        f.log.handle(&mut f.storage.db, device, &command).unwrap(),
+        first
+    );
+    assert_eq!(f.log.head(), seq, "a resend appends nothing");
+    // The same name again is a new command: harmless, still appended.
+    let again = accepted(f.handle(CommandKind::RenameSession {
+        session_id: session,
+        name: Some("x".into()),
+    }));
+    assert_eq!(again, seq.next());
+}
+
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
@@ -596,6 +678,10 @@ fn agent_appends_are_checked() {
         EventKind::ApprovalCancelled {
             id: ApprovalId::new(),
             reason: "x".into(),
+        },
+        EventKind::SessionRenamed {
+            name: Some("x".into()),
+            by: DeviceId::new(),
         },
     ] {
         assert!(matches!(

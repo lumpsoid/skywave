@@ -52,6 +52,15 @@ pub(crate) enum Effect {
     Request(Request),
 }
 
+/// A session's title as the views show it.
+struct Title {
+    text: String,
+    /// `text` is a name the user gave.
+    named: bool,
+    /// This device's latest rename, until its effect is in the replica.
+    rename: Option<Outgoing>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
     SessionList,
@@ -244,6 +253,14 @@ impl Model {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::StopSession { session_id })
+            }
+            Action::RenameSession { session_id, name } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                // As the server will log it, so the title shows it unchanged.
+                let name = skywave_proto::normalise_session_name(&name);
+                self.enqueue(CommandKind::RenameSession { session_id, name })
             }
             Action::OpenSession(id) => {
                 if self.device.is_none() || self.summary(id).is_none() {
@@ -644,7 +661,7 @@ impl Model {
                 Some(PendingApprovalRef {
                     id,
                     session_id,
-                    title: self.summary(session_id)?.title(),
+                    title: self.title(self.summary(session_id)?).text,
                 })
             })
             .collect();
@@ -691,17 +708,23 @@ impl Model {
         let sessions = self
             .sessions
             .iter()
-            .map(|s| SessionRow {
-                id: s.id,
-                workdir: s.workdir.clone(),
-                state: session_state(s),
-                pending_approvals: s.pending_approvals.len(),
-                last_activity: s.last_activity,
-                has_draft: self.drafts.contains_key(&s.id),
-                unread: match self.read_marks.get(&s.id) {
-                    Some(mark) => s.notable.saturating_sub(mark.notable),
-                    None => s.notable,
-                },
+            .map(|s| {
+                let title = self.title(s);
+                SessionRow {
+                    id: s.id,
+                    title: title.text,
+                    named: title.named,
+                    rename: title.rename,
+                    workdir: s.workdir.clone(),
+                    state: session_state(s),
+                    pending_approvals: s.pending_approvals.len(),
+                    last_activity: s.last_activity,
+                    has_draft: self.drafts.contains_key(&s.id),
+                    unread: match self.read_marks.get(&s.id) {
+                        Some(mark) => s.notable.saturating_sub(mark.notable),
+                        None => s.notable,
+                    },
+                }
             })
             .collect();
         let creating = self
@@ -759,8 +782,12 @@ impl Model {
         let stop = self.latest_outgoing(
             |kind| matches!(kind, CommandKind::StopSession { session_id } if *session_id == id),
         );
+        let title = self.title(summary);
         Some(SessionView {
             id,
+            title: title.text,
+            named: title.named,
+            rename: title.rename,
             workdir: summary.workdir.clone(),
             state: session_state(summary),
             timeline: self.timeline(id, events),
@@ -772,6 +799,32 @@ impl Model {
             last_seq: summary.last_seq,
             unread_from: open.and_then(|open| open.unread_from),
         })
+    }
+
+    /// What to call a session: this device's latest rename while it is on
+    /// its way (unless it failed), else the session's own title.
+    fn title(&self, summary: &SessionSummary) -> Title {
+        let rename = self
+            .outbox
+            .iter()
+            .rev()
+            .find_map(|e| match &e.command.kind {
+                CommandKind::RenameSession { session_id, name } if *session_id == summary.id => {
+                    Some((name, Outgoing::from(&e.status)))
+                }
+                _ => None,
+            })
+            .filter(|(_, outgoing)| !self.in_replica(*outgoing));
+        // Accepted but not yet pulled is still newer than the replica.
+        let name = match rename {
+            Some((name, outgoing)) if !matches!(outgoing, Outgoing::Failed(_)) => name.as_deref(),
+            _ => summary.name.as_deref(),
+        };
+        Title {
+            text: name.map_or_else(|| summary.default_title(), str::to_owned),
+            named: name.is_some(),
+            rename: rename.map(|(_, outgoing)| outgoing),
+        }
     }
 
     /// The latest outbox command matching `kind`, until its effect is in the
@@ -927,6 +980,11 @@ impl Model {
                 }
                 EventKind::TurnInterrupted => Some(Entry::Interrupted),
                 EventKind::SessionStopped => Some(Entry::Stopped),
+                EventKind::SessionRenamed { name, by } => Some(Entry::Renamed {
+                    name: name.clone(),
+                    by: *by,
+                    own: self.device == Some(*by),
+                }),
                 EventKind::SessionStateChanged(state) => {
                     // Every state change ends a turn or starts the next.
                     tools.end_turn(&mut items);
@@ -1696,6 +1754,179 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn message(text: &str) -> EventKind {
+        EventKind::UserMessage {
+            command_id: CommandId::new(),
+            device_id: DeviceId::new(),
+            text: text.into(),
+        }
+    }
+
+    fn rename(session_id: SessionId, name: &str) -> Action {
+        Action::RenameSession {
+            session_id,
+            name: name.into(),
+        }
+    }
+
+    fn row(f: &Fixture, id: SessionId) -> SessionRow {
+        f.list_view()
+            .sessions
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn default_title_is_the_first_prompt_else_the_directory_else_the_id() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app/");
+        assert_eq!(
+            (row(&f, sid).title, row(&f, sid).named),
+            ("app".into(), false)
+        );
+        f.log(
+            sid,
+            vec![message("fix the flaky test\nin ci"), message("more")],
+        );
+        assert_eq!(row(&f, sid).title, "fix the flaky test");
+
+        let bare = f.session("/");
+        let short = bare.0.simple().to_string()[24..].to_owned();
+        assert_eq!(row(&f, bare).title, short);
+    }
+
+    #[test]
+    fn a_rename_shows_at_once_and_settles_from_the_log() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        // Normalised as the server will log it.
+        let command = queued(&f.dispatch(rename(sid, "  flaky\ttests  ")));
+        assert_eq!(
+            command.kind,
+            CommandKind::RenameSession {
+                session_id: sid,
+                name: Some("flakytests".into()),
+            }
+        );
+        let shown = |f: &Fixture| {
+            let row = row(f, sid);
+            (row.title, row.named, row.rename)
+        };
+        assert_eq!(
+            shown(&f),
+            ("flakytests".into(), true, Some(Outgoing::Queued))
+        );
+        f.model.command_sending(command.id, Utc::now());
+        assert_eq!(shown(&f).2, Some(Outgoing::Sending));
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: Seq(2) },
+            Utc::now(),
+        );
+        // Accepted but not pulled yet: still newer than the replica.
+        assert_eq!(
+            shown(&f),
+            ("flakytests".into(), true, Some(Outgoing::Accepted(Seq(2))))
+        );
+        f.log(
+            sid,
+            vec![EventKind::SessionRenamed {
+                name: Some("flakytests".into()),
+                by: f.me,
+            }],
+        );
+        assert_eq!(shown(&f), ("flakytests".into(), true, None));
+
+        // The session view and its timeline say the same.
+        f.open(sid);
+        let view = f.session_view();
+        assert_eq!(
+            (view.title.as_str(), view.named, view.rename),
+            ("flakytests", true, None)
+        );
+        assert_eq!(
+            entries(&f),
+            vec![Entry::Renamed {
+                name: Some("flakytests".into()),
+                by: f.me,
+                own: true,
+            }]
+        );
+
+        // A blank name restores the default title.
+        let command = queued(&f.dispatch(rename(sid, " \n ")));
+        assert_eq!(
+            command.kind,
+            CommandKind::RenameSession {
+                session_id: sid,
+                name: None,
+            }
+        );
+        let view = f.session_view();
+        assert_eq!((view.title.as_str(), view.named), ("app", false));
+    }
+
+    #[test]
+    fn a_failed_rename_drops_its_name() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        let command = queued(&f.dispatch(rename(sid, "gone")));
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        let row = row(&f, sid);
+        assert_eq!((row.title.as_str(), row.named), ("app", false));
+        assert_eq!(
+            row.rename,
+            Some(Outgoing::Failed(RejectReason::UnknownSession))
+        );
+        assert!(
+            f.dispatch(rename(SessionId::new(), "x")).is_empty(),
+            "unknown here"
+        );
+    }
+
+    #[test]
+    fn renaming_keeps_the_list_order_and_is_not_unread() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/old");
+        let new = f.session("/srv/new");
+        f.log(new, vec![agent("done")]);
+        let order = |f: &Fixture| -> Vec<SessionId> {
+            f.list_view().sessions.iter().map(|row| row.id).collect()
+        };
+        assert_eq!(order(&f), vec![new, old]);
+        let other = DeviceId::new();
+        f.log(
+            old,
+            vec![EventKind::SessionRenamed {
+                name: Some("older".into()),
+                by: other,
+            }],
+        );
+        assert_eq!(order(&f), vec![new, old], "a rename is not activity");
+        assert_eq!(row(&f, old).title, "older");
+        assert_eq!(unread(&f, old), 0);
+        // Concurrent renames: the last in log order wins.
+        f.log(
+            old,
+            vec![EventKind::SessionRenamed {
+                name: Some("oldest".into()),
+                by: f.me,
+            }],
+        );
+        assert_eq!(row(&f, old).title, "oldest");
+        assert_eq!(order(&f), vec![new, old]);
+        // The alert names the session by its title too.
+        f.log(old, vec![approval_requested(ApprovalId::new(), None)]);
+        assert_eq!(f.model.view().attention.approvals[0].title, "oldest");
     }
 
     #[test]

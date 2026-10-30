@@ -16,10 +16,12 @@ use skywave_core::{
 };
 
 use super::timeline::{
-    approval_state, blob_size, bytes, delivery_label, detail_lines, glyph, head_lines, item_lines,
-    preview_lines, rule_index, title_spans, wall_ms,
+    approval_state, blob_size, bytes, clean, delivery_label, detail_lines, glyph, head_lines,
+    item_lines, preview_lines, rule_index, title_spans, wall_ms,
 };
-use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
+use super::{
+    decision_label, outgoing_badge, outgoing_label, rename_badge, render_prompt, state_badge,
+};
 use crate::app::{App, Focus, Geometry, SessionUi};
 use crate::timeline::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -37,11 +39,13 @@ pub(super) fn render(
     ui: &SessionUi,
     wall: SystemTime,
 ) {
-    let title = session
-        .workdir
-        .clone()
-        .unwrap_or_else(|| session.id.0.to_string());
-    let block = Block::bordered().title(format!(" {title} · {} ", state_badge(&session.state).0));
+    let mut title = vec![Span::raw(format!(" {}", clean(&session.title))).bold()];
+    title.extend(rename_badge(session.rename.as_ref()));
+    if let Some(workdir) = &session.workdir {
+        title.push(Span::raw(format!(" · {}", clean(workdir))).dark_gray());
+    }
+    title.push(Span::raw(format!(" · {} ", state_badge(&session.state).0)));
+    let block = Block::bordered().title(Line::from(title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -78,7 +82,11 @@ pub(super) fn render(
             approval_area,
         );
     }
-    render_composer(frame, composer, app, ui);
+    // A rename prompt stands in for the composer while it is open.
+    match &app.ui().prompt {
+        Some(prompt) => render_prompt(frame, composer, app, prompt),
+        None => render_composer(frame, composer, app, ui),
+    }
 }
 
 fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {

@@ -515,6 +515,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);
     set_user_version(&dir, 2);
@@ -552,6 +553,93 @@ fn drop_unread(dir: &Path) {
          ALTER TABLE sessions DROP COLUMN notable;",
     )
     .unwrap();
+}
+
+fn drop_titles(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE sessions DROP COLUMN name;
+         ALTER TABLE sessions DROP COLUMN first_prompt;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn names_and_first_prompts_are_projected_and_backfilled() {
+    let (_tmp, dir) = data_dir();
+    let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/x".into(),
+            },
+        )
+    };
+    let message = |id, minute, text: &str| {
+        event(
+            id,
+            minute,
+            EventKind::UserMessage {
+                command_id: CommandId::new(),
+                device_id: DeviceId::new(),
+                text: text.into(),
+            },
+        )
+    };
+    let long = format!("{}\nsecond line", "é".repeat(250));
+    // `a`: a multi-line first prompt after a blank one, then a rename;
+    // `b`: a first line too long to keep; `c`: no message at all.
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(a, 0),
+            created(b, 1),
+            created(c, 2),
+            message(a, 3, " \n "),
+            message(a, 4, "\n  fix the flaky test \r\nin ci"),
+            message(a, 5, "and then"),
+            message(b, 6, &long),
+            event(
+                a,
+                7,
+                EventKind::SessionRenamed {
+                    name: Some("flaky".into()),
+                    by: DeviceId::new(),
+                },
+            ),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch).unwrap();
+    let summary = |store: &Store, id| store.session(id).unwrap().unwrap();
+    let a_summary = summary(&store, a);
+    assert_eq!(a_summary.name.as_deref(), Some("flaky"));
+    assert_eq!(
+        a_summary.first_prompt.as_deref(),
+        Some("fix the flaky test")
+    );
+    assert_eq!(a_summary.last_seq, Seq(6), "a rename is not activity");
+    let expected_b = "é".repeat(200);
+    assert_eq!(
+        summary(&store, b).first_prompt.as_deref(),
+        Some(&*expected_b)
+    );
+    assert_eq!(summary(&store, c).first_prompt, None);
+    let before: Vec<_> = [a, b, c].map(|id| summary(&store, id)).into();
+    drop(store);
+
+    // A replica from before the columns (protocol v3: it holds no renames):
+    // the migration derives the first prompts from the log like the fold.
+    drop_titles(&dir);
+    set_user_version(&dir, 5);
+    let store = Store::open(&dir).unwrap();
+    for expected in before {
+        let actual = summary(&store, expected.id);
+        assert_eq!(actual.first_prompt, expected.first_prompt);
+        assert_eq!(actual.name, None, "no name is backfilled");
+    }
 }
 
 #[test]
@@ -628,6 +716,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_titles(&dir);
     drop_unread(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
@@ -730,6 +819,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);
     set_user_version(&dir, 1);

@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::Utc;
 use skywave_core::{
     Action, BlobDownload, BoxFuture, Connector, EngineConfig, HttpsTransport, Link, LinkRejection,
-    OutboxStatus, Screen, TimelineItem, Transport, TransportError,
+    OutboxStatus, Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
@@ -26,7 +26,10 @@ use skywave_proto::{
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
 use skywaved::devices;
-use support::{Client, Daemon, assert_same_log, config, count, is_reconnecting, user_messages};
+use support::{
+    Client, Daemon, SOON, assert_same_log, assert_same_view, config, count, is_reconnecting,
+    user_messages,
+};
 
 /// A clean link the tests can take down and whose connections they can cut.
 async fn proxy(daemon: &Daemon) -> LinkProxy {
@@ -447,4 +450,60 @@ async fn suspend_pauses_and_resume_syncs() {
         })
         .await;
     assert_same_log(&daemon.events(), &client.local_events());
+}
+
+/// Two devices rename one session while one of them is offline: each shows
+/// its own rename at once, then both converge on the last one in log order,
+/// and neither reorders the list.
+#[tokio::test(flavor = "multi_thread")]
+async fn renames_converge_on_the_last_in_log_order() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let older = a.create_session(&daemon).await;
+    let newer = a.create_session(&daemon).await;
+    daemon.settle(&[&a, &b], SOON).await;
+    let order = |rows: &[SessionRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(order(&b.session_list().await), vec![newer, older]);
+
+    // B renames while offline; A renames online, so A's lands first.
+    proxy_b.down();
+    b.wait("b offline", |_, view| is_reconnecting(&view.link))
+        .await;
+    b.dispatch(Action::RenameSession {
+        session_id: older,
+        name: "from b".into(),
+    });
+    let row = |rows: Vec<SessionRow>| rows.into_iter().find(|r| r.id == older).unwrap();
+    let shown = row(b.session_list().await);
+    assert_eq!(shown.title, "from b", "shown at once");
+    assert_eq!(shown.rename, Some(Outgoing::Queued));
+    a.dispatch(Action::RenameSession {
+        session_id: older,
+        name: "from a".into(),
+    });
+    let renames =
+        |events: &[Event]| count(events, |k| matches!(k, EventKind::SessionRenamed { .. }));
+    daemon
+        .wait_log("a's rename", |events| renames(events) == 1)
+        .await;
+    proxy_b.up();
+    daemon
+        .wait_log("b's rename", |events| renames(events) == 2)
+        .await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    for client in [&a, &b] {
+        let rows = client.session_list().await;
+        assert_eq!(order(&rows), vec![newer, older], "a rename is not activity");
+        let renamed = row(rows);
+        assert_eq!(renamed.title, "from b");
+        assert!(renamed.named);
+        assert_eq!(renamed.rename, None);
+        assert_eq!(renamed.unread, 0);
+    }
+    assert_same_view(&a, &b).await;
 }

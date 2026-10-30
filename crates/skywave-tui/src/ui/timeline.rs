@@ -263,6 +263,20 @@ impl Layout<'_> {
                 );
                 return vec![Line::from(spans)];
             }
+            Entry::Renamed { name, by, own } => {
+                let who = if *own {
+                    "you".to_owned()
+                } else {
+                    device_label(*by)
+                };
+                let what = match name {
+                    Some(name) => format!("renamed to “{}” by {who}", clean(name)),
+                    None => format!("default title restored by {who}"),
+                };
+                let mut spans = lead;
+                spans.push(Span::raw(what).dark_gray());
+                return vec![Line::from(spans)];
+            }
             Entry::AgentErrored { message } => {
                 return self.message(
                     lead,

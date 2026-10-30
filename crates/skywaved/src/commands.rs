@@ -8,7 +8,8 @@
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`;
 //! - `Interrupt` → `TurnInterrupted`;
-//! - `StopSession` → `SessionStopped`.
+//! - `StopSession` → `SessionStopped`;
+//! - `RenameSession` → `SessionRenamed` with the normalised name.
 //!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
@@ -25,6 +26,13 @@
 //! is not running does nothing. The supervisor reacts to `SessionStopped` by
 //! shutting the agent down (interrupting a running turn first); what the
 //! agent still reports, such as `TurnEnded(Interrupted)`, is logged as usual.
+//!
+//! **RenameSession.** Accepted for any known session, even with its current
+//! name: the event carries the absolute name, so a resend (deduped on the
+//! command id anyway) or a repeat changes nothing, and the last rename in log
+//! order wins on every device. The name is logged as
+//! [`skywave_proto::normalise_session_name`] leaves it; one that ends up
+//! empty restores the default title.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
@@ -138,6 +146,18 @@ impl EventLog {
                     return Ok(Err(RejectReason::UnknownSession));
                 }
                 (*session_id, EventKind::SessionStopped)
+            }
+            CommandKind::RenameSession { session_id, name } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let kind = EventKind::SessionRenamed {
+                    name: name
+                        .as_deref()
+                        .and_then(skywave_proto::normalise_session_name),
+                    by: device,
+                };
+                (*session_id, kind)
             }
         };
         Ok(Ok(event_log::append_in(tx, session_id, &kind)?))

@@ -30,7 +30,19 @@ pub struct SessionSummary {
     /// How many of the session's events are [notable](is_notable): what
     /// unread counts subtract a read mark from.
     pub notable: u64,
+    /// The name the newest `SessionRenamed` gave it; `None` for the default
+    /// title.
+    pub name: Option<String>,
+    /// First line of the session's first message, at most
+    /// [`FIRST_PROMPT_MAX_CHARS`]; the default title's first choice.
+    pub first_prompt: Option<String>,
 }
+
+/// Longest [`SessionSummary::first_prompt`] kept, in chars. The store's
+/// backfill migration cuts at the same length.
+pub const FIRST_PROMPT_MAX_CHARS: usize = 200;
+/// Longest first prompt shown as a title, in chars, before an ellipsis.
+pub const TITLE_PROMPT_MAX_CHARS: usize = 48;
 
 impl SessionSummary {
     /// Summary of a session whose first seen event is `event` at `seq`.
@@ -44,14 +56,24 @@ impl SessionSummary {
             last_seq: seq,
             stopped: false,
             notable: 0,
+            name: None,
+            first_prompt: None,
         };
         summary.apply(seq, event);
         summary
     }
 
     /// Folds one event of this session into the summary.
+    ///
+    /// A rename only sets the name: it is not activity, so it moves neither
+    /// `last_seq` nor `last_activity` and the session keeps its place in
+    /// the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
+        if let EventKind::SessionRenamed { name, .. } = &event.kind {
+            self.name = name.clone();
+            return;
+        }
         self.last_seq = seq;
         self.last_activity = event.at;
         if is_notable(&event.kind) {
@@ -69,12 +91,18 @@ impl SessionSummary {
                 self.pending_approvals.retain(|pending| pending != id);
             }
             // The next message starts the agent again.
-            EventKind::UserMessage { .. } => self.stopped = false,
+            EventKind::UserMessage { text, .. } => {
+                self.stopped = false;
+                if self.first_prompt.is_none() {
+                    self.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
+                }
+            }
             EventKind::SessionStopped => self.stopped = true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
-            | EventKind::TurnInterrupted => {}
+            | EventKind::TurnInterrupted
+            | EventKind::SessionRenamed { .. } => {}
         }
     }
 
@@ -83,9 +111,26 @@ impl SessionSummary {
         self.pending_approvals.first().copied()
     }
 
-    /// What to call the session in a line of text, e.g. a notification: the
-    /// last component of its directory, else the end of its id.
+    /// What to call the session wherever it is shown: its name, else the
+    /// [default title](Self::default_title).
     pub fn title(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.default_title())
+    }
+
+    /// The title of an unnamed session: the first line of its first
+    /// message, cut to [`TITLE_PROMPT_MAX_CHARS`] with an ellipsis, else
+    /// the last component of its directory, else the end of its id.
+    pub fn default_title(&self) -> String {
+        if let Some(prompt) = self.first_prompt.as_deref()
+            && let Some(line) = first_line(prompt, usize::MAX)
+        {
+            return if line.chars().count() > TITLE_PROMPT_MAX_CHARS {
+                let head: String = line.chars().take(TITLE_PROMPT_MAX_CHARS - 1).collect();
+                format!("{}…", head.trim_end())
+            } else {
+                line
+            };
+        }
         self.workdir
             .as_deref()
             .and_then(|dir| dir.trim_end_matches('/').rsplit('/').next())
@@ -95,6 +140,13 @@ impl SessionSummary {
                 str::to_owned,
             )
     }
+}
+
+/// The first line of `text` with leading blank lines skipped, trimmed and
+/// cut to `max` chars; `None` if `text` is blank.
+fn first_line(text: &str, max: usize) -> Option<String> {
+    let line = text.trim_start().lines().next()?.trim_end();
+    Some(line.chars().take(max).collect())
 }
 
 /// Whether an event is news for whoever was away: the agent's output (a
@@ -111,7 +163,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ApprovalResolved { .. }
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
-        | EventKind::SessionStopped => false,
+        | EventKind::SessionStopped
+        | EventKind::SessionRenamed { .. } => false,
     }
 }
 
@@ -132,6 +185,7 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
         | EventKind::SessionStopped
+        | EventKind::SessionRenamed { .. }
         | EventKind::SessionStateChanged(_) => (None, None),
     };
     first.into_iter().chain(second)
@@ -224,6 +278,73 @@ mod tests {
         }
         summary.workdir = Some("/".into());
         assert_eq!(summary.title(), short);
+    }
+
+    #[test]
+    fn title_is_the_name_else_the_first_prompt_else_the_directory() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        assert_eq!(summary.title(), "app");
+
+        let message = |text: &str| EventKind::UserMessage {
+            command_id: skywave_proto::CommandId::new(),
+            device_id: DeviceId::new(),
+            text: text.into(),
+        };
+        summary.apply(
+            Seq(2),
+            &event(sid, 1, message("\n  fix the flaky test  \nin ci")),
+        );
+        assert_eq!(summary.first_prompt.as_deref(), Some("fix the flaky test"));
+        summary.apply(Seq(3), &event(sid, 2, message("and then this")));
+        assert_eq!(
+            summary.title(),
+            "fix the flaky test",
+            "the first prompt stays"
+        );
+
+        let rename = |name: Option<&str>| EventKind::SessionRenamed {
+            name: name.map(str::to_owned),
+            by: DeviceId::new(),
+        };
+        summary.apply(Seq(4), &event(sid, 3, rename(Some("flaky"))));
+        assert_eq!(summary.title(), "flaky");
+        assert_eq!(summary.default_title(), "fix the flaky test");
+        summary.apply(Seq(5), &event(sid, 4, rename(None)));
+        assert_eq!(
+            summary.title(),
+            "fix the flaky test",
+            "no name restores the default"
+        );
+
+        summary.first_prompt = Some("x".repeat(60));
+        assert_eq!(summary.title(), format!("{}…", "x".repeat(47)));
+        assert_eq!(summary.title().chars().count(), TITLE_PROMPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn a_rename_is_not_activity() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let renamed = EventKind::SessionRenamed {
+            name: Some("x".into()),
+            by: DeviceId::new(),
+        };
+        assert!(!is_notable(&renamed));
+        summary.apply(Seq(9), &event(sid, 30, renamed));
+        assert_eq!(summary.name.as_deref(), Some("x"));
+        assert_eq!(summary.last_seq, Seq(1));
+        assert_eq!(
+            summary.last_activity,
+            event(sid, 0, EventKind::TurnInterrupted).at
+        );
+        assert_eq!(summary.notable, 0);
     }
 
     #[test]
