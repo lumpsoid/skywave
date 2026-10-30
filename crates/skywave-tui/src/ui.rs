@@ -306,6 +306,9 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     if let SessionState::Errored(info) = &row.state {
         spans.push(Span::raw(format!("  {}", info.message)).red());
     }
+    if row.has_draft {
+        spans.push(Span::raw("  ✎ draft").dark_gray());
+    }
     spans.push(
         Span::raw(format!(
             "  · {}",

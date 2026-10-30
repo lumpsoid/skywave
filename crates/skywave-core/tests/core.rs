@@ -8,9 +8,9 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, Core, CoreError, Entry, Link, Outgoing, PairedCredentials,
-    PairingStatus, Request, Route, Screen, Seam, SessionView, Store, StoreError, TimelineItem,
-    ViewState,
+    Action, BlobState, BlobStatus, Core, CoreError, Draft, Entry, Link, Outgoing,
+    PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView, Store, StoreError,
+    TimelineItem, ViewState,
 };
 use skywave_proto::{
     BlobId, BlobRef, CommandKind, CommandResult, DeviceId, Event, EventBatch, EventKind, Seq,
@@ -271,6 +271,70 @@ fn offline_send_is_persisted_first_and_appears_once() {
     let cold = core.view();
     assert_eq!(cold.screen, live.screen);
     assert_eq!(cold.link, Link::Connecting);
+}
+
+#[test]
+fn draft_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, _) = paired_core(dir.path());
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+            },
+        )],
+    })
+    .unwrap();
+    core.dispatch(Action::SaveDraft {
+        session_id: sid,
+        text: "half a thöught".into(),
+        cursor: 6,
+    })
+    .unwrap();
+    assert_eq!(drain(&requests), vec![], "drafts never reach the engine");
+    drop((core, seam));
+
+    let draft = Some(Draft {
+        text: "half a thöught".into(),
+        cursor: 6,
+    });
+    let core = Core::open_detached(dir.path()).unwrap();
+    let Screen::SessionList(list) = core.view().screen else {
+        panic!("expected the session list");
+    };
+    assert!(list.sessions[0].has_draft);
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).draft, draft);
+
+    // A send that cannot be stored keeps the draft, in the view and on disk.
+    let send = Action::SendMessage {
+        session_id: sid,
+        text: "half a thöught".into(),
+    };
+    let conn = rusqlite::Connection::open(dir.path().join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(core.dispatch(send.clone()).is_err());
+    assert_eq!(session_view(&core.view()).draft, draft);
+    assert_eq!(Store::open(dir.path()).unwrap().drafts().unwrap().len(), 1);
+
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    core.dispatch(send).unwrap();
+    assert_eq!(session_view(&core.view()).draft, None);
+    drop(core);
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(
+        session_view(&core.view()).draft,
+        None,
+        "sent with the message"
+    );
 }
 
 #[test]

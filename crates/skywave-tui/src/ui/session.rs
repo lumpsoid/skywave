@@ -44,9 +44,8 @@ pub(super) fn render(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let draft = app.draft(session.id);
     let composer_width = inner.width.saturating_sub(2) as usize;
-    let composer_rows = draft.map_or(1, |d| d.rows(composer_width).len());
+    let composer_rows = ui.composer.rows(composer_width).len();
     let composer_height = composer_rows.clamp(1, COMPOSER_ROWS) as u16 + 2;
     let approval_rows = APPROVAL_ROWS.min(inner.height as usize / 3);
     let approval = session.pending_approval.as_ref().map(|p| {
@@ -75,7 +74,7 @@ pub(super) fn render(
             approval_area,
         );
     }
-    render_composer(frame, composer, app, session, ui);
+    render_composer(frame, composer, app, ui);
 }
 
 fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
@@ -251,13 +250,7 @@ fn input_line(input: &BlobView) -> Line<'static> {
     Line::from(format!("  full input{size} · v to see it")).dark_gray()
 }
 
-fn render_composer(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    session: &SessionView,
-    ui: &SessionUi,
-) {
+fn render_composer(frame: &mut Frame, area: Rect, app: &App, ui: &SessionUi) {
     let focused = ui.focus == Focus::Composer;
     let mut title = " Message ".to_owned();
     if matches!(app.view().link, Link::Reconnecting { .. }) {
@@ -271,8 +264,8 @@ fn render_composer(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let draft = app.draft(session.id);
-    let Some(draft) = draft.filter(|d| !d.text().is_empty()) else {
+    let draft = &ui.composer;
+    if draft.text().is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("Write to the agent…").dark_gray()),
             inner,
@@ -281,7 +274,7 @@ fn render_composer(
             frame.set_cursor_position(Position::new(inner.x, inner.y));
         }
         return;
-    };
+    }
     let width = inner.width as usize;
     let rows = draft.rows(width);
     let (row, column) = draft.cursor_position(width);

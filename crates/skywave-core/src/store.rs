@@ -2,10 +2,11 @@
 //! (spec §7, D6).
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
-//! the pull cursor, blob rows and settings. Startup always reads everything
-//! back from here ([`Store::load`]), so a cold start is the normal start.
+//! the pull cursor, blob rows, settings and this device's drafts (D5: never
+//! synced). Startup always reads everything back from here
+//! ([`Store::load`]), so a cold start is the normal start.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,10 +15,13 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use skywave_proto::{BlobId, Command, CommandId, CommandResult, Event, EventBatch, Seq, SessionId};
+use skywave_proto::{
+    BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, Seq, SessionId,
+};
 use uuid::Uuid;
 
 use crate::projection::{SessionSummary, blob_refs};
+use crate::view::Draft;
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -87,6 +91,14 @@ ALTER TABLE outbox ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE outbox ADD COLUMN first_sent_at TEXT;
 ALTER TABLE outbox ADD COLUMN answered_at TEXT;
 UPDATE outbox SET tries = 1;
+"#,
+    r#"
+-- Unsent messages, one per session; `cursor` counts Unicode scalar values.
+CREATE TABLE drafts (
+    session_id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    cursor INTEGER NOT NULL
+);
 "#,
 ];
 
@@ -219,6 +231,7 @@ pub struct Snapshot {
     pub outbox: Vec<OutboxEntry>,
     pub blobs: Vec<BlobRecord>,
     pub settings: Settings,
+    pub drafts: HashMap<SessionId, Draft>,
 }
 
 /// Handle to the replica database.
@@ -265,6 +278,7 @@ impl Store {
             outbox: self.outbox()?,
             blobs: self.blobs()?,
             settings: self.settings()?,
+            drafts: self.drafts()?,
         })
     }
 
@@ -381,12 +395,25 @@ impl Store {
 
     /// Persists a command as `Queued`. Enqueuing a [`CommandId`] that is
     /// already in the outbox changes nothing.
+    ///
+    /// A message also deletes its session's draft, in the same transaction:
+    /// a crash never leaves both the queued message and the draft it was
+    /// written in, which would invite sending it twice.
     pub fn enqueue(&self, command: &Command) -> Result<(), StoreError> {
-        self.conn.execute(
+        // Unchecked only because `&self`: no other transaction is open here.
+        let tx = self.conn.unchecked_transaction()?;
+        if let CommandKind::SendMessage { session_id, .. } = &command.kind {
+            tx.execute(
+                "DELETE FROM drafts WHERE session_id = ?1",
+                [session_id.0.to_string()],
+            )?;
+        }
+        tx.execute(
             "INSERT INTO outbox (command_id, command) VALUES (?1, ?2)
              ON CONFLICT (command_id) DO NOTHING",
             params![command.id.0.to_string(), to_json(command)?],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -509,6 +536,44 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::UnknownBlob(id));
         }
+        Ok(())
+    }
+
+    // ---- drafts -------------------------------------------------------------
+
+    /// This device's unsent messages, by session.
+    pub fn drafts(&self) -> Result<HashMap<SessionId, Draft>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, text, cursor FROM drafts")?;
+        let rows = stmt.query_map([], |row| {
+            let cursor: i64 = row.get(2)?;
+            let draft = Draft {
+                text: row.get(1)?,
+                cursor: usize::try_from(cursor).map_err(|e| bad_value(2, Type::Integer, e))?,
+            };
+            Ok((SessionId(uuid_col(row, 0)?), draft))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps `draft` as the session's unsent message; `None` deletes it.
+    pub fn set_draft(
+        &self,
+        session_id: SessionId,
+        draft: Option<&Draft>,
+    ) -> Result<(), StoreError> {
+        let id = session_id.0.to_string();
+        match draft {
+            Some(draft) => self.conn.execute(
+                "INSERT INTO drafts (session_id, text, cursor) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (session_id) DO UPDATE SET text = excluded.text, cursor = excluded.cursor",
+                params![id, draft.text, u64_sql(draft.cursor as u64)?],
+            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM drafts WHERE session_id = ?1", [id])?,
+        };
         Ok(())
     }
 

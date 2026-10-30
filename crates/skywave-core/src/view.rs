@@ -140,7 +140,7 @@ pub struct BlobView {
 pub enum Screen {
     Pairing(PairingView),
     SessionList(SessionListView),
-    Session(SessionView),
+    Session(Box<SessionView>),
     Settings(SettingsView),
 }
 
@@ -186,6 +186,8 @@ pub struct SessionRow {
     pub state: SessionState,
     pub pending_approvals: usize,
     pub last_activity: DateTime<Utc>,
+    /// This device keeps an unsent message for the session.
+    pub has_draft: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +212,18 @@ pub struct SessionView {
     /// This device's latest stop of the session, until its effect is in the
     /// replica.
     pub stop: Option<Outgoing>,
+    /// This device's unsent message, as last saved.
+    pub draft: Option<Draft>,
+}
+
+/// A message being written on this device, kept in the local store and never
+/// synced (D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    /// Position in `text`, counted in Unicode scalar values (`char`s), so it
+    /// means the same on both sides of the FFI.
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

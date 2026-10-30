@@ -20,6 +20,14 @@ pub enum Action {
         session_id: SessionId,
         text: String,
     },
+    /// Keep the session's unsent message on this device; blank text drops
+    /// it. `cursor` counts `char`s. Heads save when the user pauses or
+    /// leaves, not per keystroke: every save is a durable write.
+    SaveDraft {
+        session_id: SessionId,
+        text: String,
+        cursor: usize,
+    },
     ResolveApproval {
         id: ApprovalId,
         decision: Decision,

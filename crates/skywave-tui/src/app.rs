@@ -4,8 +4,8 @@
 //! this module decides anything about pairing, sync or delivery (D2).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::{
@@ -16,6 +16,11 @@ use skywave_core::{
 
 use crate::composer::Composer;
 use crate::timeline::{ItemKey, find, gated_item, sections, selectable, starts_turn, wanted_blob};
+
+/// How old the first unsaved composer edit gets before the draft is saved
+/// anyway: at most this much typing is lost to a crash. Saves are durable
+/// writes, so never one per keystroke.
+pub const DRAFT_SAVE_AFTER: Duration = Duration::from_secs(1);
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -300,17 +305,26 @@ pub struct SessionUi {
     /// Items whose full content is shown; only logged items expand.
     pub expanded: HashSet<Seq>,
     pub geometry: RefCell<Geometry>,
+    /// The message being written. Filled from the core's draft (D5: per
+    /// device) when the session opens; later snapshots never touch it, the
+    /// core only hears of it through [`App::draft_save`].
+    pub composer: Composer,
 }
 
 impl SessionUi {
-    fn new(id: SessionId) -> SessionUi {
+    fn new(view: &SessionView) -> SessionUi {
         SessionUi {
-            id,
+            id: view.id,
             focus: Focus::Composer,
             scroll: None,
             selected: None,
             expanded: HashSet::new(),
             geometry: RefCell::default(),
+            composer: view
+                .draft
+                .as_ref()
+                .map(|d| Composer::from_draft(d.text.clone(), d.cursor))
+                .unwrap_or_default(),
         }
     }
 }
@@ -325,10 +339,8 @@ pub struct UiState {
     pub selected: Option<SessionId>,
     /// The open "new session" prompt, if any.
     pub create: Option<CreateInput>,
-    /// The open session's focus, scroll and expanded items.
+    /// The open session's focus, scroll, expanded items and composer.
     pub session: Option<SessionUi>,
-    /// Unsent messages, per session; drafts are per device (D5).
-    pub drafts: HashMap<SessionId, Composer>,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
     /// When the current [`Link`] value arrived; the retry countdown runs
@@ -356,7 +368,6 @@ impl App {
                 selected: None,
                 create: None,
                 session: None,
-                drafts: HashMap::new(),
                 revoked_dismissed: false,
                 link_since: now,
                 error: None,
@@ -416,7 +427,7 @@ impl App {
         match &self.view.screen {
             Screen::Session(session) => {
                 if self.ui.session.as_ref().is_none_or(|s| s.id != session.id) {
-                    self.ui.session = Some(SessionUi::new(session.id));
+                    self.ui.session = Some(SessionUi::new(session));
                 }
             }
             _ => self.ui.session = None,
@@ -444,9 +455,9 @@ impl App {
         })
     }
 
-    /// The draft for `session`, if one was started.
-    pub fn draft(&self, session: SessionId) -> Option<&Composer> {
-        self.ui.drafts.get(&session)
+    /// The open session's composer.
+    pub fn composer(&self) -> Option<&Composer> {
+        self.session().map(|(_, ui)| &ui.composer)
     }
 
     /// Records the outcome of dispatching an action from [`App::on_key`].
@@ -460,13 +471,53 @@ impl App {
                 create.submitted = false;
             }
         }
-        for draft in self.ui.drafts.values_mut().filter(|d| d.submitted) {
-            draft.submitted = false;
+        if let Some(session) = &mut self.ui.session
+            && session.composer.submitted
+        {
+            session.composer.submitted = false;
             if result.is_ok() {
-                draft.clear();
+                // The enqueue dropped the core's draft. Clearing counts as
+                // an edit: if the core refused a blank message instead, the
+                // next save drops its draft; otherwise that save writes
+                // nothing.
+                session.composer.clear();
             }
         }
         self.ui.error = result.err().map(|err| err.to_string());
+    }
+
+    /// Saves the open session's draft when it has unsaved edits: always if
+    /// `force` (leaving the session, quitting), else once the first of them
+    /// is [`DRAFT_SAVE_AFTER`] old at `now`. Report the outcome with
+    /// [`App::draft_saved`], not [`App::dispatched`].
+    pub fn draft_save(&mut self, now: Instant, force: bool) -> Option<Action> {
+        let session = self.ui.session.as_mut()?;
+        let since = session.composer.dirty_since?;
+        if !force && now.saturating_duration_since(since) < DRAFT_SAVE_AFTER {
+            return None;
+        }
+        session.composer.dirty_since = None;
+        Some(Action::SaveDraft {
+            session_id: session.id,
+            text: session.composer.text().to_owned(),
+            cursor: session.composer.cursor_chars(),
+        })
+    }
+
+    /// How long from `now` until [`App::draft_save`] has something to save
+    /// unforced; `None` while there are no unsaved edits.
+    pub fn draft_due_in(&self, now: Instant) -> Option<Duration> {
+        let since = self.ui.session.as_ref()?.composer.dirty_since?;
+        Some((since + DRAFT_SAVE_AFTER).saturating_duration_since(now))
+    }
+
+    /// Records the outcome of dispatching a [`App::draft_save`] action. Only
+    /// an error matters: the composer is not a submitted message and must
+    /// not be cleared like one.
+    pub fn draft_saved(&mut self, result: Result<(), CoreError>) {
+        if let Err(err) = result {
+            self.ui.error = Some(err.to_string());
+        }
     }
 
     /// The session list on screen, if that is the current screen.
@@ -544,7 +595,7 @@ impl App {
         }
         if let Some(session) = &mut self.ui.session {
             session.focus = Focus::Composer;
-            self.ui.drafts.entry(session.id).or_default().insert(text);
+            session.composer.insert(text);
             return;
         }
         if !self.typing() {
@@ -731,7 +782,7 @@ impl App {
             Focus::Composer => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                let draft = self.ui.drafts.entry(view.id).or_default();
+                let draft = &mut session.composer;
                 match key.code {
                     KeyCode::Esc => session.focus = Focus::Timeline,
                     KeyCode::Enter if alt || shift => draft.newline(),

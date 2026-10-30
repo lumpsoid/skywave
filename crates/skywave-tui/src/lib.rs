@@ -5,7 +5,8 @@
 //! - [`app`]: the latest snapshot plus head-only presentation state; keys in,
 //!   actions out.
 //! - [`ui`]: pure render functions over an [`App`].
-//! - [`run`]: the terminal event loop.
+//! - [`run`]: the terminal event loop; [`handle_key`] and [`save_draft`] are
+//!   its steps.
 
 pub mod app;
 pub mod composer;
@@ -17,9 +18,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent};
 use crossterm::execute;
-use skywave_core::{Core, Link, ViewState};
+use skywave_core::{Action, Core, Link, ViewState};
 
 pub use app::App;
 
@@ -74,8 +75,13 @@ pub fn run(core: &Core) -> io::Result<()> {
         loop {
             terminal.draw(|frame| ui::render(frame, &app, Instant::now()))?;
             let tick = matches!(app.view().link, Link::Reconnecting { .. }) || app.live();
-            let first = if tick {
-                match rx.recv_timeout(TICK) {
+            let draft = app.draft_due_in(Instant::now());
+            let wait = match (tick.then_some(TICK), draft) {
+                (Some(tick), Some(draft)) => Some(tick.min(draft)),
+                (tick, draft) => tick.or(draft),
+            };
+            let first = if let Some(wait) = wait {
+                match rx.recv_timeout(wait) {
                     Ok(msg) => Some(msg),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -94,9 +100,7 @@ pub fn run(core: &Core) -> io::Result<()> {
                 match msg {
                     Msg::View(view) => app.set_view(*view, Instant::now()),
                     Msg::Term(Event::Key(key)) => {
-                        if let Some(action) = app.on_key(key) {
-                            app.dispatched(core.dispatch(action));
-                        }
+                        handle_key(&mut app, core, key);
                     }
                     Msg::Term(Event::Paste(text)) => app.on_paste(&text),
                     Msg::Term(_) => {}
@@ -106,10 +110,36 @@ pub fn run(core: &Core) -> io::Result<()> {
                     return Ok(());
                 }
             }
+            save_draft(&mut app, core, Instant::now(), false);
         }
     })();
     core.unsubscribe(subscription);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::try_restore()?;
     result
+}
+
+/// Handles a key press: its action goes to `core`. The open session's draft
+/// is saved first, so leaving the session (or anything else) keeps it,
+/// except before a message, whose enqueue drops the draft anyway; and again
+/// before quitting.
+pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
+    let action = app.on_key(key);
+    if let Some(action) = &action {
+        if !matches!(action, Action::SendMessage { .. }) {
+            save_draft(app, core, Instant::now(), true);
+        }
+        app.dispatched(core.dispatch(action.clone()));
+    }
+    if app.ui().quit {
+        save_draft(app, core, Instant::now(), true);
+    }
+    action
+}
+
+/// Saves the open session's draft if [`App::draft_save`] has one for `now`.
+pub fn save_draft(app: &mut App, core: &Core, now: Instant, force: bool) {
+    if let Some(action) = app.draft_save(now, force) {
+        app.draft_saved(core.dispatch(action));
+    }
 }
