@@ -62,6 +62,8 @@ import dev.skywave.core.Attention
 import dev.skywave.core.Outgoing
 import dev.skywave.core.SessionState
 import dev.skywave.core.SessionView
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -146,7 +148,7 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
                         blobs = blobs,
                     )
                 }
-                ComposerBar(composer, remember(view.prompts) { view.prompts.take(50) })
+                ComposerBar(composer, remember(view.prompts) { view.prompts.take(50).toImmutableList() })
             }
         },
     ) { padding ->
@@ -195,7 +197,7 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
 @Composable
 private fun Timeline(
     view: SessionView,
-    rows: List<TimelineRow>,
+    rows: ImmutableList<TimelineRow>,
     dispatch: (Action) -> Unit,
     composer: ComposerState,
     gated: GatedApproval?,
