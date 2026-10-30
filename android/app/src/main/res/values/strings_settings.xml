@@ -12,6 +12,9 @@
     <!-- Server -->
     <string name="settings_section_server">Server</string>
     <string name="settings_server_address">Server address</string>
+    <string name="settings_server_fingerprint">Server fingerprint</string>
+    <string name="settings_server_fingerprint_copy">Copy server fingerprint</string>
+    <string name="settings_server_fingerprint_copied">Server fingerprint copied</string>
     <string name="settings_device_id">Device ID</string>
     <string name="settings_device_id_copy">Copy device ID</string>
     <string name="settings_device_id_copied">Device ID copied</string>

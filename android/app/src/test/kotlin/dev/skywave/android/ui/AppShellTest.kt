@@ -233,7 +233,7 @@ class AppShellTest {
 
     @Test
     fun systemBackAndUpNavigateThroughTheCore() {
-        show(Samples.state(Link.Online(5u), Screen.Settings(SettingsView(BlobPolicy.EAGER, null, null)), canGoBack = true))
+        show(Samples.state(Link.Online(5u), Screen.Settings(SettingsView(BlobPolicy.EAGER, null, null, null)), canGoBack = true))
         compose.onNodeWithContentDescription("Back").performClick()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()

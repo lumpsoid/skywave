@@ -139,7 +139,23 @@ private fun ServerSection(view: SettingsView, deviceName: String, onPair: () -> 
     val paired = address != null || deviceId != null
     if (paired) {
         address?.let { Setting(R.string.settings_server_address, it) }
-        deviceId?.let { DeviceId(it) }
+        view.serverFingerprint?.let {
+            Copyable(
+                it,
+                shown = fingerprintRows(it),
+                label = R.string.settings_server_fingerprint,
+                copyLabel = R.string.settings_server_fingerprint_copy,
+                copied = R.string.settings_server_fingerprint_copied,
+            )
+        }
+        deviceId?.let {
+            Copyable(
+                it,
+                label = R.string.settings_device_id,
+                copyLabel = R.string.settings_device_id_copy,
+                copied = R.string.settings_device_id_copied,
+            )
+        }
     } else {
         ListItem(
             headlineContent = { Text(stringResource(R.string.settings_not_paired)) },
@@ -163,17 +179,33 @@ private fun ServerSection(view: SettingsView, deviceName: String, onPair: () -> 
     )
 }
 
-/** The device id in monospace; tap or long-press copies it. */
+/**
+ * The fingerprint `AB:CD:…` (32 pairs) as rows of [FINGERPRINT_ROW] pairs,
+ * so it wraps between pairs and reads like a table to compare against what
+ * `skywaved` prints.
+ */
+internal fun fingerprintRows(fingerprint: String): String =
+    fingerprint.split(':').chunked(FINGERPRINT_ROW).joinToString("\n") { it.joinToString(":") }
+
+private const val FINGERPRINT_ROW = 8
+
+/** A value in monospace, shown as [shown]; tap or long-press copies [value]. */
 @Composable
-private fun DeviceId(id: String) {
+private fun Copyable(
+    value: String,
+    @StringRes label: Int,
+    @StringRes copyLabel: Int,
+    @StringRes copied: Int,
+    shown: String = value,
+) {
     val clipboard = LocalClipboard.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val copiedText = stringResource(R.string.settings_device_id_copied)
-    val label = stringResource(R.string.settings_device_id)
+    val copiedText = stringResource(copied)
+    val labelText = stringResource(label)
     val copy: () -> Unit = {
         scope.launch {
-            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(label, id)))
+            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(labelText, value)))
             // Android 13 and later confirm a copy themselves.
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 Toast.makeText(context, copiedText, Toast.LENGTH_SHORT).show()
@@ -181,10 +213,10 @@ private fun DeviceId(id: String) {
         }
     }
     ListItem(
-        headlineContent = { Text(label) },
-        supportingContent = { Text(id, fontFamily = FontFamily.Monospace) },
+        headlineContent = { Text(labelText) },
+        supportingContent = { Text(shown, fontFamily = FontFamily.Monospace) },
         modifier = Modifier.combinedClickable(
-            onClickLabel = stringResource(R.string.settings_device_id_copy),
+            onClickLabel = stringResource(copyLabel),
             onLongClick = copy,
             onClick = copy,
         ),

@@ -498,7 +498,7 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
             "( )"
         }
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(format!("Blob policy: {policy}")),
         Line::from(""),
         Line::from("  Blobs hold full tool inputs and outputs; sessions sync without them.")
@@ -525,6 +525,17 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
                 .unwrap_or_else(|| "not paired".to_owned())
         )),
     ];
+    if let Some(fingerprint) = settings.server_fingerprint {
+        // 95 characters: two rows of 16 pairs, to compare with what
+        // `skywaved` prints without wrapping mid-pair.
+        let shown = fingerprint.to_string();
+        let (first, second) = shown.split_at(shown.len().min(16 * 3 - 1));
+        lines.push(Line::from(format!("Fingerprint: {first}")));
+        lines.push(Line::from(format!(
+            "             {}",
+            second.trim_start_matches(':')
+        )));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Settings ")),
         area,

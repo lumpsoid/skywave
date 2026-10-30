@@ -19,6 +19,7 @@ pub use skywave_proto::{
 pub use crate::projection::SessionUsage;
 
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
+use crate::tls::Fingerprint;
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -676,6 +677,9 @@ pub struct SettingsView {
     pub blob_policy: BlobPolicy,
     pub server_address: Option<String>,
     pub device_id: Option<DeviceId>,
+    /// The fingerprint of the server CA pinned at pairing, to compare with
+    /// what `skywaved` prints; `None` if unknown.
+    pub server_fingerprint: Option<Fingerprint>,
 }
 
 #[cfg(test)]
