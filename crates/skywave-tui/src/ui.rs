@@ -949,6 +949,7 @@ fn fail_reason(reason: FailReason) -> &'static str {
         FailReason::UnknownSession => "the server does not know this session",
         FailReason::UnknownApproval => "the server does not know this approval",
         FailReason::ApprovalAlreadyResolved => "already answered on another device",
+        FailReason::ApprovalCancelled => "the approval was cancelled first",
         FailReason::NoActiveTurn => "the agent was not working",
         FailReason::UnknownRule => "the agent did not offer that rule",
     }

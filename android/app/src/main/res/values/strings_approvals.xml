@@ -24,6 +24,7 @@
     <string name="ap_out_sending">sending…</string>
     <string name="ap_out_accepted">sent, waiting for the agent</string>
     <string name="ap_out_failed">refused: %1$s. Answer again.</string>
+    <string name="ap_out_unapplied">did not apply: %1$s</string>
 
     <!-- The gated item in the timeline -->
     <string name="ap_waiting_you">Waiting for your approval</string>

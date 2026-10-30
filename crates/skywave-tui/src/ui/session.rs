@@ -290,6 +290,7 @@ fn approval_lines(
                 summary: prompt.summary.clone(),
                 input: prompt.input.clone(),
                 status: ApprovalStatus::Pending,
+                answer: None,
             };
             let content = gated_content(&sections(&entry), width, max_rows);
             (lines, content)
@@ -305,10 +306,7 @@ fn approval_lines(
         return lines;
     }
     lines.extend(content);
-    let answered = prompt
-        .answer
-        .as_ref()
-        .is_some_and(|a| !matches!(a.outgoing, Outgoing::Failed(_)));
+    let answered = prompt.answer.as_ref().is_some_and(|a| !a.retryable);
     if !answered {
         lines.extend(always_line(&prompt.suggestions));
     }
@@ -337,7 +335,7 @@ fn approval_lines(
                 )),
                 Span::styled(label, outgoing_badge(&answer.outgoing).1),
             ];
-            if matches!(answer.outgoing, Outgoing::Failed(_)) {
+            if answer.retryable {
                 spans.push(Span::raw(format!(" · {keys} to answer again")).dark_gray());
             }
             Line::from(spans)

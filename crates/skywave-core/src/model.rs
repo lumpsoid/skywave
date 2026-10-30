@@ -534,15 +534,16 @@ impl Model {
     }
 
     /// Pending in the replica and not already answered from this device
-    /// (a refused answer may be retried).
+    /// (an answer refused for itself may be retried, one refused because the
+    /// approval is closed on the server may not).
     fn can_answer(&self, id: ApprovalId) -> bool {
         let pending = self
             .sessions
             .iter()
             .any(|s| s.pending_approvals.contains(&id));
         let answered = self
-            .local_answer(id, &[])
-            .is_some_and(|answer| !matches!(answer.outgoing, Outgoing::Failed(_)));
+            .local_answer(id, &[], pending)
+            .is_some_and(|answer| !answer.retryable);
         pending && !answered
     }
 
@@ -609,7 +610,7 @@ impl Model {
         let mut new = false;
         for id in pending {
             // One answered here was seen; it is never news.
-            if self.alerted.insert(id) && self.local_answer(id, &[]).is_none() {
+            if self.alerted.insert(id) && self.local_answer(id, &[], true).is_none() {
                 new = true;
             }
         }
@@ -963,7 +964,7 @@ impl Model {
                     summary: summary.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
                     suggestions: suggestions.clone(),
-                    answer: self.local_answer(*id, suggestions),
+                    answer: self.local_answer(*id, suggestions, true),
                 }),
                 _ => None,
             })
@@ -1187,6 +1188,7 @@ impl Model {
                         view.approval = Some(ToolApproval {
                             id: *id,
                             status: ApprovalStatus::Pending,
+                            answer: None,
                         });
                         tools.approvals.insert(*id, item);
                         None
@@ -1199,6 +1201,7 @@ impl Model {
                             summary: summary.clone(),
                             input: input.as_ref().map(|b| self.blob_view(b)),
                             status: ApprovalStatus::Pending,
+                            answer: None,
                         })
                     }
                 },
@@ -1266,6 +1269,28 @@ impl Model {
             }
         }
 
+        // This device's answers, on the items of the approvals they answer:
+        // one that came too late stays in sight once its prompt is gone.
+        for (&approval, &item) in &tools.approvals {
+            let (status, answer) = match items.get_mut(item) {
+                Some(TimelineItem::Logged {
+                    entry: Entry::Tool(view),
+                    ..
+                }) => match view.approval.as_mut() {
+                    Some(ToolApproval { status, answer, .. }) => (&*status, answer),
+                    None => continue,
+                },
+                Some(TimelineItem::Logged {
+                    entry: Entry::Approval { status, answer, .. },
+                    ..
+                }) => (&*status, answer),
+                _ => continue,
+            };
+            let offered = tools.offered.get(&approval).map_or(&[][..], Vec::as_slice);
+            let pending = *status == ApprovalStatus::Pending;
+            *answer = self.local_answer(approval, offered, pending);
+        }
+
         items.extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
             CommandKind::SendMessage { session_id, text }
                 if *session_id == id && !logged.contains(&e.command.id) =>
@@ -1284,15 +1309,26 @@ impl Model {
     }
 
     /// This device's latest answer to an approval, its rule read from what
-    /// the approval `offered`.
-    fn local_answer(&self, approval: ApprovalId, offered: &[RuleSuggestion]) -> Option<Answer> {
+    /// the approval `offered`. Only an approval still `pending` in the
+    /// replica can take another answer.
+    fn local_answer(
+        &self,
+        approval: ApprovalId,
+        offered: &[RuleSuggestion],
+        pending: bool,
+    ) -> Option<Answer> {
         self.outbox.iter().rev().find_map(|e| match e.command.kind {
-            CommandKind::ResolveApproval { id, decision, rule } if id == approval => Some(Answer {
-                decision,
-                rule: rule.and_then(|rule| offered.get(usize::from(rule)).cloned()),
-                outgoing: Outgoing::from(&e.status),
-                delivery: Delivery::of(e),
-            }),
+            CommandKind::ResolveApproval { id, decision, rule } if id == approval => {
+                let outgoing = Outgoing::from(&e.status);
+                Some(Answer {
+                    decision,
+                    rule: rule.and_then(|rule| offered.get(usize::from(rule)).cloned()),
+                    outgoing,
+                    delivery: Delivery::of(e),
+                    retryable: pending
+                        && matches!(outgoing, Outgoing::Failed(r) if !r.rules_out_answers()),
+                })
+            }
             _ => None,
         })
     }
@@ -1957,6 +1993,7 @@ mod tests {
                 rule: None,
                 outgoing: Outgoing::Queued,
                 delivery: f.model.outbox.last().and_then(Delivery::of),
+                retryable: false,
             })
         );
 
@@ -1968,6 +2005,15 @@ mod tests {
             },
             Utc::now(),
         );
+        // Before the replica hears who won, the refusal already says the
+        // approval is closed: no answering again.
+        let refused = f.session_view().pending_approval.unwrap().answer.unwrap();
+        assert_eq!(
+            refused.outgoing,
+            Outgoing::Failed(RejectReason::ApprovalAlreadyResolved)
+        );
+        assert!(!refused.retryable);
+        assert!(f.dispatch(answer.clone()).is_empty());
         let phone = DeviceId::new();
         f.log(
             sid,
@@ -1984,6 +2030,7 @@ mod tests {
         let view = f.session_view();
         assert_eq!(view.state, SessionState::Idle);
         assert_eq!(view.pending_approval, None);
+        // The settled item keeps this device's refused answer in sight.
         assert!(view.timeline.contains(&TimelineItem::Logged {
             seq: Seq(3),
             at: f.events[2].at,
@@ -1998,12 +2045,83 @@ mod tests {
                     by_me: false,
                     rule: None,
                 },
+                answer: Some(refused),
             },
         }));
         assert!(
             f.dispatch(answer).is_empty(),
             "resolved approvals are closed"
         );
+    }
+
+    /// Only a refusal of the answer itself leaves the approval open to
+    /// another answer; a cancelled approval takes none.
+    #[test]
+    fn a_refused_answer_is_retryable_only_while_the_approval_is_open() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let approval = ApprovalId::new();
+        f.log(
+            sid,
+            vec![EventKind::ApprovalRequested {
+                id: approval,
+                call: None,
+                tool: "bash".into(),
+                summary: "ls".into(),
+                input: None,
+                suggestions: Vec::new(),
+            }],
+        );
+        f.open(sid);
+        let answer = Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        };
+        let refuse = |f: &mut Fixture, command: CommandId, reason| {
+            f.model
+                .command_result(command, CommandResult::Rejected { reason }, Utc::now());
+        };
+
+        let first = queued(&f.dispatch(answer.clone()));
+        refuse(&mut f, first.id, RejectReason::UnknownRule);
+        let prompt = f.session_view().pending_approval.unwrap();
+        assert!(prompt.answer.unwrap().retryable);
+        let second = queued(&f.dispatch(answer.clone()));
+
+        refuse(&mut f, second.id, RejectReason::ApprovalCancelled);
+        let prompt = f.session_view().pending_approval.unwrap();
+        assert!(!prompt.answer.unwrap().retryable);
+        assert!(f.dispatch(answer).is_empty());
+
+        f.log(
+            sid,
+            vec![EventKind::ApprovalCancelled {
+                id: approval,
+                reason: "daemon restarted".into(),
+            }],
+        );
+        let view = f.session_view();
+        assert_eq!(view.pending_approval, None);
+        let item = view.timeline.iter().find_map(|item| match item {
+            TimelineItem::Logged {
+                entry: Entry::Approval { status, answer, .. },
+                ..
+            } => Some((status.clone(), answer.clone().unwrap())),
+            _ => None,
+        });
+        let (status, answer) = item.unwrap();
+        assert_eq!(
+            status,
+            ApprovalStatus::Cancelled {
+                reason: "daemon restarted".into()
+            }
+        );
+        assert_eq!(
+            answer.outgoing,
+            Outgoing::Failed(RejectReason::ApprovalCancelled)
+        );
+        assert!(!answer.retryable);
     }
 
     #[test]
@@ -2176,6 +2294,7 @@ mod tests {
                     status: ApprovalStatus::Cancelled {
                         reason: "turn interrupted".into()
                     },
+                    answer: None,
                 },
                 Entry::Interrupted,
                 Entry::AgentErrored {
@@ -3251,6 +3370,7 @@ mod tests {
             approval: Some(ToolApproval {
                 id: approval,
                 status: ApprovalStatus::Pending,
+                answer: None,
             }),
             outcome: ToolOutcome::Running { since: minute(2) },
         };
@@ -3289,6 +3409,7 @@ mod tests {
                     by_me: true,
                     rule: None,
                 },
+                answer: None,
             }),
             outcome: ToolOutcome::Done {
                 is_error: false,
@@ -3388,6 +3509,7 @@ mod tests {
                     by_me: false,
                     rule: None,
                 },
+                answer: None,
             })
         );
     }
@@ -3511,6 +3633,7 @@ mod tests {
                         by_me: true,
                         rule: None,
                     },
+                    answer: None,
                 },
                 Entry::ToolResult {
                     summary: "[error] denied".into(),

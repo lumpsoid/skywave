@@ -162,11 +162,14 @@ class SessionTimelineModelTest {
     }
 
     @Test
-    fun anAnswerStandsUnlessRefused() {
+    fun anAnswerStandsUnlessItMayBeGivenAgain() {
         assertFalse(answered(null))
         assertTrue(answered(ApprovalSamples.answer()))
         assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Accepted(3u))))
-        assertFalse(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_ALREADY_RESOLVED))))
+        assertFalse(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.UNKNOWN_RULE), retryable = true)))
+        // Refused because the approval closed meanwhile: final.
+        assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_ALREADY_RESOLVED))))
+        assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_CANCELLED))))
         assertEquals("…000002", shortDevice(SessionSamples.OTHER))
     }
 }

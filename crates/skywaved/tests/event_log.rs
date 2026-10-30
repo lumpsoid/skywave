@@ -461,7 +461,7 @@ fn no_roots_allow_nothing() {
 // --- SendMessage, ResolveApproval, Interrupt -------------------------------
 
 #[test]
-fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
+fn approvals_first_answer_wins_and_cancelled_ones_refuse_answers() {
     let mut f = Fixture::new();
     let session = f.create_session();
     assert_eq!(
@@ -523,7 +523,7 @@ fn approvals_first_answer_wins_and_cancelled_counts_as_resolved() {
             decision: Decision::Approve,
             rule: None,
         }),
-        rejected(RejectReason::ApprovalAlreadyResolved)
+        rejected(RejectReason::ApprovalCancelled)
     );
 }
 

@@ -439,6 +439,7 @@ internal fun failText(reason: FailReason): String = stringResource(
         FailReason.UNKNOWN_SESSION -> R.string.fail_unknown_session
         FailReason.UNKNOWN_APPROVAL -> R.string.fail_unknown_approval
         FailReason.APPROVAL_ALREADY_RESOLVED -> R.string.fail_approval_resolved
+        FailReason.APPROVAL_CANCELLED -> R.string.fail_approval_cancelled
         FailReason.NO_ACTIVE_TURN -> R.string.fail_no_active_turn
         FailReason.UNKNOWN_RULE -> R.string.fail_unknown_rule
     },

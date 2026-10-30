@@ -5,7 +5,6 @@ import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.BlobView
 import dev.skywave.core.BodyFormat
 import dev.skywave.core.Entry
-import dev.skywave.core.Outgoing
 import dev.skywave.core.TimelineItem
 import dev.skywave.core.ToolKind
 import dev.skywave.core.ToolOutcome
@@ -123,10 +122,11 @@ internal fun approvalBody(prompt: ApprovalPrompt, tool: ToolView?): ApprovalBody
 private fun String.lineCount(): UInt = (count { it == '\n' } + 1).toUInt()
 
 /**
- * Whether this device's [answer] still stands: given and not refused. A
- * refused answer leaves the approval to answer again.
+ * Whether this device has had its say: an [answer] given, and not refused
+ * in a way that leaves the approval to answer again (the core's
+ * `retryable`). One refused because the approval closed meanwhile is final.
  */
-internal fun answered(answer: Answer?): Boolean = answer != null && answer.outgoing !is Outgoing.Failed
+internal fun answered(answer: Answer?): Boolean = answer != null && !answer.retryable
 
 /** A device id short enough for a status line: its random tail. */
 internal fun shortDevice(id: String): String = "…" + id.filter { it != '-' }.takeLast(6)

@@ -531,6 +531,8 @@ pub enum Entry {
         summary: String,
         input: Option<BlobView>,
         status: ApprovalStatus,
+        /// This device's answer, if it gave one (see [`ToolApproval::answer`]).
+        answer: Option<Answer>,
     },
     /// The agent's turn was stopped by an interrupt.
     Interrupted,
@@ -599,6 +601,10 @@ pub struct BodyView {
 pub struct ToolApproval {
     pub id: ApprovalId,
     pub status: ApprovalStatus,
+    /// This device's answer, if it gave one. Once the approval is settled,
+    /// this is where an answer that did not apply stays in sight: refused
+    /// because another device answered first or the approval was cancelled.
+    pub answer: Option<Answer>,
 }
 
 /// How a tool call stands (spec §7 "Tool timeline").
@@ -670,6 +676,13 @@ pub struct Answer {
     pub rule: Option<RuleSuggestion>,
     pub outgoing: Outgoing,
     pub delivery: Option<Delivery>,
+    /// Refused while the approval still waits, so this device may answer
+    /// again: the refusal was of the answer itself (`UnknownRule`). An
+    /// answer refused because the approval is closed on the server
+    /// ([`FailReason::rules_out_answers`]: answered elsewhere, cancelled)
+    /// did not apply and cannot be given again; nor can any once the
+    /// approval is settled.
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
