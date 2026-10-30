@@ -2,11 +2,11 @@
 //! (spec §7, D6).
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
-//! the pull cursor, blob rows, settings and this device's drafts and read
-//! marks (D5: never synced). Startup always reads everything back from here
+//! the pull cursor, blob rows, settings and this device's drafts, read
+//! marks and locally deleted sessions (D5: never synced). Startup always reads everything back from here
 //! ([`Store::load`]), so a cold start is the normal start.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -145,6 +145,14 @@ ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
 -- `SessionSummary::usage` as JSON. A replica from before this holds no
 -- turn usage events, so every session starts without: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN usage TEXT;
+"#,
+    r#"
+-- Sessions deleted from this device only (D5, D6: they stay on the server).
+-- Permanent: later events for one advance the cursor but are never stored.
+CREATE TABLE deleted_sessions (
+    session_id TEXT PRIMARY KEY,
+    at TEXT NOT NULL
+);
 "#,
 ];
 
@@ -308,6 +316,8 @@ pub struct Snapshot {
     pub settings: Settings,
     pub drafts: HashMap<SessionId, Draft>,
     pub read_marks: HashMap<SessionId, ReadMark>,
+    /// Sessions deleted from this device ([`Store::delete_session_locally`]).
+    pub deleted: HashSet<SessionId>,
 }
 
 /// Handle to the replica database.
@@ -356,6 +366,7 @@ impl Store {
             settings: self.settings()?,
             drafts: self.drafts()?,
             read_marks: self.read_marks()?,
+            deleted: read_deleted(&self.conn)?,
         })
     }
 
@@ -374,6 +385,11 @@ impl Store {
     /// batch or an overlapping range is a no-op for the old part. A batch
     /// starting after `cursor + 1` is rejected with [`StoreError::Gap`] and
     /// changes nothing.
+    ///
+    /// Events of a session deleted from this device advance the cursor but
+    /// are not stored, project no summary and register no blob. Contiguity
+    /// is the cursor's alone and events are read per session, so the holes
+    /// they leave between stored events are harmless.
     pub fn apply_batch(&mut self, batch: &EventBatch) -> Result<Applied, StoreError> {
         if batch.from == Seq::ZERO {
             return Err(StoreError::BatchFromZero);
@@ -387,11 +403,16 @@ impl Store {
             });
         }
 
+        let deleted = read_deleted(&tx)?;
         let mut touched: BTreeMap<SessionId, SessionSummary> = BTreeMap::new();
         let mut new_cursor = cursor;
         let mut new_events = 0;
         let mut blobs = Vec::new();
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
+            new_cursor = seq;
+            if deleted.contains(&event.session_id) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
                 params![
@@ -423,7 +444,6 @@ impl Store {
                     blobs.push(blob.id);
                 }
             }
-            new_cursor = seq;
             new_events += 1;
         }
         for summary in touched.values() {
@@ -455,6 +475,52 @@ impl Store {
 
     pub fn session(&self, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
         read_session(&self.conn, id)
+    }
+
+    /// Deletes a session from this device only, in one transaction: its
+    /// events, summary, blob rows, draft and read mark, and the answered
+    /// commands naming it. A tombstone keeps it out of the replica for good
+    /// ([`apply_batch`](Store::apply_batch)). Returns the blobs its events
+    /// referenced, whose files the caller removes. Whether the session may
+    /// go (archived, nothing pending) is the caller's rule.
+    pub fn delete_session_locally(
+        &mut self,
+        id: SessionId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<BlobId>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let session = id.0.to_string();
+        // The blobs table has no session column: the events say which.
+        let mut blobs = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT event FROM events WHERE session_id = ?1")?;
+            let mut rows = stmt.query([&session])?;
+            while let Some(row) = rows.next()? {
+                let event: Event = json_col(row, 0)?;
+                blobs.extend(blob_refs(&event.kind).map(|blob| blob.id));
+            }
+        }
+        blobs.sort();
+        blobs.dedup();
+        for blob in &blobs {
+            tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
+        }
+        tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
+        tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
+        tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
+        tx.execute(
+            "DELETE FROM outbox WHERE result IS NOT NULL
+                AND json_extract(command, '$.kind.session_id') = ?1",
+            [&session],
+        )?;
+        tx.execute(
+            "INSERT INTO deleted_sessions (session_id, at) VALUES (?1, ?2)
+             ON CONFLICT (session_id) DO NOTHING",
+            params![session, now.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(blobs)
     }
 
     /// The session's events in log order.
@@ -792,6 +858,12 @@ fn read_cursor(conn: &Connection) -> Result<Seq, StoreError> {
             seq_col(row, 0)
         })?,
     )
+}
+
+fn read_deleted(conn: &Connection) -> Result<HashSet<SessionId>, StoreError> {
+    let mut stmt = conn.prepare("SELECT session_id FROM deleted_sessions")?;
+    let rows = stmt.query_map([], |row| Ok(SessionId(uuid_col(row, 0)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Result<(), StoreError> {

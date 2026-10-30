@@ -12,7 +12,7 @@ use skywave_core::search;
 use skywave_core::{
     Action, ApprovalId, ApprovalPrompt, BlobPolicy, BlobState, Completion, CompletionStatus,
     CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind, Outgoing, PairingView,
-    PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView, SessionView,
+    PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView, SessionRow, SessionView,
     TimelineItem, ToolOutcome, ViewState,
 };
 
@@ -699,6 +699,9 @@ pub struct UiState {
     pub selected: Option<SessionId>,
     /// The open "new session" or rename prompt, if any.
     pub prompt: Option<Prompt>,
+    /// `D` on the archived list asks whether to delete this session from
+    /// this device; `y` does, any other key does not.
+    pub delete: Option<SessionId>,
     /// The open session's focus, scroll, expanded items and composer.
     pub session: Option<SessionUi>,
     /// The user chose to browse local data behind the revoked screen.
@@ -742,6 +745,7 @@ impl App {
                 form: PairingForm::default(),
                 selected: None,
                 prompt: None,
+                delete: None,
                 session: None,
                 revoked_dismissed: false,
                 link_since: now,
@@ -821,6 +825,11 @@ impl App {
             create.selected = create
                 .selected
                 .min(completion.candidates.len().saturating_sub(1));
+        }
+        // The question goes with its row, e.g. when a message brings the
+        // session back.
+        if self.ui.delete.is_some() && self.delete_row().is_none() {
+            self.ui.delete = None;
         }
         self.keep_selection(old_index);
         self.follow_session();
@@ -1127,6 +1136,17 @@ impl App {
     }
 
     /// The focused element takes text, so letters are input, not commands.
+    /// The archived session `D` asks about, while the question is open.
+    pub fn delete_row(&self) -> Option<&SessionRow> {
+        let id = self.ui.delete?;
+        match &self.view.screen {
+            Screen::SessionList(list) if list.kind == ListKind::Archived => {
+                list.sessions.iter().find(|row| row.id == id)
+            }
+            _ => None,
+        }
+    }
+
     pub fn typing(&self) -> bool {
         !self.revoked_screen()
             && match self.view.screen {
@@ -1192,6 +1212,13 @@ impl App {
         if ctrl && key.code == KeyCode::Char('c') {
             self.ui.quit = true;
             return None;
+        }
+        // y/N: only `y` deletes; any other key keeps the session.
+        if let Some(row) = self.delete_row() {
+            let id = row.id;
+            self.ui.delete = None;
+            return matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                .then_some(Action::DeleteSessionLocally { session_id: id });
         }
         if self.ui.help {
             if matches!(
@@ -1274,6 +1301,20 @@ impl App {
                 })),
                 KeyCode::Esc if list.kind == ListKind::Archived => {
                     Some(Action::Navigate(Route::SessionList))
+                }
+                // Deleting from this device asks first; the core says when
+                // something about the session still waits on an answer.
+                KeyCode::Char('D') if list.kind == ListKind::Archived => {
+                    let row = &list.sessions[self.selected_index(list)?];
+                    if row.deletable {
+                        self.ui.delete = Some(row.id);
+                    } else {
+                        self.ui.notice = Some(format!(
+                            "cannot delete {} yet: answer or cancel first",
+                            notify::sanitise(&row.title)
+                        ));
+                    }
+                    None
                 }
                 KeyCode::Char('r') => {
                     let row = &list.sessions[self.selected_index(list)?];

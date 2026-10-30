@@ -80,6 +80,16 @@ pub enum Action {
         session_id: SessionId,
         archived: bool,
     },
+    /// Delete an archived session from this device only, to free space and
+    /// drop its content here; it stays on the server and other devices.
+    /// Its events, summary, blobs (files too), draft and read mark go, and
+    /// it never comes back: later events for it are skipped, approvals in
+    /// it do not alert here. A no-op unless the session's row is
+    /// [`deletable`](crate::SessionRow::deletable). If it is open, its list
+    /// shows instead.
+    DeleteSessionLocally {
+        session_id: SessionId,
+    },
     OpenSession(SessionId),
     /// Open the session of the next approval in
     /// [`Attention::approvals`](crate::Attention::approvals) outside the

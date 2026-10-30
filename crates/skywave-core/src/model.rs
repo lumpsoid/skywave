@@ -48,6 +48,9 @@ pub(crate) enum Effect {
     },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
+    /// Delete the session from this device's replica, then from the model
+    /// ([`Model::session_deleted`]), and remove its blobs' files.
+    DeleteLocally(SessionId),
     /// Hand to the engine once every persistence effect succeeded.
     Request(Request),
 }
@@ -115,6 +118,9 @@ pub(crate) struct Model {
     draft_rev: u64,
     /// How far this device has read each session, as stored.
     read_marks: HashMap<SessionId, ReadMark>,
+    /// Sessions deleted from this device, as stored: their events are
+    /// skipped for good.
+    deleted: HashSet<SessionId>,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
     /// Pending approvals the user was alerted to, or that needed no alert
@@ -145,6 +151,7 @@ impl Model {
             drafts: HashMap::new(),
             draft_rev: 0,
             read_marks: HashMap::new(),
+            deleted: HashSet::new(),
             open: None,
             alerted: HashSet::new(),
             alerts: 0,
@@ -167,6 +174,7 @@ impl Model {
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
         self.drafts = snapshot.drafts;
         self.read_marks = snapshot.read_marks;
+        self.deleted = snapshot.deleted;
         self.open = None;
         // Only forget: an approval that came in during a catch-up must still
         // alert once it is over.
@@ -276,6 +284,12 @@ impl Model {
                     session_id,
                     archived,
                 })
+            }
+            Action::DeleteSessionLocally { session_id } => {
+                if !self.summary(session_id).is_some_and(|s| self.deletable(s)) {
+                    return Vec::new();
+                }
+                vec![Effect::DeleteLocally(session_id)]
             }
             Action::OpenSession(id) => {
                 if self.device.is_none() || self.summary(id).is_none() {
@@ -563,6 +577,10 @@ impl Model {
         }
         let cursor = self.cursor;
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
+            self.cursor = seq;
+            if self.deleted.contains(&event.session_id) {
+                continue;
+            }
             match self.sessions.iter_mut().find(|s| s.id == event.session_id) {
                 Some(summary) => summary.apply(seq, event),
                 None => self.sessions.push(SessionSummary::new(seq, event)),
@@ -577,7 +595,6 @@ impl Model {
             if let Some(open) = self.open.as_mut().filter(|o| o.id == event.session_id) {
                 open.events.push((seq, event.clone()));
             }
-            self.cursor = seq;
         }
         self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
         self.note_new_approvals();
@@ -594,6 +611,29 @@ impl Model {
                 events,
                 unread_from,
             });
+        }
+    }
+
+    /// Mirrors [`Store::delete_session_locally`](crate::Store::delete_session_locally),
+    /// which returned `blobs`: the session goes for good, with what this
+    /// device kept for it. If it was on screen, its list shows instead.
+    pub(crate) fn session_deleted(&mut self, id: SessionId, blobs: &[BlobId]) {
+        self.deleted.insert(id);
+        self.sessions.retain(|s| s.id != id);
+        self.drafts.remove(&id);
+        self.read_marks.remove(&id);
+        self.outbox
+            .retain(|e| e.status.is_pending() || command_session(&e.command.kind) != Some(id));
+        for blob in blobs {
+            self.blobs.remove(blob);
+            self.wanted.remove(blob);
+            self.failed.remove(blob);
+        }
+        let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
+        self.alerted.retain(|id| pending.contains(id));
+        if self.place == Place::Session(id) {
+            self.place = Place::Archived;
+            self.open = None;
         }
     }
 
@@ -755,6 +795,7 @@ impl Model {
                         None => s.notable,
                     },
                     cost_usd: s.usage.as_ref().and_then(|u| u.total.cost_usd),
+                    deletable: self.deletable(s),
                 }
             })
             .collect();
@@ -903,6 +944,20 @@ impl Model {
                 && matches!(&e.command.kind, CommandKind::SendMessage { session_id, .. } if *session_id == id)
         });
         archived && !message
+    }
+
+    /// Whether [`Action::DeleteSessionLocally`] may remove the session: it
+    /// is archived, and nothing about it is still open here — no pending
+    /// approval, no running turn, no command of this device unanswered.
+    fn deletable(&self, summary: &SessionSummary) -> bool {
+        let unanswered = self
+            .outbox
+            .iter()
+            .any(|e| e.status.is_pending() && command_session(&e.command.kind) == Some(summary.id));
+        self.archived(summary)
+            && summary.pending_approvals.is_empty()
+            && summary.state != LogState::AgentWorking
+            && !unanswered
     }
 
     /// The latest outbox command matching `kind`, until its effect is in the
@@ -1282,6 +1337,19 @@ fn tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
     }
 }
 
+/// The session a command names, if it names one. An answer names its
+/// approval only; its session is pending that approval meanwhile.
+fn command_session(kind: &CommandKind) -> Option<SessionId> {
+    match kind {
+        CommandKind::SendMessage { session_id, .. }
+        | CommandKind::Interrupt { session_id }
+        | CommandKind::StopSession { session_id }
+        | CommandKind::RenameSession { session_id, .. }
+        | CommandKind::SetSessionArchived { session_id, .. } => Some(*session_id),
+        CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
+    }
+}
+
 /// A pending approval overrides the logged agent state.
 fn session_state(summary: &SessionSummary) -> SessionState {
     if let Some(id) = summary.pending_approval() {
@@ -1401,6 +1469,7 @@ mod tests {
             settings: Settings::default(),
             drafts: HashMap::new(),
             read_marks: HashMap::new(),
+            deleted: HashSet::new(),
         }
     }
 
@@ -2344,6 +2413,121 @@ mod tests {
         assert_eq!(row(&f, mid).pending_approvals, 1);
         f.dispatch(Action::OpenNextApproval);
         assert_eq!(f.model.open_session(), Some(mid));
+    }
+
+    fn delete(session_id: SessionId) -> Action {
+        Action::DeleteSessionLocally { session_id }
+    }
+
+    /// Whether the archived list offers to delete the session, and whether
+    /// the action would.
+    fn deletable(f: &mut Fixture, id: SessionId) -> bool {
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        let shown = row(f, id).deletable;
+        let effects = f.dispatch(delete(id));
+        assert_eq!(
+            effects.is_empty(),
+            !shown,
+            "the row says what the action does"
+        );
+        shown
+    }
+
+    #[test]
+    fn delete_requires_archived() {
+        let mut f = Fixture::paired();
+        let gone = f.session("/srv/gone");
+        let kept = f.session("/srv/kept");
+        assert!(f.dispatch(delete(gone)).is_empty(), "active");
+        assert!(f.dispatch(delete(SessionId::new())).is_empty(), "unknown");
+        assert!(!row(&f, gone).deletable);
+
+        // This device's archiving counts once it is on its way.
+        queued(&f.dispatch(archive(gone, true)));
+        f.dispatch(Action::Navigate(Route::ArchivedSessions));
+        assert!(!row(&f, gone).deletable, "but it is not answered yet");
+        let command = f.model.outbox[0].command.id;
+        f.model
+            .command_result(command, CommandResult::Accepted { seq: Seq(3) }, minute(1));
+        assert!(deletable(&mut f, gone));
+        assert_eq!(f.dispatch(delete(gone)), vec![Effect::DeleteLocally(gone)]);
+
+        // As the core does once the store deleted it: it is gone, with its
+        // answered commands, and opened, its list shows instead.
+        f.open(gone);
+        f.model.session_deleted(gone, &[]);
+        assert!(f.model.outbox.is_empty());
+        assert_eq!(f.list_view().kind, ListKind::Archived);
+        assert_eq!(lists(&mut f), (vec![kept], vec![]));
+
+        // Later activity on it elsewhere never brings it back nor alerts.
+        f.model.set_link(ONLINE);
+        f.log(gone, vec![archived_event(true, f.me)]);
+        f.log(
+            gone,
+            vec![message("back"), approval_requested(ApprovalId::new(), None)],
+        );
+        assert_eq!(f.model.cursor, Seq(5));
+        assert_eq!(lists(&mut f), (vec![kept], vec![]));
+        assert!(f.model.view().attention.approvals.is_empty());
+        assert_eq!(alerts(&f), 0);
+        assert!(f.dispatch(Action::OpenSession(gone)).is_empty());
+
+        // And a restart keeps it gone.
+        let mut model = Model::new(snapshot(&f.model), Some(f.me));
+        model.apply_batch(&EventBatch {
+            from: Seq(6),
+            events: vec![Event {
+                session_id: gone,
+                at: minute(9),
+                kind: message("again"),
+            }],
+        });
+        assert_eq!(
+            model.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [kept]
+        );
+        assert_eq!(model.cursor, Seq(6));
+    }
+
+    #[test]
+    fn delete_refused_while_pending_or_running() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        assert!(deletable(&mut f, sid));
+
+        // A pending approval, until answered anywhere.
+        let approval = ApprovalId::new();
+        f.log(sid, vec![approval_requested(approval, None)]);
+        assert!(!deletable(&mut f, sid));
+        f.log(sid, vec![resolved(approval)]);
+        assert!(deletable(&mut f, sid));
+
+        // A running turn, until it ends.
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        assert!(!deletable(&mut f, sid));
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert!(deletable(&mut f, sid));
+
+        // A command from this device, until the server answers it; a
+        // refused one counts as answered.
+        let command = queued(&f.dispatch(rename(sid, "old work")));
+        assert!(!deletable(&mut f, sid));
+        f.model.command_sending(command.id, minute(1));
+        assert!(!deletable(&mut f, sid));
+        let refused = CommandResult::Rejected {
+            reason: RejectReason::UnknownSession,
+        };
+        f.model.command_result(command.id, refused, minute(2));
+        assert!(deletable(&mut f, sid));
+        // Another session's command does not hold it.
+        let other = f.session("/srv/other");
+        queued(&f.dispatch(Action::Interrupt { session_id: other }));
+        assert!(deletable(&mut f, sid));
     }
 
     #[test]
@@ -3371,6 +3555,7 @@ mod tests {
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             read_marks: model.read_marks.clone(),
+            deleted: model.deleted.clone(),
         }
     }
 
