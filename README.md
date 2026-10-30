@@ -244,9 +244,19 @@ Prerequisites:
   `rustup target add aarch64-linux-android x86_64-linux-android`.
 - [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
   `cargo install cargo-ndk`.
-- An Android NDK. `cargo-ndk` builds the `.so`, not Gradle, so the app sets
-  no `ndkVersion`; `cargo-ndk` uses `ANDROID_NDK_HOME` if set, else the newest
-  NDK under `$ANDROID_HOME/ndk`. Any recent NDK (r26+) works.
+- An Android NDK. `cargo-ndk` builds the `.so`, and Gradle tells it which NDK
+  to use (as `ANDROID_NDK_HOME`). The first of these wins:
+  1. `ANDROID_NDK_HOME` in the environment;
+  2. `skywave.ndk=/path/to/ndk` in `android/local.properties`;
+  3. the NDK pinned by `ndkVersion` in `android/app/build.gradle.kts`
+     (currently `28.2.13676358`), looked up under the SDK's `ndk/` directory.
+
+  No NDK environment variable is needed, so a build started from Android
+  Studio's desktop entry works. Install the pinned NDK with
+  `sdkmanager "ndk;28.2.13676358"`, or override it with option 1 or 2. Any
+  recent NDK (r26+) works. The `cargoBuildAndroid<Variant>` log prints the
+  NDK it used (`Using NDK ...`). Don't use `ndk.dir` for this: AGP reads that
+  key itself and rejects an NDK that doesn't match `ndkVersion`.
 
 Build and install:
 

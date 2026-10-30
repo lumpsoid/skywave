@@ -5,7 +5,8 @@
 # Usage: build-android.sh <jniLibs-dir> [profile]   (default release-android)
 # Needs cargo-ndk (`cargo install cargo-ndk`), the Rust targets
 # aarch64-linux-android and x86_64-linux-android, and an NDK that cargo-ndk
-# finds (ANDROID_NDK_HOME, or the newest under $ANDROID_HOME/ndk).
+# finds (ANDROID_NDK_HOME, or the newest under $ANDROID_HOME/ndk). The Gradle
+# build always sets ANDROID_NDK_HOME (see android/app/build.gradle.kts).
 # ABIs and API level follow docs/decisions.md D19 (minSdk 26).
 set -eu
 

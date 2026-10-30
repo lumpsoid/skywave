@@ -16,13 +16,17 @@ profile=${2:-debug}
 
 cd "$(dirname "$0")/../.."
 
+# The lib is built with the same `bindgen` feature as the `cargo run` below,
+# so both share one build of skywave-core-ffi: with differing feature sets
+# each command would recompile (and overwrite) the other's. The feature only
+# pulls in the bindgen CLI; it changes nothing the library exports.
 case "$profile" in
     debug | dev)
-        cargo build -p skywave-core-ffi --lib
+        cargo build -p skywave-core-ffi --lib --features bindgen
         profile_dir=debug
         ;;
     *)
-        cargo build -p skywave-core-ffi --lib --profile "$profile"
+        cargo build -p skywave-core-ffi --lib --features bindgen --profile "$profile"
         profile_dir=$profile
         ;;
 esac
