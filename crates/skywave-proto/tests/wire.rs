@@ -151,6 +151,14 @@ fn all_event_kinds() -> Vec<EventKind> {
         },
         EventKind::TurnInterrupted,
         EventKind::SessionStopped,
+        EventKind::SessionRenamed {
+            name: Some("fix the flaky test".into()),
+            by: device(),
+        },
+        EventKind::SessionRenamed {
+            name: None,
+            by: device(),
+        },
         EventKind::SessionStateChanged(SessionState::Idle),
         EventKind::SessionStateChanged(SessionState::AgentWorking),
         EventKind::SessionStateChanged(SessionState::Errored {
@@ -181,6 +189,14 @@ fn all_command_kinds() -> Vec<CommandKind> {
         },
         CommandKind::StopSession {
             session_id: session(),
+        },
+        CommandKind::RenameSession {
+            session_id: session(),
+            name: Some("fix the flaky test".into()),
+        },
+        CommandKind::RenameSession {
+            session_id: session(),
+            name: None,
         },
     ]
 }

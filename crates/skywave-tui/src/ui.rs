@@ -26,7 +26,7 @@ use skywave_core::{
     SessionRow, SessionState, SettingsView,
 };
 
-use crate::app::{App, Field, Focus, POPUP_ROWS, dismissable};
+use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
 use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -235,7 +235,7 @@ fn render_pairing(frame: &mut Frame, area: Rect, app: &App, pairing: &PairingVie
 }
 
 fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionListView) {
-    let create = app.ui().create.as_ref();
+    let prompt = app.ui().prompt.as_ref();
     let creating_height = if list.creating.is_empty() {
         0
     } else {
@@ -244,7 +244,7 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
     let [sessions_area, creating_area, prompt_area] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Max(creating_height),
-        Constraint::Length(if create.is_some() { 3 } else { 0 }),
+        Constraint::Length(if prompt.is_some() { 3 } else { 0 }),
     ])
     .areas(area);
 
@@ -286,27 +286,36 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
         );
     }
 
-    if let Some(create) = create {
-        let block = Block::bordered()
-            .title(" New session · workdir on the server ")
-            .cyan();
-        let inner = block.inner(prompt_area);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw("> "),
-                Span::raw(create.workdir.clone()),
-            ]))
-            .block(block),
-            prompt_area,
-        );
-        if app.typing() && !app.ui().help {
-            let width = create.workdir.chars().count() as u16 + 2;
-            let x = (inner.x + width).min(inner.right().saturating_sub(1));
-            frame.set_cursor_position(Position::new(x, inner.y));
-        }
+    if let Some(prompt) = prompt {
+        render_prompt(frame, prompt_area, app, prompt);
         if let Some((completion, selected)) = app.completion_popup() {
             render_completion(frame, area, prompt_area, app, completion, selected);
         }
+    }
+}
+
+/// An open [`Prompt`] in `area`, three rows high, with the cursor at the end
+/// of its text.
+pub(crate) fn render_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: &Prompt) {
+    let title = match prompt.kind {
+        PromptKind::Create => " New session · workdir on the server ",
+        PromptKind::Rename(_) => " Rename session · empty restores the default title ",
+    };
+    let block = Block::bordered().title(title).cyan();
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("> "),
+            Span::raw(prompt.text.clone()),
+        ]))
+        .block(block),
+        area,
+    );
+    if app.typing() && !app.ui().help {
+        let width = prompt.text.chars().count() as u16 + 2;
+        let x = (inner.x + width).min(inner.right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, inner.y));
     }
 }
 
@@ -378,19 +387,17 @@ fn render_completion(
 const BADGE_WIDTH: usize = 12;
 
 fn session_row_line(row: &SessionRow) -> ListItem<'static> {
-    let name = row.workdir.clone().unwrap_or_else(|| row.id.0.to_string());
     let (badge, style) = state_badge(&row.state);
-    // News since this device last looked: a bold name and the count.
-    let name = if row.unread > 0 {
-        Span::raw(name).bold()
-    } else {
-        Span::raw(name)
-    };
     let mut spans = vec![
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        name,
+        Span::raw(timeline::clean(&row.title)).bold(),
     ];
+    spans.extend(rename_badge(row.rename.as_ref()));
+    if let Some(workdir) = &row.workdir {
+        spans.push(Span::raw(format!("  {}", timeline::clean(workdir))).dark_gray());
+    }
+    // News since this device last looked.
     if row.unread > 0 {
         spans.push(Span::raw(format!("  ● {}", row.unread)).magenta().bold());
     }
@@ -420,6 +427,21 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
         .dark_gray(),
     );
     ListItem::new(Line::from(spans))
+}
+
+/// " queued" after a title this device's rename has not settled yet; why a
+/// rename failed.
+pub(crate) fn rename_badge(rename: Option<&Outgoing>) -> Option<Span<'static>> {
+    match rename? {
+        Outgoing::Accepted(_) => None,
+        Outgoing::Failed(reason) => {
+            Some(Span::raw(format!("  rename failed: {}", fail_reason(*reason))).red())
+        }
+        pending => {
+            let (label, style) = outgoing_badge(pending);
+            Some(Span::styled(format!(" {label}"), style))
+        }
+    }
 }
 
 fn pending_session_line(pending: &PendingSession) -> Line<'static> {
@@ -545,11 +567,20 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::SessionList(_) if app.completion_popup().is_some() => {
             "↑↓ select · Tab/Enter accept · Esc close list · F1 help · Ctrl-C quit"
         }
-        Screen::SessionList(_) if app.ui().create.is_some() => {
+        Screen::SessionList(_) | Screen::Session(_)
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| matches!(p.kind, PromptKind::Rename(_))) =>
+        {
+            "Enter rename (empty: default title) · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        Screen::SessionList(_) if app.ui().prompt.is_some() => {
             "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(_) => {
-            "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
+            "↑↓ select · Enter open · n new session · r rename · s settings · ? help · q quit"
         }
         Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
             // A pending message only takes these keys while the core says it
@@ -562,10 +593,10 @@ fn footer_keys(app: &App) -> &'static str {
                     "e edit · Del cancel · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
-                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
             _ => {
@@ -607,7 +638,23 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("paste", "a skywave://pair?… URI fills all fields"),
             key("Esc", "cancel re-pairing"),
         ]),
-        Screen::SessionList(_) if app.ui().create.is_some() => lines.extend([
+        Screen::SessionList(_) | Screen::Session(_)
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| matches!(p.kind, PromptKind::Rename(_))) =>
+        {
+            lines.extend([
+                section("Rename session"),
+                key("type / paste", "the session's new name"),
+                key("Enter", "rename; empty restores the default title"),
+                key("Backspace", "delete a character"),
+                key("Ctrl-U", "clear"),
+                key("Esc", "cancel"),
+            ])
+        }
+        Screen::SessionList(_) if app.ui().prompt.is_some() => lines.extend([
             section("New session"),
             key("type / paste", "the session's directory on the server"),
             key("Tab", "complete the directory under the roots"),
@@ -622,6 +669,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("↑↓ / k j", "select"),
             key("Enter", "open session"),
             key("n", "new session in a server directory"),
+            key("r", "rename the selected session"),
             key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
             Line::from(""),
@@ -663,6 +711,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("a / x", "approve / deny the pending approval"),
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
+                    key("R", "rename the session"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),
                     key("n / N", "older / newer match, round the ends"),

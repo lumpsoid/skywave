@@ -119,6 +119,23 @@ CREATE TABLE read_marks (
 );
 INSERT INTO read_marks (session_id, seq, notable) SELECT id, last_seq, notable FROM sessions;
 "#,
+    r#"
+-- `SessionSummary::name` and `first_prompt`. A replica from before this
+-- holds no renames, so `name` starts empty; `first_prompt` is backfilled
+-- like `projection::first_line` cuts it: the first line of the session's
+-- earliest non-blank message, leading whitespace skipped, at most 200 chars.
+ALTER TABLE sessions ADD COLUMN name TEXT;
+ALTER TABLE sessions ADD COLUMN first_prompt TEXT;
+UPDATE sessions SET first_prompt = (
+    SELECT substr(rtrim(substr(t, 1, instr(t || char(10), char(10)) - 1), char(32, 9, 13)), 1, 200)
+    FROM (SELECT ltrim(json_extract(event, '$.kind.text'), char(32, 9, 10, 13)) AS t, seq
+        FROM events
+        WHERE session_id = sessions.id
+            AND json_extract(event, '$.kind.type') = 'user_message')
+    WHERE t != ''
+    ORDER BY seq
+    LIMIT 1);
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -780,8 +797,8 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
     Ok(())
 }
 
-const SESSION_COLUMNS: &str =
-    "id, workdir, state, pending_approvals, last_activity, last_seq, stopped, notable";
+const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
+    stopped, notable, name, first_prompt";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -796,7 +813,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         ),
         params![
             summary.id.0.to_string(),
@@ -807,6 +824,8 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             seq_sql(summary.last_seq)?,
             summary.stopped,
             u64_sql(summary.notable)?,
+            summary.name,
+            summary.first_prompt,
         ],
     )?;
     Ok(())
@@ -826,6 +845,8 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         last_seq: seq_col(row, 5)?,
         stopped: row.get(6)?,
         notable: u64_col(row, 7)?,
+        name: row.get(8)?,
+        first_prompt: row.get(9)?,
     })
 }
 

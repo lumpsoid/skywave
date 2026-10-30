@@ -694,9 +694,16 @@ fn every_session_state_has_its_own_badge() {
     assert_contains(&row, "[error]");
     assert_contains(&row, "agent exited with status 1");
     assert_contains(&row, "2026-10-29 12:06 UTC");
-    // Badges are padded so the workdirs line up.
-    let column = |dir: &str| line_with(&screen, dir).find(dir).unwrap();
-    assert_eq!(column("/srv/idle"), column("/srv/approval"));
+    // Badges are padded so the titles line up; each is followed by its
+    // workdir.
+    let column = |title: &str, dir: &str| {
+        let row = line_with(&screen, dir);
+        row.find(&format!("{title}  {dir}")).unwrap()
+    };
+    assert_eq!(
+        column("idle", "/srv/idle"),
+        column("approval", "/srv/approval")
+    );
 }
 
 #[test]
@@ -723,7 +730,7 @@ fn create_session_goes_from_queued_to_the_real_row() {
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
-    assert!(h.app.ui().create.is_none(), "the prompt closes");
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
     assert!(!h.app.typing());
     let command = last_command(&h);
 
@@ -792,7 +799,7 @@ fn esc_cancels_the_new_session_prompt() {
     h.key(KeyCode::Char('n'));
     h.type_text("/srv/a");
     h.key_with(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-    assert_eq!(h.app.ui().create.as_ref().unwrap().workdir, "");
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "");
     h.type_text("/srv/b");
     // `?` is text here; F1 still opens help, which lists the prompt's keys.
     h.key(KeyCode::Char('?'));
@@ -802,10 +809,10 @@ fn esc_cancels_the_new_session_prompt() {
     assert_contains(&h.screen(), "create the session");
     h.key(KeyCode::Esc);
     assert!(!h.app.ui().help);
-    assert_eq!(h.app.ui().create.as_ref().unwrap().workdir, "/srv/b");
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "/srv/b");
 
     assert_eq!(h.key(KeyCode::Esc), None);
-    assert!(h.app.ui().create.is_none());
+    assert!(h.app.ui().prompt.is_none());
     assert!(h.drain_requests().is_empty());
     assert!(h.seam.pending_outbox().unwrap().is_empty());
     assert_contains(&h.screen(), "n new session");
@@ -848,7 +855,7 @@ fn popup(screen: &str) -> String {
 }
 
 fn workdir_input(h: &Harness) -> String {
-    h.app.ui().create.as_ref().unwrap().workdir.clone()
+    h.app.ui().prompt.as_ref().unwrap().text.clone()
 }
 
 #[test]
@@ -960,7 +967,7 @@ fn esc_closes_the_popup_then_the_prompt() {
     assert!(!h.screen().contains("Directories"));
     assert_eq!(workdir_input(&h), "/srv/");
     assert_eq!(h.key(KeyCode::Esc), Some(Action::EndCompletion));
-    assert!(h.app.ui().create.is_none());
+    assert!(h.app.ui().prompt.is_none());
 }
 
 // ---- session view -----------------------------------------------------------
@@ -1116,7 +1123,10 @@ fn own_messages_show_their_delivery_state() {
             },
         )],
     );
-    assert_contains(&line_with(&h.screen(), "line one"), "12:01 you [accepted]");
+    assert_contains(
+        &line_with(&h.screen(), ": q? line one"),
+        "12:01 you [accepted]",
+    );
 
     // A refused message says why, in words.
     h.type_text("again");
@@ -1333,6 +1343,140 @@ fn interrupt_key_and_its_delivery_state() {
         .unwrap();
     h.sync();
     assert_contains(&h.screen(), "interrupt failed: the agent was not working");
+}
+
+#[test]
+fn rename_from_the_list_shows_at_once_and_empty_restores_the_default() {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            created(id, 0, "/srv/work"),
+            event(id, 1, user(phone, "fix the flaky test\nin ci")),
+        ],
+    );
+    // The title is the first prompt's first line, the workdir follows.
+    let row = line_with(&h.screen(), "/srv/work");
+    assert_contains(&row, "fix the flaky test  /srv/work");
+
+    // Not named yet: the prompt starts empty.
+    assert_eq!(h.key(KeyCode::Char('r')), None);
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "");
+    assert_contains(&h.screen(), "Rename session");
+    h.type_text("flaky");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RenameSession {
+            session_id: id,
+            name: "flaky".into(),
+        })
+    );
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    assert_contains(
+        &line_with(&h.screen(), "/srv/work"),
+        "flaky queued  /srv/work",
+    );
+
+    // Logged: the badge goes, the name stays; the next prompt starts with it.
+    let command = last_command(&h);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(3) })
+        .unwrap();
+    let me = h.seam.identity().unwrap().device_id();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::SessionRenamed {
+                name: Some("flaky".into()),
+                by: me,
+            },
+        )],
+    );
+    let row = line_with(&h.screen(), "/srv/work");
+    assert_contains(&row, "flaky  /srv/work");
+    assert!(!row.contains("queued"), "{row}");
+    h.key(KeyCode::Char('r'));
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "flaky");
+
+    // Emptied, it restores the default title.
+    h.key_with(ctrl('u'));
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RenameSession {
+            session_id: id,
+            name: String::new(),
+        })
+    );
+    assert_contains(
+        &line_with(&h.screen(), "/srv/work"),
+        "fix the flaky test queued  /srv/work",
+    );
+
+    // Esc cancels without renaming.
+    h.key(KeyCode::Char('r'));
+    h.type_text("x");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().prompt.is_none());
+}
+
+#[test]
+fn rename_from_the_timeline_titles_the_header() {
+    let (mut h, id, me) = open_session();
+    assert_contains(&h.screen(), "┌ work · /srv/work · idle");
+    // A capital R in the composer is text, not a rename.
+    assert_eq!(h.key(KeyCode::Char('R')), None);
+    h.key_with(ctrl('u'));
+    h.key(KeyCode::Esc);
+    assert_eq!(h.key(KeyCode::Char('R')), None);
+    assert_contains(&h.screen(), "Rename session");
+    h.type_text("deploy");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RenameSession {
+            session_id: id,
+            name: "deploy".into(),
+        })
+    );
+    assert_contains(&h.screen(), "┌ deploy queued · /srv/work · idle");
+    let command = last_command(&h);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(1) })
+        .unwrap();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::SessionRenamed {
+                name: Some("deploy".into()),
+                by: me,
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "renamed to “deploy” by you");
+    let other = DeviceId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::SessionRenamed {
+                name: None,
+                by: other,
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "┌ work · /srv/work · idle");
+    assert_contains(
+        &screen,
+        &format!("default title restored by device …{}", tail(other)),
+    );
 }
 
 #[test]
@@ -1830,7 +1974,7 @@ fn new_divider_marks_first_unseen_event() {
     let row = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
     let rule = row("── new ──");
     assert!(
-        row("seen") < rule && rule < row("from the phone"),
+        row("seen") < rule && rule < row(": from the phone"),
         "{screen}"
     );
     assert!(!screen.contains("scrolled back"));
@@ -2462,7 +2606,7 @@ fn colour_of(buffer: &Buffer, needle: &str) -> Color {
 
 /// The mock-up at 90 × 60, trailing blanks trimmed.
 const MOCKUP: &str = r#"connecting…
-┌ /srv/work · approval ──────────────────────────────────────────────────────────────────┐
+┌ add a hello binary and wire it into main · /srv/work · approval ───────────────────────┐
 │agent waiting for an approval                                                           │
 │  12:01 you: add a hello binary and wire it into main                                   │
 │        agent: I'll add the binary, run it, then use it from main.                      │
@@ -2889,7 +3033,7 @@ fn user_messages_are_selectable() {
     h.key(KeyCode::Up);
     assert_contains(&h.screen(), "> 12:02 agent: on it");
     h.key(KeyCode::Up);
-    let line = line_with(&h.screen(), "from the phone");
+    let line = line_with(&h.screen(), ": from the phone");
     assert_contains(&line, "> 12:01 ");
     assert_contains(&line, &tail(phone));
     assert_eq!(h.key(KeyCode::Enter), None);

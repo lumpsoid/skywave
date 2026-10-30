@@ -52,7 +52,7 @@ pub struct Attention {
 pub struct PendingApprovalRef {
     pub id: ApprovalId,
     pub session_id: SessionId,
-    /// The session's [title](crate::SessionSummary::title). Text from the
+    /// The session's title, as [`SessionRow::title`]. Text from the
     /// server: heads sanitise it before writing it anywhere raw.
     pub title: String,
 }
@@ -307,6 +307,17 @@ pub enum CompletionStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: SessionId,
+    /// What to call the session: its name, else the first line of its first
+    /// message, else its directory's name, else the end of its id (see
+    /// [`SessionSummary::title`](crate::SessionSummary::title)). A rename
+    /// from this device shows here at once. Text from the server: heads
+    /// sanitise it before writing it anywhere raw.
+    pub title: String,
+    /// `title` is a name the user gave, not the default.
+    pub named: bool,
+    /// This device's latest rename of the session, until its effect is in
+    /// the replica. `title` already shows it unless it failed.
+    pub rename: Option<Outgoing>,
     pub workdir: Option<String>,
     pub state: SessionState,
     pub pending_approvals: usize,
@@ -331,6 +342,12 @@ pub struct PendingSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionView {
     pub id: SessionId,
+    /// As [`SessionRow::title`].
+    pub title: String,
+    /// As [`SessionRow::named`].
+    pub named: bool,
+    /// As [`SessionRow::rename`].
+    pub rename: Option<Outgoing>,
     pub workdir: Option<String>,
     pub state: SessionState,
     /// Log order; this device's messages not yet in the log come last.
@@ -461,6 +478,13 @@ pub enum Entry {
     Interrupted,
     /// The session's agent was shut down on request.
     Stopped,
+    /// The session was renamed; `None` restored its default title.
+    Renamed {
+        name: Option<String>,
+        by: DeviceId,
+        /// Renamed from this device.
+        own: bool,
+    },
     /// The agent reported an error.
     AgentErrored {
         message: String,
@@ -618,6 +642,9 @@ mod tests {
     fn prompts_are_newest_first_without_repeats() {
         let view = SessionView {
             id: SessionId::new(),
+            title: "x".into(),
+            named: false,
+            rename: None,
             workdir: None,
             state: SessionState::Idle,
             timeline: vec![

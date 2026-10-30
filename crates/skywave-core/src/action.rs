@@ -60,6 +60,14 @@ pub enum Action {
     StopSession {
         session_id: SessionId,
     },
+    /// Name the session, or with a blank `name` restore its default title.
+    /// The core normalises the name as the server will (control characters
+    /// stripped, trimmed, cut to 80 chars). It shows at once, marked by the
+    /// view's `rename` until its effect is in the replica.
+    RenameSession {
+        session_id: SessionId,
+        name: String,
+    },
     OpenSession(SessionId),
     /// Open the session of the next approval in
     /// [`Attention::approvals`](crate::Attention::approvals) outside the

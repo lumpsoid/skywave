@@ -617,6 +617,11 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                             by_me: false,
                         },
                     },
+                    Entry::Renamed { name, by, .. } => Entry::Renamed {
+                        name,
+                        by,
+                        own: false,
+                    },
                     other => other,
                 },
             },

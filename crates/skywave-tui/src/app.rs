@@ -198,16 +198,28 @@ fn percent_decode(value: &str) -> Option<String> {
 /// Rows of completion candidates shown at most.
 pub const POPUP_ROWS: usize = 8;
 
-/// The "new session" prompt on the session list: the server workdir being
-/// typed. Whether the path is acceptable is the server's call (D14).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CreateInput {
-    pub workdir: String,
+/// What a [`Prompt`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// "New session", on the session list: the server workdir, with Tab
+    /// completion. Whether the path is acceptable is the server's call
+    /// (D14).
+    Create,
+    /// A new name for the session, on the session list or the session
+    /// itself; blank restores the default title (the core decides).
+    Rename(SessionId),
+}
+
+/// A one-line prompt over the session list or a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub text: String,
     /// Enter was pressed; the prompt closes once the core takes the action
     /// and stays open with the text if dispatching fails.
     submitted: bool,
-    /// The completion popup is open, showing the core's
-    /// [`Completion`].
+    /// [`PromptKind::Create`]: the completion popup is open, showing the
+    /// core's [`Completion`].
     popup: bool,
     /// Highlighted candidate in the popup.
     selected: usize,
@@ -216,10 +228,20 @@ pub struct CreateInput {
     tab: bool,
 }
 
-impl CreateInput {
+impl Prompt {
+    fn new(kind: PromptKind, text: String) -> Prompt {
+        Prompt {
+            kind,
+            text,
+            submitted: false,
+            popup: false,
+            selected: 0,
+            tab: false,
+        }
+    }
+
     fn insert(&mut self, text: &str) {
-        self.workdir
-            .extend(text.chars().filter(|c| !c.is_control()));
+        self.text.extend(text.chars().filter(|c| !c.is_control()));
     }
 
     /// The workdir changed: while the popup is open, complete it again.
@@ -227,7 +249,7 @@ impl CreateInput {
         self.popup.then(|| {
             self.selected = 0;
             Action::CompleteWorkdir {
-                input: self.workdir.clone(),
+                input: self.text.clone(),
             }
         })
     }
@@ -237,17 +259,27 @@ impl CreateInput {
     /// listed.
     fn settle(&mut self, completion: &Completion) {
         if !self.tab
-            || completion.input != self.workdir
+            || completion.input != self.text
             || completion.status == CompletionStatus::Loading
         {
             return;
         }
         self.tab = false;
         if let Some(fill) = completion.fill() {
-            self.workdir = fill;
+            self.text = fill;
         }
         self.popup = completion.candidates.len() != 1;
         self.selected = 0;
+    }
+
+    /// Whether the prompt still belongs on `screen`: a new-session prompt
+    /// on the session list, a rename there or on its session.
+    fn fits(&self, screen: &Screen) -> bool {
+        match (self.kind, screen) {
+            (_, Screen::SessionList(_)) => true,
+            (PromptKind::Rename(id), Screen::Session(view)) => view.id == id,
+            _ => false,
+        }
     }
 }
 
@@ -583,8 +615,8 @@ pub struct UiState {
     /// Selected session on the session list, by id so it stays put when
     /// rows arrive or reorder.
     pub selected: Option<SessionId>,
-    /// The open "new session" prompt, if any.
-    pub create: Option<CreateInput>,
+    /// The open "new session" or rename prompt, if any.
+    pub prompt: Option<Prompt>,
     /// The open session's focus, scroll, expanded items and composer.
     pub session: Option<SessionUi>,
     /// The user chose to browse local data behind the revoked screen.
@@ -627,7 +659,7 @@ impl App {
                 help: false,
                 form: PairingForm::default(),
                 selected: None,
-                create: None,
+                prompt: None,
                 session: None,
                 revoked_dismissed: false,
                 link_since: now,
@@ -671,8 +703,13 @@ impl App {
             (true, false) => self.ui.form = PairingForm::default(),
             _ => {}
         }
-        if !matches!(view.screen, Screen::SessionList(_)) {
-            self.ui.create = None;
+        if self
+            .ui
+            .prompt
+            .as_ref()
+            .is_some_and(|p| !p.fits(&view.screen))
+        {
+            self.ui.prompt = None;
         }
         let attention = &view.attention;
         if attention.alerts > self.ui.seen_alerts {
@@ -694,7 +731,8 @@ impl App {
             .session()
             .and_then(|(view, ui)| find(view, ui.search.as_ref()?.current?));
         self.view = view;
-        if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.create, &self.view.screen)
+        if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.prompt, &self.view.screen)
+            && create.kind == PromptKind::Create
             && let Some(completion) = &list.completion
         {
             create.settle(completion);
@@ -773,13 +811,13 @@ impl App {
 
     /// Records the outcome of dispatching an action from [`App::on_key`].
     pub fn dispatched(&mut self, result: Result<(), CoreError>) {
-        if let Some(create) = &mut self.ui.create
-            && create.submitted
+        if let Some(prompt) = &mut self.ui.prompt
+            && prompt.submitted
         {
             if result.is_ok() {
-                self.ui.create = None;
+                self.ui.prompt = None;
             } else {
-                create.submitted = false;
+                prompt.submitted = false;
             }
         }
         if let Some(session) = &mut self.ui.session
@@ -1011,7 +1049,8 @@ impl App {
         !self.revoked_screen()
             && match self.view.screen {
                 Screen::Pairing(_) => true,
-                Screen::SessionList(_) => self.ui.create.is_some(),
+                Screen::SessionList(_) => self.ui.prompt.is_some(),
+                Screen::Session(_) if self.ui.prompt.is_some() => true,
                 Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| {
                     s.focus == Focus::Composer || s.search.as_ref().is_some_and(|s| s.editing)
                 }),
@@ -1020,12 +1059,19 @@ impl App {
     }
 
     /// Bracketed paste: on the pairing screen a pairing URI fills the whole
-    /// form, anything else goes into the focused field; in the new-session
-    /// prompt it goes into the workdir; on a session it goes into the
+    /// form, anything else goes into the focused field; an open prompt
+    /// (new session, rename) takes it; on a session it goes into the
     /// search prompt while that is open, else into the composer, line
     /// breaks included.
     pub fn on_paste(&mut self, text: &str) {
         if self.ui.help || self.revoked_screen() {
+            return;
+        }
+        if let Some(prompt) = &mut self.ui.prompt {
+            prompt.insert(text.trim());
+            // The candidates were for the text before the paste.
+            prompt.popup = false;
+            prompt.tab = false;
             return;
         }
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session)
@@ -1044,13 +1090,6 @@ impl App {
             return;
         }
         if !self.typing() {
-            return;
-        }
-        if let Some(create) = &mut self.ui.create {
-            create.insert(text.trim());
-            // The candidates were for the text before the paste.
-            create.popup = false;
-            create.tab = false;
             return;
         }
         match PairUri::parse(text) {
@@ -1110,12 +1149,16 @@ impl App {
                 _ => None,
             };
         }
+        match self.ui.prompt.as_ref().map(|p| p.kind) {
+            Some(PromptKind::Create) => return self.create_key(key, ctrl),
+            Some(PromptKind::Rename(id)) => return self.rename_key(id, key, ctrl),
+            None => {}
+        }
         match &self.view.screen {
             Screen::Pairing(pairing) => {
                 let paired = pairing.paired.is_some();
                 self.pairing_key(key, ctrl, paired)
             }
-            Screen::SessionList(_) if self.ui.create.is_some() => self.create_key(key, ctrl),
             Screen::SessionList(list) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1130,7 +1173,17 @@ impl App {
                     .selected_index(list)
                     .map(|i| Action::OpenSession(list.sessions[i].id)),
                 KeyCode::Char('n') => {
-                    self.ui.create = Some(CreateInput::default());
+                    self.ui.prompt = Some(Prompt::new(PromptKind::Create, String::new()));
+                    None
+                }
+                KeyCode::Char('r') => {
+                    let row = &list.sessions[self.selected_index(list)?];
+                    let name = if row.named {
+                        row.title.clone()
+                    } else {
+                        String::new()
+                    };
+                    self.ui.prompt = Some(Prompt::new(PromptKind::Rename(row.id), name));
                     None
                 }
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
@@ -1187,7 +1240,7 @@ impl App {
     /// The completion popup of the new-session prompt, if it is open and
     /// has something to show, with the highlighted row.
     pub fn completion_popup(&self) -> Option<(&Completion, usize)> {
-        let create = self.ui.create.as_ref().filter(|c| c.popup)?;
+        let create = self.ui.prompt.as_ref().filter(|c| c.popup)?;
         let Screen::SessionList(list) = &self.view.screen else {
             return None;
         };
@@ -1205,12 +1258,12 @@ impl App {
             .unwrap_or_default();
         let completing =
             matches!(&self.view.screen, Screen::SessionList(list) if list.completion.is_some());
-        let create = self.ui.create.as_mut()?;
+        let create = self.ui.prompt.as_mut()?;
         create.tab = false;
         match key.code {
             KeyCode::Esc if create.popup => create.popup = false,
             KeyCode::Esc => {
-                self.ui.create = None;
+                self.ui.prompt = None;
                 return completing.then_some(Action::EndCompletion);
             }
             KeyCode::Up if !candidates.is_empty() => {
@@ -1221,7 +1274,7 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Enter if !candidates.is_empty() => {
                 let chosen = &candidates[create.selected.min(candidates.len() - 1)];
-                create.workdir = format!("{}/", chosen.path);
+                create.text = format!("{}/", chosen.path);
                 create.popup = false;
             }
             KeyCode::Tab => {
@@ -1229,7 +1282,7 @@ impl App {
                 create.popup = true;
                 create.selected = 0;
                 return Some(Action::CompleteWorkdir {
-                    input: create.workdir.clone(),
+                    input: create.text.clone(),
                 });
             }
             // Blank or unacceptable paths are refused by the core or the
@@ -1237,21 +1290,44 @@ impl App {
             KeyCode::Enter => {
                 create.submitted = true;
                 return Some(Action::CreateSession {
-                    workdir: create.workdir.clone(),
+                    workdir: create.text.clone(),
                 });
             }
             KeyCode::Backspace => {
-                create.workdir.pop();
+                create.text.pop();
                 return create.edited();
             }
             KeyCode::Char('u') if ctrl => {
-                create.workdir.clear();
+                create.text.clear();
                 return create.edited();
             }
             KeyCode::Char(c) if !ctrl => {
                 create.insert(c.encode_utf8(&mut [0; 4]));
                 return create.edited();
             }
+            _ => {}
+        }
+        None
+    }
+
+    /// Keys while the rename prompt is open. Enter renames (the core takes a
+    /// blank name as "back to the default title"), Esc cancels.
+    fn rename_key(&mut self, session_id: SessionId, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let prompt = self.ui.prompt.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.ui.prompt = None,
+            KeyCode::Enter => {
+                prompt.submitted = true;
+                return Some(Action::RenameSession {
+                    session_id,
+                    name: prompt.text.clone(),
+                });
+            }
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => prompt.text.clear(),
+            KeyCode::Char(c) if !ctrl => prompt.insert(c.encode_utf8(&mut [0; 4])),
             _ => {}
         }
         None
@@ -1430,6 +1506,15 @@ impl App {
                 KeyCode::Char('S') => Some(Action::StopSession {
                     session_id: view.id,
                 }),
+                KeyCode::Char('R') => {
+                    let name = if view.named {
+                        view.title.clone()
+                    } else {
+                        String::new()
+                    };
+                    self.ui.prompt = Some(Prompt::new(PromptKind::Rename(view.id), name));
+                    None
+                }
                 _ => None,
             },
         }

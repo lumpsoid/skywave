@@ -137,7 +137,10 @@ only your server.
 
 Press `n` to create a session in a directory under one of your `roots`
 (`Tab` completes the path from the server, or from recent workdirs while
-offline), then start talking to the agent.
+offline), then start talking to the agent. Each session is titled by the
+first line of its first message until you name it: `r` on the session list
+(or `R` on the timeline) renames it on every device, and an empty name brings
+the default title back.
 
 | Key | Session view |
 |-----|--------------|
@@ -151,6 +154,7 @@ offline), then start talking to the agent.
 | `a` / `x` | Approve / deny a pending request |
 | `Ctrl-X` | Interrupt the agent's turn |
 | `S` | Stop the agent (timeline); the next message restarts it |
+| `R` | Rename the session (timeline); empty restores the default title |
 | `Ctrl-R` | Retry the connection now while offline (any screen) |
 | `Ctrl-G` | Open the next session waiting for an approval (any screen) |
 | `?` / `F1` | Help |

@@ -131,6 +131,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::ToolCall { name, summary, .. } => vec![name, summary],
         Entry::ToolResult { summary, .. } => vec![summary],
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
+        Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
         Entry::Interrupted | Entry::Stopped => Vec::new(),
     }
 }

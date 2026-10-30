@@ -16,7 +16,11 @@ use uuid::Uuid;
 ///
 /// v3: `CommandKind::StopSession` and `EventKind::SessionStopped`; a v2
 /// client cannot decode the new event.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4: `CommandKind::RenameSession` and `EventKind::SessionRenamed`. One v4
+/// carries every wire change of its release; no compatibility layer: the
+/// exact version check at `hello` rejects older clients.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -162,6 +166,13 @@ pub enum EventKind {
     /// A running turn is interrupted first. The session stays: the next
     /// message starts the agent again, resumed.
     SessionStopped,
+    /// The session's name was set by a `RenameSession` command; `None`
+    /// restores the default title. The last rename in log order wins.
+    /// Renaming is not activity.
+    SessionRenamed {
+        name: Option<String>,
+        by: DeviceId,
+    },
     SessionStateChanged(SessionState),
 }
 
@@ -180,6 +191,8 @@ pub mod limits {
     pub const PREVIEW_MAX_LINES: usize = 8;
     /// Most UTF-8 bytes in a preview.
     pub const PREVIEW_MAX_BYTES: usize = 512;
+    /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
+    pub const SESSION_NAME_MAX_CHARS: usize = 80;
 }
 
 /// The agent invoked a tool.
@@ -442,6 +455,30 @@ pub enum CommandKind {
     StopSession {
         session_id: SessionId,
     },
+    /// Name the session; `None` (or a name that is empty once normalised)
+    /// restores the default title. The server logs the name as
+    /// [`normalise_session_name`] leaves it. Accepted for any known session,
+    /// even with the same name.
+    RenameSession {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+}
+
+/// A session name as `SessionRenamed` carries it: control characters
+/// (newlines included) stripped, trimmed, and cut on a char boundary to
+/// [`limits::SESSION_NAME_MAX_CHARS`]. `None` when nothing is left, which
+/// restores the default title.
+pub fn normalise_session_name(name: &str) -> Option<String> {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name: String = clean
+        .trim()
+        .chars()
+        .take(limits::SESSION_NAME_MAX_CHARS)
+        .collect();
+    // The cut may end on whitespace.
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Response to `POST /v1/commands`. Resending a [`CommandId`] returns the
