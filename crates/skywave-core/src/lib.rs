@@ -53,8 +53,8 @@ pub use projection::SessionSummary;
 pub use seam::{Request, Seam};
 pub use skywave_proto::PROTOCOL_VERSION;
 pub use store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, Settings, Snapshot,
-    Store, StoreError,
+    Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings,
+    Snapshot, Store, StoreError,
 };
 pub use tls::Fingerprint;
 pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};

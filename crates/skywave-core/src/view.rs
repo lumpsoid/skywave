@@ -217,6 +217,9 @@ pub struct SessionRow {
     pub last_activity: DateTime<Utc>,
     /// This device keeps an unsent message for the session.
     pub has_draft: bool,
+    /// Agent output (messages, approval requests, errors) this device has
+    /// not seen yet. Messages from any device never count.
+    pub unread: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +254,14 @@ pub struct SessionView {
     /// keeps its own copy of the text being written replaces it with
     /// `draft` then.
     pub draft_rev: u64,
+    /// Seq of the session's newest event: what
+    /// [`Action::MarkRead`](crate::Action::MarkRead) marks through once the
+    /// end of the timeline was on screen.
+    pub last_seq: Seq,
+    /// Where the news starts: the first event after what this device had
+    /// read when the session was opened, if agent output follows. Fixed
+    /// while the session stays open; marking it read does not move it.
+    pub unread_from: Option<Seq>,
 }
 
 impl SessionView {
@@ -528,6 +539,8 @@ mod tests {
             stop: None,
             draft: None,
             draft_rev: 0,
+            last_seq: Seq(6),
+            unread_from: None,
         };
         assert_eq!(view.prompts(), ["queued", "first", "again", "first"]);
     }

@@ -5,8 +5,8 @@
 //! - [`app`]: the latest snapshot plus head-only presentation state; keys in,
 //!   actions out.
 //! - [`ui`]: pure render functions over an [`App`].
-//! - [`run`]: the terminal event loop; [`handle_key`] and [`save_draft`] are
-//!   its steps.
+//! - [`run`]: the terminal event loop; [`handle_key`], [`save_draft`] and
+//!   [`mark_read`] are its steps.
 
 pub mod app;
 pub mod composer;
@@ -75,11 +75,15 @@ pub fn run(core: &Core) -> io::Result<()> {
         loop {
             terminal.draw(|frame| ui::render(frame, &app, Instant::now()))?;
             let tick = matches!(app.view().link, Link::Reconnecting { .. }) || app.live();
-            let draft = app.draft_due_in(Instant::now());
-            let wait = match (tick.then_some(TICK), draft) {
-                (Some(tick), Some(draft)) => Some(tick.min(draft)),
-                (tick, draft) => tick.or(draft),
-            };
+            let now = Instant::now();
+            let wait = [
+                tick.then_some(TICK),
+                app.draft_due_in(now),
+                app.read_mark_due_in(now),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let first = if let Some(wait) = wait {
                 match rx.recv_timeout(wait) {
                     Ok(msg) => Some(msg),
@@ -111,6 +115,7 @@ pub fn run(core: &Core) -> io::Result<()> {
                 }
             }
             save_draft(&mut app, core, Instant::now(), false);
+            mark_read(&mut app, core, Instant::now(), false);
         }
     })();
     core.unsubscribe(subscription);
@@ -122,17 +127,21 @@ pub fn run(core: &Core) -> io::Result<()> {
 /// Handles a key press: its action goes to `core`. The open session's draft
 /// is saved first, so leaving the session (or anything else) keeps it,
 /// except before a message, whose enqueue drops the draft anyway; and again
-/// before quitting.
+/// before quitting. Leaving and quitting also mark what was seen read.
 pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
     let action = app.on_key(key);
     if let Some(action) = &action {
         if !matches!(action, Action::SendMessage { .. }) {
             save_draft(app, core, Instant::now(), true);
         }
+        if matches!(action, Action::Navigate(_) | Action::OpenSession(_)) {
+            mark_read(app, core, Instant::now(), true);
+        }
         app.dispatched(core.dispatch(action.clone()));
     }
     if app.ui().quit {
         save_draft(app, core, Instant::now(), true);
+        mark_read(app, core, Instant::now(), true);
     }
     action
 }
@@ -141,5 +150,12 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
 pub fn save_draft(app: &mut App, core: &Core, now: Instant, force: bool) {
     if let Some(action) = app.draft_save(now, force) {
         app.draft_saved(core.dispatch(action));
+    }
+}
+
+/// Marks the open session read if [`App::read_mark`] has a mark for `now`.
+pub fn mark_read(app: &mut App, core: &Core, now: Instant, force: bool) {
+    if let Some(action) = app.read_mark(now, force) {
+        app.read_marked(core.dispatch(action));
     }
 }

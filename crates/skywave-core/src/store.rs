@@ -2,8 +2,8 @@
 //! (spec §7, D6).
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
-//! the pull cursor, blob rows, settings and this device's drafts (D5: never
-//! synced). Startup always reads everything back from here
+//! the pull cursor, blob rows, settings and this device's drafts and read
+//! marks (D5: never synced). Startup always reads everything back from here
 //! ([`Store::load`]), so a cold start is the normal start.
 
 use std::collections::{BTreeMap, HashMap};
@@ -99,6 +99,25 @@ CREATE TABLE drafts (
     text TEXT NOT NULL,
     cursor INTEGER NOT NULL
 );
+"#,
+    r#"
+-- `SessionSummary::notable`, backfilled from the stored log with the kinds
+-- `projection::is_notable` counts: agent messages, approval requests, errors.
+ALTER TABLE sessions ADD COLUMN notable INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET notable = (SELECT COUNT(*) FROM events
+    WHERE session_id = sessions.id
+        AND (json_extract(event, '$.kind.type') IN ('agent_message', 'approval_requested')
+            OR json_extract(event, '$.kind.type') = 'session_state_changed'
+                AND json_extract(event, '$.kind.state') = 'errored'));
+
+-- How far this device has read each session (D5: never synced). Everything
+-- stored before this counts as read, so an upgrade shows nothing as new.
+CREATE TABLE read_marks (
+    session_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    notable INTEGER NOT NULL
+);
+INSERT INTO read_marks (session_id, seq, notable) SELECT id, last_seq, notable FROM sessions;
 "#,
 ];
 
@@ -241,6 +260,14 @@ pub struct Applied {
     pub blobs: Vec<BlobId>,
 }
 
+/// How far this device has read a session: through `seq`, when the session
+/// had `notable` notable events (D5: per device, never synced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadMark {
+    pub seq: Seq,
+    pub notable: u64,
+}
+
 /// Everything the replica holds except the events themselves, as read on
 /// startup.
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +280,7 @@ pub struct Snapshot {
     pub blobs: Vec<BlobRecord>,
     pub settings: Settings,
     pub drafts: HashMap<SessionId, Draft>,
+    pub read_marks: HashMap<SessionId, ReadMark>,
 }
 
 /// Handle to the replica database.
@@ -300,6 +328,7 @@ impl Store {
             blobs: self.blobs()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
+            read_marks: self.read_marks()?,
         })
     }
 
@@ -625,6 +654,37 @@ impl Store {
         }
     }
 
+    // ---- read marks -------------------------------------------------------
+
+    /// How far this device has read each session.
+    pub fn read_marks(&self) -> Result<HashMap<SessionId, ReadMark>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, seq, notable FROM read_marks")?;
+        let rows = stmt.query_map([], |row| {
+            let mark = ReadMark {
+                seq: seq_col(row, 1)?,
+                notable: u64_col(row, 2)?,
+            };
+            Ok((SessionId(uuid_col(row, 0)?), mark))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps `mark` as how far the session is read.
+    pub fn set_read_mark(&self, session_id: SessionId, mark: ReadMark) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO read_marks (session_id, seq, notable) VALUES (?1, ?2, ?3)
+             ON CONFLICT (session_id) DO UPDATE SET seq = excluded.seq, notable = excluded.notable",
+            params![
+                session_id.0.to_string(),
+                seq_sql(mark.seq)?,
+                u64_sql(mark.notable)?
+            ],
+        )?;
+        Ok(())
+    }
+
     // ---- settings -----------------------------------------------------------
 
     pub fn settings(&self) -> Result<Settings, StoreError> {
@@ -721,7 +781,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str =
-    "id, workdir, state, pending_approvals, last_activity, last_seq, stopped";
+    "id, workdir, state, pending_approvals, last_activity, last_seq, stopped, notable";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -736,7 +796,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         ),
         params![
             summary.id.0.to_string(),
@@ -746,6 +806,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.last_activity.to_rfc3339(),
             seq_sql(summary.last_seq)?,
             summary.stopped,
+            u64_sql(summary.notable)?,
         ],
     )?;
     Ok(())
@@ -764,6 +825,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         last_activity,
         last_seq: seq_col(row, 5)?,
         stopped: row.get(6)?,
+        notable: u64_col(row, 7)?,
     })
 }
 
@@ -824,6 +886,11 @@ fn seq_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Seq> {
     u64::try_from(value)
         .map(Seq)
         .map_err(|e| bad_value(idx, Type::Integer, e))
+}
+
+fn u64_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|e| bad_value(idx, Type::Integer, e))
 }
 
 fn json_col<T: DeserializeOwned>(row: &Row<'_>, idx: usize) -> rusqlite::Result<T> {

@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
-use skywave_core::{BlobPolicy, BlobStatus, Draft, OutboxStatus, Settings, Store, StoreError};
+use skywave_core::{
+    BlobPolicy, BlobStatus, Draft, OutboxStatus, ReadMark, Settings, Store, StoreError,
+};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
     DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState, ToolResult,
@@ -513,6 +515,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_unread(&dir);
     drop_drafts(&dir);
     set_user_version(&dir, 2);
 
@@ -540,6 +543,131 @@ fn drop_outbox_delivery_columns(dir: &Path) {
 fn drop_drafts(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE drafts").unwrap();
+}
+
+fn drop_unread(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE read_marks;
+         ALTER TABLE sessions DROP COLUMN notable;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn notable_count_is_projected_and_backfilled() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/x".into(),
+            },
+        )
+    };
+    let errored = SessionState::Errored {
+        message: "boom".into(),
+    };
+    // `a`: an agent message, an approval request and an error are news;
+    // a message, a tool result and other state changes are not.
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(a, 0),
+            created(b, 1),
+            event(
+                a,
+                2,
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: DeviceId::new(),
+                    text: "hi".into(),
+                },
+            ),
+            event(
+                a,
+                3,
+                EventKind::SessionStateChanged(SessionState::AgentWorking),
+            ),
+            event(a, 4, EventKind::AgentMessage { text: "ok".into() }),
+            event(
+                a,
+                5,
+                EventKind::ApprovalRequested {
+                    id: ApprovalId::new(),
+                    call: None,
+                    tool: "bash".into(),
+                    summary: "ls".into(),
+                    input: None,
+                },
+            ),
+            event(
+                a,
+                6,
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: true,
+                    status: None,
+                    preview: "no".into(),
+                    lines: 1,
+                    output: None,
+                }),
+            ),
+            event(a, 7, EventKind::SessionStateChanged(errored)),
+            event(b, 8, EventKind::SessionStateChanged(SessionState::Idle)),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch).unwrap();
+    let notable = |store: &Store, id| store.session(id).unwrap().unwrap().notable;
+    assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
+    assert!(store.read_marks().unwrap().is_empty(), "nothing read yet");
+    drop(store);
+
+    // A replica from before the column: the migration derives it from the
+    // log and marks everything stored as read, so nothing shows up as new.
+    drop_unread(&dir);
+    set_user_version(&dir, 4);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
+    let marks = store.load().unwrap().read_marks;
+    assert_eq!(
+        marks[&a],
+        ReadMark {
+            seq: Seq(8),
+            notable: 3
+        }
+    );
+    assert_eq!(
+        marks[&b],
+        ReadMark {
+            seq: Seq(9),
+            notable: 0
+        }
+    );
+}
+
+#[test]
+fn read_marks_round_trip() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let mark = |seq, notable| ReadMark {
+        seq: Seq(seq),
+        notable,
+    };
+    {
+        let store = Store::open(&dir).unwrap();
+        store.set_read_mark(a, mark(3, 1)).unwrap();
+        store.set_read_mark(b, mark(4, 0)).unwrap();
+        store.set_read_mark(a, mark(7, 2)).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let marks = store.load().unwrap().read_marks;
+    assert_eq!(marks.len(), 2);
+    assert_eq!(marks[&a], mark(7, 2), "a mark replaces the last one");
+    assert_eq!(marks[&b], mark(4, 0));
 }
 
 #[test]
@@ -602,6 +730,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_unread(&dir);
     drop_drafts(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();

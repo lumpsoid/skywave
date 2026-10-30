@@ -25,6 +25,11 @@ use crate::timeline::{
 /// writes, so never one per keystroke.
 pub const DRAFT_SAVE_AFTER: Duration = Duration::from_secs(1);
 
+/// Least time between two read marks of the open session while it follows
+/// new items: an agent streaming many small batches must not cost a durable
+/// write each. Leaving the session or quitting marks at once.
+pub const READ_MARK_EVERY: Duration = Duration::from_secs(2);
+
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Field {
@@ -241,6 +246,8 @@ pub struct Geometry {
     /// Top line shown in the last frame; where an anchor whose item is gone
     /// falls back to.
     pub top: usize,
+    /// Line of the `── new ──` rule, if the timeline has one.
+    pub rule: Option<usize>,
 }
 
 impl Geometry {
@@ -255,6 +262,15 @@ impl Geometry {
             None => self.bottom(),
             Some(anchor) => self.line(anchor).unwrap_or(self.top).min(self.bottom()),
         }
+    }
+
+    /// The scroll state a session opens at: pinned to the rule when the
+    /// unread part below it does not fit on screen, else following.
+    pub fn opening(&self) -> Option<Anchor> {
+        let rule = self.rule?;
+        (self.total.saturating_sub(rule) > self.height)
+            .then(|| self.pin(rule))
+            .flatten()
     }
 
     /// The line `anchor` stands for, if its item is still there.
@@ -317,6 +333,12 @@ pub struct SessionUi {
     draft_rev: u64,
     /// Earlier prompts being recalled into the composer; any edit ends it.
     history: Option<HistoryNav>,
+    /// The session opened with news and where to scroll is not settled: it
+    /// needs the first frame's geometry ([`Geometry::opening`]). Until then
+    /// the renderer shows that scroll state itself and nothing is read.
+    pub opening: bool,
+    /// What the last [`App::read_mark`] marked read through, and when.
+    marked: Option<(Seq, Instant)>,
 }
 
 /// Browsing [`SessionView::prompts`] in the composer.
@@ -342,7 +364,35 @@ impl SessionUi {
             composer: composer_of(view),
             draft_rev: view.draft_rev,
             history: None,
+            opening: view.unread_from.is_some(),
+            marked: None,
         }
+    }
+
+    /// The scroll state shown: while [`SessionUi::opening`], the one the
+    /// opening will settle on.
+    pub fn shown_scroll(&self) -> Option<Anchor> {
+        if self.opening {
+            self.geometry.borrow().opening()
+        } else {
+            self.scroll
+        }
+    }
+
+    /// Applies the opening scroll once a frame has laid the timeline out.
+    fn settle_opening(&mut self) {
+        if self.opening && self.geometry.borrow().height > 0 {
+            self.scroll = self.geometry.borrow().opening();
+            self.opening = false;
+        }
+    }
+
+    /// The newest item is on screen, so everything up to `last_seq` is
+    /// seen, and that is past what was last marked read.
+    fn unmarked(&self, view: &SessionView) -> bool {
+        !self.opening
+            && self.scroll.is_none()
+            && self.marked.is_none_or(|(seq, _)| view.last_seq > seq)
     }
 
     /// While browsing earlier prompts: the shown one's place, 1 the newest,
@@ -612,6 +662,57 @@ impl App {
         }
     }
 
+    /// Marks the open session read through its newest event when that is on
+    /// screen (the timeline follows) and newer than the last mark: at once
+    /// if `force` (leaving the session, quitting) or for the first mark,
+    /// else at most once per [`READ_MARK_EVERY`]. Report the outcome with
+    /// [`App::read_marked`].
+    pub fn read_mark(&mut self, now: Instant, force: bool) -> Option<Action> {
+        let Screen::Session(view) = &self.view.screen else {
+            return None;
+        };
+        let session = self.ui.session.as_mut().filter(|s| s.id == view.id)?;
+        session.settle_opening();
+        if !session.unmarked(view) {
+            return None;
+        }
+        if let Some((_, at)) = session.marked
+            && !force
+            && now.saturating_duration_since(at) < READ_MARK_EVERY
+        {
+            return None;
+        }
+        session.marked = Some((view.last_seq, now));
+        Some(Action::MarkRead {
+            session_id: view.id,
+            through: view.last_seq,
+        })
+    }
+
+    /// How long from `now` until [`App::read_mark`] has something to mark
+    /// unforced; `None` while there is nothing to mark.
+    pub fn read_mark_due_in(&self, now: Instant) -> Option<Duration> {
+        let (view, ui) = self.session()?;
+        if ui.opening {
+            // Settles as soon as a frame was drawn.
+            return (ui.geometry.borrow().height > 0).then_some(Duration::ZERO);
+        }
+        if !ui.unmarked(view) {
+            return None;
+        }
+        Some(ui.marked.map_or(Duration::ZERO, |(_, at)| {
+            (at + READ_MARK_EVERY).saturating_duration_since(now)
+        }))
+    }
+
+    /// Records the outcome of dispatching a [`App::read_mark`] action; only
+    /// an error matters.
+    pub fn read_marked(&mut self, result: Result<(), CoreError>) {
+        if let Err(err) = result {
+            self.ui.error = Some(err.to_string());
+        }
+    }
+
     /// The session list on screen, if that is the current screen.
     pub fn session_list(&self) -> Option<&SessionListView> {
         match &self.view.screen {
@@ -849,6 +950,8 @@ impl App {
             return None;
         };
         let session = self.ui.session.as_mut()?;
+        // Keys move from where the opening scrolled to.
+        session.settle_opening();
         match key.code {
             KeyCode::Char('x') if ctrl => {
                 return Some(Action::Interrupt {

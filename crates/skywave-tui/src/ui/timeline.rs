@@ -54,6 +54,7 @@ pub(super) fn item_lines(
         focused,
         width: width.max(TITLE + MIN_TITLE),
         wall_ms: wall_ms(wall),
+        rule: rule_index(session),
     };
     let mut minute = None;
     session
@@ -64,16 +65,29 @@ pub(super) fn item_lines(
         .collect()
 }
 
+/// The timeline item the `── new ──` rule goes above: the first logged one
+/// at or after [`SessionView::unread_from`].
+pub(super) fn rule_index(session: &SessionView) -> Option<usize> {
+    let from = session.unread_from?;
+    session
+        .timeline
+        .iter()
+        .position(|item| matches!(item, TimelineItem::Logged { seq, .. } if *seq >= from))
+}
+
 struct Layout<'a> {
     ui: &'a SessionUi,
     focused: bool,
     width: usize,
     wall_ms: i64,
+    /// Index of the item the `── new ──` rule goes above.
+    rule: Option<usize>,
 }
 
 impl Layout<'_> {
-    /// One item: a separator if it starts a turn, then its lines. The time
-    /// shows only when it differs from the last one shown (`minute`).
+    /// One item: the `── new ──` rule if the news starts here, else a
+    /// separator if it starts a turn, then its lines. The time shows only
+    /// when it differs from the last one shown (`minute`).
     fn item(
         &self,
         index: usize,
@@ -81,7 +95,13 @@ impl Layout<'_> {
         minute: &mut Option<String>,
     ) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        if index > 0 && starts_turn(item) {
+        if self.rule == Some(index) {
+            let rest = self.width.saturating_sub(7);
+            out.push(Line::from(vec![
+                Span::raw("── new ").magenta().bold(),
+                Span::raw("─".repeat(rest)).magenta(),
+            ]));
+        } else if index > 0 && starts_turn(item) {
             out.push(Line::from("─".repeat(self.width)).dark_gray());
         }
         let key = selectable(item);

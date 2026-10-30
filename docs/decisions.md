@@ -26,6 +26,8 @@ Clients never see the agent's native protocol. `skywaved` translates it into
 Every device is a full view of the same data.
 - Approvals: first answer wins; others receive `ApprovalResolved { by: DeviceId }`.
 - Drafts are per-device.
+- Read marks (what this device has seen of each session, behind the unread
+  counts and the "new" divider) are per-device too and never synced.
 **Deferred:** multiple servers per client.
 
 ## D6. Full local replica on every client

@@ -293,11 +293,20 @@ const BADGE_WIDTH: usize = 12;
 fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     let name = row.workdir.clone().unwrap_or_else(|| row.id.0.to_string());
     let (badge, style) = state_badge(&row.state);
+    // News since this device last looked: a bold name and the count.
+    let name = if row.unread > 0 {
+        Span::raw(name).bold()
+    } else {
+        Span::raw(name)
+    };
     let mut spans = vec![
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        Span::raw(name),
+        name,
     ];
+    if row.unread > 0 {
+        spans.push(Span::raw(format!("  ● {}", row.unread)).magenta().bold());
+    }
     if row.pending_approvals > 0 {
         let noun = if row.pending_approvals == 1 {
             "approval"

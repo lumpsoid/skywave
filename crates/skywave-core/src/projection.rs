@@ -27,6 +27,9 @@ pub struct SessionSummary {
     pub last_seq: Seq,
     /// The agent was stopped on request and no message has come since.
     pub stopped: bool,
+    /// How many of the session's events are [notable](is_notable): what
+    /// unread counts subtract a read mark from.
+    pub notable: u64,
 }
 
 impl SessionSummary {
@@ -40,6 +43,7 @@ impl SessionSummary {
             last_activity: event.at,
             last_seq: seq,
             stopped: false,
+            notable: 0,
         };
         summary.apply(seq, event);
         summary
@@ -50,6 +54,9 @@ impl SessionSummary {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         self.last_seq = seq;
         self.last_activity = event.at;
+        if is_notable(&event.kind) {
+            self.notable += 1;
+        }
         match &event.kind {
             EventKind::SessionCreated { workdir } => self.workdir = Some(workdir.clone()),
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
@@ -74,6 +81,24 @@ impl SessionSummary {
     /// The approval the session is blocked on, if any (the oldest one).
     pub fn pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().copied()
+    }
+}
+
+/// Whether an event is news for whoever was away: the agent's output (a
+/// message, an approval request, an error). Messages from any device never
+/// are. The store's backfill migration counts the same kinds.
+pub fn is_notable(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::AgentMessage { .. } | EventKind::ApprovalRequested { .. } => true,
+        EventKind::SessionStateChanged(state) => matches!(state, SessionState::Errored { .. }),
+        EventKind::SessionCreated { .. }
+        | EventKind::UserMessage { .. }
+        | EventKind::ToolCall(_)
+        | EventKind::ToolResult(_)
+        | EventKind::ApprovalResolved { .. }
+        | EventKind::ApprovalCancelled { .. }
+        | EventKind::TurnInterrupted
+        | EventKind::SessionStopped => false,
     }
 }
 
@@ -151,6 +176,7 @@ mod tests {
         }
         assert_eq!(summary.state, SessionState::AgentWorking);
         assert_eq!(summary.pending_approval(), Some(a1));
+        assert_eq!(summary.notable, 2, "both approval requests are news");
 
         let resolved = EventKind::ApprovalResolved {
             id: a1,
