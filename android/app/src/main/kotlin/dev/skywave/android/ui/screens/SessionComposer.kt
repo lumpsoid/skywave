@@ -44,6 +44,7 @@ import dev.skywave.android.R
 import dev.skywave.core.Action
 import dev.skywave.core.Draft
 import dev.skywave.core.SessionView
+import kotlinx.collections.immutable.ImmutableList
 import kotlinx.coroutines.delay
 
 /** A pause in typing this long saves the draft. */
@@ -188,7 +189,7 @@ internal object ComposerTags {
 
 /** The composer bar: recall, a multiline field and send, above the keyboard. */
 @Composable
-internal fun ComposerBar(composer: ComposerState, prompts: List<String>) {
+internal fun ComposerBar(composer: ComposerState, prompts: ImmutableList<String>) {
     Surface(tonalElevation = 3.dp) {
         Row(
             Modifier
@@ -222,7 +223,7 @@ internal fun ComposerBar(composer: ComposerState, prompts: List<String>) {
 
 /** Lists the session's earlier messages, newest first; choosing one fills the composer. */
 @Composable
-private fun RecallButton(prompts: List<String>, onPick: (String) -> Unit) {
+private fun RecallButton(prompts: ImmutableList<String>, onPick: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }, modifier = Modifier.testTag(ComposerTags.RECALL)) {

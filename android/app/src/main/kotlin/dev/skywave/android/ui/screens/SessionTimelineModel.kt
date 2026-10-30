@@ -1,5 +1,6 @@
 package dev.skywave.android.ui.screens
 
+import androidx.compose.runtime.Immutable
 import dev.skywave.core.Answer
 import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.BlobView
@@ -14,16 +15,22 @@ import dev.skywave.core.ToolOutcome
 import dev.skywave.core.ToolView
 import dev.skywave.core.TurnUsage
 import java.util.Locale
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.toImmutableList
 
 /**
  * The session timeline as LazyColumn rows: every item under a stable key,
  * plus the "new" divider. Pure, so the keys and the divider's place are
  * tested without a UI.
+ *
+ * Value-equal and immutable, so an item whose data is unchanged in a new
+ * snapshot is equal to its old row and its composable skips.
  */
+@Immutable
 internal sealed interface TimelineRow {
     val key: String
 
-    class Item(val item: TimelineItem, override val key: String) : TimelineRow
+    data class Item(val item: TimelineItem, override val key: String) : TimelineRow
 
     data object Divider : TimelineRow {
         override val key = "divider"
@@ -57,7 +64,10 @@ internal fun searchKey(item: SearchItem): String = when (item) {
  * its own latest snapshot, which may be a little newer than [rows]: a hit
  * on an item not shown yet is left out, and the next search (each new
  * snapshot runs one) brings it in.
+ *
+ * Immutable: built once by [searchHits], its collections never changed.
  */
+@Immutable
 internal class SearchHits(val keys: List<String>, private val hits: Map<String, SearchHit>, private val rows: Map<String, Int>) {
     operator fun get(key: String): SearchHit? = hits[key]
 
@@ -89,7 +99,7 @@ internal fun searchHits(result: SearchResult?, rows: List<TimelineRow>): SearchH
  * [unreadFrom]. A key seen twice (which LazyColumn would refuse) falls back
  * to a positional one, so a malformed snapshot still renders.
  */
-internal fun timelineRows(timeline: List<TimelineItem>, unreadFrom: ULong?): List<TimelineRow> {
+internal fun timelineRows(timeline: List<TimelineItem>, unreadFrom: ULong?): ImmutableList<TimelineRow> {
     val rows = ArrayList<TimelineRow>(timeline.size + 1)
     val seen = HashSet<String>(timeline.size * 2)
     var divided = unreadFrom == null
@@ -101,7 +111,7 @@ internal fun timelineRows(timeline: List<TimelineItem>, unreadFrom: ULong?): Lis
         val key = timelineKey(item).takeIf { seen.add(it) } ?: "i:$index"
         rows += TimelineRow.Item(item, key)
     }
-    return rows
+    return rows.toImmutableList()
 }
 
 /**
@@ -130,6 +140,7 @@ internal fun gatedTool(timeline: List<TimelineItem>, prompt: ApprovalPrompt): To
         ?.let { ((it as TimelineItem.Logged).entry as? Entry.Tool)?.tool }
 
 /** What an approval asks to do, as the panel shows it. */
+@Immutable
 internal sealed interface ApprovalBody {
     /** A unified diff, e.g. an edit. */
     data class Diff(val text: String, val lines: UInt, val full: BlobView?) : ApprovalBody

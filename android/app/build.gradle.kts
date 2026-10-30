@@ -67,6 +67,8 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.kotlinx.coroutines.android)
+    // ImmutableList: composable parameters the Compose compiler can trust as stable.
+    implementation(libs.kotlinx.collections.immutable)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.tooling.preview)
