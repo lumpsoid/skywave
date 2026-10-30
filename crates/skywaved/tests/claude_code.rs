@@ -658,10 +658,56 @@ fn a_failed_turn_and_unknown_messages() {
 #[test]
 fn resume_handles_round_trip() {
     let id = Uuid::new_v4();
-    let handle = protocol::resume_handle(id);
+    let handle = protocol::resume_handle(id, &[]);
     assert_eq!(handle.0, json!({ "session_id": id.to_string() }));
-    assert_eq!(protocol::parse_resume_handle(&handle), Ok(id));
+    assert_eq!(protocol::parse_resume_handle(&handle), Ok((id, Vec::new())));
+    let rules = [json!({"type":"setMode","mode":"acceptEdits","destination":"session"})];
+    let handle = protocol::resume_handle(id, &rules);
+    assert_eq!(
+        handle.0,
+        json!({ "session_id": id.to_string(), "rules": rules })
+    );
+    assert_eq!(
+        protocol::parse_resume_handle(&handle),
+        Ok((id, rules.to_vec()))
+    );
     assert!(protocol::parse_resume_handle(&ResumeHandle(json!({ "other": 1 }))).is_err());
+}
+
+#[test]
+fn a_granted_session_rule_is_added_to_the_resume_handle() {
+    let requests = permission_requests("permissions");
+    // Request #1 offers a project rule (0), then session ones (1, 2).
+    let request = &requests[1];
+    let request_id = AgentRequestId::from(request["request_id"].as_str().unwrap());
+    let line = serde_json::to_string(request).unwrap();
+    let offered = &request["request"]["permission_suggestions"];
+    let id = Uuid::new_v4();
+    let earlier = json!({"type":"addDirectories","directories":["/srv"],"destination":"session"});
+
+    // A project rule is kept by the CLI's settings: no new handle.
+    let mut protocol = Protocol::new(id, true).with_session_rules(vec![earlier.clone()]);
+    protocol.on_line(&line);
+    let out = protocol.answer(&request_id, Decision::Approve, Some(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+
+    // A session rule joins the ones the process was started with.
+    let mut protocol = Protocol::new(id, true).with_session_rules(vec![earlier.clone()]);
+    protocol.on_line(&line);
+    let out = protocol.answer(&request_id, Decision::Approve, Some(2));
+    assert_eq!(
+        out.events,
+        [AdapterEvent::ResumeHandle(protocol::resume_handle(
+            id,
+            &[earlier, offered[2].clone()]
+        ))]
+    );
+
+    // A denial grants nothing.
+    let mut protocol = Protocol::new(id, true);
+    protocol.on_line(&line);
+    let out = protocol.answer(&request_id, Decision::Deny, Some(2));
+    assert!(out.events.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -773,7 +819,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     let AdapterEvent::ResumeHandle(handle) = next(&mut events).await else {
         panic!("expected the resume handle first");
     };
-    let id = protocol::parse_resume_handle(&handle).unwrap();
+    let (id, _) = protocol::parse_resume_handle(&handle).unwrap();
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
     expected.extend(["--session-id".to_owned(), id.to_string()]);
     expected.extend(["--model".to_owned(), "haiku".to_owned()]);
@@ -889,18 +935,34 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
 }
 
 #[tokio::test]
-async fn a_restart_resumes_with_the_handle() {
+async fn a_restart_resumes_with_the_handle_and_its_session_rules() {
     let tmp = tempfile::tempdir().unwrap();
     let id = Uuid::new_v4();
-    let handle = protocol::resume_handle(id);
+    let rules = [
+        json!({"type":"setMode","mode":"acceptEdits","destination":"session"}),
+        json!({"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo test"}],
+               "behavior":"allow","destination":"session"}),
+    ];
+    let handle = protocol::resume_handle(id, &rules);
     let (mut session, mut events) = adapter()
         .start(spec(tmp.path(), Some(handle)))
         .await
         .unwrap();
-    let args = argv(tmp.path());
-    let at = args.iter().position(|a| a == "--resume").unwrap();
-    assert_eq!(args[at + 1], id.to_string());
-    assert!(!args.contains(&"--session-id".to_owned()));
+    let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+    expected.extend(
+        [
+            "--permission-mode",
+            "acceptEdits",
+            "--allowedTools",
+            "Bash(cargo test)",
+            "--resume",
+            &id.to_string(),
+            "--model",
+            "haiku",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(argv(tmp.path()), expected);
 
     // No new handle: the first event is the turn.
     session
@@ -921,7 +983,7 @@ async fn a_restart_resumes_with_the_handle() {
 #[tokio::test]
 async fn resuming_an_unknown_session_is_a_resume_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let handle = protocol::resume_handle(Uuid::nil());
+    let handle = protocol::resume_handle(Uuid::nil(), &[]);
     let error = adapter()
         .start(spec(tmp.path(), Some(handle)))
         .await
