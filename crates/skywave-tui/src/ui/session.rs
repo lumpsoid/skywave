@@ -17,7 +17,7 @@ use skywave_core::{
 
 use super::timeline::{
     approval_state, bytes, delivery_label, detail_lines, glyph, head_lines, item_lines,
-    preview_lines, title_spans, wall_ms,
+    preview_lines, rule_index, title_spans, wall_ms,
 };
 use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
 use crate::app::{App, Focus, Geometry, SessionUi};
@@ -68,8 +68,10 @@ pub(super) fn render(
     ])
     .areas(inner);
 
-    frame.render_widget(Paragraph::new(status_line(session, ui)), status);
+    // The timeline first: the status line reads the scroll state its
+    // layout settles.
     render_timeline(frame, timeline, session, ui, wall);
+    frame.render_widget(Paragraph::new(status_line(session, ui)), status);
     if let Some(lines) = approval {
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Approval needed ").yellow()),
@@ -98,7 +100,7 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
         spans.push(Span::raw(" · stop ").dark_gray());
         spans.push(Span::styled(outgoing_label(stop), outgoing_badge(stop).1));
     }
-    if ui.scroll.is_some() {
+    if ui.shown_scroll().is_some() {
         spans.push(Span::raw(" · scrolled back, End follows").dark_gray());
     }
     Line::from(spans)
@@ -119,14 +121,23 @@ fn render_timeline(
         starts.push(total);
         total += lines.len();
     }
+    let rule = rule_index(session).and_then(|index| starts.get(index).copied());
     let mut geometry = Geometry {
         keys: session.timeline.iter().map(ItemKey::of).collect(),
         starts,
         total,
         height: area.height as usize,
         top: ui.geometry.borrow().top,
+        rule,
     };
-    let top = geometry.top(ui.scroll);
+    // While the opening is not settled, show the scroll state it will
+    // settle on, from this frame's layout.
+    let scroll = if ui.opening {
+        geometry.opening()
+    } else {
+        ui.scroll
+    };
+    let top = geometry.top(scroll);
     geometry.top = top;
 
     if items.is_empty() {

@@ -1,7 +1,7 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
 use crate::store::BlobPolicy;
-use crate::view::{ApprovalId, BlobId, CommandId, Decision, SessionId};
+use crate::view::{ApprovalId, BlobId, CommandId, Decision, Seq, SessionId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -49,6 +49,15 @@ pub enum Action {
         session_id: SessionId,
     },
     OpenSession(SessionId),
+    /// The user has seen the open session through `through`: its newest
+    /// item was on screen. Only ever moves forward, never past the session's
+    /// newest event, and only for the open session. Heads mark sparingly
+    /// (every mark is a durable write) and never move the session view's
+    /// `unread_from` with it.
+    MarkRead {
+        session_id: SessionId,
+        through: Seq,
+    },
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     SetBlobPolicy(BlobPolicy),

@@ -22,7 +22,7 @@ use skywave_proto::{
     SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
-use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri};
+use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
 use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
 
@@ -1519,6 +1519,149 @@ fn drafts_survive_leaving_the_session() {
     assert!(!line_with(&h.screen(), "/srv/work").contains("draft"));
     h.key(KeyCode::Enter);
     assert_eq!(h.app.composer().unwrap().text(), "");
+}
+
+// ---- unread -------------------------------------------------------------------
+
+/// Draws a frame, then makes the read mark the event loop makes after it,
+/// `after` the harness's start.
+fn look(h: &mut Harness, after: Duration) -> String {
+    let screen = h.screen();
+    skywave_tui::mark_read(&mut h.app, &h.core, h.t0 + after, false);
+    h.sync();
+    screen
+}
+
+/// Back to the session list from the composer.
+fn leave(h: &mut Harness) {
+    h.key(KeyCode::Esc);
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+}
+
+fn agent_messages(id: SessionId, prefix: &str, n: u32) -> Vec<Event> {
+    (0..n)
+        .map(|i| event(id, 1, agent(&format!("{prefix} {i:02}"))))
+        .collect()
+}
+
+#[test]
+fn unread_badge_clears_after_reaching_the_end() {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    let other = DeviceId::new();
+    let mut events = vec![created(id, 0, "/srv/work"), event(id, 1, user(other, "go"))];
+    events.extend(agent_messages(id, "news", 40));
+    pull(&mut h, events);
+    // Another device's message is not news; the agent's 40 are.
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "● 40");
+
+    // Opened at the rule; nothing is read while scrolled back, not even
+    // by leaving.
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    assert_contains(&look(&mut h, Duration::ZERO), "scrolled back");
+    leave(&mut h);
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "● 40");
+
+    // `End` follows the newest item: read.
+    h.key(KeyCode::Enter);
+    look(&mut h, Duration::ZERO);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::End);
+    let screen = look(&mut h, Duration::ZERO);
+    assert_contains(&screen, "news 39");
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+    assert!(!line_with(&h.screen(), "/srv/work").contains('●'));
+
+    // Survives a restart: the mark is stored.
+    let h = h.restart();
+    assert!(!line_with(&h.screen(), "/srv/work").contains('●'));
+}
+
+#[test]
+fn new_divider_marks_first_unseen_event() {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, agent("seen"))]);
+    // Following: the first mark is made at once.
+    assert!(!look(&mut h, Duration::ZERO).contains("── new"));
+    leave(&mut h);
+    assert!(!line_with(&h.screen(), "/srv/work").contains('●'));
+
+    let other = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            event(id, 2, user(other, "from the phone")),
+            event(id, 3, agent("answer")),
+        ],
+    );
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "● 1");
+
+    // The rule sits above the first unseen event; short news follows.
+    h.key(KeyCode::Enter);
+    let screen = look(&mut h, Duration::ZERO);
+    let lines: Vec<&str> = screen.lines().collect();
+    let row = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
+    let rule = row("── new ──");
+    assert!(
+        row("seen") < rule && rule < row("from the phone"),
+        "{screen}"
+    );
+    assert!(!screen.contains("scrolled back"));
+
+    // More news while following stays below the rule; marks are spaced
+    // out but come.
+    pull(&mut h, vec![event(id, 4, agent("more"))]);
+    let t1 = h.t0 + READ_MARK_EVERY / 2;
+    assert_eq!(h.app.read_mark_due_in(t1), Some(READ_MARK_EVERY / 2));
+    let screen = look(&mut h, READ_MARK_EVERY / 2);
+    assert_eq!(line_with(&screen, "── new ──"), lines[rule]);
+    assert_eq!(h.app.read_mark_due_in(t1), Some(READ_MARK_EVERY / 2));
+    look(&mut h, READ_MARK_EVERY);
+    assert_eq!(h.app.read_mark_due_in(h.t0 + READ_MARK_EVERY), None);
+
+    // A last batch is marked on leaving, without waiting.
+    pull(&mut h, vec![event(id, 5, agent("last"))]);
+    h.screen();
+    leave(&mut h);
+    assert!(!line_with(&h.screen(), "/srv/work").contains('●'));
+    // Gone once everything was read.
+    h.key(KeyCode::Enter);
+    assert!(!h.screen().contains("── new"));
+}
+
+#[test]
+fn opening_pins_to_divider_when_unread_is_long() {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, agent_messages(id, "old", 3));
+    look(&mut h, Duration::ZERO);
+    leave(&mut h);
+    pull(&mut h, agent_messages(id, "new", 40));
+
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    // The rule is the timeline's first line, the newest item off screen.
+    let lines: Vec<&str> = screen.lines().collect();
+    let rule = lines.iter().position(|l| l.contains("── new ──")).unwrap();
+    assert!(lines[rule + 1].contains("new 00"), "{screen}");
+    assert!(!screen.contains("old 02"));
+    assert!(!screen.contains("new 39"));
+    assert_contains(&screen, "scrolled back, End follows");
+    // Settled into a real scroll position: not following, nothing read.
+    look(&mut h, Duration::ZERO);
+    assert_eq!(h.screen(), screen);
+    assert_eq!(h.app.read_mark_due_in(h.t0), None);
+
+    // Keys move from there.
+    h.key(KeyCode::PageUp);
+    assert_contains(&h.screen(), "old 02");
+    leave(&mut h);
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "● 40");
 }
 
 #[test]

@@ -15,10 +15,10 @@ use skywave_proto::{
 };
 
 use crate::action::{Action, Route};
-use crate::projection::{SessionSummary, blob_refs};
+use crate::projection::{SessionSummary, blob_refs, is_notable};
 use crate::seam::Request;
 use crate::store::{
-    BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, Settings, Snapshot,
+    BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyView,
@@ -37,6 +37,7 @@ pub(crate) enum Effect {
     SaveBlobPolicy(BlobPolicy),
     /// Keep the session's draft; `None` deletes it.
     SaveDraft(SessionId, Option<Draft>),
+    SaveReadMark(SessionId, ReadMark),
     /// Take the command out of the outbox and, if given, keep the draft, as
     /// one write: the text is never lost nor kept twice.
     Withdraw {
@@ -71,6 +72,9 @@ impl From<Route> for Place {
 struct OpenSession {
     id: SessionId,
     events: Vec<(Seq, Event)>,
+    /// The first event after the read mark as it was when the session
+    /// opened, if agent output follows it. Marking read leaves it alone.
+    unread_from: Option<Seq>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +95,8 @@ pub(crate) struct Model {
     /// Bumped whenever the model itself rewrites a draft, so heads know to
     /// replace the text they hold; never goes back, not even on reload.
     draft_rev: u64,
+    /// How far this device has read each session, as stored.
+    read_marks: HashMap<SessionId, ReadMark>,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
 }
@@ -111,6 +117,7 @@ impl Model {
             blobs: BTreeMap::new(),
             drafts: HashMap::new(),
             draft_rev: 0,
+            read_marks: HashMap::new(),
             open: None,
         };
         model.reload(snapshot);
@@ -126,6 +133,7 @@ impl Model {
         self.outbox = snapshot.outbox;
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
         self.drafts = snapshot.drafts;
+        self.read_marks = snapshot.read_marks;
         self.open = None;
     }
 
@@ -202,6 +210,10 @@ impl Model {
                 self.open = None;
                 vec![Effect::LoadSession(id)]
             }
+            Action::MarkRead {
+                session_id,
+                through,
+            } => self.mark_read(session_id, through),
             Action::DownloadBlob(id) => match self.blobs.get(&id) {
                 Some(blob) if !matches!(blob.status, BlobStatus::Available { .. }) => {
                     vec![Effect::Request(Request::DownloadBlob(id))]
@@ -300,6 +312,39 @@ impl Model {
         vec![Effect::SaveDraft(session_id, draft)]
     }
 
+    /// Marks the open session read through `through`, clamped to its newest
+    /// event; the notable count at that point comes from its loaded events.
+    /// Nothing to write for another session or a mark that would not move
+    /// forward.
+    fn mark_read(&mut self, session_id: SessionId, through: Seq) -> Vec<Effect> {
+        let (Some(open), Some(summary)) = (
+            self.open.as_ref().filter(|o| o.id == session_id),
+            self.summary(session_id),
+        ) else {
+            return Vec::new();
+        };
+        let through = through.min(summary.last_seq);
+        let read = self
+            .read_marks
+            .get(&session_id)
+            .map_or(Seq::ZERO, |m| m.seq);
+        if through <= read {
+            return Vec::new();
+        }
+        let notable = open
+            .events
+            .iter()
+            .take_while(|(seq, _)| *seq <= through)
+            .filter(|(_, event)| is_notable(&event.kind))
+            .count() as u64;
+        let mark = ReadMark {
+            seq: through,
+            notable,
+        };
+        self.read_marks.insert(session_id, mark);
+        vec![Effect::SaveReadMark(session_id, mark)]
+    }
+
     /// Takes back a [`discardable`](OutboxEntry::discardable) command; with
     /// `edit`, a message goes back into its session's draft, ahead of what
     /// the draft held, the cursor after the message. The state lock is the
@@ -381,7 +426,15 @@ impl Model {
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
         if self.place == Place::Session(id) {
-            self.open = Some(OpenSession { id, events });
+            let read = self.read_marks.get(&id).map_or(Seq::ZERO, |m| m.seq);
+            let mut unseen = events.iter().filter(|(seq, _)| *seq > read);
+            let first = unseen.clone().next().map(|(seq, _)| *seq);
+            let unread_from = first.filter(|_| unseen.any(|(_, e)| is_notable(&e.kind)));
+            self.open = Some(OpenSession {
+                id,
+                events,
+                unread_from,
+            });
         }
     }
 
@@ -489,6 +542,10 @@ impl Model {
                 pending_approvals: s.pending_approvals.len(),
                 last_activity: s.last_activity,
                 has_draft: self.drafts.contains_key(&s.id),
+                unread: match self.read_marks.get(&s.id) {
+                    Some(mark) => s.notable.saturating_sub(mark.notable),
+                    None => s.notable,
+                },
             })
             .collect();
         let creating = self
@@ -512,10 +569,8 @@ impl Model {
 
     fn session_view(&self, id: SessionId) -> Option<SessionView> {
         let summary = self.summary(id)?;
-        let events = match &self.open {
-            Some(open) if open.id == id => open.events.as_slice(),
-            _ => &[],
-        };
+        let open = self.open.as_ref().filter(|open| open.id == id);
+        let events = open.map_or(&[][..], |open| open.events.as_slice());
         let pending_approval = summary.pending_approval().and_then(|approval| {
             events.iter().find_map(|(_, event)| match &event.kind {
                 EventKind::ApprovalRequested {
@@ -551,6 +606,8 @@ impl Model {
             stop,
             draft: self.drafts.get(&id).cloned(),
             draft_rev: self.draft_rev,
+            last_seq: summary.last_seq,
+            unread_from: open.and_then(|open| open.unread_from),
         })
     }
 
@@ -973,6 +1030,7 @@ mod tests {
             blobs: Vec::new(),
             settings: Settings::default(),
             drafts: HashMap::new(),
+            read_marks: HashMap::new(),
         }
     }
 
@@ -2280,5 +2338,140 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn agent(text: &str) -> EventKind {
+        EventKind::AgentMessage { text: text.into() }
+    }
+
+    fn unread(f: &Fixture, id: SessionId) -> u64 {
+        f.list_view()
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.unread)
+            .expect("listed")
+    }
+
+    fn mark_read(id: SessionId, through: u64) -> Action {
+        Action::MarkRead {
+            session_id: id,
+            through: Seq(through),
+        }
+    }
+
+    #[test]
+    fn mark_read_is_monotonic_and_only_for_open_session() {
+        let mut f = Fixture::paired();
+        let (a, b) = (f.session("/srv/a"), f.session("/srv/b"));
+        f.log(a, vec![agent("one"), agent("two")]);
+        f.log(b, vec![agent("elsewhere")]);
+        assert_eq!((unread(&f, a), unread(&f, b)), (2, 1));
+
+        // Not open: nothing to mark.
+        assert!(f.dispatch(mark_read(a, 4)).is_empty());
+        f.open(a);
+        assert!(f.dispatch(mark_read(b, 5)).is_empty(), "not the open one");
+
+        // Through seq 3 (`a` created, `b` created, "one"): one notable event.
+        let mark = |seq, notable| ReadMark {
+            seq: Seq(seq),
+            notable,
+        };
+        assert_eq!(
+            f.dispatch(mark_read(a, 3)),
+            vec![Effect::SaveReadMark(a, mark(3, 1))]
+        );
+        assert!(f.dispatch(mark_read(a, 3)).is_empty(), "no step back");
+        assert!(f.dispatch(mark_read(a, 2)).is_empty(), "no step back");
+        // Clamped to the session's newest event, seq 4.
+        assert_eq!(
+            f.dispatch(mark_read(a, 99)),
+            vec![Effect::SaveReadMark(a, mark(4, 2))]
+        );
+        assert!(f.dispatch(mark_read(a, 100)).is_empty());
+
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!((unread(&f, a), unread(&f, b)), (0, 1));
+        assert!(f.dispatch(mark_read(a, 4)).is_empty(), "closed");
+        f.log(a, vec![agent("three")]);
+        assert_eq!(unread(&f, a), 1);
+    }
+
+    #[test]
+    fn own_messages_never_count_as_unread() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let me = f.me;
+        let message = |device_id| EventKind::UserMessage {
+            command_id: CommandId::new(),
+            device_id,
+            text: "hi".into(),
+        };
+        f.log(
+            sid,
+            vec![
+                message(me),
+                message(DeviceId::new()),
+                tool_call(None, ToolKind::Shell, "ls"),
+                tool_result(None, false, "ok"),
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        assert_eq!(unread(&f, sid), 0);
+        f.open(sid);
+        assert_eq!(f.session_view().unread_from, None, "nothing new to show");
+
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::Errored {
+                message: "boom".into(),
+            })],
+        );
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(unread(&f, sid), 1, "an error is news");
+    }
+
+    #[test]
+    fn divider_stays_put_while_marking_read() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(sid, vec![agent("seen")]);
+        f.open(sid);
+        assert_eq!(f.session_view().unread_from, Some(Seq(1)), "never read");
+        f.dispatch(mark_read(sid, 2));
+        f.dispatch(Action::Navigate(Route::SessionList));
+
+        // Away: another device's message, then the agent's answer.
+        f.log(
+            sid,
+            vec![
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: DeviceId::new(),
+                    text: "go on".into(),
+                },
+                agent("done"),
+            ],
+        );
+        f.open(sid);
+        let view = f.session_view();
+        assert_eq!(view.unread_from, Some(Seq(3)), "the first unseen event");
+        assert_eq!(view.last_seq, Seq(4));
+
+        f.dispatch(mark_read(sid, 4));
+        f.log(sid, vec![agent("more")]);
+        f.dispatch(mark_read(sid, 5));
+        assert_eq!(
+            f.session_view().unread_from,
+            Some(Seq(3)),
+            "fixed while open"
+        );
+
+        // Reopened with everything read: no divider.
+        f.dispatch(Action::Navigate(Route::SessionList));
+        f.open(sid);
+        assert_eq!(f.session_view().unread_from, None);
     }
 }
