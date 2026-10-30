@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Approval notifications -->
+    <string name="notif_channel_approvals">Approvals</string>
+    <string name="notif_channel_approvals_description">An agent is waiting for you to approve a tool call</string>
+    <string name="notif_approval_title">Approval needed</string>
+    <string name="notif_untitled_session">A session</string>
+</resources>
