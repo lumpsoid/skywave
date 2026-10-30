@@ -5,16 +5,22 @@ import android.net.ConnectivityManager
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
 import dev.skywave.android.core.CoreLifecycleObserver
 import dev.skywave.android.core.CoreStartup
 import dev.skywave.android.core.NetworkWatcher
 import dev.skywave.android.core.startCore
+import dev.skywave.android.notifications.AndroidNotifications
+import dev.skywave.android.notifications.ApprovalNotifier
 import dev.skywave.core.SkywaveCore
+import dev.skywave.core.ViewState
 import dev.skywave.core.initLogging
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -33,8 +39,12 @@ class SkywaveApp : Application() {
      */
     val core: CoreStartup by lazy { openCore() }
 
+    /** The approval notifications' shade; usable before the core opens (A15). */
+    private val notifications: AndroidNotifications by lazy { AndroidNotifications(this, MainActivity::class.java) }
+
     override fun onCreate() {
         super.onCreate()
+        notifications.createChannel()
         // Registered before any activity starts, so the first ON_START is seen.
         ProcessLifecycleOwner.get().lifecycle.addObserver(
             CoreLifecycleObserver { (core as? CoreStartup.Ready)?.repository },
@@ -56,11 +66,26 @@ class SkywaveApp : Application() {
             dispatchContext = Dispatchers.IO,
         )
         when (startup) {
-            is CoreStartup.Ready ->
+            is CoreStartup.Ready -> {
                 NetworkWatcher(startup.repository).register(getSystemService(ConnectivityManager::class.java))
+                followApprovals(startup.repository.state)
+            }
             is CoreStartup.Failed -> Log.e(TAG, "core failed to open: ${startup.reason}")
         }
         return startup
+    }
+
+    /**
+     * Posts approval notifications for as long as the process lives. The
+     * first snapshot (the replica as stored) is fed here, synchronously, so
+     * it is the notifier's baseline whatever the collector sees first.
+     */
+    private fun followApprovals(state: StateFlow<ViewState>) {
+        val notifier = ApprovalNotifier(notifications) {
+            ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        }
+        notifier.onView(state.value)
+        appScope.launch(Dispatchers.Main) { notifier.follow(state) }
     }
 
     /**
