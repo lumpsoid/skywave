@@ -118,7 +118,7 @@ pub enum Route {
     Pairing,
 }
 
-fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, SkywaveError> {
+pub(crate) fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, SkywaveError> {
     match Uuid::parse_str(&input) {
         Ok(uuid) => Ok(T::from(uuid)),
         Err(_) => Err(SkywaveError::InvalidId {

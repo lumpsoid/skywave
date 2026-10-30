@@ -7,6 +7,7 @@ import dev.skywave.core.PairingStatus
 import dev.skywave.core.PairingView
 import dev.skywave.core.Screen
 import dev.skywave.core.SkywaveCoreInterface
+import dev.skywave.core.TimelineSearch
 import dev.skywave.core.SkywaveException
 import dev.skywave.core.ViewListener
 import dev.skywave.core.ViewState
@@ -71,6 +72,7 @@ private class FakeCore(initial: ViewState) : SkywaveCoreInterface {
         shutdowns++
     }
     override fun unsubscribe(id: ULong) = Unit
+    override fun startSearch(sessionId: String): TimelineSearch = throw UnsupportedOperationException("native")
 }
 
 @OptIn(ExperimentalCoroutinesApi::class) // runCurrent

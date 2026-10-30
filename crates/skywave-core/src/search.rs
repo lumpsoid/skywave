@@ -11,7 +11,11 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::blobs::read_head;
 use crate::view::{BlobId, BlobState, BlobView, Entry, TimelineItem, ToolOutcome};
+
+/// Most of a downloaded blob a search reads: the head of a longer one.
+pub const HEAD_BYTES: u64 = 1024 * 1024;
 
 /// What is searched for. Smart case: case is ignored unless the query has
 /// an upper-case letter. An empty query matches nothing.
@@ -116,6 +120,22 @@ pub struct BlobText {
     pub text: Arc<str>,
     /// The content goes on past `text`: only its head was searched.
     pub cut: bool,
+}
+
+impl BlobText {
+    /// A downloaded blob's head as a search reads it, at most
+    /// [`HEAD_BYTES`]; `None` if it is not downloaded or its file cannot be
+    /// read.
+    pub fn read(blob: &BlobView) -> Option<BlobText> {
+        let BlobState::Available { path } = &blob.state else {
+            return None;
+        };
+        let (text, size) = read_head(path, HEAD_BYTES).ok()?;
+        Some(BlobText {
+            text: text.into(),
+            cut: size > HEAD_BYTES,
+        })
+    }
 }
 
 /// A line of a blob's content where a query matches.
@@ -524,6 +544,27 @@ mod tests {
         // An unreadable blob is skipped.
         let found = find(&timeline, &Query::new("warning"), &mut |_| None);
         assert!(found.hits.is_empty());
+    }
+
+    #[test]
+    fn a_blob_is_read_up_to_its_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, "x".repeat(HEAD_BYTES as usize + 1)).unwrap();
+        let text = BlobText::read(&blob(BlobState::Available { path: path.clone() })).unwrap();
+        assert_eq!((text.text.len() as u64, text.cut), (HEAD_BYTES, true));
+        std::fs::write(&path, "short").unwrap();
+        let text = BlobText::read(&blob(BlobState::Available { path })).unwrap();
+        assert_eq!((&*text.text, text.cut), ("short", false));
+        let gone = dir.path().join("gone");
+        assert_eq!(
+            BlobText::read(&blob(BlobState::Available { path: gone })),
+            None
+        );
+        assert_eq!(
+            BlobText::read(&blob(BlobState::NotDownloaded { size: 5 })),
+            None
+        );
     }
 
     #[test]
