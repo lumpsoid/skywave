@@ -2,11 +2,11 @@
 //! where turns start, and what content an item shows beneath its title,
 //! with the blobs behind it. Keys ([`app`](crate::app)) and rendering
 //! ([`ui`](crate::ui)) both go through here, so what Enter opens is what the
-//! screen shows.
+//! screen shows, and what `y` copies is what it shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, CommandId, Delivery, Entry, Outgoing, Query, Seq, SessionView,
-    TimelineItem, ToolKind, ToolOutcome, ToolView,
+    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, Outgoing, Query, Seq,
+    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -295,4 +295,97 @@ pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
         .into_iter()
         .filter_map(|s| s.blob)
         .find(|blob| !matches!(blob.state, BlobState::Available { .. }))
+}
+
+/// What `y` or `Y` copies from an item: text at hand, or a blob's whole
+/// content, never the preview of one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Content {
+    Text(String),
+    /// With `strip` dropped from the content's start if it begins with it.
+    Blob {
+        blob: BlobView,
+        strip: Option<&'static str>,
+    },
+}
+
+impl Content {
+    fn of(section: &Section) -> Content {
+        match section.blob {
+            Some(blob) => Content::Blob {
+                blob: blob.clone(),
+                strip: None,
+            },
+            None => Content::Text(section.text.to_owned()),
+        }
+    }
+}
+
+/// What a shell call's title, and so its body, starts with (see
+/// `ToolDisplay::title`); a copied command goes without it.
+const PROMPT: &str = "$ ";
+
+/// A message's text, logged or pending.
+fn message(item: &TimelineItem) -> Option<&str> {
+    match item {
+        TimelineItem::Pending { text, .. }
+        | TimelineItem::Logged {
+            entry: Entry::UserMessage { text, .. } | Entry::AgentMessage { text },
+            ..
+        } => Some(text),
+        _ => None,
+    }
+}
+
+/// What `y` copies: a message's text; else the last section shown while
+/// collapsed: a call's output, the diff or file an edit or write shows in
+/// its stead, its body while no result is here; else the call, as
+/// [`call_content`].
+pub fn main_content(item: &TimelineItem) -> Option<Content> {
+    if let Some(text) = message(item) {
+        return Some(Content::Text(text.to_owned()));
+    }
+    let TimelineItem::Logged { entry, .. } = item else {
+        return None;
+    };
+    sections(entry)
+        .iter()
+        .rev()
+        .find(|s| !s.hidden)
+        .map(Content::of)
+        .or_else(|| call_content(item))
+}
+
+/// What `Y` copies: the call. A shell call's whole command (its body when
+/// it has one, else its title) without the `$ ` prompt; title and detail
+/// of any other call; a message's text.
+pub fn call_content(item: &TimelineItem) -> Option<Content> {
+    if let Some(text) = message(item) {
+        return Some(Content::Text(text.to_owned()));
+    }
+    let TimelineItem::Logged { entry, .. } = item else {
+        return None;
+    };
+    let unprompted = |text: &str| text.strip_prefix(PROMPT).unwrap_or(text).to_owned();
+    match entry {
+        // Decided on the kind, never the tool's name (D3).
+        Entry::Tool(view) if view.kind == ToolKind::Shell => Some(match &view.body {
+            Some(BodyView {
+                full: Some(blob), ..
+            }) => Content::Blob {
+                blob: blob.clone(),
+                strip: Some(PROMPT),
+            },
+            Some(body) => Content::Text(unprompted(&body.preview)),
+            None => Content::Text(unprompted(&view.title)),
+        }),
+        Entry::Tool(view) => Some(Content::Text(match &view.detail {
+            Some(detail) => format!("{}\n{detail}", view.title),
+            None => view.title.clone(),
+        })),
+        Entry::ToolCall { summary, .. }
+        | Entry::Approval { summary, .. }
+        | Entry::ToolResult { summary, .. } => Some(Content::Text(summary.clone())),
+        _ => None,
+    }
 }

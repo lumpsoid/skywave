@@ -206,6 +206,9 @@ pub struct ToolCall {
 pub struct ToolDisplay {
     pub kind: ToolKind,
     /// One line, at most [`limits::TITLE_MAX_CHARS`], e.g. a path or command.
+    /// A [`ToolKind::Shell`] title is the command after a `$ ` prompt, e.g.
+    /// `$ cargo test`, and so is the body standing in for a cut one; heads
+    /// copying the command drop the prompt.
     pub title: String,
     /// Optional second line, at most [`limits::DETAIL_MAX_CHARS`].
     pub detail: Option<String>,

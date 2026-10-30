@@ -15,11 +15,13 @@ use skywave_core::{
     SessionView, TimelineItem, ToolOutcome, ViewState,
 };
 
+use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
 use crate::timeline::{
-    ItemKey, delivery, discardable, find, gated_item, match_hidden, sections, selectable,
-    starts_turn, wanted_blob,
+    Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
+    match_hidden, sections, selectable, starts_turn, wanted_blob,
 };
+use crate::ui::bytes;
 
 /// How old the first unsaved composer edit gets before the draft is saved
 /// anyway: at most this much typing is lost to a crash. Saves are durable
@@ -552,6 +554,12 @@ pub struct UiState {
     pub link_since: Instant,
     /// The last failed dispatch, shown in the footer until the next key.
     pub error: Option<String>,
+    /// What happened to the last key's request, e.g. a copy; shown in the
+    /// footer until the next key.
+    pub notice: Option<String>,
+    /// A copy to the terminal's clipboard, for the event loop to send
+    /// ([`App::take_copy`]).
+    pub copy: Option<Clip>,
     pub quit: bool,
 }
 
@@ -575,6 +583,8 @@ impl App {
                 revoked_dismissed: false,
                 link_since: now,
                 error: None,
+                notice: None,
+                copy: None,
                 quit: false,
             },
         };
@@ -709,7 +719,73 @@ impl App {
                 session.composer.clear();
             }
         }
+        if result.is_err() {
+            self.ui.notice = None;
+        }
         self.ui.error = result.err().map(|err| err.to_string());
+    }
+
+    /// The copy [`App::on_key`] asked for; report the outcome of sending it
+    /// with [`App::copied`].
+    pub fn take_copy(&mut self) -> Option<Clip> {
+        self.ui.copy.take()
+    }
+
+    /// Records the outcome of sending a [`App::take_copy`] copy: how many
+    /// bytes went to the terminal, or why none did.
+    pub fn copied(&mut self, result: Result<usize, CopyError>) {
+        match result {
+            Ok(n) => {
+                self.ui.notice = Some(format!(
+                    "copied {} · sent to terminal clipboard",
+                    bytes(n as u64)
+                ));
+            }
+            Err(CopyError::TooLarge { size, max, file }) => {
+                let file = file
+                    .map(|path| format!(" · file: {}", path.display()))
+                    .unwrap_or_default();
+                self.ui.notice = Some(format!(
+                    "too large for the terminal clipboard ({} > {}){file}",
+                    bytes(size),
+                    bytes(max as u64)
+                ));
+            }
+            Err(CopyError::Read { file, error }) => {
+                self.ui.notice = None;
+                self.ui.error = Some(format!("copy: cannot read {}: {error}", file.display()));
+            }
+            Err(CopyError::Write(error)) => {
+                self.ui.notice = None;
+                self.ui.error = Some(format!("copy: {error}"));
+            }
+        }
+    }
+
+    /// Asks for `content` to be copied: text or a downloaded blob go to
+    /// [`UiState::copy`]; a blob not here yet is downloaded first (never
+    /// just its preview), and the notice says to press `key` again.
+    fn copy(&mut self, key: char, content: Option<Content>) -> Option<Action> {
+        let (blob, strip) = match content? {
+            Content::Text(text) => {
+                self.ui.copy = Some(Clip::Text(text));
+                return None;
+            }
+            Content::Blob { blob, strip } => (blob, strip),
+        };
+        let (size, action) = match blob.state {
+            BlobState::Available { path } => {
+                self.ui.copy = Some(Clip::File { path, strip });
+                return None;
+            }
+            BlobState::NotDownloaded { size } => (size, Some(Action::DownloadBlob(blob.id))),
+            BlobState::Downloading { size, .. } => (size, None),
+        };
+        self.ui.notice = Some(format!(
+            "downloading {} · press {key} again when it is here",
+            bytes(size)
+        ));
+        action
     }
 
     /// Saves the open session's draft when it has unsaved edits: always if
@@ -903,6 +979,7 @@ impl App {
             return None;
         }
         self.ui.error = None;
+        self.ui.notice = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.ui.quit = true;
@@ -1181,6 +1258,16 @@ impl App {
                     .and_then(wanted_blob)
                     .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
                     .map(|blob| Action::DownloadBlob(blob.id)),
+                KeyCode::Char(c @ ('y' | 'Y')) => {
+                    let item = session.selected.and_then(|key| find(view, key));
+                    let item = item.map(|index| &view.timeline[index]);
+                    let content = if c == 'y' {
+                        item.and_then(main_content)
+                    } else {
+                        item.and_then(call_content)
+                    };
+                    self.copy(c, content)
+                }
                 // Only what the core marks discardable; anything else (it
                 // may have reached the server) is left alone.
                 KeyCode::Char('e') => {
