@@ -26,7 +26,35 @@ pub struct ViewState {
     /// Own commands persisted locally and not yet answered by the server
     /// ("offline · N queued").
     pub queued: usize,
+    /// Approvals waiting for an answer; present on every screen.
+    pub attention: Attention,
     pub screen: Screen,
+}
+
+/// Approvals some agent is blocked on (D8), so a head can point at them
+/// from any screen and alert the user to new ones.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Attention {
+    /// Every approval pending in the replica that this device has not
+    /// answered (a refused answer counts as unanswered), oldest first.
+    pub approvals: Vec<PendingApprovalRef>,
+    /// How many of `approvals` are outside the open session.
+    pub elsewhere: usize,
+    /// Bumped once whenever new approvals came in while online: never for
+    /// those already pending at start, arriving during a catch-up and
+    /// resolved before its end, or answered from this device. Heads alert
+    /// when it grows; it never goes back.
+    pub alerts: u64,
+}
+
+/// One pending approval, and which session waits on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalRef {
+    pub id: ApprovalId,
+    pub session_id: SessionId,
+    /// The session's [title](crate::SessionSummary::title). Text from the
+    /// server: heads sanitise it before writing it anywhere raw.
+    pub title: String,
 }
 
 /// State of the connection to the server.

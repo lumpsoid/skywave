@@ -46,8 +46,13 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
     let view = app.view();
     let link_age = now.saturating_duration_since(app.ui().link_since);
     frame.render_widget(
-        Paragraph::new(banner_text(&view.link, view.queued, link_age))
-            .style(banner_style(&view.link)),
+        Paragraph::new(banner_text(
+            &view.link,
+            view.queued,
+            view.attention.elsewhere,
+            link_age,
+        ))
+        .style(banner_style(&view.link)),
         banner,
     );
 
@@ -80,9 +85,20 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
     }
 }
 
-/// The link banner's text. `link_age` is how long ago the current `Link`
+/// The link banner's text, then how many approvals wait outside the open
+/// session (`elsewhere`). `link_age` is how long ago the current `Link`
 /// arrived; the retry countdown is `next_in` minus that.
-pub fn banner_text(link: &Link, queued: usize, link_age: Duration) -> String {
+pub fn banner_text(link: &Link, queued: usize, elsewhere: usize, link_age: Duration) -> String {
+    let mut text = link_text(link, queued, link_age);
+    match elsewhere {
+        0 => {}
+        1 => text.push_str(" · 1 approval elsewhere (^G)"),
+        n => text.push_str(&format!(" · {n} approvals elsewhere (^G)")),
+    }
+    text
+}
+
+fn link_text(link: &Link, queued: usize, link_age: Duration) -> String {
     let queued_part = (queued > 0).then(|| format!(" · {queued} queued"));
     let queued_part = queued_part.as_deref().unwrap_or("");
     match link {
@@ -496,9 +512,9 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
         section("Everywhere"),
         key("F1 / ?", "toggle this help (? only outside text fields)"),
-        key("q", "quit (outside text fields)"),
-        key("Ctrl-C", "quit"),
+        key("q / Ctrl-C", "quit (q only outside text fields)"),
         key("Ctrl-R", "retry now while offline"),
+        key("Ctrl-G", "open the next session waiting for an approval"),
         Line::from(""),
     ];
     if app.revoked_screen() {

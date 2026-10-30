@@ -3803,3 +3803,135 @@ fn copy_keys_are_in_help_and_footer() {
     assert_contains(&screen, "copy its output or text / its command");
     assert_contains(&screen, "set -g set-clipboard on");
 }
+
+fn approval(session_id: SessionId, minute: u32, id: ApprovalId, summary: &str) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::ApprovalRequested {
+            id,
+            call: None,
+            tool: "shell".into(),
+            summary: summary.into(),
+            input: None,
+        },
+    )
+}
+
+fn approved(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::ApprovalResolved {
+            id,
+            decision: Decision::Approve,
+            by: DeviceId::new(),
+        },
+    )
+}
+
+fn open_id(h: &Harness) -> Option<SessionId> {
+    h.app.session().map(|(view, _)| view.id)
+}
+
+#[test]
+fn ctrl_g_opens_approvals_elsewhere_counted_in_the_banner() {
+    use skywave_tui::app::Focus;
+    let mut h = Harness::paired();
+    h.seam.set_link(Link::Online { latency_ms: 5 });
+    let (a, b) = (SessionId::new(), SessionId::new());
+    pull(
+        &mut h,
+        vec![created(a, 0, "/srv/a"), created(b, 1, "/srv/b")],
+    );
+    assert!(!h.banner().contains("elsewhere"), "{}", h.banner());
+    assert_eq!(h.key_with(ctrl('g')), None, "nothing pending: a no-op");
+
+    let mut ids = [ApprovalId::new(), ApprovalId::new()];
+    ids.sort();
+    pull(
+        &mut h,
+        vec![approval(b, 2, ids[1], "ls"), approval(a, 3, ids[0], "pwd")],
+    );
+    assert_eq!(h.banner(), "online · 5 ms · 2 approvals elsewhere (^G)");
+
+    // The oldest first, on the timeline so `a` answers at once.
+    assert_eq!(h.key_with(ctrl('g')), Some(Action::OpenNextApproval));
+    assert_eq!(open_id(&h), Some(a));
+    assert_eq!(h.app.session().unwrap().1.focus, Focus::Timeline);
+    assert_eq!(h.banner(), "online · 5 ms · 1 approval elsewhere (^G)");
+
+    // From the composer, mid-sentence: the draft stays behind.
+    h.key(KeyCode::Tab);
+    h.type_text("half a tho");
+    assert_eq!(h.key_with(ctrl('g')), Some(Action::OpenNextApproval));
+    assert_eq!(open_id(&h), Some(b));
+    assert_eq!(h.app.session().unwrap().1.focus, Focus::Timeline);
+    assert_eq!(
+        h.key(KeyCode::Char('a')),
+        Some(Action::ResolveApproval {
+            id: ids[1],
+            decision: Decision::Approve,
+        })
+    );
+    // Cycles back.
+    assert_eq!(h.key_with(ctrl('g')), Some(Action::OpenNextApproval));
+    assert_eq!(open_id(&h), Some(a));
+    assert_eq!(h.core_draft().unwrap().text, "half a tho");
+
+    // Answered here, b is no longer waiting; a is the open one.
+    assert_eq!(h.banner(), "online · 5 ms · 1 queued");
+    assert_eq!(h.key_with(ctrl('g')), None);
+    assert_eq!(open_id(&h), Some(a));
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('?'));
+    assert_contains(&h.screen(), "Ctrl-G        open the next session waiting");
+}
+
+#[test]
+fn a_new_approval_alerts_once_naming_the_session_only() {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    pull(&mut h, vec![created(id, 0, "/srv/we\u{1b}]0;ird\u{9b};x")]);
+    // Pending before going online: the catch-up has it, no alert yet.
+    let first = ApprovalId::new();
+    pull(&mut h, vec![approval(id, 1, first, "cat ~/.secret")]);
+    assert_eq!(h.app.ui().alert, None);
+    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.sync();
+
+    let notify = skywave_tui::Notify::parse("bell,osc9").unwrap();
+    let mut out = Vec::new();
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    let sent = String::from_utf8(out).unwrap();
+    assert_eq!(
+        sent,
+        "\u{1b}]9;skywave: approval needed · we]0irdx\u{7}\u{7}"
+    );
+    assert!(!sent.contains("secret"), "never the tool input");
+    assert_contains(&h.screen(), "approval needed · we]0irdx");
+
+    // One ring per new approval, not per snapshot.
+    let mut out = Vec::new();
+    pull(&mut h, vec![approved(id, 2, first)]);
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    assert!(out.is_empty());
+    pull(&mut h, vec![approval(id, 3, ApprovalId::new(), "ls")]);
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    assert_eq!(
+        out.iter().filter(|&&b| b == 0x07).count(),
+        2,
+        "OSC + bell once"
+    );
+
+    // Pending at a (re)start: never news.
+    let mut h = h.restart();
+    h.seam.set_link(Link::Online { latency_ms: 5 });
+    h.sync();
+    let mut out = Vec::new();
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    assert!(out.is_empty());
+    assert_contains(&h.banner(), "1 approval elsewhere (^G)");
+}

@@ -6,12 +6,14 @@
 //!   actions out.
 //! - [`ui`]: pure render functions over an [`App`].
 //! - [`clipboard`]: copies to the terminal's clipboard (OSC 52).
-//! - [`run`]: the terminal event loop; [`handle_key`], [`copy`],
+//! - [`notify`]: alerts for new approvals (bell, OSC 9/777).
+//! - [`run`]: the terminal event loop; [`handle_key`], [`copy`], [`alert`],
 //!   [`save_draft`] and [`mark_read`] are its steps.
 
 pub mod app;
 pub mod clipboard;
 pub mod composer;
+pub mod notify;
 pub mod timeline;
 pub mod ui;
 
@@ -25,6 +27,7 @@ use crossterm::execute;
 use skywave_core::{Action, Core, Link, ViewState};
 
 pub use app::App;
+pub use notify::Notify;
 
 /// How often the screen refreshes while a retry countdown or a running
 /// tool's clock is shown.
@@ -36,9 +39,11 @@ enum Msg {
     TermFailed(io::Error),
 }
 
-/// Runs the TUI over `core` until the user quits. Restores the terminal on
-/// return and on panic.
-pub fn run(core: &Core) -> io::Result<()> {
+/// Runs the TUI over `core` until the user quits, alerting to new
+/// approvals as `notify` says. Restores the terminal on return and on
+/// panic.
+pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
+    let tmux = notify::in_tmux();
     let (tx, rx) = mpsc::channel();
 
     // Snapshots: the callback only forwards, so it never blocks the core.
@@ -75,6 +80,7 @@ pub fn run(core: &Core) -> io::Result<()> {
     let result = (|| {
         execute!(io::stdout(), EnableBracketedPaste)?;
         loop {
+            alert(&mut app, &mut io::stdout(), notify, tmux);
             terminal.draw(|frame| ui::render(frame, &app, Instant::now()))?;
             let tick = matches!(app.view().link, Link::Reconnecting { .. }) || app.live();
             let now = Instant::now();
@@ -137,7 +143,10 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
         if !matches!(action, Action::SendMessage { .. }) {
             save_draft(app, core, Instant::now(), true);
         }
-        if matches!(action, Action::Navigate(_) | Action::OpenSession(_)) {
+        if matches!(
+            action,
+            Action::Navigate(_) | Action::OpenSession(_) | Action::OpenNextApproval
+        ) {
             mark_read(app, core, Instant::now(), true);
         }
         app.dispatched(core.dispatch(action.clone()));
@@ -154,6 +163,15 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
 pub fn copy(app: &mut App, out: &mut impl Write, max: usize) {
     if let Some(clip) = app.take_copy() {
         app.copied(clipboard::send(out, &clip, max));
+    }
+}
+
+/// Sends the alert [`App::take_alert`] has, if any, through `out`; `tmux`
+/// wraps desktop notifications for its passthrough. A failed write is
+/// dropped: the screen shows the approval anyway.
+pub fn alert(app: &mut App, out: &mut impl Write, notify: Notify, tmux: bool) {
+    if let Some(title) = app.take_alert() {
+        let _ = notify::send(out, notify, Some(&title), tmux);
     }
 }
 

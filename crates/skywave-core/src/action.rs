@@ -49,6 +49,12 @@ pub enum Action {
         session_id: SessionId,
     },
     OpenSession(SessionId),
+    /// Open the session of the next approval in
+    /// [`Attention::approvals`](crate::Attention::approvals) outside the
+    /// open session: the oldest, or, when the open session has one, the
+    /// first after that, wrapping round, so repeating it cycles. A no-op
+    /// when there is none.
+    OpenNextApproval,
     /// The user has seen the open session through `through`: its newest
     /// item was on screen. Only ever moves forward, never past the session's
     /// newest event, and only for the open session. Heads mark sparingly

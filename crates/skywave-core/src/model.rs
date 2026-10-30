@@ -21,11 +21,11 @@ use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
 use crate::view::{
-    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyView,
-    CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link, Outgoing,
-    PairedInfo, PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId,
-    SessionListView, SessionRow, SessionState, SessionView, SettingsView, TimelineItem,
-    ToolApproval, ToolOutcome, ToolView, ViewState,
+    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
+    BodyView, CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link,
+    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen,
+    Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -104,6 +104,11 @@ pub(crate) struct Model {
     read_marks: HashMap<SessionId, ReadMark>,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
+    /// Pending approvals the user was alerted to, or that needed no alert
+    /// (pending at start, answered here); in memory only.
+    alerted: HashSet<ApprovalId>,
+    /// How often new approvals came in ([`Attention::alerts`]).
+    alerts: u64,
 }
 
 impl Model {
@@ -126,13 +131,18 @@ impl Model {
             draft_rev: 0,
             read_marks: HashMap::new(),
             open: None,
+            alerted: HashSet::new(),
+            alerts: 0,
         };
         model.reload(snapshot);
+        // What was pending before the start is not news.
+        model.alerted = model.pending_approvals().map(|(_, id)| id).collect();
         model
     }
 
-    /// Replaces the replica mirror with `snapshot`, keeping link, pairing
-    /// and screen. The open session's events must be reloaded afterwards.
+    /// Replaces the replica mirror with `snapshot`, keeping link, pairing,
+    /// screen and alerts. The open session's events must be reloaded
+    /// afterwards.
     pub(crate) fn reload(&mut self, snapshot: Snapshot) {
         self.settings = snapshot.settings;
         self.cursor = snapshot.cursor;
@@ -142,6 +152,10 @@ impl Model {
         self.drafts = snapshot.drafts;
         self.read_marks = snapshot.read_marks;
         self.open = None;
+        // Only forget: an approval that came in during a catch-up must still
+        // alert once it is over.
+        let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
+        self.alerted.retain(|id| pending.contains(id));
     }
 
     /// The session on screen, whose events the model needs.
@@ -217,6 +231,10 @@ impl Model {
                 self.open = None;
                 vec![Effect::LoadSession(id)]
             }
+            Action::OpenNextApproval => match self.next_approval() {
+                Some(id) => self.dispatch(Action::OpenSession(id)),
+                None => Vec::new(),
+            },
             Action::MarkRead {
                 session_id,
                 through,
@@ -406,6 +424,67 @@ impl Model {
         pending && !answered
     }
 
+    /// The session of the approval [`Action::OpenNextApproval`] goes to.
+    fn next_approval(&self) -> Option<SessionId> {
+        let approvals = self.waiting_approvals();
+        let open = self.open_session();
+        let after = approvals
+            .iter()
+            .find(|(session, _)| Some(*session) == open)
+            .map(|(_, id)| *id);
+        let mut elsewhere = approvals
+            .iter()
+            .filter(|(session, _)| Some(*session) != open);
+        let next = match after {
+            Some(after) => elsewhere
+                .clone()
+                .find(|(_, id)| *id > after)
+                .or_else(|| elsewhere.next()),
+            None => elsewhere.next(),
+        };
+        next.map(|(session, _)| *session)
+    }
+
+    /// Every approval pending in the replica, with its session.
+    fn pending_approvals(&self) -> impl Iterator<Item = (&SessionSummary, ApprovalId)> {
+        self.sessions
+            .iter()
+            .flat_map(|s| s.pending_approvals.iter().map(move |id| (s, *id)))
+    }
+
+    /// The pending approvals this device can still answer, oldest first.
+    fn waiting_approvals(&self) -> Vec<(SessionId, ApprovalId)> {
+        let mut approvals: Vec<_> = self
+            .pending_approvals()
+            .filter(|(_, id)| self.can_answer(*id))
+            .map(|(s, id)| (s.id, id))
+            .collect();
+        approvals.sort_by_key(|(_, id)| *id);
+        approvals
+    }
+
+    /// Bumps `alerts` once if approvals came in that nobody was alerted to
+    /// yet, and forgets those no longer pending. Only online: while catching
+    /// up the replica shows the past, and an approval requested and resolved
+    /// during that is no news; one still pending at its end alerts then.
+    fn note_new_approvals(&mut self) {
+        if !matches!(self.link, Link::Online { .. }) {
+            return;
+        }
+        let pending: Vec<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
+        self.alerted.retain(|id| pending.contains(id));
+        let mut new = false;
+        for id in pending {
+            // One answered here was seen; it is never news.
+            if self.alerted.insert(id) && self.local_answer(id).is_none() {
+                new = true;
+            }
+        }
+        if new {
+            self.alerts += 1;
+        }
+    }
+
     // ---- engine notifications -------------------------------------------------
 
     /// Folds a batch the store has accepted. Mirrors
@@ -434,6 +513,7 @@ impl Model {
             self.cursor = seq;
         }
         self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
+        self.note_new_approvals();
     }
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
@@ -474,6 +554,7 @@ impl Model {
 
     pub(crate) fn set_link(&mut self, link: Link) {
         self.link = link;
+        self.note_new_approvals();
     }
 
     pub(crate) fn paired(&mut self, device: DeviceId, address: String) {
@@ -521,7 +602,31 @@ impl Model {
         ViewState {
             link: self.link.clone(),
             queued: self.outbox.iter().filter(|e| e.status.is_pending()).count(),
+            attention: self.attention(),
             screen: self.screen(),
+        }
+    }
+
+    fn attention(&self) -> Attention {
+        let open = self.open_session();
+        let approvals: Vec<PendingApprovalRef> = self
+            .waiting_approvals()
+            .into_iter()
+            .filter_map(|(session_id, id)| {
+                Some(PendingApprovalRef {
+                    id,
+                    session_id,
+                    title: self.summary(session_id)?.title(),
+                })
+            })
+            .collect();
+        Attention {
+            elsewhere: approvals
+                .iter()
+                .filter(|a| Some(a.session_id) != open)
+                .count(),
+            approvals,
+            alerts: self.alerts,
         }
     }
 
@@ -2554,5 +2659,177 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         f.open(sid);
         assert_eq!(f.session_view().unread_from, None);
+    }
+
+    const ONLINE: Link = Link::Online { latency_ms: 5 };
+
+    fn catching_up() -> Link {
+        Link::CatchingUp {
+            have: Seq(1),
+            server: Seq(9),
+        }
+    }
+
+    /// What the store would load for the model's replica.
+    fn snapshot(model: &Model) -> Snapshot {
+        Snapshot {
+            cursor: model.cursor,
+            sessions: model.sessions.clone(),
+            outbox: model.outbox.clone(),
+            blobs: model.blobs.values().cloned().collect(),
+            settings: model.settings.clone(),
+            drafts: model.drafts.clone(),
+            read_marks: model.read_marks.clone(),
+        }
+    }
+
+    fn alerts(f: &Fixture) -> u64 {
+        f.model.view().attention.alerts
+    }
+
+    fn resolved(id: ApprovalId) -> EventKind {
+        EventKind::ApprovalResolved {
+            id,
+            decision: Decision::Approve,
+            by: DeviceId::new(),
+        }
+    }
+
+    #[test]
+    fn approvals_pending_at_start_never_alert() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
+        let mut model = Model::new(snapshot(&f.model), Some(f.me));
+        model.set_link(ONLINE);
+        let attention = model.view().attention;
+        assert_eq!(attention.alerts, 0);
+        assert_eq!(attention.approvals.len(), 1);
+        assert_eq!(attention.approvals[0].title, "app");
+    }
+
+    #[test]
+    fn new_approvals_while_online_alert_once_per_batch() {
+        let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
+        let sid = f.session("/srv/app");
+        assert_eq!(alerts(&f), 0);
+        f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
+        assert_eq!(alerts(&f), 1);
+        // Many at once ring once; nothing new rings nothing.
+        f.log(
+            sid,
+            vec![
+                approval_requested(ApprovalId::new(), None),
+                approval_requested(ApprovalId::new(), None),
+            ],
+        );
+        assert_eq!(alerts(&f), 2);
+        f.log(sid, vec![agent("still waiting")]);
+        f.model.set_link(Link::Online { latency_ms: 9 });
+        assert_eq!(alerts(&f), 2);
+        // Requested and resolved in one batch: no news.
+        let quick = ApprovalId::new();
+        f.log(sid, vec![approval_requested(quick, None), resolved(quick)]);
+        assert_eq!(alerts(&f), 2);
+        // A replayed batch changes nothing.
+        let before = f.model.clone();
+        f.model.apply_batch(&EventBatch {
+            from: Seq(1),
+            events: f.events.clone(),
+        });
+        assert_eq!(f.model, before);
+    }
+
+    #[test]
+    fn approvals_during_a_catch_up_alert_once_it_ends_if_still_pending() {
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        let (gone, still) = (ApprovalId::new(), ApprovalId::new());
+        f.log(sid, vec![approval_requested(gone, None)]);
+        f.log(sid, vec![approval_requested(still, None)]);
+        f.log(sid, vec![resolved(gone)]);
+        assert_eq!(alerts(&f), 0, "nothing while catching up");
+        f.model.set_link(ONLINE);
+        assert_eq!(alerts(&f), 1);
+        f.model.set_link(catching_up());
+        f.model.set_link(ONLINE);
+        assert_eq!(alerts(&f), 1, "once only");
+
+        // Requested and resolved within one catch-up: never news.
+        f.model.set_link(catching_up());
+        let brief = ApprovalId::new();
+        f.log(sid, vec![approval_requested(brief, None)]);
+        f.log(sid, vec![resolved(brief)]);
+        f.model.set_link(ONLINE);
+        assert_eq!(alerts(&f), 1);
+    }
+
+    #[test]
+    fn a_resync_keeps_an_unalerted_approval_alertable() {
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
+        f.model.reload(snapshot(&f.model));
+        assert_eq!(alerts(&f), 0, "a resync alerts nothing by itself");
+        f.model.set_link(ONLINE);
+        assert_eq!(alerts(&f), 1);
+        f.model.reload(snapshot(&f.model));
+        f.log(sid, vec![agent("more")]);
+        assert_eq!(alerts(&f), 1, "nor does it forget what was alerted");
+    }
+
+    #[test]
+    fn an_approval_answered_here_never_alerts() {
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        let id = ApprovalId::new();
+        f.log(sid, vec![approval_requested(id, None)]);
+        queued(&f.dispatch(Action::ResolveApproval {
+            id,
+            decision: Decision::Deny,
+        }));
+        f.model.set_link(ONLINE);
+        let attention = f.model.view().attention;
+        assert_eq!(attention.alerts, 0);
+        assert!(attention.approvals.is_empty(), "answered: nothing to do");
+    }
+
+    #[test]
+    fn open_next_approval_goes_oldest_first_and_cycles() {
+        let mut f = Fixture::paired();
+        let mut ids = [ApprovalId::new(), ApprovalId::new(), ApprovalId::new()];
+        ids.sort();
+        let (s1, s2, s3) = (f.session("/a"), f.session("/b"), f.session("/c"));
+        // Logged out of order: the order is the approvals' age.
+        f.log(s2, vec![approval_requested(ids[1], None)]);
+        f.log(s3, vec![approval_requested(ids[2], None)]);
+        f.log(s1, vec![approval_requested(ids[0], None)]);
+        let attention = f.model.view().attention;
+        let order: Vec<_> = attention.approvals.iter().map(|a| a.id).collect();
+        assert_eq!(order, ids);
+        assert_eq!(attention.elsewhere, 3, "no session open");
+
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            let effects = f.dispatch(Action::OpenNextApproval);
+            let [Effect::LoadSession(id)] = effects[..] else {
+                panic!("expected a session to load, got {effects:?}");
+            };
+            f.open(id);
+            visited.push(id);
+        }
+        assert_eq!(visited, [s1, s2, s3, s1]);
+        assert_eq!(f.model.view().attention.elsewhere, 2);
+
+        // Only the open session waits: nowhere to go.
+        f.log(s2, vec![resolved(ids[1])]);
+        f.log(s3, vec![resolved(ids[2])]);
+        assert!(f.dispatch(Action::OpenNextApproval).is_empty());
+        assert_eq!(f.model.view().attention.elsewhere, 0);
+        assert_eq!(f.session_view().id, s1);
     }
 }
