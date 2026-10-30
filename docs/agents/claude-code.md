@@ -118,7 +118,9 @@ the following, in order:
    - `terminal_reason`: `"completed"`, `"aborted_streaming"` or `"aborted_tools"`
    - `session_id`
    - `permission_denials`: an array of `{tool_name, tool_use_id, tool_input}`
-   - `total_cost_usd`, `usage`, `num_turns`, `duration_ms`
+   - `total_cost_usd`, `usage`, `model_usage_since_last_result`,
+     `num_turns`, `duration_ms`: which are per turn and which run on is in
+     §2.5
 
    The startup-failure `result` also has `errors:[...]` (§5).
 
@@ -153,6 +155,48 @@ the final mapping.
 
 The full `assistant` message for each block is still emitted, so T09 can
 ignore `stream_event` entirely and get correct output, only less live.
+
+### 2.5 Cost, tokens and time in `result` (read off the fixtures, 2026-10-30)
+
+Which figures in `result` are the turn's own and which run on, checked on
+every `result` in the fixtures: `basic.ndjson` (two turns in one process),
+`resume.ndjson` (a new process resuming `basic`'s session),
+`permissions.ndjson`, `interrupt.ndjson` and `interrupt_pending.ndjson`
+(several turns each). No new capture was needed. All runs are on one model.
+
+| field | scope | evidence |
+|-------|-------|----------|
+| `duration_ms` | **the turn**, wall clock, waiting for approvals included | `permissions` turn 1: 153312 ms with the approval held 150 s |
+| `usage` | **the turn**, summed over its requests (`usage.iterations`) | `permissions` turn 1 (`num_turns: 2`): `cache_read_input_tokens` 34669 = 15367 + 19302 of its two `assistant` messages |
+| `model_usage_since_last_result` | **the turn**, per model, with `costUSD` | `basic` turn 2: `costUSD` 0.00086724 = 0.00229693 − 0.00142969 |
+| `total_cost_usd` | **the whole CLI session, across processes** | `basic`: 0.00142969, then 0.00229693; `resume`'s first turn: 0.00251523 = 0.00229693 + 0.0002183 |
+| `modelUsage` | the whole CLI session, across processes, per model | `resume`: `inputTokens` 6 = 2 + 2 (`basic`) + 2 |
+
+So `total_cost_usd` is cumulative, and **a resume does not reset it**: the
+CLI restores the session's spend from its transcript. A delta of
+`total_cost_usd` within one process would be wrong for the first turn after
+every restart. The adapter therefore takes the turn's figures directly and
+never differences totals (`usage.rs`):
+
+- time: `duration_ms`;
+- tokens read: `usage.input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens` (cached input is most of what a turn reads;
+  `input_tokens` alone is 2 or 4 in every fixture); tokens written:
+  `usage.output_tokens`;
+- cost: the sum of `costUSD` over `model_usage_since_last_result` (one
+  entry per model the turn used, e.g. a subagent on another model);
+- model: the `model` of the turn's `system/init`.
+
+A turn interrupted while text streamed (`interrupt.ndjson` turn 1,
+`terminal_reason:"aborted_streaming"`) reports zero `usage`, an empty
+`model_usage_since_last_result` and `total_cost_usd: 0`, though its
+`assistant` message did consume tokens; the spend is not counted in any later
+`result` either (turn 2's `total_cost_usd` is turn 2's own cost). Only its
+time is reported for it. A turn interrupted at an approval (`interrupt_pending`,
+`aborted_tools`) reports its figures normally.
+
+Not observed: a turn on two models. Summing `costUSD` per model is the
+reading of the field's shape, not a capture.
 
 ## 3. Permission prompts
 
@@ -346,6 +390,9 @@ notes above:
   with the result's first line as the reason.
 - **Approvals still pending at `result`** are cancelled (`interrupted` or
   `turn ended`) before `TurnEnded`.
+- **The turn's usage** (§2.5) is reported as `TurnUsage` just before
+  `TurnEnded`, per-turn figures only; nothing is carried between turns or
+  processes, so a restart needs no reset. Core sums them per session.
 - **Turn outcome:** `success` and not `is_error` → completed; otherwise
   interrupted if an interrupt was sent this turn or `terminal_reason` starts
   with `aborted`; otherwise failed with `errors` (or `result`) as message.

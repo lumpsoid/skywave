@@ -314,6 +314,30 @@
           "state": "errored",
           "message": "agent exited"
         }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "turn_usage",
+          "duration_ms": 12400,
+          "tokens_in": 3100,
+          "tokens_out": 812,
+          "cost_usd": 0.04,
+          "model": "model-a"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "kind": {
+          "type": "turn_usage",
+          "duration_ms": 2590,
+          "tokens_in": null,
+          "tokens_out": null,
+          "cost_usd": null,
+          "model": null
+        }
       }
     ]
   },

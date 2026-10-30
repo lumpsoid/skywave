@@ -37,6 +37,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
 /// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
+/// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
@@ -241,6 +242,13 @@ impl EventMapper {
                     None => {
                         tracing::debug!(request = %request.0, "agent cancelled an approval that is not pending");
                     }
+                }
+            }
+            AdapterEvent::TurnUsage(usage) => {
+                if self.turn_open && !usage.is_empty() {
+                    seqs.push(self.append(log, storage, EventKind::TurnUsage(usage))?);
+                } else {
+                    tracing::debug!("dropping turn usage outside a turn or with nothing in it");
                 }
             }
             AdapterEvent::TurnEnded(outcome) => {

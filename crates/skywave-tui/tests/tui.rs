@@ -20,7 +20,7 @@ use skywave_core::{
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DirsResult, Event, EventBatch, EventKind,
     RuleScope, RuleSuggestion, SessionState as LogState, ToolCall, ToolDisplay, ToolKind,
-    ToolResult,
+    ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
@@ -4571,4 +4571,94 @@ fn an_approval_in_an_archived_session_still_shows() {
     assert_contains(&line_with(&h.screen(), "/srv/a"), "! 1 approval pending");
     assert_eq!(h.key_with(ctrl('g')), Some(Action::OpenNextApproval));
     assert_eq!(open_id(&h), Some(a));
+}
+
+// ---- turn usage -------------------------------------------------------------
+
+/// Two turns with their usage: the first $1.23, the second (the last)
+/// 12.4 s, 3.1k in, 812 out, $0.04.
+fn two_turns(id: SessionId) -> Vec<Event> {
+    let turn = |minute, usage| {
+        [
+            event(
+                id,
+                minute,
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+            ),
+            event(id, minute, agent("done")),
+            event(id, minute, EventKind::TurnUsage(usage)),
+            event(id, minute, EventKind::SessionStateChanged(LogState::Idle)),
+        ]
+    };
+    let first = TurnUsage {
+        duration_ms: Some(95_000),
+        cost_usd: Some(1.23),
+        model: Some("model-a".into()),
+        ..TurnUsage::default()
+    };
+    let second = TurnUsage {
+        duration_ms: Some(12_400),
+        tokens_in: Some(3_100),
+        tokens_out: Some(812),
+        cost_usd: Some(0.04),
+        model: None,
+    };
+    turn(1, first).into_iter().chain(turn(2, second)).collect()
+}
+
+/// The status line of a `width`-column frame, borders cut off.
+fn status_line(h: &Harness, width: u16) -> String {
+    let screen = text(&h.frame(width, 24, at(3)));
+    line_with(&screen, "agent idle")
+        .trim_end()
+        .trim_matches('│')
+        .trim_end()
+        .to_owned()
+}
+
+#[test]
+fn the_status_line_drops_usage_fields_from_the_left_as_it_narrows() {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, two_turns(id));
+
+    let wide = status_line(&h, 140);
+    assert!(
+        wide.ends_with("last turn 12.4s · 3.1k in / 812 out · $0.04 · session $1.27 · model-a"),
+        "{wide:?}"
+    );
+    assert!(wide.contains("agent idle   "), "right-aligned: {wide:?}");
+
+    let narrow = status_line(&h, 60);
+    assert!(
+        narrow.ends_with(" $0.04 · session $1.27 · model-a"),
+        "{narrow:?}"
+    );
+    assert!(!narrow.contains("in /"), "{narrow:?}");
+
+    let narrower = status_line(&h, 30);
+    assert!(narrower.ends_with(" model-a"), "{narrower:?}");
+    assert!(!narrower.contains("session"), "{narrower:?}");
+
+    h.key(KeyCode::F(1));
+    assert_contains(
+        &text(&h.frame(140, 60, at(3))),
+        "Status line, right: last turn's time",
+    );
+}
+
+#[test]
+fn each_turn_ends_with_its_time_and_cost_and_the_list_shows_the_session_cost() {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, two_turns(id));
+    let screen = text(&h.frame(140, 30, at(3)));
+    assert_contains(&screen, "turn · 1m 35s · $1.23");
+    assert_contains(&screen, "turn · 12.4s · $0.04");
+
+    leave(&mut h);
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "· $1.27 · 2026-10-29");
+
+    // A session whose agent reports no cost shows none, never $0.
+    let other = SessionId::new();
+    pull(&mut h, vec![created(other, 4, "/srv/free")]);
+    assert!(!line_with(&h.screen(), "/srv/free").contains('$'));
 }

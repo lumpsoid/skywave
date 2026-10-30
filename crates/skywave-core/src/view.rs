@@ -13,8 +13,10 @@ use chrono::{DateTime, Utc};
 pub use skywave_proto::RejectReason as FailReason;
 pub use skywave_proto::{
     ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, RuleScope,
-    RuleSuggestion, Seq, SessionId, ToolKind,
+    RuleSuggestion, Seq, SessionId, ToolKind, TurnUsage,
 };
+
+pub use crate::projection::SessionUsage;
 
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 
@@ -346,6 +348,9 @@ pub struct SessionRow {
     /// Agent output (messages, approval requests, errors) this device has
     /// not seen yet. Messages from any device never count.
     pub unread: u64,
+    /// What the session has cost so far, in US dollars, when its agent
+    /// reports cost.
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,6 +385,9 @@ pub struct SessionView {
     /// device, in log order. Only what was granted through Skywave: rules
     /// the agent keeps elsewhere are not seen.
     pub rules: Vec<RuleSuggestion>,
+    /// What the session's turns took, the newest one and the sums; `None`
+    /// until the agent reports any.
+    pub usage: Option<SessionUsage>,
     /// This device's latest interrupt of the session, until its effect is in
     /// the replica.
     pub interrupt: Option<Outgoing>,
@@ -523,6 +531,9 @@ pub enum Entry {
     AgentErrored {
         message: String,
     },
+    /// A turn ended and its agent reported what it took. A figure the agent
+    /// does not report is `None`.
+    TurnUsage(TurnUsage),
 }
 
 /// A tool call as one timeline item: what it does (decided by the server,
@@ -702,6 +713,7 @@ mod tests {
             ],
             pending_approval: None,
             rules: Vec::new(),
+            usage: None,
             interrupt: None,
             stop: None,
             draft: None,

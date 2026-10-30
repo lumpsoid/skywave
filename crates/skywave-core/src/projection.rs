@@ -5,8 +5,10 @@
 //! the events, so the projection never runs ahead of or behind the log.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall, ToolResult,
+    TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -40,6 +42,53 @@ pub struct SessionSummary {
     /// [`archived_effect`](EventKind::archived_effect) left it: archived by
     /// `SessionArchived`, back with the next message.
     pub archived: bool,
+    /// What the session's turns took, as their agent reported it; `None`
+    /// until a turn reports anything.
+    pub usage: Option<SessionUsage>,
+}
+
+/// What a session's turns took: the newest turn's figures and the sums over
+/// every turn that reported any. Agent-agnostic (D3); folded from
+/// `TurnUsage` events, which hold per-turn figures, so this only adds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    /// The newest turn that reported usage, as reported.
+    pub last_turn: TurnUsage,
+    /// Each figure summed over the turns that reported it; `None` while no
+    /// turn has. `model` is the newest one named.
+    pub total: TurnUsage,
+}
+
+impl SessionUsage {
+    /// Usage after a first `turn`.
+    pub fn new(turn: &TurnUsage) -> Self {
+        SessionUsage {
+            last_turn: turn.clone(),
+            total: turn.clone(),
+        }
+    }
+
+    /// Folds in the next `turn`.
+    pub fn add(&mut self, turn: &TurnUsage) {
+        fn sum<T: std::ops::Add<Output = T> + Copy>(
+            total: Option<T>,
+            turn: Option<T>,
+        ) -> Option<T> {
+            match (total, turn) {
+                (Some(total), Some(turn)) => Some(total + turn),
+                (total, turn) => total.or(turn),
+            }
+        }
+        self.last_turn = turn.clone();
+        let total = &mut self.total;
+        total.duration_ms = sum(total.duration_ms, turn.duration_ms);
+        total.tokens_in = sum(total.tokens_in, turn.tokens_in);
+        total.tokens_out = sum(total.tokens_out, turn.tokens_out);
+        total.cost_usd = sum(total.cost_usd, turn.cost_usd);
+        if turn.model.is_some() {
+            total.model.clone_from(&turn.model);
+        }
+    }
 }
 
 /// Longest [`SessionSummary::first_prompt`] kept, in chars. The store's
@@ -63,6 +112,7 @@ impl SessionSummary {
             name: None,
             first_prompt: None,
             archived: false,
+            usage: None,
         };
         summary.apply(seq, event);
         summary
@@ -110,6 +160,10 @@ impl SessionSummary {
                 }
             }
             EventKind::SessionStopped => self.stopped = true,
+            EventKind::TurnUsage(turn) => match &mut self.usage {
+                Some(usage) => usage.add(turn),
+                None => self.usage = Some(SessionUsage::new(turn)),
+            },
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
@@ -178,7 +232,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::TurnInterrupted
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
-        | EventKind::SessionArchived { .. } => false,
+        | EventKind::SessionArchived { .. }
+        | EventKind::TurnUsage(_) => false,
     }
 }
 
@@ -201,7 +256,8 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
-        | EventKind::SessionStateChanged(_) => (None, None),
+        | EventKind::SessionStateChanged(_)
+        | EventKind::TurnUsage(_) => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -395,6 +451,59 @@ mod tests {
         summary.apply(Seq(8), &event(sid, 13, archive(true)));
         summary.apply(Seq(9), &event(sid, 14, archive(false)));
         assert!(!summary.archived);
+    }
+
+    #[test]
+    fn turn_usage_sums_what_each_turn_reports() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        assert_eq!(summary.usage, None);
+
+        let first = TurnUsage {
+            duration_ms: Some(12_400),
+            tokens_in: Some(3_100),
+            tokens_out: Some(812),
+            cost_usd: Some(0.25),
+            model: Some("model-a".into()),
+        };
+        let kind = EventKind::TurnUsage(first.clone());
+        assert!(!is_notable(&kind));
+        assert_eq!(kind.archived_effect(), None);
+        summary.apply(Seq(2), &event(sid, 1, kind));
+        let usage = summary.usage.clone().unwrap();
+        assert_eq!((&usage.last_turn, &usage.total), (&first, &first));
+        assert_eq!(summary.last_seq, Seq(2), "part of the turn's end");
+        assert_eq!(summary.notable, 0);
+
+        // A turn missing figures adds nothing to them, and an earlier model
+        // stays until another is named.
+        let second = TurnUsage {
+            duration_ms: Some(600),
+            cost_usd: Some(0.5),
+            ..TurnUsage::default()
+        };
+        summary.apply(Seq(3), &event(sid, 2, EventKind::TurnUsage(second.clone())));
+        let third = TurnUsage {
+            tokens_out: Some(188),
+            model: Some("model-b".into()),
+            ..TurnUsage::default()
+        };
+        summary.apply(Seq(4), &event(sid, 3, EventKind::TurnUsage(third.clone())));
+        let usage = summary.usage.unwrap();
+        assert_eq!(usage.last_turn, third);
+        assert_eq!(
+            usage.total,
+            TurnUsage {
+                duration_ms: Some(13_000),
+                tokens_in: Some(3_100),
+                tokens_out: Some(1_000),
+                cost_usd: Some(0.75),
+                model: Some("model-b".into()),
+            }
+        );
     }
 
     #[test]

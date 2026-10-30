@@ -30,6 +30,7 @@
 pub mod display;
 pub mod protocol;
 pub mod rules;
+pub mod usage;
 
 use std::path::Path;
 use std::process::Stdio;

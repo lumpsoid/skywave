@@ -195,6 +195,17 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::SessionStateChanged(SessionState::Errored {
             message: "agent exited".into(),
         }),
+        EventKind::TurnUsage(TurnUsage {
+            duration_ms: Some(12_400),
+            tokens_in: Some(3_100),
+            tokens_out: Some(812),
+            cost_usd: Some(0.04),
+            model: Some("model-a".into()),
+        }),
+        EventKind::TurnUsage(TurnUsage {
+            duration_ms: Some(2_590),
+            ..TurnUsage::default()
+        }),
     ]
 }
 
@@ -462,6 +473,19 @@ fn v3_approval_events_decode_without_suggestions_or_rule() {
             rule: None,
         }
     );
+}
+
+#[test]
+fn turn_usage_decodes_with_figures_left_out() {
+    let kind = decode(r#"{"type":"turn_usage","duration_ms":1648}"#);
+    assert_eq!(
+        kind,
+        EventKind::TurnUsage(TurnUsage {
+            duration_ms: Some(1648),
+            ..TurnUsage::default()
+        })
+    );
+    assert!(TurnUsage::default().is_empty());
 }
 
 #[test]

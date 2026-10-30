@@ -52,7 +52,7 @@ pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCrede
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };
-pub use projection::SessionSummary;
+pub use projection::{SessionSummary, SessionUsage};
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::PROTOCOL_VERSION;
@@ -69,5 +69,5 @@ pub use view::{
     LinkRejection, ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
     PendingSession, RuleScope, RuleSuggestion, Screen, Seq, SessionId, SessionListView, SessionRow,
     SessionState, SessionView, SettingsView, TimelineItem, ToolApproval, ToolKind, ToolOutcome,
-    ToolView, ViewState,
+    ToolView, TurnUsage, ViewState,
 };

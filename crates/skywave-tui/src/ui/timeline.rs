@@ -292,6 +292,20 @@ impl Layout<'_> {
                 spans.push(Span::raw(what).dark_gray());
                 return vec![Line::from(spans)];
             }
+            Entry::TurnUsage(usage) => {
+                // What the turn took, after its last item; the status line
+                // has tokens and the model.
+                let mut text = "turn".to_owned();
+                if let Some(ms) = usage.duration_ms {
+                    text.push_str(&format!(" · {}", turn_time(ms)));
+                }
+                if let Some(cost) = usage.cost_usd {
+                    text.push_str(&format!(" · {}", dollars(cost)));
+                }
+                let mut spans = lead;
+                spans.push(Span::raw(text).dark_gray());
+                return vec![Line::from(spans)];
+            }
             Entry::AgentErrored { message } => {
                 return self.message(
                     lead,
@@ -1112,5 +1126,89 @@ pub fn bytes(n: u64) -> String {
         0..1024 => format!("{n} B"),
         1024..1_048_576 => format!("{:.1} KiB", n as f64 / KIB),
         _ => format!("{:.1} MiB", n as f64 / (KIB * KIB)),
+    }
+}
+
+/// A turn's length: "0.8s", "12.4s", "2m 05s", "1h 02m".
+pub fn turn_time(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{:.1}s", ms as f64 / 1000.0),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// A token count, compact: "812", "3.1k", "153k", "1.2M".
+pub fn tokens(n: u64) -> String {
+    let (value, unit) = match n {
+        0..1000 => return n.to_string(),
+        1000..999_500 => (n as f64 / 1e3, "k"),
+        _ => (n as f64 / 1e6, "M"),
+    };
+    if value < 9.95 {
+        format!("{value:.1}{unit}")
+    } else {
+        format!("{value:.0}{unit}")
+    }
+}
+
+/// A cost in US dollars to 2–3 significant digits: "$0.0014", "$0.04",
+/// "$0.87", "$1.27", "$12.3", "$140".
+pub fn dollars(usd: f64) -> String {
+    if usd.is_nan() || usd <= 0.0 {
+        return "$0".to_owned();
+    }
+    if usd >= 1.0 {
+        let decimals = if usd < 9.995 {
+            2
+        } else if usd < 99.95 {
+            1
+        } else {
+            0
+        };
+        return format!("${usd:.decimals$}");
+    }
+    // Two significant digits, at least cents, without trailing zeros.
+    let decimals = (1 - usd.log10().floor() as i32).max(2) as usize;
+    let text = format!("{usd:.decimals$}");
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let fraction = fraction.trim_end_matches('0');
+    format!("${whole}.{fraction:0<2}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_figures_are_compact() {
+        let times = [(800, "0.8s"), (12_400, "12.4s"), (125_000, "2m 05s")];
+        for (ms, text) in times.into_iter().chain([(3_720_000, "1h 02m")]) {
+            assert_eq!(turn_time(ms), text);
+        }
+        for (n, text) in [
+            (812, "812"),
+            (3_100, "3.1k"),
+            (19_337, "19k"),
+            (153_400, "153k"),
+            (999_999, "1.0M"),
+            (1_234_567, "1.2M"),
+            (45_000_000, "45M"),
+        ] {
+            assert_eq!(tokens(n), text, "{n}");
+        }
+        for (usd, text) in [
+            (0.0, "$0"),
+            (0.00142969, "$0.0014"),
+            (0.04, "$0.04"),
+            (0.1, "$0.10"),
+            (0.86724, "$0.87"),
+            (1.27, "$1.27"),
+            (12.34, "$12.3"),
+            (140.2, "$140"),
+        ] {
+            assert_eq!(dollars(usd), text, "{usd}");
+        }
     }
 }
