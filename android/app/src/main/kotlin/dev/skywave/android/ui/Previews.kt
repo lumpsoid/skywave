@@ -24,8 +24,8 @@ internal object Samples {
 
     val twoElsewhere = Attention(
         approvals = listOf(
-            PendingApprovalRef(id = "a1", sessionId = "s2", title = "Run cargo test"),
-            PendingApprovalRef(id = "a2", sessionId = "s3", title = "Edit README.md"),
+            PendingApprovalRef(id = "a1", sessionId = "s2", title = "Run cargo test", alertedAt = 0u),
+            PendingApprovalRef(id = "a2", sessionId = "s3", title = "Edit README.md", alertedAt = 0u),
         ),
         elsewhere = 2u,
         alerts = 2u,
