@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::Utc;
 use skywave_core::{
     Action, BlobDownload, BoxFuture, Connector, EngineConfig, HttpsTransport, Link, LinkRejection,
-    OutboxStatus, Screen, Transport, TransportError,
+    OutboxStatus, Screen, TimelineItem, Transport, TransportError,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
@@ -341,6 +341,81 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
         )),
         2
     );
+}
+
+/// Messages taken back while offline — discarded, or pulled into the draft
+/// to edit — never reach the server once the link is back; the rest still
+/// drains.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawn_message_never_reaches_the_server() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&daemon).await;
+
+    proxy.down();
+    client
+        .wait("the link to drop", |_, view| is_reconnecting(&view.link))
+        .await;
+    for text in ["keep", "drop", "edit"] {
+        client.dispatch(Action::SendMessage {
+            session_id: session,
+            text: text.into(),
+        });
+    }
+    let ids: Vec<CommandId> = client.outbox()[1..].iter().map(|e| e.command.id).collect();
+    let view = client
+        .open_session(session, |s| s.timeline.len() == 3)
+        .await;
+    assert!(
+        view.timeline.iter().all(|item| matches!(
+            item,
+            TimelineItem::Pending {
+                discardable: true,
+                ..
+            }
+        )),
+        "never sent, so each can be taken back: {:?}",
+        view.timeline
+    );
+    client.dispatch(Action::Discard(ids[1]));
+    client.dispatch(Action::EditQueued(ids[2]));
+    let view = client
+        .open_session(session, |s| s.timeline.len() == 1)
+        .await;
+    assert_eq!(view.draft.map(|d| d.text).as_deref(), Some("edit"));
+    assert_eq!(client.core.view().queued, 1);
+
+    proxy.up();
+    client
+        .wait("the queue to drain and the echo to arrive", |c, view| {
+            let events = daemon.events();
+            view.queued == 0
+                && count(
+                    &events,
+                    |k| matches!(k, EventKind::AgentMessage { text } if text.starts_with("echo:")),
+                ) == 1
+                && c.cursor() == Seq(events.len() as u64)
+        })
+        .await;
+    assert_eq!(
+        user_messages(&daemon.events()),
+        vec![(ids[0], "keep".to_owned())],
+        "only the message left in the outbox went out"
+    );
+    let delivered: Vec<String> = agent
+        .inputs(session)
+        .into_iter()
+        .filter_map(|input| match input {
+            skywaved::agent::fake::FakeInput::Message(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["keep"]);
+    let left: Vec<CommandId> = client.outbox()[1..].iter().map(|e| e.command.id).collect();
+    assert_eq!(left, vec![ids[0]]);
 }
 
 /// Suspending stops the network loops without losing work; resuming syncs

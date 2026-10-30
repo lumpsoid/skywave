@@ -2504,3 +2504,124 @@ fn turn_stepping_lands_on_the_user_message() {
     h.key(KeyCode::Char(']'));
     assert_eq!(selected(&h), Some(ItemKey::Pending(three)));
 }
+
+/// The footer line of the screen.
+fn footer(h: &Harness) -> String {
+    h.screen().lines().last().unwrap().trim_end().to_owned()
+}
+
+#[test]
+fn edit_and_cancel_a_queued_message() {
+    let (mut h, _, _) = open_session();
+    let mut sent = Vec::new();
+    for text in ["first", "second", "third"] {
+        h.type_text(text);
+        h.key(KeyCode::Enter);
+        sent.push(last_command(&h));
+    }
+    h.type_text("unsaved");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(sent[2])));
+    assert!(
+        footer(&h).starts_with("e edit · Del cancel"),
+        "{}",
+        footer(&h)
+    );
+
+    // `e` saves the composer, then takes the message back into it, ahead of
+    // what was typed, focused, the cursor after the message.
+    assert_eq!(h.key(KeyCode::Char('e')), Some(Action::EditQueued(sent[2])));
+    let session = h.app.ui().session.as_ref().unwrap();
+    assert_eq!(session.focus, skywave_tui::app::Focus::Composer);
+    assert_eq!(session.composer.text(), "third\n\nunsaved");
+    assert_eq!(session.composer.cursor_chars(), 5);
+    assert_eq!(h.core_draft().unwrap().text, "third\n\nunsaved");
+    assert!(!h.screen().contains("you [queued]: third"));
+    assert_eq!(h.seam.pending_outbox().unwrap().len(), 2);
+
+    // The selection went to the neighbour; Delete cancels it.
+    h.key(KeyCode::Esc);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(sent[1])));
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(sent[1])));
+    assert!(!h.screen().contains("you [queued]: second"));
+    assert_eq!(selected(&h), Some(ItemKey::Pending(sent[0])));
+    assert_eq!(
+        h.app.composer().unwrap().text(),
+        "third\n\nunsaved",
+        "a discard leaves the composer alone"
+    );
+
+    // Once sent it may have reached the server: no hint, and the keys do
+    // nothing, also once it is back in the queue.
+    h.seam.command_sending(sent[0]).unwrap();
+    h.sync();
+    assert!(!footer(&h).contains("e edit"), "{}", footer(&h));
+    assert_eq!(h.key(KeyCode::Char('e')), None);
+    assert_eq!(h.key(KeyCode::Delete), None);
+    let mut h = h.restart();
+    assert_eq!(h.seam.pending_outbox().unwrap().len(), 1);
+
+    // A refused message can be dismissed.
+    h.key(KeyCode::Enter);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.seam
+        .command_result(
+            sent[0],
+            &CommandResult::Rejected {
+                reason: FailReason::UnknownSession,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert!(
+        footer(&h).starts_with("e edit · Del dismiss"),
+        "{}",
+        footer(&h)
+    );
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(sent[0])));
+    assert!(h.seam.pending_outbox().unwrap().is_empty());
+    assert!(!h.screen().contains("first"));
+}
+
+#[test]
+fn dismiss_refused_creation() {
+    let mut h = Harness::paired();
+    for workdir in ["/etc", "/srv/new"] {
+        h.key(KeyCode::Char('n'));
+        h.app.on_paste(workdir);
+        h.key(KeyCode::Enter);
+    }
+    let outbox = h.seam.pending_outbox().unwrap();
+    let (refused, waiting) = (outbox[0].command.id, outbox[1].command.id);
+    // Nothing refused yet: Delete does nothing to a queued creation.
+    assert!(!h.screen().contains("Del dismiss"));
+    assert_eq!(h.key(KeyCode::Delete), None);
+
+    h.seam.command_sending(refused).unwrap();
+    h.seam
+        .command_result(
+            refused,
+            &CommandResult::Rejected {
+                reason: FailReason::WorkdirNotAllowed,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(&h.screen(), "Creating · Del dismiss");
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(refused)));
+    let screen = h.screen();
+    assert!(!screen.contains("/etc"), "{screen}");
+    assert!(!screen.contains("Del dismiss"));
+    assert_contains(&line_with(&screen, "/srv/new"), "[queued]");
+    assert_eq!(h.key(KeyCode::Delete), None);
+    let left: Vec<CommandId> = h
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [waiting]);
+}

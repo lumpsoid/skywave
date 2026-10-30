@@ -37,6 +37,12 @@ pub(crate) enum Effect {
     SaveBlobPolicy(BlobPolicy),
     /// Keep the session's draft; `None` deletes it.
     SaveDraft(SessionId, Option<Draft>),
+    /// Take the command out of the outbox and, if given, keep the draft, as
+    /// one write: the text is never lost nor kept twice.
+    Withdraw {
+        id: CommandId,
+        draft: Option<(SessionId, Draft)>,
+    },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
     /// Hand to the engine once every persistence effect succeeded.
@@ -82,6 +88,9 @@ pub(crate) struct Model {
     blobs: BTreeMap<BlobId, BlobRecord>,
     /// This device's unsent messages, as stored.
     drafts: HashMap<SessionId, Draft>,
+    /// Bumped whenever the model itself rewrites a draft, so heads know to
+    /// replace the text they hold; never goes back, not even on reload.
+    draft_rev: u64,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
 }
@@ -101,6 +110,7 @@ impl Model {
             outbox: Vec::new(),
             blobs: BTreeMap::new(),
             drafts: HashMap::new(),
+            draft_rev: 0,
             open: None,
         };
         model.reload(snapshot);
@@ -164,6 +174,8 @@ impl Model {
                 text,
                 cursor,
             } => self.save_draft(session_id, text, cursor),
+            Action::Discard(id) => self.withdraw(id, false),
+            Action::EditQueued(id) => self.withdraw(id, true),
             Action::ResolveApproval { id, decision } => {
                 if !self.can_answer(id) {
                     return Vec::new();
@@ -286,6 +298,42 @@ impl Model {
             None => self.drafts.remove(&session_id),
         };
         vec![Effect::SaveDraft(session_id, draft)]
+    }
+
+    /// Takes back a [`discardable`](OutboxEntry::discardable) command; with
+    /// `edit`, a message goes back into its session's draft, ahead of what
+    /// the draft held, the cursor after the message. The state lock is the
+    /// one the engine's claim takes, so a command it claimed meanwhile is no
+    /// longer discardable here: nothing happens.
+    fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
+        let Some(index) = self
+            .outbox
+            .iter()
+            .position(|e| e.command.id == id && e.discardable())
+        else {
+            return Vec::new();
+        };
+        let draft = match &self.outbox[index].command.kind {
+            CommandKind::SendMessage { session_id, text } if edit => {
+                let joined = match self.drafts.get(session_id) {
+                    Some(old) => format!("{text}\n\n{}", old.text),
+                    None => text.clone(),
+                };
+                let draft = Draft {
+                    cursor: text.chars().count(),
+                    text: joined,
+                };
+                Some((*session_id, draft))
+            }
+            _ if edit => return Vec::new(),
+            _ => None,
+        };
+        self.outbox.remove(index);
+        if let Some((session_id, draft)) = &draft {
+            self.drafts.insert(*session_id, draft.clone());
+            self.draft_rev += 1;
+        }
+        vec![Effect::Withdraw { id, draft }]
     }
 
     /// Pending in the replica and not already answered from this device
@@ -453,6 +501,7 @@ impl Model {
                         command_id: e.command.id,
                         workdir: workdir.clone(),
                         outgoing,
+                        discardable: e.discardable(),
                     })
                 }
                 _ => None,
@@ -501,6 +550,7 @@ impl Model {
             interrupt,
             stop,
             draft: self.drafts.get(&id).cloned(),
+            draft_rev: self.draft_rev,
         })
     }
 
@@ -690,6 +740,7 @@ impl Model {
                     command_id: e.command.id,
                     text: text.clone(),
                     outgoing: Outgoing::from(&e.status),
+                    discardable: e.discardable(),
                 })
             }
             _ => None,
@@ -1051,6 +1102,7 @@ mod tests {
                 command_id: command.id,
                 text: "hello".into(),
                 outgoing,
+                discardable: outgoing == Outgoing::Queued,
             }]
         };
         assert_eq!(f.session_view().timeline, pending(Outgoing::Queued));
@@ -1158,6 +1210,7 @@ mod tests {
                 command_id: command.id,
                 text: "x".into(),
                 outgoing: Outgoing::Failed(RejectReason::UnknownSession),
+                discardable: true,
             }
         );
     }
@@ -1541,6 +1594,7 @@ mod tests {
                 command_id: command.id,
                 workdir: "/srv/new".into(),
                 outgoing: Outgoing::Queued,
+                discardable: true,
             }]
         );
         f.model.command_result(
@@ -1549,6 +1603,8 @@ mod tests {
             Utc::now(),
         );
         assert_eq!(creating(&f)[0].outgoing, Outgoing::Accepted(Seq(2)));
+        assert!(!creating(&f)[0].discardable, "accepted is final");
+        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
 
         let new = f.session("/srv/new");
         let list = f.list_view();
@@ -1556,6 +1612,173 @@ mod tests {
         let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![new, old], "most recently active first");
         assert_eq!(list.sessions[0].state, SessionState::Idle);
+    }
+
+    fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {
+        queued(&f.dispatch(Action::SendMessage {
+            session_id,
+            text: text.into(),
+        }))
+    }
+
+    /// The pending items of the open session, as (text, discardable).
+    fn pending(f: &Fixture) -> Vec<(String, bool)> {
+        f.session_view()
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                TimelineItem::Pending {
+                    text, discardable, ..
+                } => Some((text, discardable)),
+                TimelineItem::Logged { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edit_queued_moves_text_into_draft() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let first = send(&mut f, sid, "fix the tests");
+        let second = send(&mut f, sid, "then lint");
+        f.dispatch(save_draft(sid, "half typed", 4));
+        let rev = f.session_view().draft_rev;
+
+        // The message goes first, the old draft after a blank line; the
+        // cursor ends the message. One effect carries both writes.
+        let effects = f.dispatch(Action::EditQueued(first.id));
+        let draft = Draft {
+            text: "fix the tests\n\nhalf typed".into(),
+            cursor: "fix the tests".len(),
+        };
+        assert_eq!(
+            effects,
+            vec![Effect::Withdraw {
+                id: first.id,
+                draft: Some((sid, draft.clone())),
+            }]
+        );
+        let view = f.session_view();
+        assert_eq!(view.draft, Some(draft));
+        assert!(view.draft_rev > rev, "heads replace their composer");
+        assert_eq!(pending(&f), vec![("then lint".to_owned(), true)]);
+        assert_eq!(f.model.view().queued, 1);
+        assert!(
+            f.dispatch(Action::EditQueued(first.id)).is_empty(),
+            "already withdrawn"
+        );
+
+        // Without a draft the text is the message alone.
+        f.dispatch(save_draft(sid, "", 0));
+        let effects = f.dispatch(Action::EditQueued(second.id));
+        assert_eq!(
+            effects,
+            vec![Effect::Withdraw {
+                id: second.id,
+                draft: Some((
+                    sid,
+                    Draft {
+                        text: "then lint".into(),
+                        cursor: 9,
+                    }
+                )),
+            }]
+        );
+        assert_eq!(pending(&f), Vec::new());
+
+        // Discarding drops the message and leaves the draft alone.
+        let third = send(&mut f, sid, "never mind");
+        let rev = f.session_view().draft_rev;
+        assert_eq!(
+            f.dispatch(Action::Discard(third.id)),
+            vec![Effect::Withdraw {
+                id: third.id,
+                draft: None,
+            }]
+        );
+        assert_eq!(pending(&f), Vec::new());
+        assert_eq!(f.session_view().draft_rev, rev);
+
+        // Only messages go back into a draft.
+        let interrupt = queued(&f.dispatch(Action::Interrupt { session_id: sid }));
+        assert!(f.dispatch(Action::EditQueued(interrupt.id)).is_empty());
+        assert!(f.dispatch(Action::Discard(interrupt.id)).is_empty());
+    }
+
+    #[test]
+    fn claimed_message_is_not_discardable() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let command = send(&mut f, sid, "hello");
+        assert_eq!(pending(&f), vec![("hello".to_owned(), true)]);
+
+        // Once claimed it may have reached the server: it stays, even after
+        // a failed attempt puts it back in the queue (a restart does that).
+        f.model.command_sending(command.id, Utc::now());
+        assert_eq!(pending(&f), vec![("hello".to_owned(), false)]);
+        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
+        assert!(f.dispatch(Action::EditQueued(command.id)).is_empty());
+        f.model.outbox_entry(command.id).unwrap().status = OutboxStatus::Queued;
+        assert_eq!(pending(&f), vec![("hello".to_owned(), false)]);
+        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
+
+        // A refusal settles it: the message can be dismissed or edited.
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownSession,
+            },
+            Utc::now(),
+        );
+        assert_eq!(pending(&f), vec![("hello".to_owned(), true)]);
+        assert_eq!(f.dispatch(Action::EditQueued(command.id)).len(), 1);
+        assert_eq!(f.session_view().draft.unwrap().text, "hello");
+    }
+
+    #[test]
+    fn discard_refused_creation_hides_row() {
+        let mut f = Fixture::paired();
+        let refused = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/etc".into(),
+        }));
+        let waiting = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/new".into(),
+        }));
+        f.model.command_sending(refused.id, Utc::now());
+        f.model.command_sending(waiting.id, Utc::now());
+        f.model.command_result(
+            refused.id,
+            CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotAllowed,
+            },
+            Utc::now(),
+        );
+        let discardable = |f: &Fixture| -> Vec<(String, bool)> {
+            f.list_view()
+                .creating
+                .into_iter()
+                .map(|p| (p.workdir, p.discardable))
+                .collect()
+        };
+        assert_eq!(
+            discardable(&f),
+            vec![("/etc".to_owned(), true), ("/srv/new".to_owned(), false)]
+        );
+        assert!(f.dispatch(Action::Discard(waiting.id)).is_empty());
+        assert!(
+            f.dispatch(Action::EditQueued(refused.id)).is_empty(),
+            "only messages are edited"
+        );
+        assert_eq!(
+            f.dispatch(Action::Discard(refused.id)),
+            vec![Effect::Withdraw {
+                id: refused.id,
+                draft: None,
+            }]
+        );
+        assert_eq!(discardable(&f), vec![("/srv/new".to_owned(), false)]);
     }
 
     #[test]

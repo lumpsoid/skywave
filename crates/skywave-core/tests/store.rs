@@ -676,3 +676,134 @@ fn enqueue_message_clears_its_draft_atomically() {
     assert_eq!(store.drafts().unwrap().keys().collect::<Vec<_>>(), [&b]);
     assert_eq!(store.pending_outbox().unwrap().len(), 2);
 }
+
+#[test]
+fn withdraw_only_never_attempted_or_refused() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    let session = SessionId::new();
+    let [fresh, claimed, requeued, refused, accepted] =
+        ["fresh", "claimed", "requeued", "refused", "accepted"].map(|text| send(session, text));
+    for command in [&fresh, &claimed, &requeued, &refused, &accepted] {
+        store.enqueue(command).unwrap();
+    }
+    for command in [&claimed, &requeued, &refused, &accepted] {
+        assert!(store.claim_send(command.id, at(1)).unwrap());
+    }
+    let rejected = CommandResult::Rejected {
+        reason: RejectReason::UnknownSession,
+    };
+    store.record_result(refused.id, &rejected, at(2)).unwrap();
+    store
+        .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
+        .unwrap();
+    // A restart puts the claimed rows back to `Queued`; their tries count.
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.claim_send(claimed.id, at(3)).unwrap());
+
+    let discardable: Vec<(String, bool)> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| match &e.command.kind {
+            CommandKind::SendMessage { text, .. } => (text.clone(), e.discardable()),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        discardable,
+        [
+            ("fresh", true),
+            ("claimed", false),
+            ("requeued", false),
+            ("refused", true),
+            ("accepted", false),
+        ]
+        .map(|(text, discardable)| (text.to_owned(), discardable))
+    );
+
+    // What may have reached the server, or was accepted, stays.
+    for command in [&claimed, &requeued, &accepted] {
+        assert!(matches!(
+            store.withdraw(command.id, None),
+            Err(StoreError::NotWithdrawable(id)) if id == command.id
+        ));
+    }
+    assert!(matches!(
+        store.withdraw(CommandId::new(), None),
+        Err(StoreError::NotWithdrawable(_))
+    ));
+    store.withdraw(fresh.id, None).unwrap();
+    store.withdraw(refused.id, None).unwrap();
+    let left: Vec<CommandId> = store
+        .outbox()
+        .unwrap()
+        .iter()
+        .map(|e| e.command.id)
+        .collect();
+    assert_eq!(left, [claimed.id, requeued.id, accepted.id]);
+
+    // A session creation is withdrawn the same way; other kinds are not
+    // discardable even if never sent.
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: "/etc".into(),
+        },
+    };
+    let interrupt = Command {
+        id: CommandId::new(),
+        kind: CommandKind::Interrupt {
+            session_id: session,
+        },
+    };
+    store.enqueue(&create).unwrap();
+    store.enqueue(&interrupt).unwrap();
+    let outbox = store.outbox().unwrap();
+    assert!(outbox[3].discardable());
+    assert!(!outbox[4].discardable());
+    store.withdraw(create.id, None).unwrap();
+}
+
+#[test]
+fn withdraw_into_draft_is_one_transaction() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let command = send(session, "edit me");
+    let older = Draft {
+        text: "older".into(),
+        cursor: 0,
+    };
+    let draft = Draft {
+        text: "edit me\n\nolder".into(),
+        cursor: 7,
+    };
+    let store = Store::open(&dir).unwrap();
+    store.enqueue(&command).unwrap();
+    store.set_draft(session, Some(&older)).unwrap();
+
+    // A draft write that fails after the delete keeps the message queued:
+    // the text is never lost.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE UPDATE ON drafts BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(store.withdraw(command.id, Some((session, &draft))).is_err());
+    assert_eq!(store.pending_outbox().unwrap().len(), 1);
+    assert_eq!(store.drafts().unwrap()[&session], older);
+
+    // Once it succeeds the text is in the draft only, never in both.
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    store.withdraw(command.id, Some((session, &draft))).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(store.drafts().unwrap()[&session], draft);
+
+    // A refused withdraw writes no draft either.
+    let other = SessionId::new();
+    assert!(store.withdraw(command.id, Some((other, &draft))).is_err());
+    assert!(!store.drafts().unwrap().contains_key(&other));
+}

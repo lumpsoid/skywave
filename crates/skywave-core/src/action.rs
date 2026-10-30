@@ -1,7 +1,7 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
 use crate::store::BlobPolicy;
-use crate::view::{ApprovalId, BlobId, Decision, SessionId};
+use crate::view::{ApprovalId, BlobId, CommandId, Decision, SessionId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -28,6 +28,14 @@ pub enum Action {
         text: String,
         cursor: usize,
     },
+    /// Take back one of this device's messages or session creations that
+    /// the server never saw, or dismiss one it refused. Only items shown as
+    /// `discardable` can be; anything else is a no-op.
+    Discard(CommandId),
+    /// Take back a `discardable` message into its session's draft, ahead of
+    /// what the draft held, to edit and send again. The session view's
+    /// `draft_rev` changes so heads refill their composer.
+    EditQueued(CommandId),
     ResolveApproval {
         id: ApprovalId,
         decision: Decision,
