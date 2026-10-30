@@ -1,6 +1,6 @@
 //! Mirrors of [`skywave_core::Action`] and [`skywave_core::Route`]. A head
 //! builds an [`Action`] and the core takes it through `TryFrom`, which fails
-//! with an [`ActionError`] on an id that is not a UUID (D16). Core → FFI
+//! with [`SkywaveError::InvalidId`] on an id that is not a UUID (D16). Core → FFI
 //! (`From`) exists too, so actions round-trip.
 //!
 //! Tuple variants become named fields (`Discard { command_id }`,
@@ -9,6 +9,7 @@
 use skywave_core as sc;
 use uuid::Uuid;
 
+use crate::error::SkywaveError;
 use crate::view::{BlobPolicy, Decision, chars_to_utf16, id, utf16_to_chars};
 
 /// A user intent for the core.
@@ -114,18 +115,10 @@ pub enum Route {
     Pairing,
 }
 
-/// Why an [`Action`] from the head could not be handed to the core.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
-pub enum ActionError {
-    /// `name` (e.g. `session_id`) holds `input`, which is not a UUID.
-    #[error("{name} is not a valid id: {input:?}")]
-    InvalidId { name: String, input: String },
-}
-
-fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, ActionError> {
+fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, SkywaveError> {
     match Uuid::parse_str(&input) {
         Ok(uuid) => Ok(T::from(uuid)),
-        Err(_) => Err(ActionError::InvalidId {
+        Err(_) => Err(SkywaveError::InvalidId {
             name: name.to_owned(),
             input,
         }),
@@ -133,9 +126,9 @@ fn parse<T: From<Uuid>>(name: &str, input: String) -> Result<T, ActionError> {
 }
 
 impl TryFrom<Action> for sc::Action {
-    type Error = ActionError;
+    type Error = SkywaveError;
 
-    fn try_from(a: Action) -> Result<Self, ActionError> {
+    fn try_from(a: Action) -> Result<Self, SkywaveError> {
         Ok(match a {
             Action::Pair {
                 address,
@@ -469,7 +462,7 @@ mod tests {
         let err = sc::Action::try_from(bad).unwrap_err();
         assert_eq!(
             err,
-            ActionError::InvalidId {
+            SkywaveError::InvalidId {
                 name: "id".into(),
                 input: "not-a-uuid".into(),
             }
@@ -481,7 +474,7 @@ mod tests {
         };
         assert!(matches!(
             sc::Action::try_from(empty),
-            Err(ActionError::InvalidId { name, .. }) if name == "blob_id"
+            Err(SkywaveError::InvalidId { name, .. }) if name == "blob_id"
         ));
     }
 
