@@ -22,6 +22,7 @@ unicode-width = "0.2"
 skywave-proto.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+rusqlite.workspace = true
 # End-to-end tests (tests/e2e.rs) run a real server with the fake agent.
 # Test-only: never a normal dependency.
 serde_json.workspace = true

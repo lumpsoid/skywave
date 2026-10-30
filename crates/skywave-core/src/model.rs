@@ -22,7 +22,7 @@ use crate::store::{
 };
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyView,
-    CallId, CommandId, Decision, DeviceId, Entry, ErrorInfo, Link, Outgoing, PairedInfo,
+    CallId, CommandId, Decision, DeviceId, Draft, Entry, ErrorInfo, Link, Outgoing, PairedInfo,
     PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId, SessionListView,
     SessionRow, SessionState, SessionView, SettingsView, TimelineItem, ToolApproval, ToolOutcome,
     ToolView, ViewState,
@@ -35,6 +35,8 @@ pub(crate) enum Effect {
     /// Write the command to the outbox.
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
+    /// Keep the session's draft; `None` deletes it.
+    SaveDraft(SessionId, Option<Draft>),
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
     /// Hand to the engine once every persistence effect succeeded.
@@ -78,6 +80,8 @@ pub(crate) struct Model {
     /// Oldest first, finished entries included.
     outbox: Vec<OutboxEntry>,
     blobs: BTreeMap<BlobId, BlobRecord>,
+    /// This device's unsent messages, as stored.
+    drafts: HashMap<SessionId, Draft>,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
 }
@@ -96,6 +100,7 @@ impl Model {
             sessions: Vec::new(),
             outbox: Vec::new(),
             blobs: BTreeMap::new(),
+            drafts: HashMap::new(),
             open: None,
         };
         model.reload(snapshot);
@@ -110,6 +115,7 @@ impl Model {
         self.sessions = snapshot.sessions;
         self.outbox = snapshot.outbox;
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
+        self.drafts = snapshot.drafts;
         self.open = None;
     }
 
@@ -146,8 +152,18 @@ impl Model {
                 if text.trim().is_empty() || self.summary(session_id).is_none() {
                     return Vec::new();
                 }
-                self.enqueue(CommandKind::SendMessage { session_id, text })
+                let effects = self.enqueue(CommandKind::SendMessage { session_id, text });
+                // The store drops the draft with the enqueue.
+                if !effects.is_empty() {
+                    self.drafts.remove(&session_id);
+                }
+                effects
             }
+            Action::SaveDraft {
+                session_id,
+                text,
+                cursor,
+            } => self.save_draft(session_id, text, cursor),
             Action::ResolveApproval { id, decision } => {
                 if !self.can_answer(id) {
                     return Vec::new();
@@ -250,6 +266,26 @@ impl Model {
             Effect::Enqueue(command),
             Effect::Request(Request::OutboxChanged),
         ]
+    }
+
+    /// Keeps the session's draft; blank text drops it. Nothing to write when
+    /// the draft is unchanged or the session unknown.
+    fn save_draft(&mut self, session_id: SessionId, text: String, cursor: usize) -> Vec<Effect> {
+        if self.summary(session_id).is_none() {
+            return Vec::new();
+        }
+        let draft = (!text.trim().is_empty()).then(|| Draft {
+            cursor: cursor.min(text.chars().count()),
+            text,
+        });
+        if self.drafts.get(&session_id) == draft.as_ref() {
+            return Vec::new();
+        }
+        match &draft {
+            Some(draft) => self.drafts.insert(session_id, draft.clone()),
+            None => self.drafts.remove(&session_id),
+        };
+        vec![Effect::SaveDraft(session_id, draft)]
     }
 
     /// Pending in the replica and not already answered from this device
@@ -378,7 +414,7 @@ impl Model {
             }),
             Place::SessionList => Screen::SessionList(self.session_list()),
             Place::Session(id) => match self.session_view(id) {
-                Some(view) => Screen::Session(view),
+                Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list()),
             },
         }
@@ -404,6 +440,7 @@ impl Model {
                 state: session_state(s),
                 pending_approvals: s.pending_approvals.len(),
                 last_activity: s.last_activity,
+                has_draft: self.drafts.contains_key(&s.id),
             })
             .collect();
         let creating = self
@@ -463,6 +500,7 @@ impl Model {
             pending_approval,
             interrupt,
             stop,
+            draft: self.drafts.get(&id).cloned(),
         })
     }
 
@@ -863,7 +901,7 @@ mod tests {
 
         fn session_view(&self) -> SessionView {
             match self.model.view().screen {
-                Screen::Session(view) => view,
+                Screen::Session(view) => *view,
                 other => panic!("expected the session screen, got {other:?}"),
             }
         }
@@ -883,6 +921,7 @@ mod tests {
             outbox: Vec::new(),
             blobs: Vec::new(),
             settings: Settings::default(),
+            drafts: HashMap::new(),
         }
     }
 
@@ -1378,6 +1417,76 @@ mod tests {
             .blob_status(output.id, BlobStatus::Available { path: path.clone() });
         assert_eq!(output_state(&f), BlobState::Available { path });
         assert!(f.dispatch(Action::DownloadBlob(output.id)).is_empty());
+    }
+
+    fn save_draft(session_id: SessionId, text: &str, cursor: usize) -> Action {
+        Action::SaveDraft {
+            session_id,
+            text: text.into(),
+            cursor,
+        }
+    }
+
+    #[test]
+    fn save_draft_is_shown_and_send_clears_it() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let other = f.session("/srv/b");
+        let draft = Draft {
+            text: "héllo".into(),
+            cursor: 5,
+        };
+        // The cursor is clamped to the text's chars.
+        assert_eq!(
+            f.dispatch(save_draft(sid, "héllo", 99)),
+            vec![Effect::SaveDraft(sid, Some(draft.clone()))]
+        );
+        let rows = f.list_view().sessions;
+        let has_draft = |id| rows.iter().find(|r| r.id == id).unwrap().has_draft;
+        assert!(has_draft(sid) && !has_draft(other));
+        f.open(sid);
+        assert_eq!(f.session_view().draft, Some(draft));
+
+        queued(&f.dispatch(Action::SendMessage {
+            session_id: sid,
+            text: "héllo".into(),
+        }));
+        assert_eq!(f.session_view().draft, None, "the enqueue drops it");
+
+        // Whitespace is no draft: saving it deletes the stored one.
+        f.dispatch(save_draft(sid, "x", 1));
+        assert_eq!(
+            f.dispatch(save_draft(sid, " \n ", 2)),
+            vec![Effect::SaveDraft(sid, None)]
+        );
+        assert_eq!(f.session_view().draft, None);
+    }
+
+    #[test]
+    fn unchanged_draft_emits_no_effect() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        assert!(
+            f.dispatch(save_draft(sid, "   ", 0)).is_empty(),
+            "blank over no draft writes nothing"
+        );
+        assert!(
+            f.dispatch(save_draft(SessionId::new(), "x", 1)).is_empty(),
+            "unknown session"
+        );
+        assert_eq!(f.dispatch(save_draft(sid, "abc", 3)).len(), 1);
+        assert!(f.dispatch(save_draft(sid, "abc", 3)).is_empty());
+        assert_eq!(
+            f.dispatch(save_draft(sid, "abc", 1)),
+            vec![Effect::SaveDraft(
+                sid,
+                Some(Draft {
+                    text: "abc".into(),
+                    cursor: 1
+                })
+            )],
+            "a moved cursor is a change"
+        );
     }
 
     #[test]

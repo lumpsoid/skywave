@@ -1,5 +1,5 @@
 //! The TUI against a real core, without a terminal or a network: keys go in
-//! through `App::on_key`, actions go to `Core::dispatch`, engine reports go
+//! through `handle_key`, actions go to `Core::dispatch`, engine reports go
 //! in through `core.seam()`, and frames are checked on ratatui's
 //! `TestBackend`.
 
@@ -13,7 +13,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
-    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, DeviceId,
+    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, DeviceId, Draft,
     FailReason, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam, Seq,
     SessionId, ViewState,
 };
@@ -22,7 +22,7 @@ use skywave_proto::{
     SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywave_tui::App;
-use skywave_tui::app::PairUri;
+use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri};
 use skywave_tui::timeline::ItemKey;
 use skywave_tui::ui;
 
@@ -30,7 +30,7 @@ const FP: &str = "ab:cd:ef";
 
 /// A core over a temp dir, the TUI over it, and the engine's side.
 struct Harness {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     core: Core,
     seam: Seam,
     requests: Receiver<Request>,
@@ -41,7 +41,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
-        let dir = tempfile::tempdir().unwrap();
+        Harness::open(tempfile::tempdir().unwrap())
+    }
+
+    fn open(dir: tempfile::TempDir) -> Harness {
         let core = Core::open_detached(dir.path()).unwrap();
         let seam = core.seam();
         let requests = seam.take_requests().unwrap();
@@ -50,13 +53,54 @@ impl Harness {
         let t0 = Instant::now();
         let app = App::new(views.recv().unwrap(), t0);
         Harness {
-            _dir: dir,
+            dir,
             core,
             seam,
             requests,
             views,
             app,
             t0,
+        }
+    }
+
+    /// Drops the core and the TUI without quitting, as a crash does, and
+    /// starts both again over the same data.
+    fn restart(self) -> Harness {
+        let Harness { dir, core, app, .. } = self;
+        drop((core, app));
+        Harness::open(dir)
+    }
+
+    /// The idle save the event loop makes once the first unsaved edit is
+    /// old enough.
+    fn idle_save(&mut self) {
+        skywave_tui::save_draft(
+            &mut self.app,
+            &self.core,
+            Instant::now() + DRAFT_SAVE_AFTER,
+            false,
+        );
+        self.sync();
+    }
+
+    /// Makes every enqueue fail (`true`), as a full disk would, or work
+    /// again.
+    fn fail_enqueue(&self, fail: bool) {
+        let db = self.dir.path().join(skywave_core::store::DB_FILE);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch(if fail {
+            "CREATE TRIGGER full BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+        } else {
+            "DROP TRIGGER full"
+        })
+        .unwrap();
+    }
+
+    /// The draft the core keeps for the open session.
+    fn core_draft(&self) -> Option<Draft> {
+        match self.core.view().screen {
+            Screen::Session(view) => view.draft,
+            other => panic!("expected the session screen, got {other:?}"),
         }
     }
 
@@ -89,12 +133,9 @@ impl Harness {
         self.key_with(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    /// A key press, handled as the event loop does.
     fn key_with(&mut self, key: KeyEvent) -> Option<Action> {
-        let action = self.app.on_key(key);
-        if let Some(action) = &action {
-            let result = self.core.dispatch(action.clone());
-            self.app.dispatched(result);
-        }
+        let action = skywave_tui::handle_key(&mut self.app, &self.core, key);
         self.sync();
         action
     }
@@ -899,7 +940,7 @@ fn own_messages_show_their_delivery_state() {
         })
     );
     assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
-    assert_eq!(h.app.draft(id).unwrap().text(), "", "sent drafts clear");
+    assert_eq!(h.app.composer().unwrap().text(), "", "sent drafts clear");
     let command = last_command(&h);
     let screen = h.screen();
     assert_contains(&screen, "you [queued]: q? line one");
@@ -958,7 +999,7 @@ fn own_messages_show_their_delivery_state() {
     assert!(!h.app.typing());
     h.app.on_paste("pasted\r\nlines");
     assert!(h.app.typing());
-    assert_eq!(h.app.draft(id).unwrap().text(), "pasted\nlines");
+    assert_eq!(h.app.composer().unwrap().text(), "pasted\nlines");
 }
 
 #[test]
@@ -1453,11 +1494,120 @@ fn session_keys_are_in_help_and_footer() {
 #[test]
 fn drafts_survive_leaving_the_session() {
     let (mut h, id, _) = open_session();
-    h.type_text("half a thought");
+    h.type_text("half a thöught");
+    h.key(KeyCode::Left);
     h.key(KeyCode::Esc);
-    h.key(KeyCode::Esc);
+    // Leaving saves the draft first; the list marks the session.
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "✎ draft");
+
+    // The TUI kept no copy: the composer comes back from the core.
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
-    assert_contains(&h.screen(), "│half a thought");
+    let composer = h.app.composer().unwrap();
+    assert_eq!(composer.text(), "half a thöught");
+    assert_eq!(composer.cursor_chars(), 13);
+    assert_contains(&h.screen(), "│half a thöught");
+
+    // Sending clears it everywhere.
+    h.key(KeyCode::Enter);
+    assert_eq!(h.core_draft(), None);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    assert!(!line_with(&h.screen(), "/srv/work").contains("draft"));
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.composer().unwrap().text(), "");
+}
+
+#[test]
+fn drafts_survive_a_restart() {
+    let (mut h, id, _) = open_session();
+    h.type_text("before the crash");
+    for _ in 0..3 {
+        h.key(KeyCode::Left);
+    }
+    h.idle_save();
+
+    let mut h = h.restart();
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "✎ draft");
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    let composer = h.app.composer().unwrap();
+    assert_eq!(composer.text(), "before the crash");
+    assert_eq!(composer.cursor_chars(), 13);
+
+    // Quitting saves what the idle timer has not yet.
+    h.type_text("X");
+    h.key_with(ctrl('c'));
+    assert!(h.app.ui().quit);
+    let mut h = h.restart();
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.composer().unwrap().text(), "before the crXash");
+}
+
+#[test]
+fn idle_draft_is_saved_once() {
+    let (mut h, _, _) = open_session();
+    let before = Instant::now();
+    h.type_text("abc");
+    // Typing writes nothing.
+    assert_eq!(h.core_draft(), None);
+    assert!(h.app.draft_due_in(Instant::now()).unwrap() <= DRAFT_SAVE_AFTER);
+    assert_eq!(
+        h.app.draft_save(before, false),
+        None,
+        "not idle long enough"
+    );
+
+    h.idle_save();
+    assert_eq!(
+        h.core_draft(),
+        Some(Draft {
+            text: "abc".into(),
+            cursor: 3
+        })
+    );
+    assert_eq!(h.app.draft_due_in(before), None);
+    let later = Instant::now() + 10 * DRAFT_SAVE_AFTER;
+    assert_eq!(h.app.draft_save(later, false), None, "saved once");
+    assert_eq!(h.app.draft_save(later, true), None, "even when forced");
+
+    h.type_text("d");
+    assert!(h.app.draft_save(later, false).is_some());
+}
+
+#[test]
+fn failed_send_keeps_the_text() {
+    let (mut h, id, _) = open_session();
+    h.type_text("keep");
+    h.idle_save();
+    h.type_text(" me");
+    h.fail_enqueue(true);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SendMessage {
+            session_id: id,
+            text: "keep me".into(),
+        })
+    );
+    assert!(h.app.ui().error.is_some());
+    assert_eq!(h.app.composer().unwrap().text(), "keep me");
+    assert_eq!(
+        h.core_draft().map(|d| d.text),
+        Some("keep".into()),
+        "the core's draft is kept too"
+    );
+
+    // A save right after is not a sent message: the text stays.
+    h.idle_save();
+    assert_eq!(h.app.composer().unwrap().text(), "keep me");
+    assert_eq!(h.core_draft().map(|d| d.text), Some("keep me".into()));
+
+    h.fail_enqueue(false);
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.composer().unwrap().text(), "");
+    assert_eq!(h.core_draft(), None);
 }
 
 #[test]

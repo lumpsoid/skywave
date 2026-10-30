@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
-use skywave_core::{BlobPolicy, BlobStatus, OutboxStatus, Settings, Store, StoreError};
+use skywave_core::{BlobPolicy, BlobStatus, Draft, OutboxStatus, Settings, Store, StoreError};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
     DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState, ToolResult,
@@ -513,6 +513,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_drafts(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -534,6 +535,11 @@ fn drop_outbox_delivery_columns(dir: &Path) {
          ALTER TABLE outbox DROP COLUMN answered_at;",
     )
     .unwrap();
+}
+
+fn drop_drafts(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE drafts").unwrap();
 }
 
 #[test]
@@ -596,6 +602,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_drafts(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -605,4 +612,67 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn drafts_round_trip_and_blank_deletes() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let draft = |text: &str, cursor| Draft {
+        text: text.into(),
+        cursor,
+    };
+    {
+        let store = Store::open(&dir).unwrap();
+        store.set_draft(a, Some(&draft("héllo\nwörld", 7))).unwrap();
+        store.set_draft(b, Some(&draft("first", 0))).unwrap();
+        store.set_draft(b, Some(&draft("second", 6))).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let drafts = store.load().unwrap().drafts;
+    assert_eq!(drafts.len(), 2);
+    assert_eq!(drafts[&a], draft("héllo\nwörld", 7));
+    assert_eq!(drafts[&b], draft("second", 6), "a save replaces the draft");
+
+    store.set_draft(a, None).unwrap();
+    store.set_draft(SessionId::new(), None).unwrap();
+    assert_eq!(store.drafts().unwrap().keys().collect::<Vec<_>>(), [&b]);
+}
+
+#[test]
+fn enqueue_message_clears_its_draft_atomically() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let draft = |text: &str| Draft {
+        text: text.into(),
+        cursor: 0,
+    };
+    let store = Store::open(&dir).unwrap();
+    store.set_draft(a, Some(&draft("to a"))).unwrap();
+    store.set_draft(b, Some(&draft("to b"))).unwrap();
+
+    // Other commands leave drafts alone.
+    store
+        .enqueue(&Command {
+            id: CommandId::new(),
+            kind: CommandKind::Interrupt { session_id: a },
+        })
+        .unwrap();
+    assert_eq!(store.drafts().unwrap().len(), 2);
+
+    // An enqueue that fails after deleting the draft keeps it: the outbox
+    // insert comes second and aborts the whole transaction.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(store.enqueue(&send(a, "to a")).is_err());
+    assert_eq!(store.drafts().unwrap().len(), 2);
+    assert_eq!(store.pending_outbox().unwrap().len(), 1);
+
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    store.enqueue(&send(a, "to a")).unwrap();
+    assert_eq!(store.drafts().unwrap().keys().collect::<Vec<_>>(), [&b]);
+    assert_eq!(store.pending_outbox().unwrap().len(), 2);
 }

@@ -2,6 +2,8 @@
 //! cursor, and its layout into rows of a given width. Pure text editing; what
 //! a message may contain is the core's call.
 
+use std::time::Instant;
+
 /// Spaces a tab is expanded to; a terminal cell grid has no tab stops here.
 const TAB: &str = "    ";
 
@@ -13,6 +15,9 @@ pub struct Composer {
     /// Enter was pressed; the draft is cleared once the core takes the
     /// message and kept if dispatching fails.
     pub(crate) submitted: bool,
+    /// When the first edit the core has not saved yet was made; `None`
+    /// while the core has the text and cursor as shown.
+    pub(crate) dirty_since: Option<Instant>,
 }
 
 /// One screen row of the composer: a slice of the text.
@@ -23,12 +28,37 @@ pub struct Row {
 }
 
 impl Composer {
+    /// A composer holding a saved draft, the cursor `cursor_chars` chars in
+    /// (clamped to the text).
+    pub fn from_draft(text: String, cursor_chars: usize) -> Composer {
+        let cursor = text
+            .char_indices()
+            .nth(cursor_chars)
+            .map_or(text.len(), |(i, _)| i);
+        Composer {
+            text,
+            cursor,
+            submitted: false,
+            dirty_since: None,
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The cursor counted in chars, as the core keeps it.
+    pub fn cursor_chars(&self) -> usize {
+        self.text[..self.cursor].chars().count()
+    }
+
+    /// Marks an edit (the cursor counts: it is saved too).
+    fn touch(&mut self) {
+        self.dirty_since.get_or_insert_with(Instant::now);
     }
 
     pub fn is_blank(&self) -> bool {
@@ -51,6 +81,7 @@ impl Composer {
         }
         self.text.insert_str(self.cursor, &clean);
         self.cursor += clean.len();
+        self.touch();
     }
 
     pub fn newline(&mut self) {
@@ -60,30 +91,35 @@ impl Composer {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.touch();
     }
 
     pub fn backspace(&mut self) {
         if let Some(c) = self.text[..self.cursor].chars().next_back() {
             self.cursor -= c.len_utf8();
             self.text.remove(self.cursor);
+            self.touch();
         }
     }
 
     pub fn delete(&mut self) {
         if self.cursor < self.text.len() {
             self.text.remove(self.cursor);
+            self.touch();
         }
     }
 
     pub fn left(&mut self) {
         if let Some(c) = self.text[..self.cursor].chars().next_back() {
             self.cursor -= c.len_utf8();
+            self.touch();
         }
     }
 
     pub fn right(&mut self) {
         if let Some(c) = self.text[self.cursor..].chars().next() {
             self.cursor += c.len_utf8();
+            self.touch();
         }
     }
 
@@ -99,10 +135,12 @@ impl Composer {
 
     pub fn home(&mut self) {
         self.cursor = self.line_start(self.cursor);
+        self.touch();
     }
 
     pub fn end(&mut self) {
         self.cursor = self.line_end(self.cursor);
+        self.touch();
     }
 
     /// Moves to the same column of the previous line (`up`) or the next.
@@ -126,6 +164,7 @@ impl Composer {
             .char_indices()
             .nth(column)
             .map_or(target_end, |(i, _)| target + i);
+        self.touch();
     }
 
     /// Splits the text into rows of at most `width` characters: one or more
@@ -226,6 +265,22 @@ mod tests {
         c.vertical(false);
         c.vertical(false);
         assert_eq!(c.cursor(), 8);
+    }
+
+    #[test]
+    fn from_draft_clamps_cursor_to_chars() {
+        let c = Composer::from_draft("héllo wörld".into(), 8);
+        assert_eq!(c.cursor(), "héllo wö".len());
+        assert_eq!(c.cursor_chars(), 8);
+        assert_eq!(c.dirty_since, None, "the core has it already");
+        let c = Composer::from_draft("ñ".into(), 5);
+        assert_eq!((c.cursor(), c.cursor_chars()), (2, 1));
+        let mut c = Composer::from_draft(String::new(), 3);
+        assert_eq!(c.cursor(), 0);
+        c.left();
+        assert_eq!(c.dirty_since, None, "nothing moved");
+        c.insert("x");
+        assert!(c.dirty_since.is_some());
     }
 
     #[test]

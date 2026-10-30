@@ -1442,6 +1442,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "rusqlite",
  "serde_json",
  "skywave-core",
  "skywave-proto",

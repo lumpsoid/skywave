@@ -396,7 +396,7 @@ impl Client {
         let Screen::Session(session) = view.screen else {
             unreachable!()
         };
-        session
+        *session
     }
 }
 

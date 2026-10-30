@@ -181,10 +181,7 @@ impl Tui {
     /// A key press; its action goes to the core, as the event loop does.
     fn key_event(&mut self, key: KeyEvent) {
         self.pump();
-        if let Some(action) = self.app.on_key(key) {
-            let result = self.core.dispatch(action);
-            self.app.dispatched(result);
-        }
+        skywave_tui::handle_key(&mut self.app, &self.core, key);
         self.pump();
     }
 

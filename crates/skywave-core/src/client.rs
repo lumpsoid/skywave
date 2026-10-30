@@ -170,6 +170,7 @@ impl Core {
                 let done = match effect {
                     Effect::Enqueue(command) => state.store.enqueue(&command),
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
+                    Effect::SaveDraft(id, draft) => state.store.set_draft(id, draft.as_ref()),
                     Effect::LoadSession(id) => state
                         .store
                         .session_events(id)
