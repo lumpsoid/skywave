@@ -315,6 +315,19 @@ pub struct SessionUi {
     pub composer: Composer,
     /// The core's [`SessionView::draft_rev`] the composer was filled at.
     draft_rev: u64,
+    /// Earlier prompts being recalled into the composer; any edit ends it.
+    history: Option<HistoryNav>,
+}
+
+/// Browsing [`SessionView::prompts`] in the composer.
+#[derive(Debug, Clone)]
+struct HistoryNav {
+    /// Taken when browsing starts, so new prompts do not shift `index`.
+    list: Vec<String>,
+    /// The prompt shown; 0 is the newest.
+    index: usize,
+    /// What was being written before browsing, restored past the newest.
+    stash: Composer,
 }
 
 impl SessionUi {
@@ -328,7 +341,50 @@ impl SessionUi {
             geometry: RefCell::default(),
             composer: composer_of(view),
             draft_rev: view.draft_rev,
+            history: None,
         }
+    }
+
+    /// While browsing earlier prompts: the shown one's place, 1 the newest,
+    /// and how many there are.
+    pub fn history_position(&self) -> Option<(usize, usize)> {
+        self.history
+            .as_ref()
+            .map(|nav| (nav.index + 1, nav.list.len()))
+    }
+
+    /// Shows the next older (`older`) or newer earlier prompt; newer than
+    /// the newest is the text that was being written. The shown text is
+    /// the draft: it is saved like typed text.
+    fn recall(&mut self, view: &SessionView, older: bool) {
+        let Some(nav) = &mut self.history else {
+            let list: Vec<String> = view.prompts().into_iter().map(str::to_owned).collect();
+            if older && let Some(newest) = list.first() {
+                let stash = self.composer.clone();
+                self.composer.replace(newest);
+                self.history = Some(HistoryNav {
+                    list,
+                    index: 0,
+                    stash,
+                });
+            }
+            return;
+        };
+        if older {
+            if nav.index + 1 == nav.list.len() {
+                return;
+            }
+            nav.index += 1;
+        } else if nav.index == 0 {
+            if let Some(nav) = self.history.take() {
+                self.composer = nav.stash;
+                self.composer.dirty_since.get_or_insert_with(Instant::now);
+            }
+            return;
+        } else {
+            nav.index -= 1;
+        }
+        self.composer.replace(&nav.list[nav.index]);
     }
 
     /// Refills the composer, focused, when the core rewrote the draft.
@@ -336,6 +392,7 @@ impl SessionUi {
         if view.draft_rev != self.draft_rev {
             self.draft_rev = view.draft_rev;
             self.composer = composer_of(view);
+            self.history = None;
             self.focus = Focus::Composer;
         }
     }
@@ -630,6 +687,7 @@ impl App {
         }
         if let Some(session) = &mut self.ui.session {
             session.focus = Focus::Composer;
+            session.history = None;
             session.composer.insert(text);
             return;
         }
@@ -818,6 +876,22 @@ impl App {
             Focus::Composer => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                // Earlier prompts: Ctrl-P/N from any line, Up/Down past the
+                // first/last line. Any other key ends browsing.
+                let older = match key.code {
+                    KeyCode::Char('p') if ctrl => Some(true),
+                    KeyCode::Char('n') if ctrl => Some(false),
+                    KeyCode::Up => Some(true),
+                    KeyCode::Down => Some(false),
+                    _ => None,
+                };
+                if let Some(older) = older {
+                    if ctrl || !session.composer.vertical(older) {
+                        session.recall(view, older);
+                    }
+                    return None;
+                }
+                session.history = None;
                 let draft = &mut session.composer;
                 match key.code {
                     KeyCode::Esc => session.focus = Focus::Timeline,
@@ -835,8 +909,6 @@ impl App {
                     KeyCode::Delete => draft.delete(),
                     KeyCode::Left => draft.left(),
                     KeyCode::Right => draft.right(),
-                    KeyCode::Up => draft.vertical(true),
-                    KeyCode::Down => draft.vertical(false),
                     KeyCode::Home => draft.home(),
                     KeyCode::End => draft.end(),
                     KeyCode::Char('u') if ctrl => draft.clear(),

@@ -253,6 +253,29 @@ pub struct SessionView {
     pub draft_rev: u64,
 }
 
+impl SessionView {
+    /// The messages sent into the session, newest first, for a head to
+    /// recall into its composer: every device's logged messages, then this
+    /// device's not yet logged, a message repeated back to back listed once.
+    pub fn prompts(&self) -> Vec<&str> {
+        let mut prompts: Vec<&str> = Vec::new();
+        for item in self.timeline.iter().rev() {
+            let text = match item {
+                TimelineItem::Logged {
+                    entry: Entry::UserMessage { text, .. },
+                    ..
+                }
+                | TimelineItem::Pending { text, .. } => text.as_str(),
+                TimelineItem::Logged { .. } => continue,
+            };
+            if prompts.last() != Some(&text) {
+                prompts.push(text);
+            }
+        }
+        prompts
+    }
+}
+
 /// A message being written on this device, kept in the local store and never
 /// synced (D5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,4 +469,66 @@ pub struct SettingsView {
     pub blob_policy: BlobPolicy,
     pub server_address: Option<String>,
     pub device_id: Option<DeviceId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logged(seq: u64, entry: Entry) -> TimelineItem {
+        TimelineItem::Logged {
+            seq: Seq(seq),
+            at: DateTime::UNIX_EPOCH,
+            entry,
+        }
+    }
+
+    fn message(seq: u64, text: &str, own: bool) -> TimelineItem {
+        logged(
+            seq,
+            Entry::UserMessage {
+                command_id: CommandId::new(),
+                text: text.into(),
+                from: DeviceId::new(),
+                own,
+                outgoing: None,
+                delivery: None,
+            },
+        )
+    }
+
+    fn pending(text: &str) -> TimelineItem {
+        TimelineItem::Pending {
+            command_id: CommandId::new(),
+            text: text.into(),
+            outgoing: Outgoing::Queued,
+            discardable: true,
+            delivery: None,
+        }
+    }
+
+    #[test]
+    fn prompts_are_newest_first_without_repeats() {
+        let view = SessionView {
+            id: SessionId::new(),
+            workdir: None,
+            state: SessionState::Idle,
+            timeline: vec![
+                message(1, "first", true),
+                logged(2, Entry::AgentMessage { text: "ok".into() }),
+                message(3, "again", false),
+                message(4, "again", true),
+                logged(5, Entry::Interrupted),
+                message(6, "first", true),
+                pending("queued"),
+                pending("queued"),
+            ],
+            pending_approval: None,
+            interrupt: None,
+            stop: None,
+            draft: None,
+            draft_rev: 0,
+        };
+        assert_eq!(view.prompts(), ["queued", "first", "again", "first"]);
+    }
 }

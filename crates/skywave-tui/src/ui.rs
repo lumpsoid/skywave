@@ -10,6 +10,7 @@ mod timeline;
 
 pub use timeline::{SHOW_BYTES, SHOW_LINES, bytes};
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::Frame;
@@ -389,8 +390,21 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
     );
 }
 
-/// Key hints for the footer.
-fn footer_hint(app: &App) -> &'static str {
+/// Key hints for the footer, and where the composer is while it shows an
+/// earlier prompt.
+fn footer_hint(app: &App) -> Cow<'static, str> {
+    if !app.ui().help
+        && let Some((_, ui)) = app.session()
+        && ui.focus == Focus::Composer
+        && let Some((at, of)) = ui.history_position()
+    {
+        return format!("history {at}/{of} · Ctrl-P/N older/newer · edit to keep · Enter send")
+            .into();
+    }
+    footer_keys(app).into()
+}
+
+fn footer_keys(app: &App) -> &'static str {
     if app.ui().help {
         return "Esc close help";
     }
@@ -525,6 +539,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("Ctrl-J", "new line (also Alt-Enter, Shift-Enter)"),
                     key("paste", "inserts text, line breaks included"),
                     key("←→↑↓ Home End", "move the cursor"),
+                    key(
+                        "Ctrl-P / N",
+                        "earlier / later sent message (also ↑ on the first line, ↓ on the last)",
+                    ),
                     key("Ctrl-U", "clear the message"),
                     key("Esc", "go to the timeline"),
                 ]),

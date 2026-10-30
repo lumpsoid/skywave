@@ -1610,6 +1610,143 @@ fn failed_send_keeps_the_text() {
     assert_eq!(h.core_draft(), None);
 }
 
+/// [`open_session`] with `prompts` in the log, oldest first, sent from this
+/// device.
+fn session_with_prompts(prompts: &[&str]) -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    let events = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| event(id, i as u32 + 1, user(me, text)))
+        .collect();
+    pull(&mut h, events);
+    (h, id, me)
+}
+
+fn composer_text(h: &Harness) -> String {
+    h.app.composer().unwrap().text().to_owned()
+}
+
+#[test]
+fn up_at_the_top_recalls_earlier_prompts_and_down_restores_the_draft() {
+    let (mut h, id, me) = session_with_prompts(&["first", "two\nlines", "third"]);
+    h.type_text("half");
+    h.idle_save();
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "third");
+    assert_contains(&h.screen(), "history 1/3");
+    // The recalled text is the draft, saved like typed text.
+    h.idle_save();
+    assert_eq!(h.core_draft().map(|d| d.text), Some("third".into()));
+
+    // A multi-line prompt: Up moves through its lines before going older.
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "two\nlines");
+    assert_contains(&h.screen(), "history 2/3");
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "two\nlines", "moved to the first line");
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "first");
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "first", "the oldest stays");
+
+    // New prompts while browsing do not shift it.
+    pull(&mut h, vec![event(id, 9, user(me, "newer"))]);
+    assert_contains(&h.screen(), "history 3/3");
+
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "two\nlines");
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "third");
+    h.key(KeyCode::Down);
+    let composer = h.app.composer().unwrap();
+    assert_eq!((composer.text(), composer.cursor_chars()), ("half", 4));
+    assert!(!h.screen().contains("history"));
+    h.idle_save();
+    assert_eq!(h.core_draft().map(|d| d.text), Some("half".into()));
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "half", "nothing newer than the draft");
+}
+
+#[test]
+fn ctrl_p_recalls_from_any_line() {
+    let (mut h, _, _) = session_with_prompts(&["older", "newest"]);
+    h.type_text("line one");
+    h.key_with(ctrl('j'));
+    h.type_text("line two");
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "line one\nline two", "Up moved a line");
+    h.key(KeyCode::Down);
+    h.key_with(ctrl('p'));
+    assert_eq!(composer_text(&h), "newest");
+    h.key_with(ctrl('p'));
+    assert_eq!(composer_text(&h), "older");
+    h.key_with(ctrl('n'));
+    h.key_with(ctrl('n'));
+    assert_eq!(composer_text(&h), "line one\nline two");
+
+    // No prompts: nothing to recall.
+    let (mut h, _, _) = open_session();
+    h.type_text("x");
+    h.key_with(ctrl('p'));
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "x");
+    assert!(!h.screen().contains("history"));
+}
+
+#[test]
+fn editing_a_recalled_prompt_ends_browsing() {
+    let (mut h, id, _) = session_with_prompts(&["older", "newest"]);
+    h.type_text("draft");
+    h.key(KeyCode::Up);
+    h.type_text("!");
+    assert_eq!(composer_text(&h), "newest!");
+    assert!(!h.screen().contains("history"));
+    // Down no longer goes back to the old draft; Up starts over.
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "newest!");
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "newest");
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "newest!");
+
+    // A cursor move ends it too, and leaving keeps the shown text.
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Left);
+    h.key(KeyCode::Down);
+    assert_eq!(composer_text(&h), "older");
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    assert_eq!(composer_text(&h), "newest");
+}
+
+#[test]
+fn history_includes_other_devices_and_pending_messages() {
+    let (mut h, id, me) = open_session();
+    let other = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, user(me, "mine")),
+            event(id, 2, agent("ok")),
+            event(id, 3, user(other, "from the laptop")),
+            event(id, 4, user(other, "from the laptop")),
+        ],
+    );
+    h.type_text("queued");
+    h.key(KeyCode::Enter);
+    let mut recalled = Vec::new();
+    for _ in 0..4 {
+        h.key_with(ctrl('p'));
+        recalled.push(composer_text(&h));
+    }
+    assert_eq!(recalled, ["queued", "from the laptop", "mine", "mine"]);
+    assert_contains(&h.screen(), "history 3/3");
+}
+
 #[test]
 fn offline_composer_says_messages_wait() {
     let (mut h, _, _) = open_session();

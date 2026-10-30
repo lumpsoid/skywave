@@ -88,6 +88,13 @@ impl Composer {
         self.insert("\n");
     }
 
+    /// Replaces the whole text, the cursor at its end; an edit like any.
+    pub fn replace(&mut self, text: &str) {
+        self.text = text.to_owned();
+        self.cursor = self.text.len();
+        self.touch();
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -143,19 +150,21 @@ impl Composer {
         self.touch();
     }
 
-    /// Moves to the same column of the previous line (`up`) or the next.
-    pub fn vertical(&mut self, up: bool) {
+    /// Moves to the same column of the previous line (`up`) or the next;
+    /// `false` if the cursor is already on the first (last) line. Lines are
+    /// logical: a wrapped line is one line.
+    pub fn vertical(&mut self, up: bool) -> bool {
         let start = self.line_start(self.cursor);
         let column = self.text[start..self.cursor].chars().count();
         let target = if up {
             if start == 0 {
-                return;
+                return false;
             }
             self.line_start(start - 1)
         } else {
             let end = self.line_end(self.cursor);
             if end == self.text.len() {
-                return;
+                return false;
             }
             end + 1
         };
@@ -165,6 +174,7 @@ impl Composer {
             .nth(column)
             .map_or(target_end, |(i, _)| target + i);
         self.touch();
+        true
     }
 
     /// Splits the text into rows of at most `width` characters: one or more
@@ -265,6 +275,28 @@ mod tests {
         c.vertical(false);
         c.vertical(false);
         assert_eq!(c.cursor(), 8);
+    }
+
+    #[test]
+    fn vertical_reports_when_it_hits_an_edge() {
+        let mut c = composer("ab\ncd");
+        assert!(!c.vertical(false), "already on the last line");
+        assert!(c.vertical(true));
+        assert!(!c.vertical(true), "already on the first line");
+        assert_eq!(c.cursor(), 2);
+        let mut c = composer("a long line that wraps");
+        c.dirty_since = None;
+        assert!(!c.vertical(true), "a wrapped line is one line");
+        assert!(!c.vertical(false));
+        assert_eq!(c.dirty_since, None, "nothing moved");
+    }
+
+    #[test]
+    fn replace_puts_the_cursor_at_the_end() {
+        let mut c = Composer::from_draft("old".into(), 0);
+        c.replace("néw");
+        assert_eq!((c.text(), c.cursor()), ("néw", "néw".len()));
+        assert!(c.dirty_since.is_some());
     }
 
     #[test]
