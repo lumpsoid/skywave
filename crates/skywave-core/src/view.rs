@@ -59,7 +59,8 @@ pub struct Attention {
     /// Counts from 0 in every core and only grows: it is always 0 in the
     /// first snapshot, as it is bumped only once online. Heads alert when
     /// it grows within the core's lifetime, taking 0, not the first
-    /// snapshot, as where it started.
+    /// snapshot, as where it started. Which approvals a bump was for is
+    /// each one's [`PendingApprovalRef::alerted_at`].
     pub alerts: u64,
 }
 
@@ -71,6 +72,12 @@ pub struct PendingApprovalRef {
     /// The session's title, as [`SessionRow::title`]. Text from the
     /// server: heads sanitise it before writing it anywhere raw.
     pub title: String,
+    /// The value [`Attention::alerts`] was bumped to when this approval
+    /// alerted in this core, or 0 if it has not alerted here: not yet,
+    /// judged no news (answered here), or alerted by an earlier process.
+    /// A head that saw `alerts` at `n` notifies for every approval with
+    /// `alerted_at > n`, and never for one at 0.
+    pub alerted_at: u64,
 }
 
 /// State of the connection to the server.

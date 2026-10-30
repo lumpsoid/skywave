@@ -132,6 +132,10 @@ pub struct PendingApprovalRef {
     pub session_id: String,
     /// Text from the server: sanitise before writing it anywhere raw.
     pub title: String,
+    /// The `alerts` value this approval alerted at in this core, 0 if it
+    /// has not alerted here (not yet, no news, or an earlier process
+    /// alerted). Notify for those above the last `alerts` seen.
+    pub alerted_at: u64,
 }
 
 impl From<sc::PendingApprovalRef> for PendingApprovalRef {
@@ -140,11 +144,13 @@ impl From<sc::PendingApprovalRef> for PendingApprovalRef {
             id: approval,
             session_id,
             title,
+            alerted_at,
         } = p;
         PendingApprovalRef {
             id: id(approval.0),
             session_id: id(session_id.0),
             title,
+            alerted_at,
         }
     }
 }
@@ -2015,6 +2021,7 @@ mod tests {
                     id: approval,
                     session_id: session,
                     title: "t".into(),
+                    alerted_at: 5,
                 }],
                 elsewhere: 1,
                 alerts: 6,
@@ -2032,6 +2039,7 @@ mod tests {
                         id: s(approval.0),
                         session_id: s(session.0),
                         title: "t".into(),
+                        alerted_at: 5,
                     }],
                     elsewhere: 1,
                     alerts: 6,

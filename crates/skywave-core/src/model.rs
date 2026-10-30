@@ -153,6 +153,9 @@ pub(crate) struct Model {
     alerted: HashSet<ApprovalId>,
     /// How often new approvals came in ([`Attention::alerts`]).
     alerts: u64,
+    /// What `alerts` was bumped to for each pending approval that alerted
+    /// in this process ([`PendingApprovalRef::alerted_at`]); in memory only.
+    alerted_at: HashMap<ApprovalId, u64>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
 }
@@ -187,6 +190,7 @@ impl Model {
             open: None,
             alerted: HashSet::new(),
             alerts: 0,
+            alerted_at: HashMap::new(),
             completer: Completer::default(),
         };
         // An approval pending at start that no process alerted on yet (one
@@ -212,8 +216,14 @@ impl Model {
         // during a catch-up must still alert once it is over, and one
         // alerted on whose mark failed to store must not alert again.
         self.alerted.extend(snapshot.alerted);
+        self.forget_resolved_alerts();
+    }
+
+    /// Drops what is kept about approvals no longer pending.
+    fn forget_resolved_alerts(&mut self) {
         let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
         self.alerted.retain(|id| pending.contains(id));
+        self.alerted_at.retain(|id, _| pending.contains(id));
     }
 
     /// The session on screen, whose events the model needs.
@@ -612,20 +622,23 @@ impl Model {
         if !matches!(self.link, Link::Online { .. }) {
             return Vec::new();
         }
-        let pending: Vec<(SessionId, ApprovalId)> =
-            self.pending_approvals().map(|(s, id)| (s.id, id)).collect();
-        self.alerted
-            .retain(|id| pending.iter().any(|(_, pending)| pending == id));
-        let marked: Vec<_> = pending
-            .into_iter()
-            .filter(|(_, id)| self.alerted.insert(*id))
+        self.forget_resolved_alerts();
+        let marked: Vec<(SessionId, ApprovalId)> = self
+            .pending_approvals()
+            .map(|(s, id)| (s.id, id))
+            .filter(|(_, id)| !self.alerted.contains(id))
             .collect();
+        self.alerted.extend(marked.iter().map(|(_, id)| *id));
         // One answered here was seen; it is never news.
-        if marked
+        let news: Vec<ApprovalId> = marked
             .iter()
-            .any(|(_, id)| self.local_answer(*id, &[], true).is_none())
-        {
+            .map(|(_, id)| *id)
+            .filter(|id| self.local_answer(*id, &[], true).is_none())
+            .collect();
+        if !news.is_empty() {
             self.alerts += 1;
+            let at = self.alerts;
+            self.alerted_at.extend(news.into_iter().map(|id| (id, at)));
         }
         marked
     }
@@ -732,8 +745,7 @@ impl Model {
             self.wanted.remove(blob);
             self.failed.remove(blob);
         }
-        let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
-        self.alerted.retain(|id| pending.contains(id));
+        self.forget_resolved_alerts();
         if self.place == Place::Session(id) {
             self.place = Place::Archived;
             self.open = None;
@@ -783,6 +795,7 @@ impl Model {
         self.wanted.clear();
         self.failed.clear();
         self.alerted.clear();
+        self.alerted_at.clear();
         self.completer = Completer::default();
         if had_drafts {
             self.draft_rev += 1;
@@ -850,6 +863,7 @@ impl Model {
                     id,
                     session_id,
                     title: self.title(self.summary(session_id)?).text,
+                    alerted_at: self.alerted_at.get(&id).copied().unwrap_or(0),
                 })
             })
             .collect();
@@ -3904,6 +3918,7 @@ mod tests {
         let id = ApprovalId::new();
         f.log(sid, vec![approval_requested(id, None)]);
         assert_eq!(alerts(&f), 1);
+        assert_eq!(f.model.view().attention.approvals[0].alerted_at, 1);
         let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
         assert_eq!(model.view().attention.alerts, 0, "counts from zero");
         assert!(model.set_link(ONLINE).is_empty(), "nothing new to store");
@@ -3911,6 +3926,10 @@ mod tests {
         assert_eq!(attention.alerts, 0);
         assert_eq!(attention.approvals.len(), 1);
         assert_eq!(attention.approvals[0].title, "app");
+        assert_eq!(
+            attention.approvals[0].alerted_at, 0,
+            "an earlier process alerted on it"
+        );
     }
 
     #[test]
@@ -3934,6 +3953,7 @@ mod tests {
         }));
         let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
         assert_eq!(model.view().attention.alerts, 0, "not before online");
+        assert_eq!(model.view().attention.approvals[0].alerted_at, 0);
         assert!(model.set_link(catching_up()).is_empty());
         assert_eq!(model.view().attention.alerts, 0, "nor while catching up");
         let mut marked = model.set_link(ONLINE);
@@ -3944,12 +3964,18 @@ mod tests {
         let attention = model.view().attention;
         assert_eq!(attention.alerts, 1);
         assert_eq!(
-            attention.approvals.iter().map(|a| a.id).collect::<Vec<_>>(),
-            vec![id]
+            attention
+                .approvals
+                .iter()
+                .map(|a| (a.id, a.alerted_at))
+                .collect::<Vec<_>>(),
+            vec![(id, 1)],
+            "heads learn the first snapshot's approval alerted"
         );
         model.set_link(catching_up());
         model.set_link(ONLINE);
         assert_eq!(model.view().attention.alerts, 1, "once only");
+        assert_eq!(model.view().attention.approvals[0].alerted_at, 1);
     }
 
     #[test]
@@ -3999,6 +4025,62 @@ mod tests {
             events: f.events.clone(),
         });
         assert_eq!(f.model, before);
+    }
+
+    #[test]
+    fn each_approval_tells_the_alert_it_rang_for() {
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        // Answered here while catching up, the answer then refused: it shows
+        // again, but was never news.
+        let mine = ApprovalId::new();
+        f.log(sid, vec![approval_requested(mine, None)]);
+        let answer = queued(&f.dispatch(Action::ResolveApproval {
+            id: mine,
+            decision: Decision::Approve,
+            rule: None,
+        }));
+        f.model.command_result(
+            answer.id,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownRule,
+            },
+            Utc::now(),
+        );
+        f.model.set_link(ONLINE);
+        let at = |f: &Fixture| {
+            let mut at: Vec<_> = f
+                .model
+                .view()
+                .attention
+                .approvals
+                .iter()
+                .map(|a| (a.id, a.alerted_at))
+                .collect();
+            at.sort();
+            at
+        };
+        assert_eq!(alerts(&f), 0);
+        assert_eq!(at(&f), vec![(mine, 0)]);
+
+        let first = ApprovalId::new();
+        f.log(sid, vec![approval_requested(first, None)]);
+        let (b, c) = (ApprovalId::new(), ApprovalId::new());
+        f.log(
+            sid,
+            vec![approval_requested(b, None), approval_requested(c, None)],
+        );
+        assert_eq!(alerts(&f), 2);
+        let mut want = vec![(mine, 0), (first, 1), (b, 2), (c, 2)];
+        want.sort();
+        assert_eq!(at(&f), want);
+
+        // Resolved, it is forgotten; a resync keeps the rest.
+        f.log(sid, vec![resolved(first)]);
+        f.model.reload(snapshot(&f.model));
+        want.retain(|(id, _)| *id != first);
+        assert_eq!(at(&f), want);
     }
 
     #[test]

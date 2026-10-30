@@ -95,7 +95,7 @@ internal object ApprovalSamples {
 
     /** [n] approvals waiting in other sessions. */
     fun elsewhere(n: Int) = Attention(
-        List(n) { PendingApprovalRef("ap-x$it", "s-x$it", "Other session $it") },
+        List(n) { PendingApprovalRef("ap-x$it", "s-x$it", "Other session $it", 0u) },
         n.toULong(),
         n.toULong(),
     )

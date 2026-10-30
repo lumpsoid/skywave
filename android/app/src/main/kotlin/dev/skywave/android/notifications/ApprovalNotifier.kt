@@ -1,6 +1,5 @@
 package dev.skywave.android.notifications
 
-import dev.skywave.core.Link
 import dev.skywave.core.Screen
 import dev.skywave.core.ViewState
 import kotlinx.coroutines.flow.Flow
@@ -23,16 +22,23 @@ interface Notifications {
 
 /**
  * Turns snapshots into approval notifications (architecture.md, "New approval
- * while Online"). The core decides when to alert (D2): this only posts when
- * `attention.alerts` grows, for the approvals it has not accounted for yet,
- * and takes each notification down once its approval leaves
- * `attention.approvals` (answered here or elsewhere, or cancelled).
+ * while Online"). The core decides what to alert for (D2): each pending
+ * approval carries the `attention.alerts` value it alerted at in this core
+ * (`alertedAt`, 0 if it has not alerted here), so this posts every approval
+ * whose `alertedAt` is above the last `alerts` it saw, and takes each
+ * notification down once its approval leaves `attention.approvals` (answered
+ * here or elsewhere, or cancelled). That includes an approval already in the
+ * first snapshot that alerts later (pulled by a catch-up an earlier process
+ * cut short), and never one an earlier process alerted for: the core reports
+ * those at 0.
  *
- * The last seen `alerts` is kept in memory, not persisted: the core counts
- * from zero in every process and never alerts for what was pending at start,
- * so a restart cannot re-alert, and a persisted count would swallow the next
- * process's first alerts. What does outlive the process is the shade itself,
- * read back through [Notifications.active] so stale notifications still go.
+ * The last seen `alerts` is kept in memory, not persisted, and starts at 0:
+ * the core counts from zero in every process and its first snapshot is
+ * always 0, so this may attach after that snapshot and still miss nothing,
+ * while a persisted count would swallow the next process's first alerts.
+ * There is one core per process, so one count per notifier is enough. What
+ * does outlive the process is the shade itself, read back through
+ * [Notifications.active] so stale notifications still go.
  *
  * Not thread-safe: feed it from one coroutine ([follow]).
  *
@@ -43,15 +49,11 @@ class ApprovalNotifier(
     private val notifications: Notifications,
     private val inForeground: () -> Boolean,
 ) {
-    /** `alerts` of the last snapshot; null before the first. */
-    private var seenAlerts: ULong? = null
+    /** `alerts` of the last snapshot; the core's count starts at 0. */
+    private var seenAlerts: ULong = 0u
 
-    /**
-     * Approvals that need no notification from now on: posted, pending at
-     * start, or pending while online without `alerts` growing (the core
-     * judged them no news, e.g. answered here and the answer refused).
-     */
-    private val accounted = mutableSetOf<String>()
+    /** Whether the shade was read back yet. */
+    private var started = false
 
     /** Approvals this notifier believes have a notification up. */
     private val posted = mutableSetOf<String>()
@@ -59,26 +61,21 @@ class ApprovalNotifier(
     suspend fun follow(views: Flow<ViewState>) = views.collect(::onView)
 
     fun onView(view: ViewState) {
+        if (!started) {
+            // The shade may still hold what an earlier process posted.
+            posted += notifications.active()
+            started = true
+        }
         val approvals = view.attention.approvals
         val pending = approvals.mapTo(HashSet()) { it.id }
-        val last = seenAlerts
         val onScreen = (view.screen as? Screen.Session)?.view?.id?.takeIf { inForeground() }
-        if (last == null) {
-            // Pending at start is not news; the shade may still hold what an
-            // earlier process posted.
-            accounted += pending
-            posted += notifications.active()
-        } else if (view.attention.alerts > last) {
-            for (approval in approvals) {
-                if (!accounted.add(approval.id) || approval.sessionId == onScreen) continue
-                notifications.post(ApprovalAlert(approval.id, approval.sessionId, sanitiseTitle(approval.title)))
-                posted += approval.id
-            }
+        for (approval in approvals) {
+            // One in the session on screen was seen: it counts as handled.
+            if (approval.alertedAt <= seenAlerts || approval.id in posted || approval.sessionId == onScreen) continue
+            notifications.post(ApprovalAlert(approval.id, approval.sessionId, sanitiseTitle(approval.title)))
+            posted += approval.id
         }
-        seenAlerts = maxOf(last ?: 0u, view.attention.alerts)
-        // The core only decides while online: an approval that shows up while
-        // catching up alerts at the end if still pending, so it stays open.
-        if (view.link is Link.Online) accounted += pending
+        seenAlerts = maxOf(seenAlerts, view.attention.alerts)
         val onScreenIds = approvals.filter { it.sessionId == onScreen }.mapTo(HashSet()) { it.id }
         val gone = posted.filter { it !in pending || it in onScreenIds }
         for (id in gone) {

@@ -21,8 +21,9 @@ private val list = Screen.SessionList(
     SessionListView(kind = ListKind.ACTIVE, sessions = emptyList(), otherCount = 0u, creating = emptyList(), completion = null),
 )
 
-private fun approval(id: String, session: String = "s-$id", title: String = "Session $id") =
-    PendingApprovalRef(id = id, sessionId = session, title = title)
+/** A pending approval that alerted at [at] in this core, or not here at all (0). */
+private fun approval(id: String, at: Int = 0, session: String = "s-$id", title: String = "Session $id") =
+    PendingApprovalRef(id = id, sessionId = session, title = title, alertedAt = at.toULong())
 
 private fun view(
     alerts: Int,
@@ -64,59 +65,81 @@ class ApprovalNotifierTest {
     private val notifier = ApprovalNotifier(shade) { foreground }
 
     @Test
-    fun approvalsPendingAtStartAreNotPosted() {
+    fun approvalsThatDidNotAlertHereAreNeverPosted() {
+        // Alerted by an earlier process, answered here, or not alerted yet.
+        notifier.onView(view(0, approval("a"), approval("b")))
         notifier.onView(view(3, approval("a"), approval("b")))
-        notifier.onView(view(3, approval("a"), approval("b")))
+        notifier.onView(view(4, approval("a"), approval("b"), approval("c", at = 4)))
+        assertEquals(listOf("c"), shade.posts.map { it.approvalId })
+    }
+
+    @Test
+    fun anApprovalInTheFirstSnapshotIsPostedOnceItAlerts() {
+        // Pulled by a catch-up an earlier process cut short: the core alerts
+        // for it once online.
+        notifier.onView(view(0, approval("x"), link = Link.Connecting))
+        notifier.onView(view(0, approval("x"), link = Link.CatchingUp(have = 5u, server = 9u)))
         assertEquals(emptyList<ApprovalAlert>(), shade.posts)
+        notifier.onView(view(1, approval("x", at = 1)))
+        notifier.onView(view(1, approval("x", at = 1)))
+        assertEquals(listOf("x"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun aGrowingAlertCountPostsTheNewApprovalOnce() {
         notifier.onView(view(0, approval("a")))
-        notifier.onView(view(1, approval("a"), approval("b", session = "s1", title = "Fix the bug")))
-        notifier.onView(view(1, approval("a"), approval("b", session = "s1", title = "Fix the bug")))
-        notifier.onView(view(1, approval("a"), approval("b", session = "s1", title = "Fix the bug"), link = Link.Connecting))
+        val b = approval("b", at = 1, session = "s1", title = "Fix the bug")
+        notifier.onView(view(1, approval("a"), b))
+        notifier.onView(view(1, approval("a"), b))
+        notifier.onView(view(1, approval("a"), b, link = Link.Connecting))
         assertEquals(listOf(ApprovalAlert("b", "s1", "Fix the bug")), shade.posts)
     }
 
     @Test
-    fun newApprovalsWithoutAnAlertAreNotPosted() {
-        // Answered here and refused, or pending while online but judged no
-        // news by the core: alerts stays put, so nothing is posted, then or later.
+    fun approvalsJudgedNoNewsAreNotPosted() {
+        // Answered here and refused: the core never alerted for it.
         notifier.onView(view(0))
         notifier.onView(view(0, approval("a")))
-        notifier.onView(view(1, approval("a"), approval("b")))
+        notifier.onView(view(1, approval("a"), approval("b", at = 1)))
         assertEquals(listOf("b"), shade.posts.map { it.approvalId })
+    }
+
+    @Test
+    fun attachingAfterTheFirstSnapshotMissesNothing() {
+        // The core's count started at 0 before this notifier saw a snapshot.
+        notifier.onView(view(2, approval("a", at = 1), approval("b", at = 2), approval("c")))
+        assertEquals(listOf("a", "b"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun anApprovalSeenWhileCatchingUpIsPostedWhenItAlertsOnline() {
         notifier.onView(view(0, link = Link.CatchingUp(have = 1u, server = 9u)))
         notifier.onView(view(0, approval("a"), link = Link.CatchingUp(have = 5u, server = 9u)))
-        notifier.onView(view(1, approval("a")))
+        notifier.onView(view(1, approval("a", at = 1)))
         assertEquals(listOf("a"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun aRestartDoesNotRepostAndStillAlertsAfterwards() {
         notifier.onView(view(0))
-        notifier.onView(view(1, approval("a")))
-        // A new process: the core counts from zero again and "a" is not news.
+        notifier.onView(view(1, approval("a", at = 1)))
+        // A new process: the core counts from zero again and reports "a",
+        // alerted by the earlier one, at 0.
         val restarted = ApprovalNotifier(shade) { false }
         restarted.onView(view(0, approval("a"), link = Link.Connecting))
         restarted.onView(view(0, approval("a")))
         assertEquals(listOf("a"), shade.posts.map { it.approvalId })
         // Its first alert is posted, though the count is below the old one's.
-        restarted.onView(view(1, approval("a"), approval("b")))
+        restarted.onView(view(1, approval("a"), approval("b", at = 1)))
         assertEquals(listOf("a", "b"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun anApprovalLeavingTheListIsCancelled() {
         notifier.onView(view(0))
-        notifier.onView(view(1, approval("a")))
-        notifier.onView(view(2, approval("a"), approval("b")))
-        notifier.onView(view(2, approval("b")))
+        notifier.onView(view(1, approval("a", at = 1)))
+        notifier.onView(view(2, approval("a", at = 1), approval("b", at = 2)))
+        notifier.onView(view(2, approval("b", at = 2)))
         assertEquals(listOf("a"), shade.cancels)
         notifier.onView(view(2))
         assertEquals(listOf("a", "b"), shade.cancels)
@@ -133,16 +156,19 @@ class ApprovalNotifierTest {
         assertEquals(listOf("old"), leftover.cancels)
         fresh.onView(view(0))
         assertEquals(listOf("old", "kept"), leftover.cancels)
+        assertEquals(emptyList<ApprovalAlert>(), leftover.posts)
     }
 
     @Test
     fun notPostedWhileThatSessionIsOnScreenInTheForeground() {
         foreground = true
         notifier.onView(view(0, screen = onSession("s1")))
-        notifier.onView(view(1, approval("a", session = "s1"), screen = onSession("s1")))
+        notifier.onView(view(1, approval("a", at = 1, session = "s1"), screen = onSession("s1")))
         assertEquals(emptyList<ApprovalAlert>(), shade.posts)
         // Leaving the session does not post it late: the user saw it.
-        notifier.onView(view(1, approval("a", session = "s1")))
+        notifier.onView(view(1, approval("a", at = 1, session = "s1")))
+        foreground = false
+        notifier.onView(view(1, approval("a", at = 1, session = "s1")))
         assertEquals(emptyList<ApprovalAlert>(), shade.posts)
     }
 
@@ -150,26 +176,32 @@ class ApprovalNotifierTest {
     fun postedForOtherSessionsOrWhenInTheBackground() {
         foreground = true
         notifier.onView(view(0, screen = onSession("s1")))
-        notifier.onView(view(1, approval("a", session = "s2"), screen = onSession("s1")))
+        notifier.onView(view(1, approval("a", at = 1, session = "s2"), screen = onSession("s1")))
         foreground = false
-        notifier.onView(view(2, approval("a", session = "s2"), approval("b", session = "s1"), screen = onSession("s1")))
+        notifier.onView(
+            view(2, approval("a", at = 1, session = "s2"), approval("b", at = 2, session = "s1"), screen = onSession("s1")),
+        )
         assertEquals(listOf("a", "b"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun openingTheSessionInTheForegroundCancelsItsNotifications() {
         notifier.onView(view(0))
-        notifier.onView(view(1, approval("a", session = "s1"), approval("b", session = "s2")))
+        val both = arrayOf(approval("a", at = 1, session = "s1"), approval("b", at = 1, session = "s2"))
+        notifier.onView(view(1, *both))
         foreground = true
-        notifier.onView(view(1, approval("a", session = "s1"), approval("b", session = "s2"), screen = onSession("s1")))
+        notifier.onView(view(1, *both, screen = onSession("s1")))
         assertEquals(listOf("a"), shade.cancels)
         assertEquals(setOf("b"), shade.active())
+        // Leaving it again does not bring the notification back.
+        notifier.onView(view(1, *both))
+        assertEquals(listOf("a", "b"), shade.posts.map { it.approvalId })
     }
 
     @Test
     fun titlesAreSanitised() {
         notifier.onView(view(0))
-        notifier.onView(view(1, approval("a", title = "\u001bred\u0007\n  title\u202e")))
+        notifier.onView(view(1, approval("a", at = 1, title = "\u001bred\u0007\n  title‮")))
         assertEquals("red title", shade.posts.single().sessionTitle)
     }
 
@@ -179,7 +211,7 @@ class ApprovalNotifierTest {
         val state = MutableStateFlow(view(2, approval("a")))
         val job = launch { notifier.follow(state) }
         runCurrent()
-        state.value = view(3, approval("a"), approval("b"))
+        state.value = view(3, approval("a"), approval("b", at = 3))
         runCurrent()
         state.value = view(3, approval("a"))
         runCurrent()
@@ -192,7 +224,7 @@ class ApprovalNotifierTest {
 class SanitiseTitleTest {
     @Test
     fun controlAndFormatCharactersAreDropped() {
-        assertEquals("ab c", sanitiseTitle("a\u0000b\tc\u200f"))
+        assertEquals("ab c", sanitiseTitle("a\u0000b\tc‏"))
         assertEquals("", sanitiseTitle(" \u0001\n "))
     }
 
