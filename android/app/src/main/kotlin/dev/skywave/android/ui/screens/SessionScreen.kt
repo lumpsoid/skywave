@@ -57,6 +57,7 @@ import dev.skywave.android.R
 import dev.skywave.android.ui.ScreenScaffold
 import dev.skywave.android.ui.ShellChrome
 import dev.skywave.core.Action
+import dev.skywave.core.Attention
 import dev.skywave.core.Outgoing
 import dev.skywave.core.SessionState
 import dev.skywave.core.SessionView
@@ -80,37 +81,46 @@ internal object SessionTags {
 }
 
 /**
- * One session (D2: heads only render): its timeline, a composer whose
- * draft the core keeps, and the session's controls. Everything is keyed by
- * the session, so opening another one starts afresh.
+ * One session (D2: heads only render): its timeline, the approval its agent
+ * waits on, a composer whose draft the core keeps, and the session's
+ * controls. [attention] is the app's pending approvals, for the jump to the
+ * next one elsewhere. Everything is keyed by the session, so opening
+ * another one starts afresh.
  */
 @Composable
-fun SessionScreen(view: SessionView, chrome: ShellChrome, dispatch: (Action) -> Unit) {
-    key(view.id) { SessionContent(view, chrome, dispatch) }
+fun SessionScreen(view: SessionView, attention: Attention, chrome: ShellChrome, dispatch: (Action) -> Unit) {
+    key(view.id) { SessionContent(view, attention, chrome, dispatch) }
 }
 
 @Composable
-private fun SessionContent(view: SessionView, chrome: ShellChrome, dispatch: (Action) -> Unit) {
+private fun SessionContent(view: SessionView, attention: Attention, chrome: ShellChrome, dispatch: (Action) -> Unit) {
     val composer = rememberComposer(view, dispatch)
     val rows = remember(view.timeline, view.unreadFrom) { timelineRows(view.timeline, view.unreadFrom) }
     var renaming by rememberSaveable { mutableStateOf(false) }
+    val prompt = view.pendingApproval
+    // Each new approval opens the panel; a collapsed one stays so until reopened.
+    var approvalOpen by rememberSaveable(prompt?.id) { mutableStateOf(true) }
+    val gated = remember(prompt) { prompt?.let { GatedApproval(it) { approvalOpen = true } } }
+    val gatedKey = remember(rows, prompt) { gatedRowKey(rows, prompt) }
 
     ScreenScaffold(
         title = view.title,
         chrome = chrome,
-        actions = { SessionActions(view, dispatch, onRename = { renaming = true }) },
+        actions = {
+            NextApprovalButton(attention.elsewhere) { dispatch(Action.OpenNextApproval) }
+            SessionActions(view, dispatch, onRename = { renaming = true })
+        },
         bottomBar = {
             Column {
-                view.pendingApproval?.let { prompt ->
-                    Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            stringResource(R.string.sv_waiting_approval, prompt.tool, prompt.summary),
-                            color = MaterialTheme.colorScheme.onTertiaryContainer,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                        )
-                    }
+                if (prompt != null) {
+                    val tool = remember(view.timeline, prompt) { gatedTool(view.timeline, prompt) }
+                    ApprovalPanel(
+                        prompt = prompt,
+                        tool = tool,
+                        open = approvalOpen,
+                        onOpen = { approvalOpen = it },
+                        onAnswer = { decision, rule -> dispatch(Action.ResolveApproval(prompt.id, decision, rule)) },
+                    )
                 }
                 ComposerBar(composer, remember(view.prompts) { view.prompts.take(50) })
             }
@@ -126,7 +136,7 @@ private fun SessionContent(view: SessionView, chrome: ShellChrome, dispatch: (Ac
                         modifier = Modifier.align(Alignment.Center).padding(24.dp),
                     )
                 } else {
-                    Timeline(view, rows, dispatch, composer)
+                    Timeline(view, rows, dispatch, composer, gated, gatedKey)
                 }
             }
         }
@@ -151,7 +161,14 @@ private fun SessionContent(view: SessionView, chrome: ShellChrome, dispatch: (Ac
  * items since. Marks the session read when the bottom is on screen.
  */
 @Composable
-private fun Timeline(view: SessionView, rows: List<TimelineRow>, dispatch: (Action) -> Unit, composer: ComposerState) {
+private fun Timeline(
+    view: SessionView,
+    rows: List<TimelineRow>,
+    dispatch: (Action) -> Unit,
+    composer: ComposerState,
+    gated: GatedApproval?,
+    gatedKey: String?,
+) {
     val divider = remember { rows.indexOf(TimelineRow.Divider) }
     // Opens on the divider when there is news, else at the end; LazyColumn
     // pulls back to fill the screen when what follows is short.
@@ -208,7 +225,7 @@ private fun Timeline(view: SessionView, rows: List<TimelineRow>, dispatch: (Acti
             items(rows, key = { it.key }, contentType = { contentType(it) }) { row ->
                 when (row) {
                     TimelineRow.Divider -> NewDivider()
-                    is TimelineRow.Item -> TimelineItemView(row, actions)
+                    is TimelineRow.Item -> TimelineItemView(row, actions, gated?.takeIf { row.key == gatedKey })
                 }
             }
         }

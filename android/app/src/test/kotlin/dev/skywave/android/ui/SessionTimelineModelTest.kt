@@ -1,21 +1,37 @@
 package dev.skywave.android.ui
 
+import dev.skywave.android.ui.screens.ApprovalBody
+import dev.skywave.android.ui.screens.ApprovalSamples
 import dev.skywave.android.ui.screens.SessionSamples
 import dev.skywave.android.ui.screens.TextBlock
 import dev.skywave.android.ui.screens.TimelineRow
+import dev.skywave.android.ui.screens.answered
+import dev.skywave.android.ui.screens.approvalBody
 import dev.skywave.android.ui.screens.copyText
 import dev.skywave.android.ui.screens.firstLines
 import dev.skywave.android.ui.screens.formatBytes
 import dev.skywave.android.ui.screens.formatDuration
 import dev.skywave.android.ui.screens.formatTokens
+import dev.skywave.android.ui.screens.gatedRowKey
+import dev.skywave.android.ui.screens.gatedTool
 import dev.skywave.android.ui.screens.inlineCodeSpans
+import dev.skywave.android.ui.screens.shortDevice
 import dev.skywave.android.ui.screens.textBlocks
 import dev.skywave.android.ui.screens.timelineKey
 import dev.skywave.android.ui.screens.timelineRows
 import dev.skywave.android.ui.screens.usageLine
+import dev.skywave.core.ApprovalPrompt
+import dev.skywave.core.ApprovalStatus
+import dev.skywave.core.BodyFormat
+import dev.skywave.core.BodyView
 import dev.skywave.core.Entry
+import dev.skywave.core.FailReason
+import dev.skywave.core.Outgoing
+import dev.skywave.core.ToolKind
 import dev.skywave.core.TurnUsage
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** The timeline's pure parts: keys, the divider's place, markdown-lite, formats. */
@@ -112,5 +128,45 @@ class SessionTimelineModelTest {
         assertEquals("hello", copyText(SessionSamples.pending("p", "hello")))
         assertEquals("rate limited", copyText(SessionSamples.logged(1, Entry.AgentErrored("rate limited"))))
         assertEquals(null, copyText(SessionSamples.logged(1, Entry.Interrupted)))
+    }
+
+    @Test
+    fun theGatedRowIsTheCallThePromptNames() {
+        val view = ApprovalSamples.blocked(ApprovalSamples.editTool)
+        val prompt = view.pendingApproval!!
+        assertEquals("s:3", gatedRowKey(timelineRows(view.timeline, null), prompt))
+        assertEquals(ApprovalSamples.editTool.tool, gatedTool(view.timeline, prompt))
+        assertEquals(null, gatedRowKey(timelineRows(view.timeline, null), null))
+        // A call that is not in the timeline gates nothing there.
+        assertEquals(null, gatedTool(view.timeline, prompt.copy(call = "elsewhere")))
+        // With no logged call, the standalone approval is the gated item.
+        val v1 = prompt.copy(call = null)
+        val entry = SessionSamples.logged(7, Entry.Approval(prompt.id, "Bash", "ls", null, ApprovalStatus.Pending))
+        assertEquals("s:7", gatedRowKey(timelineRows(listOf(entry), null), v1))
+        assertEquals(null, gatedTool(listOf(entry), v1))
+    }
+
+    @Test
+    fun theApprovalBodyIsTheDiffTheContentOrTheCommand() {
+        fun body(tool: Entry.Tool) = approvalBody(ApprovalSamples.prompt(tool), tool.tool)
+        assertEquals(ApprovalBody.Diff(ApprovalSamples.diff, 6u, null), body(ApprovalSamples.editTool))
+        assertTrue(body(ApprovalSamples.writeTool) is ApprovalBody.Content)
+        assertEquals(ApprovalBody.Command("cargo test -p sync -- --nocapture"), body(ApprovalSamples.commandTool))
+        // A command too long for the title comes whole in the body.
+        val long = SessionSamples.tool(ToolKind.SHELL, "$ make all…", body = BodyView(BodyFormat.TEXT, "make all\n  -j8", 2u, null))
+        assertEquals(ApprovalBody.Command("make all\n  -j8"), body(long))
+        assertEquals(ApprovalBody.None, body(SessionSamples.tool(ToolKind.FETCH, "https://example.com")))
+        // No logged call: the prompt's summary is all there is.
+        val v1 = ApprovalPrompt("a", null, "Bash", "rm -rf build", null, emptyList(), null)
+        assertEquals(ApprovalBody.Content("rm -rf build", 1u, null), approvalBody(v1, null))
+    }
+
+    @Test
+    fun anAnswerStandsUnlessRefused() {
+        assertFalse(answered(null))
+        assertTrue(answered(ApprovalSamples.answer()))
+        assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Accepted(3u))))
+        assertFalse(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_ALREADY_RESOLVED))))
+        assertEquals("…000002", shortDevice(SessionSamples.OTHER))
     }
 }

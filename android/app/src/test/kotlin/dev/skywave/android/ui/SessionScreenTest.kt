@@ -33,7 +33,6 @@ import dev.skywave.android.ui.screens.SessionScreen
 import dev.skywave.android.ui.screens.SessionTags
 import dev.skywave.android.ui.screens.TimelineTags
 import dev.skywave.core.Action
-import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.Draft
 import dev.skywave.core.Entry
 import dev.skywave.core.FailReason
@@ -61,7 +60,7 @@ class SessionScreenTest {
         view = v
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
-                if (shown) SessionScreen(view, SessionSamples.noChrome, dispatch = { dispatched += it })
+                if (shown) SessionScreen(view, SessionSamples.noAttention, SessionSamples.noChrome, dispatch = { dispatched += it })
             }
         }
         compose.waitForIdle()
@@ -113,7 +112,7 @@ class SessionScreenTest {
         seeAt("s:5", "Shell", "cargo test -p sync", "test sync ... FAILED\nfailures: 1", "Failed (exit 101) in 8.3s")
         seeAt("s:6", "Write", "# Notes")
         seeAt("s:7", "Search", "in src/")
-        seeAt("s:8", "Fetch", "Denied from another device")
+        seeAt("s:8", "Fetch", "Denied on another device (…000002)")
         seeAt("s:9", "Subagent", "Cancelled: turn ended")
         seeAt("s:10", "Tool Frobnicate", "No result")
         seeAt("s:11", "Running since")
@@ -346,14 +345,6 @@ class SessionScreenTest {
         compose.waitForIdle()
         tag(SessionTags.INTERRUPT).assertDoesNotExist()
         tag(SessionTags.STATUS).assert(hasText("Idle", substring = true))
-    }
-
-    @Test
-    fun pendingApprovalShowsAsStatusOnly() {
-        val prompt = ApprovalPrompt("ap", "call", "Bash", "rm -rf build", null, emptyList(), null)
-        show(SessionSamples.view(state = SessionState.AwaitingApproval("ap"), pendingApproval = prompt))
-        text("Waiting for approval: Bash rm -rf build").assertExists()
-        tag(SessionTags.INTERRUPT).assertExists()
     }
 
     @Test

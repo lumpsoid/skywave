@@ -6,6 +6,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import dev.skywave.android.ui.ShellChrome
 import dev.skywave.android.ui.SkywaveTheme
 import dev.skywave.core.ApprovalPrompt
+import dev.skywave.core.Attention
 import dev.skywave.core.ApprovalStatus
 import dev.skywave.core.BlobState
 import dev.skywave.core.BlobView
@@ -34,6 +35,7 @@ internal object SessionSamples {
     private const val T0 = 1_761_800_000_000L
 
     val noChrome = ShellChrome(banners = {}, snackbarHost = {}, onUp = {})
+    val noAttention = Attention(emptyList(), 0u, 0u)
 
     fun logged(seq: Int, entry: Entry) = TimelineItem.Logged(seq.toULong(), T0 + seq * 1000L, entry)
 
@@ -162,9 +164,10 @@ internal object SessionSamples {
 }
 
 @Composable
-private fun SessionPreview(view: SessionView) = SkywaveTheme(dynamicColor = false) {
-    SessionScreen(view, SessionSamples.noChrome, dispatch = {})
-}
+internal fun SessionPreview(view: SessionView, attention: Attention = SessionSamples.noAttention) =
+    SkywaveTheme(dynamicColor = false) {
+        SessionScreen(view, attention, SessionSamples.noChrome, dispatch = {})
+    }
 
 @Preview(name = "Session: every entry", heightDp = 1600)
 @Composable

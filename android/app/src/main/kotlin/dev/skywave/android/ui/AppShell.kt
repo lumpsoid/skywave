@@ -99,7 +99,7 @@ fun AppShell(
     when (screen) {
         is Screen.Pairing -> PairingScreen(screen.view, chrome, dispatch, pairInbox)
         is Screen.SessionList -> SessionListScreen(screen.view, chrome, dispatch)
-        is Screen.Session -> SessionScreen(screen.view, chrome, dispatch)
+        is Screen.Session -> SessionScreen(screen.view, state.attention, chrome, dispatch)
         is Screen.Settings -> SettingsScreen(screen.view, chrome, dispatch, about)
     }
 }

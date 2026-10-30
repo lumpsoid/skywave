@@ -68,7 +68,7 @@
     <string name="sv_tool_failed">Failed in %1$s</string>
     <string name="sv_tool_failed_status">Failed (%1$s) in %2$s</string>
     <string name="sv_tool_denied_me">Denied by you</string>
-    <string name="sv_tool_denied_other">Denied from another device</string>
+    <string name="sv_tool_denied_other">Denied on another device (%1$s)</string>
     <string name="sv_tool_cancelled">Cancelled: %1$s</string>
     <string name="sv_tool_no_result">No result</string>
     <string name="sv_tool_expand">Show details</string>
@@ -83,16 +83,15 @@
     <string name="sv_tool_call">Call %1$s: %2$s</string>
     <string name="sv_tool_result">Result: %1$s</string>
 
-    <!-- Approvals (status only; answering is A12) -->
+    <!-- Approvals in the timeline; answering them is strings_approvals.xml. Another device is named by its id. -->
     <string name="sv_approval">Approval for %1$s: %2$s</string>
     <string name="sv_approval_pending">Waiting for approval</string>
     <string name="sv_approval_approved_me">Approved by you</string>
-    <string name="sv_approval_approved_other">Approved from another device</string>
+    <string name="sv_approval_approved_other">Approved on another device (%1$s)</string>
     <string name="sv_approval_denied_me">Denied by you</string>
-    <string name="sv_approval_denied_other">Denied from another device</string>
+    <string name="sv_approval_denied_other">Denied on another device (%1$s)</string>
     <string name="sv_approval_rule">, with rule: %1$s</string>
     <string name="sv_approval_cancelled">Approval cancelled: %1$s</string>
-    <string name="sv_waiting_approval">Waiting for approval: %1$s %2$s</string>
 
     <!-- Blobs (state only; downloading is A13) -->
     <string name="sv_blob_not_downloaded">%1$s, not downloaded</string>
