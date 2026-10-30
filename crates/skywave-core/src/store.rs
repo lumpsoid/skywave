@@ -141,6 +141,11 @@ UPDATE sessions SET first_prompt = (
 -- events, so every session starts active: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- `SessionSummary::usage` as JSON. A replica from before this holds no
+-- turn usage events, so every session starts without: nothing to backfill.
+ALTER TABLE sessions ADD COLUMN usage TEXT;
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -803,7 +808,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived";
+    stopped, notable, name, first_prompt, archived, usage";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -818,7 +823,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
         ),
         params![
             summary.id.0.to_string(),
@@ -832,6 +837,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.name,
             summary.first_prompt,
             summary.archived,
+            summary.usage.as_ref().map(to_json).transpose()?,
         ],
     )?;
     Ok(())
@@ -854,6 +860,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         name: row.get(8)?,
         first_prompt: row.get(9)?,
         archived: row.get(10)?,
+        usage: opt_json_col(row, 11)?,
     })
 }
 

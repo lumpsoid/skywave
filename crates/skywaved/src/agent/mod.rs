@@ -26,7 +26,10 @@
 //!   as it knows it (before the first turn ends).
 //! - A turn begins with a user message and ends with exactly one
 //!   [`AdapterEvent::TurnEnded`]. A message sent while a turn runs is queued
-//!   by the agent and starts the next turn.
+//!   by the agent and starts the next turn. What the turn took (time,
+//!   tokens, cost, model) may come just before as [`AdapterEvent::TurnUsage`],
+//!   per-turn figures: an adapter whose agent reports running totals turns
+//!   them into the turn's share.
 //! - An approval blocks the agent until [`AgentSession::answer_approval`] (D8).
 //!   It may offer lasting rules ([`RuleSuggestion`]s, labelled by the
 //!   adapter); an approval can grant one of them by its index, which only
@@ -52,7 +55,7 @@ use std::path::PathBuf;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{Decision, SessionId};
-pub use skywave_proto::{RuleScope, RuleSuggestion};
+pub use skywave_proto::{RuleScope, RuleSuggestion, TurnUsage};
 use tokio::sync::mpsc;
 
 use crate::db::Db;
@@ -196,6 +199,10 @@ pub enum AdapterEvent {
         request: AgentRequestId,
         reason: String,
     },
+    /// What the turn took, figures for this turn alone; reported at most
+    /// once a turn, just before its `TurnEnded`, and only with something in
+    /// it. Optional: an agent that measures nothing never sends it.
+    TurnUsage(TurnUsage),
     /// The current turn is over.
     TurnEnded(TurnOutcome),
     /// The handle to persist for resuming this session; replaces any earlier.

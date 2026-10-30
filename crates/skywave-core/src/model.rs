@@ -754,6 +754,7 @@ impl Model {
                         Some(mark) => s.notable.saturating_sub(mark.notable),
                         None => s.notable,
                     },
+                    cost_usd: s.usage.as_ref().and_then(|u| u.total.cost_usd),
                 }
             })
             .collect();
@@ -838,6 +839,7 @@ impl Model {
             timeline,
             pending_approval,
             rules,
+            usage: summary.usage.clone(),
             interrupt,
             stop,
             draft: self.drafts.get(&id).cloned(),
@@ -1089,6 +1091,7 @@ impl Model {
                         LogState::Idle | LogState::AgentWorking => None,
                     }
                 }
+                EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
                 // Shown in the header.
                 EventKind::SessionCreated { .. } => None,
             };

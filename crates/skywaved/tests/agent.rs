@@ -688,6 +688,38 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
     assert_eq!(suggestions[7].label, "rule 5");
 }
 
+#[test]
+fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
+    use skywaved::agent::TurnUsage;
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id);
+    let usage = TurnUsage {
+        duration_ms: Some(12_400),
+        cost_usd: Some(0.04),
+        ..TurnUsage::default()
+    };
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnUsage(TurnUsage::default()),
+            AdapterEvent::TurnUsage(usage.clone()),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            AdapterEvent::TurnUsage(usage.clone()),
+        ],
+    );
+    assert_eq!(
+        f.kinds(),
+        [
+            state(SessionState::AgentWorking),
+            EventKind::TurnUsage(usage),
+            state(SessionState::Idle),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn exit_with_a_pending_approval_cancels_it() {
     let mut f = Fixture::new();

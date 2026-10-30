@@ -10,7 +10,8 @@
 //! **Turns.** The adapter, not the CLI, queues a message sent while a turn
 //! runs: the next user message is written only after the turn's `result`, so
 //! every written message is exactly one turn, framed by `TurnStarted` and
-//! exactly one `TurnEnded`.
+//! exactly one `TurnEnded`. The `result` ending a turn also gives what the
+//! turn took, reported just before as `TurnUsage` ([`usage::turn_usage`]).
 //!
 //! **Approvals.** A `can_use_tool` request is reported as `ApprovalRequested`
 //! and stays pending, with no timeout (D8), until it is answered, the CLI
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 use skywave_proto::Decision;
 use uuid::Uuid;
 
-use super::{display, rules};
+use super::{display, rules, usage};
 use crate::agent::{AdapterEvent, AgentCallId, AgentRequestId, ResumeHandle, TurnOutcome};
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -163,6 +164,8 @@ pub struct Protocol {
     /// The last stdout line that was not JSON (startup errors may land here).
     stray_output: Option<String>,
     version: Option<String>,
+    /// The model the latest `system/init` named.
+    model: Option<String>,
     turn_open: bool,
     interrupt_sent: bool,
     queued: VecDeque<String>,
@@ -187,6 +190,7 @@ impl Protocol {
             error: None,
             stray_output: None,
             version: None,
+            model: None,
             turn_open: false,
             interrupt_sent: false,
             queued: VecDeque::new(),
@@ -368,6 +372,9 @@ impl Protocol {
 
     fn on_init(&mut self, message: &Value, out: &mut Output) {
         self.check_version(message.get("claude_code_version").and_then(Value::as_str));
+        if let Some(model) = message.get("model").and_then(Value::as_str) {
+            self.model = Some(model.to_owned());
+        }
         if !self.turn_open {
             // A turn the CLI started on its own; frame it all the same.
             self.turn_open = true;
@@ -589,6 +596,10 @@ impl Protocol {
                 request: pending.request,
                 reason: reason.to_owned(),
             });
+        }
+        let usage = usage::turn_usage(message, self.model.as_deref());
+        if !usage.is_empty() {
+            out.events.push(AdapterEvent::TurnUsage(usage));
         }
         out.events.push(AdapterEvent::TurnEnded(outcome));
         self.tools.clear();

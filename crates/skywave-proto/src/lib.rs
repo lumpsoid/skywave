@@ -21,9 +21,9 @@ use uuid::Uuid;
 /// `CommandKind::SetSessionArchived` and `EventKind::SessionArchived`;
 /// `suggestions` on `EventKind::ApprovalRequested`, the `rule` granted with
 /// `CommandKind::ResolveApproval` and `EventKind::ApprovalResolved`, and
-/// `RejectReason::UnknownRule`. One v4 carries every wire change of its
-/// release; no compatibility layer: the exact version check at `hello`
-/// rejects older clients.
+/// `RejectReason::UnknownRule`; `EventKind::TurnUsage`. One v4 carries
+/// every wire change of its release; no compatibility layer: the exact
+/// version check at `hello` rejects older clients.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 macro_rules! uuid_id {
@@ -194,6 +194,10 @@ pub enum EventKind {
         by: DeviceId,
     },
     SessionStateChanged(SessionState),
+    /// What the turn that is ending took, as the agent reported it; logged
+    /// just before the turn's closing `SessionStateChanged`, at most once a
+    /// turn. Not notable.
+    TurnUsage(TurnUsage),
 }
 
 impl EventKind {
@@ -215,7 +219,8 @@ impl EventKind {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
-            | EventKind::SessionStateChanged(_) => None,
+            | EventKind::SessionStateChanged(_)
+            | EventKind::TurnUsage(_) => None,
         }
     }
 }
@@ -450,6 +455,32 @@ mod compat {
                 output: wire.output,
             })
         }
+    }
+}
+
+/// What one turn took, as the agent reported it when the turn ended.
+/// Agent-agnostic (D3): figures for this turn alone, never running totals.
+/// A figure the agent does not report is `None`, never 0; heads omit it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct TurnUsage {
+    /// Wall-clock time of the turn in milliseconds, time spent waiting for
+    /// approvals included.
+    pub duration_ms: Option<u64>,
+    /// Tokens the model read over the turn's requests, cached ones included.
+    pub tokens_in: Option<u64>,
+    /// Tokens the model wrote over the turn's requests.
+    pub tokens_out: Option<u64>,
+    /// What the turn cost, in US dollars, as the agent priced it.
+    pub cost_usd: Option<f64>,
+    /// The model that ran the turn, as the agent names it.
+    pub model: Option<String>,
+}
+
+impl TurnUsage {
+    /// The agent reported nothing at all.
+    pub fn is_empty(&self) -> bool {
+        *self == TurnUsage::default()
     }
 }
 

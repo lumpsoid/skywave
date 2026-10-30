@@ -148,6 +148,10 @@ one back). An archived session keeps running, opens and works as usual, and
 a message to it from any device brings it back; its pending approvals still
 alert and still count for `Ctrl-G`.
 
+When the agent reports them, each turn ends with its time and cost, the
+session's status line shows the last turn's time, tokens and cost, the
+session's cost and the model, and the session list shows each session's cost.
+
 | Key | Session view |
 |-----|--------------|
 | `i` / `c` | Focus the composer |

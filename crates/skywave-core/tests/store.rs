@@ -10,6 +10,7 @@ use skywave_core::{
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
     DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState, ToolResult,
+    TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -517,6 +518,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
@@ -573,6 +575,75 @@ fn drop_archived(dir: &Path) {
         .unwrap();
 }
 
+fn drop_usage(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN usage;")
+        .unwrap();
+}
+
+#[test]
+fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let turn = |minute, usage| event(id, minute, EventKind::TurnUsage(usage));
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                id,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/x".into(),
+                },
+            ),
+            turn(
+                1,
+                TurnUsage {
+                    duration_ms: Some(1_000),
+                    tokens_in: Some(3_000),
+                    tokens_out: Some(800),
+                    cost_usd: Some(0.25),
+                    model: Some("model-a".into()),
+                },
+            ),
+            turn(
+                2,
+                TurnUsage {
+                    duration_ms: Some(500),
+                    cost_usd: Some(0.5),
+                    ..TurnUsage::default()
+                },
+            ),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch).unwrap();
+    drop(store);
+
+    // Kept over a reopen.
+    let store = Store::open(&dir).unwrap();
+    let usage = store.session(id).unwrap().unwrap().usage.unwrap();
+    assert_eq!(usage.last_turn.duration_ms, Some(500));
+    assert_eq!(usage.last_turn.tokens_in, None);
+    assert_eq!(
+        usage.total,
+        TurnUsage {
+            duration_ms: Some(1_500),
+            tokens_in: Some(3_000),
+            tokens_out: Some(800),
+            cost_usd: Some(0.75),
+            model: Some("model-a".into()),
+        }
+    );
+    drop(store);
+
+    // A replica from before the column holds no usage events.
+    drop_usage(&dir);
+    set_user_version(&dir, 7);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.session(id).unwrap().unwrap().usage, None);
+}
+
 #[test]
 fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     let (_tmp, dir) = data_dir();
@@ -626,6 +697,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
 
     // A replica from before the column (protocol v3: it holds no archive
     // events): everything starts active.
+    drop_usage(&dir);
     drop_archived(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
@@ -701,6 +773,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
 
     // A replica from before the columns (protocol v3: it holds no renames):
     // the migration derives the first prompts from the log like the fold.
+    drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
     set_user_version(&dir, 5);
@@ -787,6 +860,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
@@ -891,6 +965,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);

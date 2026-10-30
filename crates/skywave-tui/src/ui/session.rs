@@ -12,12 +12,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use skywave_core::{
     ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, SessionState,
-    SessionView, TimelineItem, ToolView,
+    SessionUsage, SessionView, TimelineItem, ToolView,
 };
 
 use super::timeline::{
-    approval_state, blob_size, bytes, clean, delivery_label, detail_lines, glyph, head_lines,
-    item_lines, preview_lines, rule_index, title_spans, wall_ms,
+    approval_state, blob_size, bytes, clean, delivery_label, detail_lines, dollars, glyph,
+    head_lines, item_lines, preview_lines, rule_index, title_spans, tokens, turn_time, wall_ms,
 };
 use super::{
     answer_words, outgoing_badge, outgoing_label, rename_badge, render_prompt, rule_text,
@@ -80,7 +80,10 @@ pub(super) fn render(
     // The timeline first: the status line reads the scroll state its
     // layout settles.
     render_timeline(frame, timeline, session, ui, wall);
-    frame.render_widget(Paragraph::new(status_line(session, ui)), status);
+    frame.render_widget(
+        Paragraph::new(status_line(session, ui, status.width as usize)),
+        status,
+    );
     if let Some(lines) = approval {
         frame.render_widget(
             Paragraph::new(lines).block(Block::bordered().title(" Approval needed ").yellow()),
@@ -94,7 +97,9 @@ pub(super) fn render(
     }
 }
 
-fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
+/// The agent's state and what is on its way, then what the session takes,
+/// right-aligned in `width` columns.
+fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'static> {
     let mut spans = vec![match &session.state {
         SessionState::Idle => Span::raw("agent idle").green(),
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
@@ -129,7 +134,50 @@ fn status_line(session: &SessionView, ui: &SessionUi) -> Line<'static> {
             spans.push(Span::raw(" · search wrapped").yellow().bold());
         }
     }
+    // What the session takes, right-aligned in what the rest leaves.
+    let used = Line::from(spans.clone()).width();
+    if let Some(usage) = &session.usage
+        && let Some(summary) = usage_summary(usage, width.saturating_sub(used + 2))
+    {
+        let gap = width - used - summary.chars().count();
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::raw(summary).dark_gray());
+    }
     Line::from(spans)
+}
+
+/// `last turn 12.4s · 3.1k in / 812 out · $0.04 · session $1.27 · <model>`,
+/// with the figures the agent did not report left out, and fields dropped
+/// from the left until it fits in `room` columns; `None` if nothing does.
+fn usage_summary(usage: &SessionUsage, room: usize) -> Option<String> {
+    let turn = &usage.last_turn;
+    let mut fields = Vec::new();
+    if let Some(ms) = turn.duration_ms {
+        fields.push(turn_time(ms));
+    }
+    match (turn.tokens_in, turn.tokens_out) {
+        (Some(read), Some(written)) => {
+            fields.push(format!("{} in / {} out", tokens(read), tokens(written)));
+        }
+        (Some(read), None) => fields.push(format!("{} in", tokens(read))),
+        (None, Some(written)) => fields.push(format!("{} out", tokens(written))),
+        (None, None) => {}
+    }
+    if let Some(cost) = turn.cost_usd {
+        fields.push(dollars(cost));
+    }
+    if let Some(first) = fields.first_mut() {
+        *first = format!("last turn {first}");
+    }
+    if let Some(cost) = usage.total.cost_usd {
+        fields.push(format!("session {}", dollars(cost)));
+    }
+    if let Some(model) = &usage.total.model {
+        fields.push(clean(model));
+    }
+    (0..fields.len())
+        .map(|first| fields[first..].join(" · "))
+        .find(|summary| summary.chars().count() <= room)
 }
 
 fn render_timeline(

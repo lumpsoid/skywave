@@ -18,7 +18,7 @@ use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
     BodyFormat, DisplayBody, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
-    ToolDisplay, ToolKind, TurnOutcome,
+    ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -137,6 +137,7 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::ApprovalCancelled { request, reason } => {
                 format!("cancelled {}: {}", request.0, cut(reason))
             }
+            AdapterEvent::TurnUsage(_) => "turn usage".to_owned(),
             AdapterEvent::TurnEnded(outcome) => format!("turn ended: {outcome:?}"),
             AdapterEvent::ResumeHandle(handle) => {
                 format!(
@@ -203,9 +204,11 @@ fn replay_basic_two_turns() {
             "resume handle: ce771f8e-e3a8-428f-b5d7-e2f40233a2b6",
             "turn started",
             "text: Hi there!",
+            "turn usage",
             "turn ended: Completed",
             "turn started",
             "text: You asked me to say hi in exactly two words.",
+            "turn usage",
             "turn ended: Completed",
         ]
     );
@@ -219,9 +222,113 @@ fn replay_resume_reports_no_new_handle() {
         [
             "turn started",
             "text: \"Say hi in exactly two words.\"",
+            "turn usage",
             "turn ended: Completed",
         ]
     );
+}
+
+/// The turn usage reported, in order, costs apart: serde_json's float
+/// parsing may be a bit off the recorded digits, so costs compare within
+/// [`COST_EPSILON`].
+fn usages(events: &[AdapterEvent]) -> (Vec<TurnUsage>, Vec<Option<f64>>) {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::TurnUsage(usage) => Some((
+                TurnUsage {
+                    cost_usd: None,
+                    ..usage.clone()
+                },
+                usage.cost_usd,
+            )),
+            _ => None,
+        })
+        .unzip()
+}
+
+const COST_EPSILON: f64 = 1e-12;
+
+fn assert_costs(actual: &[Option<f64>], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len(), "{actual:?}");
+    for (actual, expected) in actual.iter().zip(expected) {
+        let actual = actual.unwrap_or_else(|| panic!("no cost, expected {expected}"));
+        assert!(
+            (actual - expected).abs() < COST_EPSILON,
+            "{actual} != {expected}"
+        );
+    }
+}
+
+/// The `total_cost_usd` of each `result` in fixture `name`.
+fn recorded_totals(name: &str) -> Vec<f64> {
+    fixture(name)
+        .iter()
+        .filter(|r| r["dir"] == "out" && r["msg"]["type"] == "result")
+        .map(|r| r["msg"]["total_cost_usd"].as_f64().unwrap())
+        .collect()
+}
+
+const HAIKU: &str = "claude-haiku-5-5";
+
+/// A measured turn, cost apart.
+fn haiku_turn(duration_ms: u64, tokens_in: u64, tokens_out: u64) -> TurnUsage {
+    TurnUsage {
+        duration_ms: Some(duration_ms),
+        tokens_in: Some(tokens_in),
+        tokens_out: Some(tokens_out),
+        cost_usd: None,
+        model: Some(HAIKU.to_owned()),
+    }
+}
+
+#[test]
+fn replay_usage_is_per_turn_across_turns_and_a_resume() {
+    // The CLI's `total_cost_usd` runs over the session: within a process,
+    // and on into a resumed one.
+    let (basic_totals, resume_totals) = (recorded_totals("basic"), recorded_totals("resume"));
+    let (first, second, third) = (0.00142969, 0.00086724, 0.0002183);
+    assert_costs(
+        &[
+            Some(basic_totals[0]),
+            Some(basic_totals[1]),
+            Some(resume_totals[0]),
+        ],
+        &[first, first + second, first + second + third],
+    );
+
+    // The adapter reports each turn's own share instead.
+    let (basic, costs) = usages(&replay("basic", uuid(BASIC_SESSION), false, &[]));
+    assert_eq!(
+        basic,
+        [
+            haiku_turn(1648, 2 + 12_799 + 6_490, 7),
+            haiku_turn(1255, 2 + 15_834 + 3_501, 17),
+        ]
+    );
+    assert_costs(&costs, &[first, second]);
+
+    let (resume, costs) = usages(&replay("resume", uuid(BASIC_SESSION), true, &[]));
+    assert_eq!(resume, [haiku_turn(1471, 2 + 19_310 + 90, 14)]);
+    assert_costs(&costs, &[third]);
+}
+
+#[test]
+fn replay_an_unmeasured_interrupted_turn_reports_only_its_time() {
+    let ours = uuid("11111111-1111-4111-8111-111111111111");
+    let (usages, costs) = usages(&replay("interrupt", ours, false, &[4]));
+    // Interrupted while text streamed, the CLI counts nothing for the turn
+    // (zero tokens, `total_cost_usd: 0`): only its time is reported.
+    assert_eq!(
+        usages[0],
+        TurnUsage {
+            duration_ms: Some(2590),
+            model: Some(HAIKU.to_owned()),
+            ..TurnUsage::default()
+        }
+    );
+    assert_eq!(costs[0], None);
+    assert_costs(&costs[1..], &[0.00055378, 0.0002098]);
 }
 
 #[test]
@@ -241,12 +348,14 @@ fn replay_permissions_allow_then_deny() {
             "approval 6587ec1f-4dd9-4cd1-b704-51fcb4f5ec34: Write",
             "tool result ok: File created successfully at: /tmp/skywave-t07-s",
             "text: I created `/tmp/skywave-t07-scratch/hello.txt` c",
+            "turn usage",
             "turn ended: Completed",
             "turn started",
             "tool call: Bash",
             "approval 5446b928-31cd-4fb3-b499-1f4fccf50f2a: Bash",
             "tool result error: The user denied this action.",
             "text: The `rm` was denied, so I haven't deleted `hello",
+            "turn usage",
             "turn ended: Completed",
         ]
     );
@@ -416,14 +525,17 @@ fn replay_interrupt_while_streaming_and_while_idle() {
             "turn started".to_owned(),
             format!("resume handle: {cli}"),
             "text: 1".to_owned(),
+            "turn usage".to_owned(),
             "turn ended: Interrupted".to_owned(),
             "turn started".to_owned(),
             "tool call: Bash".to_owned(),
             "tool result ok: pending-test".to_owned(),
             "text: pending-test".to_owned(),
+            "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
             "turn started".to_owned(),
             "text: ok".to_owned(),
+            "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]
     );
@@ -450,6 +562,7 @@ fn replay_interrupt_with_a_pending_approval() {
             "approval aa219e26-965b-44bc-ad3e-0f57fede7ee4: Write".to_owned(),
             format!("cancelled aa219e26-965b-44bc-ad3e-0f57fede7ee4: {INTERRUPT_REASON}"),
             "tool result error: The user doesn't want to proceed with this tool ".to_owned(),
+            "turn usage".to_owned(),
             "turn ended: Interrupted".to_owned(),
             // Then stdin closes while a second approval waits: the CLI fails
             // the approval itself and carries on.
@@ -462,6 +575,7 @@ fn replay_interrupt_with_a_pending_approval() {
             "tool call: Write".to_owned(),
             "tool result error: Tool permission request failed: AbortError: Stre".to_owned(),
             "text: I couldn't create `pending2.txt`. The Write call".to_owned(),
+            "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]
     );

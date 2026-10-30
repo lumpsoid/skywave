@@ -141,8 +141,8 @@ impl EventLog {
     /// Appends an agent-produced event to `session_id` and returns its seq.
     ///
     /// Accepts the kinds the agent supervisor owns: `AgentMessage`,
-    /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id) and
-    /// `SessionStateChanged`. Kinds that only commands produce, and
+    /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id),
+    /// `SessionStateChanged` and `TurnUsage`. Kinds that only commands produce, and
     /// `ApprovalCancelled` (use [`EventLog::cancel_approval`]), are refused
     /// with [`Error::InvalidAppend`], as is an unknown session.
     pub fn append(&self, db: &mut Db, session_id: SessionId, kind: EventKind) -> Result<Seq> {
@@ -151,7 +151,8 @@ impl EventLog {
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
             | EventKind::ApprovalRequested { .. }
-            | EventKind::SessionStateChanged(_) => {}
+            | EventKind::SessionStateChanged(_)
+            | EventKind::TurnUsage(_) => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -340,7 +341,8 @@ pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKi
         | EventKind::ToolResult { .. }
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
-        | EventKind::SessionArchived { .. } => {}
+        | EventKind::SessionArchived { .. }
+        | EventKind::TurnUsage(_) => {}
     }
     Ok(seq)
 }
@@ -411,6 +413,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::SessionRenamed { .. } => "SessionRenamed",
         EventKind::SessionArchived { .. } => "SessionArchived",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
+        EventKind::TurnUsage(_) => "TurnUsage",
     }
 }
 

@@ -428,9 +428,13 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     if row.has_draft {
         spans.push(Span::raw("  ✎ draft").dark_gray());
     }
+    // What the session has cost, when its agent says.
+    let cost = row.cost_usd.map_or_else(String::new, |cost| {
+        format!("{} · ", timeline::dollars(cost))
+    });
     spans.push(
         Span::raw(format!(
-            "  · {}",
+            "  · {cost}{}",
             row.last_activity.format("%Y-%m-%d %H:%M UTC")
         ))
         .dark_gray(),
@@ -765,6 +769,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("Esc", "go to the timeline"),
                 ]),
             }
+            lines.extend([
+                Line::from(""),
+                Line::from(
+                    "  Status line, right: last turn's time, tokens, cost; session cost; model",
+                ),
+            ]);
         }
         Screen::Settings(_) => lines.extend([
             section("Settings"),
