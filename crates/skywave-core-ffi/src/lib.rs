@@ -17,6 +17,8 @@
 //! snapshots, `dispatch` actions, `suspend`/`resume` with the app, and
 //! `shutdown` when done (D17). [`helpers`] holds the few pure functions a
 //! head needs besides; every failure is a [`error::SkywaveError`].
+//! [`search`] finds text in the open session's timeline by the core's
+//! rules (`SkywaveCore.startSearch`, `searchRanges`).
 //!
 //! Generate Kotlin with `crates/skywave-core-ffi/gen-kotlin.sh <out-dir> [profile]`,
 //! which for the default `debug` profile runs:
@@ -48,6 +50,7 @@ pub mod client;
 pub mod error;
 pub mod helpers;
 pub mod logging;
+pub mod search;
 pub mod view;
 
 /// The crate version and the wire protocol it speaks, e.g. `"0.1.0 (protocol 1)"`.

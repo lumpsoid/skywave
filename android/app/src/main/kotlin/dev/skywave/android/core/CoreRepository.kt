@@ -1,5 +1,6 @@
 package dev.skywave.android.core
 
+import dev.skywave.android.ui.screens.TimelineSearcher
 import dev.skywave.core.Action
 import dev.skywave.core.SkywaveCoreInterface
 import dev.skywave.core.ViewListener
@@ -61,6 +62,9 @@ class CoreRepository internal constructor(
         // process is going away.
         actions.trySend(action)
     }
+
+    /** Searches the open session's timeline through this core. */
+    val searcher: TimelineSearcher = CoreTimelineSearcher(core)
 
     /** App went to the background (D21): pause the network, keep the replica. */
     fun suspend() = core.suspend()

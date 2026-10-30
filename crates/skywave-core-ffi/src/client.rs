@@ -194,7 +194,7 @@ impl SkywaveCore {
 
 /// A handle on the core for the length of one call; shutdown waits until
 /// none is left.
-struct Call<'a> {
+pub(crate) struct Call<'a> {
     owner: &'a SkywaveCore,
     core: sc::Core,
 }
@@ -243,7 +243,7 @@ impl SkywaveCore {
 
     /// A handle on the core, taken without holding our lock through the
     /// call: a listener's `dispatch` runs inside another call's delivery.
-    fn core(&self) -> Result<Call<'_>, SkywaveError> {
+    pub(crate) fn core(&self) -> Result<Call<'_>, SkywaveError> {
         self.enter(&mut self.lock())
     }
 

@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use skywave_core::search::{self, BlobLine, BlobText, Found, Hit};
+use skywave_core::search::{self, BlobLine, BlobText, Found, HEAD_BYTES, Hit};
 use skywave_core::{
-    Action, ApprovalId, ApprovalPrompt, BlobId, BlobPolicy, BlobState, BlobView, Completion,
+    Action, ApprovalId, ApprovalPrompt, BlobId, BlobPolicy, BlobState, Completion,
     CompletionStatus, CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind,
     Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView,
     SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState,
@@ -34,9 +34,6 @@ pub const DRAFT_SAVE_AFTER: Duration = Duration::from_secs(1);
 /// new items: an agent streaming many small batches must not cost a durable
 /// write each. Leaving the session or quitting marks at once.
 pub const READ_MARK_EVERY: Duration = Duration::from_secs(2);
-
-/// Most of a downloaded blob a search reads: the head of a longer one.
-pub const SEARCH_BYTES: u64 = 1024 * 1024;
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -478,7 +475,7 @@ pub struct Search {
     /// keeps that scroll state.
     pub pin: bool,
     /// The heads of the downloaded blobs read so far (at most
-    /// [`SEARCH_BYTES`] each), so a search reads each file once; `None`
+    /// [`HEAD_BYTES`] each), so a search reads each file once; `None`
     /// for one that could not be read.
     blob_cache: HashMap<BlobId, Option<BlobText>>,
 }
@@ -523,7 +520,7 @@ impl Search {
         self.found = search::find(&view.timeline, &self.query, &mut |blob| {
             cache
                 .entry(blob.id)
-                .or_insert_with(|| read_blob(blob))
+                .or_insert_with(|| BlobText::read(blob))
                 .clone()
         });
     }
@@ -582,7 +579,7 @@ impl Search {
                 "{n} {} searched only in {} first {}",
                 outputs(n),
                 if n == 1 { "its" } else { "their" },
-                bytes(SEARCH_BYTES)
+                bytes(HEAD_BYTES)
             )),
         }
         (!out.is_empty()).then(|| out.join(" · "))
@@ -603,19 +600,6 @@ impl Search {
     pub fn status(&self, view: &SessionView) -> String {
         format!("/{} · {}", self.query.as_str(), self.count(view))
     }
-}
-
-/// A downloaded blob's head as a search reads it; `None` if its file
-/// cannot be read.
-fn read_blob(blob: &BlobView) -> Option<BlobText> {
-    let BlobState::Available { path } = &blob.state else {
-        return None;
-    };
-    let (text, size) = skywave_core::read_head(path, SEARCH_BYTES).ok()?;
-    Some(BlobText {
-        text: text.into(),
-        cut: size > SEARCH_BYTES,
-    })
 }
 
 /// Browsing [`SessionView::prompts`] in the composer.

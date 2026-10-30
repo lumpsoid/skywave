@@ -24,6 +24,7 @@ import dev.skywave.android.ui.SkywaveRoot
 import dev.skywave.android.ui.pairLinkInput
 import dev.skywave.android.ui.screens.AboutInfo
 import dev.skywave.android.ui.screens.LocalBlobHeadReader
+import dev.skywave.android.ui.screens.LocalTimelineSearcher
 import dev.skywave.core.Action
 import dev.skywave.core.Route
 import dev.skywave.core.Screen
@@ -65,7 +66,10 @@ class MainActivity : ComponentActivity() {
             SkywaveTheme {
                 when (startup) {
                     // The core reads blob previews: native, so only once it is Ready.
-                    is CoreStartup.Ready -> CompositionLocalProvider(LocalBlobHeadReader provides coreBlobHeadReader) {
+                    is CoreStartup.Ready -> CompositionLocalProvider(
+                        LocalBlobHeadReader provides coreBlobHeadReader,
+                        LocalTimelineSearcher provides startup.repository.searcher,
+                    ) {
                         SkywaveRoot(startup.repository, pairInbox, remember { about(app) })
                     }
                     is CoreStartup.Failed -> StartupFailedScreen(startup.reason, appVersion())

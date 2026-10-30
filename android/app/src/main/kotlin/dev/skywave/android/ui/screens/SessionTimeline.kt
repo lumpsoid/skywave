@@ -22,6 +22,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -98,9 +100,19 @@ internal fun NewDivider() {
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions, gated: GatedApproval? = null) {
+internal fun TimelineItemView(
+    row: TimelineRow.Item,
+    actions: ItemActions,
+    gated: GatedApproval? = null,
+    search: RowSearch? = null,
+) {
     val item = row.item
     var expanded by rememberSaveable(row.key) { mutableStateOf(false) }
+    // A jump to a match in a tool call opens it: the match may be in what
+    // only the expanded call shows (its whole body, output, blobs).
+    LaunchedEffect(search?.current, search?.jump) {
+        if (search?.current == true && item is TimelineItem.Logged && item.entry is Entry.Tool) expanded = true
+    }
     var menu by remember { mutableStateOf(false) }
     val text = remember(item) { copyText(item) }
     val discardable = (item as? TimelineItem.Pending)?.takeIf { it.discardable }
@@ -125,18 +137,31 @@ internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions, gated
             )
             .padding(horizontal = 12.dp, vertical = 4.dp),
     ) {
-        when (item) {
-            is TimelineItem.Pending -> MessageBubble(
-                text = item.text,
-                own = true,
-                outgoing = item.outgoing,
-                delivery = item.delivery,
-                expanded = expanded,
-                discardable = item.discardable,
-                onDiscard = { actions.discard(item.commandId) },
-                onEdit = { actions.edit(item.commandId) },
-            )
-            is TimelineItem.Logged -> LoggedEntry(item, expanded, gated, actions.blobs)
+        CompositionLocalProvider(LocalHighlight provides search?.highlight) {
+            Column {
+                when (item) {
+                    is TimelineItem.Pending -> MessageBubble(
+                        text = item.text,
+                        own = true,
+                        outgoing = item.outgoing,
+                        delivery = item.delivery,
+                        expanded = expanded,
+                        discardable = item.discardable,
+                        onDiscard = { actions.discard(item.commandId) },
+                        onEdit = { actions.edit(item.commandId) },
+                    )
+                    is TimelineItem.Logged -> LoggedEntry(item, expanded, gated, actions.blobs)
+                }
+                val line = search?.blobLine
+                if (search?.current == true && line != null) {
+                    Text(
+                        stringResource(R.string.search_in_blob, line.toLong() + 1),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.testTag(SearchTags.IN_BLOB),
+                    )
+                }
+            }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             if (text != null) {
@@ -184,24 +209,27 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
         is Entry.AgentMessage -> AgentText(e.text)
         is Entry.Tool -> ToolItem(e.tool, expanded, gated, blobs)
         is Entry.ToolCall -> Column {
-            Label(stringResource(R.string.sv_tool_call, e.name, e.summary))
+            Label(markedParts(stringResource(R.string.sv_tool_call, e.name, e.summary), e.name, e.summary))
             e.input?.let { BlobRow(stringResource(R.string.blob_input), it, blobs, viewerTitle(R.string.blob_input, e.name)) }
         }
         is Entry.ToolResult -> Column {
-            Label(stringResource(R.string.sv_tool_result, e.summary))
+            Label(markedParts(stringResource(R.string.sv_tool_result, e.summary), e.summary))
             e.output?.let { BlobRow(stringResource(R.string.blob_output), it, blobs, viewerTitle(R.string.blob_output, e.summary)) }
         }
         is Entry.Approval -> Column {
-            Label(stringResource(R.string.sv_approval, e.tool, e.summary))
+            Label(markedParts(stringResource(R.string.sv_approval, e.tool, e.summary), e.tool, e.summary))
             ApprovalLine(e.status, gated, e.answer)
         }
         Entry.Interrupted -> SystemLine(stringResource(R.string.sv_interrupted))
         Entry.Stopped -> SystemLine(stringResource(R.string.sv_stopped))
         is Entry.Renamed -> SystemLine(
-            listOf(
-                e.name?.let { stringResource(R.string.sv_renamed, it) } ?: stringResource(R.string.sv_renamed_default),
-                byText(e.own),
-            ).joinToString(" "),
+            markedParts(
+                listOf(
+                    e.name?.let { stringResource(R.string.sv_renamed, it) } ?: stringResource(R.string.sv_renamed_default),
+                    byText(e.own),
+                ).joinToString(" "),
+                e.name,
+            ),
         )
         is Entry.Archived -> SystemLine(
             listOf(
@@ -220,7 +248,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onErrorContainer,
                 )
-                Text(e.message, color = MaterialTheme.colorScheme.onErrorContainer)
+                Text(marked(e.message), color = MaterialTheme.colorScheme.onErrorContainer)
             }
         }
         is Entry.TurnUsage -> {
@@ -260,7 +288,7 @@ private fun MessageBubble(
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.widthIn(max = 560.dp),
         ) {
-            Text(text, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+            Text(marked(text), modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
         }
         // Accepted is the normal end: said only when asked for details.
         if (outgoing != null && (outgoing !is Outgoing.Accepted || expanded)) {
@@ -310,7 +338,7 @@ internal fun AgentText(text: String) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         for (block in blocks) {
             when (block) {
-                is TextBlock.Prose -> Text(remember(block, codeBg) { proseWithInlineCode(block.text, codeBg) })
+                is TextBlock.Prose -> Text(marked(remember(block, codeBg) { proseWithInlineCode(block.text, codeBg) }))
                 is TextBlock.Code -> CodeBox(block.text)
             }
         }
@@ -337,7 +365,7 @@ internal fun CodeBox(text: String, color: Color? = null, maxLines: Int = Int.MAX
         modifier = Modifier.fillMaxWidth(),
     ) {
         Text(
-            remember(text, maxLines) { firstLines(text, maxLines) },
+            marked(remember(text, maxLines) { firstLines(text, maxLines) }),
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.bodySmall,
             color = color ?: MaterialTheme.colorScheme.onSurfaceVariant,
@@ -392,7 +420,7 @@ internal fun DiffBox(text: String, maxLines: Int = Int.MAX_VALUE) {
         modifier = Modifier.fillMaxWidth(),
     ) {
         Text(
-            styled,
+            marked(styled),
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.bodySmall,
             softWrap = false,
@@ -436,20 +464,20 @@ private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?, b
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    kindLabel(tool),
+                    markedParts(kindLabel(tool), tool.name.takeIf { tool.kind == ToolKind.OTHER }),
                     style = MaterialTheme.typography.labelMedium,
                     color = colors.primary,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Spacer(Modifier.padding(start = 8.dp))
                 Text(
-                    tool.title,
+                    marked(tool.title),
                     fontFamily = if (tool.kind == ToolKind.SHELL) FontFamily.Monospace else FontFamily.Default,
                     maxLines = if (expanded) Int.MAX_VALUE else 2,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            tool.detail?.let { Minor(it) }
+            tool.detail?.let { Minor(marked(it)) }
             tool.body?.let { body ->
                 val lines = if (expanded) Int.MAX_VALUE else PREVIEW_LINES
                 when (body.format) {
@@ -476,7 +504,7 @@ private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?, b
                 outcome is ToolOutcome.Denied && it.status.isPlainDenial() && it.answer?.outgoing !is Outgoing.Failed
             }?.let { ApprovalLine(it.status, gated, it.answer) }
             Text(
-                outcomeText(outcome),
+                markedParts(outcomeText(outcome), (outcome as? ToolOutcome.Done)?.status),
                 style = MaterialTheme.typography.labelMedium,
                 color = if (failed) colors.error else colors.onSurfaceVariant,
             )
@@ -548,17 +576,23 @@ internal fun viewerTitle(@StringRes what: Int, of: String): String =
     stringResource(R.string.blob_viewer_title, stringResource(what), of.lineSequence().first())
 
 @Composable
-private fun Label(text: String) = Text(text, style = MaterialTheme.typography.bodyMedium)
+private fun Label(text: AnnotatedString) = Text(text, style = MaterialTheme.typography.bodyMedium)
 
 @Composable
-internal fun Minor(text: String, color: Color? = null) = Text(
+internal fun Minor(text: String, color: Color? = null) = Minor(AnnotatedString(text), color)
+
+@Composable
+internal fun Minor(text: AnnotatedString, color: Color? = null) = Text(
     text,
     style = MaterialTheme.typography.bodySmall,
     color = color ?: MaterialTheme.colorScheme.onSurfaceVariant,
 )
 
 @Composable
-private fun SystemLine(text: String) = Text(
+private fun SystemLine(text: String) = SystemLine(AnnotatedString(text))
+
+@Composable
+private fun SystemLine(text: AnnotatedString) = Text(
     text,
     style = MaterialTheme.typography.bodySmall,
     fontStyle = FontStyle.Italic,

@@ -3,6 +3,7 @@ package dev.skywave.android.ui.screens
 import android.content.ClipData
 import android.os.Build
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -111,13 +112,26 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
     val blobs = remember(dispatch) {
         BlobActions(download = { dispatch(Action.DownloadBlob(it)) }, open = { viewing = it })
     }
+    val search = rememberSearch(view.id, view.timeline)
+    val searching = search?.active == true
+    val hits = remember(search?.result, rows) { searchHits(search?.result, rows) }
 
     ScreenScaffold(
         title = view.title,
         chrome = chrome,
+        titleContent = if (searching) {
+            { SearchField(search!!, onSearch = { search.step(hits, forward = true) }) }
+        } else {
+            null
+        },
         actions = {
-            NextApprovalButton(attention.elsewhere) { dispatch(Action.OpenNextApproval) }
-            SessionActions(view, dispatch, onRename = { renaming = true })
+            if (searching) {
+                SearchActions(search!!, hits)
+            } else {
+                search?.let { SearchButton(onClick = it::open) }
+                NextApprovalButton(attention.elsewhere) { dispatch(Action.OpenNextApproval) }
+                SessionActions(view, dispatch, onRename = { renaming = true })
+            }
         },
         bottomBar = {
             Column {
@@ -138,6 +152,7 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             StatusLine(view)
+            if (searching) SearchHint(search!!.result)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 if (rows.isEmpty()) {
                     Text(
@@ -146,11 +161,14 @@ private fun SessionContent(view: SessionView, attention: Attention, chrome: Shel
                         modifier = Modifier.align(Alignment.Center).padding(24.dp),
                     )
                 } else {
-                    Timeline(view, rows, dispatch, composer, gated, gatedKey, blobs)
+                    Timeline(view, rows, dispatch, composer, gated, gatedKey, blobs, search.takeIf { searching }, hits)
                 }
             }
         }
     }
+
+    // Back closes the search first; the viewer, composed later, before it.
+    BackHandler(enabled = searching) { search?.close() }
 
     // Over the session, which stays composed below: closing it comes back
     // to the timeline where it was.
@@ -183,6 +201,8 @@ private fun Timeline(
     gated: GatedApproval?,
     gatedKey: String?,
     blobs: BlobActions,
+    search: SearchState?,
+    hits: SearchHits,
 ) {
     val divider = remember { rows.indexOf(TimelineRow.Divider) }
     // Opens on the divider when there is news, else at the end; LazyColumn
@@ -209,6 +229,19 @@ private fun Timeline(
         }
     }
     ReadMarker(view, listState, dispatch)
+    if (search != null) {
+        // A new result settles the current match from where the user is.
+        LaunchedEffect(search, hits) { search.settle(hits, listState.firstVisibleItemIndex) }
+        // Each jump brings the current match to the top and stops following.
+        LaunchedEffect(search, search.jumps) {
+            val key = search.current ?: return@LaunchedEffect
+            val index = currentRows.indexOfFirst { it.key == key }
+            if (index < 0) return@LaunchedEffect
+            following = false
+            leftAtKey = currentRows.lastOrNull()?.key
+            listState.scrollToItem(index)
+        }
+    }
 
     val clipboard = LocalClipboard.current
     val context = LocalContext.current
@@ -241,7 +274,12 @@ private fun Timeline(
             items(rows, key = { it.key }, contentType = { contentType(it) }) { row ->
                 when (row) {
                     TimelineRow.Divider -> NewDivider()
-                    is TimelineRow.Item -> TimelineItemView(row, actions, gated?.takeIf { row.key == gatedKey })
+                    is TimelineRow.Item -> TimelineItemView(
+                        row,
+                        actions,
+                        gated?.takeIf { row.key == gatedKey },
+                        search?.let { s -> hits[row.key]?.let { rowSearch(s, row.key, it) } },
+                    )
                 }
             }
         }

@@ -5,6 +5,9 @@ import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.BlobView
 import dev.skywave.core.BodyFormat
 import dev.skywave.core.Entry
+import dev.skywave.core.SearchHit
+import dev.skywave.core.SearchItem
+import dev.skywave.core.SearchResult
 import dev.skywave.core.TimelineItem
 import dev.skywave.core.ToolKind
 import dev.skywave.core.ToolOutcome
@@ -38,6 +41,47 @@ internal fun timelineKey(item: TimelineItem): String = when (item) {
         is Entry.UserMessage -> "m:${entry.commandId}"
         else -> "s:${item.seq}"
     }
+}
+
+/**
+ * The row key of the item a search hit names: [timelineKey]'s rule, from
+ * the ids the core reports instead of the item itself.
+ */
+internal fun searchKey(item: SearchItem): String = when (item) {
+    is SearchItem.Pending -> "m:${item.commandId}"
+    is SearchItem.Logged -> item.commandId?.let { "m:$it" } ?: "s:${item.seq}"
+}
+
+/**
+ * A search's hits among the rows on screen, oldest first. The core searched
+ * its own latest snapshot, which may be a little newer than [rows]: a hit
+ * on an item not shown yet is left out, and the next search (each new
+ * snapshot runs one) brings it in.
+ */
+internal class SearchHits(val keys: List<String>, private val hits: Map<String, SearchHit>, private val rows: Map<String, Int>) {
+    operator fun get(key: String): SearchHit? = hits[key]
+
+    /** The row index of the hit [key]; -1 when it is not one. */
+    fun rowOf(key: String): Int = rows[key] ?: -1
+
+    /** The first hit at or below row [from], else the last one; null with no hits. */
+    fun from(from: Int): String? = keys.firstOrNull { rowOf(it) >= from } ?: keys.lastOrNull()
+
+    companion object {
+        val None = SearchHits(emptyList(), emptyMap(), emptyMap())
+    }
+}
+
+internal fun searchHits(result: SearchResult?, rows: List<TimelineRow>): SearchHits {
+    if (result == null || result.hits.isEmpty()) return SearchHits.None
+    val index = HashMap<String, Int>(rows.size * 2)
+    rows.forEachIndexed { i, row -> if (row is TimelineRow.Item) index[row.key] = i }
+    val hits = LinkedHashMap<String, SearchHit>()
+    for (hit in result.hits) {
+        val key = searchKey(hit.item)
+        if (key in index) hits.putIfAbsent(key, hit)
+    }
+    return SearchHits(hits.keys.toList(), hits, index.filterKeys { it in hits })
 }
 
 /**

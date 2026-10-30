@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Timeline search: the session's top bar while searching -->
+    <string name="search_open">Search</string>
+    <string name="search_hint">Search this session</string>
+    <string name="search_previous">Previous match</string>
+    <string name="search_next">Next match</string>
+    <string name="search_close">Close search</string>
+    <!-- Which match is current, of how many: "3 of 17" -->
+    <string name="search_position">%1$d of %2$d</string>
+    <string name="search_no_matches">No matches</string>
+    <!-- The current match is in a downloaded output, not in what the timeline shows -->
+    <string name="search_in_blob">Match in the downloaded content, line %1$d</string>
+    <!-- Blob content the search could not look through -->
+    <plurals name="search_not_downloaded">
+        <item quantity="one">%2$d downloaded searched, %1$d not downloaded</item>
+        <item quantity="other">%2$d downloaded searched, %1$d not downloaded</item>
+    </plurals>
+    <plurals name="search_cut">
+        <item quantity="one">%1$d searched only in its first %2$s</item>
+        <item quantity="other">%1$d searched only in their first %2$s</item>
+    </plurals>
+</resources>

@@ -36,6 +36,7 @@ class ShellChrome(
  * The frame of every screen: a top app bar titled [title] with [actions],
  * the shell's banners under it, then [content]. Edge to edge: the top bar
  * takes the status bar inset and [content] gets the rest as its padding.
+ * [titleContent], when given, takes the title's place (e.g. a search field).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,6 +47,7 @@ fun ScreenScaffold(
     actions: @Composable RowScope.() -> Unit = {},
     bottomBar: @Composable () -> Unit = {},
     floatingActionButton: @Composable () -> Unit = {},
+    titleContent: (@Composable () -> Unit)? = null,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
@@ -53,7 +55,7 @@ fun ScreenScaffold(
         topBar = {
             Column {
                 TopAppBar(
-                    title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    title = titleContent ?: { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     navigationIcon = {
                         chrome.onUp?.let { up ->
                             IconButton(onClick = up) {
