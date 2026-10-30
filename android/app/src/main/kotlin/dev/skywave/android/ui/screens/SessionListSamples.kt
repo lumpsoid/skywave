@@ -107,9 +107,14 @@ internal object SessionListSamples {
 }
 
 @Composable
-private fun ListPreview(screen: Screen, link: Link = Link.Online(latencyMs = 42u), queued: ULong = 0u) {
+private fun ListPreview(
+    screen: Screen,
+    link: Link = Link.Online(latencyMs = 42u),
+    queued: ULong = 0u,
+    canGoBack: Boolean = false,
+) {
     val inbox = remember { PairInbox { PairInput.Unreadable("previews read no links") } }
-    val state = ViewState(link = link, queued = queued, attention = Samples.noAttention, screen = screen)
+    val state = ViewState(link = link, queued = queued, attention = Samples.noAttention, screen = screen, canGoBack = canGoBack)
     SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = {}, pairInbox = inbox, about = SettingsSamples.about) }
 }
 
@@ -132,8 +137,8 @@ private fun OfflinePendingPreview() =
 
 @Preview(name = "Archived sessions")
 @Composable
-private fun ArchivedPreview() = ListPreview(SessionListSamples.archived)
+private fun ArchivedPreview() = ListPreview(SessionListSamples.archived, canGoBack = true)
 
 @Preview(name = "Archived sessions: empty")
 @Composable
-private fun EmptyArchivedPreview() = ListPreview(SessionListSamples.emptyArchived)
+private fun EmptyArchivedPreview() = ListPreview(SessionListSamples.emptyArchived, canGoBack = true)

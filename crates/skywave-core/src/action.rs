@@ -113,6 +113,12 @@ pub enum Action {
     /// reconnect now. The attempt count and `offline_since` carry on.
     RetryNow,
     Navigate(Route),
+    /// Go back from the screen shown: a session to the list it is on, the
+    /// archived list, settings and re-pairing to the active list. A no-op
+    /// where [`ViewState::can_go_back`](crate::ViewState::can_go_back) is
+    /// false (the active list, pairing an unpaired device): there back
+    /// leaves the app, which is the head's to do.
+    Back,
 }
 
 /// Screens reachable without a parameter; a session opens with

@@ -104,6 +104,9 @@ pub enum Action {
     Navigate {
         route: Route,
     },
+    /// Go back from the screen shown; a no-op where `ViewState.can_go_back`
+    /// is false.
+    Back,
 }
 
 /// Screens reachable without a parameter.
@@ -201,6 +204,7 @@ impl TryFrom<Action> for sc::Action {
             Action::SetBlobPolicy { policy } => sc::Action::SetBlobPolicy(policy.into()),
             Action::RetryNow => sc::Action::RetryNow,
             Action::Navigate { route } => sc::Action::Navigate(route.into()),
+            Action::Back => sc::Action::Back,
         })
     }
 }
@@ -289,6 +293,7 @@ impl From<sc::Action> for Action {
             sc::Action::Navigate(route) => Action::Navigate {
                 route: route.into(),
             },
+            sc::Action::Back => Action::Back,
         }
     }
 }
@@ -369,6 +374,7 @@ mod tests {
             sc::Action::SetBlobPolicy(sc::BlobPolicy::Eager),
             sc::Action::RetryNow,
             sc::Action::Navigate(sc::Route::ArchivedSessions),
+            sc::Action::Back,
         ]
     }
 

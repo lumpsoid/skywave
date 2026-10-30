@@ -528,10 +528,7 @@ fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     assert_contains(&screen, "Currently paired as");
     assert_eq!(h.app.ui().form.address, "srv:7443");
     // Esc cancels a re-pair.
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 
     // From the full-screen state, p goes straight to pairing.
     h.seam.set_link(Link::Connecting);
@@ -813,10 +810,7 @@ fn settings_toggle_the_blob_policy_through_the_core() {
         vec![Request::BlobPolicyChanged(BlobPolicy::Eager)]
     );
     assert_contains(&h.screen(), "Blob policy: eager");
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 }
 
 #[test]
@@ -872,10 +866,7 @@ fn sessions_created_elsewhere_appear_live_and_keep_the_selection() {
     // Back on the list (Esc leaves the composer, then the session), the
     // same session is still selected.
     assert_eq!(h.key(KeyCode::Esc), None);
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
     h.key(KeyCode::Char('j'));
     assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"), "last row");
@@ -2093,10 +2084,7 @@ fn session_keys_are_in_help_and_footer() {
     h.key(KeyCode::Char('i'));
     assert!(h.app.typing());
     h.key(KeyCode::Esc);
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 }
 
 #[test]
@@ -2106,10 +2094,7 @@ fn drafts_survive_leaving_the_session() {
     h.key(KeyCode::Left);
     h.key(KeyCode::Esc);
     // Leaving saves the draft first; the list marks the session.
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     assert_contains(&line_with(&h.screen(), "/srv/work"), "✎ draft");
 
     // The TUI kept no copy: the composer comes back from the core.
@@ -2143,10 +2128,7 @@ fn look(h: &mut Harness, after: Duration) -> String {
 /// Back to the session list from the composer.
 fn leave(h: &mut Harness) {
     h.key(KeyCode::Esc);
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 }
 
 fn agent_messages(id: SessionId, prefix: &str, n: u32) -> Vec<Event> {
@@ -2180,10 +2162,7 @@ fn unread_badge_clears_after_reaching_the_end() {
     h.key(KeyCode::End);
     let screen = look(&mut h, Duration::ZERO);
     assert_contains(&screen, "news 39");
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     assert!(!line_with(&h.screen(), "/srv/work").contains('●'));
 
     // Survives a restart: the mark is stored.
@@ -4278,10 +4257,7 @@ fn esc_clears_search_before_leaving() {
     assert_eq!(h.key(KeyCode::Esc), None);
     assert!(search(&h).is_none());
     assert!(!h.screen().contains("/test"));
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 }
 
 #[test]
@@ -5093,15 +5069,9 @@ fn a_archives_the_selected_session_and_shift_a_switches_lists() {
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(b)));
     assert_contains(&h.screen(), "· archived · a message brings it back");
     h.key(KeyCode::Esc);
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::ArchivedSessions))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     // Esc on the archived list goes back to the active one, and `A` too.
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     h.key(KeyCode::Char('A'));
     assert_eq!(
         h.key(KeyCode::Char('A')),
@@ -5151,10 +5121,7 @@ fn a_message_brings_an_archived_session_back() {
     ));
     assert!(!h.screen().contains("· archived ·"), "{}", h.screen());
     h.key(KeyCode::Esc);
-    assert_eq!(
-        h.key(KeyCode::Esc),
-        Some(Action::Navigate(Route::SessionList))
-    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     // On the active list, which no longer counts it as archived.
     let screen = h.screen();
     assert_contains(&screen, "Sessions (1) ");

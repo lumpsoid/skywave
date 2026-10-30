@@ -340,6 +340,28 @@ impl Model {
                 self.completer.end();
                 Vec::new()
             }
+            Action::Back => match self.back() {
+                Some(route) => self.dispatch(Action::Navigate(route)),
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Where [`Action::Back`] goes from the screen shown; `None` where back
+    /// leaves the app. Follows [`Model::screen`]: an unpaired device sees
+    /// pairing, a session gone from the replica shows the active list.
+    fn back(&self) -> Option<Route> {
+        self.device?;
+        match self.place {
+            Place::SessionList => None,
+            Place::Archived | Place::Settings | Place::Pairing => Some(Route::SessionList),
+            Place::Session(id) => self.summary(id).map(|s| {
+                if self.archived(s) {
+                    Route::ArchivedSessions
+                } else {
+                    Route::SessionList
+                }
+            }),
         }
     }
 
@@ -769,6 +791,7 @@ impl Model {
             queued: self.outbox.iter().filter(|e| e.status.is_pending()).count(),
             attention: self.attention(),
             screen: self.screen(),
+            can_go_back: self.back().is_some(),
         }
     }
 
@@ -3990,5 +4013,80 @@ mod tests {
             workdir: "/srv/x".into(),
         }));
         assert_eq!(f.list_view().completion, None);
+    }
+
+    /// What a view shows, for the back tests: the screen and which list.
+    fn shown(view: &ViewState) -> &'static str {
+        match &view.screen {
+            Screen::Pairing(_) => "pairing",
+            Screen::Settings(_) => "settings",
+            Screen::Session(v) if v.archived => "archived session",
+            Screen::Session(_) => "session",
+            Screen::SessionList(l) if l.kind == ListKind::Archived => "archived list",
+            Screen::SessionList(_) => "active list",
+        }
+    }
+
+    /// From what `go` shows, back goes to `to`, and `can_go_back` says
+    /// whether it goes anywhere.
+    fn assert_back(f: &mut Fixture, go: impl FnOnce(&mut Fixture), from: &str, to: &str) {
+        go(f);
+        let before = f.model.view();
+        assert_eq!(shown(&before), from);
+        assert_eq!(before.can_go_back, from != to, "can_go_back on {from}");
+        assert!(f.dispatch(Action::Back).is_empty());
+        assert_eq!(shown(&f.model.view()), to, "back from {from}");
+    }
+
+    #[test]
+    fn back_goes_to_the_parent_screen_and_stops_at_the_root() {
+        let mut f = Fixture::paired();
+        let active = f.session("/srv/a");
+        let archived = f.session("/srv/b");
+        queued(&f.dispatch(archive(archived, true)));
+
+        let nav = |route| move |f: &mut Fixture| drop(f.dispatch(Action::Navigate(route)));
+        assert_back(
+            &mut f,
+            nav(Route::SessionList),
+            "active list",
+            "active list",
+        );
+        assert_back(
+            &mut f,
+            nav(Route::ArchivedSessions),
+            "archived list",
+            "active list",
+        );
+        assert_back(&mut f, nav(Route::Settings), "settings", "active list");
+        // Re-pairing a paired device can be cancelled.
+        assert_back(&mut f, nav(Route::Pairing), "pairing", "active list");
+        // A session goes back to the list it is on.
+        assert_back(&mut f, |f| f.open(active), "session", "active list");
+        assert_back(
+            &mut f,
+            |f| f.open(archived),
+            "archived session",
+            "archived list",
+        );
+    }
+
+    #[test]
+    fn back_goes_nowhere_while_unpaired() {
+        let mut model = Model::new(empty_snapshot(), None);
+        model.dispatch(Action::Navigate(Route::Settings));
+        assert!(!model.view().can_go_back);
+        assert!(model.dispatch(Action::Back).is_empty());
+        assert!(matches!(model.view().screen, Screen::Pairing(_)));
+    }
+
+    #[test]
+    fn back_from_a_session_gone_from_the_replica_goes_nowhere() {
+        let mut f = Fixture::paired();
+        // The open session's summary is missing: the active list shows.
+        f.model.place = Place::Session(SessionId::new());
+        let view = f.model.view();
+        assert_eq!(shown(&view), "active list");
+        assert!(!view.can_go_back);
     }
 }

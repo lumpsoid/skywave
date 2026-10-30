@@ -58,8 +58,8 @@ fun AppShell(
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
     val screen = state.screen
-    val back = backRoute(screen)
-    val goBack = back?.let { route -> { dispatch(Action.Navigate(route)) } }
+    // Where back goes is the core's rule; at its root back leaves the app.
+    val goBack = if (state.canGoBack) ({ dispatch(Action.Back) }) else null
 
     val onPairing = screen is Screen.Pairing
     val pairAgain = { dispatch(Action.Navigate(Route.PAIRING)) }
@@ -81,7 +81,7 @@ fun AppShell(
 
     // After the early return, so it is only registered while the screen it
     // navigates away from is the one showing.
-    BackHandler(enabled = goBack != null) { goBack?.invoke() }
+    BackHandler(enabled = state.canGoBack) { dispatch(Action.Back) }
 
     // Before the first pairing there is no server to link to, so the link's
     // state ("Connecting…") would only mislead.

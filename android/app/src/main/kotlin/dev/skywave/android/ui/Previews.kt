@@ -85,7 +85,10 @@ internal object Samples {
         screen: Screen = sessionList,
         queued: ULong = 0u,
         attention: Attention = noAttention,
-    ) = ViewState(link = link, queued = queued, attention = attention, screen = screen)
+        // The core's answer; true for screens back leaves (all but the active
+        // list and first pairing).
+        canGoBack: Boolean = false,
+    ) = ViewState(link = link, queued = queued, attention = attention, screen = screen, canGoBack = canGoBack)
 }
 
 @Composable
@@ -112,7 +115,7 @@ private fun PairingFailedPreview() = ShellPreview(Samples.state(Link.Connecting,
 
 @Preview(name = "Pair again")
 @Composable
-private fun RepairPreview() = ShellPreview(Samples.state(Link.Online(latencyMs = 42u), Samples.repair))
+private fun RepairPreview() = ShellPreview(Samples.state(Link.Online(latencyMs = 42u), Samples.repair, canGoBack = true))
 
 @Preview(name = "Online")
 @Composable
@@ -133,7 +136,7 @@ private fun RevokedPreview() = ShellPreview(Samples.state(Link.Rejected(LinkReje
 @Preview(name = "Rejected: revoked, on pairing")
 @Composable
 private fun RevokedOnPairingPreview() =
-    ShellPreview(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.repair))
+    ShellPreview(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.repair, canGoBack = true))
 
 @Preview(name = "Rejected: protocol mismatch")
 @Composable
