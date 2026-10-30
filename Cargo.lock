@@ -1591,8 +1591,12 @@ dependencies = [
 name = "skywave-core-ffi"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "skywave-core",
+ "tempfile",
+ "thiserror",
  "uniffi",
+ "uuid",
 ]
 
 [[package]]
