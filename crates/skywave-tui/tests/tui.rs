@@ -983,7 +983,7 @@ fn approval_prompt_answer_and_resolutions() {
     assert_contains(&screen, "Approval needed");
     assert_contains(&screen, "│? write a.txt ");
     assert_contains(&screen, "Esc, then a approve · x deny");
-    assert_contains(&screen, "full input 5.9 KiB · select it in the timeline");
+    assert_contains(&screen, "full input 5.9 KiB · v to see it");
     assert_contains(&line_with(&screen, "needs approval"), "12:01 ? write a.txt");
     // In the composer `a` is text.
     assert_eq!(h.key(KeyCode::Char('a')), None);
@@ -1808,7 +1808,7 @@ fn colour_of(buffer: &Buffer, needle: &str) -> Color {
     buffer[(x as u16, y as u16)].fg
 }
 
-/// The mock-up at 90 × 58, trailing blanks trimmed.
+/// The mock-up at 90 × 60, trailing blanks trimmed.
 const MOCKUP: &str = r#"connecting…
 ┌ /srv/work · approval ──────────────────────────────────────────────────────────────────┐
 │agent waiting for an approval                                                           │
@@ -1860,6 +1860,8 @@ const MOCKUP: &str = r#"connecting…
 │        │ +    assert_eq!(add(2, 2), 4);                                                │
 │┌ Approval needed ─────────────────────────────────────────────────────────────────────┐│
 ││± Edit src/lib.rs                                                                     ││
+│││ -    assert_eq!(add(2, 2), 5);                                                      ││
+│││ +    assert_eq!(add(2, 2), 4);                                                      ││
 ││Esc, then a approve · x deny                                                          ││
 │└──────────────────────────────────────────────────────────────────────────────────────┘│
 │┌ Message ─────────────────────────────────────────────────────────────────────────────┐│
@@ -1871,7 +1873,7 @@ Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline ·
 #[test]
 fn tool_timeline_mockup_at_90_columns() {
     let (h, other, _, _) = mockup();
-    let frame = h.frame(90, 58, mockup_now());
+    let frame = h.frame(90, 60, mockup_now());
     let screen = trimmed(&frame);
     assert_eq!(screen, MOCKUP, "\n{screen}");
     assert!(screen.contains(&tail(other)));
@@ -1896,10 +1898,14 @@ fn tool_timeline_mockup_at_90_columns() {
     assert_eq!(colour_of(&frame, "test tests::adds"), Color::Red);
     assert_eq!(colour_of(&frame, "Hello, world!"), Color::Reset);
 
-    // The approval box names the call; no raw JSON.
+    // The approval box names the call and shows its diff; no raw JSON.
     let start = screen.find("Approval needed").unwrap();
     let approval = &screen[start..screen.find(" Message ").unwrap()];
     assert!(approval.contains("± Edit src/lib.rs"), "{approval}");
+    assert!(
+        approval.contains("│ +    assert_eq!(add(2, 2), 4);"),
+        "{approval}"
+    );
     assert!(
         !approval.contains('{') && !approval.contains('"'),
         "{approval}"
@@ -2032,4 +2038,159 @@ fn wrapped_text_hangs_under_its_column() {
             .any(|line| line.starts_with("│instead") || line.starts_with("│column")),
         "{screen}"
     );
+}
+
+// ---- the approval panel shows what the gated call will do ----------------
+
+/// `before` events, then `tool` gated by a pending approval; the open
+/// session's harness and id, the approval and the call's seq.
+fn gated(before: Vec<EventKind>, tool: ToolCall) -> (Harness, SessionId, ApprovalId, Seq) {
+    let (mut h, id, _) = open_session();
+    let approval = ApprovalId::new();
+    let call = tool.call;
+    let summary = tool.display.title.clone();
+    let name = tool.name.clone();
+    let mut kinds = before;
+    kinds.push(EventKind::ToolCall(tool));
+    kinds.push(EventKind::ApprovalRequested {
+        id: approval,
+        call,
+        tool: name,
+        summary,
+        input: None,
+    });
+    let seq = Seq(h.seam.cursor().unwrap().0 + kinds.len() as u64 - 1);
+    let events: Vec<Event> = kinds.into_iter().map(|kind| event(id, 1, kind)).collect();
+    pull(&mut h, events);
+    (h, id, approval, seq)
+}
+
+/// The colour of `needle`'s last occurrence: the approval panel's, when
+/// the timeline shows it too.
+fn last_colour_of(buffer: &Buffer, needle: &str) -> Color {
+    let screen = text(buffer);
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(needle))
+        .last()
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"));
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    buffer[(x as u16, y as u16)].fg
+}
+
+/// The approval panel's rows, borders excluded.
+fn panel(screen: &str) -> Vec<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = lines
+        .iter()
+        .position(|l| l.contains("Approval needed"))
+        .unwrap_or_else(|| panic!("no approval panel:\n{screen}"));
+    lines[top + 1..]
+        .iter()
+        .take_while(|l| !l.contains('└'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn numbered(n: usize) -> String {
+    (1..=n).map(|i| format!("line {i}\n")).collect()
+}
+
+#[test]
+fn approval_panel_shows_edit_diff() {
+    let mut edit = call(CallId::new(), "Edit", ToolKind::FileEdit, "src/lib.rs");
+    edit.display.body = body(BodyFormat::Diff, "@@ -1 +1 @@\n-old line\n+new line\n");
+    let (h, _, _, _) = gated(vec![], edit);
+    let frame = h.frame(90, 40, mockup_now());
+    let rows = panel(&text(&frame));
+    assert_contains(&rows[0], "± Edit src/lib.rs");
+    assert_contains(&rows[1], "│ @@ -1 +1 @@");
+    assert_contains(&rows[2], "│ -old line");
+    assert_contains(&rows[3], "│ +new line");
+    assert_contains(&rows[4], "Esc, then a approve · x deny");
+    // It all fits: no note.
+    assert_eq!(rows.len(), 5, "{rows:#?}");
+    // Coloured as in the timeline.
+    assert_eq!(last_colour_of(&frame, "+new line"), Color::Green);
+    assert_eq!(last_colour_of(&frame, "-old line"), Color::Red);
+    assert_eq!(last_colour_of(&frame, "@@ -1 +1 @@"), Color::Cyan);
+}
+
+#[test]
+fn approval_panel_caps_rows() {
+    let mut write = call(CallId::new(), "Write", ToolKind::FileWrite, "notes.txt");
+    write.display.body = body(BodyFormat::Text, &numbered(30));
+    let (h, _, _, _) = gated(vec![], write);
+    // Ten rows at most, then what was left out.
+    let rows = panel(&trimmed(&h.frame(90, 60, mockup_now())));
+    assert_contains(&rows[10], "│ 10 line 10");
+    assert_contains(&rows[11], "│ … +20 lines · v shows all");
+    assert_eq!(rows.len(), 13, "{rows:#?}");
+    // A third of the session when that is less: 20 rows inside, so 6.
+    let rows = panel(&h.screen());
+    assert_contains(&rows[6], "│  6 line 6");
+    assert_contains(&rows[7], "│ … +24 lines · v shows all");
+}
+
+#[test]
+fn v_reveals_gated_call() {
+    let mut edit = call(CallId::new(), "Edit", ToolKind::FileEdit, "src/lib.rs");
+    let diff: String = (1..=30).map(|i| format!("+added {i}\n")).collect();
+    edit.display.body = body(BodyFormat::Diff, &diff);
+    let before = (0..30).map(|i| agent(&format!("message {i}"))).collect();
+    let (mut h, id, approval, seq) = gated(before, edit);
+    h.key(KeyCode::Esc);
+    assert_eq!(h.key(KeyCode::Char('v')), None, "nothing is downloaded");
+    let ui = h.app.ui().session.as_ref().unwrap();
+    assert_eq!(ui.selected, Some(seq));
+    assert!(ui.expanded.contains(&seq));
+    // Taller than the timeline: its top is the first row.
+    let screen = h.screen();
+    assert_contains(screen.lines().nth(3).unwrap(), ">       ± Edit src/lib.rs");
+    assert_contains(&screen, "v show the call");
+    // Expanded, it shows every line where it fits.
+    let screen = trimmed(&h.frame(100, 60, mockup_now()));
+    assert_contains(&screen, ">       ± Edit src/lib.rs");
+    assert_contains(&screen, "│ +added 30");
+
+    // Answered elsewhere while reading: the panel goes, the selection stays.
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::ApprovalResolved {
+                id: approval,
+                decision: Decision::Approve,
+                by: DeviceId::new(),
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert!(!screen.contains("Approval needed"), "{screen}");
+    assert_eq!(h.app.ui().session.as_ref().unwrap().selected, Some(seq));
+    assert_contains(&screen, ">       ± Edit src/lib.rs");
+}
+
+#[test]
+fn long_shell_output_stays_visible() {
+    let id = CallId::new();
+    let mut bash = call(id, "Bash", ToolKind::Shell, "cargo build \\…");
+    bash.display.body = body(BodyFormat::Text, "cargo build \\\n  --release");
+    let (mut h, session, _, _) = gated(vec![], bash);
+    let rows = panel(&h.screen());
+    assert_contains(&rows[1], "│ cargo build \\");
+    assert_contains(&rows[2], "│   --release");
+    pull(
+        &mut h,
+        vec![event(
+            session,
+            2,
+            EventKind::ToolResult(result(id, false, "exit 0", "Finished release")),
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "│   --release");
+    assert_contains(&screen, "│ Finished release");
 }

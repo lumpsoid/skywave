@@ -399,8 +399,11 @@ fn footer_hint(app: &App) -> &'static str {
         Screen::SessionList(_) => {
             "↑↓ select · Enter open · n new session · s settings · ? help · q quit"
         }
-        Screen::Session(_) => match app.session().map(|(_, ui)| ui.focus) {
-            Some(Focus::Timeline) => {
+        Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui.focus)) {
+            Some((view, Focus::Timeline)) if view.pending_approval.is_some() => {
+                "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+            }
+            Some((_, Focus::Timeline)) => {
                 "↑↓ select · Enter expand · d download · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
             }
             _ => {
@@ -480,8 +483,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("↑↓ / k j", "select a tool call or agent message"),
                     key("[ / ]", "previous / next turn"),
                     key("Enter / Space", "expand it; downloads its blob if needed"),
-                    key("d", "download the selected blob"),
+                    key(
+                        "d",
+                        "download the selected blob; a long command's text before its output",
+                    ),
                     key("a / x", "approve / deny the pending approval"),
+                    key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("i", "write a message"),

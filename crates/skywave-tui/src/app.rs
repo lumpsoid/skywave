@@ -15,7 +15,7 @@ use skywave_core::{
 };
 
 use crate::composer::Composer;
-use crate::timeline::{ItemKey, sections, selectable, starts_turn, wanted_blob};
+use crate::timeline::{ItemKey, gated_item, sections, selectable, starts_turn, wanted_blob};
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -795,6 +795,10 @@ impl App {
                     .map(|blob| Action::DownloadBlob(blob.id)),
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
+                KeyCode::Char('v') => {
+                    session.reveal_gated(view);
+                    None
+                }
                 // Shifted, so a stray key does not end the agent's run.
                 KeyCode::Char('S') => Some(Action::StopSession {
                     session_id: view.id,
@@ -946,6 +950,25 @@ impl SessionUi {
         if let Some(first) = first_selectable(target) {
             self.selected = selectable(&view.timeline[first]);
         }
+    }
+
+    /// Selects and expands the item the pending approval gates and scrolls
+    /// its top into view. Downloads nothing: what is not here says so.
+    fn reveal_gated(&mut self, view: &SessionView) {
+        let Some((_, item)) = gated_item(view) else {
+            return;
+        };
+        let Some(seq) = selectable(item) else {
+            return;
+        };
+        self.selected = Some(seq);
+        self.expanded.insert(seq);
+        // Anchored to the item, not to a line: it grows by expanding, and the
+        // renderer clamps the anchor to the bottom.
+        self.scroll = Some(Anchor {
+            key: ItemKey::of(item),
+            offset: 0,
+        });
     }
 
     fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {

@@ -326,17 +326,84 @@ impl Layout<'_> {
         };
 
         let bar = || vec![indent(LEAD), Span::styled("│ ", gutter)];
-        let digits = if section.numbered {
-            let last = section
-                .lines
-                .map_or(0, |lines| lines as usize)
-                .max(content.len());
-            last.max(1).to_string().len()
-        } else {
-            0
+        let mut out: Vec<Line<'static>> = content_rows(section, content, &bar, self.width)
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(note) = note {
+            out.extend(wrap(bar(), bar(), vec![note], self.width));
+        }
+        out
+    }
+}
+
+/// A section's head as the approval panel shows it: its preview's lines
+/// under a gutter, at most `max_rows` rows of them (at least one), then
+/// what was left out and that `v` shows all.
+pub(super) fn preview_lines(
+    section: &Section,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let preview = content_lines(section.text);
+    let bar = || vec![Span::styled("│ ", Style::new().yellow())];
+    let content = preview.iter().map(|line| clean(line)).collect();
+    let max_rows = max_rows.max(1);
+    let mut out = Vec::new();
+    let mut shown = 0;
+    for rows in content_rows(section, content, &bar, width) {
+        if out.len() + rows.len() > max_rows {
+            // A line taller than the cap shows its head.
+            if shown == 0 {
+                out.extend(rows.into_iter().take(max_rows));
+            }
+            break;
+        }
+        out.extend(rows);
+        shown += 1;
+    }
+    let whole = section
+        .lines
+        .map_or(preview.len(), |lines| lines as usize)
+        .max(preview.len());
+    let rest = whole - shown;
+    if rest > 0 || section.blob.is_some() {
+        let more = match rest {
+            0 => String::new(),
+            1 => "+1 line · ".to_owned(),
+            _ => format!("+{rest} lines · "),
         };
-        let mut out = Vec::new();
-        for (i, line) in content.into_iter().enumerate() {
+        out.extend(wrap(
+            bar(),
+            bar(),
+            vec![Span::raw(format!("… {more}v shows all")).dark_gray()],
+            width,
+        ));
+    }
+    out
+}
+
+/// Each content line's rows after `bar`: numbered if the section is,
+/// coloured by [`line_style`], wrapped to `width`.
+fn content_rows(
+    section: &Section,
+    content: Vec<String>,
+    bar: &dyn Fn() -> Vec<Span<'static>>,
+    width: usize,
+) -> Vec<Vec<Line<'static>>> {
+    let digits = if section.numbered {
+        let last = section
+            .lines
+            .map_or(0, |lines| lines as usize)
+            .max(content.len());
+        last.max(1).to_string().len()
+    } else {
+        0
+    };
+    content
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
             let mut first = bar();
             let mut rest = bar();
             if section.numbered {
@@ -344,18 +411,9 @@ impl Layout<'_> {
                 rest.push(indent(digits + 1));
             }
             let style = line_style(section, &line);
-            out.extend(wrap(
-                first,
-                rest,
-                vec![Span::styled(line, style)],
-                self.width,
-            ));
-        }
-        if let Some(note) = note {
-            out.extend(wrap(bar(), bar(), vec![note], self.width));
-        }
-        out
-    }
+            wrap(first, rest, vec![Span::styled(line, style)], width)
+        })
+        .collect()
 }
 
 /// A content line's colour: diff lines by their sign, an error's in red.

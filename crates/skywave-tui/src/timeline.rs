@@ -5,8 +5,8 @@
 //! screen shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, CommandId, Entry, Seq, TimelineItem, ToolKind, ToolOutcome,
-    ToolView,
+    BlobState, BlobView, BodyFormat, CommandId, Entry, Seq, SessionView, TimelineItem, ToolKind,
+    ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -122,9 +122,10 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
 }
 
 /// A grouped call: its body (e.g. the file written or the diff), then its
-/// output. Output beside a body is shown only when it is an error; the rest
-/// waits for Enter. The whole input is offered when nothing else has a blob.
-fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
+/// output. Output beside a body is shown only when it is an error or the
+/// body is a shell command; the rest waits for Enter. The whole input is
+/// offered when nothing else has a blob.
+pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     let mut out = Vec::new();
     if let Some(body) = &view.body {
         out.push(Section {
@@ -153,7 +154,7 @@ fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             numbered: view.kind == ToolKind::FileRead && view.body.is_none() && !is_error,
             error: *is_error,
             blob: output.as_ref(),
-            hidden: !is_error && view.body.is_some(),
+            hidden: !is_error && view.body.is_some() && view.kind != ToolKind::Shell,
         });
     }
     if out.iter().all(|s| s.blob.is_none())
@@ -167,6 +168,26 @@ fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
 /// Kinds whose content is a file's lines.
 fn is_file(kind: ToolKind) -> bool {
     matches!(kind, ToolKind::FileWrite | ToolKind::FileRead)
+}
+
+/// The timeline item the pending approval gates, with its timeline index:
+/// its grouped call, else (no logged call) the approval itself.
+pub fn gated_item(view: &SessionView) -> Option<(usize, &TimelineItem)> {
+    let prompt = view.pending_approval.as_ref()?;
+    view.timeline
+        .iter()
+        .enumerate()
+        .find(|(_, item)| match item {
+            TimelineItem::Logged {
+                entry: Entry::Tool(tool),
+                ..
+            } => prompt.call == Some(tool.call),
+            TimelineItem::Logged {
+                entry: Entry::Approval { id, .. },
+                ..
+            } => prompt.call.is_none() && *id == prompt.id,
+            _ => false,
+        })
 }
 
 /// The first blob behind `entry` that is not here yet; what `d` fetches.

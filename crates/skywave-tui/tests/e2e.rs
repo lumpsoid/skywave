@@ -389,7 +389,7 @@ async fn f5_converse() {
 #[tokio::test(flavor = "multi_thread")]
 async fn f6_approvals() {
     let approval = |request: &str| {
-        Step::approval(request, "write", json!({ "path": "a.txt" }))
+        Step::approval(request, "write", json!({ "path": "a.txt", "text": "hi" }))
             .on_approve([Step::text("written")])
             .on_deny([Step::text("not writing")])
     };
@@ -411,9 +411,20 @@ async fn f6_approvals() {
     // Approve here; the other device sees who answered.
     a.send("one");
     // The prompt names the call, as the timeline does.
-    a.wait_for(PROMPT).await;
+    let screen = a.wait_for(PROMPT).await;
     b.wait_for(PROMPT).await;
+    // The title leaves the text out: the prompt points at the whole input,
+    // and `v` opens it in the timeline without downloading it.
+    assert!(screen.contains("full input "), "{screen}");
+    assert!(screen.contains(" · v to see it"), "{screen}");
     a.key(KeyCode::Esc);
+    a.key(KeyCode::Char('v'));
+    a.wait("revealed", |_, s| {
+        s.lines()
+            .any(|l| l.contains(">       ? write a.txt") && l.contains("needs approval"))
+            && s.contains("│ not downloaded · 37 B · press d to download")
+    })
+    .await;
     a.key(KeyCode::Char('a'));
     let screen = a
         .wait("approved", |_, s| {

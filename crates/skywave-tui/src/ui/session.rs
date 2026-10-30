@@ -11,19 +11,22 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobState, Entry, Link, Outgoing, SessionState, SessionView,
-    TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobState, BlobView, Entry, Link, Outgoing, SessionState,
+    SessionView, TimelineItem, ToolView,
 };
 
 use super::timeline::{
-    approval_state, bytes, detail_lines, glyph, head_lines, item_lines, title_spans,
+    approval_state, bytes, detail_lines, glyph, head_lines, item_lines, preview_lines, title_spans,
 };
 use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
 use crate::app::{App, Focus, Geometry, SessionUi};
-use crate::timeline::ItemKey;
+use crate::timeline::{ItemKey, Section, gated_item, sections, tool_sections};
 
 /// Most composer rows on screen; longer drafts scroll.
 const COMPOSER_ROWS: usize = 6;
+/// Most rows of the gated call's content in the approval prompt; a third of
+/// the screen when that is less.
+const APPROVAL_ROWS: usize = 10;
 
 pub(super) fn render(
     frame: &mut Frame,
@@ -45,10 +48,16 @@ pub(super) fn render(
     let composer_width = inner.width.saturating_sub(2) as usize;
     let composer_rows = draft.map_or(1, |d| d.rows(composer_width).len());
     let composer_height = composer_rows.clamp(1, COMPOSER_ROWS) as u16 + 2;
-    let approval = session
-        .pending_approval
-        .as_ref()
-        .map(|p| approval_lines(p, session, ui.focus, inner.width.saturating_sub(2) as usize));
+    let approval_rows = APPROVAL_ROWS.min(inner.height as usize / 3);
+    let approval = session.pending_approval.as_ref().map(|p| {
+        approval_lines(
+            p,
+            session,
+            ui.focus,
+            inner.width.saturating_sub(2) as usize,
+            approval_rows,
+        )
+    });
     let approval_height = approval.as_ref().map_or(0, |lines| lines.len() as u16 + 2);
     let [status, timeline, approval_area, composer] = Layout::vertical([
         Constraint::Length(1),
@@ -137,25 +146,24 @@ fn render_timeline(
 }
 
 /// The prompt above the composer while the agent is blocked: the call it
-/// gates as the timeline shows it (kind, title, detail), then the keys.
+/// gates as the timeline shows it (kind, title, detail), what it will do
+/// (at most `max_rows` rows of it), then the keys.
 fn approval_lines(
     prompt: &ApprovalPrompt,
     session: &SessionView,
     focus: Focus,
     width: usize,
+    max_rows: usize,
 ) -> Vec<Line<'static>> {
-    let call = prompt.call.and_then(|call| {
-        session.timeline.iter().find_map(|item| match item {
+    let mut lines = match gated_item(session) {
+        Some((
+            _,
             TimelineItem::Logged {
                 entry: Entry::Tool(view),
                 ..
-            } if view.call == call => Some(view.as_ref()),
-            _ => None,
-        })
-    });
-    let mut lines = match call {
-        Some(view) => gated_call(view, width),
-        None => {
+            },
+        )) => gated_call(view, width, max_rows),
+        _ => {
             let (_, style) = approval_state(&ApprovalStatus::Pending);
             let mut lines = head_lines(
                 Vec::new(),
@@ -164,20 +172,16 @@ fn approval_lines(
                 None,
                 width,
             );
-            if let Some(input) = &prompt.input {
-                let size = match &input.state {
-                    BlobState::NotDownloaded { size } | BlobState::Downloading { size, .. } => {
-                        format!("{} · ", bytes(*size))
-                    }
-                    BlobState::Available { .. } => String::new(),
-                };
-                lines.push(
-                    Line::from(format!(
-                        "  full input {size}select it in the timeline and press Enter to see it"
-                    ))
-                    .dark_gray(),
-                );
-            }
+            // An approval with no logged call (a v1 one): the rest of its
+            // summary, else its input.
+            let entry = Entry::Approval {
+                id: prompt.id,
+                tool: prompt.tool.clone(),
+                summary: prompt.summary.clone(),
+                input: prompt.input.clone(),
+                status: ApprovalStatus::Pending,
+            };
+            lines.extend(gated_content(&sections(&entry), width, max_rows));
             lines
         }
     };
@@ -204,8 +208,9 @@ fn approval_lines(
     lines
 }
 
-/// The call an approval gates: glyph, name and title, then its detail.
-fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
+/// The call an approval gates: glyph, name and title, its detail, then
+/// what it will do (the diff, the content written, the whole command).
+fn gated_call(view: &ToolView, width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let (_, style) = approval_state(&ApprovalStatus::Pending);
     let mut lines = head_lines(
         Vec::new(),
@@ -217,7 +222,33 @@ fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
     if let Some(detail) = &view.detail {
         lines.extend(detail_lines(detail, 2, width));
     }
+    lines.extend(gated_content(&tool_sections(view), width, max_rows));
     lines
+}
+
+/// The first section shown while collapsed, capped to `max_rows`; with none,
+/// where to see the whole input if there is one.
+fn gated_content(sections: &[Section], width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    if let Some(section) = sections.iter().find(|s| !s.hidden) {
+        return preview_lines(section, width, max_rows);
+    }
+    sections
+        .iter()
+        .find_map(|s| s.blob)
+        .map(input_line)
+        .into_iter()
+        .collect()
+}
+
+/// Where the whole input of a gated call is, and its size if it is not here.
+fn input_line(input: &BlobView) -> Line<'static> {
+    let size = match &input.state {
+        BlobState::NotDownloaded { size } | BlobState::Downloading { size, .. } => {
+            format!(" {}", bytes(*size))
+        }
+        BlobState::Available { .. } => String::new(),
+    };
+    Line::from(format!("  full input{size} · v to see it")).dark_gray()
 }
 
 fn render_composer(
