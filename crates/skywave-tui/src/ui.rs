@@ -901,7 +901,7 @@ pub(crate) fn answer_words(decision: Decision, rule: Option<&RuleSuggestion>) ->
 /// How far a rule reaches, in words.
 fn scope_label(scope: RuleScope) -> &'static str {
     match scope {
-        RuleScope::Session => "session",
+        RuleScope::Session => "this session",
         RuleScope::Project => "project",
         RuleScope::User => "user",
     }
