@@ -82,6 +82,19 @@ impl SessionSummary {
     pub fn pending_approval(&self) -> Option<ApprovalId> {
         self.pending_approvals.first().copied()
     }
+
+    /// What to call the session in a line of text, e.g. a notification: the
+    /// last component of its directory, else the end of its id.
+    pub fn title(&self) -> String {
+        self.workdir
+            .as_deref()
+            .and_then(|dir| dir.trim_end_matches('/').rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .map_or_else(
+                || self.id.0.simple().to_string()[24..].to_owned(),
+                str::to_owned,
+            )
+    }
 }
 
 /// Whether an event is news for whoever was away: the agent's output (a
@@ -197,6 +210,20 @@ mod tests {
             summary.last_activity,
             event(sid, 6, EventKind::TurnInterrupted).at
         );
+    }
+
+    #[test]
+    fn title_is_the_directory_name_else_the_id() {
+        let sid = SessionId::new();
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, EventKind::TurnInterrupted));
+        let short = sid.0.simple().to_string()[24..].to_owned();
+        assert_eq!(summary.title(), short);
+        for (workdir, title) in [("/srv/app", "app"), ("/srv/app/", "app"), ("app", "app")] {
+            summary.workdir = Some(workdir.into());
+            assert_eq!(summary.title(), title);
+        }
+        summary.workdir = Some("/".into());
+        assert_eq!(summary.title(), short);
     }
 
     #[test]

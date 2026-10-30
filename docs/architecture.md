@@ -109,5 +109,7 @@ enum BlobState {
 | `CatchingUp` | Render local replica immediately, subtle syncing indicator. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
+| New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. |
+| Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
 | `Rejected(Revoked)` | Full-screen state with re-pair action; local data stays readable. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |

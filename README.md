@@ -151,12 +151,19 @@ start talking to the agent.
 | `Ctrl-X` | Interrupt the agent's turn |
 | `S` | Stop the agent (timeline); the next message restarts it |
 | `Ctrl-R` | Retry the connection now while offline (any screen) |
+| `Ctrl-G` | Open the next session waiting for an approval (any screen) |
 | `?` / `F1` | Help |
 
 Copies go to your local clipboard through the terminal (OSC 52), so they work
 over SSH. Inside tmux, enable `set -g set-clipboard on`. Content over 74 KiB is
 not copied (the notice names the blob's file); `SKYWAVE_OSC52_MAX` sets another
 limit in bytes.
+
+When an agent asks for an approval the TUI rings the terminal bell, once per
+new batch of requests. `--notify` (or `SKYWAVE_NOTIFY`) picks how: `off`, or
+any of `bell`, `osc9`, `osc777` separated by commas; `osc9` / `osc777` send a
+desktop notification naming the session (never the tool's input). Inside tmux
+those two need `set -g allow-passthrough on`; the bell always works.
 
 ### Managing devices
 

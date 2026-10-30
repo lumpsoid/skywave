@@ -17,6 +17,7 @@ use skywave_core::{
 
 use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
+use crate::notify;
 use crate::timeline::{
     Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
     match_hidden, sections, selectable, starts_turn, wanted_blob,
@@ -560,6 +561,15 @@ pub struct UiState {
     /// A copy to the terminal's clipboard, for the event loop to send
     /// ([`App::take_copy`]).
     pub copy: Option<Clip>,
+    /// The core's [`alerts`](skywave_core::Attention::alerts) count last
+    /// seen; the first snapshot's needs no alert.
+    pub seen_alerts: u64,
+    /// An alert that new approvals came in, for the event loop to send
+    /// ([`App::take_alert`]): the newest one's session title.
+    pub alert: Option<String>,
+    /// Ctrl-G asked for the next approval's session: it opens on the
+    /// timeline, so `a`/`x` answer at once.
+    pub jumped: bool,
     pub quit: bool,
 }
 
@@ -585,6 +595,9 @@ impl App {
                 error: None,
                 notice: None,
                 copy: None,
+                seen_alerts: view.attention.alerts,
+                alert: None,
+                jumped: false,
                 quit: false,
             },
         };
@@ -622,6 +635,16 @@ impl App {
         if !matches!(view.screen, Screen::SessionList(_)) {
             self.ui.create = None;
         }
+        let attention = &view.attention;
+        if attention.alerts > self.ui.seen_alerts {
+            let title = attention.approvals.last().map(|a| a.title.clone());
+            self.ui.notice = Some(match &title {
+                Some(title) => format!("approval needed · {}", notify::sanitise(title)),
+                None => "approval needed".to_owned(),
+            });
+            self.ui.alert = Some(title.unwrap_or_default());
+        }
+        self.ui.seen_alerts = self.ui.seen_alerts.max(attention.alerts);
         let old_index = self
             .session_list()
             .and_then(|list| self.selected_index(list));
@@ -643,12 +666,17 @@ impl App {
         }
     }
 
-    /// Fresh session presentation state when another session opens.
+    /// Fresh session presentation state when another session opens; on
+    /// the timeline after Ctrl-G.
     fn follow_session(&mut self) {
         match &self.view.screen {
             Screen::Session(session) => {
                 if self.ui.session.as_ref().is_none_or(|s| s.id != session.id) {
-                    self.ui.session = Some(SessionUi::new(session));
+                    let mut ui = SessionUi::new(session);
+                    if std::mem::take(&mut self.ui.jumped) {
+                        ui.focus = Focus::Timeline;
+                    }
+                    self.ui.session = Some(ui);
                 }
             }
             _ => self.ui.session = None,
@@ -729,6 +757,12 @@ impl App {
     /// with [`App::copied`].
     pub fn take_copy(&mut self) -> Option<Clip> {
         self.ui.copy.take()
+    }
+
+    /// The alert [`App::set_view`] asked for, if any: the session title to
+    /// name, maybe empty.
+    pub fn take_alert(&mut self) -> Option<String> {
+        self.ui.alert.take()
     }
 
     /// Records the outcome of sending a [`App::take_copy`] copy: how many
@@ -982,6 +1016,7 @@ impl App {
         }
         self.ui.error = None;
         self.ui.notice = None;
+        self.ui.jumped = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.ui.quit = true;
@@ -1002,6 +1037,14 @@ impl App {
         }
         if ctrl && key.code == KeyCode::Char('r') {
             return Some(Action::RetryNow);
+        }
+        // Even while typing: the draft is saved on the way out.
+        if ctrl && key.code == KeyCode::Char('g') {
+            if self.revoked_screen() || self.view.attention.elsewhere == 0 {
+                return None;
+            }
+            self.ui.jumped = true;
+            return Some(Action::OpenNextApproval);
         }
         if self.revoked_screen() {
             return match key.code {
