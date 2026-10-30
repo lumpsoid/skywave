@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -158,7 +158,7 @@ impl Tui {
         core.subscribe(move |view| {
             let _ = tx.send(view);
         });
-        let app = App::new(views.try_recv().unwrap(), Instant::now());
+        let app = App::new(views.try_recv().unwrap());
         Tui {
             dir,
             core,
@@ -174,7 +174,7 @@ impl Tui {
     /// Takes every snapshot already pushed.
     fn pump(&mut self) {
         while let Ok(view) = self.views.try_recv() {
-            self.app.set_view(view, Instant::now());
+            self.app.set_view(view);
         }
     }
 
@@ -203,9 +203,7 @@ impl Tui {
 
     fn screen(&self) -> String {
         let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
-        terminal
-            .draw(|frame| ui::render(frame, &self.app, Instant::now()))
-            .unwrap();
+        terminal.draw(|frame| ui::render(frame, &self.app)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -228,7 +226,7 @@ impl Tui {
                 return screen;
             }
             match tokio::time::timeout_at(deadline, self.views.recv()).await {
-                Ok(Some(view)) => self.app.set_view(view, Instant::now()),
+                Ok(Some(view)) => self.app.set_view(view),
                 Ok(None) => panic!("core gone"),
                 Err(_) => panic!("timed out waiting for {what}; screen:\n{screen}"),
             }

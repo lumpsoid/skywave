@@ -188,8 +188,8 @@ fn offline_send_is_persisted_first_and_appears_once() {
     core.dispatch(Action::OpenSession(sid)).unwrap();
     seam.set_link(Link::Reconnecting {
         attempt: 1,
-        next_in: std::time::Duration::from_secs(2),
-        offline_since: std::time::Instant::now(),
+        retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(2),
+        offline_since: chrono::Utc::now(),
     });
 
     core.dispatch(Action::SendMessage {

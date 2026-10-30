@@ -1,6 +1,5 @@
 package dev.skywave.android.ui
 
-import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,8 +22,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -91,7 +92,8 @@ private fun CatchingUp(link: Link.CatchingUp, modifier: Modifier) {
 
 @Composable
 private fun Reconnecting(link: Link.Reconnecting, queued: ULong, onRetryNow: () -> Unit, modifier: Modifier) {
-    val left = rememberCountdown(link)
+    val clock = LocalWallClock.current
+    val left = rememberCountdown(link.retryAtMs, clock)
     val separator = stringResource(R.string.separator)
     val headline = buildList {
         add(stringResource(R.string.link_offline))
@@ -106,7 +108,7 @@ private fun Reconnecting(link: Link.Reconnecting, queued: ULong, onRetryNow: () 
     }.joinToString(separator)
     val locale = LocalConfiguration.current.locales[0]
     val since = remember(link.offlineSinceMs, locale) {
-        formatOfflineSince(link.offlineSinceMs, System.currentTimeMillis(), ZoneId.systemDefault(), locale)
+        formatOfflineSince(link.offlineSinceMs, clock(), ZoneId.systemDefault(), locale)
     }
     val detail = listOf(
         stringResource(R.string.link_offline_since, since),
@@ -175,22 +177,30 @@ private val bannerInsets: WindowInsets
     @Composable get() = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
 
 /**
- * Ticks down from the snapshot's `nextInMs` once a second. Presentation only:
- * the core decides when to retry and sends a new snapshot when it does.
+ * The wall clock the banner counts against, in Unix-epoch millis. The core's
+ * times are wall-clock instants, so this keeps counting through deep sleep
+ * and reads the same after the Activity is recreated. Tests provide a fake.
+ */
+internal val LocalWallClock = staticCompositionLocalOf<() -> Long> { System::currentTimeMillis }
+
+/**
+ * Counts down to [retryAtMs] on [clock], recomputed at each second boundary.
+ * Presentation only: the core decides when to retry and sends a new snapshot
+ * when it does. Nothing is anchored to when a snapshot arrived, so a new
+ * snapshot or a recreated screen picks up where the countdown stood.
  */
 @Composable
-private fun rememberCountdown(link: Link.Reconnecting): Countdown {
-    val received = remember(link) { SystemClock.elapsedRealtime() }
-    val left by produceState(countdown(link.nextInMs, 0), link) {
+private fun rememberCountdown(retryAtMs: Long, clock: () -> Long): Countdown = key(retryAtMs) {
+    val left by produceState(countdown(retryAtMs, clock())) {
         while (true) {
-            val elapsed = SystemClock.elapsedRealtime() - received
-            value = countdown(link.nextInMs, elapsed)
-            val wait = nextTickInMs(link.nextInMs, elapsed)
+            val now = clock()
+            value = countdown(retryAtMs, now)
+            val wait = nextTickInMs(retryAtMs, now)
             if (wait == 0L) break
             delay(wait)
         }
     }
-    return left
+    left
 }
 
 /** Plural quantity for a count from the core; clamps the (unreachable) huge ones. */

@@ -12,23 +12,26 @@ data class Countdown(val minutes: Long, val seconds: Long) {
 }
 
 /**
- * The countdown [elapsedMs] after a snapshot said the next attempt is
- * [nextInMs] away. Rounds up, so "1s" shows until the attempt is due.
+ * The countdown at wall time [nowMs] to the attempt due at [retryAtMs]
+ * (both Unix-epoch millis). Rounds up, so "1s" shows until the attempt is due.
  */
-fun countdown(nextInMs: ULong, elapsedMs: Long): Countdown {
-    val leftMs = (nextInMs.coerceAtMost(Long.MAX_VALUE.toULong()).toLong() - elapsedMs.coerceAtLeast(0))
-        .coerceAtLeast(0)
-    val total = (leftMs + 999) / 1000
+fun countdown(retryAtMs: Long, nowMs: Long): Countdown {
+    val leftMs = leftMs(retryAtMs, nowMs)
+    val total = leftMs / 1000 + if (leftMs % 1000 == 0L) 0 else 1
     return Countdown(minutes = total / 60, seconds = total % 60)
 }
 
-/** How long to wait from [elapsedMs] until [countdown] next changes, at most a second. */
-fun nextTickInMs(nextInMs: ULong, elapsedMs: Long): Long {
-    val leftMs = nextInMs.coerceAtMost(Long.MAX_VALUE.toULong()).toLong() - elapsedMs
-    if (leftMs <= 0) return 0
+/** How long to wait from [nowMs] until [countdown] next changes, at most a second; 0 once it is over. */
+fun nextTickInMs(retryAtMs: Long, nowMs: Long): Long {
+    val leftMs = leftMs(retryAtMs, nowMs)
+    if (leftMs == 0L) return 0
     val partial = leftMs % 1000
     return if (partial == 0L) 1000 else partial
 }
+
+/** Millis from [nowMs] to [retryAtMs], never negative, safe at the extremes. */
+private fun leftMs(retryAtMs: Long, nowMs: Long): Long =
+    if (retryAtMs <= nowMs) 0 else (retryAtMs - nowMs).let { if (it < 0) Long.MAX_VALUE else it }
 
 /**
  * "Offline since" for [sinceMs] (Unix-epoch millis): the time alone when it

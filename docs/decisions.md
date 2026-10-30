@@ -98,9 +98,14 @@ Type mapping across the boundary:
 - `Seq` → `u64`
 - `Duration` → millis (`u64`)
 - `DateTime<Utc>` → unix-epoch millis (`i64`)
-- `Instant` → unix-epoch millis (`i64`), converted against `SystemTime::now()`
-  at conversion time
 - `PathBuf` → `String`
+
+No `Instant` crosses the boundary: a monotonic instant can only be shown as
+wall time by reading a clock at conversion, which makes every snapshot of
+the same value differ, and `CLOCK_MONOTONIC` stops while Android sleeps. A
+view field that is a moment holds a `DateTime<Utc>` fixed when the core
+learned of it (e.g. `Link::Reconnecting { retry_at, offline_since }`), and a
+head counts against its own wall clock from there.
 
 Mirrors are plain data. If a head would need logic to render something
 (formatting, counting, deciding visibility), that logic goes into core's

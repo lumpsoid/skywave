@@ -30,7 +30,7 @@ private fun viewState(link: Link = Link.Connecting, queued: ULong = 0u) = ViewSt
     screen = Screen.Pairing(PairingView(paired = null, status = PairingStatus.Idle)),
 )
 
-private val reconnecting = Link.Reconnecting(attempt = 3u, nextInMs = 4_000u, offlineSinceMs = 0)
+private val reconnecting = Link.Reconnecting(attempt = 3u, retryAtMs = 4_000, offlineSinceMs = 0)
 
 private fun draft(i: Int) = Action.SaveDraft(sessionId = "s", text = "t$i", cursor = 0u)
 

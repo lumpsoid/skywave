@@ -76,7 +76,8 @@ enum Link {
     Connecting,
     Online { latency_ms: u32 },
     CatchingUp { have: Seq, server: Seq },
-    Reconnecting { attempt: u32, next_in: Duration, offline_since: Instant },
+    // wall-clock instants fixed at the failure; heads count down to retry_at
+    Reconnecting { attempt: u32, retry_at: DateTime<Utc>, offline_since: DateTime<Utc> },
     Rejected(RejectReason),          // revoked cert, protocol mismatch
 }
 

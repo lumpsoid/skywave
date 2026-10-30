@@ -6,7 +6,7 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -53,7 +53,7 @@ impl Harness {
         let (tx, views) = mpsc::channel();
         core.subscribe(move |view| tx.send(view).unwrap());
         let t0 = Instant::now();
-        let app = App::new(views.recv().unwrap(), t0);
+        let app = App::new(views.recv().unwrap());
         Harness {
             dir,
             core,
@@ -129,18 +129,14 @@ impl Harness {
     }
 
     /// Takes the snapshots the core pushed, as the event loop does.
-    fn sync_at(&mut self, now: Instant) {
+    fn sync(&mut self) {
         loop {
             match self.views.try_recv() {
-                Ok(view) => self.app.set_view(view, now),
+                Ok(view) => self.app.set_view(view),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => panic!("core gone"),
             }
         }
-    }
-
-    fn sync(&mut self) {
-        self.sync_at(self.t0);
     }
 
     /// A key press; any resulting action goes to the core.
@@ -174,10 +170,10 @@ impl Harness {
         self.requests.try_iter().collect()
     }
 
-    fn screen_at(&self, now: Instant) -> String {
+    fn screen_at(&self, wall: DateTime<Utc>) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| ui::render_at(frame, &self.app, now, mockup_now().into()))
+            .draw(|frame| ui::render_at(frame, &self.app, wall.into()))
             .unwrap();
         text(terminal.backend().buffer())
     }
@@ -187,17 +183,17 @@ impl Harness {
     fn frame(&self, width: u16, height: u16, wall: DateTime<Utc>) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| ui::render_at(frame, &self.app, self.t0, wall.into()))
+            .draw(|frame| ui::render_at(frame, &self.app, wall.into()))
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
     fn screen(&self) -> String {
-        self.screen_at(self.t0)
+        self.screen_at(mockup_now())
     }
 
-    fn banner_at(&self, now: Instant) -> String {
-        self.screen_at(now)
+    fn banner_at(&self, wall: DateTime<Utc>) -> String {
+        self.screen_at(wall)
             .lines()
             .next()
             .unwrap()
@@ -206,7 +202,7 @@ impl Harness {
     }
 
     fn banner(&self) -> String {
-        self.banner_at(self.t0)
+        self.banner_at(mockup_now())
     }
 }
 
@@ -447,24 +443,35 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         })
         .unwrap();
     // The killed server: the engine reports it is backing off.
+    let t0 = mockup_now();
     h.seam.set_link(Link::Reconnecting {
         attempt: 3,
-        next_in: Duration::from_secs(5),
-        offline_since: h.t0,
+        retry_at: t0 + TimeDelta::seconds(5),
+        offline_since: t0,
     });
     h.sync();
-    let t0 = h.t0;
     assert_eq!(
         h.banner_at(t0),
         "offline · 2 queued · retry in 05s · Ctrl-R now (attempt 3)"
     );
     assert_eq!(
-        h.banner_at(t0 + Duration::from_millis(2500)),
+        h.banner_at(t0 + TimeDelta::milliseconds(2500)),
         "offline · 2 queued · retry in 03s · Ctrl-R now (attempt 3)"
     );
+    // Another snapshot in the same wait does not restart the countdown.
+    h.core
+        .dispatch(Action::CreateSession {
+            workdir: "/srv/c".into(),
+        })
+        .unwrap();
+    h.sync();
     assert_eq!(
-        h.banner_at(t0 + Duration::from_secs(6)),
-        "offline · 2 queued · retrying… (attempt 3)"
+        h.banner_at(t0 + TimeDelta::milliseconds(2500)),
+        "offline · 3 queued · retry in 03s · Ctrl-R now (attempt 3)"
+    );
+    assert_eq!(
+        h.banner_at(t0 + TimeDelta::seconds(6)),
+        "offline · 3 queued · retrying… (attempt 3)"
     );
     // Local data still renders under the banner.
     assert_contains(&line_with(&h.screen(), "/srv/a"), "[queued]");
@@ -474,23 +481,23 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     assert_eq!(h.key_with(ctrl('r')), Some(Action::RetryNow));
     assert_eq!(h.drain_requests(), vec![Request::RetryNow]);
 
-    // A new attempt restarts the countdown from when it arrived.
-    let later = t0 + Duration::from_secs(10);
+    // A new attempt counts down to its own deadline.
+    let later = t0 + TimeDelta::seconds(10);
     h.seam.set_link(Link::Reconnecting {
         attempt: 4,
-        next_in: Duration::from_secs(10),
+        retry_at: later + TimeDelta::seconds(10),
         offline_since: t0,
     });
-    h.sync_at(later);
+    h.sync();
     assert_eq!(
-        h.banner_at(later + Duration::from_secs(1)),
-        "offline · 2 queued · retry in 09s · Ctrl-R now (attempt 4)"
+        h.banner_at(later + TimeDelta::seconds(1)),
+        "offline · 3 queued · retry in 09s · Ctrl-R now (attempt 4)"
     );
 
     // Back online, the queue drains; the count stays until results arrive.
     h.seam.set_link(Link::Online { latency_ms: 80 });
     h.sync();
-    assert_eq!(h.banner(), "online · 80 ms · 2 queued");
+    assert_eq!(h.banner(), "online · 80 ms · 3 queued");
 }
 
 #[test]
@@ -1173,8 +1180,8 @@ fn esc_closes_the_popup_then_the_prompt() {
     );
     h.seam.set_link(Link::Reconnecting {
         attempt: 1,
-        next_in: Duration::from_secs(5),
-        offline_since: Instant::now(),
+        retry_at: Utc::now() + TimeDelta::seconds(5),
+        offline_since: Utc::now(),
     });
     h.sync();
     h.key(KeyCode::Char('n'));
@@ -1832,8 +1839,8 @@ fn tool_output_expands_through_every_blob_state() {
     // With the link down it is paused, not frozen; back online it goes on.
     h.seam.set_link(Link::Reconnecting {
         attempt: 1,
-        next_in: Duration::from_secs(5),
-        offline_since: h.t0,
+        retry_at: mockup_now() + TimeDelta::seconds(5),
+        offline_since: mockup_now(),
     });
     h.sync();
     assert_contains(&h.screen(), "│ … downloading 40% · paused, offline");
@@ -2563,8 +2570,8 @@ fn offline_composer_says_messages_wait() {
     let (mut h, _, _) = open_session();
     h.seam.set_link(Link::Reconnecting {
         attempt: 1,
-        next_in: Duration::from_secs(5),
-        offline_since: h.t0,
+        retry_at: mockup_now() + TimeDelta::seconds(5),
+        offline_since: mockup_now(),
     });
     h.sync();
     assert_contains(&h.screen(), "Message · offline, sends when back online");
@@ -3712,15 +3719,15 @@ fn selection_moves_to_neighbour_when_pending_vanishes() {
 
     // The next item takes its place; at the end, the one before.
     let view = without(&h, ItemKey::Pending(first));
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(selected(&h), Some(ItemKey::Pending(second)));
     assert_contains(&h.screen(), ">       you [queued]: second");
     let view = without(&h, ItemKey::Pending(second));
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
     // Nothing left to select.
     let view = without(&h, ItemKey::Logged(Seq(2)));
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(selected(&h), None);
 }
 
@@ -3965,7 +3972,7 @@ fn selected_own_message_shows_delivery_detail() {
         tries: 2,
     };
     let view = with_delivery(&h, ItemKey::Logged(seq), resent);
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(
         line_after(&h.screen(), "you [accepted]: hello"),
         "queued 12:02:11 · sent +3.2s · 2 tries · answered +8.1s"
@@ -3977,7 +3984,7 @@ fn selected_own_message_shows_delivery_detail() {
         ..resent
     };
     let view = with_delivery(&h, ItemKey::Logged(seq), old);
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(
         line_after(&h.screen(), "you [accepted]: hello"),
         "queued 12:02:11 · sent · answered +8.1s"
@@ -4014,7 +4021,7 @@ fn selected_own_message_shows_delivery_detail() {
         tries: 1,
     };
     let view = with_delivery(&h, ItemKey::Pending(refused), quick);
-    h.app.set_view(view, h.t0);
+    h.app.set_view(view);
     assert_eq!(
         line_after(&h.screen(), "]: again"),
         "queued 12:03:00 · sent +0.5s · refused +2.1s"

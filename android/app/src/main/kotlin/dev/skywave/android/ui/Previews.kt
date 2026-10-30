@@ -55,7 +55,9 @@ internal object Samples {
 
     val unpaired = Screen.Pairing(PairingView(paired = null, status = PairingStatus.Idle))
 
-    val reconnecting = Link.Reconnecting(attempt = 3u, nextInMs = 4_000u, offlineSinceMs = 1_700_000_000_000)
+    /** Third attempt, due 4 s after [nowMs], offline for the last 10 minutes. */
+    fun reconnecting(nowMs: Long = System.currentTimeMillis()) =
+        Link.Reconnecting(attempt = 3u, retryAtMs = nowMs + 4_000, offlineSinceMs = nowMs - 600_000)
 
     fun state(
         link: Link,
@@ -84,7 +86,7 @@ private fun CatchingUpPreview() = ShellPreview(Samples.state(Link.CatchingUp(hav
 
 @Preview(name = "Reconnecting, 3 queued")
 @Composable
-private fun ReconnectingPreview() = ShellPreview(Samples.state(Samples.reconnecting, queued = 3u))
+private fun ReconnectingPreview() = ShellPreview(Samples.state(Samples.reconnecting(), queued = 3u))
 
 @Preview(name = "Rejected: revoked")
 @Composable
@@ -108,4 +110,4 @@ private fun AttentionPreview() =
 @Preview(name = "Reconnecting + approvals, dark", uiMode = android.content.res.Configuration.UI_MODE_NIGHT_YES)
 @Composable
 private fun DarkPreview() =
-    ShellPreview(Samples.state(Samples.reconnecting, queued = 1u, attention = Samples.twoElsewhere))
+    ShellPreview(Samples.state(Samples.reconnecting(), queued = 1u, attention = Samples.twoElsewhere))

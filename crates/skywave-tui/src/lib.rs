@@ -54,7 +54,7 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
     let Ok(Msg::View(first)) = rx.recv() else {
         unreachable!("subscribe delivers the current snapshot right away");
     };
-    let mut app = App::new(*first, Instant::now());
+    let mut app = App::new(*first);
 
     // Terminal input on its own thread; it ends with the process.
     thread::spawn(move || {
@@ -81,7 +81,7 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
         execute!(io::stdout(), EnableBracketedPaste)?;
         loop {
             alert(&mut app, &mut io::stdout(), notify, tmux);
-            terminal.draw(|frame| ui::render(frame, &app, Instant::now()))?;
+            terminal.draw(|frame| ui::render(frame, &app))?;
             let tick = matches!(app.view().link, Link::Reconnecting { .. }) || app.live();
             let now = Instant::now();
             let wait = [
@@ -110,7 +110,7 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
                 .chain(std::iter::from_fn(|| rx.try_recv().ok()))
             {
                 match msg {
-                    Msg::View(view) => app.set_view(*view, Instant::now()),
+                    Msg::View(view) => app.set_view(*view),
                     Msg::Term(Event::Key(key)) => {
                         handle_key(&mut app, core, key);
                         copy(&mut app, &mut io::stdout(), clipboard::max());
