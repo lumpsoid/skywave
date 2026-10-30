@@ -5,8 +5,8 @@
 //! screen shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, CommandId, Entry, Outgoing, Seq, SessionView, TimelineItem,
-    ToolKind, ToolOutcome, ToolView,
+    BlobState, BlobView, BodyFormat, CommandId, Delivery, Entry, Outgoing, Seq, SessionView,
+    TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -87,6 +87,29 @@ pub fn discardable(view: &SessionView, selected: Option<ItemKey>) -> Option<(Com
         } if *command_id == id => Some((id, *outgoing)),
         _ => None,
     })
+}
+
+/// How an own message went out, with its delivery state: what its detail
+/// line shows when selected. `None` for other devices' messages and for
+/// everything else.
+pub fn delivery(item: &TimelineItem) -> Option<(Outgoing, Delivery)> {
+    match item {
+        TimelineItem::Pending {
+            outgoing,
+            delivery: Some(delivery),
+            ..
+        }
+        | TimelineItem::Logged {
+            entry:
+                Entry::UserMessage {
+                    outgoing: Some(outgoing),
+                    delivery: Some(delivery),
+                    ..
+                },
+            ..
+        } => Some((*outgoing, *delivery)),
+        _ => None,
+    }
 }
 
 /// A user message, logged or not, starts a turn.

@@ -598,6 +598,7 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                         from,
                         own: false,
                         outgoing: None,
+                        delivery: None,
                     },
                     Entry::Approval {
                         id,

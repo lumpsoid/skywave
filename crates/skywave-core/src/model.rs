@@ -22,10 +22,10 @@ use crate::store::{
 };
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, BlobId, BlobState, BlobView, BodyView,
-    CallId, CommandId, Decision, DeviceId, Draft, Entry, ErrorInfo, Link, Outgoing, PairedInfo,
-    PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId, SessionListView,
-    SessionRow, SessionState, SessionView, SettingsView, TimelineItem, ToolApproval, ToolOutcome,
-    ToolView, ViewState,
+    CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link, Outgoing,
+    PairedInfo, PairingStatus, PairingView, PendingSession, Screen, Seq, SessionId,
+    SessionListView, SessionRow, SessionState, SessionView, SettingsView, TimelineItem,
+    ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -566,11 +566,8 @@ impl Model {
     }
 
     fn timeline(&self, id: SessionId, events: &[(Seq, Event)]) -> Vec<TimelineItem> {
-        let outbox: HashMap<CommandId, Outgoing> = self
-            .outbox
-            .iter()
-            .map(|e| (e.command.id, Outgoing::from(&e.status)))
-            .collect();
+        let outbox: HashMap<CommandId, &OutboxEntry> =
+            self.outbox.iter().map(|e| (e.command.id, e)).collect();
         let mut logged = HashSet::new();
         let mut items = Vec::with_capacity(events.len());
         let mut tools = ToolIndex::default();
@@ -582,13 +579,14 @@ impl Model {
                     text,
                 } => {
                     logged.insert(*command_id);
-                    let outgoing = outbox.get(command_id).copied();
+                    let sent = outbox.get(command_id);
                     Some(Entry::UserMessage {
                         command_id: *command_id,
                         text: text.clone(),
                         from: *device_id,
-                        own: outgoing.is_some() || self.device == Some(*device_id),
-                        outgoing,
+                        own: sent.is_some() || self.device == Some(*device_id),
+                        outgoing: sent.map(|e| Outgoing::from(&e.status)),
+                        delivery: sent.and_then(|e| Delivery::of(e)),
                     })
                 }
                 EventKind::AgentMessage { text } => {
@@ -741,6 +739,7 @@ impl Model {
                     text: text.clone(),
                     outgoing: Outgoing::from(&e.status),
                     discardable: e.discardable(),
+                    delivery: Delivery::of(e),
                 })
             }
             _ => None,
@@ -754,6 +753,7 @@ impl Model {
             CommandKind::ResolveApproval { id, decision } if id == approval => Some(Answer {
                 decision,
                 outgoing: Outgoing::from(&e.status),
+                delivery: Delivery::of(e),
             }),
             _ => None,
         })
@@ -878,7 +878,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use chrono::{TimeZone, Utc};
+    use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{BlobRef, Decision, RejectReason, ToolDisplay, ToolKind, ToolResult};
 
     use super::*;
@@ -1097,28 +1097,73 @@ mod tests {
                 text: "hello".into()
             }
         );
-        let pending = |outgoing| {
+        // Queued: the time comes from the command's UUIDv7 id.
+        let queued_at = match &f.session_view().timeline[..] {
+            [
+                TimelineItem::Pending {
+                    delivery: Some(delivery),
+                    ..
+                },
+            ] => delivery.queued_at,
+            other => panic!("expected one pending message, got {other:?}"),
+        };
+        let since = Utc::now() - queued_at;
+        assert!(since >= TimeDelta::zero() && since < TimeDelta::seconds(5));
+        let pending = |outgoing, delivery| {
             vec![TimelineItem::Pending {
                 command_id: command.id,
                 text: "hello".into(),
                 outgoing,
                 discardable: outgoing == Outgoing::Queued,
+                delivery: Some(delivery),
             }]
         };
-        assert_eq!(f.session_view().timeline, pending(Outgoing::Queued));
+        let fresh = Delivery {
+            queued_at,
+            first_sent_at: None,
+            answered_at: None,
+            tries: 0,
+        };
+        assert_eq!(f.session_view().timeline, pending(Outgoing::Queued, fresh));
         assert_eq!(f.model.view().queued, 1);
 
-        f.model.command_sending(command.id, Utc::now());
-        assert_eq!(f.session_view().timeline, pending(Outgoing::Sending));
+        let sent = queued_at + TimeDelta::milliseconds(3200);
+        f.model.command_sending(command.id, sent);
+        let sending = Delivery {
+            first_sent_at: Some(sent),
+            tries: 1,
+            ..fresh
+        };
+        assert_eq!(
+            f.session_view().timeline,
+            pending(Outgoing::Sending, sending)
+        );
 
+        // A resend keeps the first send's time.
+        f.model
+            .command_sending(command.id, sent + TimeDelta::seconds(2));
+        let resent = Delivery {
+            tries: 2,
+            ..sending
+        };
+        assert_eq!(
+            f.session_view().timeline,
+            pending(Outgoing::Sending, resent)
+        );
+
+        let answered = queued_at + TimeDelta::milliseconds(8100);
         f.model.command_result(
             command.id,
             CommandResult::Accepted { seq: Seq(2) },
-            Utc::now(),
+            answered,
         );
+        let done = Delivery {
+            answered_at: Some(answered),
+            ..resent
+        };
         assert_eq!(
             f.session_view().timeline,
-            pending(Outgoing::Accepted(Seq(2)))
+            pending(Outgoing::Accepted(Seq(2)), done)
         );
         assert_eq!(f.model.view().queued, 0);
 
@@ -1154,6 +1199,7 @@ mod tests {
                     from: me,
                     own: true,
                     outgoing: Some(Outgoing::Accepted(Seq(2))),
+                    delivery: Some(done),
                 },
                 &Entry::AgentMessage { text: "hi".into() },
             ]
@@ -1199,20 +1245,27 @@ mod tests {
                     command_id,
                     own: false,
                     outgoing: None,
+                    delivery: None,
                     ..
                 },
                 ..
             } if *command_id == phone
         ));
-        assert_eq!(
-            timeline[1],
+        assert!(matches!(
+            &timeline[1],
             TimelineItem::Pending {
-                command_id: command.id,
-                text: "x".into(),
+                command_id,
+                text,
                 outgoing: Outgoing::Failed(RejectReason::UnknownSession),
                 discardable: true,
-            }
-        );
+                delivery: Some(Delivery {
+                    first_sent_at: None,
+                    answered_at: Some(_),
+                    tries: 0,
+                    ..
+                }),
+            } if *command_id == command.id && text == "x"
+        ));
     }
 
     #[test]
@@ -1280,6 +1333,7 @@ mod tests {
             Some(Answer {
                 decision: Decision::Approve,
                 outgoing: Outgoing::Queued,
+                delivery: f.model.outbox.last().and_then(Delivery::of),
             })
         );
 

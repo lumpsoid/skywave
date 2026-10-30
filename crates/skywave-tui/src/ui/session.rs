@@ -16,7 +16,8 @@ use skywave_core::{
 };
 
 use super::timeline::{
-    approval_state, bytes, detail_lines, glyph, head_lines, item_lines, preview_lines, title_spans,
+    approval_state, bytes, delivery_label, detail_lines, glyph, head_lines, item_lines,
+    preview_lines, title_spans, wall_ms,
 };
 use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
 use crate::app::{App, Focus, Geometry, SessionUi};
@@ -55,6 +56,7 @@ pub(super) fn render(
             ui.focus,
             inner.width.saturating_sub(2) as usize,
             approval_rows,
+            wall_ms(wall),
         )
     });
     let approval_height = approval.as_ref().map_or(0, |lines| lines.len() as u16 + 2);
@@ -153,6 +155,7 @@ fn approval_lines(
     focus: Focus,
     width: usize,
     max_rows: usize,
+    wall_ms: i64,
 ) -> Vec<Line<'static>> {
     let mut lines = match gated_item(session) {
         Some((
@@ -191,12 +194,16 @@ fn approval_lines(
     lines.push(match &prompt.answer {
         None => Line::from(keys).yellow().bold(),
         Some(answer) => {
+            // On its way: how long it has waited says more than "queued".
+            let label = match (&answer.outgoing, &answer.delivery) {
+                (Outgoing::Queued | Outgoing::Sending, Some(delivery)) => {
+                    delivery_label(delivery, &answer.outgoing, wall_ms)
+                }
+                _ => outgoing_label(&answer.outgoing),
+            };
             let mut spans = vec![
                 Span::raw(format!("you {} · ", decision_label(answer.decision))),
-                Span::styled(
-                    outgoing_label(&answer.outgoing),
-                    outgoing_badge(&answer.outgoing).1,
-                ),
+                Span::styled(label, outgoing_badge(&answer.outgoing).1),
             ];
             if matches!(answer.outgoing, Outgoing::Failed(_)) {
                 spans.push(Span::raw(format!(" · {keys} to answer again")).dark_gray());

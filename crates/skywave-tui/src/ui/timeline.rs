@@ -16,14 +16,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::{
-    ApprovalStatus, BlobState, BodyFormat, Decision, DeviceId, Entry, Outgoing, SessionView,
-    TimelineItem, ToolKind, ToolOutcome, ToolView,
+    ApprovalStatus, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing,
+    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 use unicode_width::UnicodeWidthChar;
 
 use super::{decision_label, outgoing_badge, outgoing_label};
 use crate::app::SessionUi;
-use crate::timeline::{ItemKey, PREVIEW_LINES, Section, sections, selectable, starts_turn};
+use crate::timeline::{
+    ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
+};
 
 /// Most of a blob shown when expanded.
 pub const SHOW_BYTES: u64 = 64 * 1024;
@@ -38,7 +40,8 @@ const TITLE: usize = LEAD + 2;
 const MIN_TITLE: usize = 8;
 
 /// Every timeline item's lines at `width` columns, in timeline order.
-/// `wall` is what running calls' elapsed time counts to.
+/// `wall` is what running calls' elapsed time and a selected own message's
+/// wait count to.
 pub(super) fn item_lines(
     session: &SessionView,
     ui: &SessionUi,
@@ -50,9 +53,7 @@ pub(super) fn item_lines(
         ui,
         focused,
         width: width.max(TITLE + MIN_TITLE),
-        wall_ms: wall
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        wall_ms: wall_ms(wall),
     };
     let mut minute = None;
     session
@@ -110,6 +111,14 @@ impl Layout<'_> {
             }
             TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded),
         });
+        if selected && let Some((outgoing, delivery)) = delivery(item) {
+            out.extend(wrap(
+                vec![indent(LEAD)],
+                vec![indent(LEAD)],
+                vec![Span::raw(delivery_label(&delivery, &outgoing, self.wall_ms)).dark_gray()],
+                self.width,
+            ));
+        }
         out
     }
 
@@ -623,6 +632,67 @@ fn where_(by: DeviceId, by_me: bool) -> String {
     } else {
         format!("on {}", device_label(by))
     }
+}
+
+/// Milliseconds since the Unix epoch.
+pub(super) fn wall_ms(wall: SystemTime) -> i64 {
+    wall.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// How an own command went out, all by this device's clock. Once answered,
+/// what each step took from the queueing: `queued 14:02:11 · sent +3.2s ·
+/// 2 tries · answered +8.1s`. Until then, how long it has waited and where
+/// it is: `queued 2m10s ago · sending, try 3`, or `… · sent once, waiting
+/// for the server` (sent, so it can no longer be taken back).
+pub(super) fn delivery_label(delivery: &Delivery, outgoing: &Outgoing, wall_ms: i64) -> String {
+    let queued = delivery.queued_at;
+    // From the queueing to `ms`; never negative, should the clock step back.
+    let since =
+        |ms: i64| Duration::from_millis(u64::try_from(ms - queued.timestamp_millis()).unwrap_or(0));
+    let tries = delivery.tries;
+    let mut parts = Vec::new();
+    match delivery.answered_at {
+        Some(answered) => {
+            parts.push(format!("queued {}", queued.format("%H:%M:%S")));
+            match delivery.first_sent_at {
+                Some(sent) => {
+                    parts.push(format!(
+                        "sent +{}",
+                        took_label(since(sent.timestamp_millis()))
+                    ));
+                }
+                // Sent before send times were recorded.
+                None if tries > 0 => parts.push("sent".to_owned()),
+                None => {}
+            }
+            if tries > 1 {
+                parts.push(format!("{tries} tries"));
+            }
+            let verb = match outgoing {
+                Outgoing::Failed(_) => "refused",
+                _ => "answered",
+            };
+            parts.push(format!(
+                "{verb} +{}",
+                took_label(since(answered.timestamp_millis()))
+            ));
+        }
+        None => {
+            parts.push(format!("queued {} ago", seconds(since(wall_ms))));
+            match (outgoing, tries) {
+                (Outgoing::Sending, 0 | 1) => parts.push("sending".to_owned()),
+                (Outgoing::Sending, n) => parts.push(format!("sending, try {n}")),
+                (Outgoing::Queued, 0) => {}
+                (Outgoing::Queued, 1) => parts.push("sent once, waiting for the server".to_owned()),
+                (Outgoing::Queued, n) => {
+                    parts.push(format!("sent {n} times, waiting for the server"));
+                }
+                (Outgoing::Accepted(_) | Outgoing::Failed(_), _) => {}
+            }
+        }
+    }
+    parts.join(" · ")
 }
 
 /// A call's duration: tenths below ten seconds.
