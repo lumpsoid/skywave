@@ -7,6 +7,8 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -39,17 +41,26 @@ class AppShellTest {
 
     private val dispatched = mutableListOf<Action>()
 
+    private val inbox = PairInbox { PairInput.Unreadable("no links in these tests") }
+
     private fun show(state: ViewState) {
-        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox) } }
     }
 
     private fun text(s: String, substring: Boolean = false) = compose.onNodeWithText(s, substring = substring)
 
     @Test
     fun connectingShowsAQuietLine() {
-        show(Samples.state(Link.Connecting, Samples.unpaired))
+        show(Samples.state(Link.Connecting))
         text("Connecting…").assertExists()
-        text("Not paired yet").assertExists()
+        text("Fix the sync bug").assertExists()
+    }
+
+    @Test
+    fun unpairedPairingHidesTheLink() {
+        show(Samples.state(Link.Connecting, Samples.unpaired))
+        text("Pair with a server").assertExists()
+        text("Connecting…").assertDoesNotExist()
     }
 
     @Test
@@ -94,7 +105,7 @@ class AppShellTest {
         compose.mainClock.autoAdvance = false
         compose.setContent {
             CompositionLocalProvider(LocalWallClock provides clock) {
-                SkywaveTheme(dynamicColor = false) { key(generation) { AppShell(state, dispatch = {}) } }
+                SkywaveTheme(dynamicColor = false) { key(generation) { AppShell(state, dispatch = {}, inbox) } }
             }
         }
         compose.mainClock.advanceTimeByFrame()
@@ -178,10 +189,10 @@ class AppShellTest {
 
     @Test
     fun revokedOnPairingIsOnlyABanner() {
-        show(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.unpaired))
-        text("Not paired yet").assertExists()
+        show(Samples.state(Link.Rejected(LinkRejection.Revoked), Samples.repair))
+        text("Paired as dev-7f3a", substring = true).assertExists()
         text("This device was revoked").assertExists()
-        text("Pair again").assertDoesNotExist()
+        compose.onNode(hasText("Pair again") and hasClickAction()).assertDoesNotExist() // the title only
     }
 
     @Test
@@ -222,7 +233,7 @@ class AppShellTest {
     @Test
     fun sessionStubShowsTitleAndItemCount() {
         var state by mutableStateOf(Samples.state(Link.Online(5u), Screen.Session(sessionView(archived = true, items = 3))))
-        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox) } }
         text("Fix the sync bug").assertExists()
         text("3 items").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
@@ -242,7 +253,7 @@ class AppShellTest {
                 dispatched += action
             }
         }
-        compose.setContent { SkywaveTheme(dynamicColor = false) { SkywaveRoot(client) } }
+        compose.setContent { SkywaveTheme(dynamicColor = false) { SkywaveRoot(client, inbox) } }
         messages.trySend(CoreMessage.Storage("disk full"))
         compose.waitUntil(5_000) {
             compose.onAllNodesWithText("Storage error: disk full").fetchSemanticsNodes().isNotEmpty()

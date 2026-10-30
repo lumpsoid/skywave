@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- The core's sync engine talks to the server. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- NetworkWatcher: nudge a reconnect when a network comes back. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Scanning the pairing QR code (D20); the scanner asks for it when opened. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Typing the details or opening the link pairs without a camera. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:name=".SkywaveApp"
@@ -17,12 +22,28 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- skywave://pair?addr=…&code=…&fp=… (what the pairing QR code holds) prefills pairing. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="skywave" android:host="pair" />
+            </intent-filter>
         </activity>
+        <!-- The QR scanner turns with the device instead of staying in the
+             library's default landscape. This lifts a fixed orientation, which
+             is what the DiscouragedApi check asks for, so it is ignored here. -->
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:screenOrientation="unspecified"
+            tools:ignore="DiscouragedApi"
+            tools:replace="screenOrientation" />
     </application>
 
 </manifest>

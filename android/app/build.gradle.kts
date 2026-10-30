@@ -62,6 +62,7 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
     implementation(libs.jna) { artifact { type = "aar" } }
+    implementation(libs.zxing.android.embedded)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
