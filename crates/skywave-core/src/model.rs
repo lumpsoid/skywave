@@ -147,7 +147,9 @@ pub(crate) struct Model {
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
     /// Pending approvals the user was alerted to, or that needed no alert
-    /// (pending at start, answered here); in memory only.
+    /// (answered here), in this process or an earlier one: as stored, plus
+    /// what [`Model::apply_batch`] and [`Model::set_link`] hand out to
+    /// store.
     alerted: HashSet<ApprovalId>,
     /// How often new approvals came in ([`Attention::alerts`]).
     alerts: u64,
@@ -187,9 +189,9 @@ impl Model {
             alerts: 0,
             completer: Completer::default(),
         };
+        // An approval pending at start that no process alerted on yet (one
+        // that came in during a catch-up cut short) alerts once online.
         model.reload(snapshot);
-        // What was pending before the start is not news.
-        model.alerted = model.pending_approvals().map(|(_, id)| id).collect();
         model
     }
 
@@ -206,8 +208,10 @@ impl Model {
         self.read_marks = snapshot.read_marks;
         self.deleted = snapshot.deleted;
         self.open = None;
-        // Only forget: an approval that came in during a catch-up must still
-        // alert once it is over.
+        // Never forget what is still pending: an approval that came in
+        // during a catch-up must still alert once it is over, and one
+        // alerted on whose mark failed to store must not alert again.
+        self.alerted.extend(snapshot.alerted);
         let pending: HashSet<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
         self.alerted.retain(|id| pending.contains(id));
     }
@@ -601,22 +605,29 @@ impl Model {
     /// yet, and forgets those no longer pending. Only online: while catching
     /// up the replica shows the past, and an approval requested and resolved
     /// during that is no news; one still pending at its end alerts then.
-    fn note_new_approvals(&mut self) {
+    ///
+    /// Returns the approvals it marked alerted, to store, so a later
+    /// process does not alert for them again.
+    fn note_new_approvals(&mut self) -> Vec<(SessionId, ApprovalId)> {
         if !matches!(self.link, Link::Online { .. }) {
-            return;
+            return Vec::new();
         }
-        let pending: Vec<ApprovalId> = self.pending_approvals().map(|(_, id)| id).collect();
-        self.alerted.retain(|id| pending.contains(id));
-        let mut new = false;
-        for id in pending {
-            // One answered here was seen; it is never news.
-            if self.alerted.insert(id) && self.local_answer(id, &[], true).is_none() {
-                new = true;
-            }
-        }
-        if new {
+        let pending: Vec<(SessionId, ApprovalId)> =
+            self.pending_approvals().map(|(s, id)| (s.id, id)).collect();
+        self.alerted
+            .retain(|id| pending.iter().any(|(_, pending)| pending == id));
+        let marked: Vec<_> = pending
+            .into_iter()
+            .filter(|(_, id)| self.alerted.insert(*id))
+            .collect();
+        // One answered here was seen; it is never news.
+        if marked
+            .iter()
+            .any(|(_, id)| self.local_answer(*id, &[], true).is_none())
+        {
             self.alerts += 1;
         }
+        marked
     }
 
     // ---- engine notifications -------------------------------------------------
@@ -624,9 +635,12 @@ impl Model {
     /// Folds a batch the store has accepted. Mirrors
     /// [`Store::apply_batch`](crate::Store::apply_batch): already-seen events
     /// are skipped and a batch that would leave a gap changes nothing.
-    pub(crate) fn apply_batch(&mut self, batch: &EventBatch) {
+    ///
+    /// Returns the approvals newly marked alerted, which the caller stores
+    /// ([`Store::mark_alerted`](crate::Store::mark_alerted)).
+    pub(crate) fn apply_batch(&mut self, batch: &EventBatch) -> Vec<(SessionId, ApprovalId)> {
         if batch.from == Seq::ZERO || batch.from > self.cursor.next() {
-            return;
+            return Vec::new();
         }
         let cursor = self.cursor;
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
@@ -650,7 +664,7 @@ impl Model {
             }
         }
         self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
-        self.note_new_approvals();
+        self.note_new_approvals()
     }
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
@@ -748,9 +762,11 @@ impl Model {
         }
     }
 
-    pub(crate) fn set_link(&mut self, link: Link) {
+    /// Returns the approvals newly marked alerted, as
+    /// [`apply_batch`](Model::apply_batch).
+    pub(crate) fn set_link(&mut self, link: Link) -> Vec<(SessionId, ApprovalId)> {
         self.link = link;
-        self.note_new_approvals();
+        self.note_new_approvals()
     }
 
     pub(crate) fn dirs_listed(&mut self, req: u64, result: Result<DirsResult, TransportError>) {
@@ -759,9 +775,8 @@ impl Model {
 
     /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
     /// which left the replica as `snapshot`: nothing of the previous
-    /// server's log shows any more, nor what was kept in memory for it —
-    /// download requests and failures, alerted approvals, listed
-    /// directories. Heads replace the drafts they hold.
+    /// server's log shows any more, nor what was kept for it — download
+    /// requests and failures, alerted approvals, listed directories. Heads replace the drafts they hold.
     pub(crate) fn replica_reset(&mut self, snapshot: Snapshot) {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
@@ -1621,6 +1636,7 @@ mod tests {
             drafts: HashMap::new(),
             read_marks: HashMap::new(),
             deleted: HashSet::new(),
+            alerted: HashSet::new(),
         }
     }
 
@@ -3863,6 +3879,7 @@ mod tests {
             drafts: model.drafts.clone(),
             read_marks: model.read_marks.clone(),
             deleted: model.deleted.clone(),
+            alerted: model.alerted.clone(),
         }
     }
 
@@ -3880,16 +3897,75 @@ mod tests {
     }
 
     #[test]
-    fn approvals_pending_at_start_never_alert() {
+    fn approvals_alerted_before_the_start_never_alert_again() {
         let mut f = Fixture::paired();
+        f.model.set_link(ONLINE);
         let sid = f.session("/srv/app");
-        f.log(sid, vec![approval_requested(ApprovalId::new(), None)]);
+        let id = ApprovalId::new();
+        f.log(sid, vec![approval_requested(id, None)]);
+        assert_eq!(alerts(&f), 1);
         let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
-        model.set_link(ONLINE);
+        assert_eq!(model.view().attention.alerts, 0, "counts from zero");
+        assert!(model.set_link(ONLINE).is_empty(), "nothing new to store");
         let attention = model.view().attention;
         assert_eq!(attention.alerts, 0);
         assert_eq!(attention.approvals.len(), 1);
         assert_eq!(attention.approvals[0].title, "app");
+    }
+
+    #[test]
+    fn an_approval_pending_at_start_but_never_alerted_alerts_once_online() {
+        // The previous process pulled it in a catch-up it never finished.
+        let mut f = Fixture::paired();
+        f.model.set_link(catching_up());
+        let sid = f.session("/srv/app");
+        let (id, answered) = (ApprovalId::new(), ApprovalId::new());
+        f.log(
+            sid,
+            vec![
+                approval_requested(id, None),
+                approval_requested(answered, None),
+            ],
+        );
+        queued(&f.dispatch(Action::ResolveApproval {
+            id: answered,
+            decision: Decision::Deny,
+            rule: None,
+        }));
+        let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+        assert_eq!(model.view().attention.alerts, 0, "not before online");
+        assert!(model.set_link(catching_up()).is_empty());
+        assert_eq!(model.view().attention.alerts, 0, "nor while catching up");
+        let mut marked = model.set_link(ONLINE);
+        marked.sort_by_key(|(_, id)| *id);
+        let mut both = vec![(sid, id), (sid, answered)];
+        both.sort_by_key(|(_, id)| *id);
+        assert_eq!(marked, both, "the answered one is stored as seen too");
+        let attention = model.view().attention;
+        assert_eq!(attention.alerts, 1);
+        assert_eq!(
+            attention.approvals.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![id]
+        );
+        model.set_link(catching_up());
+        model.set_link(ONLINE);
+        assert_eq!(model.view().attention.alerts, 1, "once only");
+    }
+
+    #[test]
+    fn an_approval_answered_here_before_the_start_never_alerts() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        let id = ApprovalId::new();
+        f.log(sid, vec![approval_requested(id, None)]);
+        queued(&f.dispatch(Action::ResolveApproval {
+            id,
+            decision: Decision::Approve,
+            rule: None,
+        }));
+        let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+        assert_eq!(model.set_link(ONLINE), vec![(sid, id)]);
+        assert_eq!(model.view().attention.alerts, 0);
     }
 
     #[test]

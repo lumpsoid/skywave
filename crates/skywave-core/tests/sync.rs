@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, ApprovalStatus, BlobDownload, BoxFuture, Connector, Decision, EngineConfig, Entry,
-    FailReason, HttpsTransport, Link, LinkRejection, OutboxStatus, Outgoing, Screen, SessionRow,
-    TimelineItem, Transport, TransportError,
+    Action, ApprovalStatus, BlobDownload, BoxFuture, Connector, Core, Decision, EngineConfig,
+    Entry, FailReason, HttpsTransport, Link, LinkRejection, OutboxStatus, Outgoing, Screen,
+    SessionRow, TimelineItem, Transport, TransportError, ViewState,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
@@ -734,4 +734,73 @@ async fn an_answer_to_an_approval_cancelled_while_offline_is_shown_refused() {
         rule: None,
     });
     assert_eq!(answers(&client).len(), 1);
+}
+
+/// An approval that came in while no core of this device ran, pulled by a
+/// catch-up that ended before the link was online (a background pull cut
+/// short), alerts once the next core is online and caught up; the core
+/// after that does not alert for it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_pulled_while_offline_alerts_once_after_a_cold_start() {
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([Step::approval(
+            "req-1",
+            "write",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .on_approve([Step::tool_result("written")])]),
+    );
+    let daemon = Daemon::start(agent.clone()).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let dir = a.stop();
+
+    // Another device starts a turn that waits on an approval.
+    let session = b.create_session(&daemon).await;
+    b.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "write a.txt".into(),
+    });
+    daemon
+        .wait_log("the approval request", |events| {
+            count(events, |k| matches!(k, EventKind::ApprovalRequested { .. })) == 1
+        })
+        .await;
+
+    // A core without a link pulls the log, then stops: never online.
+    let log = daemon.events();
+    let dir = std::thread::spawn(move || {
+        let core = Core::open_detached(dir.path()).unwrap();
+        let seam = core.seam();
+        let cursor = seam.cursor().unwrap();
+        seam.apply_events(&EventBatch {
+            from: cursor.next(),
+            events: log[usize::try_from(cursor.0).unwrap()..].to_vec(),
+        })
+        .unwrap();
+        assert_eq!(core.view().attention.approvals.len(), 1);
+        assert_eq!(core.view().attention.alerts, 0, "not online: no alert");
+        drop(seam);
+        core.shutdown(SOON).unwrap();
+        dir
+    })
+    .join()
+    .unwrap();
+
+    let online_and_caught_up = |c: &Client, view: &ViewState| {
+        matches!(view.link, Link::Online { .. }) && c.cursor() >= daemon.head()
+    };
+    let a = Client::open_in(dir, config());
+    let view = a.wait("a online again", online_and_caught_up).await;
+    assert_eq!(view.attention.alerts, 1, "news to this device");
+    assert_eq!(view.attention.approvals.len(), 1);
+    assert_eq!(view.attention.approvals[0].session_id, session);
+
+    // Alerted on: the next start stays quiet.
+    let a = Client::open_in(a.stop(), config());
+    let view = a.wait("a online once more", online_and_caught_up).await;
+    assert_eq!(view.attention.alerts, 0, "alerted before");
+    assert_eq!(view.attention.approvals.len(), 1, "still waiting");
 }

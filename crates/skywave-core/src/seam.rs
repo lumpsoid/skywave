@@ -20,7 +20,7 @@ use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
 use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
 use crate::transport::TransportError;
-use crate::view::{BlobId, CommandId, Link, Seq};
+use crate::view::{ApprovalId, BlobId, CommandId, Link, Seq, SessionId};
 
 /// Work the core asks the engine to do. Sent only after the action that
 /// caused it is persisted.
@@ -134,7 +134,8 @@ impl Seam {
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         self.update(|state| {
             let applied = state.store.apply_batch(batch)?;
-            state.model.apply_batch(batch);
+            let alerted = state.model.apply_batch(batch);
+            mark_alerted(state, &alerted);
             Ok((applied, Vec::new()))
         })
     }
@@ -170,7 +171,8 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state| {
                 if self.current(state) {
-                    state.model.set_link(link);
+                    let alerted = state.model.set_link(link);
+                    mark_alerted(state, &alerted);
                 }
                 Ok(((), Vec::new()))
             })
@@ -284,5 +286,15 @@ impl Seam {
             }
             change(state)
         })
+    }
+}
+
+/// Stores approvals the model marked alerted. Best effort, after the batch
+/// or link change that caused it: if the write fails, this process still
+/// remembers them, and the next one alerts for them once more rather than
+/// never.
+fn mark_alerted(state: &mut State, approvals: &[(SessionId, ApprovalId)]) {
+    if let Err(error) = state.store.mark_alerted(approvals) {
+        tracing::warn!(%error, "cannot store alerted approvals");
     }
 }
