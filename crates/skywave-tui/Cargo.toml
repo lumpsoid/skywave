@@ -11,6 +11,8 @@ publish.workspace = true
 skywave-core.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+# OSC 52 copies are base64.
+base64.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 # Cell widths for laying out wrapped timeline text; already in the tree
 # through ratatui.

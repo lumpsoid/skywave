@@ -146,11 +146,17 @@ start talking to the agent.
 | `j` / `k`, `PgUp` / `PgDn` | Move through the timeline |
 | `Enter` / `Space` | Expand a tool output |
 | `d` | Download a blob |
+| `y` / `Y` | Copy the selected output, diff, file or message / its command |
 | `a` / `x` | Approve / deny a pending request |
 | `Ctrl-X` | Interrupt the agent's turn |
 | `S` | Stop the agent (timeline); the next message restarts it |
 | `Ctrl-R` | Retry the connection now while offline (any screen) |
 | `?` / `F1` | Help |
+
+Copies go to your local clipboard through the terminal (OSC 52), so they work
+over SSH. Inside tmux, enable `set -g set-clipboard on`. Content over 74 KiB is
+not copied (the notice names the blob's file); `SKYWAVE_OSC52_MAX` sets another
+limit in bytes.
 
 ### Managing devices
 

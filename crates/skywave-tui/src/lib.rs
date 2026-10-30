@@ -5,15 +5,17 @@
 //! - [`app`]: the latest snapshot plus head-only presentation state; keys in,
 //!   actions out.
 //! - [`ui`]: pure render functions over an [`App`].
-//! - [`run`]: the terminal event loop; [`handle_key`], [`save_draft`] and
-//!   [`mark_read`] are its steps.
+//! - [`clipboard`]: copies to the terminal's clipboard (OSC 52).
+//! - [`run`]: the terminal event loop; [`handle_key`], [`copy`],
+//!   [`save_draft`] and [`mark_read`] are its steps.
 
 pub mod app;
+pub mod clipboard;
 pub mod composer;
 pub mod timeline;
 pub mod ui;
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -105,6 +107,7 @@ pub fn run(core: &Core) -> io::Result<()> {
                     Msg::View(view) => app.set_view(*view, Instant::now()),
                     Msg::Term(Event::Key(key)) => {
                         handle_key(&mut app, core, key);
+                        copy(&mut app, &mut io::stdout(), clipboard::max());
                     }
                     Msg::Term(Event::Paste(text)) => app.on_paste(&text),
                     Msg::Term(_) => {}
@@ -144,6 +147,14 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
         mark_read(app, core, Instant::now(), true);
     }
     action
+}
+
+/// Sends the copy [`App::take_copy`] has, if any, to the terminal's
+/// clipboard through `out`, at most `max` bytes of it.
+pub fn copy(app: &mut App, out: &mut impl Write, max: usize) {
+    if let Some(clip) = app.take_copy() {
+        app.copied(clipboard::send(out, &clip, max));
+    }
 }
 
 /// Saves the open session's draft if [`App::draft_save`] has one for `now`.

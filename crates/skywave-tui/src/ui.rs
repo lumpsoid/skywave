@@ -68,7 +68,10 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
 
     let footer_line = match &app.ui().error {
         Some(error) => Line::from(format!("error: {error}")).red(),
-        None => Line::from(footer_hint(app)).dark_gray(),
+        None => match &app.ui().notice {
+            Some(notice) => Line::from(notice.as_str()).yellow(),
+            None => Line::from(footer_hint(app)).dark_gray(),
+        },
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
 
@@ -458,10 +461,10 @@ fn footer_keys(app: &App) -> &'static str {
                     "e edit · Del cancel · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
-                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · / search · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
             },
             _ => {
@@ -547,6 +550,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                         "d",
                         "download the selected blob; a long command's text before its output",
                     ),
+                    key("y / Y", "copy its output or text / its command"),
+                    key("", "(in tmux: set -g set-clipboard on)"),
                     key("e", "edit your never-sent or refused message"),
                     key(
                         "Del",

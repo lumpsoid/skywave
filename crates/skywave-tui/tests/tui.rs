@@ -23,6 +23,7 @@ use skywave_proto::{
 };
 use skywave_tui::App;
 use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
+use skywave_tui::clipboard::{self, Clip};
 use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
 
@@ -3408,4 +3409,326 @@ fn a_match_only_in_hidden_output_expands_its_item() {
     h.type_text("notes.md");
     h.key(KeyCode::Enter);
     assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+}
+
+// ---- copying ----------------------------------------------------------------
+
+/// A session holding `events`, with the newest item selected.
+fn copy_session(events: impl FnOnce(SessionId) -> Vec<Event>) -> Harness {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, events(id));
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h
+}
+
+fn clip(h: &Harness) -> Option<Clip> {
+    h.app.ui().copy.clone()
+}
+
+fn notice(h: &Harness) -> Option<String> {
+    h.app.ui().notice.clone()
+}
+
+/// The event loop's copy step, with the terminal written to a buffer.
+fn send_copy(h: &mut Harness, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    skywave_tui::copy(&mut h.app, &mut out, max);
+    assert_eq!(clip(h), None, "taken");
+    out
+}
+
+/// A long shell command: the title cut short, the whole command its body.
+fn long_command(call_id: CallId, full: Option<BlobRef>) -> ToolCall {
+    let mut tool = call(
+        call_id,
+        "Bash",
+        ToolKind::Shell,
+        "$ cargo test --workspace …",
+    );
+    tool.display.body = Some(Body {
+        format: BodyFormat::Text,
+        preview: "$ cargo test --workspace \\\n  --all-features".into(),
+        lines: 2,
+        full,
+    });
+    tool
+}
+
+#[test]
+fn y_copies_agent_text() {
+    let mut h = copy_session(|id| vec![event(id, 1, agent("Done:\nall green"))]);
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("Done:\nall green".into())));
+    let out = send_copy(&mut h, clipboard::MAX);
+    assert_eq!(out, clipboard::osc52(b"Done:\nall green").into_bytes());
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 15 B · sent to terminal clipboard")
+    );
+    assert_contains(&h.screen(), "copied 15 B · sent to terminal clipboard");
+    // Gone with the next key.
+    h.key(KeyCode::Up);
+    assert_eq!(notice(&h), None);
+    assert!(!h.screen().contains("copied"));
+}
+
+#[test]
+fn y_copies_own_pending_message() {
+    let (mut h, _, _) = open_session();
+    h.type_text("hello there");
+    h.key(KeyCode::Enter);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Char('y'));
+    assert_eq!(clip(&h), Some(Clip::Text("hello there".into())));
+}
+
+#[test]
+fn y_copies_shell_output_not_command() {
+    let shell = CallId::new();
+    let mut h = copy_session(|id| {
+        vec![
+            event(id, 1, EventKind::ToolCall(long_command(shell, None))),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(result(shell, false, "exit 0", "test result: ok")),
+            ),
+        ]
+    });
+    h.key(KeyCode::Char('y'));
+    assert_eq!(clip(&h), Some(Clip::Text("test result: ok".into())));
+}
+
+#[test]
+fn y_copies_edit_diff() {
+    let edit = CallId::new();
+    let diff = "-    run();\n+    let code = run();\n";
+    let mut h = copy_session(|id| {
+        let mut tool = call(edit, "Edit", ToolKind::FileEdit, "src/main.rs");
+        tool.display.body = body(BodyFormat::Diff, diff);
+        vec![
+            event(id, 1, EventKind::ToolCall(tool)),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(result(edit, false, "", "updated src/main.rs")),
+            ),
+        ]
+    });
+    h.key(KeyCode::Char('y'));
+    assert_eq!(clip(&h), Some(Clip::Text(diff.into())));
+}
+
+#[test]
+fn y_on_undownloaded_blob_requests_it() {
+    let read = CallId::new();
+    let (blob_id, output) = blob(1_258_291);
+    let mut h = copy_session(|id| {
+        let mut done = result(read, false, "", "line 1");
+        done.output = Some(output);
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(read, "Read", ToolKind::FileRead, "big.log")),
+            ),
+            event(id, 2, EventKind::ToolResult(done)),
+        ]
+    });
+    // Never the preview alone.
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(clip(&h), None);
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("downloading 1.2 MiB · press y again when it is here")
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("blob.part");
+    h.seam
+        .blob_status(
+            blob_id,
+            BlobStatus::Downloading {
+                got: 10,
+                path: part,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_eq!(h.key(KeyCode::Char('y')), None, "already on its way");
+    assert_eq!(clip(&h), None);
+    assert_contains(&notice(&h).unwrap(), "press y again");
+
+    // Here: the whole file, invalid UTF-8 as it is.
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"line 1\n\xff\n").unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path: path.clone() })
+        .unwrap();
+    h.sync();
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(
+        clip(&h),
+        Some(Clip::File {
+            path: path.clone(),
+            strip: None
+        })
+    );
+    assert_eq!(
+        send_copy(&mut h, clipboard::MAX),
+        clipboard::osc52(b"line 1\n\xff\n").into_bytes()
+    );
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 9 B · sent to terminal clipboard")
+    );
+
+    // Deleted meanwhile: an error, nothing sent.
+    h.key(KeyCode::Char('y'));
+    std::fs::remove_file(&path).unwrap();
+    assert!(send_copy(&mut h, clipboard::MAX).is_empty());
+    assert_eq!(notice(&h), None);
+    assert_contains(&h.app.ui().error.clone().unwrap(), "copy: cannot read");
+}
+
+#[test]
+fn y_over_cap_names_the_file() {
+    let shell = CallId::new();
+    let (blob_id, output) = blob(80 * 1024);
+    let mut h = copy_session(|id| {
+        let mut done = result(shell, false, "exit 0", "a");
+        done.output = Some(output);
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(shell, "Bash", ToolKind::Shell, "$ seq")),
+            ),
+            event(id, 2, EventKind::ToolResult(done)),
+        ]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, vec![b'a'; 80 * 1024]).unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path: path.clone() })
+        .unwrap();
+    h.sync();
+    h.key(KeyCode::Char('y'));
+    assert!(send_copy(&mut h, clipboard::MAX).is_empty(), "nothing sent");
+    assert_eq!(
+        notice(&h),
+        Some(format!(
+            "too large for the terminal clipboard (80.0 KiB > 74.0 KiB) · file: {}",
+            path.display()
+        ))
+    );
+    // A larger cap takes it.
+    h.key(KeyCode::Char('y'));
+    assert_eq!(
+        send_copy(&mut h, 100 * 1024),
+        clipboard::osc52(&vec![b'a'; 80 * 1024]).into_bytes()
+    );
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("copied 80.0 KiB · sent to terminal clipboard")
+    );
+}
+
+#[test]
+fn shift_y_copies_shell_command_without_dollar() {
+    let shell = CallId::new();
+    let mut h = copy_session(|id| {
+        let mut tool = call(shell, "Bash", ToolKind::Shell, "$ cargo test");
+        tool.display.detail = Some("Run the tests".into());
+        vec![
+            event(id, 1, EventKind::ToolCall(tool)),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(result(shell, false, "exit 0", "ok")),
+            ),
+        ]
+    });
+    h.key(KeyCode::Char('Y'));
+    assert_eq!(clip(&h), Some(Clip::Text("cargo test".into())));
+    // Not a shell call: title and detail, as they are.
+    let edit = CallId::new();
+    let mut h = copy_session(|id| {
+        let mut tool = call(edit, "Edit", ToolKind::FileEdit, "src/main.rs");
+        tool.display.detail = Some("2 edits".into());
+        vec![event(id, 1, EventKind::ToolCall(tool))]
+    });
+    h.key(KeyCode::Char('Y'));
+    assert_eq!(clip(&h), Some(Clip::Text("src/main.rs\n2 edits".into())));
+}
+
+#[test]
+fn shift_y_copies_long_command_body() {
+    let shell = CallId::new();
+    let mut h =
+        copy_session(|id| vec![event(id, 1, EventKind::ToolCall(long_command(shell, None)))]);
+    h.key(KeyCode::Char('Y'));
+    assert_eq!(
+        clip(&h),
+        Some(Clip::Text(
+            "cargo test --workspace \\\n  --all-features".into()
+        ))
+    );
+    // No result yet: `y` gives the body as shown.
+    h.key(KeyCode::Char('y'));
+    assert_eq!(
+        clip(&h),
+        Some(Clip::Text(
+            "$ cargo test --workspace \\\n  --all-features".into()
+        ))
+    );
+
+    // A body too long for its preview is a blob: the whole file, unprompted.
+    let shell = CallId::new();
+    let (blob_id, full) = blob(60);
+    let mut h = copy_session(|id| {
+        vec![event(
+            id,
+            1,
+            EventKind::ToolCall(long_command(shell, Some(full))),
+        )]
+    });
+    assert_eq!(
+        h.key(KeyCode::Char('Y')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(
+        notice(&h).as_deref(),
+        Some("downloading 60 B · press Y again when it is here")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    let command = "cargo test --workspace \\\n  --all-features \\\n  -- --nocapture";
+    std::fs::write(&path, format!("$ {command}")).unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    h.key(KeyCode::Char('Y'));
+    assert_eq!(
+        send_copy(&mut h, clipboard::MAX),
+        clipboard::osc52(command.as_bytes()).into_bytes()
+    );
+}
+
+#[test]
+fn copy_keys_are_in_help_and_footer() {
+    let mut h = copy_session(|id| vec![event(id, 1, agent("hi"))]);
+    assert_contains(&h.screen(), "d download · y/Y copy");
+    h.key(KeyCode::Char('?'));
+    let screen = h.screen();
+    assert_contains(&screen, "copy its output or text / its command");
+    assert_contains(&screen, "set -g set-clipboard on");
 }
