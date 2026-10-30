@@ -5,7 +5,7 @@
 //! screen shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, CommandId, Delivery, Entry, Outgoing, Seq, SessionView,
+    BlobState, BlobView, BodyFormat, CommandId, Delivery, Entry, Outgoing, Query, Seq, SessionView,
     TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 
@@ -254,6 +254,39 @@ pub fn gated_item(view: &SessionView) -> Option<(usize, &TimelineItem)> {
             } => prompt.call.is_none() && *id == prompt.id,
             _ => false,
         })
+}
+
+/// `query` matches `entry` only where it shows once expanded: in a hidden
+/// section, or past the lines a section shows while collapsed. A search
+/// jumping to it expands it.
+pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
+    let first_line = |text: &str| text.split('\n').next().unwrap_or_default().to_owned();
+    let mut head: Vec<String> = match entry {
+        Entry::Tool(view) => {
+            let mut head = vec![view.name.clone(), first_line(&view.title)];
+            head.extend(view.detail.as_deref().map(first_line));
+            if let ToolOutcome::Done {
+                status: Some(status),
+                ..
+            } = &view.outcome
+            {
+                head.push(status.clone());
+            }
+            head
+        }
+        Entry::ToolCall { name, summary, .. }
+        | Entry::Approval {
+            tool: name,
+            summary,
+            ..
+        } => vec![name.clone(), first_line(summary)],
+        Entry::ToolResult { .. } => Vec::new(),
+        _ => return false,
+    };
+    for section in sections(entry).iter().filter(|s| !s.hidden) {
+        head.extend(section.text.lines().take(PREVIEW_LINES).map(str::to_owned));
+    }
+    !head.iter().any(|text| query.matches(text))
 }
 
 /// The first blob behind `entry` that is not here yet; what `d` fetches.

@@ -10,13 +10,14 @@
 
 use std::fs::File;
 use std::io::Read;
+use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::{
-    ApprovalStatus, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing,
+    ApprovalStatus, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing, Query,
     SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 use unicode_width::UnicodeWidthChar;
@@ -24,7 +25,7 @@ use unicode_width::UnicodeWidthChar;
 use super::{decision_label, outgoing_badge, outgoing_label};
 use crate::app::SessionUi;
 use crate::timeline::{
-    ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
+    ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
 };
 
 /// Most of a blob shown when expanded.
@@ -39,9 +40,9 @@ const TITLE: usize = LEAD + 2;
 /// Narrowest a title may get beside its state before it wraps.
 const MIN_TITLE: usize = 8;
 
-/// Every timeline item's lines at `width` columns, in timeline order.
-/// `wall` is what running calls' elapsed time and a selected own message's
-/// wait count to.
+/// Every timeline item's lines at `width` columns, in timeline order, with
+/// the search's matches marked. `wall` is what running calls' elapsed time
+/// and a selected own message's wait count to.
 pub(super) fn item_lines(
     session: &SessionView,
     ui: &SessionUi,
@@ -55,6 +56,14 @@ pub(super) fn item_lines(
         width: width.max(TITLE + MIN_TITLE),
         wall_ms: wall_ms(wall),
         rule: rule_index(session),
+        search: ui
+            .search
+            .as_ref()
+            .map(|search| (&search.query, search.hits.as_slice())),
+        current: ui
+            .search
+            .as_ref()
+            .and_then(|search| find(session, search.current?)),
     };
     let mut minute = None;
     session
@@ -82,6 +91,64 @@ struct Layout<'a> {
     wall_ms: i64,
     /// Index of the item the `── new ──` rule goes above.
     rule: Option<usize>,
+    /// What the search marks, and in which items: the matches by timeline
+    /// index, oldest first.
+    search: Option<(&'a Query, &'a [usize])>,
+    /// Index of the search's current match.
+    current: Option<usize>,
+}
+
+/// Marks a search's matches in an item's text.
+#[derive(Clone, Copy)]
+pub(super) struct Mark<'a> {
+    query: &'a Query,
+    /// The item is the current match: its matches are bold too.
+    current: bool,
+}
+
+impl Mark<'_> {
+    /// `span` split where the query matches, the matches reversed yellow
+    /// over the span's own style. Done before wrapping: the style is per
+    /// char, so a match broken over two rows stays marked.
+    fn spans(self, span: Span<'static>) -> Vec<Span<'static>> {
+        let ranges = self.query.ranges(&span.content);
+        if ranges.is_empty() {
+            return vec![span];
+        }
+        let mut style = span.style.patch(Style::new().yellow().reversed());
+        if self.current {
+            style = style.bold();
+        }
+        split(&span.content, &ranges, span.style, style)
+    }
+}
+
+/// `text` as spans in `base` style, `ranges` of it in `marked` style.
+fn split(text: &str, ranges: &[Range<usize>], base: Style, marked: Style) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for range in ranges {
+        if range.start > at {
+            out.push(Span::styled(text[at..range.start].to_owned(), base));
+        }
+        out.push(Span::styled(text[range.clone()].to_owned(), marked));
+        at = range.end;
+    }
+    if at < text.len() {
+        out.push(Span::styled(text[at..].to_owned(), base));
+    }
+    out
+}
+
+/// `spans` with `mark`'s matches marked in each.
+fn marked(spans: Vec<Span<'static>>, mark: Option<Mark>) -> Vec<Span<'static>> {
+    match mark {
+        Some(mark) => spans
+            .into_iter()
+            .flat_map(|span| mark.spans(span))
+            .collect(),
+        None => spans,
+    }
 }
 
 impl Layout<'_> {
@@ -106,6 +173,12 @@ impl Layout<'_> {
         }
         let key = selectable(item);
         let selected = self.focused && key.is_some() && key == self.ui.selected;
+        let mark = self.search.and_then(|(query, hits)| {
+            hits.binary_search(&index).ok().map(|_| Mark {
+                query,
+                current: self.current == Some(index),
+            })
+        });
         let expanded = matches!(key, Some(ItemKey::Logged(seq)) if self.ui.expanded.contains(&seq));
         let marker = if selected {
             Span::raw("> ").bold().reversed()
@@ -127,9 +200,9 @@ impl Layout<'_> {
         let lead = vec![marker, time];
         out.extend(match item {
             TimelineItem::Pending { text, outgoing, .. } => {
-                self.message(lead, you(Some(outgoing)), text)
+                self.message(lead, you(Some(outgoing)), text, mark)
             }
-            TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded),
+            TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded, mark),
         });
         if selected && let Some((outgoing, delivery)) = delivery(item) {
             out.extend(wrap(
@@ -142,7 +215,13 @@ impl Layout<'_> {
         out
     }
 
-    fn entry(&self, lead: Vec<Span<'static>>, entry: &Entry, expanded: bool) -> Vec<Line<'static>> {
+    fn entry(
+        &self,
+        lead: Vec<Span<'static>>,
+        entry: &Entry,
+        expanded: bool,
+        mark: Option<Mark>,
+    ) -> Vec<Line<'static>> {
         let width = self.width;
         let (mut out, gutter) = match entry {
             Entry::UserMessage {
@@ -160,10 +239,10 @@ impl Layout<'_> {
                         Span::raw(": "),
                     ]
                 };
-                return self.message(lead, label, text);
+                return self.message(lead, label, text, mark);
             }
             Entry::AgentMessage { text } => {
-                return self.message(lead, vec![Span::raw("agent: ").green().bold()], text);
+                return self.message(lead, vec![Span::raw("agent: ").green().bold()], text, mark);
             }
             Entry::Interrupted => {
                 let mut spans = lead;
@@ -178,19 +257,24 @@ impl Layout<'_> {
                 return vec![Line::from(spans)];
             }
             Entry::AgentErrored { message } => {
-                return self.message(lead, vec![Span::raw("agent error: ").red().bold()], message);
+                return self.message(
+                    lead,
+                    vec![Span::raw("agent error: ").red().bold()],
+                    message,
+                    mark,
+                );
             }
             Entry::Tool(view) => {
                 let (state, style) = tool_state(view, self.wall_ms);
                 let mut out = head_lines(
                     lead,
                     Span::styled(glyph(view.kind), style),
-                    title_spans(&view.name, &view.title),
-                    Some(Span::styled(state, style)),
+                    marked(title_spans(&view.name, &view.title), mark),
+                    marked(vec![Span::styled(state, style)], mark),
                     width,
                 );
                 if let Some(detail) = &view.detail {
-                    out.extend(detail_lines(detail, TITLE, width));
+                    out.extend(detail_lines(detail, TITLE, width, mark));
                 }
                 (out, style)
             }
@@ -198,8 +282,8 @@ impl Layout<'_> {
                 head_lines(
                     lead,
                     Span::raw("•"),
-                    title_spans(name, summary),
-                    None,
+                    marked(title_spans(name, summary), mark),
+                    Vec::new(),
                     width,
                 ),
                 Style::new().dark_gray(),
@@ -209,7 +293,7 @@ impl Layout<'_> {
                     lead,
                     Span::raw("↳"),
                     vec![Span::raw("result").bold()],
-                    None,
+                    Vec::new(),
                     width,
                 ),
                 Style::new().dark_gray(),
@@ -224,8 +308,8 @@ impl Layout<'_> {
                 let out = head_lines(
                     lead,
                     Span::styled("?", style),
-                    title_spans(tool, summary),
-                    Some(Span::styled(state, style)),
+                    marked(title_spans(tool, summary), mark),
+                    vec![Span::styled(state, style)],
                     width,
                 );
                 (out, style)
@@ -233,7 +317,7 @@ impl Layout<'_> {
         };
         for section in sections(entry) {
             if expanded || !section.hidden {
-                out.extend(self.section(&section, expanded, gutter));
+                out.extend(self.section(&section, expanded, gutter, mark));
             }
         }
         out
@@ -246,16 +330,20 @@ impl Layout<'_> {
         lead: Vec<Span<'static>>,
         label: Vec<Span<'static>>,
         text: &str,
+        mark: Option<Mark>,
     ) -> Vec<Line<'static>> {
         let mut lines = text.split('\n');
         let mut content = label;
-        content.push(Span::raw(clean(lines.next().unwrap_or_default())));
+        content.extend(marked(
+            vec![Span::raw(clean(lines.next().unwrap_or_default()))],
+            mark,
+        ));
         let mut out = wrap(lead, vec![indent(LEAD)], content, self.width);
         for line in lines {
             out.extend(wrap(
                 vec![indent(LEAD)],
                 vec![indent(LEAD)],
-                vec![Span::raw(clean(line))],
+                marked(vec![Span::raw(clean(line))], mark),
                 self.width,
             ));
         }
@@ -264,7 +352,13 @@ impl Layout<'_> {
 
     /// One section under the gutter: its preview's head and what more there
     /// is while collapsed; all of it (the blob once here) while expanded.
-    fn section(&self, section: &Section, expanded: bool, gutter: Style) -> Vec<Line<'static>> {
+    fn section(
+        &self,
+        section: &Section,
+        expanded: bool,
+        gutter: Style,
+        mark: Option<Mark>,
+    ) -> Vec<Line<'static>> {
         let preview = content_lines(section.text);
         let mut note: Option<Span<'static>> = None;
         let content: Vec<String> = if expanded {
@@ -356,7 +450,7 @@ impl Layout<'_> {
         };
 
         let bar = || vec![indent(LEAD), Span::styled("│ ", gutter)];
-        let mut out: Vec<Line<'static>> = content_rows(section, content, &bar, self.width)
+        let mut out: Vec<Line<'static>> = content_rows(section, content, &bar, self.width, mark)
             .into_iter()
             .flatten()
             .collect();
@@ -381,7 +475,7 @@ pub(super) fn preview_lines(
     let max_rows = max_rows.max(1);
     let mut out = Vec::new();
     let mut shown = 0;
-    for rows in content_rows(section, content, &bar, width) {
+    for rows in content_rows(section, content, &bar, width, None) {
         if out.len() + rows.len() > max_rows {
             // A line taller than the cap shows its head.
             if shown == 0 {
@@ -414,12 +508,13 @@ pub(super) fn preview_lines(
 }
 
 /// Each content line's rows after `bar`: numbered if the section is,
-/// coloured by [`line_style`], wrapped to `width`.
+/// coloured by [`line_style`], search matches marked, wrapped to `width`.
 fn content_rows(
     section: &Section,
     content: Vec<String>,
     bar: &dyn Fn() -> Vec<Span<'static>>,
     width: usize,
+    mark: Option<Mark>,
 ) -> Vec<Vec<Line<'static>>> {
     let digits = if section.numbered {
         let last = section
@@ -441,7 +536,12 @@ fn content_rows(
                 rest.push(indent(digits + 1));
             }
             let style = line_style(section, &line);
-            wrap(first, rest, vec![Span::styled(line, style)], width)
+            wrap(
+                first,
+                rest,
+                marked(vec![Span::styled(line, style)], mark),
+                width,
+            )
         })
         .collect()
 }
@@ -503,20 +603,21 @@ pub(super) fn title_spans(name: &str, title: &str) -> Vec<Span<'static>> {
     ]
 }
 
-/// A head line: `lead`, `glyph`, then `content` with `state` right-aligned
-/// on the first row; wrapped rows hang under the content.
+/// A head line: `lead`, `glyph`, then `content` with `state` (may be
+/// empty) right-aligned on the first row; wrapped rows hang under the
+/// content.
 pub(super) fn head_lines(
     lead: Vec<Span<'static>>,
     glyph: Span<'static>,
     content: Vec<Span<'static>>,
-    state: Option<Span<'static>>,
+    state: Vec<Span<'static>>,
     width: usize,
 ) -> Vec<Line<'static>> {
     let mut first = lead;
     first.push(glyph);
     first.push(Span::raw(" "));
     let column = spans_width(&first);
-    let state_width = state.as_ref().map_or(0, Span::width);
+    let state_width = spans_width(&state);
     let reserve = if state_width > 0 { state_width + 2 } else { 0 };
     let rows = rows(
         &content,
@@ -532,24 +633,30 @@ pub(super) fn head_lines(
             vec![indent(column)]
         };
         spans.extend(row);
-        if i == 0
-            && let Some(state) = &state
-        {
+        if i == 0 && state_width > 0 {
             let pad = width.saturating_sub(used + state_width).max(2);
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(state.clone());
+            spans.extend(state.iter().cloned());
         }
         out.push(Line::from(spans));
     }
     out
 }
 
-/// A tool call's detail line, dim, at `column`.
-pub(super) fn detail_lines(detail: &str, column: usize, width: usize) -> Vec<Line<'static>> {
+/// A tool call's detail line, dim, at `column`, search matches marked.
+pub(super) fn detail_lines(
+    detail: &str,
+    column: usize,
+    width: usize,
+    mark: Option<Mark>,
+) -> Vec<Line<'static>> {
     wrap(
         vec![indent(column)],
         vec![indent(column)],
-        vec![Span::raw(clean(detail.split('\n').next().unwrap_or_default())).dark_gray()],
+        marked(
+            vec![Span::raw(clean(detail.split('\n').next().unwrap_or_default())).dark_gray()],
+            mark,
+        ),
         width,
     )
 }

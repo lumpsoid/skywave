@@ -3162,3 +3162,250 @@ fn approval_answer_says_how_long_it_waited() {
         "you approved · queued 40s ago · sending",
     );
 }
+
+// ---- searching the timeline -------------------------------------------------
+
+/// A session with three matches for "test", far apart: a message, a failed
+/// shell call, and an agent message in upper case.
+fn searchable() -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    let shell = CallId::new();
+    let mut events = vec![event(id, 1, user(me, "run the tests"))];
+    events.extend((0..30).map(|i| event(id, 2, agent(&format!("chatter {i:02}")))));
+    events.push(event(
+        id,
+        3,
+        EventKind::ToolCall(call(shell, "Bash", ToolKind::Shell, "cargo test")),
+    ));
+    events.push(event(
+        id,
+        3,
+        EventKind::ToolResult(result(shell, true, "exit 101", "assertion failed")),
+    ));
+    events.extend((30..60).map(|i| event(id, 4, agent(&format!("chatter {i:02}")))));
+    events.push(event(id, 5, agent("the TESTS pass now")));
+    pull(&mut h, events);
+    (h, id, me)
+}
+
+fn search(h: &Harness) -> Option<&skywave_tui::app::Search> {
+    h.app.ui().session.as_ref()?.search.as_ref()
+}
+
+/// The position of the first character of `needle` on the line holding
+/// `on`.
+fn position_of(buffer: &Buffer, on: &str, needle: &str) -> (u16, u16) {
+    let screen = text(buffer);
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(on))
+        .unwrap_or_else(|| panic!("{on:?} not on screen:\n{screen}"));
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    (x as u16, y as u16)
+}
+
+#[test]
+fn slash_searches_and_n_jumps_between_matches() {
+    let (mut h, _, _) = searchable();
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    // The prompt takes letters, commands included.
+    assert!(h.app.typing());
+    h.type_text("test");
+    assert_contains(&h.screen(), "/test▏ · 3 matches · Enter jump · Esc cancel");
+    // Enter starts from the bottom of the screen: the newest match.
+    h.key(KeyCode::Enter);
+    assert!(!h.app.typing());
+    let screen = h.screen();
+    assert_contains(&screen, "/test · 3 of 3");
+    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+    assert_contains(&screen, "n/N older/newer match");
+    h.key(KeyCode::Char('n'));
+    let screen = h.screen();
+    assert_contains(&screen, "/test · 2 of 3");
+    assert_contains(&screen, "> 12:03 ❯ Bash cargo test");
+    h.key(KeyCode::Char('n'));
+    let screen = h.screen();
+    assert_contains(&screen, "/test · 1 of 3");
+    assert_contains(&screen, "> 12:01 you: run the tests");
+    h.key(KeyCode::Char('N'));
+    assert_contains(&h.screen(), "/test · 2 of 3");
+
+    // Smart case: an upper-case letter matches case.
+    h.key(KeyCode::Char('/'));
+    h.type_text("TESTS");
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    assert_contains(&screen, "/TESTS · 1 of 1");
+    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+
+    // Ctrl-F opens it from the composer too; `q` is text there.
+    h.key(KeyCode::Char('i'));
+    h.key_with(ctrl('f'));
+    h.type_text("q");
+    assert!(!h.app.ui().quit);
+    assert_eq!(search(&h).unwrap().query.as_str(), "q");
+    assert_contains(&h.screen(), "/q▏ · no matches");
+}
+
+#[test]
+fn n_wraps_and_says_so() {
+    let (mut h, _, _) = searchable();
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("test");
+    h.key(KeyCode::Enter);
+    h.key(KeyCode::Char('n'));
+    h.key(KeyCode::Char('n'));
+    assert!(!h.screen().contains("search wrapped"));
+    // Past the oldest: round to the newest.
+    h.key(KeyCode::Char('n'));
+    let screen = h.screen();
+    assert_contains(&screen, "/test · 3 of 3 · search wrapped");
+    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+    // Said until the next key.
+    h.key(KeyCode::Char('k'));
+    assert!(!h.screen().contains("search wrapped"));
+    // Past the newest: round to the oldest.
+    h.key(KeyCode::Char('N'));
+    let screen = h.screen();
+    assert_contains(&screen, "/test · 1 of 3 · search wrapped");
+    assert_contains(&screen, "> 12:01 you: run the tests");
+}
+
+#[test]
+fn esc_clears_search_before_leaving() {
+    let (mut h, _, _) = searchable();
+    h.key(KeyCode::Esc);
+    // Esc in the prompt cancels it.
+    h.key(KeyCode::Char('/'));
+    h.type_text("chatter");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(search(&h).is_none());
+    // Enter on an empty prompt closes it as well.
+    h.key(KeyCode::Char('/'));
+    h.key(KeyCode::Enter);
+    assert!(search(&h).is_none());
+    // A kept search goes first, then the session.
+    h.key(KeyCode::Char('/'));
+    h.type_text("test");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(search(&h).is_none());
+    assert!(!h.screen().contains("/test"));
+    assert_eq!(
+        h.key(KeyCode::Esc),
+        Some(Action::Navigate(Route::SessionList))
+    );
+}
+
+#[test]
+fn current_match_survives_new_items() {
+    let (mut h, id, me) = searchable();
+    // A queued message that matches; the search jumps to it.
+    h.type_text("test once more");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.key_with(ctrl('f'));
+    h.type_text("test");
+    h.key(KeyCode::Enter);
+    assert_eq!(search(&h).unwrap().current, Some(ItemKey::Pending(command)));
+    assert_contains(&h.screen(), "/test · 4 of 4");
+
+    // It is logged, and a newer match arrives: the current one stays.
+    let seq = Seq(h.seam.cursor().unwrap().0 + 1);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq })
+        .unwrap();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                6,
+                EventKind::UserMessage {
+                    command_id: command,
+                    device_id: me,
+                    text: "test once more".into(),
+                },
+            ),
+            event(id, 7, agent("tests are green")),
+        ],
+    );
+    assert_eq!(search(&h).unwrap().current, Some(ItemKey::Logged(seq)));
+    assert_contains(&h.screen(), "/test · 4 of 5");
+    h.key(KeyCode::Char('N'));
+    assert_contains(&h.screen(), "/test · 5 of 5");
+}
+
+#[test]
+fn matches_are_marked_and_the_current_one_bold() {
+    use ratatui::style::Modifier;
+    let (mut h, id, _) = open_session();
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, agent("alpha needle one")),
+            event(id, 2, agent("beta needle two")),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("needle");
+    // Marked while typing; none is current yet.
+    let buffer = h.frame(100, 24, mockup_now());
+    let cell = &buffer[position_of(&buffer, "alpha", "needle")];
+    assert!(cell.modifier.contains(Modifier::REVERSED));
+    assert!(!cell.modifier.contains(Modifier::BOLD));
+    assert_eq!(cell.fg, Color::Yellow);
+
+    h.key(KeyCode::Enter);
+    let buffer = h.frame(100, 24, mockup_now());
+    let (x, y) = position_of(&buffer, "beta", "needle");
+    // Every char of the current match, bold, and nothing around it.
+    for dx in 0..6 {
+        let cell = &buffer[(x + dx, y)];
+        assert!(cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD));
+    }
+    assert!(!buffer[(x + 6, y)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(x - 1, y)].modifier.contains(Modifier::REVERSED));
+    let other = &buffer[position_of(&buffer, "alpha", "needle")];
+    assert!(other.modifier.contains(Modifier::REVERSED));
+    assert!(!other.modifier.contains(Modifier::BOLD));
+    let word = &buffer[position_of(&buffer, "alpha", "alpha")];
+    assert!(!word.modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn a_match_only_in_hidden_output_expands_its_item() {
+    let (mut h, id, _) = open_session();
+    let write = CallId::new();
+    let mut tool = call(write, "Write", ToolKind::FileWrite, "notes.md");
+    tool.display.body = body(BodyFormat::Text, "# Notes");
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, EventKind::ToolCall(tool)),
+            event(
+                id,
+                1,
+                EventKind::ToolResult(result(write, false, "", "wrote 7 bytes to notes.md")),
+            ),
+        ],
+    );
+    assert!(!h.screen().contains("wrote 7 bytes"));
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('/'));
+    h.type_text("7 bytes");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.ui().session.as_ref().unwrap().expanded.len(), 1);
+    assert_contains(&h.screen(), "wrote 7 bytes");
+    // A match in the title shows collapsed: nothing expands.
+    h.key(KeyCode::Enter);
+    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    h.key(KeyCode::Char('/'));
+    h.type_text("notes.md");
+    h.key(KeyCode::Enter);
+    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+}
