@@ -15,7 +15,8 @@
 //!   `TurnEnded(Interrupted)` and the mapper cancels leftover approvals and
 //!   appends `SessionStateChanged(Idle)`. An interrupt aimed at an earlier
 //!   turn (that already ended) is ignored, so it can't stop a later one.
-//! - `SessionStopped` → [`AgentSession::interrupt`] if a turn runs, then
+//! - `SessionStopped` → [`AgentSession::interrupt`] if a turn runs or a
+//!   delivered message's turn has not ended, then
 //!   [`AgentSession::shutdown`]. The agent reports `TurnEnded(Interrupted)`
 //!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
 //!   session whose agent is not running is left alone. Like an idle
@@ -52,9 +53,13 @@
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
 //!
-//! [`SupervisorHandle::shutdown`] stops the agents but leaves their open
-//! turns and approvals as they are in the log, so the next start settles them
-//! the same way whether the daemon stopped cleanly or crashed.
+//! [`SupervisorHandle::shutdown`] stops the agents without interrupting them
+//! ([`AgentSession::shutdown`] abandons a running turn, so the agent cancels
+//! none of its approvals) and does not record their exit. Open turns and
+//! approvals stay as they are in the log, and the next start settles them the
+//! same way whether the daemon stopped cleanly or crashed. A pending approval
+//! cannot outlive the daemon: the agent's request for it lives only in the
+//! agent process (D8).
 //!
 //! **Threading.** SQLite and the mapper block, so the supervisor runs on its
 //! own thread with a current-thread runtime and its own [`Storage`]; agent
@@ -318,9 +323,10 @@ impl<A: AgentAdapter> Supervisor<A> {
                 let Some(running) = self.running.get_mut(&session_id) else {
                     return Ok(());
                 };
-                // Shutting down mid-turn would log the turn as lost; end it
-                // as interrupted instead.
-                if running.turn_started.is_some()
+                // Shutting down mid-turn would abandon the turn and log it as
+                // lost; end it as interrupted instead. A delivered message
+                // counts too: its turn may have begun before we heard.
+                if (running.turn_started.is_some() || running.owed_turns > 0)
                     && let Err(error) = running.session.interrupt().await
                 {
                     tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");

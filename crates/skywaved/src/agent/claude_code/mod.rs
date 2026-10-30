@@ -23,11 +23,13 @@
 //! for the process, like the fake agent's; their effects arrive as events.
 //! stderr lines go to the daemon log.
 //!
-//! **Shutdown.** Closing stdin does not stop a running turn, so
-//! [`AgentSession::shutdown`] interrupts a running turn and waits up to the
-//! grace period for its `result`, then closes stdin and waits up to the
-//! grace period for the process to exit before killing it. The event stream
-//! ends with `Exited`.
+//! **Shutdown.** [`AgentSession::shutdown`] with a turn that was interrupted
+//! waits up to the grace period for its `result`. A turn still running
+//! without an interrupt is abandoned: the process is killed at once, so the
+//! CLI cancels nothing and reports nothing more (closing stdin would not stop
+//! the turn, and interrupting it would cancel its approvals). Otherwise
+//! shutdown closes stdin and waits up to the grace period for the process to
+//! exit before killing it. The event stream ends with `Exited`.
 
 pub mod display;
 pub mod protocol;
@@ -481,9 +483,14 @@ impl Driver {
     /// Stops the process on request; a requested stop is not an error.
     async fn shutdown(&mut self) -> Option<String> {
         self.protocol.begin_shutdown();
+        if self.protocol.turn_open() && !self.protocol.interrupting() {
+            // Abandoned: no interrupt, so the CLI cancels nothing and the
+            // turn and its approvals stay open in the log.
+            tracing::info!("abandoning the running turn; killing the agent");
+            self.process.kill().await;
+            return None;
+        }
         if self.protocol.turn_open() {
-            let out = self.protocol.interrupt();
-            self.apply(out).await;
             let grace_period = self.grace_period;
             if timeout(grace_period, self.pump(true)).await.is_err() {
                 tracing::warn!("agent turn did not end within {grace_period:?} of the interrupt");

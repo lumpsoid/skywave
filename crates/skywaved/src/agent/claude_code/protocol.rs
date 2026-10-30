@@ -263,6 +263,11 @@ impl Protocol {
         self.turn_open
     }
 
+    /// The open turn has been asked to stop and its `result` not yet read.
+    pub fn interrupting(&self) -> bool {
+        self.turn_open && self.interrupt_sent
+    }
+
     /// The CLI version reported by the handshake or `system/init`.
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
