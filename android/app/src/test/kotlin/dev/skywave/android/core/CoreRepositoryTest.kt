@@ -28,6 +28,7 @@ private fun viewState(link: Link = Link.Connecting, queued: ULong = 0u) = ViewSt
     queued = queued,
     attention = Attention(approvals = emptyList(), elsewhere = 0u, alerts = 0u),
     screen = Screen.Pairing(PairingView(paired = null, status = PairingStatus.Idle)),
+    canGoBack = false,
 )
 
 private val reconnecting = Link.Reconnecting(attempt = 3u, retryAtMs = 4_000, offlineSinceMs = 0)

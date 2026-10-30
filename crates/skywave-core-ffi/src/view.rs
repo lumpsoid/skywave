@@ -76,6 +76,9 @@ pub struct ViewState {
     pub queued: u64,
     pub attention: Attention,
     pub screen: Screen,
+    /// `Action::Back` goes somewhere from `screen`; when false, back leaves
+    /// the app. Heads show an up arrow only when true.
+    pub can_go_back: bool,
 }
 
 impl From<sc::ViewState> for ViewState {
@@ -85,12 +88,14 @@ impl From<sc::ViewState> for ViewState {
             queued,
             attention,
             screen,
+            can_go_back,
         } = v;
         ViewState {
             link: link.into(),
             queued: count(queued),
             attention: attention.into(),
             screen: screen.into(),
+            can_go_back,
         }
     }
 }
@@ -1979,6 +1984,7 @@ mod tests {
                 alerts: 6,
             },
             screen: sc::Screen::Session(Box::new(view)),
+            can_go_back: true,
         });
         assert_eq!(
             converted,
@@ -1995,6 +2001,7 @@ mod tests {
                     alerts: 6,
                 },
                 screen: Screen::Session { view: view_mirror },
+                can_go_back: true,
             }
         );
     }

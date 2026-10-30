@@ -1435,10 +1435,7 @@ impl App {
             None => {}
         }
         match &self.view.screen {
-            Screen::Pairing(pairing) => {
-                let paired = pairing.paired.is_some();
-                self.pairing_key(key, ctrl, paired)
-            }
+            Screen::Pairing(_) => self.pairing_key(key, ctrl),
             Screen::SessionList(list) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1470,9 +1467,7 @@ impl App {
                     ListKind::Active => Route::ArchivedSessions,
                     ListKind::Archived => Route::SessionList,
                 })),
-                KeyCode::Esc if list.kind == ListKind::Archived => {
-                    Some(Action::Navigate(Route::SessionList))
-                }
+                KeyCode::Esc if self.view.can_go_back => Some(Action::Back),
                 // Deleting from this device asks first; the core says when
                 // something about the session still waits on an answer.
                 KeyCode::Char('D') if list.kind == ListKind::Archived => {
@@ -1504,7 +1499,7 @@ impl App {
             Screen::Session(_) => self.session_key(key, ctrl),
             Screen::Settings(settings) => match key.code {
                 KeyCode::Char('q') => self.quit(),
-                KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
+                KeyCode::Esc => Some(Action::Back),
                 KeyCode::Char('b') => Some(Action::SetBlobPolicy(match settings.blob_policy {
                     BlobPolicy::Eager => BlobPolicy::OnDemand,
                     BlobPolicy::OnDemand => BlobPolicy::Eager,
@@ -1515,7 +1510,7 @@ impl App {
         }
     }
 
-    fn pairing_key(&mut self, key: KeyEvent, ctrl: bool, paired: bool) -> Option<Action> {
+    fn pairing_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
         let form = &mut self.ui.form;
         // A URI typed or pasted without bracketed paste lands in one field.
         if key.code == KeyCode::Enter
@@ -1533,7 +1528,7 @@ impl App {
                 return Some(form.to_action());
             }
             KeyCode::Enter => form.focus = form.focus.next(),
-            KeyCode::Esc if paired => return Some(Action::Navigate(Route::SessionList)),
+            KeyCode::Esc if self.view.can_go_back => return Some(Action::Back),
             KeyCode::Backspace => {
                 let field = form.focus;
                 form.value_mut(field).pop();
@@ -1744,9 +1739,8 @@ impl App {
                     session.search = None;
                     None
                 }
-                // Back to the list the session is on.
-                KeyCode::Esc if view.archived => Some(Action::Navigate(Route::ArchivedSessions)),
-                KeyCode::Esc => Some(Action::Navigate(Route::SessionList)),
+                // Back to the list the session is on (the core knows which).
+                KeyCode::Esc => Some(Action::Back),
                 KeyCode::Char('/') => {
                     session.open_search();
                     None

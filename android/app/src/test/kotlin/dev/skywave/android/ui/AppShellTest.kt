@@ -19,11 +19,15 @@ import dev.skywave.android.core.CoreMessage
 import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.core.Action
 import dev.skywave.core.BlobPolicy
+import dev.skywave.core.Entry
 import dev.skywave.core.Link
 import dev.skywave.core.LinkRejection
 import dev.skywave.core.Route
 import dev.skywave.core.Screen
+import dev.skywave.core.SessionState
+import dev.skywave.core.SessionView
 import dev.skywave.core.SettingsView
+import dev.skywave.core.TimelineItem
 import dev.skywave.core.ViewState
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -173,7 +177,13 @@ class AppShellTest {
 
     @Test
     fun systemBackOnRevokedKeepsReadingInsteadOfNavigating() {
-        show(Samples.state(Link.Rejected(LinkRejection.Revoked), Screen.Session(sessionView(archived = false, items = 3))))
+        show(
+            Samples.state(
+                Link.Rejected(LinkRejection.Revoked),
+                Screen.Session(sessionView(archived = false, items = 3)),
+                canGoBack = true,
+            ),
+        )
         text("3 items").assertDoesNotExist()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
@@ -185,7 +195,7 @@ class AppShellTest {
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
         compose.mainClock.advanceTimeByFrame()
-        assertEquals(listOf<Action>(Action.Navigate(Route.SESSION_LIST)), dispatched)
+        assertEquals(listOf<Action>(Action.Back), dispatched)
     }
 
     @Test
@@ -223,22 +233,30 @@ class AppShellTest {
 
     @Test
     fun systemBackAndUpNavigateThroughTheCore() {
-        show(Samples.state(Link.Online(5u), Screen.Settings(SettingsView(BlobPolicy.EAGER, null, null))))
+        show(Samples.state(Link.Online(5u), Screen.Settings(SettingsView(BlobPolicy.EAGER, null, null)), canGoBack = true))
         compose.onNodeWithContentDescription("Back").performClick()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
         compose.mainClock.advanceTimeByFrame()
-        assertEquals(List(2) { Action.Navigate(Route.SESSION_LIST) }, dispatched)
+        assertEquals(List(2) { Action.Back }, dispatched)
+    }
+
+    @Test
+    fun systemBackAtTheRootIsLeftToTheSystem() {
+        show(Samples.state(Link.Online(5u)))
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.waitForIdle()
+        assertEquals(emptyList<Action>(), dispatched)
     }
 
     @Test
     fun sessionStubShowsTitleAndItemCount() {
-        var state by mutableStateOf(Samples.state(Link.Online(5u), Screen.Session(sessionView(archived = true, items = 3))))
+        var state by mutableStateOf(Samples.state(Link.Online(5u), Screen.Session(sessionView(archived = true, items = 3)), canGoBack = true))
         compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox, SettingsSamples.about) } }
         text("Fix the sync bug").assertExists()
         text("3 items").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
-        assertEquals(listOf<Action>(Action.Navigate(Route.ARCHIVED_SESSIONS)), dispatched)
+        assertEquals(listOf<Action>(Action.Back), dispatched)
         // The core answers with a new screen; the shell just follows.
         state = Samples.state(Link.Online(5u))
         text("Sessions").assertExists()
@@ -262,3 +280,26 @@ class AppShellTest {
         text("Retry now").assertDoesNotExist()
     }
 }
+
+internal fun sessionView(archived: Boolean, items: Int = 0) = SessionView(
+    id = "s1",
+    title = "Fix the sync bug",
+    named = true,
+    rename = null,
+    archived = archived,
+    workdir = null,
+    state = SessionState.Idle,
+    timeline = List(items) {
+        TimelineItem.Logged(seq = it.toULong(), atMs = 0, entry = Entry.Interrupted)
+    },
+    pendingApproval = null,
+    rules = emptyList(),
+    usage = null,
+    interrupt = null,
+    stop = null,
+    draft = null,
+    draftRev = 0u,
+    lastSeq = 0u,
+    unreadFrom = null,
+    prompts = emptyList(),
+)

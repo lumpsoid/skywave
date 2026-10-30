@@ -42,16 +42,24 @@ class SessionListScreenTest {
     private val dispatched = mutableListOf<Action>()
     private var screen by mutableStateOf<Screen>(SessionListSamples.active)
     private var link by mutableStateOf<Link>(Link.Online(5u))
+    private var canGoBack by mutableStateOf(false)
     private var core: (Action) -> Unit = {}
     private var shown = false
 
     /**
      * Shows [next]; later calls swap the snapshot as the core would. [answer]
-     * stands in for the core's answer to each action.
+     * stands in for the core's answer to each action; [back] for its
+     * `canGoBack`.
      */
-    private fun show(next: Screen, online: Link = Link.Online(5u), answer: (Action) -> Unit = {}) {
+    private fun show(
+        next: Screen,
+        online: Link = Link.Online(5u),
+        back: Boolean = false,
+        answer: (Action) -> Unit = {},
+    ) {
         screen = next
         link = online
+        canGoBack = back
         core = answer
         if (shown) {
             compose.waitForIdle()
@@ -62,7 +70,7 @@ class SessionListScreenTest {
         compose.setContent {
             SkywaveTheme(dynamicColor = false) {
                 AppShell(
-                    Samples.state(link, screen),
+                    Samples.state(link, screen, canGoBack = canGoBack),
                     dispatch = {
                         dispatched += it
                         core(it)
@@ -114,13 +122,13 @@ class SessionListScreenTest {
 
     @Test
     fun archivedListHasItsTitleBackAndNoNewSession() {
-        show(SessionListSamples.emptyArchived)
+        show(SessionListSamples.emptyArchived, back = true)
         text("Archived sessions").assertExists()
         text("No archived sessions").assertExists()
         tag(SessionListTags.NEW).assertDoesNotExist()
         compose.onNodeWithContentDescription("Settings").assertDoesNotExist()
         compose.onNodeWithContentDescription("Back").performClick()
-        assertEquals(listOf<Action>(Action.Navigate(Route.SESSION_LIST)), dispatched)
+        assertEquals(listOf<Action>(Action.Back), dispatched)
     }
 
     @Test

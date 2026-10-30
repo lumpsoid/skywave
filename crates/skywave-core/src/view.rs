@@ -32,6 +32,10 @@ pub struct ViewState {
     /// Approvals waiting for an answer; present on every screen.
     pub attention: Attention,
     pub screen: Screen,
+    /// [`Action::Back`](crate::Action::Back) goes somewhere from `screen`.
+    /// When false, back leaves the app (or does whatever a head does at
+    /// its root); heads show an up arrow only when true.
+    pub can_go_back: bool,
 }
 
 /// Approvals some agent is blocked on (D8), so a head can point at them

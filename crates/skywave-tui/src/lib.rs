@@ -145,7 +145,7 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
         }
         if matches!(
             action,
-            Action::Navigate(_) | Action::OpenSession(_) | Action::OpenNextApproval
+            Action::Navigate(_) | Action::Back | Action::OpenSession(_) | Action::OpenNextApproval
         ) {
             mark_read(app, core, Instant::now(), true);
         }
