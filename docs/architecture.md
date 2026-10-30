@@ -122,11 +122,16 @@ Post-MVP (D13). Decisions D16–D22.
 Compose UI (single Activity, Material 3)      renders ViewState.screen, sends Actions
    ▲ collectAsState            │ dispatch
 CoreRepository                                owns the StateFlow<ViewState>
-   ▲ listener (core thread)    │
+   ▲ listener (any thread)     │
 SkywaveCore (UniFFI, skywave-core-ffi)        mirror types + From/TryFrom
    ▲                           │
 skywave-core                                  all logic, sync, replica
 ```
+
+- The listener runs on whichever thread delivers the snapshot: the caller's
+  own inside `subscribe`, `dispatch` and `unsubscribe` (the IO coroutine
+  that consumes actions), or an engine thread. It only sets the
+  `MutableStateFlow` and returns (D17).
 
 - One core per process, owned by the `Application`; suspended on app stop,
   resumed on start.

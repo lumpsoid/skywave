@@ -691,3 +691,32 @@ fn callbacks_may_dispatch_and_every_subscriber_ends_on_the_latest_snapshot() {
     seam.set_link(Link::Connecting);
     assert_eq!(gone.count(), 1);
 }
+
+/// Publishes a link change when dropped.
+struct PublishOnDrop(Seam);
+
+impl Drop for PublishOnDrop {
+    fn drop(&mut self) {
+        self.0.set_link(Link::Online { latency_ms: 7 });
+    }
+}
+
+#[test]
+fn a_snapshot_published_during_unsubscribe_still_reaches_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
+    let watching = Views::subscribe(&core);
+
+    // `unsubscribe` drops the removed callback while it holds the
+    // subscriber list, so this publish finds the list taken — exactly the
+    // race with a publish from another thread, made deterministic. It
+    // leaves its snapshot to the holder, which must deliver it.
+    let guard = PublishOnDrop(core.seam());
+    let id = core.subscribe(move |_| {
+        let _ = &guard;
+    });
+    core.unsubscribe(id);
+
+    assert_eq!(core.view().link, Link::Online { latency_ms: 7 });
+    assert_eq!(watching.last(), core.view());
+}

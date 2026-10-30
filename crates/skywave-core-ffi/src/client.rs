@@ -21,10 +21,15 @@ use crate::view::ViewState;
 
 /// Receives every [`ViewState`] the core publishes.
 ///
-/// Called on a core thread, never the caller's: hand the snapshot on (e.g.
-/// to a `MutableStateFlow`) and return at once, since delivery to every
-/// listener waits for it. Snapshots arrive in order; one may be skipped in
-/// favour of a newer one. The listener may call `dispatch`, but not
+/// There is no dedicated delivery thread: the listener runs on whichever
+/// thread delivers — the caller's own thread inside `subscribe` (the first
+/// snapshot), inside `dispatch` and `unsubscribe` (snapshots published
+/// meanwhile, possibly several), or a core engine thread. So it must be
+/// thread-safe and must not assume a thread (in particular not the main
+/// thread); hand the snapshot on (e.g. to a `MutableStateFlow`) and return
+/// at once, since delivery to every listener, and the call that happened
+/// to deliver, waits for it. Snapshots arrive in order; one may be skipped
+/// in favour of a newer one. The listener may call `dispatch`, but not
 /// `subscribe`, `unsubscribe` or `shutdown` (they fail with
 /// `SkywaveException.Reentrant`). An exception it throws is logged and
 /// otherwise ignored: the listener stays subscribed and the core goes on.
