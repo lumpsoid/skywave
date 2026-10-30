@@ -3,7 +3,8 @@
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
 //! the pull cursor, blob rows, settings and this device's drafts, read
-//! marks and locally deleted sessions (D5: never synced). Startup always reads everything back from here
+//! marks, locally deleted sessions and alerted approvals (D5: never
+//! synced). Startup always reads everything back from here
 //! ([`Store::load`]), so a cold start is the normal start.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,7 +17,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, Seq, SessionId,
+    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, Seq,
+    SessionId,
 };
 use uuid::Uuid;
 
@@ -153,6 +155,18 @@ CREATE TABLE deleted_sessions (
     session_id TEXT PRIMARY KEY,
     at TEXT NOT NULL
 );
+"#,
+    r#"
+-- Pending approvals this device alerted on or judged no news (D5: never
+-- synced), so a restart alerts only for the rest. A row goes when its
+-- approval stops pending. Everything pending before this counts as
+-- alerted, so an upgrade alerts for nothing old.
+CREATE TABLE alerted_approvals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL
+);
+INSERT OR IGNORE INTO alerted_approvals (id, session_id)
+    SELECT approval.value, sessions.id FROM sessions, json_each(sessions.pending_approvals) AS approval;
 "#,
 ];
 
@@ -318,6 +332,9 @@ pub struct Snapshot {
     pub read_marks: HashMap<SessionId, ReadMark>,
     /// Sessions deleted from this device ([`Store::delete_session_locally`]).
     pub deleted: HashSet<SessionId>,
+    /// Pending approvals this device alerted on or judged no news
+    /// ([`Store::mark_alerted`]).
+    pub alerted: HashSet<ApprovalId>,
 }
 
 /// Handle to the replica database.
@@ -367,6 +384,7 @@ impl Store {
             drafts: self.drafts()?,
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
+            alerted: self.alerted()?,
         })
     }
 
@@ -385,6 +403,9 @@ impl Store {
     /// batch or an overlapping range is a no-op for the old part. A batch
     /// starting after `cursor + 1` is rejected with [`StoreError::Gap`] and
     /// changes nothing.
+    ///
+    /// Approvals that stop pending leave the alerted ones
+    /// ([`mark_alerted`](Store::mark_alerted)) in the same transaction.
     ///
     /// Events of a session deleted from this device advance the cursor but
     /// are not stored, project no summary and register no blob. Contiguity
@@ -448,6 +469,14 @@ impl Store {
         }
         for summary in touched.values() {
             write_session(&tx, summary)?;
+            tx.execute(
+                "DELETE FROM alerted_approvals WHERE session_id = ?1
+                    AND id NOT IN (SELECT value FROM json_each(?2))",
+                params![
+                    summary.id.0.to_string(),
+                    to_json(&summary.pending_approvals)?
+                ],
+            )?;
         }
         if new_cursor != cursor {
             tx.execute(
@@ -478,7 +507,8 @@ impl Store {
     }
 
     /// Deletes a session from this device only, in one transaction: its
-    /// events, summary, blob rows, draft and read mark, and the answered
+    /// events, summary, blob rows, draft, read mark and alerted approvals,
+    /// and the answered
     /// commands naming it. A tombstone keeps it out of the replica for good
     /// ([`apply_batch`](Store::apply_batch)). Returns the blobs its events
     /// referenced, whose files the caller removes. Whether the session may
@@ -510,6 +540,10 @@ impl Store {
         tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
         tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
         tx.execute(
+            "DELETE FROM alerted_approvals WHERE session_id = ?1",
+            [&session],
+        )?;
+        tx.execute(
             "DELETE FROM outbox WHERE result IS NOT NULL
                 AND json_extract(command, '$.kind.session_id') = ?1",
             [&session],
@@ -526,8 +560,8 @@ impl Store {
     /// Makes the replica a fresh one for the server at `address`, in one
     /// transaction: the event log, session summaries, cursor, outbox and
     /// blob rows the old server's log produced go, and so does what this
-    /// device kept beside them — drafts, read marks and locally deleted
-    /// sessions. Of the settings, the server address becomes `address`;
+    /// device kept beside them — drafts, read marks, locally deleted
+    /// sessions and alerted approvals. Of the settings, the server address becomes `address`;
     /// the blob policy, a preference of this device, stays, as do keys a
     /// newer build wrote. Returns the blobs that were known, whose files
     /// the caller removes.
@@ -546,7 +580,8 @@ impl Store {
              DELETE FROM blobs;
              DELETE FROM drafts;
              DELETE FROM read_marks;
-             DELETE FROM deleted_sessions;",
+             DELETE FROM deleted_sessions;
+             DELETE FROM alerted_approvals;",
         )?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -809,6 +844,38 @@ impl Store {
                 u64_sql(mark.notable)?
             ],
         )?;
+        Ok(())
+    }
+
+    // ---- alerted approvals ------------------------------------------------
+
+    /// The pending approvals this device alerted on or judged no news.
+    pub fn alerted(&self) -> Result<HashSet<ApprovalId>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM alerted_approvals")?;
+        let rows = stmt.query_map([], |row| Ok(ApprovalId(uuid_col(row, 0)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps that these approvals, pending in their sessions, need no
+    /// alert any more, in one transaction. The row goes again once the
+    /// approval stops pending ([`apply_batch`](Store::apply_batch)) or its
+    /// session is deleted here.
+    pub fn mark_alerted(
+        &mut self,
+        approvals: &[(SessionId, ApprovalId)],
+    ) -> Result<(), StoreError> {
+        if approvals.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for (session, approval) in approvals {
+            tx.execute(
+                "INSERT INTO alerted_approvals (id, session_id) VALUES (?1, ?2)
+                 ON CONFLICT (id) DO NOTHING",
+                params![approval.0.to_string(), session.0.to_string()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

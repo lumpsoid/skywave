@@ -13,8 +13,8 @@ use skywave_core::{
     SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    BlobId, BlobRef, CommandKind, CommandResult, DeviceId, Event, EventBatch, EventKind, Seq,
-    SessionId, ToolResult,
+    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, Decision, DeviceId, Event, EventBatch,
+    EventKind, Seq, SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -592,6 +592,95 @@ fn blob_progress_is_persisted_and_shown() {
             paused: true,
         }
     );
+}
+
+#[test]
+fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, _) = paired_core(dir.path());
+    let sid = SessionId::new();
+    let (news, answered, resolved) = (ApprovalId::new(), ApprovalId::new(), ApprovalId::new());
+    let requested = |minute, id| {
+        event(
+            sid,
+            minute,
+            EventKind::ApprovalRequested {
+                id,
+                call: None,
+                tool: "Bash".into(),
+                summary: "ls".into(),
+                input: None,
+                suggestions: Vec::new(),
+            },
+        )
+    };
+    // Pulled while never online: nobody was alerted.
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                },
+            ),
+            requested(1, news),
+            requested(2, answered),
+            requested(3, resolved),
+        ],
+    })
+    .unwrap();
+    core.dispatch(Action::ResolveApproval {
+        id: answered,
+        decision: Decision::Deny,
+        rule: None,
+    })
+    .unwrap();
+    assert_eq!(core.view().attention.alerts, 0);
+    drop((core, seam));
+
+    let ids = |view: &ViewState| {
+        view.attention
+            .approvals
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>()
+    };
+    let core = Core::open_detached(dir.path()).unwrap();
+    let seam = core.seam();
+    assert_eq!(core.view().attention.alerts, 0, "nothing before online");
+    seam.set_link(Link::CatchingUp {
+        have: Seq(4),
+        server: Seq(5),
+    });
+    seam.apply_events(&EventBatch {
+        from: Seq(5),
+        events: vec![event(
+            sid,
+            4,
+            EventKind::ApprovalResolved {
+                id: resolved,
+                decision: Decision::Approve,
+                by: DeviceId::new(),
+                rule: None,
+            },
+        )],
+    })
+    .unwrap();
+    assert_eq!(core.view().attention.alerts, 0, "nor while catching up");
+    seam.set_link(Link::Online { latency_ms: 5 });
+    let view = core.view();
+    assert_eq!(view.attention.alerts, 1, "one alert, for the news only");
+    assert_eq!(ids(&view), vec![news]);
+    drop((core, seam));
+
+    // Alerted on: a later start stays quiet.
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.seam().set_link(Link::Online { latency_ms: 5 });
+    let view = core.view();
+    assert_eq!(view.attention.alerts, 0);
+    assert_eq!(ids(&view), vec![news]);
 }
 
 #[test]

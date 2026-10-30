@@ -49,9 +49,17 @@ pub struct Attention {
     /// How many of `approvals` are outside the open session.
     pub elsewhere: usize,
     /// Bumped once whenever new approvals came in while online: never for
-    /// those already pending at start, arriving during a catch-up and
-    /// resolved before its end, or answered from this device. Heads alert
-    /// when it grows; it never goes back.
+    /// those arriving during a catch-up and resolved before its end, or
+    /// answered from this device, and never twice for one approval, not
+    /// even across restarts — which approvals were alerted on is stored.
+    /// One pending at start that no earlier core alerted on (pulled by a
+    /// catch-up that ended before the link was online) is new, and alerts
+    /// once the link is online, like one that came in during a catch-up.
+    ///
+    /// Counts from 0 in every core and only grows: it is always 0 in the
+    /// first snapshot, as it is bumped only once online. Heads alert when
+    /// it grows within the core's lifetime, taking 0, not the first
+    /// snapshot, as where it started.
     pub alerts: u64,
 }
 

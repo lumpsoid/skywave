@@ -226,7 +226,12 @@ pub struct Client {
 
 impl Client {
     pub fn open(config: EngineConfig) -> Client {
-        let dir = tempfile::tempdir().unwrap();
+        Client::open_in(tempfile::tempdir().unwrap(), config)
+    }
+
+    /// A core over the data dir a [`stop`](Client::stop)ped one left: a
+    /// cold start.
+    pub fn open_in(dir: TempDir, config: EngineConfig) -> Client {
         let core = Core::open_with(dir.path(), config).unwrap();
         let (tx, views) = watch::channel(core.view());
         core.subscribe(move |view| {
@@ -273,6 +278,24 @@ impl Client {
                 self.core.view()
             )
         })
+    }
+
+    /// Ends the core and its engine, as the process dying would, and hands
+    /// back its data dir.
+    pub fn stop(self) -> TempDir {
+        let Client {
+            dir,
+            core,
+            seam,
+            views,
+        } = self;
+        drop((seam, views));
+        // Off the runtime: a shutdown refuses to block a runtime thread.
+        std::thread::spawn(move || core.shutdown(SOON))
+            .join()
+            .unwrap()
+            .unwrap();
+        dir
     }
 
     pub fn dispatch(&self, action: Action) {

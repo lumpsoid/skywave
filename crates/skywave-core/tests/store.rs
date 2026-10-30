@@ -519,6 +519,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
@@ -575,6 +576,11 @@ fn drop_archived(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN archived;")
         .unwrap();
+}
+
+fn drop_alerted(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE alerted_approvals;").unwrap();
 }
 
 fn drop_deleted(dir: &Path) {
@@ -645,6 +651,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop(store);
 
     // A replica from before the column holds no usage events.
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     set_user_version(&dir, 7);
@@ -705,6 +712,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
 
     // A replica from before the column (protocol v3: it holds no archive
     // events): everything starts active.
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
@@ -782,6 +790,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
 
     // A replica from before the columns (protocol v3: it holds no renames):
     // the migration derives the first prompts from the log like the fold.
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
@@ -870,6 +879,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
@@ -976,6 +986,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
@@ -1450,4 +1461,151 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     // The new server's log starts from the beginning.
     let applied = seam.apply_events(&log.batch(1, 2)).unwrap();
     assert_eq!((applied.cursor, applied.new_events), (Seq(2), 2));
+}
+
+fn requested(session_id: SessionId, minute: u32, id: ApprovalId) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::ApprovalRequested {
+            id,
+            call: None,
+            tool: "Bash".into(),
+            summary: "ls".into(),
+            input: None,
+            suggestions: Vec::new(),
+        },
+    )
+}
+
+fn created(session_id: SessionId, minute: u32) -> Event {
+    event(
+        session_id,
+        minute,
+        EventKind::SessionCreated {
+            workdir: "/srv/x".into(),
+        },
+    )
+}
+
+fn sorted(ids: impl IntoIterator<Item = ApprovalId>) -> Vec<ApprovalId> {
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn alerted_approvals_are_kept_until_they_stop_pending() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let (x, y, z) = (ApprovalId::new(), ApprovalId::new(), ApprovalId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(&EventBatch {
+            from: Seq(1),
+            events: vec![
+                created(a, 0),
+                created(b, 1),
+                requested(a, 2, x),
+                requested(a, 3, y),
+                requested(b, 4, z),
+            ],
+        })
+        .unwrap();
+    assert!(store.load().unwrap().alerted.is_empty(), "none alerted yet");
+    store.mark_alerted(&[(a, x), (b, z)]).unwrap();
+    store.mark_alerted(&[(a, x)]).unwrap();
+    drop(store);
+
+    // Kept over a reopen.
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, z]));
+
+    // Resolved or cancelled, it goes with the batch that says so; another
+    // session's events leave it alone.
+    store
+        .apply_batch(&EventBatch {
+            from: Seq(6),
+            events: vec![
+                event(
+                    a,
+                    5,
+                    EventKind::ApprovalResolved {
+                        id: x,
+                        decision: Decision::Approve,
+                        by: DeviceId::new(),
+                        rule: None,
+                    },
+                ),
+                event(a, 6, EventKind::AgentMessage { text: "ok".into() }),
+            ],
+        })
+        .unwrap();
+    assert_eq!(sorted(store.alerted().unwrap()), vec![z]);
+    store.mark_alerted(&[(a, y)]).unwrap();
+    store
+        .apply_batch(&EventBatch {
+            from: Seq(8),
+            events: vec![event(
+                a,
+                7,
+                EventKind::ApprovalCancelled {
+                    id: y,
+                    reason: "restart".into(),
+                },
+            )],
+        })
+        .unwrap();
+    assert_eq!(sorted(store.alerted().unwrap()), vec![z]);
+
+    // Its session deleted here, it goes too.
+    store.delete_session_locally(b, Utc::now()).unwrap();
+    assert!(store.alerted().unwrap().is_empty());
+
+    // As it does with a new server.
+    let w = ApprovalId::new();
+    store
+        .apply_batch(&EventBatch {
+            from: Seq(9),
+            events: vec![requested(a, 8, w)],
+        })
+        .unwrap();
+    store.mark_alerted(&[(a, w)]).unwrap();
+    store.reset_for_server("other:7443").unwrap();
+    assert!(store.alerted().unwrap().is_empty());
+}
+
+#[test]
+fn the_migration_counts_every_pending_approval_as_alerted() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let (x, y, z) = (ApprovalId::new(), ApprovalId::new(), ApprovalId::new());
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(&EventBatch {
+            from: Seq(1),
+            events: vec![
+                created(a, 0),
+                created(b, 1),
+                requested(a, 2, x),
+                requested(a, 3, y),
+                requested(b, 4, z),
+                event(
+                    b,
+                    5,
+                    EventKind::ApprovalCancelled {
+                        id: z,
+                        reason: "restart".into(),
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+    drop(store);
+
+    // A replica from before the table: what is pending is old news.
+    drop_alerted(&dir);
+    set_user_version(&dir, 9);
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
 }
