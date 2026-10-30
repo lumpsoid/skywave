@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- The core's sync engine talks to the server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- NetworkWatcher: nudge a reconnect when a network comes back. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application
         android:name=".SkywaveApp"
         android:allowBackup="false"
