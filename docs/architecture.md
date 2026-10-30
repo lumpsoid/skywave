@@ -113,3 +113,28 @@ enum BlobState {
 | Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
 | `Rejected(Revoked)` | Full-screen state with re-pair action; local data stays readable. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
+
+## Android head
+
+Post-MVP (D13). Decisions D16–D22.
+
+```
+Compose UI (single Activity, Material 3)      renders ViewState.screen, sends Actions
+   ▲ collectAsState            │ dispatch
+CoreRepository                                owns the StateFlow<ViewState>
+   ▲ listener (core thread)    │
+SkywaveCore (UniFFI, skywave-core-ffi)        mirror types + From/TryFrom
+   ▲                           │
+skywave-core                                  all logic, sync, replica
+```
+
+- One core per process, owned by the `Application`; suspended on app stop,
+  resumed on start.
+- The core's data dir (replica and device key) is under `filesDir`.
+
+Build pipeline:
+
+```
+Gradle ─► cargo-ndk ─► libskywave_core_ffi.so (arm64-v8a, x86_64) ─► jniLibs
+       └► uniffi-bindgen (crate's own binary) ─► generated Kotlin ─► compiled with the app
+```
