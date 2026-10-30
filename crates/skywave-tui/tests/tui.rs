@@ -399,11 +399,11 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     let t0 = h.t0;
     assert_eq!(
         h.banner_at(t0),
-        "offline · 2 queued · retry in 5s (attempt 3)"
+        "offline · 2 queued · retry in 05s · Ctrl-R now (attempt 3)"
     );
     assert_eq!(
         h.banner_at(t0 + Duration::from_millis(2500)),
-        "offline · 2 queued · retry in 3s (attempt 3)"
+        "offline · 2 queued · retry in 03s · Ctrl-R now (attempt 3)"
     );
     assert_eq!(
         h.banner_at(t0 + Duration::from_secs(6)),
@@ -411,6 +411,11 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     );
     // Local data still renders under the banner.
     assert_contains(&line_with(&h.screen(), "/srv/a"), "[queued]");
+
+    // Ctrl-R asks the engine to stop waiting.
+    h.drain_requests();
+    assert_eq!(h.key_with(ctrl('r')), Some(Action::RetryNow));
+    assert_eq!(h.drain_requests(), vec![Request::RetryNow]);
 
     // A new attempt restarts the countdown from when it arrived.
     let later = t0 + Duration::from_secs(10);
@@ -422,7 +427,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     h.sync_at(later);
     assert_eq!(
         h.banner_at(later + Duration::from_secs(1)),
-        "offline · 2 queued · retry in 9s (attempt 4)"
+        "offline · 2 queued · retry in 09s · Ctrl-R now (attempt 4)"
     );
 
     // Back online, the queue drains; the count stays until results arrive.

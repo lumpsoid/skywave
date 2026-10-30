@@ -36,6 +36,9 @@ pub enum Action {
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     SetBlobPolicy(BlobPolicy),
+    /// While the link is `Reconnecting`, skip the rest of the wait and
+    /// reconnect now. The attempt count and `offline_since` carry on.
+    RetryNow,
     Navigate(Route),
 }
 

@@ -10,6 +10,8 @@
 //! - `Connect` (re)starts the link with the stored identity and address,
 //!   also after `Rejected`.
 //! - `OutboxChanged` wakes the outbox sender.
+//! - `RetryNow` cuts short the link's backoff wait, if it is waiting, to
+//!   [`Backoff::RETRY_NOW_MIN`] after the failure.
 //! - `DownloadBlob` and `BlobPolicyChanged` go to the blob queue; the blob
 //!   downloader (see [`crate::blobs`]) runs beside the link, on its own
 //!   task and connections, so blobs never hold up the pull or the sender.
@@ -33,7 +35,8 @@
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
 //! else shows `Reconnecting { attempt, next_in, offline_since }`, waits
 //! [`Backoff::delay`] and connects again, still showing `Reconnecting`
-//! until `hello` succeeds. The attempt count and `offline_since` reset once
+//! until `hello` succeeds (`RetryNow` ends the wait early, without
+//! touching the bookkeeping). The attempt count and `offline_since` reset once
 //! a pull succeeds, so a server that answers `hello` and then fails keeps
 //! backing off.
 //!
@@ -171,6 +174,8 @@ pub(crate) struct Engine {
     suspended: watch::Receiver<bool>,
     /// Wakes the outbox sender; outlives each link so no wake-up is lost.
     outbox: Arc<Notify>,
+    /// Ends the link's backoff wait; outlives each link.
+    retry_now: Arc<Notify>,
     link: Option<JoinHandle<()>>,
     /// The blob downloader, running while the link does.
     downloader: Option<JoinHandle<Infallible>>,
@@ -198,6 +203,7 @@ impl Engine {
             requests,
             suspended,
             outbox: Arc::new(Notify::new()),
+            retry_now: Arc::new(Notify::new()),
             link: None,
             downloader: None,
             rejected: watch::Sender::new(false),
@@ -251,6 +257,9 @@ impl Engine {
                 self.start_link();
             }
             Request::OutboxChanged => self.outbox.notify_one(),
+            // Only a link already waiting is woken: no permit is stored, so
+            // a press that lands mid-connect cannot skip the next wait.
+            Request::RetryNow => self.retry_now.notify_waiters(),
             Request::DownloadBlob(id) => self.blobs.want(id),
             Request::BlobPolicyChanged(policy) => {
                 let blobs = self.seam.blobs().unwrap_or_else(|error| {
@@ -295,6 +304,7 @@ impl Engine {
             seam: self.seam.clone(),
             config: self.config.clone(),
             outbox: self.outbox.clone(),
+            retry_now: self.retry_now.clone(),
             blobs: self.blobs.clone(),
             address,
             identity,
@@ -323,6 +333,8 @@ pub(crate) struct LinkCtx {
     pub(crate) seam: Seam,
     pub(crate) config: Arc<EngineConfig>,
     pub(crate) outbox: Arc<Notify>,
+    /// Ends a backoff wait early.
+    pub(crate) retry_now: Arc<Notify>,
     /// Where an `Eager` policy queues the blobs a batch registers.
     pub(crate) blobs: Arc<BlobQueue>,
     pub(crate) address: String,
@@ -413,6 +425,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
         let offline_since = *retry
             .offline_since
             .get_or_insert_with(|| tokio::time::Instant::now().into_std());
+        let failed_at = tokio::time::Instant::now();
         let next_in = ctx.config.backoff.delay(retry.attempt);
         tracing::debug!(%error, attempt = retry.attempt, ?next_in, "link down");
         reporter.set(Link::Reconnecting {
@@ -420,7 +433,22 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             next_in,
             offline_since,
         });
-        tokio::time::sleep(next_in).await;
+        let mut wake = failed_at + next_in;
+        tokio::select! {
+            () = tokio::time::sleep_until(wake) => {}
+            () = ctx.retry_now.notified() => {
+                wake = wake.min(failed_at + Backoff::RETRY_NOW_MIN);
+                tracing::debug!(after = ?wake - failed_at, "retrying now");
+                // The banner counts down from when this value arrives.
+                reporter.set(Link::Reconnecting {
+                    attempt: retry.attempt,
+                    next_in: wake.saturating_duration_since(tokio::time::Instant::now()),
+                    offline_since,
+                });
+                // Further presses are ignored until the attempt fails.
+                tokio::time::sleep_until(wake).await;
+            }
+        }
     }
 }
 
@@ -621,6 +649,7 @@ mod tests {
             seam: seam.clone(),
             config: Arc::new(config),
             outbox: Arc::new(Notify::new()),
+            retry_now: Arc::new(Notify::new()),
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
@@ -679,6 +708,102 @@ mod tests {
             reconnects(&links.lock().unwrap())[before..before + 2],
             [(1, 1), (2, 2)]
         );
+        link.abort();
+    }
+
+    /// `retry_now` cuts a backoff wait down to `RETRY_NOW_MIN` after the
+    /// failure; the attempt count and `offline_since` carry on as if the
+    /// wait had run out. Held down, it retries about once a second.
+    #[tokio::test(start_paused = true)]
+    async fn retry_now_skips_the_wait_and_keeps_the_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let sink = links.clone();
+        seam.core
+            .subscribe(move |view| sink.lock().unwrap().push(view.link));
+
+        let server = Arc::new(FlakyServer::default());
+        let fake = server.clone();
+        let config = EngineConfig {
+            backoff: Backoff {
+                base: Duration::from_secs(60),
+                cap: Duration::from_secs(60),
+                jitter: Jitter::fixed(1.0),
+            },
+            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            ..EngineConfig::default()
+        };
+        let retry_now = Arc::new(Notify::new());
+        let ctx = LinkCtx {
+            seam: seam.clone(),
+            config: Arc::new(config),
+            outbox: Arc::new(Notify::new()),
+            retry_now: retry_now.clone(),
+            blobs: Arc::new(BlobQueue::default()),
+            address: "srv:7443".into(),
+            identity: seam.identity().unwrap(),
+        };
+        let link = tokio::spawn(run_link(ctx));
+
+        let reconnecting = |links: &[Link]| -> Vec<(u32, Instant)> {
+            links
+                .iter()
+                .filter_map(|l| match l {
+                    Link::Reconnecting {
+                        attempt,
+                        offline_since,
+                        ..
+                    } => Some((*attempt, *offline_since)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let reconnecting_next_in = |links: &[Link]| -> Vec<(u32, Duration)> {
+            links
+                .iter()
+                .filter_map(|l| match l {
+                    Link::Reconnecting {
+                        attempt, next_in, ..
+                    } => Some((*attempt, *next_in)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_for = |n: usize| {
+            let links = links.clone();
+            async move {
+                while reconnecting(&links.lock().unwrap()).len() < n {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        wait_for(1).await;
+        let failed = tokio::time::Instant::now();
+        retry_now.notify_waiters();
+        // The shortened countdown is reported; then the floor is kept.
+        wait_for(2).await;
+        assert!(matches!(
+            reconnecting_next_in(&links.lock().unwrap()).last(),
+            Some(&(1, d)) if d <= Backoff::RETRY_NOW_MIN
+        ));
+        wait_for(3).await;
+        let waited = failed.elapsed();
+        assert!(waited >= Backoff::RETRY_NOW_MIN, "floor kept: {waited:?}");
+        assert!(waited < Duration::from_secs(2), "no 60s wait: {waited:?}");
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 2);
+        let seen = reconnecting(&links.lock().unwrap());
+        assert_eq!(seen[2].0, 2, "attempts keep counting");
+        assert_eq!(seen[0].1, seen[2].1, "offline_since is kept");
+
+        // Held down: a press every 30 ms for 5 s is about 5 attempts.
+        let start = server.hellos.load(Ordering::SeqCst);
+        for _ in 0..(5000 / 30) {
+            retry_now.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let held = server.hellos.load(Ordering::SeqCst) - start;
+        assert!((4..=6).contains(&held), "{held} attempts in 5 s");
         link.abort();
     }
 

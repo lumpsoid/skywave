@@ -73,7 +73,7 @@ from `OnDemand` to `Eager`.
 
 ### 📡 You always know where you stand
 A link banner is always on screen: `Online · 120 ms`, `Catching up`, or
-`Offline · 3 queued · retry in 8s`. Input stays enabled in every state.
+`Offline · 3 queued · retry in 08s`. Input stays enabled in every state.
 
 ### 🔐 Private by default
 `skywaved` runs its own certificate authority. Devices pair with a one-time
@@ -149,6 +149,7 @@ start talking to the agent.
 | `a` / `x` | Approve / deny a pending request |
 | `Ctrl-X` | Interrupt the agent's turn |
 | `S` | Stop the agent (timeline); the next message restarts it |
+| `Ctrl-R` | Retry the connection now while offline (any screen) |
 | `?` / `F1` | Help |
 
 ### Managing devices

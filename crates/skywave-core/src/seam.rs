@@ -37,6 +37,8 @@ pub enum Request {
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
+    /// The user wants the link to stop waiting out its backoff.
+    RetryNow,
 }
 
 /// Engine-side handle to a [`Core`]; see the module docs.

@@ -190,6 +190,10 @@ impl Model {
                     Effect::Request(Request::BlobPolicyChanged(policy)),
                 ]
             }
+            Action::RetryNow => match self.link {
+                Link::Reconnecting { .. } => vec![Effect::Request(Request::RetryNow)],
+                _ => Vec::new(),
+            },
             Action::Navigate(route) => {
                 self.place = route.into();
                 self.open = None;
@@ -1443,6 +1447,28 @@ mod tests {
         f.model.set_link(Link::Rejected(LinkRejection::Revoked));
         // Local data stays readable while rejected.
         assert_eq!(f.list_view().sessions.len(), 1);
+    }
+
+    #[test]
+    fn retry_now_only_while_reconnecting() {
+        let mut f = Fixture::paired();
+        for link in [
+            Link::Connecting,
+            Link::Online { latency_ms: 5 },
+            Link::Rejected(LinkRejection::Revoked),
+        ] {
+            f.model.set_link(link);
+            assert!(f.dispatch(Action::RetryNow).is_empty());
+        }
+        f.model.set_link(Link::Reconnecting {
+            attempt: 2,
+            next_in: Duration::from_secs(30),
+            offline_since: Instant::now(),
+        });
+        assert_eq!(
+            f.dispatch(Action::RetryNow),
+            vec![Effect::Request(Request::RetryNow)]
+        );
     }
 
     // Tool timeline (spec §7): calls group their approval and result.
