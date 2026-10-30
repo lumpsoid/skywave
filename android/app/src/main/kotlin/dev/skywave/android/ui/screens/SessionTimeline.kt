@@ -1,5 +1,6 @@
 package dev.skywave.android.ui.screens
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
@@ -43,8 +44,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.skywave.android.R
 import dev.skywave.core.ApprovalStatus
-import dev.skywave.core.BlobState
-import dev.skywave.core.BlobView
 import dev.skywave.core.BodyFormat
 import dev.skywave.core.Decision
 import dev.skywave.core.Delivery
@@ -72,6 +71,7 @@ internal class ItemActions(
     val copy: (String) -> Unit,
     val discard: (String) -> Unit,
     val edit: (String) -> Unit,
+    val blobs: BlobActions = BlobActions.None,
 )
 
 @Composable
@@ -136,7 +136,7 @@ internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions, gated
                 onDiscard = { actions.discard(item.commandId) },
                 onEdit = { actions.edit(item.commandId) },
             )
-            is TimelineItem.Logged -> LoggedEntry(item, expanded, gated)
+            is TimelineItem.Logged -> LoggedEntry(item, expanded, gated, actions.blobs)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             if (text != null) {
@@ -169,7 +169,7 @@ internal fun TimelineItemView(row: TimelineRow.Item, actions: ItemActions, gated
 }
 
 @Composable
-private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: GatedApproval?) {
+private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: GatedApproval?, blobs: BlobActions) {
     when (val e = item.entry) {
         is Entry.UserMessage -> MessageBubble(
             text = e.text,
@@ -182,14 +182,14 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
             onEdit = {},
         )
         is Entry.AgentMessage -> AgentText(e.text)
-        is Entry.Tool -> ToolItem(e.tool, expanded, gated)
+        is Entry.Tool -> ToolItem(e.tool, expanded, gated, blobs)
         is Entry.ToolCall -> Column {
             Label(stringResource(R.string.sv_tool_call, e.name, e.summary))
-            e.input?.let { Minor(stringResource(R.string.sv_tool_input, blobText(it))) }
+            e.input?.let { BlobRow(stringResource(R.string.blob_input), it, blobs, viewerTitle(R.string.blob_input, e.name)) }
         }
         is Entry.ToolResult -> Column {
             Label(stringResource(R.string.sv_tool_result, e.summary))
-            e.output?.let { Minor(stringResource(R.string.sv_tool_output, blobText(it))) }
+            e.output?.let { BlobRow(stringResource(R.string.blob_output), it, blobs, viewerTitle(R.string.blob_output, e.summary)) }
         }
         is Entry.Approval -> Column {
             Label(stringResource(R.string.sv_approval, e.tool, e.summary))
@@ -424,7 +424,7 @@ private fun outputShownCollapsed(tool: ToolView, done: ToolOutcome.Done): Boolea
 
 /** One tool call: kind and title, body preview, outcome; tap shows everything. */
 @Composable
-private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?) {
+private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?, blobs: BlobActions) {
     val colors = MaterialTheme.colorScheme
     val outcome = tool.outcome
     val failed = (outcome is ToolOutcome.Done && outcome.isError) || outcome is ToolOutcome.Denied
@@ -458,7 +458,7 @@ private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?) {
                 }
                 if (expanded) {
                     Minor(pluralStringResource(R.plurals.sv_more_lines, body.lines.toInt(), body.lines.toInt()))
-                    body.full?.let { Minor(stringResource(R.string.sv_tool_full, blobText(it))) }
+                    body.full?.let { BlobRow(stringResource(R.string.blob_full), it, blobs, viewerTitle(R.string.blob_full, tool.title)) }
                 }
             }
             if (outcome is ToolOutcome.Done && outcome.preview.isNotEmpty() &&
@@ -485,9 +485,11 @@ private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?) {
                     if (done.preview.isNotEmpty()) {
                         Minor(pluralStringResource(R.plurals.sv_more_lines, done.lines.toInt(), done.lines.toInt()))
                     }
-                    done.output?.let { Minor(stringResource(R.string.sv_tool_output, blobText(it))) }
+                    done.output?.let {
+                        BlobRow(stringResource(R.string.blob_output), it, blobs, viewerTitle(R.string.blob_output, tool.title))
+                    }
                 }
-                tool.input?.let { Minor(stringResource(R.string.sv_tool_input, blobText(it))) }
+                tool.input?.let { BlobRow(stringResource(R.string.blob_input), it, blobs, viewerTitle(R.string.blob_input, tool.title)) }
             }
         }
     }
@@ -540,19 +542,10 @@ internal fun approvalText(status: ApprovalStatus): String = when (status) {
     is ApprovalStatus.Cancelled -> stringResource(R.string.sv_approval_cancelled, status.reason)
 }
 
-/** A blob's size and download state as text; fetching it is A13's. */
+/** The viewer's title for a blob: what it is ([what]), then whose ([of], its first line). */
 @Composable
-internal fun blobText(blob: BlobView): String = when (val s = blob.state) {
-    is BlobState.NotDownloaded -> stringResource(R.string.sv_blob_not_downloaded, formatBytes(s.size))
-    is BlobState.Requested -> stringResource(R.string.sv_blob_requested, formatBytes(s.size))
-    is BlobState.Downloading -> stringResource(
-        if (s.paused) R.string.sv_blob_paused else R.string.sv_blob_downloading,
-        formatBytes(s.got),
-        formatBytes(s.size),
-    )
-    is BlobState.Failed -> stringResource(R.string.sv_blob_failed, formatBytes(s.size), s.reason)
-    is BlobState.Available -> stringResource(R.string.sv_blob_available)
-}
+internal fun viewerTitle(@StringRes what: Int, of: String): String =
+    stringResource(R.string.blob_viewer_title, stringResource(what), of.lineSequence().first())
 
 @Composable
 private fun Label(text: String) = Text(text, style = MaterialTheme.typography.bodyMedium)

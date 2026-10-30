@@ -77,9 +77,6 @@
         <item quantity="one">%1$d line in all</item>
         <item quantity="other">%1$d lines in all</item>
     </plurals>
-    <string name="sv_tool_input">Input: %1$s</string>
-    <string name="sv_tool_output">Output: %1$s</string>
-    <string name="sv_tool_full">Full content: %1$s</string>
     <string name="sv_tool_call">Call %1$s: %2$s</string>
     <string name="sv_tool_result">Result: %1$s</string>
 
@@ -92,14 +89,6 @@
     <string name="sv_approval_denied_other">Denied on another device (%1$s)</string>
     <string name="sv_approval_rule">, with rule: %1$s</string>
     <string name="sv_approval_cancelled">Approval cancelled: %1$s</string>
-
-    <!-- Blobs (state only; downloading is A13) -->
-    <string name="sv_blob_not_downloaded">%1$s, not downloaded</string>
-    <string name="sv_blob_requested">%1$s, download requested</string>
-    <string name="sv_blob_downloading">%1$s of %2$s downloaded</string>
-    <string name="sv_blob_paused">%1$s of %2$s downloaded, paused</string>
-    <string name="sv_blob_failed">%1$s, download failed: %2$s</string>
-    <string name="sv_blob_available">downloaded</string>
 
     <!-- Composer -->
     <string name="sv_composer_hint">Message the agent</string>
