@@ -133,6 +133,10 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         if search.wrapped {
             spans.push(Span::raw(" · search wrapped").yellow().bold());
         }
+        // So a partial search is not taken for a whole one.
+        if let Some(partial) = search.partial() {
+            spans.push(Span::raw(format!(" · {partial}")).dark_gray());
+        }
     }
     // What the session takes, right-aligned in what the rest leaves.
     let used = Line::from(spans.clone()).width();
@@ -188,7 +192,7 @@ fn render_timeline(
     wall: SystemTime,
 ) {
     let focused = ui.focus == Focus::Timeline;
-    let items = item_lines(session, ui, focused, area.width as usize, wall);
+    let (items, matched) = item_lines(session, ui, focused, area.width as usize, wall);
     let mut starts = Vec::with_capacity(items.len());
     let mut total = 0;
     for lines in &items {
@@ -196,20 +200,29 @@ fn render_timeline(
         total += lines.len();
     }
     let rule = rule_index(session).and_then(|index| starts.get(index).copied());
+    let keys: Vec<ItemKey> = session.timeline.iter().map(ItemKey::of).collect();
+    let matched = matched.map(|(index, row)| (keys[index], starts[index] + row));
     let mut geometry = Geometry {
-        keys: session.timeline.iter().map(ItemKey::of).collect(),
+        keys,
         starts,
         total,
         height: area.height as usize,
         top: ui.geometry.borrow().top,
         rule,
+        matched,
     };
     // While the opening is not settled, show the scroll state it will
-    // settle on, from this frame's layout.
+    // settle on, from this frame's layout; likewise the one that shows a
+    // search match in a blob, while that waits.
+    let pinned = ui
+        .search
+        .as_ref()
+        .filter(|search| search.pin)
+        .and_then(|search| geometry.match_scroll(search.current?));
     let scroll = if ui.opening {
         geometry.opening()
     } else {
-        ui.scroll
+        pinned.unwrap_or(ui.scroll)
     };
     let top = geometry.top(scroll);
     geometry.top = top;

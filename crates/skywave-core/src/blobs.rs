@@ -39,7 +39,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
-use std::io::SeekFrom;
+use std::fs::File;
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -63,6 +64,17 @@ pub fn blob_dir(data_dir: &Path) -> PathBuf {
     std::path::absolute(data_dir)
         .unwrap_or_else(|_| data_dir.to_owned())
         .join("blobs")
+}
+
+/// The head of a downloaded blob's file, as heads show and search it: its
+/// first `max` bytes as text (invalid UTF-8 replaced), and the file's size.
+/// One bounded reader, so a huge blob never gets read whole.
+pub fn read_head(path: &Path, max: u64) -> std::io::Result<(String, u64)> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut head = Vec::new();
+    file.take(max).read_to_end(&mut head)?;
+    Ok((String::from_utf8_lossy(&head).into_owned(), size))
 }
 
 /// A blob waiting for a download.
@@ -714,6 +726,19 @@ mod tests {
 
     fn content(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn read_head_reads_at_most_max_bytes_lossily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, b"ab\xffcdef").unwrap();
+        assert_eq!(read_head(&path, 4).unwrap(), ("ab\u{fffd}c".to_owned(), 7));
+        assert_eq!(
+            read_head(&path, 100).unwrap(),
+            ("ab\u{fffd}cdef".to_owned(), 7)
+        );
+        assert!(read_head(&dir.path().join("gone"), 4).is_err());
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ pub mod view;
 pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
 pub use backoff::{Backoff, Jitter};
-pub use blobs::blob_dir;
+pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, SubscriptionId};
 pub use engine::{Connector, DEFAULT_WAIT_SECS, EngineConfig, default_device_name};
 pub use https::{HttpsTransport, TransportConfig};

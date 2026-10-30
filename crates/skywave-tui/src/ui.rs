@@ -535,8 +535,11 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
         && let Some(search) = &ui.search
     {
         if search.editing {
+            let partial = search
+                .partial()
+                .map_or(String::new(), |partial| format!(" · {partial}"));
             return format!(
-                "/{}▏ · {} · Enter jump · Esc cancel",
+                "/{}▏ · {}{partial} · Enter jump · Esc cancel",
                 search.query.as_str(),
                 search.count(view)
             )
