@@ -45,7 +45,7 @@ pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress};
 pub use backoff::{Backoff, Jitter};
 pub use blobs::{blob_dir, read_head};
-pub use client::{Core, CoreError, SubscriptionId};
+pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
     Connector, DEFAULT_WAIT_SECS, EngineConfig, WALL_CHECK, WallClock, default_device_name,
 };
