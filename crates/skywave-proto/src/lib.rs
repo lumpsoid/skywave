@@ -13,7 +13,10 @@ use uuid::Uuid;
 /// v2: tool calls carry a [`CallId`] and a bounded [`ToolDisplay`] instead of
 /// a free-form summary; v1 log events still decode (see [`ToolCall`],
 /// [`ToolResult`]).
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3: `CommandKind::StopSession` and `EventKind::SessionStopped`; a v2
+/// client cannot decode the new event.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -155,6 +158,10 @@ pub enum EventKind {
     },
     /// The agent's current turn was stopped by an `Interrupt` command.
     TurnInterrupted,
+    /// The session's agent was told to shut down by a `StopSession` command.
+    /// A running turn is interrupted first. The session stays: the next
+    /// message starts the agent again, resumed.
+    SessionStopped,
     SessionStateChanged(SessionState),
 }
 
@@ -424,6 +431,12 @@ pub enum CommandKind {
     },
     /// Stop the agent's current turn in this session.
     Interrupt {
+        session_id: SessionId,
+    },
+    /// Shut down the session's agent, interrupting its turn if one runs.
+    /// Accepted whether or not the agent is running; the next message starts
+    /// it again.
+    StopSession {
         session_id: SessionId,
     },
 }

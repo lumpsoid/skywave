@@ -24,7 +24,8 @@ pub const DB_FILE: &str = "core.db";
 
 /// Schema migrations; entry `i` moves the schema from version `i` to `i + 1`.
 /// The schema version is SQLite's `user_version`.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE events (
     seq INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -67,7 +68,18 @@ CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-"#];
+"#,
+    r#"
+-- `SessionSummary::stopped`, backfilled from the stored log: a session is
+-- stopped if its newest stop is newer than its newest message.
+ALTER TABLE sessions ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET stopped = 1 WHERE
+    (SELECT MAX(seq) FROM events WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'session_stopped')
+    > COALESCE((SELECT MAX(seq) FROM events WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'user_message'), 0);
+"#,
+];
 
 /// Highest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -549,7 +561,8 @@ fn read_cursor(conn: &Connection) -> Result<Seq, StoreError> {
     )
 }
 
-const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq";
+const SESSION_COLUMNS: &str =
+    "id, workdir, state, pending_approvals, last_activity, last_seq, stopped";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -564,7 +577,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         ),
         params![
             summary.id.0.to_string(),
@@ -573,6 +586,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             to_json(&summary.pending_approvals)?,
             summary.last_activity.to_rfc3339(),
             seq_sql(summary.last_seq)?,
+            summary.stopped,
         ],
     )?;
     Ok(())
@@ -590,6 +604,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         pending_approvals: json_col(row, 3)?,
         last_activity,
         last_seq: seq_col(row, 5)?,
+        stopped: row.get(6)?,
     })
 }
 

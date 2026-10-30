@@ -150,6 +150,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             reason: "daemon restarted".into(),
         },
         EventKind::TurnInterrupted,
+        EventKind::SessionStopped,
         EventKind::SessionStateChanged(SessionState::Idle),
         EventKind::SessionStateChanged(SessionState::AgentWorking),
         EventKind::SessionStateChanged(SessionState::Errored {
@@ -176,6 +177,9 @@ fn all_command_kinds() -> Vec<CommandKind> {
             decision: Decision::Deny,
         },
         CommandKind::Interrupt {
+            session_id: session(),
+        },
+        CommandKind::StopSession {
             session_id: session(),
         },
     ]

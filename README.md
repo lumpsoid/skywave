@@ -148,6 +148,7 @@ start talking to the agent.
 | `d` | Download a blob |
 | `a` / `x` | Approve / deny a pending request |
 | `Ctrl-X` | Interrupt the agent's turn |
+| `S` | Stop the agent (timeline); the next message restarts it |
 | `?` / `F1` | Help |
 
 ### Managing devices

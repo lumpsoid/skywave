@@ -792,6 +792,10 @@ impl App {
                     .map(|blob| Action::DownloadBlob(blob.id)),
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
+                // Shifted, so a stray key does not end the agent's run.
+                KeyCode::Char('S') => Some(Action::StopSession {
+                    session_id: view.id,
+                }),
                 _ => None,
             },
         }

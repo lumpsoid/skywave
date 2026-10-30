@@ -160,6 +160,12 @@ impl Model {
                 }
                 self.enqueue(CommandKind::Interrupt { session_id })
             }
+            Action::StopSession { session_id } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::StopSession { session_id })
+            }
             Action::OpenSession(id) => {
                 if self.device.is_none() || self.summary(id).is_none() {
                     return Vec::new();
@@ -427,13 +433,12 @@ impl Model {
                 _ => None,
             })
         });
-        let interrupt = self
-            .outbox
-            .iter()
-            .rev()
-            .find(|e| matches!(e.command.kind, CommandKind::Interrupt { session_id } if session_id == id))
-            .map(|e| Outgoing::from(&e.status))
-            .filter(|outgoing| !self.in_replica(*outgoing));
+        let interrupt = self.latest_outgoing(
+            |kind| matches!(kind, CommandKind::Interrupt { session_id } if *session_id == id),
+        );
+        let stop = self.latest_outgoing(
+            |kind| matches!(kind, CommandKind::StopSession { session_id } if *session_id == id),
+        );
         Some(SessionView {
             id,
             workdir: summary.workdir.clone(),
@@ -441,7 +446,19 @@ impl Model {
             timeline: self.timeline(id, events),
             pending_approval,
             interrupt,
+            stop,
         })
+    }
+
+    /// The latest outbox command matching `kind`, until its effect is in the
+    /// replica.
+    fn latest_outgoing(&self, kind: impl Fn(&CommandKind) -> bool) -> Option<Outgoing> {
+        self.outbox
+            .iter()
+            .rev()
+            .find(|e| kind(&e.command.kind))
+            .map(|e| Outgoing::from(&e.status))
+            .filter(|outgoing| !self.in_replica(*outgoing))
     }
 
     fn timeline(&self, id: SessionId, events: &[(Seq, Event)]) -> Vec<TimelineItem> {
@@ -586,6 +603,7 @@ impl Model {
                     None
                 }
                 EventKind::TurnInterrupted => Some(Entry::Interrupted),
+                EventKind::SessionStopped => Some(Entry::Stopped),
                 EventKind::SessionStateChanged(state) => {
                     // Every state change ends a turn or starts the next.
                     tools.end_turn(&mut items);
@@ -739,6 +757,8 @@ fn session_state(summary: &SessionSummary) -> SessionState {
         return SessionState::AwaitingApproval(id);
     }
     match &summary.state {
+        // A turn still ending after the stop shows as working; an error wins.
+        LogState::Idle if summary.stopped => SessionState::Stopped,
         LogState::Idle => SessionState::Idle,
         LogState::AgentWorking => SessionState::AgentWorking,
         LogState::Errored { message } => SessionState::Errored(ErrorInfo {

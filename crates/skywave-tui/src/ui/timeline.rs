@@ -140,6 +140,13 @@ impl Layout<'_> {
                 spans.push(Span::raw("interrupted · the agent stopped its turn").yellow());
                 return vec![Line::from(spans)];
             }
+            Entry::Stopped => {
+                let mut spans = lead;
+                spans.push(
+                    Span::raw("stopped · the agent was shut down, a message restarts it").yellow(),
+                );
+                return vec![Line::from(spans)];
+            }
             Entry::AgentErrored { message } => {
                 return self.message(lead, vec![Span::raw("agent error: ").red().bold()], message);
             }

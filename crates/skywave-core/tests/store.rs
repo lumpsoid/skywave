@@ -421,6 +421,60 @@ fn newer_schema_is_refused() {
     ));
 }
 
+#[test]
+fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/x".into(),
+            },
+        )
+    };
+    let message = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::UserMessage {
+                command_id: CommandId::new(),
+                device_id: DeviceId::new(),
+                text: "hi".into(),
+            },
+        )
+    };
+    // `a` stays stopped; `b` got a message after its stop.
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(a, 0),
+            created(b, 1),
+            message(a, 2),
+            event(a, 3, EventKind::SessionStopped),
+            event(b, 4, EventKind::SessionStopped),
+            message(b, 5),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch).unwrap();
+    let stopped = |store: &Store, id| store.session(id).unwrap().unwrap().stopped;
+    assert!(stopped(&store, a));
+    assert!(!stopped(&store, b));
+    drop(store);
+
+    // A replica from before the column: the migration derives it from the log.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN stopped")
+        .unwrap();
+    drop(conn);
+    set_user_version(&dir, 1);
+    let store = Store::open(&dir).unwrap();
+    assert!(stopped(&store, a));
+    assert!(!stopped(&store, b));
+}
+
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.pragma_update(None, "user_version", version).unwrap();
