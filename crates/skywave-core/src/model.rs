@@ -90,6 +90,11 @@ pub(crate) struct Model {
     /// Oldest first, finished entries included.
     outbox: Vec<OutboxEntry>,
     blobs: BTreeMap<BlobId, BlobRecord>,
+    /// Blobs asked for and not yet taken by a download; in memory only, as
+    /// the blob queue forgets un-started requests on a restart too.
+    wanted: HashSet<BlobId>,
+    /// Why the last download of a blob was given up; in memory only.
+    failed: HashMap<BlobId, String>,
     /// This device's unsent messages, as stored.
     drafts: HashMap<SessionId, Draft>,
     /// Bumped whenever the model itself rewrites a draft, so heads know to
@@ -115,6 +120,8 @@ impl Model {
             sessions: Vec::new(),
             outbox: Vec::new(),
             blobs: BTreeMap::new(),
+            wanted: HashSet::new(),
+            failed: HashMap::new(),
             drafts: HashMap::new(),
             draft_rev: 0,
             read_marks: HashMap::new(),
@@ -214,11 +221,16 @@ impl Model {
                 session_id,
                 through,
             } => self.mark_read(session_id, through),
-            Action::DownloadBlob(id) => match self.blobs.get(&id) {
-                Some(blob) if !matches!(blob.status, BlobStatus::Available { .. }) => {
+            Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
+                None | Some(BlobStatus::Available { .. }) => Vec::new(),
+                Some(status) => {
+                    // A download already running shows its progress instead.
+                    if *status == BlobStatus::NotDownloaded {
+                        self.wanted.insert(id);
+                    }
+                    self.failed.remove(&id);
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
-                _ => Vec::new(),
             },
             Action::SetBlobPolicy(policy) => {
                 if self.settings.blob_policy == policy {
@@ -483,8 +495,19 @@ impl Model {
     }
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
+        self.wanted.remove(&id);
+        self.failed.remove(&id);
         if let Some(blob) = self.blobs.get_mut(&id) {
             blob.status = status;
+        }
+    }
+
+    /// The download of `id` was given up: it is `NotDownloaded` again, and
+    /// says why until it is asked for again.
+    pub(crate) fn blob_failed(&mut self, id: BlobId, reason: String) {
+        self.blob_status(id, BlobStatus::NotDownloaded);
+        if self.blobs.contains_key(&id) {
+            self.failed.insert(id, reason);
         }
     }
 
@@ -826,9 +849,30 @@ impl Model {
     }
 
     fn blob_view(&self, blob: &BlobRef) -> BlobView {
-        let state = match self.blobs.get(&blob.id) {
-            Some(record) => BlobState::from(record),
-            None => BlobState::NotDownloaded { size: blob.size },
+        let Some(record) = self.blobs.get(&blob.id) else {
+            return BlobView {
+                id: blob.id,
+                state: BlobState::NotDownloaded { size: blob.size },
+            };
+        };
+        let size = record.size;
+        let state = match &record.status {
+            BlobStatus::NotDownloaded => match self.failed.get(&blob.id) {
+                Some(reason) => BlobState::Failed {
+                    size,
+                    reason: reason.clone(),
+                },
+                None if self.wanted.contains(&blob.id) => BlobState::Requested { size },
+                None => BlobState::NotDownloaded { size },
+            },
+            BlobStatus::Downloading { got, .. } => BlobState::Downloading {
+                got: *got,
+                size,
+                // Blob traffic needs the server too; while the link is down
+                // the download waits for it.
+                paused: !matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }),
+            },
+            BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
         BlobView { id: blob.id, state }
     }
@@ -1563,6 +1607,27 @@ mod tests {
             f.dispatch(Action::DownloadBlob(output.id)),
             vec![Effect::Request(Request::DownloadBlob(output.id))]
         );
+        // Asked for, it says so until a worker takes it.
+        assert_eq!(output_state(&f), BlobState::Requested { size: 10_000 });
+
+        // A given-up download says why; asking again requests it again.
+        f.model
+            .blob_failed(output.id, "blob size mismatch".to_owned());
+        assert_eq!(
+            output_state(&f),
+            BlobState::Failed {
+                size: 10_000,
+                reason: "blob size mismatch".into()
+            }
+        );
+        assert_eq!(
+            f.dispatch(Action::DownloadBlob(output.id)),
+            vec![Effect::Request(Request::DownloadBlob(output.id))]
+        );
+        assert_eq!(output_state(&f), BlobState::Requested { size: 10_000 });
+
+        // Paused follows the link, with no status change.
+        f.model.set_link(Link::Online { latency_ms: 20 });
         let path = PathBuf::from("/data/blobs/x");
         f.model.blob_status(
             output.id,
@@ -1571,13 +1636,29 @@ mod tests {
                 path: path.clone(),
             },
         );
+        let downloading = |paused| BlobState::Downloading {
+            got: 4096,
+            size: 10_000,
+            paused,
+        };
+        assert_eq!(output_state(&f), downloading(false));
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            next_in: Duration::from_secs(1),
+            offline_since: Instant::now(),
+        });
+        assert_eq!(output_state(&f), downloading(true));
+        f.model.set_link(Link::CatchingUp {
+            have: Seq(1),
+            server: Seq(2),
+        });
+        assert_eq!(output_state(&f), downloading(false));
+        // A running download asked for again keeps showing its progress.
         assert_eq!(
-            output_state(&f),
-            BlobState::Downloading {
-                got: 4096,
-                size: 10_000
-            }
+            f.dispatch(Action::DownloadBlob(output.id)),
+            vec![Effect::Request(Request::DownloadBlob(output.id))]
         );
+        assert_eq!(output_state(&f), downloading(false));
         f.model
             .blob_status(output.id, BlobStatus::Available { path: path.clone() });
         assert_eq!(output_state(&f), BlobState::Available { path });

@@ -11,12 +11,12 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobState, BlobView, Entry, Link, Outgoing, SessionState,
-    SessionView, TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, SessionState, SessionView,
+    TimelineItem, ToolView,
 };
 
 use super::timeline::{
-    approval_state, bytes, delivery_label, detail_lines, glyph, head_lines, item_lines,
+    approval_state, blob_size, bytes, delivery_label, detail_lines, glyph, head_lines, item_lines,
     preview_lines, rule_index, title_spans, wall_ms,
 };
 use super::{decision_label, outgoing_badge, outgoing_label, state_badge};
@@ -266,12 +266,7 @@ fn gated_content(sections: &[Section], width: usize, max_rows: usize) -> Vec<Lin
 
 /// Where the whole input of a gated call is, and its size if it is not here.
 fn input_line(input: &BlobView) -> Line<'static> {
-    let size = match &input.state {
-        BlobState::NotDownloaded { size } | BlobState::Downloading { size, .. } => {
-            format!(" {}", bytes(*size))
-        }
-        BlobState::Available { .. } => String::new(),
-    };
+    let size = blob_size(&input.state).map_or_else(String::new, |size| format!(" {}", bytes(size)));
     Line::from(format!("  full input{size} · v to see it")).dark_gray()
 }
 

@@ -175,6 +175,19 @@ impl Seam {
         })
     }
 
+    /// The download of `id` was given up for `reason`: back to
+    /// `NotDownloaded`, the reason shown until it is asked for again.
+    pub fn blob_failed(&self, id: BlobId, reason: impl Into<String>) -> Result<(), CoreError> {
+        let reason = reason.into();
+        self.update(|state| {
+            state
+                .store
+                .set_blob_status(id, &BlobStatus::NotDownloaded)?;
+            state.model.blob_failed(id, reason);
+            Ok(((), Vec::new()))
+        })
+    }
+
     /// Runs a change that persists before touching the model, so a failed
     /// write leaves the model as it was.
     fn update<R>(

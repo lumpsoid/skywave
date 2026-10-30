@@ -15,7 +15,7 @@ pub use skywave_proto::{
     ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Seq, SessionId, ToolKind,
 };
 
-use crate::store::{BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus};
+use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.
@@ -136,25 +136,26 @@ pub enum BlobState {
     NotDownloaded {
         size: u64,
     },
+    /// Asked for (`Action::DownloadBlob`) and waiting for a download slot.
+    Requested {
+        size: u64,
+    },
+    /// `paused` while the link is down: the download waits for it.
     Downloading {
         got: u64,
         size: u64,
+        paused: bool,
+    },
+    /// The last download was given up (e.g. the sizes disagree); asking
+    /// again retries it.
+    Failed {
+        size: u64,
+        reason: String,
     },
     /// Complete content is in the file at `path`.
     Available {
         path: PathBuf,
     },
-}
-
-impl From<&BlobRecord> for BlobState {
-    fn from(record: &BlobRecord) -> Self {
-        let size = record.size;
-        match &record.status {
-            BlobStatus::NotDownloaded => BlobState::NotDownloaded { size },
-            BlobStatus::Downloading { got, .. } => BlobState::Downloading { got: *got, size },
-            BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
-        }
-    }
 }
 
 /// A blob referenced from the timeline, with its download state.

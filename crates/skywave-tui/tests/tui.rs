@@ -1260,13 +1260,30 @@ fn tool_output_expands_through_every_blob_state() {
         Some(Action::DownloadBlob(blob_id))
     );
     assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
-    // Expanding asks for it too.
-    assert_eq!(h.key(KeyCode::Enter), Some(Action::DownloadBlob(blob_id)));
+    // Until a worker takes it, it says it is waiting; neither expanding nor
+    // `d` asks again.
+    assert_contains(&h.screen(), "│ … full 9.8 KiB · requested ");
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "│ requested · waiting for a slot · 9.8 KiB");
+    assert_eq!(h.key(KeyCode::Char('d')), None);
+
+    // A given-up download says why, and `d` retries it.
+    h.seam
+        .blob_failed(blob_id, "blob size mismatch: expected 10000 bytes")
+        .unwrap();
+    h.sync();
     assert_contains(
         &h.screen(),
-        "not downloaded · 9.8 KiB · press d to download",
+        "│ download failed: blob size mismatch: expected 10000 bytes · 9.8 KiB · d retries",
     );
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    assert_contains(&h.screen(), "│ requested · waiting for a slot · 9.8 KiB");
 
+    h.seam.set_link(Link::Online { latency_ms: 20 });
     let dir = tempfile::tempdir().unwrap();
     let part = dir.path().join("blob.part");
     h.seam
@@ -1280,11 +1297,26 @@ fn tool_output_expands_through_every_blob_state() {
         .unwrap();
     h.sync();
     let screen = h.screen();
-    assert_contains(&screen, "│ downloading · 4.0 KiB of 9.8 KiB (40%)");
+    assert_contains(&screen, "│ downloading · 4.0 KiB of 9.8 KiB (40%) ");
     // Collapsed, the footer follows the download.
     h.key(KeyCode::Enter);
-    assert_contains(&h.screen(), "│ … downloading 40%");
+    assert_contains(&h.screen(), "│ … downloading 40% ");
+    // With the link down it is paused, not frozen; back online it goes on.
+    h.seam.set_link(Link::Reconnecting {
+        attempt: 1,
+        next_in: Duration::from_secs(5),
+        offline_since: h.t0,
+    });
+    h.sync();
+    assert_contains(&h.screen(), "│ … downloading 40% · paused, offline");
     h.key(KeyCode::Enter);
+    assert_contains(
+        &h.screen(),
+        "│ downloading · 4.0 KiB of 9.8 KiB (40%) · paused, offline",
+    );
+    h.seam.set_link(Link::Online { latency_ms: 20 });
+    h.sync();
+    assert!(!h.screen().contains("paused"));
 
     // Content arrives; invalid UTF-8 and control bytes are shown safely.
     let path = dir.path().join("blob");
@@ -1310,6 +1342,45 @@ fn tool_output_expands_through_every_blob_state() {
     h.key(KeyCode::Char('k'));
     assert_eq!(h.key(KeyCode::Char(' ')), None);
     assert_contains(&h.screen(), "        │ line c ");
+}
+
+#[test]
+fn footer_names_blob_size() {
+    let (mut h, id, _) = open_session();
+    let (blob_id, input) = blob(4300);
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::ToolCall(ToolCall {
+                call: None,
+                name: "write".into(),
+                display: ToolDisplay {
+                    kind: ToolKind::Other,
+                    title: "a.txt".into(),
+                    detail: None,
+                    body: None,
+                },
+                input: Some(input),
+            }),
+        )],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // The only blob is hidden: the call's line gives its size.
+    assert_contains(&h.screen(), "> 12:01 • write a.txt · input 4.2 KiB ");
+    assert_contains(
+        &footer(&h),
+        "Enter expand · d download (4.2 KiB) · y/Y copy",
+    );
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_contains(&h.screen(), "• write a.txt · input 4.2 KiB · requested ");
+    // Asked for, `d` has nothing more to fetch.
+    assert_contains(&footer(&h), "Enter expand · d download · y/Y copy");
 }
 
 #[test]

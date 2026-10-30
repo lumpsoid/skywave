@@ -445,7 +445,7 @@ fn blob_progress_is_persisted_and_shown() {
         } => blob.state.clone(),
         other => panic!("expected the tool result, got {other:?}"),
     };
-    assert_eq!(output_state(&core), BlobState::NotDownloaded { size: 9000 });
+    assert_eq!(output_state(&core), BlobState::Requested { size: 9000 });
     let partial = seam.data_dir().join("blobs").join("partial");
     seam.blob_status(
         blob.id,
@@ -459,7 +459,9 @@ fn blob_progress_is_persisted_and_shown() {
         output_state(&core),
         BlobState::Downloading {
             got: 1000,
-            size: 9000
+            size: 9000,
+            // A detached core has no link.
+            paused: true,
         }
     );
     assert!(
@@ -474,7 +476,9 @@ fn blob_progress_is_persisted_and_shown() {
         output_state(&core),
         BlobState::Downloading {
             got: 1000,
-            size: 9000
+            size: 9000,
+            // A detached core has no link.
+            paused: true,
         }
     );
 }

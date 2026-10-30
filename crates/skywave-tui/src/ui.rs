@@ -26,7 +26,7 @@ use skywave_core::{
 };
 
 use crate::app::{App, Field, Focus, dismissable};
-use crate::timeline::discardable;
+use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
 pub fn render(frame: &mut Frame, app: &App, now: Instant) {
@@ -429,7 +429,21 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
         return format!("history {at}/{of} · Ctrl-P/N older/newer · edit to keep · Enter send")
             .into();
     }
-    footer_keys(app).into()
+    let keys = footer_keys(app);
+    // `d` says how much it would fetch.
+    if !app.ui().help
+        && let Some((view, ui)) = app.session()
+        && ui.focus == Focus::Timeline
+        && let Some(size) = ui
+            .selected_entry(view)
+            .and_then(wanted_blob)
+            .and_then(|blob| timeline::blob_size(&blob.state))
+    {
+        return keys
+            .replacen("d download", &format!("d download ({})", bytes(size)), 1)
+            .into();
+    }
+    keys.into()
 }
 
 fn footer_keys(app: &App) -> &'static str {

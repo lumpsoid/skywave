@@ -141,6 +141,8 @@ pub struct Section<'a> {
     pub blob: Option<&'a BlobView>,
     /// Shown only while the item is expanded.
     pub hidden: bool,
+    /// The call's whole input rather than what it did.
+    pub input: bool,
 }
 
 impl<'a> Section<'a> {
@@ -153,6 +155,7 @@ impl<'a> Section<'a> {
             error: false,
             blob: None,
             hidden: false,
+            input: false,
         }
     }
 
@@ -161,6 +164,7 @@ impl<'a> Section<'a> {
         Section {
             blob: Some(blob),
             hidden: true,
+            input: true,
             ..Section::text("")
         }
     }
@@ -202,6 +206,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             error: false,
             blob: body.full.as_ref(),
             hidden: false,
+            input: false,
         });
     }
     if let ToolOutcome::Done {
@@ -221,6 +226,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             error: *is_error,
             blob: output.as_ref(),
             hidden: !is_error && view.body.is_some() && view.kind != ToolKind::Shell,
+            input: false,
         });
     }
     if out.iter().all(|s| s.blob.is_none())
@@ -289,12 +295,18 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
     !head.iter().any(|text| query.matches(text))
 }
 
-/// The first blob behind `entry` that is not here yet; what `d` fetches.
+/// The first blob behind `entry` that nobody asked for yet, or whose
+/// download failed; what `d` fetches.
 pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
     sections(entry)
         .into_iter()
         .filter_map(|s| s.blob)
-        .find(|blob| !matches!(blob.state, BlobState::Available { .. }))
+        .find(|blob| {
+            matches!(
+                blob.state,
+                BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+            )
+        })
 }
 
 /// What `y` or `Y` copies from an item: text at hand, or a blob's whole
