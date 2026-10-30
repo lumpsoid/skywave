@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
+use chrono::Utc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as async_mpsc, watch};
 
 use crate::action::Action;
+use crate::blobs::remove_blob_files;
 use crate::engine::{Engine, EngineConfig};
 use crate::identity::{FileIdentity, Identity, IdentityError};
 use crate::model::{Effect, Model};
@@ -163,6 +165,7 @@ impl Core {
     /// the local store before any request reaches the network side; when
     /// this returns `Ok`, the action survives a crash.
     pub fn dispatch(&self, action: Action) -> Result<(), CoreError> {
+        let data_dir = &self.shared.data_dir;
         self.shared.update(|state| {
             let effects = state.model.dispatch(action);
             let mut requests = Vec::new();
@@ -181,6 +184,18 @@ impl Core {
                         .store
                         .session_events(id)
                         .map(|events| state.model.session_loaded(id, events)),
+                    // The files go once the rows are gone; a download still
+                    // writing one finds its blob unknown and removes it too.
+                    Effect::DeleteLocally(id) => state
+                        .store
+                        .delete_session_locally(id, Utc::now())
+                        .map(|blobs| {
+                            state.model.session_deleted(id, &blobs);
+                            for blob in &blobs {
+                                remove_blob_files(data_dir, *blob);
+                            }
+                            requests.push(Request::BlobsPurged(blobs));
+                        }),
                     Effect::Request(request) => {
                         requests.push(request);
                         Ok(())

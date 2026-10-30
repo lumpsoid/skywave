@@ -484,6 +484,106 @@ fn blob_progress_is_persisted_and_shown() {
 }
 
 #[test]
+fn deleted_session_stays_gone_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, _) = paired_core(dir.path());
+    let (gone, kept) = (SessionId::new(), SessionId::new());
+    let blob = BlobRef {
+        id: BlobId::new(),
+        size: 3,
+    };
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+            },
+        )
+    };
+    let archived = EventKind::SessionArchived {
+        archived: true,
+        by: DeviceId::new(),
+    };
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(gone, 0),
+            created(kept, 1),
+            event(
+                gone,
+                2,
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "log".into(),
+                    lines: 1,
+                    output: Some(blob.clone()),
+                }),
+            ),
+            event(gone, 3, archived.clone()),
+        ],
+    })
+    .unwrap();
+    // Downloaded, and a stale part file besides.
+    let blobs = skywave_core::blob_dir(dir.path());
+    std::fs::create_dir_all(&blobs).unwrap();
+    let (done, part) = (
+        blobs.join(blob.id.0.to_string()),
+        blobs.join(format!("{}.part", blob.id.0)),
+    );
+    std::fs::write(&done, "abc").unwrap();
+    std::fs::write(&part, "a").unwrap();
+    seam.blob_status(blob.id, BlobStatus::Available { path: done.clone() })
+        .unwrap();
+    core.dispatch(Action::SaveDraft {
+        session_id: gone,
+        text: "unsent".into(),
+        cursor: 0,
+    })
+    .unwrap();
+
+    core.dispatch(Action::Navigate(Route::ArchivedSessions))
+        .unwrap();
+    core.dispatch(Action::DeleteSessionLocally { session_id: gone })
+        .unwrap();
+    assert_eq!(drain(&requests), vec![Request::BlobsPurged(vec![blob.id])]);
+    assert!(!done.exists() && !part.exists(), "its files are gone");
+    let listed = |core: &Core| match core.view().screen {
+        Screen::SessionList(list) => (list.sessions.len(), list.other_count),
+        other => panic!("expected the session list, got {other:?}"),
+    };
+    assert_eq!(listed(&core), (0, 1));
+
+    // The log goes on: the session is used elsewhere, which would bring it
+    // back. The cursor moves; the session stays gone.
+    let again = |seam: &Seam, from| {
+        seam.apply_events(&EventBatch {
+            from: Seq(from),
+            events: vec![event(gone, 10, archived.clone())],
+        })
+        .unwrap()
+    };
+    assert_eq!(again(&seam, 5).cursor, Seq(5));
+    assert_eq!(listed(&core), (0, 1));
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    let seam = core.seam();
+    assert_eq!(again(&seam, 6).cursor, Seq(6));
+    core.dispatch(Action::Navigate(Route::ArchivedSessions))
+        .unwrap();
+    assert_eq!(listed(&core), (0, 1));
+    core.dispatch(Action::OpenSession(gone)).unwrap();
+    assert_eq!(listed(&core), (0, 1), "it does not open");
+    let store = Store::open(dir.path()).unwrap();
+    assert!(store.session_events(gone).unwrap().is_empty());
+    assert_eq!(store.blob(blob.id).unwrap(), None);
+    assert!(!store.load().unwrap().drafts.contains_key(&gone));
+}
+
+#[test]
 fn callbacks_may_dispatch_and_every_subscriber_ends_on_the_latest_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let (core, seam, _requests, _) = paired_core(dir.path());

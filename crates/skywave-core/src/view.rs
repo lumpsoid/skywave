@@ -351,6 +351,10 @@ pub struct SessionRow {
     /// What the session has cost so far, in US dollars, when its agent
     /// reports cost.
     pub cost_usd: Option<f64>,
+    /// [`Action::DeleteSessionLocally`](crate::Action::DeleteSessionLocally)
+    /// would remove it: it is archived, has no pending approval, no running
+    /// turn and no command from this device still unanswered.
+    pub deletable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

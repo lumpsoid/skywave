@@ -4573,6 +4573,82 @@ fn an_approval_in_an_archived_session_still_shows() {
     assert_eq!(open_id(&h), Some(a));
 }
 
+#[test]
+fn shift_d_confirms_and_removes_row() {
+    let mut h = Harness::paired();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let archived = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionArchived {
+                archived: true,
+                by: DeviceId::new(),
+            },
+        )
+    };
+    pull(
+        &mut h,
+        vec![
+            created(a, 0, "/srv/a"),
+            created(b, 1, "/srv/b"),
+            archived(a, 2),
+            archived(b, 3),
+            approval(b, 4, ApprovalId::new(), "ls"),
+        ],
+    );
+    // Not from the active list.
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_eq!(h.app.ui().delete, None);
+
+    h.key(KeyCode::Char('A'));
+    assert_contains(&h.screen(), "D delete here");
+    // `b` waits on an approval: refused, saying why.
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_contains(&footer(&h), "cannot delete b yet: answer or cancel first");
+
+    // Any key but `y` keeps it.
+    h.key(KeyCode::Down);
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_contains(
+        &footer(&h),
+        "Delete a from this device for good? It stays on the server and other devices. y/N",
+    );
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert_contains(&footer(&h), "D delete here");
+    assert_contains(&h.screen(), "/srv/a");
+
+    h.key(KeyCode::Char('D'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::DeleteSessionLocally { session_id: a })
+    );
+    assert_eq!(h.drain_requests(), vec![Request::BlobsPurged(Vec::new())]);
+    let screen = h.screen();
+    assert!(!screen.contains("/srv/a"), "{screen}");
+    assert_contains(&screen, "Archived (1) · 0 active");
+    assert_eq!(selected_workdir(&h).as_deref(), Some("/srv/b"));
+
+    // Gone for good, even when used elsewhere.
+    pull(
+        &mut h,
+        vec![event(
+            a,
+            5,
+            EventKind::UserMessage {
+                command_id: CommandId::new(),
+                device_id: DeviceId::new(),
+                text: "still here?".into(),
+            },
+        )],
+    );
+    h.key(KeyCode::Esc);
+    let screen = h.screen();
+    assert_contains(&screen, "Sessions (0) · 1 archived");
+    assert!(!screen.contains("/srv/a"), "{screen}");
+}
+
 // ---- turn usage -------------------------------------------------------------
 
 /// Two turns with their usage: the first $1.23, the second (the last)

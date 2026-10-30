@@ -39,6 +39,9 @@ pub enum Request {
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
+    /// These blobs left the replica with a locally deleted session, their
+    /// files already removed: stop waiting to download them.
+    BlobsPurged(Vec<BlobId>),
     /// The user wants the link to stop waiting out its backoff.
     RetryNow,
     /// List the server directory `dir` (empty: the roots) for workdir

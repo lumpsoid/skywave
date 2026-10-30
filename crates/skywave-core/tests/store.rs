@@ -518,6 +518,7 @@ fn migration_marks_existing_rows_attempted() {
     }
     // A replica from before the columns.
     drop_outbox_delivery_columns(&dir);
+    drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
@@ -573,6 +574,11 @@ fn drop_archived(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN archived;")
         .unwrap();
+}
+
+fn drop_deleted(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE deleted_sessions;").unwrap();
 }
 
 fn drop_usage(dir: &Path) {
@@ -638,6 +644,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop(store);
 
     // A replica from before the column holds no usage events.
+    drop_deleted(&dir);
     drop_usage(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
@@ -697,6 +704,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
 
     // A replica from before the column (protocol v3: it holds no archive
     // events): everything starts active.
+    drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
     set_user_version(&dir, 6);
@@ -773,6 +781,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
 
     // A replica from before the columns (protocol v3: it holds no renames):
     // the migration derives the first prompts from the log like the fold.
+    drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
@@ -860,6 +869,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
@@ -965,6 +975,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         .unwrap();
     drop(conn);
     drop_outbox_delivery_columns(&dir);
+    drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
@@ -1173,4 +1184,153 @@ fn withdraw_into_draft_is_one_transaction() {
     let other = SessionId::new();
     assert!(store.withdraw(command.id, Some((other, &draft))).is_err());
     assert!(!store.drafts().unwrap().contains_key(&other));
+}
+
+// ---- local delete ---------------------------------------------------------------
+
+/// The whole log applied, plus what this device keeps for both sessions:
+/// drafts, read marks, an answered and an unanswered message each, and
+/// session A's blob downloaded.
+fn replica_with_both_sessions(dir: &Path, log: &Log) -> (Store, [Command; 4]) {
+    let mut store = Store::open(dir).unwrap();
+    store.apply_batch(&log.batch(1, 7)).unwrap();
+    let draft = Draft {
+        text: "later".into(),
+        cursor: 0,
+    };
+    let commands = [
+        send(log.a, "answered a"),
+        send(log.a, "waiting a"),
+        send(log.b, "answered b"),
+        send(log.b, "waiting b"),
+    ];
+    for (i, command) in commands.iter().enumerate() {
+        store.enqueue(command).unwrap();
+        if i % 2 == 0 {
+            let result = CommandResult::Accepted { seq: Seq(1) };
+            store.record_result(command.id, &result, at(1)).unwrap();
+        }
+    }
+    for id in [log.a, log.b] {
+        store.set_draft(id, Some(&draft)).unwrap();
+        let mark = ReadMark {
+            seq: Seq(2),
+            notable: 0,
+        };
+        store.set_read_mark(id, mark).unwrap();
+    }
+    let available = BlobStatus::Available {
+        path: "/data/blobs/x".into(),
+    };
+    store.set_blob_status(log.blob.id, &available).unwrap();
+    (store, commands)
+}
+
+#[test]
+fn local_delete_is_one_transaction() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let (mut store, commands) = replica_with_both_sessions(&dir, &log);
+    let before = store.load().unwrap();
+    let a_events = store.session_events(log.a).unwrap();
+
+    // A delete that fails at its last write (the tombstone) changes nothing.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER full BEFORE INSERT ON deleted_sessions
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    assert!(store.delete_session_locally(log.a, at(2)).is_err());
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(store.session_events(log.a).unwrap(), a_events);
+
+    conn.execute_batch("DROP TRIGGER full").unwrap();
+    assert_eq!(
+        store.delete_session_locally(log.a, at(2)).unwrap(),
+        [log.blob.id],
+        "the blobs whose files go"
+    );
+    drop(store);
+
+    // Everything of A is gone, over a reopen; B is untouched.
+    let store = Store::open(&dir).unwrap();
+    let after = store.load().unwrap();
+    assert_eq!(after.cursor, Seq(7));
+    assert_eq!(
+        after.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [log.b]
+    );
+    assert!(store.session_events(log.a).unwrap().is_empty());
+    assert_eq!(store.session_events(log.b).unwrap().len(), 2);
+    assert!(after.blobs.is_empty());
+    assert_eq!(after.drafts.keys().collect::<Vec<_>>(), [&log.b]);
+    assert_eq!(after.read_marks.keys().collect::<Vec<_>>(), [&log.b]);
+    // Only A's answered command goes; an unanswered one is the caller's to
+    // refuse the delete over.
+    let left: Vec<CommandId> = after.outbox.iter().map(|e| e.command.id).collect();
+    assert_eq!(left, [commands[1].id, commands[2].id, commands[3].id]);
+    assert_eq!(after.deleted, [log.a].into());
+}
+
+#[test]
+fn events_for_deleted_session_advance_cursor_but_are_not_stored() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 3)).unwrap();
+    store.delete_session_locally(log.a, at(2)).unwrap();
+
+    // The rest of A (its blob and approval among it) arrives with B's message.
+    let applied = store.apply_batch(&log.batch(4, 7)).unwrap();
+    assert_eq!(applied.cursor, Seq(7));
+    assert_eq!(applied.new_events, 1, "only B's message is stored");
+    assert_eq!(applied.sessions, [log.b]);
+    assert!(applied.blobs.is_empty());
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.cursor, Seq(7));
+    assert_eq!(
+        snapshot.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [log.b],
+        "no summary brings A back"
+    );
+    assert!(store.session_events(log.a).unwrap().is_empty());
+    assert!(store.blob(log.blob.id).unwrap().is_none());
+}
+
+#[test]
+fn cursor_stays_contiguous_after_local_delete() {
+    let log = Log::new();
+    let mut store = Store::open_in_memory().unwrap();
+    store.apply_batch(&log.batch(1, 2)).unwrap();
+    store.delete_session_locally(log.a, at(2)).unwrap();
+
+    // Batches of only A's events still move the cursor, so the next batch
+    // follows on and a gap is still a gap.
+    assert_eq!(store.apply_batch(&log.batch(3, 3)).unwrap().cursor, Seq(3));
+    assert_eq!(store.apply_batch(&log.batch(4, 5)).unwrap().cursor, Seq(5));
+    assert!(matches!(
+        store.apply_batch(&log.batch(7, 7)),
+        Err(StoreError::Gap {
+            cursor: Seq(5),
+            from: Seq(7)
+        })
+    ));
+    // A replay of what was skipped stays skipped.
+    assert_eq!(store.apply_batch(&log.batch(1, 7)).unwrap().cursor, Seq(7));
+    assert!(store.session_events(log.a).unwrap().is_empty());
+
+    // B's stored events have holes where A's were; read per session they
+    // are whole, and the replica equals one built without A at all.
+    let b_events = store.session_events(log.b).unwrap();
+    assert_eq!(
+        b_events,
+        [
+            (Seq(3), log.events[2].clone()),
+            (Seq(6), log.events[5].clone())
+        ]
+    );
+    let mut whole = Store::open_in_memory().unwrap();
+    whole.apply_batch(&log.batch(1, 7)).unwrap();
+    assert_eq!(whole.session_events(log.b).unwrap(), b_events);
+    assert_eq!(whole.session(log.b).unwrap(), store.session(log.b).unwrap());
 }

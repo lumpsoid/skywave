@@ -27,6 +27,7 @@ use skywave_core::{
 };
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
+use crate::notify;
 use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -72,9 +73,14 @@ pub fn render_at(frame: &mut Frame, app: &App, now: Instant, wall: SystemTime) {
         }
     }
 
-    let footer_line = match &app.ui().error {
-        Some(error) => Line::from(format!("error: {error}")).red(),
-        None => match &app.ui().notice {
+    let footer_line = match (&app.ui().error, app.delete_row()) {
+        (Some(error), _) => Line::from(format!("error: {error}")).red(),
+        (None, Some(row)) => Line::from(format!(
+            "Delete {} from this device for good? It stays on the server and other devices. y/N",
+            notify::sanitise(&row.title)
+        ))
+        .yellow(),
+        (None, None) => match &app.ui().notice {
             Some(notice) => Line::from(notice.as_str()).yellow(),
             None => Line::from(footer_hint(app)).dark_gray(),
         },
@@ -593,7 +599,8 @@ fn footer_keys(app: &App) -> &'static str {
             "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
         Screen::SessionList(list) if list.kind == ListKind::Archived => {
-            "↑↓ select · Enter open · a unarchive · r rename · A/Esc active sessions · ? help · q quit"
+            // `↑↓ select` makes way for `D` in 100 columns.
+            "Enter open · a unarchive · D delete here · r rename · A/Esc active sessions · ? help · q quit"
         }
         Screen::SessionList(_) => {
             // `↑↓ select` makes way for the archive keys in 100 columns.
@@ -700,6 +707,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("a", "archive it (on the archived list: bring it back)"),
             key("A", "switch between active and archived sessions"),
             key("Esc", "from the archived list: back to the active one"),
+            key("D", "archived list: delete here only (y/N)"),
             key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
             Line::from(""),
@@ -714,6 +722,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             section("Archive"),
             Line::from("  Archived sessions open and work as usual; a message from any"),
             Line::from("  device brings one back. Archiving does not stop the agent."),
+            Line::from("  D deletes one from this device for good; it stays on the"),
+            Line::from("  server and other devices, and later use elsewhere is not"),
+            Line::from("  shown here. Not while it waits on an approval, a turn or a"),
+            Line::from("  command from this device: answer or cancel first."),
         ]),
         Screen::Session(_) => {
             lines.extend([

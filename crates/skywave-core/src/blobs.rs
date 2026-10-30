@@ -27,7 +27,10 @@
 //! size the event's `BlobRef` gave, and the server must agree on it; a
 //! mismatch, an unknown blob or a local file error deletes the `.part`
 //! file, logs an error and leaves the blob `NotDownloaded`, failed with
-//! that reason, until it is asked for again.
+//! that reason, until it is asked for again. A blob whose session is deleted
+//! from this device loses both files; a download of it stops, without a
+//! retry, when its next report finds the blob unknown, and removes what it
+//! wrote meanwhile.
 //!
 //! **Status.** `Downloading { got, path }` (`path` the `.part` file) is
 //! reported when a response starts, then at most every
@@ -169,6 +172,13 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
+    /// These blobs left the replica (a session deleted from this device):
+    /// they wait no longer. One a worker holds is let go by the worker
+    /// itself, when its next report finds the blob unknown.
+    pub(crate) fn purged(&self, ids: &[BlobId]) {
+        lock(&self.queue).waiting.retain(|q| !ids.contains(&q.id));
+    }
+
     /// Waits for the next blob to download and holds it.
     async fn next(&self) -> Claim<'_> {
         loop {
@@ -244,6 +254,12 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>) -> Infa
                 Ok(()) => break,
                 Err(error) => error,
             };
+            if error.is_purged() {
+                // Whatever this try wrote may have outlived the deletion.
+                tracing::debug!(?id, "blob purged during its download");
+                remove_blob_files(&ctx.seam.data_dir(), id);
+                break;
+            }
             if !error.is_retryable() {
                 give_up(ctx, id, &error).await;
                 break;
@@ -277,6 +293,15 @@ enum FetchError {
 }
 
 impl FetchError {
+    /// The blob left the replica mid-download (its session was deleted from
+    /// this device): nothing to retry, and its files must go.
+    fn is_purged(&self) -> bool {
+        matches!(
+            self,
+            FetchError::Core(CoreError::Store(crate::store::StoreError::UnknownBlob(_)))
+        )
+    }
+
     fn is_retryable(&self) -> bool {
         match self {
             // A rejection is the link's to report; wait for it to stop us.
@@ -301,6 +326,19 @@ async fn give_up(ctx: &BlobCtx, id: BlobId, error: &FetchError) {
 
 fn part_path(dir: &Path, id: BlobId) -> PathBuf {
     dir.join(format!("{}.part", id.0))
+}
+
+/// Removes a blob's files, complete and partial, from `data_dir`; a file
+/// already gone is no error.
+pub(crate) fn remove_blob_files(data_dir: &Path, id: BlobId) {
+    let dir = blob_dir(data_dir);
+    for path in [dir.join(id.0.to_string()), part_path(&dir, id)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(?id, %error, "cannot remove a blob file"),
+        }
+    }
 }
 
 /// One try at a blob: resume its `.part` file and finish it.
@@ -476,6 +514,8 @@ mod tests {
         break_after: Mutex<Option<usize>>,
         froms: Mutex<Vec<u64>>,
         calls: AtomicUsize,
+        /// Runs once, as the first response starts.
+        on_blob: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     struct Chunks {
@@ -512,6 +552,9 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.froms.lock().unwrap().push(from);
+                if let Some(hook) = self.on_blob.lock().unwrap().take() {
+                    hook();
+                }
                 let rest = &self.content[from as usize..];
                 let mut chunks: VecDeque<_> = rest
                     .chunks(self.chunk)
@@ -591,6 +634,7 @@ mod tests {
                 break_after: Mutex::new(None),
                 froms: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
+                on_blob: Mutex::new(None),
             });
             Fixture {
                 _dir: dir,
@@ -738,6 +782,51 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
+    #[tokio::test]
+    async fn purge_during_download_leaves_no_file_and_no_retry() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.seam
+            .apply_events(&EventBatch {
+                from: Seq(3),
+                events: vec![Event {
+                    session_id: f.session_id,
+                    at: Utc::now(),
+                    kind: EventKind::SessionArchived {
+                        archived: true,
+                        by: DeviceId::new(),
+                    },
+                }],
+            })
+            .unwrap();
+        // The session is deleted here while the server starts sending.
+        let (core, session_id) = (f.core.clone(), f.session_id);
+        *f.server.on_blob.lock().unwrap() = Some(Box::new(move || {
+            core.dispatch(Action::DeleteSessionLocally { session_id })
+                .unwrap();
+        }));
+        f.queue.want(f.blob.id);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.server.calls.load(Ordering::SeqCst) == 0
+                || !lock(&f.queue.queue).active.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the worker lets the blob go");
+        // Well past the backoff a retry would wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        downloader.abort();
+
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
+        assert!(lock(&f.queue.queue).waiting.is_empty());
+        assert_eq!(f.seam.blob(f.blob.id).unwrap(), None);
+        assert!(!f.part().exists(), "the part file it wrote is gone");
+        let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
+        assert!(!done.exists());
+    }
+
     #[test]
     fn the_queue_follows_the_policy() {
         let queue = BlobQueue::default();
@@ -776,5 +865,9 @@ mod tests {
         // Back to OnDemand: only what the user asked for stays.
         queue.set_policy(BlobPolicy::OnDemand, &[]);
         assert_eq!(waiting(&queue), [(d, true), (a.id, true)]);
+
+        // A purged blob waits no longer, asked for or not.
+        queue.purged(&[d, c.id]);
+        assert_eq!(waiting(&queue), [(a.id, true)]);
     }
 }
