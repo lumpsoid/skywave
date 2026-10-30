@@ -27,6 +27,11 @@ pub enum CoreError {
     Identity(#[from] IdentityError),
     #[error("cannot start the sync engine: {0}")]
     Runtime(std::io::Error),
+    /// The device paired with another server since this engine-side
+    /// handle was bound ([`Seam::bind`]): what it would write belongs to
+    /// the old server's replica, which is gone.
+    #[error("the device paired with another server; this work belongs to the old one")]
+    Superseded,
 }
 
 /// Handle returned by [`Core::subscribe`], for [`Core::unsubscribe`].
@@ -90,6 +95,9 @@ pub(crate) struct State {
     pub(crate) store: Store,
     pub(crate) model: Model,
     pub(crate) identity: Option<Arc<FileIdentity>>,
+    /// Bumped whenever pairing with another server resets the replica; a
+    /// [`Seam`] bound to an older one may no longer write.
+    pub(crate) server_epoch: u64,
     /// Bumped for every published snapshot, so delivery never goes back in
     /// time.
     version: u64,
@@ -115,12 +123,10 @@ impl Core {
             .build()
             .map_err(CoreError::Runtime)?;
         let (suspended, suspended_rx) = watch::channel(false);
-        let seam = Seam {
-            core: Core {
-                shared: shared.clone(),
-                engine: None,
-            },
-        };
+        let seam = Seam::new(Core {
+            shared: shared.clone(),
+            engine: None,
+        });
         runtime.spawn(Engine::new(seam, config, request_rx, suspended_rx).run());
         Ok(Core {
             shared,
@@ -250,7 +256,7 @@ impl Core {
     /// The engine-side API (T13 transport and pairing, T14 sync, T15
     /// blobs). Heads never use it.
     pub fn seam(&self) -> Seam {
-        Seam { core: self.clone() }
+        Seam::new(self.clone())
     }
 }
 
@@ -269,6 +275,7 @@ impl Shared {
                 store,
                 model,
                 identity,
+                server_epoch: 0,
                 version: 0,
             }),
             requests,

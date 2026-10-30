@@ -371,6 +371,67 @@ fn draft_survives_restart() {
 }
 
 #[test]
+fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, _) = paired_core(dir.path());
+    let created = |id, minute| {
+        event(
+            id,
+            minute,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+            },
+        )
+    };
+    let old = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(old, 0),
+            event(old, 1, EventKind::AgentMessage { text: "hi".into() }),
+        ],
+    })
+    .unwrap();
+    core.dispatch(Action::SaveDraft {
+        session_id: old,
+        text: "unsent".into(),
+        cursor: 0,
+    })
+    .unwrap();
+    let rows = |core: &Core| match core.view().screen {
+        Screen::SessionList(list) => list
+            .sessions
+            .iter()
+            .map(|row| (row.id, row.has_draft, row.unread))
+            .collect::<Vec<_>>(),
+        other => panic!("expected the session list, got {other:?}"),
+    };
+    assert_eq!(rows(&core), vec![(old, true, 1)]);
+    core.dispatch(Action::OpenSession(old)).unwrap();
+
+    // Another CA is another server.
+    let creds = PairedCredentials {
+        ca_cert_pem: "ANOTHER CA".into(),
+        ..credentials()
+    };
+    seam.pairing_succeeded("other:7443", creds).unwrap();
+    assert_eq!(drain(&requests), vec![Request::Connect]);
+    assert_eq!(rows(&core), vec![], "nothing of the old server shows");
+
+    // The new server's log starts at seq 1; only its sessions show.
+    let new = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![created(new, 2)],
+    })
+    .unwrap();
+    assert_eq!(rows(&core), vec![(new, false, 0)]);
+    drop((core, seam));
+    let core = Core::open_detached(dir.path()).unwrap();
+    assert_eq!(rows(&core), vec![(new, false, 0)], "and after a restart");
+}
+
+#[test]
 fn gap_is_refused_and_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (core, seam, _requests, _) = paired_core(dir.path());

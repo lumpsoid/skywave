@@ -14,6 +14,7 @@ use std::sync::mpsc::Receiver;
 use chrono::Utc;
 use skywave_proto::{CommandResult, DirsResult, EventBatch};
 
+use crate::blobs::remove_all_blob_files;
 use crate::client::{Core, CoreError, State, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
@@ -57,9 +58,36 @@ pub enum Request {
 #[derive(Clone)]
 pub struct Seam {
     pub(crate) core: Core,
+    /// The server epoch this handle is bound to ([`Seam::bind`]); `None`
+    /// for an unbound handle, which may always write.
+    epoch: Option<u64>,
 }
 
 impl Seam {
+    pub(crate) fn new(core: Core) -> Seam {
+        Seam { core, epoch: None }
+    }
+
+    /// The identity, with a handle bound to it for a link or a downloader
+    /// using it; `None` before pairing. Once the device pairs with another
+    /// server, every write through the bound handle fails with
+    /// [`CoreError::Superseded`] and its link changes are ignored, so work
+    /// still running for the old server cannot reach the new replica.
+    pub(crate) fn bind(&self) -> Option<(Seam, Arc<dyn Identity>)> {
+        let state = lock(&self.core.shared.state);
+        let identity = state.identity.clone()? as Arc<dyn Identity>;
+        let bound = Seam {
+            core: self.core.clone(),
+            epoch: Some(state.server_epoch),
+        };
+        Some((bound, identity))
+    }
+
+    /// Whether this handle may still write to `state`.
+    fn current(&self, state: &State) -> bool {
+        self.epoch.is_none_or(|epoch| epoch == state.server_epoch)
+    }
+
     /// The request channel. There is one receiver; later calls get `None`.
     pub fn take_requests(&self) -> Option<Receiver<Request>> {
         lock(&self.core.shared.request_rx).take()
@@ -140,7 +168,9 @@ impl Seam {
         self.core
             .shared
             .update::<(), Infallible>(|state| {
-                state.model.set_link(link);
+                if self.current(state) {
+                    state.model.set_link(link);
+                }
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});
@@ -160,6 +190,13 @@ impl Seam {
 
     /// Pairing with the server at `address` returned these credentials:
     /// store them, switch to the session list and ask for a connection.
+    ///
+    /// Pairing again with the same server (the same CA,
+    /// [`PairedCredentials::same_server`]) keeps the replica. Pairing with
+    /// another one — or with none known — first resets it
+    /// ([`Store::reset_for_server`](crate::Store::reset_for_server)) and
+    /// removes the blob files, so the device starts over like a fresh
+    /// install; handles bound to the old server stop writing ([`Seam::bind`]).
     pub fn pairing_succeeded(
         &self,
         address: &str,
@@ -167,13 +204,33 @@ impl Seam {
     ) -> Result<(), CoreError> {
         let data_dir = self.data_dir();
         self.update(|state| {
-            // Address first: an address without an identity is harmless,
-            // the device simply stays unpaired.
-            state.store.set_server_address(Some(address))?;
+            let same_server = state
+                .identity
+                .as_ref()
+                .is_some_and(|old| old.credentials().same_server(&credentials));
+            let mut requests = Vec::new();
+            if same_server {
+                // Address first: an address without an identity is
+                // harmless, the device simply stays unpaired.
+                state.store.set_server_address(Some(address))?;
+            } else {
+                // The reset commits (with the address) before the new
+                // identity is saved: a crash in between leaves the old
+                // identity over an empty replica, which only pulls again,
+                // never the old server's log under the new identity.
+                let blobs = state.store.reset_for_server(address)?;
+                state.server_epoch += 1;
+                state.model.replica_reset(state.store.load()?);
+                remove_all_blob_files(&data_dir);
+                if !blobs.is_empty() {
+                    requests.push(Request::BlobsPurged(blobs));
+                }
+            }
             let identity = FileIdentity::save(&data_dir, credentials)?;
             state.model.paired(identity.device_id(), address.to_owned());
             state.identity = Some(Arc::new(identity));
-            Ok(((), vec![Request::Connect]))
+            requests.push(Request::Connect);
+            Ok(((), requests))
         })
     }
 
@@ -212,11 +269,17 @@ impl Seam {
     }
 
     /// Runs a change that persists before touching the model, so a failed
-    /// write leaves the model as it was.
+    /// write leaves the model as it was. A handle bound to an older server
+    /// changes nothing ([`CoreError::Superseded`]).
     fn update<R>(
         &self,
         change: impl FnOnce(&mut State) -> Result<(R, Vec<Request>), CoreError>,
     ) -> Result<R, CoreError> {
-        self.core.shared.update(change)
+        self.core.shared.update(|state| {
+            if !self.current(state) {
+                return Err(CoreError::Superseded);
+            }
+            change(state)
+        })
     }
 }
