@@ -1,4 +1,83 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Skywave</string>
+
+    <!-- Startup -->
+    <string name="startup_failed_title">Could not start Skywave</string>
+    <string name="startup_core_version">core %1$s</string>
+
+    <!-- Failed core calls (CoreMessage) -->
+    <string name="message_storage">Storage error: %1$s</string>
+    <string name="message_io">Could not read file: %1$s</string>
+    <string name="message_invalid_pair_uri">Not a Skywave pairing code: %1$s</string>
+    <string name="message_shut_down">Skywave has shut down</string>
+
+    <!-- Common -->
+    <string name="action_back">Back</string>
+    <string name="separator">" · "</string>
+
+    <!-- Link banner -->
+    <string name="link_connecting">Connecting…</string>
+    <string name="link_catching_up">Syncing %1$d of %2$d</string>
+    <string name="link_offline">Offline</string>
+    <plurals name="link_queued">
+        <item quantity="one">%1$d queued</item>
+        <item quantity="other">%1$d queued</item>
+    </plurals>
+    <string name="link_retry_in_seconds">retry in %1$ds</string>
+    <string name="link_retry_in_minutes">retry in %1$dm %2$02ds</string>
+    <string name="link_retrying">retrying…</string>
+    <string name="link_offline_since">since %1$s</string>
+    <string name="link_attempt">attempt %1$d</string>
+    <string name="link_retry_now">Retry now</string>
+    <string name="link_revoked">This device was revoked</string>
+    <string name="link_protocol_mismatch">Protocol mismatch: app %1$d, server %2$d</string>
+
+    <!-- Rejected, full screen -->
+    <string name="rejected_revoked_title">This device was revoked</string>
+    <string name="rejected_revoked_body">The server no longer accepts this device. Pair it again to reconnect. Sessions already on this device stay readable.</string>
+    <string name="rejected_mismatch_title">Update needed</string>
+    <string name="rejected_mismatch_body">This app and the server speak different protocol versions (app: %1$d, server: %2$d). Update whichever is older. Sessions already on this device stay readable.</string>
+    <string name="rejected_pair_again">Pair again</string>
+    <string name="rejected_keep_reading">Keep reading</string>
+
+    <!-- Attention banner -->
+    <plurals name="attention_elsewhere">
+        <item quantity="one">%1$d approval elsewhere</item>
+        <item quantity="other">%1$d approvals elsewhere</item>
+    </plurals>
+    <string name="attention_open_next">Open</string>
+
+    <!-- Pairing -->
+    <string name="pairing_title">Pair with a server</string>
+    <string name="pairing_title_repair">Pair again</string>
+    <string name="pairing_unpaired">Not paired yet</string>
+    <string name="pairing_paired">Paired as %1$s</string>
+    <string name="pairing_paired_with">Paired as %1$s with %2$s</string>
+    <string name="pairing_in_progress">Pairing with %1$s…</string>
+    <string name="pairing_failed">Pairing with %1$s failed: %2$s</string>
+
+    <!-- Session list -->
+    <string name="sessions_title">Sessions</string>
+    <string name="sessions_archived_title">Archived sessions</string>
+    <string name="sessions_empty">No sessions yet</string>
+    <string name="sessions_archived_empty">No archived sessions</string>
+    <string name="sessions_open_archived">Archived sessions</string>
+    <string name="sessions_open_settings">Settings</string>
+
+    <!-- Session -->
+    <plurals name="session_items">
+        <item quantity="one">%1$d item</item>
+        <item quantity="other">%1$d items</item>
+    </plurals>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_server">Server</string>
+    <string name="settings_device">Device</string>
+    <string name="settings_unknown">Not paired</string>
+    <string name="settings_downloads">Downloads</string>
+    <string name="settings_downloads_eager">Fetch attachments right away</string>
+    <string name="settings_downloads_on_demand">Fetch attachments when opened</string>
+    <string name="settings_pair">Pair with a server</string>
 </resources>

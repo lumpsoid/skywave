@@ -3,7 +3,6 @@ package dev.skywave.android.core
 import dev.skywave.core.Action
 import dev.skywave.core.Link
 import dev.skywave.core.SkywaveCoreInterface
-import dev.skywave.core.SkywaveException
 import dev.skywave.core.ViewListener
 import dev.skywave.core.ViewState
 import kotlinx.coroutines.CoroutineScope
@@ -38,8 +37,8 @@ class CoreRepository internal constructor(
     private val views = MutableStateFlow(core.view())
     override val state: StateFlow<ViewState> = views.asStateFlow()
 
-    private val errors = Channel<String>(capacity = MESSAGE_BUFFER, onBufferOverflow = BufferOverflow.DROP_OLDEST)
-    override val messages: Flow<String> = errors.receiveAsFlow()
+    private val errors = Channel<CoreMessage>(capacity = MESSAGE_BUFFER, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    override val messages: Flow<CoreMessage> = errors.receiveAsFlow()
 
     private val actions = Channel<Action>(Channel.UNLIMITED)
 
@@ -91,14 +90,4 @@ class CoreRepository internal constructor(
     private companion object {
         const val MESSAGE_BUFFER = 16
     }
-}
-
-/** A short user-facing text for a failed core call. */
-internal fun describe(e: Throwable): String = when (e) {
-    is SkywaveException.Store -> "Storage error: ${e.reason}"
-    is SkywaveException.Io -> "Could not read file: ${e.reason}"
-    is SkywaveException.InvalidPairUri -> "Not a Skywave pairing code: ${e.reason}"
-    is SkywaveException.ShutDown -> "Skywave has shut down"
-    is SkywaveException -> "${e::class.simpleName}: ${e.message}"
-    else -> e.message ?: e::class.simpleName ?: "Unknown error"
 }

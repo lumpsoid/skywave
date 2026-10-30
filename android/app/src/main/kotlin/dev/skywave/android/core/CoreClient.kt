@@ -13,8 +13,8 @@ interface CoreClient {
     /** The latest snapshot; starts at the local replica, before any network. */
     val state: StateFlow<ViewState>
 
-    /** One-shot error texts (a failed action), each delivered to one collector. */
-    val messages: Flow<String>
+    /** One-shot failures (a refused action), each delivered to one collector. */
+    val messages: Flow<CoreMessage>
 
     /** Queues [action]; actions reach the core in the order they were queued. */
     fun dispatch(action: Action)
