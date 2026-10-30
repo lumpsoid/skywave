@@ -4,8 +4,6 @@
 
 use skywave_core as sc;
 
-use crate::action::ActionError;
-
 /// Why a call into the core failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum SkywaveError {
@@ -40,14 +38,6 @@ pub enum SkywaveError {
     Io { reason: String },
 }
 
-impl From<ActionError> for SkywaveError {
-    fn from(e: ActionError) -> Self {
-        match e {
-            ActionError::InvalidId { name, input } => SkywaveError::InvalidId { name, input },
-        }
-    }
-}
-
 impl From<sc::CoreError> for SkywaveError {
     fn from(e: sc::CoreError) -> Self {
         let reason = e.to_string();
@@ -63,22 +53,6 @@ impl From<sc::CoreError> for SkywaveError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn action_errors_keep_their_fields() {
-        let e = SkywaveError::from(ActionError::InvalidId {
-            name: "session_id".into(),
-            input: "nope".into(),
-        });
-        assert_eq!(
-            e,
-            SkywaveError::InvalidId {
-                name: "session_id".into(),
-                input: "nope".into()
-            }
-        );
-        assert_eq!(e.to_string(), r#"session_id is not a valid id: "nope""#);
-    }
 
     #[test]
     fn core_errors_keep_their_message() {
