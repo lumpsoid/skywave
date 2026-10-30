@@ -23,7 +23,7 @@ use skywave_proto::{
     ToolResult, TurnUsage,
 };
 use skywave_tui::App;
-use skywave_tui::app::{DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
+use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
 use skywave_tui::clipboard::{self, Clip};
 use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
@@ -3168,6 +3168,66 @@ fn v_reveals_gated_call() {
         Some(ItemKey::Logged(seq))
     );
     assert_contains(&screen, ">       ± Edit src/lib.rs");
+}
+
+/// The scroll state of the open session: `None` follows.
+fn scroll(h: &Harness) -> Option<Anchor> {
+    h.app.ui().session.as_ref().unwrap().scroll
+}
+
+#[test]
+fn v_keeps_following_when_the_call_fits_at_the_bottom() {
+    let mut edit = call(CallId::new(), "Edit", ToolKind::FileEdit, "src/lib.rs");
+    edit.display.body = body(BodyFormat::Diff, "+added 1\n+added 2\n+added 3\n");
+    let (mut h, id, _, seq) = gated(vec![agent("before")], edit);
+    h.key(KeyCode::Esc);
+    h.screen();
+    assert_eq!(h.key(KeyCode::Char('v')), None);
+    // As the main loop does: a read mark before the expanded frame is
+    // drawn decides nothing yet.
+    skywave_tui::mark_read(&mut h.app, &h.core, h.t0, false);
+    let screen = h.screen();
+    assert_contains(&screen, ">       ± Edit src/lib.rs");
+    assert_contains(&screen, "│ +added 3");
+    assert!(!screen.contains("scrolled back"), "{screen}");
+    skywave_tui::mark_read(&mut h.app, &h.core, h.t0, false);
+    assert_eq!(scroll(&h), None);
+    assert_eq!(selected(&h), Some(ItemKey::Logged(seq)));
+
+    // Still following: what arrives next shows.
+    pull(&mut h, vec![event(id, 2, agent("newest"))]);
+    let screen = h.screen();
+    assert_contains(&screen, "newest");
+    assert!(!screen.contains("scrolled back"), "{screen}");
+}
+
+#[test]
+fn v_pins_the_call_when_it_is_off_screen() {
+    let mut edit = call(CallId::new(), "Edit", ToolKind::FileEdit, "src/lib.rs");
+    edit.display.body = body(BodyFormat::Diff, "+added 1\n");
+    let (mut h, id, _, seq) = gated(vec![], edit);
+    let after = (0..30)
+        .map(|i| event(id, 2, agent(&format!("message {i}"))))
+        .collect();
+    pull(&mut h, after);
+    h.key(KeyCode::Esc);
+    let screen = h.screen();
+    assert!(!screen.contains("       ± Edit src/lib.rs"), "{screen}");
+    assert_eq!(h.key(KeyCode::Char('v')), None);
+    let screen = h.screen();
+    assert_contains(screen.lines().nth(3).unwrap(), "> 12:01 ± Edit src/lib.rs");
+    assert_contains(&screen, "scrolled back, End follows");
+    skywave_tui::mark_read(&mut h.app, &h.core, h.t0, false);
+    assert_eq!(
+        scroll(&h).map(|anchor| (anchor.key, anchor.offset)),
+        Some((ItemKey::Logged(seq), 0))
+    );
+
+    // Pinned: what arrives next does not move it.
+    pull(&mut h, vec![event(id, 3, agent("newest"))]);
+    let screen = h.screen();
+    assert!(!screen.contains("newest"), "{screen}");
+    assert_contains(screen.lines().nth(3).unwrap(), "> 12:01 ± Edit src/lib.rs");
 }
 
 #[test]
