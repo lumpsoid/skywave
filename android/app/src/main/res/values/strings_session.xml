@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Session view: top bar. State names and rename/archive come from strings_session_list.xml. -->
+    <string name="sv_interrupt">Interrupt</string>
+    <string name="sv_interrupting">Interrupting…</string>
+    <string name="sv_stop">Stop agent</string>
+    <string name="sv_stopping">Stopping…</string>
+    <string name="sv_more">More actions</string>
+    <string name="sv_refused">Refused: %1$s</string>
+    <string name="sv_total_cost">$%1$.2f total</string>
+
+    <!-- Timeline -->
+    <string name="sv_empty">No messages yet. Write one below to start the agent.</string>
+    <string name="sv_new_divider">New</string>
+    <string name="sv_jump_latest">Jump to latest</string>
+    <plurals name="sv_jump_new">
+        <item quantity="one">%1$d new</item>
+        <item quantity="other">%1$d new</item>
+    </plurals>
+    <string name="sv_you">You</string>
+    <string name="sv_other_device">Another device</string>
+    <string name="sv_interrupted">Turn interrupted</string>
+    <string name="sv_stopped">Agent stopped</string>
+    <string name="sv_renamed">Renamed to “%1$s”</string>
+    <string name="sv_renamed_default">Name removed</string>
+    <string name="sv_archived">Archived</string>
+    <string name="sv_unarchived">Brought back from the archive</string>
+    <string name="sv_by_you">by you</string>
+    <string name="sv_by_other">from another device</string>
+    <string name="sv_agent_error">Agent error</string>
+    <string name="sv_tokens_in">in</string>
+    <string name="sv_tokens_out">out</string>
+    <string name="sv_item_actions">Item actions</string>
+    <string name="sv_copy">Copy text</string>
+    <string name="sv_copied">Copied</string>
+    <string name="sv_clip_label">Skywave session text</string>
+
+    <!-- Own messages -->
+    <string name="sv_out_queued">Queued</string>
+    <string name="sv_out_sending">Sending…</string>
+    <string name="sv_out_accepted">Sent</string>
+    <string name="sv_out_failed">Refused: %1$s</string>
+    <string name="sv_delivery_queued_at">queued %1$s</string>
+    <string name="sv_delivery_sent_after">sent +%1$s</string>
+    <string name="sv_delivery_sent">sent</string>
+    <string name="sv_delivery_not_sent">not sent yet</string>
+    <string name="sv_delivery_answered_after">answered +%1$s</string>
+    <plurals name="sv_delivery_tries">
+        <item quantity="one">%1$d try</item>
+        <item quantity="other">%1$d tries</item>
+    </plurals>
+    <string name="sv_discard">Discard</string>
+    <string name="sv_edit">Edit</string>
+    <string name="sv_message_details">Show delivery details</string>
+
+    <!-- Tools: one label per ToolKind -->
+    <string name="sv_kind_write">Write</string>
+    <string name="sv_kind_edit">Edit</string>
+    <string name="sv_kind_read">Read</string>
+    <string name="sv_kind_shell">Shell</string>
+    <string name="sv_kind_search">Search</string>
+    <string name="sv_kind_fetch">Fetch</string>
+    <string name="sv_kind_subagent">Subagent</string>
+    <string name="sv_kind_other">Tool %1$s</string>
+    <string name="sv_tool_running">Running since %1$s</string>
+    <string name="sv_tool_done">Done in %1$s</string>
+    <string name="sv_tool_done_status">Done (%1$s) in %2$s</string>
+    <string name="sv_tool_failed">Failed in %1$s</string>
+    <string name="sv_tool_failed_status">Failed (%1$s) in %2$s</string>
+    <string name="sv_tool_denied_me">Denied by you</string>
+    <string name="sv_tool_denied_other">Denied from another device</string>
+    <string name="sv_tool_cancelled">Cancelled: %1$s</string>
+    <string name="sv_tool_no_result">No result</string>
+    <string name="sv_tool_expand">Show details</string>
+    <string name="sv_tool_collapse">Hide details</string>
+    <plurals name="sv_more_lines">
+        <item quantity="one">%1$d line in all</item>
+        <item quantity="other">%1$d lines in all</item>
+    </plurals>
+    <string name="sv_tool_input">Input: %1$s</string>
+    <string name="sv_tool_output">Output: %1$s</string>
+    <string name="sv_tool_full">Full content: %1$s</string>
+    <string name="sv_tool_call">Call %1$s: %2$s</string>
+    <string name="sv_tool_result">Result: %1$s</string>
+
+    <!-- Approvals (status only; answering is A12) -->
+    <string name="sv_approval">Approval for %1$s: %2$s</string>
+    <string name="sv_approval_pending">Waiting for approval</string>
+    <string name="sv_approval_approved_me">Approved by you</string>
+    <string name="sv_approval_approved_other">Approved from another device</string>
+    <string name="sv_approval_denied_me">Denied by you</string>
+    <string name="sv_approval_denied_other">Denied from another device</string>
+    <string name="sv_approval_rule">, with rule: %1$s</string>
+    <string name="sv_approval_cancelled">Approval cancelled: %1$s</string>
+    <string name="sv_waiting_approval">Waiting for approval: %1$s %2$s</string>
+
+    <!-- Blobs (state only; downloading is A13) -->
+    <string name="sv_blob_not_downloaded">%1$s, not downloaded</string>
+    <string name="sv_blob_requested">%1$s, download requested</string>
+    <string name="sv_blob_downloading">%1$s of %2$s downloaded</string>
+    <string name="sv_blob_paused">%1$s of %2$s downloaded, paused</string>
+    <string name="sv_blob_failed">%1$s, download failed: %2$s</string>
+    <string name="sv_blob_available">downloaded</string>
+
+    <!-- Composer -->
+    <string name="sv_composer_hint">Message the agent</string>
+    <string name="sv_send">Send</string>
+    <string name="sv_recall">Earlier messages</string>
+</resources>

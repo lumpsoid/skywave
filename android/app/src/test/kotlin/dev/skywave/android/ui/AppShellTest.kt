@@ -184,12 +184,12 @@ class AppShellTest {
                 canGoBack = true,
             ),
         )
-        text("3 items").assertDoesNotExist()
+        text("Message the agent").assertDoesNotExist()
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
         compose.waitForIdle()
         compose.mainClock.advanceTimeByFrame()
         assertEquals(emptyList<Action>(), dispatched)
-        text("3 items").assertExists() // the session, not the list behind it
+        text("Message the agent").assertExists() // the session, not the list behind it
         text("This device was revoked").assertExists() // now as a banner
         // With the full screen gone, back navigates again.
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
@@ -250,11 +250,11 @@ class AppShellTest {
     }
 
     @Test
-    fun sessionStubShowsTitleAndItemCount() {
+    fun sessionShowsTitleAndComposer() {
         var state by mutableStateOf(Samples.state(Link.Online(5u), Screen.Session(sessionView(archived = true, items = 3)), canGoBack = true))
         compose.setContent { SkywaveTheme(dynamicColor = false) { AppShell(state, dispatch = { dispatched += it }, inbox, SettingsSamples.about) } }
         text("Fix the sync bug").assertExists()
-        text("3 items").assertExists()
+        text("Message the agent").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
         assertEquals(listOf<Action>(Action.Back), dispatched)
         // The core answers with a new screen; the shell just follows.
