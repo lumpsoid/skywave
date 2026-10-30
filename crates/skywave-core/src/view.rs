@@ -231,6 +231,9 @@ pub enum TimelineItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     UserMessage {
+        /// The send command that logged it; a [`TimelineItem::Pending`] with
+        /// this id became this message.
+        command_id: CommandId,
         text: String,
         from: DeviceId,
         /// Sent from this device.

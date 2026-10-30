@@ -255,6 +255,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             seq: Seq(2),
             at: event(sid, 1, EventKind::TurnInterrupted).at,
             entry: Entry::UserMessage {
+                command_id: command.id,
                 text: "fix the build".into(),
                 from: device,
                 own: true,

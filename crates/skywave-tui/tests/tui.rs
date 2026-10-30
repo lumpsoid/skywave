@@ -23,6 +23,7 @@ use skywave_proto::{
 };
 use skywave_tui::App;
 use skywave_tui::app::PairUri;
+use skywave_tui::timeline::ItemKey;
 use skywave_tui::ui;
 
 const FP: &str = "ab:cd:ef";
@@ -1927,22 +1928,24 @@ fn select_the_write(h: &mut Harness) {
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
     assert_contains(&h.screen(), ">       ± Edit src/lib.rs");
+    // A turn starts at its message.
     h.key(KeyCode::Char('['));
-    assert_contains(&h.screen(), ">       ❯ Bash $ cargo test -- --nocapture");
+    assert_contains(&h.screen(), "> 12:08 you: fix the failing test");
     h.key(KeyCode::Char('['));
-    assert_contains(&h.screen(), ">       ✎ Write NOTES.md");
+    assert_contains(&h.screen(), "> 12:06 you: write it up in NOTES.md");
     h.key(KeyCode::Char('['));
     h.key(KeyCode::Char('['));
     let screen = h.screen();
-    assert_contains(&screen, ">       agent: I'll add the binary");
     assert!(
         screen
             .lines()
             .nth(3)
             .unwrap()
-            .starts_with("│  12:01 you: add a hello binary"),
-        "the turn is at the top:\n{screen}"
+            .starts_with("│> 12:01 you: add a hello binary"),
+        "the turn is at the top, its message selected:\n{screen}"
     );
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), ">       agent: I'll add the binary");
     h.key(KeyCode::Down);
     assert_contains(&h.screen(), ">       ✎ Write src/bin/hello.rs");
 }
@@ -1953,7 +1956,10 @@ fn turns_step_and_agent_messages_select() {
     select_the_write(&mut h);
     h.key(KeyCode::Char(']'));
     let screen = h.screen();
-    assert_contains(&screen, ">       ❯ Bash $ cargo test");
+    assert_contains(
+        &line_with(&screen, "> 12:04 "),
+        "run the tests and clean up",
+    );
     assert_contains(screen.lines().nth(3).unwrap(), "────");
     // Agent messages expand to nothing.
     h.key(KeyCode::Up);
@@ -2143,7 +2149,7 @@ fn v_reveals_gated_call() {
     h.key(KeyCode::Esc);
     assert_eq!(h.key(KeyCode::Char('v')), None, "nothing is downloaded");
     let ui = h.app.ui().session.as_ref().unwrap();
-    assert_eq!(ui.selected, Some(seq));
+    assert_eq!(ui.selected, Some(ItemKey::Logged(seq)));
     assert!(ui.expanded.contains(&seq));
     // Taller than the timeline: its top is the first row.
     let screen = h.screen();
@@ -2169,7 +2175,10 @@ fn v_reveals_gated_call() {
     );
     let screen = h.screen();
     assert!(!screen.contains("Approval needed"), "{screen}");
-    assert_eq!(h.app.ui().session.as_ref().unwrap().selected, Some(seq));
+    assert_eq!(
+        h.app.ui().session.as_ref().unwrap().selected,
+        Some(ItemKey::Logged(seq))
+    );
     assert_contains(&screen, ">       ± Edit src/lib.rs");
 }
 
@@ -2193,4 +2202,155 @@ fn long_shell_output_stays_visible() {
     let screen = h.screen();
     assert_contains(&screen, "│   --release");
     assert_contains(&screen, "│ Finished release");
+}
+
+// ---- messages can be selected -----------------------------------------------
+
+fn selected(h: &Harness) -> Option<ItemKey> {
+    h.app.ui().session.as_ref().unwrap().selected
+}
+
+#[test]
+fn user_messages_are_selectable() {
+    let (mut h, id, me) = open_session();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, user(phone, "from the phone")),
+            event(id, 2, agent("on it")),
+            event(id, 3, user(me, "and this")),
+        ],
+    );
+    h.type_text("not sent yet");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
+    assert_contains(&h.screen(), ">       you [queued]: not sent yet");
+    // A message expands to nothing and has nothing to download.
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(h.key(KeyCode::Char('d')), None);
+    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:03 you: and this");
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:02 agent: on it");
+    h.key(KeyCode::Up);
+    let line = line_with(&h.screen(), "from the phone");
+    assert_contains(&line, "> 12:01 ");
+    assert_contains(&line, &tail(phone));
+    assert_eq!(h.key(KeyCode::Enter), None);
+}
+
+#[test]
+fn selection_follows_pending_to_logged() {
+    let (mut h, id, me) = open_session();
+    pull(&mut h, vec![event(id, 1, agent("ready"))]);
+    h.type_text("hello");
+    h.key(KeyCode::Enter);
+    let command = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
+
+    // Accepted but not pulled yet: still pending.
+    let seq = Seq(h.seam.cursor().unwrap().0 + 1);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq })
+        .unwrap();
+    h.sync();
+    assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
+
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::UserMessage {
+                command_id: command,
+                device_id: me,
+                text: "hello".into(),
+            },
+        )],
+    );
+    assert_eq!(selected(&h), Some(ItemKey::Logged(seq)));
+    assert_contains(&h.screen(), "> 12:02 you [accepted]: hello");
+    // And moves on from there.
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), "> 12:01 agent: ready");
+}
+
+/// The app's view with `key` taken out of the open session's timeline, as
+/// if the message were discarded.
+fn without(h: &Harness, key: ItemKey) -> ViewState {
+    let mut view = h.app.view().clone();
+    let Screen::Session(session) = &mut view.screen else {
+        panic!("no session open");
+    };
+    session.timeline.retain(|item| ItemKey::of(item) != key);
+    view
+}
+
+#[test]
+fn selection_moves_to_neighbour_when_pending_vanishes() {
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, agent("ready"))]);
+    h.type_text("first");
+    h.key(KeyCode::Enter);
+    let first = last_command(&h);
+    h.type_text("second");
+    h.key(KeyCode::Enter);
+    let second = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(first)));
+
+    // The next item takes its place; at the end, the one before.
+    let view = without(&h, ItemKey::Pending(first));
+    h.app.set_view(view, h.t0);
+    assert_eq!(selected(&h), Some(ItemKey::Pending(second)));
+    assert_contains(&h.screen(), ">       you [queued]: second");
+    let view = without(&h, ItemKey::Pending(second));
+    h.app.set_view(view, h.t0);
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
+    // Nothing left to select.
+    let view = without(&h, ItemKey::Logged(Seq(2)));
+    h.app.set_view(view, h.t0);
+    assert_eq!(selected(&h), None);
+}
+
+#[test]
+fn turn_stepping_lands_on_the_user_message() {
+    let (mut h, id, me) = open_session();
+    let phone = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, user(me, "one")),
+            event(id, 1, agent("a")),
+            event(id, 2, user(phone, "two")),
+            event(id, 2, agent("b")),
+        ],
+    );
+    h.type_text("three");
+    h.key(KeyCode::Enter);
+    let three = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_contains(&h.screen(), ">       agent: b");
+    // Back from inside a turn: its message; from there, the turn before.
+    h.key(KeyCode::Char('['));
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(4))));
+    h.key(KeyCode::Char('['));
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
+    assert_contains(&h.screen(), "> 12:01 you: one");
+    h.key(KeyCode::Char(']'));
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(4))));
+    // A pending message starts a turn too.
+    h.key(KeyCode::Char(']'));
+    assert_eq!(selected(&h), Some(ItemKey::Pending(three)));
 }

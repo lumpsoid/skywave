@@ -15,7 +15,7 @@ use skywave_core::{
 };
 
 use crate::composer::Composer;
-use crate::timeline::{ItemKey, gated_item, sections, selectable, starts_turn, wanted_blob};
+use crate::timeline::{ItemKey, find, gated_item, sections, selectable, starts_turn, wanted_blob};
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -295,10 +295,9 @@ pub struct SessionUi {
     /// Where the user scrolled back to; `None` follows the newest item. New
     /// items never move a pinned view.
     pub scroll: Option<Anchor>,
-    /// The selected tool item or agent message, by seq so it stays put as
-    /// items arrive.
-    pub selected: Option<Seq>,
-    /// Items whose full content is shown.
+    /// The selected item, by key so it stays put as items arrive.
+    pub selected: Option<ItemKey>,
+    /// Items whose full content is shown; only logged items expand.
     pub expanded: HashSet<Seq>,
     pub geometry: RefCell<Geometry>,
 }
@@ -401,9 +400,15 @@ impl App {
         let old_index = self
             .session_list()
             .and_then(|list| self.selected_index(list));
+        let old_item = self
+            .session()
+            .and_then(|(view, ui)| find(view, ui.selected?));
         self.view = view;
         self.keep_selection(old_index);
         self.follow_session();
+        if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
+            session.keep_selection(view, old_item);
+        }
     }
 
     /// Fresh session presentation state when another session opens.
@@ -857,7 +862,7 @@ impl SessionUi {
     /// Moves the selection to the previous (`up`) or next selectable item
     /// and scrolls it into view. Nothing selected starts from the newest.
     fn select(&mut self, view: &SessionView, up: bool) {
-        let items: Vec<(usize, Seq)> = view
+        let items: Vec<(usize, ItemKey)> = view
             .timeline
             .iter()
             .enumerate()
@@ -868,14 +873,31 @@ impl SessionUi {
         };
         let current = self
             .selected
-            .and_then(|seq| items.iter().position(|(_, s)| *s == seq));
-        let (index, seq) = match (current, up) {
+            .and_then(|key| items.iter().position(|(_, k)| *k == key));
+        let (index, key) = match (current, up) {
             (None, _) => last,
             (Some(i), true) => items[i.saturating_sub(1)],
             (Some(i), false) => items[(i + 1).min(items.len() - 1)],
         };
-        self.selected = Some(seq);
+        self.selected = Some(key);
         self.reveal(index);
+    }
+
+    /// Keeps the selection on its item as the timeline changes: a pending
+    /// message stays selected once logged. If the item is gone, selects the
+    /// selectable item at its old index `old`, else the one before, so the
+    /// cursor does not jump.
+    fn keep_selection(&mut self, view: &SessionView, old: Option<usize>) {
+        let Some(key) = self.selected else {
+            return;
+        };
+        let index = find(view, key).or_else(|| {
+            let old = old?;
+            let after =
+                (old..view.timeline.len()).find(|&i| selectable(&view.timeline[i]).is_some());
+            after.or_else(|| (0..old).rfind(|&i| selectable(&view.timeline[i]).is_some()))
+        });
+        self.selected = index.and_then(|i| selectable(&view.timeline[i]));
     }
 
     /// Scrolls so the timeline item at `index` is on screen, its top first
@@ -905,10 +927,10 @@ impl SessionUi {
         let geometry = self.geometry.borrow();
         let current = self
             .selected
-            .and_then(|seq| {
+            .and_then(|key| {
                 view.timeline
                     .iter()
-                    .position(|item| selectable(item) == Some(seq))
+                    .position(|item| selectable(item) == Some(key))
             })
             .or_else(|| geometry.index_at(geometry.top))
             .unwrap_or(0);
@@ -958,10 +980,10 @@ impl SessionUi {
         let Some((_, item)) = gated_item(view) else {
             return;
         };
-        let Some(seq) = selectable(item) else {
+        let Some(key @ ItemKey::Logged(seq)) = selectable(item) else {
             return;
         };
-        self.selected = Some(seq);
+        self.selected = Some(key);
         self.expanded.insert(seq);
         // Anchored to the item, not to a line: it grows by expanding, and the
         // renderer clamps the anchor to the bottom.
@@ -971,8 +993,11 @@ impl SessionUi {
         });
     }
 
+    /// The selected logged item's entry; a pending message has none.
     fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
-        let seq = self.selected?;
+        let Some(ItemKey::Logged(seq)) = self.selected else {
+            return None;
+        };
         view.timeline.iter().find_map(|item| match item {
             TimelineItem::Logged { seq: s, entry, .. } if *s == seq => Some(entry),
             _ => None,
@@ -982,7 +1007,9 @@ impl SessionUi {
     /// Expands or collapses the selected item. Expanding a blob that is not
     /// here yet asks for it (spec §8: expanding downloads if needed).
     fn toggle(&mut self, view: &SessionView) -> Option<Action> {
-        let seq = self.selected?;
+        let Some(ItemKey::Logged(seq)) = self.selected else {
+            return None;
+        };
         if self.expanded.remove(&seq) {
             return None;
         }

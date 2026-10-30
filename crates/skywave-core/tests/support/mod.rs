@@ -587,7 +587,13 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                 seq,
                 at,
                 entry: match entry {
-                    Entry::UserMessage { text, from, .. } => Entry::UserMessage {
+                    Entry::UserMessage {
+                        command_id,
+                        text,
+                        from,
+                        ..
+                    } => Entry::UserMessage {
+                        command_id,
                         text,
                         from,
                         own: false,

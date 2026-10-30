@@ -12,8 +12,9 @@ use skywave_core::{
 /// Most preview lines an item shows while collapsed.
 pub const PREVIEW_LINES: usize = 8;
 
-/// A timeline item's identity, stable as items arrive; scrolling anchors to
-/// it.
+/// A timeline item's identity, stable as items arrive; scrolling and the
+/// selection anchor to it. A pending message's key changes once, when it is
+/// logged; [`Entry::UserMessage`] carries the command id to follow it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemKey {
     Logged(Seq),
@@ -29,21 +30,46 @@ impl ItemKey {
     }
 }
 
-/// Tool items and agent messages can be selected; tool items expand.
-pub fn selectable(item: &TimelineItem) -> Option<Seq> {
+/// Messages (any device's, logged or pending), tool items and agent messages
+/// can be selected; tool items expand.
+pub fn selectable(item: &TimelineItem) -> Option<ItemKey> {
     match item {
-        TimelineItem::Logged {
-            seq,
+        TimelineItem::Pending { .. }
+        | TimelineItem::Logged {
             entry:
-                Entry::Tool(_)
+                Entry::UserMessage { .. }
+                | Entry::Tool(_)
                 | Entry::ToolCall { .. }
                 | Entry::ToolResult { .. }
                 | Entry::Approval { .. }
                 | Entry::AgentMessage { .. },
             ..
-        } => Some(*seq),
+        } => Some(ItemKey::of(item)),
         _ => None,
     }
+}
+
+/// The timeline index of the item `key` names. A pending message that is
+/// gone is found as the logged message it became.
+pub fn find(view: &SessionView, key: ItemKey) -> Option<usize> {
+    let here = view
+        .timeline
+        .iter()
+        .position(|item| ItemKey::of(item) == key);
+    here.or_else(|| {
+        let ItemKey::Pending(command) = key else {
+            return None;
+        };
+        view.timeline.iter().position(|item| {
+            matches!(
+                item,
+                TimelineItem::Logged {
+                    entry: Entry::UserMessage { command_id, .. },
+                    ..
+                } if *command_id == command
+            )
+        })
+    })
 }
 
 /// A user message, logged or not, starts a turn.
