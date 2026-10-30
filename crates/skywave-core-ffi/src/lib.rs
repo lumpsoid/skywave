@@ -6,6 +6,10 @@
 //! scaffolding version. Kotlin bindings land in package `dev.skywave.core`
 //! (see `uniffi.toml`).
 //!
+//! [`view`] mirrors `ViewState` and everything reachable from it (core →
+//! FFI); [`action`] mirrors `Action` and `Route` (FFI → core, failing on a
+//! bad id). Both follow the type mapping of D16.
+//!
 //! Generate Kotlin with `crates/skywave-core-ffi/gen-kotlin.sh <out-dir> [profile]`,
 //! which for the default `debug` profile runs:
 //!
@@ -17,6 +21,9 @@
 //! ```
 
 uniffi::setup_scaffolding!();
+
+pub mod action;
+pub mod view;
 
 /// The crate version and the wire protocol it speaks, e.g. `"0.1.0 (protocol 1)"`.
 #[uniffi::export]

@@ -23,3 +23,9 @@ bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 [dependencies]
 skywave-core.workspace = true
 uniffi.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
