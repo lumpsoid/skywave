@@ -245,25 +245,28 @@ private fun isLong(body: ApprovalBody): Boolean = when (body) {
 
 /**
  * How the gated item states its approval: pending ones the session waits on
- * carry a way to the panel, until this device has answered.
+ * carry a way to the panel, until this device has answered. A settled one
+ * also states this device's [answer] if it did not apply.
  */
 @Composable
-internal fun ApprovalLine(status: ApprovalStatus, gated: GatedApproval?) {
+internal fun ApprovalLine(status: ApprovalStatus, gated: GatedApproval?, answer: Answer? = null) {
     val prompt = gated?.prompt
     if (status !is ApprovalStatus.Pending || prompt == null) {
         Minor(approvalText(status))
+        answer?.takeIf { status !is ApprovalStatus.Pending && it.outgoing is Outgoing.Failed }
+            ?.let { Minor(answerText(it), color = MaterialTheme.colorScheme.error) }
         return
     }
-    val answer = prompt.answer
+    val given = prompt.answer
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
-            if (answer != null) answerText(answer) else stringResource(R.string.ap_waiting_you),
+            if (given != null) answerText(given) else stringResource(R.string.ap_waiting_you),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.tertiary,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f),
         )
-        if (!answered(answer)) {
+        if (!answered(given)) {
             TextButton(onClick = gated.open, modifier = Modifier.testTag(ApprovalTags.ANSWER)) {
                 Text(stringResource(R.string.ap_answer))
             }
@@ -283,7 +286,11 @@ internal fun answerText(answer: Answer): String {
         Outgoing.Queued -> stringResource(R.string.ap_out_queued)
         Outgoing.Sending -> stringResource(R.string.ap_out_sending)
         is Outgoing.Accepted -> stringResource(R.string.ap_out_accepted)
-        is Outgoing.Failed -> stringResource(R.string.ap_out_failed, failText(out.reason))
+        // Answering again only helps if the approval still takes one.
+        is Outgoing.Failed -> stringResource(
+            if (answer.retryable) R.string.ap_out_failed else R.string.ap_out_unapplied,
+            failText(out.reason),
+        )
     }
     return said + stringResource(R.string.separator) + delivery
 }

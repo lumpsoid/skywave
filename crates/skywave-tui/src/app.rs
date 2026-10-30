@@ -1872,12 +1872,10 @@ fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
     })
 }
 
-/// This device has not answered `prompt`, or its answer was refused.
+/// This device has not answered `prompt`, or its answer was refused in a
+/// way that leaves it open to another.
 fn unanswered(prompt: &ApprovalPrompt) -> bool {
-    prompt
-        .answer
-        .as_ref()
-        .is_none_or(|answer| matches!(answer.outgoing, Outgoing::Failed(_)))
+    prompt.answer.as_ref().is_none_or(|answer| answer.retryable)
 }
 
 impl SessionUi {

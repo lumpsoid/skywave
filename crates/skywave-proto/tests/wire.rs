@@ -267,6 +267,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownSession,
             RejectReason::UnknownApproval,
             RejectReason::ApprovalAlreadyResolved,
+            RejectReason::ApprovalCancelled,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
         ]

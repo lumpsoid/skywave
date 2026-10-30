@@ -193,7 +193,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
         }
         is Entry.Approval -> Column {
             Label(stringResource(R.string.sv_approval, e.tool, e.summary))
-            ApprovalLine(e.status, gated)
+            ApprovalLine(e.status, gated, e.answer)
         }
         Entry.Interrupted -> SystemLine(stringResource(R.string.sv_interrupted))
         Entry.Stopped -> SystemLine(stringResource(R.string.sv_stopped))
@@ -470,9 +470,11 @@ private fun ToolItem(tool: ToolView, expanded: Boolean, gated: GatedApproval?) {
                     maxLines = if (expanded) Int.MAX_VALUE else PREVIEW_LINES,
                 )
             }
-            // A denial is the outcome line's to say, unless it granted more.
-            tool.approval?.takeUnless { outcome is ToolOutcome.Denied && it.status.isPlainDenial() }
-                ?.let { ApprovalLine(it.status, gated) }
+            // A denial is the outcome line's to say, unless it granted more
+            // or overrode this device's answer.
+            tool.approval?.takeUnless {
+                outcome is ToolOutcome.Denied && it.status.isPlainDenial() && it.answer?.outgoing !is Outgoing.Failed
+            }?.let { ApprovalLine(it.status, gated, it.answer) }
             Text(
                 outcomeText(outcome),
                 style = MaterialTheme.typography.labelMedium,

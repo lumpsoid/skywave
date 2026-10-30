@@ -18,12 +18,13 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
-    ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry, Outgoing,
-    Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
+    Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry,
+    Outgoing, Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    read_head,
 };
 use unicode_width::UnicodeWidthChar;
 
-use super::{answer_words, decision_label, outgoing_badge, outgoing_label};
+use super::{answer_words, decision_label, fail_reason, outgoing_badge, outgoing_label};
 use crate::app::{Search, SessionUi};
 use crate::timeline::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -341,7 +342,14 @@ impl Layout<'_> {
                 );
             }
             Entry::Tool(view) => {
-                let (state, style) = tool_state(view, self.wall_ms);
+                let (mut state, style) = tool_state(view, self.wall_ms);
+                if let Some(note) = view
+                    .approval
+                    .as_ref()
+                    .and_then(|a| unapplied(&a.status, a.answer.as_ref()))
+                {
+                    state = format!("{state} · {note}");
+                }
                 let mut out = head_lines(
                     lead,
                     Span::styled(glyph(view.kind), style),
@@ -378,9 +386,13 @@ impl Layout<'_> {
                 tool,
                 summary,
                 status,
+                answer,
                 ..
             } => {
-                let (state, style) = approval_state(status);
+                let (mut state, style) = approval_state(status);
+                if let Some(note) = unapplied(status, answer.as_ref()) {
+                    state = format!("{state} · {note}");
+                }
                 let out = head_lines(
                     lead,
                     Span::styled("?", style),
@@ -969,6 +981,23 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
                 .collect();
             (parts.join(" · "), Style::new().dark_gray())
         }
+    }
+}
+
+/// This device's answer to a settled approval, when it did not apply:
+/// `you approved · not applied: the approval was cancelled first`.
+fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String> {
+    let answer = answer?;
+    match (status, answer.outgoing) {
+        (
+            ApprovalStatus::Resolved { .. } | ApprovalStatus::Cancelled { .. },
+            Outgoing::Failed(reason),
+        ) => Some(format!(
+            "you {} · not applied: {}",
+            answer_words(answer.decision, answer.rule.as_ref()),
+            fail_reason(reason)
+        )),
+        _ => None,
     }
 }
 

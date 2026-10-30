@@ -187,12 +187,30 @@ class ApprovalPanelTest {
     @Test
     fun aRefusedAnswerCanBeGivenAgain() {
         val gated = ApprovalSamples.editTool
-        val refused = ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.UNKNOWN_APPROVAL))
+        val refused = ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.UNKNOWN_RULE), retryable = true)
         show(ApprovalSamples.blocked(gated, ApprovalSamples.prompt(gated, answer = refused)))
         tag(ApprovalTags.STATE).assert(hasText("refused", substring = true))
         tag(ApprovalTags.APPROVE).assertIsEnabled().performClick()
         assertEquals(listOf(Action.ResolveApproval(ApprovalSamples.ID, Decision.APPROVE, null)), answers())
         tag(ApprovalTags.ANSWER).assertExists()
+    }
+
+    @Test
+    fun anAnswerTooLateForTheApprovalIsNotOfferedAgain() {
+        val gated = ApprovalSamples.editTool
+        val late = ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_CANCELLED))
+        show(ApprovalSamples.blocked(gated, ApprovalSamples.prompt(gated, answer = late)))
+        tag(ApprovalTags.STATE).assert(hasText("did not apply: the approval was cancelled first", substring = true))
+        tag(ApprovalTags.ANSWER).assertDoesNotExist()
+    }
+
+    @Test
+    fun aCancelledApprovalKeepsTheAnswerThatCameTooLate() {
+        val late = ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_CANCELLED))
+        show(ApprovalSamples.cancelledUnderAnswer(ApprovalSamples.editTool, late))
+        seeGated("Approval cancelled: daemon restarted", "You approved · did not apply: the approval was cancelled first")
+        tag(ApprovalTags.ANSWER).assertDoesNotExist()
+        tag(ApprovalTags.PANEL).assertDoesNotExist()
     }
 
     @Test

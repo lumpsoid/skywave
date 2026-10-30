@@ -59,8 +59,19 @@ internal object ApprovalSamples {
     fun prompt(gated: Entry.Tool, suggestions: List<RuleSuggestion> = emptyList(), answer: Answer? = null) =
         ApprovalPrompt(ID, gated.tool.call, gated.tool.name, gated.tool.title, null, suggestions, answer)
 
-    fun answer(decision: Decision = Decision.APPROVE, outgoing: Outgoing = Outgoing.Queued, rule: RuleSuggestion? = null) =
-        Answer(decision, rule, outgoing, Delivery(T0, null, null, 0u))
+    fun answer(
+        decision: Decision = Decision.APPROVE,
+        outgoing: Outgoing = Outgoing.Queued,
+        rule: RuleSuggestion? = null,
+        retryable: Boolean = false,
+    ) = Answer(decision, rule, outgoing, Delivery(T0, null, null, 0u), retryable)
+
+    /** [gated] cancelled with this device's [answer] refused as too late. */
+    fun cancelledUnderAnswer(gated: Entry.Tool, answer: Answer): SessionView {
+        val approval = ToolApproval(ID, ApprovalStatus.Cancelled("daemon restarted"), answer)
+        val settled = Entry.Tool(gated.tool.copy(approval = approval, outcome = ToolOutcome.Cancelled("daemon restarted")))
+        return SessionSamples.view(timeline = before() + logged(3, settled), state = SessionState.Idle)
+    }
 
     private fun before(): List<TimelineItem> = listOf(
         message(1, "Make sync apply batches by reference"),

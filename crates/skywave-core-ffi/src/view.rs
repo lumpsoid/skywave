@@ -263,6 +263,8 @@ pub enum FailReason {
     UnknownSession,
     UnknownApproval,
     ApprovalAlreadyResolved,
+    /// The approval was cancelled before the answer arrived.
+    ApprovalCancelled,
     NoActiveTurn,
     UnknownRule,
 }
@@ -275,6 +277,7 @@ impl From<sc::FailReason> for FailReason {
             sc::FailReason::UnknownSession => FailReason::UnknownSession,
             sc::FailReason::UnknownApproval => FailReason::UnknownApproval,
             sc::FailReason::ApprovalAlreadyResolved => FailReason::ApprovalAlreadyResolved,
+            sc::FailReason::ApprovalCancelled => FailReason::ApprovalCancelled,
             sc::FailReason::NoActiveTurn => FailReason::NoActiveTurn,
             sc::FailReason::UnknownRule => FailReason::UnknownRule,
         }
@@ -858,6 +861,9 @@ pub enum Entry {
         summary: String,
         input: Option<BlobView>,
         status: ApprovalStatus,
+        /// This device's answer, if it gave one.
+        #[uniffi(default)]
+        answer: Option<Answer>,
     },
     Interrupted,
     Stopped,
@@ -921,12 +927,14 @@ impl From<sc::Entry> for Entry {
                 summary,
                 input,
                 status,
+                answer,
             } => Entry::Approval {
                 id: id(approval.0),
                 tool,
                 summary,
                 input: opt(input),
                 status: status.into(),
+                answer: opt(answer),
             },
             sc::Entry::Interrupted => Entry::Interrupted,
             sc::Entry::Stopped => Entry::Stopped,
@@ -1018,6 +1026,10 @@ impl From<sc::BodyView> for BodyView {
 pub struct ToolApproval {
     pub id: String,
     pub status: ApprovalStatus,
+    /// This device's answer, if it gave one; once settled, where an answer
+    /// that did not apply stays in sight.
+    #[uniffi(default)]
+    pub answer: Option<Answer>,
 }
 
 impl From<sc::ToolApproval> for ToolApproval {
@@ -1025,10 +1037,12 @@ impl From<sc::ToolApproval> for ToolApproval {
         let sc::ToolApproval {
             id: approval,
             status,
+            answer,
         } = a;
         ToolApproval {
             id: id(approval.0),
             status: status.into(),
+            answer: opt(answer),
         }
     }
 }
@@ -1169,6 +1183,10 @@ pub struct Answer {
     pub rule: Option<RuleSuggestion>,
     pub outgoing: Outgoing,
     pub delivery: Option<Delivery>,
+    /// Refused while the approval still waits: this device may answer
+    /// again. A refused answer that is not retryable did not apply.
+    #[uniffi(default = false)]
+    pub retryable: bool,
 }
 
 impl From<sc::Answer> for Answer {
@@ -1178,12 +1196,14 @@ impl From<sc::Answer> for Answer {
             rule,
             outgoing,
             delivery,
+            retryable,
         } = a;
         Answer {
             decision: decision.into(),
             rule: opt(rule),
             outgoing: outgoing.into(),
             delivery: opt(delivery),
+            retryable,
         }
     }
 }
@@ -1576,6 +1596,7 @@ mod tests {
             sc::FailReason::UnknownSession,
             sc::FailReason::UnknownApproval,
             sc::FailReason::ApprovalAlreadyResolved,
+            sc::FailReason::ApprovalCancelled,
             sc::FailReason::NoActiveTurn,
             sc::FailReason::UnknownRule,
         ]);
@@ -1587,6 +1608,7 @@ mod tests {
                 FailReason::UnknownSession,
                 FailReason::UnknownApproval,
                 FailReason::ApprovalAlreadyResolved,
+                FailReason::ApprovalCancelled,
                 FailReason::NoActiveTurn,
                 FailReason::UnknownRule,
             ]
@@ -1694,6 +1716,7 @@ mod tests {
                     rule: Some(rule()),
                     outgoing: sc::Outgoing::Queued,
                     delivery: Some(delivery()),
+                    retryable: true,
                 }),
             }),
             rules: vec![rule()],
@@ -1741,6 +1764,7 @@ mod tests {
                     rule: Some(rule_mirror()),
                     outgoing: Outgoing::Queued,
                     delivery: Some(delivery_mirror()),
+                    retryable: true,
                 }),
             }),
             rules: vec![rule_mirror()],
@@ -2149,6 +2173,7 @@ mod tests {
                 approval: Some(sc::ToolApproval {
                     id: approval,
                     status: sc::ApprovalStatus::Pending,
+                    answer: None,
                 }),
                 outcome: sc::ToolOutcome::NoResult,
             })),
@@ -2169,6 +2194,13 @@ mod tests {
                 status: sc::ApprovalStatus::Cancelled {
                     reason: "gone".into(),
                 },
+                answer: Some(sc::Answer {
+                    decision: sc::Decision::Deny,
+                    rule: None,
+                    outgoing: sc::Outgoing::Failed(sc::FailReason::ApprovalCancelled),
+                    delivery: None,
+                    retryable: false,
+                }),
             },
             sc::Entry::Interrupted,
             sc::Entry::Stopped,
@@ -2216,6 +2248,7 @@ mod tests {
                         approval: Some(ToolApproval {
                             id: s(approval.0),
                             status: ApprovalStatus::Pending,
+                            answer: None,
                         }),
                         outcome: ToolOutcome::NoResult,
                     }
@@ -2237,6 +2270,15 @@ mod tests {
                     status: ApprovalStatus::Cancelled {
                         reason: "gone".into()
                     },
+                    answer: Some(Answer {
+                        decision: Decision::Deny,
+                        rule: None,
+                        outgoing: Outgoing::Failed {
+                            reason: FailReason::ApprovalCancelled
+                        },
+                        delivery: None,
+                        retryable: false,
+                    }),
                 },
                 Entry::Interrupted,
                 Entry::Stopped,

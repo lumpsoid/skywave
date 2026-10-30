@@ -373,25 +373,41 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApprovalRow {
     pub session_id: SessionId,
-    /// Seq of the `ApprovalResolved` or `ApprovalCancelled` that closed it.
-    pub closed: Option<Seq>,
+    /// How it was closed; `None` while it is pending.
+    pub closed: Option<Closed>,
     /// How many rule suggestions the request offers.
     pub rules: usize,
 }
 
+/// How an approval request was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Closed {
+    /// By an `ApprovalResolved`: an answer won.
+    Resolved,
+    /// By an `ApprovalCancelled`: no answer ever will.
+    Cancelled,
+}
+
 /// Approval `id` as the log has it; `None` if unknown.
 pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<ApprovalRow>> {
-    let row: Option<(String, Option<i64>, i64)> = conn
+    // The type tag of the event at `closed_seq` tells an answer from a
+    // cancel.
+    let row: Option<(String, Option<String>, i64)> = conn
         .query_row(
-            "SELECT session_id, closed_seq, rules FROM approvals WHERE id = ?1",
+            "SELECT a.session_id, json_extract(e.kind, '$.type'), a.rules
+             FROM approvals a LEFT JOIN events e ON e.seq = a.closed_seq
+             WHERE a.id = ?1",
             [id.0.to_string()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    row.map(|(session, closed, rules)| {
+    row.map(|(session, closed_by, rules)| {
         Ok(ApprovalRow {
             session_id: parse_id(&session)?,
-            closed: closed.map(seq_from_sql).transpose()?,
+            closed: closed_by.map(|kind| match kind.as_str() {
+                "approval_cancelled" => Closed::Cancelled,
+                _ => Closed::Resolved,
+            }),
             rules: usize::try_from(rules).unwrap_or(0),
         })
     })

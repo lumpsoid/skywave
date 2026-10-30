@@ -374,6 +374,7 @@ mod tests {
                 summary: "notes.md".into(),
                 input: None,
                 status: crate::view::ApprovalStatus::Pending,
+                answer: None,
             }),
             logged(Entry::Interrupted),
             TimelineItem::Pending {

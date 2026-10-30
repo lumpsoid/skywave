@@ -35,8 +35,10 @@
 //! [`skywave_proto::normalise_session_name`] leaves it; one that ends up
 //! empty restores the default title.
 //!
-//! **ResolveApproval.** The first answer wins (D5); a cancelled approval is
-//! closed too. A `rule` must come with an approval and index one of the
+//! **ResolveApproval.** The first answer wins (D5): a later one is
+//! `ApprovalAlreadyResolved`. A cancelled approval is closed too, and an
+//! answer to it is `ApprovalCancelled`, so the device can tell an answer
+//! that came too late from one another device beat. A `rule` must come with an approval and index one of the
 //! request's suggestions, else the answer is `UnknownRule`: the log never
 //! claims a rule the agent was not offered.
 //!
@@ -55,7 +57,7 @@ use skywave_proto::{
 use crate::db::Db;
 use crate::dirs;
 use crate::error::Result;
-use crate::event_log::{self, EventLog};
+use crate::event_log::{self, Closed, EventLog};
 
 impl EventLog {
     /// Handles `command` from `device` and returns its result.
@@ -128,14 +130,16 @@ impl EventLog {
                 (*session_id, kind)
             }
             CommandKind::ResolveApproval { id, decision, rule } => {
-                // A cancelled approval is closed too: no answer can win it.
-                let approval = match event_log::approval_in(tx, *id)? {
-                    None => return Ok(Err(RejectReason::UnknownApproval)),
-                    Some(approval) if approval.closed.is_some() => {
+                let Some(approval) = event_log::approval_in(tx, *id)? else {
+                    return Ok(Err(RejectReason::UnknownApproval));
+                };
+                match approval.closed {
+                    Some(Closed::Resolved) => {
                         return Ok(Err(RejectReason::ApprovalAlreadyResolved));
                     }
-                    Some(approval) => approval,
-                };
+                    Some(Closed::Cancelled) => return Ok(Err(RejectReason::ApprovalCancelled)),
+                    None => {}
+                }
                 let offered = |rule: u8| usize::from(rule) < approval.rules;
                 if rule.is_some_and(|rule| *decision == Decision::Deny || !offered(rule)) {
                     return Ok(Err(RejectReason::UnknownRule));

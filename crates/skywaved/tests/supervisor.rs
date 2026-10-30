@@ -405,7 +405,7 @@ async fn interrupt_with_pending_approval_returns_to_idle() {
     assert_eq!(
         f.resolve(DeviceId::new(), id, Decision::Approve),
         CommandResult::Rejected {
-            reason: RejectReason::ApprovalAlreadyResolved
+            reason: RejectReason::ApprovalCancelled
         }
     );
     assert_eq!(
@@ -528,7 +528,7 @@ async fn daemon_restart_cancels_pending_approvals_and_resumes() {
     assert_eq!(
         f.resolve(DeviceId::new(), id, Decision::Approve),
         CommandResult::Rejected {
-            reason: RejectReason::ApprovalAlreadyResolved
+            reason: RejectReason::ApprovalCancelled
         }
     );
 

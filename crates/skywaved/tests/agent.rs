@@ -397,7 +397,7 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
     assert_eq!(f.log.head(), Seq(interrupted.0 + 2));
     assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
     assert_eq!(mapper.pending_approvals().count(), 0);
-    // Too late: a device answering now loses.
+    // Too late: a device answering now is told so.
     assert_eq!(
         f.handle(CommandKind::ResolveApproval {
             id,
@@ -405,7 +405,7 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
             rule: None,
         }),
         CommandResult::Rejected {
-            reason: RejectReason::ApprovalAlreadyResolved
+            reason: RejectReason::ApprovalCancelled
         }
     );
 

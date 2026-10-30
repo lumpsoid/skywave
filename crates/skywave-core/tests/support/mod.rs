@@ -623,18 +623,25 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                         tool,
                         summary,
                         input,
-                        status: ApprovalStatus::Resolved { decision, by, .. },
+                        status,
+                        answer: _,
                     } => Entry::Approval {
                         id,
                         tool,
                         summary,
                         input,
-                        status: ApprovalStatus::Resolved {
-                            decision,
-                            by,
-                            by_me: false,
-                            rule: None,
+                        status: match status {
+                            ApprovalStatus::Resolved { decision, by, .. } => {
+                                ApprovalStatus::Resolved {
+                                    decision,
+                                    by,
+                                    by_me: false,
+                                    rule: None,
+                                }
+                            }
+                            other => other,
                         },
+                        answer: None,
                     },
                     Entry::Renamed { name, by, .. } => Entry::Renamed {
                         name,

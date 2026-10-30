@@ -16,12 +16,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, BlobDownload, BoxFuture, Connector, EngineConfig, HttpsTransport, Link, LinkRejection,
-    OutboxStatus, Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError,
+    Action, ApprovalStatus, BlobDownload, BoxFuture, Connector, Decision, EngineConfig, Entry,
+    FailReason, HttpsTransport, Link, LinkRejection, OutboxStatus, Outgoing, Screen, SessionRow,
+    TimelineItem, Transport, TransportError,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
-    EventsQuery, HelloResponse, Seq, SessionState,
+    EventsQuery, HelloResponse, RejectReason, Seq, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
@@ -622,4 +623,115 @@ async fn archiving_converges_and_a_message_brings_a_session_back() {
         assert_eq!(active, all);
     }
     assert_same_view(&a, &b).await;
+}
+
+/// An answer given while the server was down, to an approval the server
+/// cancelled meanwhile (its agent was shut down with the daemon): the server
+/// refuses it as `ApprovalCancelled`, and the device shows it did not apply,
+/// on the settled item, with no way to answer again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_to_an_approval_cancelled_while_offline_is_shown_refused() {
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([Step::approval(
+            "req-1",
+            "write",
+            serde_json::json!({ "path": "a.txt" }),
+        )
+        .on_approve([Step::tool_result("written")])]),
+    );
+    let mut daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&daemon).await;
+    client.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "write a.txt".into(),
+    });
+    let view = client
+        .open_session(session, |s| s.pending_approval.is_some())
+        .await;
+    let approval = view.pending_approval.unwrap().id;
+
+    // The phone answers while the server is down; the answer is queued.
+    proxy.down();
+    client
+        .wait("the link to drop", |_, view| is_reconnecting(&view.link))
+        .await;
+    client.dispatch(Action::ResolveApproval {
+        id: approval,
+        decision: Decision::Approve,
+        rule: None,
+    });
+    // Meanwhile the server cancels the approval, as a restart does.
+    let db = &mut daemon.storage.db;
+    daemon
+        .log
+        .cancel_approval(db, approval, "interrupted")
+        .unwrap()
+        .unwrap();
+
+    proxy.up();
+    let view = client
+        .wait("the answer's result and the cancel", |c, _| {
+            c.outbox().iter().any(|e| {
+                matches!(e.command.kind, CommandKind::ResolveApproval { .. })
+                    && matches!(e.status, OutboxStatus::Done(_))
+            }) && c.cursor() >= daemon.head()
+        })
+        .await;
+    let answers = |c: &Client| {
+        c.outbox()
+            .into_iter()
+            .filter(|e| matches!(e.command.kind, CommandKind::ResolveApproval { .. }))
+            .collect::<Vec<_>>()
+    };
+    // Refused as too late, not as answered elsewhere.
+    assert_eq!(
+        answers(&client)[0].status,
+        OutboxStatus::Done(CommandResult::Rejected {
+            reason: RejectReason::ApprovalCancelled
+        })
+    );
+
+    // The prompt is gone; the settled item keeps the answer, refused.
+    let Screen::Session(view) = view.screen else {
+        panic!("not on the session")
+    };
+    assert_eq!(view.pending_approval, None);
+    let (status, answer) = view
+        .timeline
+        .iter()
+        .find_map(|item| match item {
+            TimelineItem::Logged {
+                entry:
+                    Entry::Approval {
+                        id, status, answer, ..
+                    },
+                ..
+            } if *id == approval => Some((status.clone(), answer.clone())),
+            _ => None,
+        })
+        .expect("the approval's item");
+    assert_eq!(
+        status,
+        ApprovalStatus::Cancelled {
+            reason: "interrupted".into()
+        }
+    );
+    let answer = answer.expect("this device's answer on the item");
+    assert_eq!(answer.decision, Decision::Approve);
+    assert_eq!(
+        answer.outgoing,
+        Outgoing::Failed(FailReason::ApprovalCancelled)
+    );
+    assert!(!answer.retryable, "a cancelled approval takes no answer");
+
+    // Answering again changes nothing.
+    client.dispatch(Action::ResolveApproval {
+        id: approval,
+        decision: Decision::Deny,
+        rule: None,
+    });
+    assert_eq!(answers(&client).len(), 1);
 }

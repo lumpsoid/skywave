@@ -24,7 +24,10 @@ use uuid::Uuid;
 /// `RejectReason::UnknownRule`; `EventKind::TurnUsage`. One v4 carries
 /// every wire change of its release; no compatibility layer: the exact
 /// version check at `hello` rejects older clients.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5: `RejectReason::ApprovalCancelled`, so an answer that arrives after
+/// its approval was cancelled is not reported as answered elsewhere.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -619,11 +622,30 @@ pub enum RejectReason {
     UnknownApproval,
     /// Another answer already won (D5).
     ApprovalAlreadyResolved,
+    /// The approval was cancelled before the answer arrived: its turn
+    /// ended, its agent was stopped, or the daemon restarted. No answer can
+    /// apply any more.
+    ApprovalCancelled,
     /// `Interrupt` arrived while the session had no running turn.
     NoActiveTurn,
     /// `ResolveApproval.rule` came with a denial, or names no suggestion of
     /// the approval.
     UnknownRule,
+}
+
+impl RejectReason {
+    /// Whether this refusal of a `ResolveApproval` rules out every answer:
+    /// the approval is unknown, already answered, or cancelled. Answering
+    /// again is pointless; only a refusal of the answer itself
+    /// ([`RejectReason::UnknownRule`]) leaves the approval open to another.
+    pub fn rules_out_answers(self) -> bool {
+        matches!(
+            self,
+            RejectReason::UnknownApproval
+                | RejectReason::ApprovalAlreadyResolved
+                | RejectReason::ApprovalCancelled
+        )
+    }
 }
 
 /// Body of `POST /v1/pair`, the only endpoint reachable without a client
