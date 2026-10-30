@@ -87,3 +87,74 @@ paths outside the `roots` list in its config.
 ## D15. Long-poll over HTTPS for the MVP
 `GET /v1/events?after=&wait=` returns a batch or times out empty. Survives
 proxies and the worst links; SSE/QUIC can replace it behind `Transport`.
+
+## D16. UniFFI in proc-macro mode; mirror types live in `skywave-core-ffi`
+No UDL file. `skywave-core-ffi` declares its own `#[uniffi::Record]` /
+`#[uniffi::Enum]` / `#[uniffi::Object]` mirrors of `Action`, `ViewState` and
+friends, with `From` / `TryFrom` conversions to and from the core types.
+`skywave-core` never depends on `uniffi`.
+Type mapping across the boundary:
+- ids (`SessionId`, `ApprovalId`, command ids, ...) → `String`
+- `Seq` → `u64`
+- `Duration` → millis (`u64`)
+- `DateTime<Utc>` → unix-epoch millis (`i64`)
+- `Instant` → unix-epoch millis (`i64`), converted against `SystemTime::now()`
+  at conversion time
+- `PathBuf` → `String`
+
+Mirrors are plain data. If a head would need logic to render something
+(formatting, counting, deciding visibility), that logic goes into core's
+`ViewState`, not into the mirror or Kotlin (D2).
+**Why:** keeps the core free of FFI concerns and its types idiomatic Rust; the
+conversion layer is the one place the boundary is visible.
+
+## D17. One core per process, pushed to Kotlin as a `StateFlow`
+- The Android `Application` opens and owns the single `SkywaveCore` for the
+  process lifetime; activities and view models never open their own.
+- `ViewState` reaches Kotlin through a Kotlin-implemented callback interface
+  passed to `subscribe`. It is called on a core thread and must not block:
+  it only hands the snapshot to a `MutableStateFlow`, which conflates (the
+  core may already skip snapshots, so conflation loses nothing).
+- The device name is passed at open (`EngineConfig::device_name`):
+  `Settings.Global.DEVICE_NAME` if set, else `Build.MODEL`. The core's
+  host-name default is meaningless on Android.
+
+## D18. Kotlin + Jetpack Compose, Material 3, single Activity
+- Navigation is driven by `ViewState.screen`: the core owns the route, the
+  Activity renders whatever screen it is told. System back maps to
+  `Action::Navigate`; no Jetpack Navigation graph.
+- Manual dependency injection (the `Application` holds the core and its
+  repository). Hilt/Dagger only if a later task shows a clear need.
+**Why:** a second source of navigation truth in the head would violate D2.
+
+## D19. Android build: minSdk 26, arm64-v8a + x86_64, cargo-ndk from Gradle
+- `minSdk` 26; `compileSdk` / `targetSdk` the current stable SDK.
+- ABIs: `arm64-v8a` (devices) and `x86_64` (emulator). No 32-bit ABIs.
+- Gradle runs `cargo-ndk` to build `skywave-core-ffi` into `jniLibs`.
+- Kotlin bindings are generated at build time by the crate's own
+  `uniffi-bindgen` binary (version-locked to the crate's `uniffi`), never
+  checked in.
+**Deferred:** armeabi-v7a / x86, if a real device needs them.
+
+## D20. QR scanning without Google Play Services
+Pairing scans the `skywaved pair` QR (D9) with `zxing-android-embedded`
+(ZXing core plus its own camera handling). No ML Kit / Play Services
+dependency.
+**Why:** works on de-Googled devices and emulators; one small dependency.
+CameraX + ZXing core stays the fallback if the embedded library's camera
+handling proves inadequate.
+
+## D21. Background: suspend on stop, resume on start
+The head calls `suspend()` when the app goes to the background
+(`ProcessLifecycleOwner` `ON_STOP`) and `resume()` on `ON_START`. Actions
+taken while suspended still persist and queue (D7).
+**Open (A15):** how a new approval reaches the user while the app is in the
+background. Options:
+- periodic WorkManager catch-up (resume, pull, notify, suspend);
+- opt-in foreground service keeping the link up;
+- both (WorkManager by default, foreground service as a setting).
+
+## D22. Android device key in app-private `filesDir`
+MVP per D9: the core's data dir, including the device key, lives under
+`Context.filesDir`, which only the app can read.
+**Deferred (A19):** Keystore-backed signer via an FFI callback.
