@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::{decision_label, outgoing_badge, outgoing_label};
 use crate::app::SessionUi;
-use crate::timeline::{PREVIEW_LINES, Section, sections, selectable, starts_turn};
+use crate::timeline::{ItemKey, PREVIEW_LINES, Section, sections, selectable, starts_turn};
 
 /// Most of a blob shown when expanded.
 pub const SHOW_BYTES: u64 = 64 * 1024;
@@ -83,9 +83,9 @@ impl Layout<'_> {
         if index > 0 && starts_turn(item) {
             out.push(Line::from("─".repeat(self.width)).dark_gray());
         }
-        let seq = selectable(item);
-        let selected = self.focused && seq.is_some() && seq == self.ui.selected;
-        let expanded = seq.is_some_and(|seq| self.ui.expanded.contains(&seq));
+        let key = selectable(item);
+        let selected = self.focused && key.is_some() && key == self.ui.selected;
+        let expanded = matches!(key, Some(ItemKey::Logged(seq)) if self.ui.expanded.contains(&seq));
         let marker = if selected {
             Span::raw("> ").bold().reversed()
         } else {
@@ -121,6 +121,7 @@ impl Layout<'_> {
                 from,
                 own,
                 outgoing,
+                ..
             } => {
                 let label = if *own {
                     you(outgoing.as_ref())

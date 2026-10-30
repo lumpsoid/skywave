@@ -496,6 +496,7 @@ impl Model {
                     logged.insert(*command_id);
                     let outgoing = outbox.get(command_id).copied();
                     Some(Entry::UserMessage {
+                        command_id: *command_id,
                         text: text.clone(),
                         from: *device_id,
                         own: outgoing.is_some() || self.device == Some(*device_id),
@@ -1057,6 +1058,7 @@ mod tests {
             entries,
             vec![
                 &Entry::UserMessage {
+                    command_id: command.id,
                     text: "hello".into(),
                     from: me,
                     own: true,
@@ -1089,10 +1091,11 @@ mod tests {
             CommandResult::Accepted { seq: Seq(9) },
             Utc::now(),
         );
+        let phone = CommandId::new();
         f.log(
             sid,
             vec![EventKind::UserMessage {
-                command_id: CommandId::new(),
+                command_id: phone,
                 device_id: DeviceId::new(),
                 text: "from the phone".into(),
             }],
@@ -1102,12 +1105,13 @@ mod tests {
             &timeline[0],
             TimelineItem::Logged {
                 entry: Entry::UserMessage {
+                    command_id,
                     own: false,
                     outgoing: None,
                     ..
                 },
                 ..
-            }
+            } if *command_id == phone
         ));
         assert_eq!(
             timeline[1],
