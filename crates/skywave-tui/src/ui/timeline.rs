@@ -223,6 +223,13 @@ impl Layout<'_> {
         mark: Option<Mark>,
     ) -> Vec<Line<'static>> {
         let width = self.width;
+        let aside = if expanded { None } else { unseen_blob(entry) };
+        let titled = |mut content: Vec<Span<'static>>| {
+            if let Some(aside) = &aside {
+                content.push(Span::raw(format!(" · {aside}")).dark_gray());
+            }
+            content
+        };
         let (mut out, gutter) = match entry {
             Entry::UserMessage {
                 text,
@@ -269,7 +276,7 @@ impl Layout<'_> {
                 let mut out = head_lines(
                     lead,
                     Span::styled(glyph(view.kind), style),
-                    marked(title_spans(&view.name, &view.title), mark),
+                    titled(marked(title_spans(&view.name, &view.title), mark)),
                     marked(vec![Span::styled(state, style)], mark),
                     width,
                 );
@@ -282,7 +289,7 @@ impl Layout<'_> {
                 head_lines(
                     lead,
                     Span::raw("•"),
-                    marked(title_spans(name, summary), mark),
+                    titled(marked(title_spans(name, summary), mark)),
                     Vec::new(),
                     width,
                 ),
@@ -292,7 +299,7 @@ impl Layout<'_> {
                 head_lines(
                     lead,
                     Span::raw("↳"),
-                    vec![Span::raw("result").bold()],
+                    titled(vec![Span::raw("result").bold()]),
                     Vec::new(),
                     width,
                 ),
@@ -308,7 +315,7 @@ impl Layout<'_> {
                 let out = head_lines(
                     lead,
                     Span::styled("?", style),
-                    marked(title_spans(tool, summary), mark),
+                    titled(marked(title_spans(tool, summary), mark)),
                     vec![Span::styled(state, style)],
                     width,
                 );
@@ -399,15 +406,34 @@ impl Layout<'_> {
                     );
                     preview.into_iter().map(clean).collect()
                 }
-                Some(BlobState::Downloading { got, size }) => {
+                Some(BlobState::Requested { size }) => {
+                    note = Some(
+                        Span::raw(format!("requested · waiting for a slot · {}", bytes(*size)))
+                            .cyan(),
+                    );
+                    preview.into_iter().map(clean).collect()
+                }
+                Some(BlobState::Downloading { got, size, paused }) => {
+                    let progress = format!(
+                        "downloading · {} of {} ({}%)",
+                        bytes(*got),
+                        bytes(*size),
+                        percent(*got, *size)
+                    );
+                    note = Some(if *paused {
+                        Span::raw(format!("{progress} · paused, offline")).yellow()
+                    } else {
+                        Span::raw(progress).cyan()
+                    });
+                    preview.into_iter().map(clean).collect()
+                }
+                Some(BlobState::Failed { size, reason }) => {
                     note = Some(
                         Span::raw(format!(
-                            "downloading · {} of {} ({}%)",
-                            bytes(*got),
-                            bytes(*size),
-                            percent(*got, *size)
+                            "download failed: {reason} · {} · d retries",
+                            bytes(*size)
                         ))
-                        .cyan(),
+                        .red(),
                     );
                     preview.into_iter().map(clean).collect()
                 }
@@ -433,12 +459,23 @@ impl Layout<'_> {
                 ));
             }
             if let Some(blob) = section.blob {
-                more.push(match blob.state {
+                more.push(match &blob.state {
                     BlobState::NotDownloaded { size } => {
-                        format!("full {} · not downloaded", bytes(size))
+                        format!("full {} · not downloaded", bytes(*size))
                     }
-                    BlobState::Downloading { got, size } => {
-                        format!("downloading {}%", percent(got, size))
+                    BlobState::Requested { size } => {
+                        format!("full {} · requested", bytes(*size))
+                    }
+                    BlobState::Downloading { got, size, paused } => {
+                        let progress = format!("downloading {}%", percent(*got, *size));
+                        if *paused {
+                            format!("{progress} · paused, offline")
+                        } else {
+                            progress
+                        }
+                    }
+                    BlobState::Failed { size, .. } => {
+                        format!("full {} · download failed · d retries", bytes(*size))
                     }
                     BlobState::Available { .. } => "downloaded".to_owned(),
                 });
@@ -459,6 +496,36 @@ impl Layout<'_> {
         }
         out
     }
+}
+
+/// While collapsed, the state of an item's blob when no section on screen
+/// carries one (a hidden input or output, an empty preview), so `d` on it
+/// shows what it did: `input 4.2 KiB`, `output 4.2 KiB · requested`.
+fn unseen_blob(entry: &Entry) -> Option<String> {
+    let sections = sections(entry);
+    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
+    if sections.iter().any(|s| shown(s) && s.blob.is_some()) {
+        return None;
+    }
+    let section = sections.iter().find(|s| s.blob.is_some())?;
+    let what = match (section.input, section.hidden) {
+        (true, _) => "input",
+        (false, true) => "output",
+        (false, false) => "full",
+    };
+    let state = match &section.blob?.state {
+        BlobState::NotDownloaded { size } => bytes(*size),
+        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
+        BlobState::Downloading { got, size, paused } => format!(
+            "{} · downloading {}%{}",
+            bytes(*size),
+            percent(*got, *size),
+            if *paused { " · paused, offline" } else { "" }
+        ),
+        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
+        BlobState::Available { .. } => return None,
+    };
+    Some(format!("{what} {state}"))
 }
 
 /// A section's head as the approval panel shows it: its preview's lines
@@ -492,11 +559,14 @@ pub(super) fn preview_lines(
         .max(preview.len());
     let rest = whole - shown;
     if rest > 0 || section.blob.is_some() {
-        let more = match rest {
+        let mut more = match rest {
             0 => String::new(),
             1 => "+1 line · ".to_owned(),
             _ => format!("+{rest} lines · "),
         };
+        if let Some(size) = section.blob.and_then(|blob| blob_size(&blob.state)) {
+            more.push_str(&format!("full {} · ", bytes(size)));
+        }
         out.extend(wrap(
             bar(),
             bar(),
@@ -975,6 +1045,17 @@ pub(super) fn clean(line: &str) -> String {
         }
     }
     out
+}
+
+/// A blob's size while it is not here; a downloaded blob is its file.
+pub(super) fn blob_size(state: &BlobState) -> Option<u64> {
+    match state {
+        BlobState::NotDownloaded { size }
+        | BlobState::Requested { size }
+        | BlobState::Downloading { size, .. }
+        | BlobState::Failed { size, .. } => Some(*size),
+        BlobState::Available { .. } => None,
+    }
 }
 
 pub(super) fn percent(got: u64, size: u64) -> u64 {

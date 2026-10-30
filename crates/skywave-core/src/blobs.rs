@@ -26,8 +26,8 @@
 //! blob instead, the file starts over. The content must have exactly the
 //! size the event's `BlobRef` gave, and the server must agree on it; a
 //! mismatch, an unknown blob or a local file error deletes the `.part`
-//! file, logs an error and leaves the blob `NotDownloaded` until it is
-//! asked for again.
+//! file, logs an error and leaves the blob `NotDownloaded`, failed with
+//! that reason, until it is asked for again.
 //!
 //! **Status.** `Downloading { got, path }` (`path` the `.part` file) is
 //! reported when a response starts, then at most every
@@ -287,12 +287,13 @@ impl FetchError {
     }
 }
 
-/// Deletes what was fetched of a blob and leaves it `NotDownloaded`.
+/// Deletes what was fetched of a blob and leaves it `NotDownloaded`, with
+/// the reason shown until it is asked for again.
 async fn give_up(ctx: &BlobCtx, id: BlobId, error: &FetchError) {
     tracing::error!(?id, %error, "blob download failed");
     let part = part_path(&blob_dir(&ctx.seam.data_dir()), id);
     let _ = tokio::fs::remove_file(&part).await;
-    match ctx.seam.blob_status(id, BlobStatus::NotDownloaded) {
+    match ctx.seam.blob_failed(id, error.to_string()) {
         Ok(()) | Err(CoreError::Store(crate::store::StoreError::UnknownBlob(_))) => {}
         Err(error) => tracing::warn!(?id, %error, "cannot reset the blob's status"),
     }
@@ -458,12 +459,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::Core;
     use crate::backoff::{Backoff, Jitter};
     use crate::engine::Connector;
     use crate::identity::PairedCredentials;
     use crate::transport::{BlobBody, BlobDownload, BoxFuture};
-    use crate::view::DeviceId;
+    use crate::view::{BlobState, DeviceId, Entry, Screen, TimelineItem};
+    use crate::{Action, Core};
 
     /// Serves one blob's content (claiming `total` as its size), honouring
     /// `from`, in chunks of `chunk` bytes; records each request's `from`.
@@ -531,7 +532,9 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
+        core: Core,
         seam: Seam,
+        session_id: SessionId,
         blob: BlobRef,
         server: Arc<BlobServer>,
         queue: Arc<BlobQueue>,
@@ -591,7 +594,9 @@ mod tests {
             });
             Fixture {
                 _dir: dir,
+                core,
                 seam,
+                session_id,
                 blob,
                 server,
                 queue: Arc::new(BlobQueue::default()),
@@ -636,6 +641,28 @@ mod tests {
             downloader.abort();
         }
 
+        /// The blob as the open session shows it.
+        fn shown(&self) -> BlobState {
+            self.core
+                .dispatch(Action::OpenSession(self.session_id))
+                .unwrap();
+            match self.core.view().screen {
+                Screen::Session(view) => match &view.timeline[..] {
+                    [
+                        TimelineItem::Logged {
+                            entry:
+                                Entry::ToolResult {
+                                    output: Some(blob), ..
+                                },
+                            ..
+                        },
+                    ] => blob.state.clone(),
+                    other => panic!("expected the tool result, got {other:?}"),
+                },
+                other => panic!("expected the session, got {other:?}"),
+            }
+        }
+
         fn part(&self) -> PathBuf {
             part_path(&blob_dir(&self.seam.data_dir()), self.blob.id)
         }
@@ -672,6 +699,16 @@ mod tests {
         assert_eq!(f.status(), BlobStatus::NotDownloaded);
         assert!(!f.part().exists());
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
+        // It says why it stopped, until asked for again.
+        assert_eq!(
+            f.shown(),
+            BlobState::Failed {
+                size: 5000,
+                reason: "blob size mismatch: expected 5000 bytes, the server has 6000".into()
+            }
+        );
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
     }
 
     #[tokio::test]

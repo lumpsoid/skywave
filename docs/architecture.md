@@ -96,8 +96,10 @@ enum SessionState {
 
 enum BlobState {
     NotDownloaded { size: u64 },
-    Downloading { got: u64, size: u64 },
-    Available,
+    Requested { size: u64 },                         // asked for, waiting for a slot
+    Downloading { got: u64, size: u64, paused: bool }, // paused: the link is down
+    Failed { size: u64, reason: String },            // given up; asking again retries
+    Available { path: PathBuf },
 }
 ```
 

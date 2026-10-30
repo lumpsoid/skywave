@@ -778,8 +778,10 @@ impl App {
                 self.ui.copy = Some(Clip::File { path, strip });
                 return None;
             }
-            BlobState::NotDownloaded { size } => (size, Some(Action::DownloadBlob(blob.id))),
-            BlobState::Downloading { size, .. } => (size, None),
+            BlobState::NotDownloaded { size } | BlobState::Failed { size, .. } => {
+                (size, Some(Action::DownloadBlob(blob.id)))
+            }
+            BlobState::Requested { size } | BlobState::Downloading { size, .. } => (size, None),
         };
         self.ui.notice = Some(format!(
             "downloading {} · press {key} again when it is here",
@@ -1256,7 +1258,6 @@ impl App {
                 KeyCode::Char('d') => session
                     .selected_entry(view)
                     .and_then(wanted_blob)
-                    .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
                     .map(|blob| Action::DownloadBlob(blob.id)),
                 KeyCode::Char(c @ ('y' | 'Y')) => {
                     let item = session.selected.and_then(|key| find(view, key));
@@ -1580,7 +1581,7 @@ impl SessionUi {
     }
 
     /// The selected logged item's entry; a pending message has none.
-    fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
+    pub(crate) fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
         let Some(ItemKey::Logged(seq)) = self.selected else {
             return None;
         };
