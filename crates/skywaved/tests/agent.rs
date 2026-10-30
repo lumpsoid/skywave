@@ -786,18 +786,28 @@ fn large_content_gives_small_events_and_blobs() {
         ],
     );
     let kinds = f.kinds();
-    for kind in &kinds[1..=3] {
+    for (i, kind) in kinds[1..=3].iter().enumerate() {
         let wire = serde_json::to_string(kind).unwrap();
-        assert!(wire.len() < 1024, "{} bytes: {wire}", wire.len());
+        // The call carries a body preview beside its title.
+        let max = if i == 0 {
+            1024 + PREVIEW_MAX_BYTES
+        } else {
+            1024
+        };
+        assert!(wire.len() < max, "{} bytes: {wire}", wire.len());
         assert!(!wire.contains("[error]"));
     }
     let title = format!("{}…", "é".repeat(TITLE_MAX_CHARS - 1));
 
-    // The generic display: the cut first line; the whole input as a blob.
+    // The generic display: the cut first line, the whole text as a body;
+    // the whole input as a blob.
     let EventKind::ToolCall(ToolCall { display, .. }) = &kinds[1] else {
         panic!("expected ToolCall, got {:?}", kinds[1]);
     };
     assert_eq!(display.title, title);
+    let body = display.body.as_ref().expect("a cut title has a body");
+    assert_eq!((body.format, body.lines), (BodyFormat::Text, 4001));
+    assert!(body.full.is_some());
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&f.blob(&kinds[1])).unwrap(),
         input
@@ -1059,4 +1069,72 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
             (None, "late"),
         ]
     );
+}
+
+/// A shell call shown by the adapter with `title` and no body; the input is
+/// a blob exactly when the body is cut.
+fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
+    let mut mapper = EventMapper::new(f.session_id);
+    apply_all(
+        f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::ToolCall {
+                call: Some("c1".into()),
+                name: "shell".into(),
+                input: json!({ "command": title }),
+                display: Some(agent::ToolDisplay {
+                    kind: ToolKind::Shell,
+                    title: title.into(),
+                    detail: None,
+                    body: None,
+                    shows_all_input: true,
+                }),
+            },
+        ],
+    );
+    let EventKind::ToolCall(call) = f.kinds().remove(1) else {
+        panic!("expected ToolCall");
+    };
+    let body_cut = call.display.body.as_ref().is_some_and(|b| b.full.is_some());
+    assert_eq!(call.input.is_some(), body_cut, "{call:?}");
+    call.display
+}
+
+#[test]
+fn a_cut_title_gets_a_text_body() {
+    let mut f = Fixture::new();
+    let command = "cargo build \\\n  --release\n";
+    let display = shell_call(&mut f, command);
+    assert_eq!(display.title, "cargo build \\…");
+    assert_eq!(
+        display.body,
+        Some(skywave_proto::Body {
+            format: BodyFormat::Text,
+            preview: command.trim().to_owned(),
+            lines: 2,
+            full: None,
+        })
+    );
+}
+
+#[test]
+fn a_short_title_gets_none() {
+    let mut f = Fixture::new();
+    let display = shell_call(&mut f, "ls -la");
+    assert_eq!((display.title.as_str(), display.body), ("ls -la", None));
+}
+
+#[test]
+fn a_huge_command_blobs_the_body() {
+    let mut f = Fixture::new();
+    let huge = huge_text();
+    let display = shell_call(&mut f, &huge);
+    let body = display.body.expect("a cut title has a body");
+    assert_eq!(body.format, BodyFormat::Text);
+    assert!(body.preview.len() <= PREVIEW_MAX_BYTES);
+    assert_eq!(body.lines, 4001);
+    let full = body.full.expect("the body is a blob");
+    assert_eq!(full.size, huge.trim().len() as u64);
 }

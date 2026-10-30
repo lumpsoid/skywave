@@ -7,8 +7,8 @@ use skywave_proto::limits::{
     DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, ApprovalId, BlobRef, Body, CallId, EventKind, Seq, SessionId, SessionState,
-    ToolCall, ToolKind, ToolResult,
+    self as proto, ApprovalId, BlobRef, Body, BodyFormat, CallId, EventKind, Seq, SessionId,
+    SessionState, ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
@@ -51,7 +51,10 @@ const AGENT_EXITED: &str = "agent exited";
 /// line and its char cap (a cut one ends in `…`); a body or result preview
 /// to its first [`PREVIEW_MAX_LINES`] lines and [`PREVIEW_MAX_BYTES`] bytes.
 /// Cuts fall on char boundaries; `lines` counts the whole content. Failure
-/// is `is_error`, never a marker in the text.
+/// is `is_error`, never a marker in the text. A cut title of a display with
+/// no body gets a `Text` body holding its whole text (bounded and blobbed
+/// like any body), so a long or multi-line command is never shown in part
+/// only; such a title no longer counts as cut for the input blob.
 ///
 /// **Blobs** are made only for content that was cut: a body's text
 /// (`Body::full`) when its preview is shorter; a result's output when its
@@ -318,10 +321,10 @@ fn call_display(
                 }
                 None => (None, false),
             };
-            let body = display
-                .body
-                .map(|body| display_body(storage, body))
-                .transpose()?;
+            let (body, title_cut) = match display.body {
+                Some(body) => (Some(display_body(storage, body)?), title_cut),
+                None => (title_body(storage, &display.title, title_cut)?, false),
+            };
             let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: display.kind,
@@ -335,14 +338,17 @@ fn call_display(
             )
         }
         None => {
-            let (title, shown_whole) = generic_title(input);
+            let (text, whole) = generic_text(input);
+            let (title, title_cut) = cut_line(&text, TITLE_MAX_CHARS);
+            let body = title_body(storage, &text, title_cut)?;
+            let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: ToolKind::Other,
                 title,
                 detail: None,
-                body: None,
+                body,
             };
-            (display, shown_whole)
+            (display, whole && !body_cut)
         }
     };
     let blob = if shown_whole {
@@ -351,6 +357,19 @@ fn call_display(
         Some(input_blob(storage, input)?)
     };
     Ok((display, blob))
+}
+
+/// The body standing in for a cut title: its whole text, so a long or
+/// multi-line title (a shell command) is never shown in part only.
+fn title_body(storage: &Storage, title: &str, cut: bool) -> Result<Option<Body>> {
+    if !cut {
+        return Ok(None);
+    }
+    let body = DisplayBody {
+        format: BodyFormat::Text,
+        text: title.trim().to_owned(),
+    };
+    display_body(storage, body).map(Some)
 }
 
 /// A body's preview, with its text as a blob when the preview is shorter.
@@ -396,10 +415,18 @@ fn tool_result(
 }
 
 /// Title of the generic display for `input`, cut, and whether it shows all
-/// of the input: the input itself if it is a string, else its first string
-/// field, else its compact JSON.
+/// of the input (see [`generic_text`]).
 fn generic_title(input: &Value) -> (String, bool) {
-    let (text, whole) = match input {
+    let (text, whole) = generic_text(input);
+    let (title, cut) = cut_line(&text, TITLE_MAX_CHARS);
+    (title, whole && !cut)
+}
+
+/// Title text of the generic display for `input`, uncut, and whether it
+/// holds all of the input: the input itself if it is a string, else its
+/// first string field, else its compact JSON.
+fn generic_text(input: &Value) -> (String, bool) {
+    match input {
         Value::String(text) => (text.clone(), true),
         Value::Object(fields) => match fields.values().find_map(Value::as_str) {
             Some(text) => (text.to_owned(), fields.len() == 1),
@@ -407,9 +434,7 @@ fn generic_title(input: &Value) -> (String, bool) {
         },
         Value::Null => (String::new(), true),
         _ => (input.to_string(), true),
-    };
-    let (title, cut) = cut_line(&text, TITLE_MAX_CHARS);
-    (title, whole && !cut)
+    }
 }
 
 /// `input` stored whole: a string as itself, anything else pretty-printed.
@@ -508,18 +533,18 @@ mod tests {
     #[test]
     fn the_generic_title_is_the_first_string_field() {
         assert_eq!(
-            generic_title(&json!({ "command": "ls" })),
+            generic_text(&json!({ "command": "ls" })),
             ("ls".to_owned(), true)
         );
         assert_eq!(
-            generic_title(&json!({ "count": 3, "path": "a.txt", "text": "hi" })),
+            generic_text(&json!({ "count": 3, "path": "a.txt", "text": "hi" })),
             ("a.txt".to_owned(), false)
         );
         assert_eq!(
-            generic_title(&json!({ "count": 3 })),
+            generic_text(&json!({ "count": 3 })),
             (r#"{"count":3}"#.to_owned(), true)
         );
-        assert_eq!(generic_title(&json!("echo")), ("echo".to_owned(), true));
-        assert_eq!(generic_title(&Value::Null), (String::new(), true));
+        assert_eq!(generic_text(&json!("echo")), ("echo".to_owned(), true));
+        assert_eq!(generic_text(&Value::Null), (String::new(), true));
     }
 }
