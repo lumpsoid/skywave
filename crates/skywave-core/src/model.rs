@@ -89,7 +89,8 @@ struct OpenSession {
     id: SessionId,
     events: Vec<(Seq, Event)>,
     /// The first event after the read mark as it was when the session
-    /// opened, if agent output follows it. Marking read leaves it alone.
+    /// opened, past this device's own messages, if agent output follows
+    /// it. Marking read leaves it alone.
     unread_from: Option<Seq>,
 }
 
@@ -604,7 +605,7 @@ impl Model {
         if self.place == Place::Session(id) {
             let read = self.read_marks.get(&id).map_or(Seq::ZERO, |m| m.seq);
             let mut unseen = events.iter().filter(|(seq, _)| *seq > read);
-            let first = unseen.clone().next().map(|(seq, _)| *seq);
+            let first = self.first_unseen(unseen.clone());
             let unread_from = first.filter(|_| unseen.any(|(_, e)| is_notable(&e.kind)));
             self.open = Some(OpenSession {
                 id,
@@ -612,6 +613,42 @@ impl Model {
                 unread_from,
             });
         }
+    }
+
+    /// Where the divider goes in `unseen`: its first event, past any
+    /// messages this device sent before the first news or other device's
+    /// message. Whoever sent a message here saw what came before it.
+    fn first_unseen<'a>(&self, unseen: impl Iterator<Item = &'a (Seq, Event)>) -> Option<Seq> {
+        let mut first = None;
+        for (seq, event) in unseen {
+            match &event.kind {
+                EventKind::UserMessage {
+                    command_id,
+                    device_id,
+                    ..
+                } => {
+                    let sent = self.outbox.iter().any(|e| e.command.id == *command_id);
+                    if self.is_own_message(sent, *device_id) {
+                        first = None;
+                        continue;
+                    }
+                    return first.or(Some(*seq));
+                }
+                kind => {
+                    let at = *first.get_or_insert(*seq);
+                    if is_notable(kind) {
+                        return Some(at);
+                    }
+                }
+            }
+        }
+        first
+    }
+
+    /// A logged user message is this device's own if it is still in the
+    /// outbox (`sent`) or carries this device's id.
+    fn is_own_message(&self, sent: bool, device_id: DeviceId) -> bool {
+        sent || self.device == Some(device_id)
     }
 
     /// Mirrors [`Store::delete_session_locally`](crate::Store::delete_session_locally),
@@ -1012,7 +1049,7 @@ impl Model {
                         command_id: *command_id,
                         text: text.clone(),
                         from: *device_id,
-                        own: sent.is_some() || self.device == Some(*device_id),
+                        own: self.is_own_message(sent.is_some(), *device_id),
                         outgoing: sent.map(|e| Outgoing::from(&e.status)),
                         delivery: sent.and_then(|e| Delivery::of(e)),
                     })
@@ -3551,6 +3588,67 @@ mod tests {
         f.dispatch(Action::Navigate(Route::SessionList));
         f.open(sid);
         assert_eq!(f.session_view().unread_from, None);
+    }
+
+    #[test]
+    fn divider_goes_below_own_messages() {
+        let mut f = Fixture::paired();
+        let me = f.me;
+        let message = |device_id| EventKind::UserMessage {
+            command_id: CommandId::new(),
+            device_id,
+            text: "hi".into(),
+        };
+        // Created here: the first message, then the agent's answer.
+        let sid = f.session("/srv/a");
+        f.log(sid, vec![message(me), agent("hello")]);
+        f.open(sid);
+        assert_eq!(
+            f.session_view().unread_from,
+            Some(Seq(3)),
+            "past my message"
+        );
+        f.dispatch(Action::Navigate(Route::SessionList));
+
+        // Another device's message first is news to this one.
+        let other = f.session("/srv/b");
+        f.log(
+            other,
+            vec![message(DeviceId::new()), message(me), agent("ok")],
+        );
+        f.open(other);
+        // From the start (seq 4, not shown), so above their message.
+        assert_eq!(f.session_view().unread_from, Some(Seq(4)), "theirs");
+        f.dispatch(Action::Navigate(Route::SessionList));
+
+        // Mine after theirs, then a tool call and the answer.
+        let third = f.session("/srv/c");
+        f.log(
+            third,
+            vec![
+                message(me),
+                message(DeviceId::new()),
+                message(me),
+                tool_call(None, ToolKind::Shell, "ls"),
+                agent("done"),
+            ],
+        );
+        f.open(third);
+        assert_eq!(f.session_view().unread_from, Some(Seq(10)), "theirs");
+        f.dispatch(mark_read(third, 13));
+        f.dispatch(Action::Navigate(Route::SessionList));
+
+        // Read, then mine: the divider goes on what the agent did next.
+        f.log(
+            third,
+            vec![
+                message(me),
+                tool_call(None, ToolKind::Shell, "ls"),
+                agent("more"),
+            ],
+        );
+        f.open(third);
+        assert_eq!(f.session_view().unread_from, Some(Seq(15)), "the tool call");
     }
 
     const ONLINE: Link = Link::Online { latency_ms: 5 };
