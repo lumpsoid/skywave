@@ -1,9 +1,10 @@
 //! Agent supervisor (T10) with the fake agent: commands go through
 //! `EventLog::handle` as the HTTPS API would send them, and the supervisor
-//! does the rest. Waits are driven by the log's notifier with a bound, never
+//! does the rest; a few run the Claude Code adapter against
+//! `tests/support/fake-claude.sh` instead. Waits are driven by the log's notifier with a bound, never
 //! by fixed sleeps.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
@@ -11,7 +12,9 @@ use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
     RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState, ToolResult,
 };
+use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, Step};
+use skywaved::config::AgentConfig;
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
@@ -767,4 +770,94 @@ async fn agent_that_cannot_start_errors_the_session() {
             if message.starts_with("cannot start agent")
     ));
     supervisor.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The Claude Code adapter, against tests/support/fake-claude.sh
+
+fn claude_adapter() -> ClaudeCodeAdapter {
+    ClaudeCodeAdapter::new(AgentConfig {
+        command: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-claude.sh"),
+        args: Vec::new(),
+    })
+    .with_grace_period(Duration::from_secs(5))
+}
+
+/// The fake CLI's process id, from `pid.txt` in the session workdir.
+fn fake_cli_pid(f: &Fixture) -> u32 {
+    std::fs::read_to_string(f.root.join("project/pid.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Whether process `pid` exists, a zombie included (`kill -0`).
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+async fn start_claude(f: &Fixture) -> SupervisorHandle {
+    Supervisor::start(
+        claude_adapter(),
+        &f.data,
+        f.log.clone(),
+        SupervisorConfig::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn daemon_restart_cancels_a_claude_approval_left_pending_at_shutdown() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+
+    f.send("please approve");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    let id = f.approval_id();
+    let pid = fake_cli_pid(&f);
+    supervisor.shutdown().await.unwrap();
+    // The agent is gone, and was not interrupted: nothing was cancelled.
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    assert_eq!(f.log.pending_approvals(&f.storage.db).unwrap().len(), 1);
+    assert!(
+        !f.kinds()
+            .iter()
+            .any(|k| matches!(k, EventKind::ApprovalCancelled { .. }))
+    );
+
+    f.reopen_log();
+    let supervisor = start_claude(&f).await;
+    let kinds = f.kinds();
+    assert_eq!(
+        kinds[kinds.len() - 2..],
+        [
+            EventKind::ApprovalCancelled {
+                id,
+                reason: DAEMON_RESTARTED.into()
+            },
+            state(SessionState::Errored {
+                message: TURN_LOST.into()
+            }),
+        ]
+    );
+    assert_eq!(
+        f.resolve(DeviceId::new(), id, Decision::Approve),
+        CommandResult::Rejected {
+            reason: RejectReason::ApprovalCancelled
+        }
+    );
+
+    // The next message resumes the agent.
+    f.send("again");
+    f.wait_count("idle", 1, is_idle).await;
+    let pid = fake_cli_pid(&f);
+    supervisor.shutdown().await.unwrap();
+    assert!(!process_exists(pid), "agent process {pid} still exists");
 }

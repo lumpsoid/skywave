@@ -268,7 +268,9 @@ pub trait AgentSession: Send + 'static {
     fn interrupt(&mut self) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
-    /// Interrupt first to stop a running turn cleanly.
+    /// Interrupt first to stop a running turn cleanly; a turn still running
+    /// without an interrupt is abandoned, not ended, and its approvals are
+    /// left for the caller.
     fn shutdown(self) -> impl Future<Output = Result<(), AgentError>> + Send;
 }
 

@@ -877,6 +877,25 @@ fn argv(workdir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The fake CLI's process id, from ./pid.txt in its workdir.
+fn fake_pid(workdir: &Path) -> u32 {
+    std::fs::read_to_string(workdir.join("pid.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Whether process `pid` exists, a zombie included (`kill -0`).
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn text(text: &str) -> AdapterEvent {
     AdapterEvent::Text(text.to_owned())
 }
@@ -1138,7 +1157,7 @@ async fn a_missing_command_is_a_start_error() {
 }
 
 #[tokio::test]
-async fn shutdown_mid_turn_interrupts_and_waits_for_the_result() {
+async fn shutdown_after_an_interrupt_waits_for_the_result() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
     assert!(matches!(
@@ -1152,12 +1171,37 @@ async fn shutdown_mid_turn_interrupts_and_waits_for_the_result() {
     );
     // A message queued behind the running turn is dropped by the shutdown.
     session.send_message("never sent".to_owned()).await.unwrap();
+    session.interrupt().await.unwrap();
     session.shutdown().await.unwrap();
     assert_eq!(
         take(&mut events, 2).await,
         [INTERRUPTED, AdapterEvent::Exited { error: None }]
     );
     assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await,
+        AdapterEvent::ResumeHandle(_)
+    ));
+    session.send_message("approve".to_owned()).await.unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [AdapterEvent::TurnStarted, write_call(), write_approval()]
+    );
+    let pid = fake_pid(tmp.path());
+    session.shutdown().await.unwrap();
+    // Neither cancelled nor ended: the process was killed, not interrupted.
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(events.recv().await.is_none());
+    assert!(!process_exists(pid), "agent process {pid} still exists");
 }
 
 #[tokio::test]
@@ -1198,9 +1242,12 @@ async fn dropping_the_session_stops_the_agent() {
         take(&mut events, 2).await,
         [AdapterEvent::TurnStarted, text("working")]
     );
+    let pid = fake_pid(tmp.path());
     drop(session);
     assert_eq!(
-        take(&mut events, 2).await,
-        [INTERRUPTED, AdapterEvent::Exited { error: None }]
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
     );
+    assert!(events.recv().await.is_none());
+    assert!(!process_exists(pid), "agent process {pid} still exists");
 }

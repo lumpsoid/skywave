@@ -4,13 +4,14 @@
 # shapes copied from the T07 fixtures, and replies only to what it reads, so
 # every run is the same.
 #
-# It writes its argv to ./argv.txt (the session workdir). A user message
-# containing "approve" asks for a Write permission; one containing "hang"
-# streams until interrupted; one containing "crash" exits 3 with a stderr
-# line; any other message gets the text "echo".
+# It writes its argv to ./argv.txt and its pid to ./pid.txt (the session
+# workdir). A user message containing "approve" asks for a Write permission;
+# one containing "hang" streams until interrupted; one containing "crash"
+# exits 3 with a stderr line; any other message gets the text "echo".
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id.
 
 printf '%s\n' "$@" > argv.txt
+echo $$ > pid.txt
 
 sid=""
 prev=""

@@ -43,9 +43,15 @@ Not platform-specific.
 On link loss: reconnect with backoff, resume pull from last `seq`, resend
 queued commands. Client-generated command ids make resend idempotent.
 
-## D8. Approvals wait indefinitely
-The agent stays blocked until any device answers.
+## D8. Approvals wait indefinitely while the agent session lives
+The agent stays blocked until any device answers. A daemon restart cancels
+the approvals still pending (`ApprovalCancelled { reason: "daemon
+restarted" }`): the agent's request lives only in its process, over stdio,
+and `--resume` restores the history, not an in-flight turn
+(docs/agents/claude-code.md §5).
 **Deferred:** configurable timeout / auto-deny / pre-approved tool list.
+**Deferred:** an agent host process that survives `skywaved` restarts, the
+only way to keep a pending approval across one.
 
 ## D9. Identity: mTLS with a server-owned CA
 - `skywaved` creates its CA and server certificate on first run.
