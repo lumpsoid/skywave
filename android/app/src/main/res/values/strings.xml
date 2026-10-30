@@ -4,13 +4,14 @@
 
     <!-- Startup -->
     <string name="startup_failed_title">Could not start Skywave</string>
-    <string name="startup_core_version">core %1$s</string>
+    <string name="startup_app_version">version %1$s</string>
 
     <!-- Failed core calls (CoreMessage) -->
     <string name="message_storage">Storage error: %1$s</string>
     <string name="message_io">Could not read file: %1$s</string>
     <string name="message_invalid_pair_uri">Not a Skywave pairing code: %1$s</string>
     <string name="message_shut_down">Skywave has shut down</string>
+    <string name="message_native_library">The app is incomplete for this device: %1$s</string>
 
     <!-- Common -->
     <string name="action_back">Back</string>

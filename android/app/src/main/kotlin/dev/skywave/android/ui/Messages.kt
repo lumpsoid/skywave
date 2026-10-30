@@ -10,5 +10,6 @@ fun CoreMessage.text(resources: Resources): String = when (this) {
     is CoreMessage.Io -> resources.getString(R.string.message_io, reason)
     is CoreMessage.InvalidPairUri -> resources.getString(R.string.message_invalid_pair_uri, reason)
     CoreMessage.ShutDown -> resources.getString(R.string.message_shut_down)
+    is CoreMessage.NativeLibrary -> resources.getString(R.string.message_native_library, reason)
     is CoreMessage.Other -> detail
 }

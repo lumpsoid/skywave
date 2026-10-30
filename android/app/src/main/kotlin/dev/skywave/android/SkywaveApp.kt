@@ -35,8 +35,6 @@ class SkywaveApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        // Routes the core's tracing output to logcat; null keeps the default filter.
-        initLogging(null)
         // Registered before any activity starts, so the first ON_START is seen.
         ProcessLifecycleOwner.get().lifecycle.addObserver(
             CoreLifecycleObserver { (core as? CoreStartup.Ready)?.repository },
@@ -47,7 +45,13 @@ class SkywaveApp : Application() {
         val dataDir = File(filesDir, "skywave") // D22
         Log.i(TAG, "opening core at $dataDir")
         val startup = startCore(
-            open = { SkywaveCore.open(dataDir.path, deviceName()) },
+            open = {
+                // The first native calls, inside open so a library that will
+                // not load ends at the Failed screen. Routes the core's
+                // tracing to logcat; null keeps the default filter.
+                initLogging(null)
+                SkywaveCore.open(dataDir.path, deviceName())
+            },
             scope = appScope,
             dispatchContext = Dispatchers.IO,
         )

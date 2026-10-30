@@ -53,7 +53,6 @@ fun AppShell(
     val screen = state.screen
     val back = backRoute(screen)
     val goBack = back?.let { route -> { dispatch(Action.Navigate(route)) } }
-    BackHandler(enabled = goBack != null) { goBack?.invoke() }
 
     val onPairing = screen is Screen.Pairing
     val pairAgain = { dispatch(Action.Navigate(Route.PAIRING)) }
@@ -61,15 +60,21 @@ fun AppShell(
 
     // Dismissing the full-screen state is presentation only; it comes back
     // when the link is refused anew (a different rejection, or after a
-    // reconnect).
+    // reconnect). System back on it means "keep reading" too: navigating
+    // behind a screen that hides the result would surprise the user.
     val rejection = (state.link as? Link.Rejected)?.rejection
     var keepReading by rememberSaveable(rejection?.toString()) { mutableStateOf(false) }
     if (rejection != null && !onPairing && !keepReading) {
+        BackHandler { keepReading = true }
         Scaffold(snackbarHost = snackbarHost) { padding ->
             RejectedScreen(rejection, onPairAgain = pairAgain, onKeepReading = { keepReading = true }, padding)
         }
         return
     }
+
+    // After the early return, so it is only registered while the screen it
+    // navigates away from is the one showing.
+    BackHandler(enabled = goBack != null) { goBack?.invoke() }
 
     val chrome = ShellChrome(
         banners = {

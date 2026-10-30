@@ -42,6 +42,8 @@ private class FakeCore(initial: ViewState) : SkywaveCoreInterface {
     var failWith: ((Action) -> Exception?) = { null }
     var dispatchDelayMs = 0L
     var suspended = false
+    var failView: Exception? = null
+    var shutdowns = 0
 
     /** What the core does after a change: tell every listener. */
     fun publish(view: ViewState) {
@@ -61,10 +63,12 @@ private class FakeCore(initial: ViewState) : SkywaveCoreInterface {
         return listeners.size.toULong()
     }
 
-    override fun view(): ViewState = current
+    override fun view(): ViewState = failView?.let { throw it } ?: current
     override fun resume() { suspended = false }
     override fun suspend() { suspended = true }
-    override fun shutdown() = Unit
+    override fun shutdown() {
+        shutdowns++
+    }
     override fun unsubscribe(id: ULong) = Unit
 }
 
@@ -136,20 +140,18 @@ class CoreRepositoryTest {
     }
 
     @Test
-    fun networkBackSendsRetryNowOnlyWhileReconnecting() = runTest {
+    fun networkBackAlwaysSendsRetryNowAndTheCoreDecides() = runTest {
+        // The core ignores RetryNow unless reconnecting (model.rs), so the
+        // repository does not second-guess a possibly stale snapshot.
         val core = FakeCore(viewState())
         val repo = repository(core)
-        for (link in listOf(Link.Connecting, Link.Online(5u), Link.CatchingUp(1u, 9u))) {
+        val links = listOf(Link.Connecting, Link.Online(5u), Link.CatchingUp(1u, 9u), reconnecting)
+        for (link in links) {
             core.publish(viewState(link = link))
             repo.onNetworkAvailable()
         }
         runCurrent()
-        assertTrue(core.dispatched.isEmpty())
-
-        core.publish(viewState(link = reconnecting))
-        repo.onNetworkAvailable()
-        runCurrent()
-        assertEquals(listOf<Action>(Action.RetryNow), core.dispatched)
+        assertEquals(List<Action>(links.size) { Action.RetryNow }, core.dispatched)
     }
 
     @Test
@@ -170,6 +172,24 @@ class CoreRepositoryTest {
             dispatchContext = StandardTestDispatcher(testScheduler),
         )
         assertEquals(CoreStartup.Failed(CoreMessage.Storage("database is locked")), startup)
+    }
+
+    @Test
+    fun nativeLibraryFailureBecomesFailedStartup() = runTest {
+        val startup = startCore(
+            open = { throw UnsatisfiedLinkError("libskywave_core.so not found") },
+            scope = backgroundScope,
+            dispatchContext = StandardTestDispatcher(testScheduler),
+        )
+        assertEquals(CoreStartup.Failed(CoreMessage.NativeLibrary("libskywave_core.so not found")), startup)
+    }
+
+    @Test
+    fun failureAfterOpenShutsTheCoreDown() = runTest {
+        val core = FakeCore(viewState()).apply { failView = SkywaveException.Store("corrupt snapshot") }
+        val startup = startCore({ core }, backgroundScope, StandardTestDispatcher(testScheduler))
+        assertEquals(CoreStartup.Failed(CoreMessage.Storage("corrupt snapshot")), startup)
+        assertEquals(1, core.shutdowns)
     }
 
     @Test
