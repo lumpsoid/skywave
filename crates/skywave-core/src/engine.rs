@@ -62,7 +62,7 @@ use crate::https::{HttpsTransport, TransportConfig};
 use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
-use crate::store::StoreError;
+use crate::store::{OutboxEntry, StoreError};
 use crate::transport::{Transport, TransportError};
 use crate::view::{Link, LinkRejection};
 
@@ -522,17 +522,36 @@ async fn pull(
 
 /// The outbox sender: one command at a time, oldest first, each until it
 /// has a result.
+///
+/// Every command is claimed ([`Seam::command_sending`]) and the claim is
+/// on disk before the request leaves, so the server never sees a command
+/// with `tries == 0`. Any future batched send must claim every row of the
+/// batch before the request leaves.
 async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, LinkError> {
     loop {
         let Some(entry) = ctx.seam.pending_outbox()?.into_iter().next() else {
             ctx.outbox.notified().await;
             continue;
         };
-        let id = entry.command.id;
-        ctx.seam.command_sending(id)?;
-        let result = transport.send_command(&entry.command).await?;
-        ctx.seam.command_result(id, &result)?;
+        send_entry(ctx, transport, &entry).await?;
     }
+}
+
+/// Claims and sends one outbox entry read earlier. An entry that can no
+/// longer be claimed (gone from the outbox, or answered meanwhile) is
+/// skipped.
+async fn send_entry(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    entry: &OutboxEntry,
+) -> Result<(), LinkError> {
+    let id = entry.command.id;
+    if !ctx.seam.command_sending(id)? {
+        return Ok(());
+    }
+    let result = transport.send_command(&entry.command).await?;
+    ctx.seam.command_result(id, &result)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -542,8 +561,8 @@ mod tests {
     use std::time::Duration;
 
     use skywave_proto::{
-        BlobId as ProtoBlobId, Command, CommandResult, EventBatch, HelloResponse, PROTOCOL_VERSION,
-        ServerId,
+        BlobId as ProtoBlobId, Command, CommandId, CommandKind, CommandResult, EventBatch,
+        HelloResponse, PROTOCOL_VERSION, ServerId, SessionId,
     };
 
     use super::*;
@@ -805,6 +824,143 @@ mod tests {
         let held = server.hellos.load(Ordering::SeqCst) - start;
         assert!((4..=6).contains(&held), "{held} attempts in 5 s");
         link.abort();
+    }
+
+    /// Answers every command, first noting the `tries` its outbox row has
+    /// on disk at that moment, read through a connection of its own.
+    struct RecordingServer {
+        db: std::path::PathBuf,
+        seen: Mutex<Vec<(CommandId, u32)>>,
+    }
+
+    impl RecordingServer {
+        fn new(dir: &std::path::Path) -> Self {
+            RecordingServer {
+                db: dir.join(crate::store::DB_FILE),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Transport for RecordingServer {
+        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                let db = rusqlite::Connection::open(&self.db).unwrap();
+                let tries: u32 = db
+                    .query_row(
+                        "SELECT tries FROM outbox WHERE command_id = ?1",
+                        [command.id.0.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let mut seen = self.seen.lock().unwrap();
+                seen.push((command.id, tries));
+                Ok(CommandResult::Accepted {
+                    seq: Seq(seen.len() as u64),
+                })
+            })
+        }
+
+        fn events(&self, _query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+    }
+
+    fn sender_ctx(seam: &Seam) -> LinkCtx {
+        LinkCtx {
+            seam: seam.clone(),
+            config: Arc::new(EngineConfig::default()),
+            outbox: Arc::new(Notify::new()),
+            retry_now: Arc::new(Notify::new()),
+            blobs: Arc::new(BlobQueue::default()),
+            address: "srv:7443".into(),
+            identity: seam.identity().unwrap(),
+        }
+    }
+
+    fn enqueue(seam: &Seam, text: &str) -> Command {
+        let command = Command {
+            id: CommandId::new(),
+            kind: CommandKind::SendMessage {
+                session_id: SessionId::new(),
+                text: text.into(),
+            },
+        };
+        crate::client::lock(&seam.core.shared.state)
+            .store
+            .enqueue(&command)
+            .unwrap();
+        command
+    }
+
+    /// The claim is on disk before the request leaves: the server can
+    /// never receive a command whose row still says `tries == 0`.
+    #[tokio::test(start_paused = true)]
+    async fn server_never_sees_an_unclaimed_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let commands = [enqueue(&seam, "one"), enqueue(&seam, "two")];
+        let server = RecordingServer::new(dir.path());
+        let ctx = sender_ctx(&seam);
+
+        // The sender drains the outbox, then waits for more forever.
+        let drained = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        assert!(drained.is_err(), "the sender only ends on an error");
+        assert_eq!(
+            *server.seen.lock().unwrap(),
+            vec![(commands[0].id, 1), (commands[1].id, 1)]
+        );
+        assert!(seam.pending_outbox().unwrap().is_empty());
+    }
+
+    /// A row read as pending but gone (or answered) by the time of the
+    /// claim is not sent.
+    #[tokio::test]
+    async fn send_skips_row_that_cannot_be_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let server = RecordingServer::new(dir.path());
+        let ctx = sender_ctx(&seam);
+
+        let deleted = enqueue(&seam, "deleted");
+        let entry = seam.pending_outbox().unwrap().remove(0);
+        rusqlite::Connection::open(&server.db)
+            .unwrap()
+            .execute(
+                "DELETE FROM outbox WHERE command_id = ?1",
+                [deleted.id.0.to_string()],
+            )
+            .unwrap();
+        send_entry(&ctx, &server, &entry).await.unwrap();
+
+        let answered = enqueue(&seam, "answered");
+        let entry = seam.pending_outbox().unwrap().remove(0);
+        seam.command_result(answered.id, &CommandResult::Accepted { seq: Seq(1) })
+            .unwrap();
+        send_entry(&ctx, &server, &entry).await.unwrap();
+
+        assert!(server.seen.lock().unwrap().is_empty());
+        let outbox = crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].tries, 0, "a refused claim counts nothing");
     }
 
     #[test]

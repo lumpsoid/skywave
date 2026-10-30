@@ -287,27 +287,37 @@ impl Client {
     pub fn outbox(&self) -> Vec<OutboxEntry> {
         let db = replica(self.dir.path());
         let mut stmt = db
-            .prepare("SELECT command, sending, result FROM outbox ORDER BY position")
+            .prepare(
+                "SELECT command, sending, result, tries, first_sent_at, answered_at
+                 FROM outbox ORDER BY position",
+            )
             .unwrap();
+        let time = |text: Option<String>| {
+            text.map(|t| {
+                chrono::DateTime::parse_from_rfc3339(&t)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            })
+        };
         stmt.query_map([], |row| {
             let command: String = row.get(0)?;
             let sending: bool = row.get(1)?;
             let result: Option<String> = row.get(2)?;
-            Ok((command, sending, result))
-        })
-        .unwrap()
-        .map(|row| {
-            let (command, sending, result) = row.unwrap();
             let status = match (result, sending) {
                 (Some(result), _) => OutboxStatus::Done(serde_json::from_str(&result).unwrap()),
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
             };
-            OutboxEntry {
+            Ok(OutboxEntry {
                 command: serde_json::from_str(&command).unwrap(),
                 status,
-            }
+                tries: row.get(3)?,
+                first_sent_at: time(row.get(4)?),
+                answered_at: time(row.get(5)?),
+            })
         })
+        .unwrap()
+        .map(Result::unwrap)
         .collect()
     }
 

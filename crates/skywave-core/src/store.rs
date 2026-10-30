@@ -79,6 +79,15 @@ UPDATE sessions SET stopped = 1 WHERE
     > COALESCE((SELECT MAX(seq) FROM events WHERE session_id = sessions.id
         AND json_extract(event, '$.kind.type') = 'user_message'), 0);
 "#,
+    r#"
+-- Delivery bookkeeping: how often a command was claimed for sending, when it
+-- first was, and when the server answered. Any row that predates this may
+-- already have gone out, so it counts as attempted.
+ALTER TABLE outbox ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE outbox ADD COLUMN first_sent_at TEXT;
+ALTER TABLE outbox ADD COLUMN answered_at TEXT;
+UPDATE outbox SET tries = 1;
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -153,6 +162,13 @@ impl OutboxStatus {
 pub struct OutboxEntry {
     pub command: Command,
     pub status: OutboxStatus,
+    /// How often the command was claimed for sending. 0 proves it never
+    /// reached the server: a claim is durable before the request leaves.
+    pub tries: u32,
+    /// When the first claim was made.
+    pub first_sent_at: Option<DateTime<Utc>>,
+    /// When the server's answer was recorded.
+    pub answered_at: Option<DateTime<Utc>>,
 }
 
 /// Local state of one blob.
@@ -216,7 +232,7 @@ impl Store {
     ///
     /// Commands left in `Sending` by a previous run go back to `Queued`:
     /// nothing is in flight after a restart, and the server dedups the
-    /// resend (D7).
+    /// resend (D7). Their `tries` are kept: they may have gone out.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
         fs::create_dir_all(data_dir).map_err(|source| StoreError::DataDir {
             path: data_dir.to_path_buf(),
@@ -386,7 +402,8 @@ impl Store {
 
     fn query_outbox(&self, filter: &str) -> Result<Vec<OutboxEntry>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT command, sending, result FROM outbox {filter} ORDER BY position"
+            "SELECT command, sending, result, tries, first_sent_at, answered_at
+             FROM outbox {filter} ORDER BY position"
         ))?;
         let rows = stmt.query_map([], |row| {
             let command = json_col(row, 0)?;
@@ -397,30 +414,46 @@ impl Store {
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
             };
-            Ok(OutboxEntry { command, status })
+            Ok(OutboxEntry {
+                command,
+                status,
+                tries: row.get(3)?,
+                first_sent_at: opt_time_col(row, 4)?,
+                answered_at: opt_time_col(row, 5)?,
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Marks a pending command as handed to the transport. A command that
-    /// already has its result stays `Done`.
-    pub fn mark_sending(&self, id: CommandId) -> Result<(), StoreError> {
+    /// Claims a pending command for sending at `now`: marks it `Sending`,
+    /// counts the try and keeps the first send time. The claim is durable
+    /// when this returns (autocommit on a `synchronous = FULL` connection),
+    /// so the server never sees a command whose `tries` is 0 on disk.
+    /// `false` when there is nothing to send: the command is not in the
+    /// outbox or already answered.
+    pub fn claim_send(&self, id: CommandId, now: DateTime<Utc>) -> Result<bool, StoreError> {
         let changed = self.conn.execute(
-            "UPDATE outbox SET sending = 1 WHERE command_id = ?1 AND result IS NULL",
-            [id.0.to_string()],
+            "UPDATE outbox SET sending = 1, tries = tries + 1,
+                 first_sent_at = COALESCE(first_sent_at, ?2)
+             WHERE command_id = ?1 AND result IS NULL",
+            params![id.0.to_string(), now.to_rfc3339()],
         )?;
-        if changed == 0 {
-            self.require_command(id)?;
-        }
-        Ok(())
+        Ok(changed == 1)
     }
 
-    /// Records the server's answer. The first recorded result is kept; the
-    /// server returns the same one for every resend anyway.
-    pub fn record_result(&self, id: CommandId, result: &CommandResult) -> Result<(), StoreError> {
+    /// Records the server's answer, received at `now`. The first recorded
+    /// result is kept; the server returns the same one for every resend
+    /// anyway.
+    pub fn record_result(
+        &self,
+        id: CommandId,
+        result: &CommandResult,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
-            "UPDATE outbox SET result = ?2, sending = 0 WHERE command_id = ?1 AND result IS NULL",
-            params![id.0.to_string(), to_json(result)?],
+            "UPDATE outbox SET result = ?2, sending = 0, answered_at = ?3
+             WHERE command_id = ?1 AND result IS NULL",
+            params![id.0.to_string(), to_json(result)?, now.to_rfc3339()],
         )?;
         if changed == 0 {
             self.require_command(id)?;
@@ -606,6 +639,16 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         last_seq: seq_col(row, 5)?,
         stopped: row.get(6)?,
     })
+}
+
+fn opt_time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    let text: Option<String> = row.get(idx)?;
+    text.map(|text| {
+        DateTime::parse_from_rfc3339(&text)
+            .map(|time| time.with_timezone(&Utc))
+            .map_err(|e| bad_value(idx, Type::Text, e))
+    })
+    .transpose()
 }
 
 fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
