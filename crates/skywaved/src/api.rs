@@ -21,6 +21,13 @@
 //! ranges, other units or malformed ranges are ignored and the full blob is
 //! sent (RFC 9110 lets a server do that). Content is streamed from the file.
 //!
+//! **Dirs** (`GET /v1/dirs?dir=`, workdir completion): every outcome is a
+//! 200 [`DirsResult`](skywave_proto::DirsResult), since 401/403 would read
+//! as a revoked device. The listing ([`crate::dirs`]) runs on a blocking
+//! thread outside the API's database connection; one that takes longer than
+//! [`DIRS_TIMEOUT`] gets a 503, and the scan, bounded by its cap, finishes
+//! unobserved.
+//!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
 //! 500 server fault.
 
@@ -40,7 +47,8 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, DeviceId, EventsQuery, HelloResponse, PROTOCOL_VERSION, ServerId, path,
+    BlobId, Command, DeviceId, DirsQuery, EventsQuery, HelloResponse, PROTOCOL_VERSION, ServerId,
+    path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
@@ -49,6 +57,7 @@ use crate::EventLog;
 use crate::blobs::BlobStore;
 use crate::db::Db;
 use crate::devices;
+use crate::dirs;
 use crate::error::Result;
 use crate::event_log::DEFAULT_BATCH_LIMIT;
 use crate::identity::Fingerprint;
@@ -57,6 +66,8 @@ use crate::identity::Fingerprint;
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// `last_seen` is written at most this often per device.
 pub const TOUCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
+/// Longest a `GET /v1/dirs` listing may take before the reply gives up.
+pub const DIRS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Read size when streaming a blob.
 const BLOB_CHUNK: usize = 64 * 1024;
 
@@ -130,6 +141,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::HELLO, get(hello))
         .route(path::COMMANDS, post(commands))
         .route(path::EVENTS, get(events))
+        .route(path::DIRS, get(list_dirs))
         .route(path::BLOB_ROUTE, get(blob))
         .route_layer(middleware::from_fn_with_state(api.clone(), authenticate))
         .with_state(api)
@@ -228,6 +240,29 @@ async fn events(
     {
         Ok(batch) => Json(batch).into_response(),
         Err(status) => status.into_response(),
+    }
+}
+
+async fn list_dirs(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<DirsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // Not `Api::blocking`: a slow file system must not hold the database.
+    let roots = api.log.roots().to_vec();
+    let listing = tokio::task::spawn_blocking(move || dirs::list_dirs(&roots, &query.dir));
+    match tokio::time::timeout(DIRS_TIMEOUT, listing).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "directory listing failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => {
+            tracing::warn!("directory listing timed out");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 

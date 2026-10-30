@@ -18,8 +18,9 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, EventBatch, EventKind,
-    HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId, path,
+    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DirsResult, EventBatch,
+    EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq,
+    SessionId, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -681,4 +682,59 @@ async fn blobs_download_whole_or_by_range() {
         device.get("/v1/blobs/not-a-uuid").await.status,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dirs_answers_every_outcome_with_200() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let root = std::fs::canonicalize(&f.root).unwrap();
+    let roots = vec![root.display().to_string()];
+    let dirs = |dir: &std::path::Path| format!("{}?dir={}", path::DIRS, dir.display());
+
+    let cases = [
+        (
+            path::DIRS.to_owned(),
+            DirsResult::Roots {
+                roots: roots.clone(),
+            },
+        ),
+        (
+            format!("{}?dir=", path::DIRS),
+            DirsResult::Roots {
+                roots: roots.clone(),
+            },
+        ),
+        (
+            dirs(&root),
+            DirsResult::Listed {
+                dir: root.display().to_string(),
+                names: vec!["project".into()],
+                truncated: false,
+            },
+        ),
+        (
+            dirs(&root.join("project/../..")),
+            DirsResult::NotAllowed {
+                roots: roots.clone(),
+            },
+        ),
+        (
+            format!("{}?dir=relative", path::DIRS),
+            DirsResult::NotAllowed {
+                roots: roots.clone(),
+            },
+        ),
+        (dirs(&root.join("missing")), DirsResult::NotFound),
+    ];
+    for (uri, want) in cases {
+        let reply = device.get(&uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.json::<DirsResult>(), want, "{uri}");
+    }
+
+    // Like every authenticated route, it needs a certificate.
+    let mut anon = f.anonymous().await;
+    assert_eq!(anon.get(path::DIRS).await.status, StatusCode::UNAUTHORIZED);
 }

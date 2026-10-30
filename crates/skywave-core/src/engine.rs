@@ -15,6 +15,10 @@
 //! - `DownloadBlob` and `BlobPolicyChanged` go to the blob queue; the blob
 //!   downloader (see [`crate::blobs`]) runs beside the link, on its own
 //!   task and connections, so blobs never hold up the pull or the sender.
+//! - `ListDirs` lists a server directory on its own task within
+//!   [`DIRS_TIMEOUT`], on a transport kept for listings, and answers with
+//!   [`Seam::dirs_listed`]; unpaired, suspended or rejected, it fails at
+//!   once. A failure never touches the link.
 //!
 //! **The link** runs while the device is paired, not rejected and not
 //! suspended. Each connection starts with `hello`, then runs two loops side
@@ -49,7 +53,7 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use skywave_proto::{EventsQuery, Seq};
 use tokio::sync::{Notify, mpsc, watch};
@@ -68,6 +72,8 @@ use crate::view::{Link, LinkRejection};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
+/// Longest a directory listing for completion may take, connecting included.
+pub const DIRS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How the sync engine talks to the server; [`Default`] is what heads use.
 #[derive(Debug, Clone)]
@@ -183,6 +189,9 @@ pub(crate) struct Engine {
     rejected: watch::Sender<bool>,
     /// Blobs waiting for the downloader; outlives each downloader.
     blobs: Arc<BlobQueue>,
+    /// The transport directory listings use, built on the first; dropped
+    /// whenever the link restarts, as the identity may have changed.
+    dirs: Option<Arc<dyn Transport>>,
 }
 
 impl Engine {
@@ -208,6 +217,7 @@ impl Engine {
             downloader: None,
             rejected: watch::Sender::new(false),
             blobs: Arc::new(BlobQueue::restore(&seam)),
+            dirs: None,
         }
     }
 
@@ -268,13 +278,48 @@ impl Engine {
                 });
                 self.blobs.set_policy(policy, &blobs);
             }
+            Request::ListDirs { req, dir } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.dirs_transport() else {
+                    let error = TransportError::Unreachable("not connected".into());
+                    seam.dirs_listed(req, Err(error));
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(DIRS_TIMEOUT, transport.list_dirs(&dir))
+                        .await
+                        .unwrap_or(Err(TransportError::Timeout));
+                    seam.dirs_listed(req, result);
+                });
+            }
         }
+    }
+
+    /// The transport for directory listings, if the link may run.
+    fn dirs_transport(&mut self) -> Option<Arc<dyn Transport>> {
+        if *self.suspended.borrow() || *self.rejected.borrow() {
+            return None;
+        }
+        if let Some(transport) = &self.dirs {
+            return Some(transport.clone());
+        }
+        let identity = self.seam.identity()?;
+        let address = self.seam.settings().ok()?.server_address?;
+        let transport = self
+            .config
+            .connector
+            .connect(&address, identity.as_ref(), &self.config.transport)
+            .inspect_err(|error| tracing::debug!(%error, "no transport for listings"))
+            .ok()?;
+        self.dirs = Some(transport.clone());
+        Some(transport)
     }
 
     /// (Re)starts the link and the blob downloader if the device is
     /// paired, not rejected and not suspended.
     fn start_link(&mut self) {
         self.stop_link();
+        self.dirs = None;
         if *self.suspended.borrow() || *self.rejected.borrow() {
             return;
         }

@@ -16,6 +16,18 @@ pub enum Action {
     CreateSession {
         workdir: String,
     },
+    /// Complete `input` as a workdir: the session list's
+    /// [`completion`](crate::SessionListView::completion) shows the
+    /// candidates. Heads send it on Tab and on every edit while the
+    /// candidates are shown. The server is asked again when the directory
+    /// part changes, when the same input is completed twice, or after a
+    /// failed listing; otherwise the last listing is filtered.
+    CompleteWorkdir {
+        input: String,
+    },
+    /// The new-session prompt closed: forget the completion and its
+    /// listing.
+    EndCompletion,
     SendMessage {
         session_id: SessionId,
         text: String,
