@@ -110,11 +110,15 @@ fun SessionListScreen(view: SessionListView, chrome: ShellChrome, dispatch: (Act
         floatingActionButton = {
             // A new session is active: it is started from the active list.
             if (!archived) {
+                val label = stringResource(R.string.sessions_new)
+                // The extended FAB's text does not reach its merged semantics: say it here.
                 ExtendedFloatingActionButton(
                     onClick = { creating = true },
                     icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                    text = { Text(stringResource(R.string.sessions_new)) },
-                    modifier = Modifier.testTag(SessionListTags.NEW),
+                    text = { Text(label) },
+                    modifier = Modifier
+                        .semantics { contentDescription = label }
+                        .testTag(SessionListTags.NEW),
                 )
             }
         },

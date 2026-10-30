@@ -121,6 +121,14 @@ class SessionListScreenTest {
     }
 
     @Test
+    fun newSessionButtonIsLabelledInTheMergedTreeAndOpensTheDialog() {
+        show(SessionListSamples.emptyActive)
+        // The merged tree is what TalkBack and uiautomator see.
+        compose.onNodeWithContentDescription("New session", useUnmergedTree = false).performClick()
+        tag(NewSessionTags.WORKDIR).assertExists()
+    }
+
+    @Test
     fun archivedListHasItsTitleBackAndNoNewSession() {
         show(SessionListSamples.emptyArchived, back = true)
         text("Archived sessions").assertExists()
