@@ -3,9 +3,12 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/search_holder.dart';
+import 'package:skywave_gui/session/status_line.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
+import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 import '../fakes.dart';
@@ -928,6 +931,33 @@ void main() {
       expect(find.textContaining('working', findRichText: true), findsOne);
       expect(find.byTooltip('agent working'), findsOneWidget);
       expect(find.text('/home/me/work'), findsOneWidget);
+    });
+
+    testWidgets('on a wide window the header keeps to the timeline column', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(1600, 900)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(usage: [r'$0.04']),
+        timeline: holding([]),
+        sent: [],
+      );
+      const left = (1600 - timelineMaxWidth) / 2;
+      const right = left + timelineMaxWidth;
+      final back = tester.getRect(find.byType(BackButton));
+      final more = tester.getRect(find.byTooltip('More'));
+      final status = tester.getRect(find.byType(StatusLine));
+      final composer = tester.getRect(find.byType(Composer));
+      expect(back.left, greaterThanOrEqualTo(left));
+      expect(more.right, lessThanOrEqualTo(right));
+      expect(status.left, left);
+      expect(status.right, right);
+      expect(composer.left, left);
+      expect(tester.getRect(find.text(r'$0.04')).right, lessThan(right));
     });
 
     testWidgets('the chips take taps over 48 dp', (tester) async {
