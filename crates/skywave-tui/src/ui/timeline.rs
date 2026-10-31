@@ -22,8 +22,8 @@ use skywave_core::{
     Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
-    answer_words, blob_size, bytes, decision_label, delivery_label, dollars, fail_reason,
-    outgoing_label, percent, seconds, took_label, turn_time,
+    agent_setting_line, answer_words, asked_by, blob_size, bytes, decision_label, delivery_label,
+    dollars, fail_reason, outgoing_label, percent, seconds, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -319,6 +319,24 @@ impl Layout<'_> {
                 };
                 let mut spans = lead;
                 spans.push(Span::raw(what).dark_gray());
+                return vec![Line::from(spans)];
+            }
+            Entry::AgentSetting {
+                setting,
+                by,
+                refused,
+            } => {
+                let mut what = agent_setting_line(setting, refused.as_deref());
+                if let Some(by) = asked_by(by.as_ref()) {
+                    what = format!("{what} {by}");
+                }
+                let what = clean(&what);
+                let mut spans = lead;
+                // A refusal kept the old value: worth noticing.
+                spans.push(match refused {
+                    Some(_) => Span::raw(what).yellow(),
+                    None => Span::raw(what).dark_gray(),
+                });
                 return vec![Line::from(spans)];
             }
             Entry::TurnUsage(usage) => {

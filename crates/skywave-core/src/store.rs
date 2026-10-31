@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo,
-    Event, EventBatch, Seq, SessionId,
+    Event, EventBatch, EventKind, ModelChoice, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -175,6 +175,16 @@ INSERT OR IGNORE INTO alerted_approvals (id, session_id)
 CREATE TABLE devices (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL
+);
+"#,
+    r#"
+-- `SessionSummary::agent` as JSON, and the models of the newest
+-- `ModelsOffered`. A replica from before this holds no such events, so
+-- every session starts without: nothing to backfill.
+ALTER TABLE sessions ADD COLUMN agent TEXT;
+CREATE TABLE offered_models (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    models TEXT NOT NULL
 );
 "#,
 ];
@@ -370,6 +380,9 @@ pub struct Snapshot {
     pub alerted: HashSet<ApprovalId>,
     /// The server's devices by name ([`Store::set_devices`]).
     pub devices: HashMap<DeviceId, String>,
+    /// The models of the newest `ModelsOffered` in the log, in any session;
+    /// empty until one comes.
+    pub models: Vec<ModelChoice>,
 }
 
 /// Handle to the replica database.
@@ -421,7 +434,23 @@ impl Store {
             deleted: read_deleted(&self.conn)?,
             alerted: self.alerted()?,
             devices: self.devices()?,
+            models: self.offered_models()?,
         })
+    }
+
+    /// The models of the newest `ModelsOffered` stored; empty if none.
+    pub fn offered_models(&self) -> Result<Vec<ModelChoice>, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row("SELECT models FROM offered_models WHERE id = 0", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default())
     }
 
     // ---- events, sessions, cursor -------------------------------------
@@ -483,6 +512,14 @@ impl Store {
                 if settle_in(&tx, id, &accepted, now)? {
                     settled.push((id, seq));
                 }
+            }
+            // Offered for every session, so kept whatever session said so.
+            if let EventKind::ModelsOffered { models } = &event.kind {
+                tx.execute(
+                    "INSERT INTO offered_models (id, models) VALUES (0, ?1)
+                     ON CONFLICT (id) DO UPDATE SET models = excluded.models",
+                    [to_json(models)?],
+                )?;
             }
             if deleted.contains(&event.session_id) {
                 continue;
@@ -1102,7 +1139,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage";
+    stopped, notable, name, first_prompt, archived, usage, agent";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -1117,7 +1154,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             summary.id.0.to_string(),
@@ -1132,6 +1169,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.first_prompt,
             summary.archived,
             summary.usage.as_ref().map(to_json).transpose()?,
+            to_json(&summary.agent)?,
         ],
     )?;
     Ok(())
@@ -1155,6 +1193,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         first_prompt: row.get(9)?,
         archived: row.get(10)?,
         usage: opt_json_col(row, 11)?,
+        agent: opt_json_col(row, 12)?.unwrap_or_default(),
     })
 }
 

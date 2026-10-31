@@ -114,6 +114,13 @@ const MIGRATIONS: &[&str] = &[
     -- The command that logged the event; NULL for agent and daemon events.
     ALTER TABLE events ADD COLUMN command_id TEXT;
     "#,
+    // v6: what the supervisor gives a starting agent (protocol v7).
+    r#"
+    -- The session's permission mode and model as the log has them, folded
+    -- with `AgentSettings::apply`; NULL until the first such event.
+    ALTER TABLE sessions ADD COLUMN
+        agent_settings TEXT CHECK (agent_settings IS NULL OR json_valid(agent_settings));
+    "#,
 ];
 
 /// Schema version this build creates and understands.

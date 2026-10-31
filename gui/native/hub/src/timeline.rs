@@ -13,8 +13,8 @@ use skywave_core::{
     ToolView, read_head,
 };
 use skywave_present::format::{
-    answer_words, bytes, decision_label, delivery_label, dollars, fail_reason, outgoing_label,
-    percent, seconds, took_label, turn_time,
+    agent_setting_line, answer_words, asked_by, bytes, decision_label, delivery_label, dollars,
+    fail_reason, outgoing_label, percent, seconds, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
@@ -244,6 +244,21 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
                 format!("brought back from the archive by {}", who(by))
             },
         ),
+        Entry::AgentSetting {
+            setting,
+            by,
+            refused,
+        } => {
+            let mut text = agent_setting_line(setting, refused.as_deref());
+            if let Some(by) = asked_by(by.as_ref()) {
+                text = format!("{text} {by}");
+            }
+            let kind = match refused {
+                Some(_) => RowKind::SettingRefused,
+                None => RowKind::AgentSetting,
+            };
+            set(&mut row, kind, clean_line(&text));
+        }
         Entry::TurnUsage(usage) => {
             let mut text = "turn".to_owned();
             if let Some(ms) = usage.duration_ms {
@@ -783,7 +798,9 @@ fn clean(line: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use skywave_core::{CommandId, DeviceId, SessionId, SessionState};
+    use skywave_core::{
+        AgentSetting, AgentView, CommandId, DeviceId, PermissionMode, SessionId, SessionState,
+    };
 
     use super::*;
 
@@ -800,6 +817,7 @@ mod tests {
             pending_approval: None,
             rules: Vec::new(),
             usage: None,
+            agent: AgentView::default(),
             interrupt: None,
             stop: None,
             draft: None,
@@ -970,6 +988,48 @@ mod tests {
         new.rows.swap(0, 1);
         new.was.swap(0, 1);
         assert_eq!(diff(&old.rows, &new), None);
+    }
+
+    #[test]
+    fn a_setting_change_is_a_note_and_a_refusal_a_warning() {
+        let logged = |seq, setting, by, refused: Option<&str>| TimelineItem::Logged {
+            seq: Seq(seq),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            entry: Entry::AgentSetting {
+                setting,
+                by,
+                refused: refused.map(str::to_owned),
+            },
+        };
+        let laptop = DeviceRef {
+            id: DeviceId::new(),
+            name: Some("laptop".into()),
+            me: false,
+        };
+        let rows = rows_of(vec![
+            logged(1, AgentSetting::Mode(PermissionMode::Plan), None, None),
+            logged(
+                2,
+                AgentSetting::Model("big".into()),
+                Some(laptop),
+                Some("no model named"),
+            ),
+        ]);
+        let got: Vec<_> = rows
+            .rows
+            .iter()
+            .map(|r| (r.kind, r.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (RowKind::AgentSetting, "mode → plan"),
+                (
+                    RowKind::SettingRefused,
+                    "model big refused: no model named by laptop"
+                ),
+            ]
+        );
     }
 
     #[test]

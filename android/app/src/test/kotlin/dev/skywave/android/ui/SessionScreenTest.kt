@@ -102,6 +102,9 @@ class SessionScreenTest {
         seeAt("s:19", "Archived by laptop")
         seeAt("s:20", "12.3k in · 840 out · $0.0123 · 4.1s · sonnet")
         seeAt("m:c21", "And from my laptop", "laptop")
+        seeAt("s:22", "Mode → plan by you")
+        seeAt("s:23", "Model → claude-sonnet-4-5")
+        seeAt("s:24", "Mode bypass refused: not allowed here (asked by laptop)")
     }
 
     @Test
@@ -239,21 +242,21 @@ class SessionScreenTest {
     @Test
     fun marksReadOnceWhenTheBottomIsVisibleAndOnlyForward() {
         show(SessionSamples.view())
-        assertEquals(listOf(Action.MarkRead("s1", 21u)), sent<Action.MarkRead>())
+        assertEquals(listOf(Action.MarkRead("s1", 24u)), sent<Action.MarkRead>())
         compose.mainClock.advanceTimeBy(READ_MARK_EVERY_MS * 2)
         assertEquals(1, sent<Action.MarkRead>().size)
 
         // A new event at the bottom marks again, after the cool-down.
-        val more = view.timeline + SessionSamples.logged(22, Entry.AgentMessage("more"))
-        view = view.copy(timeline = more, lastSeq = 22u)
+        val more = view.timeline + SessionSamples.logged(25, Entry.AgentMessage("more"))
+        view = view.copy(timeline = more, lastSeq = 25u)
         compose.waitForIdle()
         compose.mainClock.advanceTimeBy(READ_MARK_EVERY_MS + 100)
-        assertEquals(listOf(21uL, 22uL), sent<Action.MarkRead>().map { it.through })
+        assertEquals(listOf(24uL, 25uL), sent<Action.MarkRead>().map { it.through })
 
         // Never backwards.
         view = view.copy(lastSeq = 20u)
         compose.mainClock.advanceTimeBy(READ_MARK_EVERY_MS * 2)
-        assertEquals(listOf(21uL, 22uL), sent<Action.MarkRead>().map { it.through })
+        assertEquals(listOf(24uL, 25uL), sent<Action.MarkRead>().map { it.through })
     }
 
     @Test

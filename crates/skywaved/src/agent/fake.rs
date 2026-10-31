@@ -42,6 +42,13 @@
 //!
 //! Tool steps name no call unless given one with [`Step::call`], and carry
 //! no display of their own, so the mapper's generic display applies.
+//!
+//! **Mode and model.** A request to set either is answered at once, idle or
+//! mid-turn: `PermissionModeSet` / `ModelSet` with what was asked, or a
+//! refusal for a mode or model the script refuses
+//! ([`FakeScript::refuse_mode`], [`FakeScript::refuse_model`]). A start
+//! naming a mode or model asks for it the same way, after reporting the
+//! models the script offers ([`FakeScript::offer_models`]), if any.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -53,7 +60,8 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSession, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
+    RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -61,16 +69,61 @@ const EVENT_CAPACITY: usize = 64;
 
 /// The reason a fake reports for an approval it drops on interrupt.
 pub const INTERRUPT_REASON: &str = "interrupted";
+/// The reason a fake refuses a mode or model with.
+pub const REFUSE_REASON: &str = "refused by the script";
 
 /// Turns a [`FakeAgent`] plays, in order, for every session.
 #[derive(Debug, Clone, Default)]
 pub struct FakeScript {
     turns: Vec<Vec<Step>>,
+    refused_modes: Vec<PermissionMode>,
+    refused_models: Vec<String>,
+    models: Vec<ModelChoice>,
 }
 
 impl FakeScript {
     pub fn new() -> FakeScript {
         FakeScript::default()
+    }
+
+    /// Refuses requests for `mode`.
+    pub fn refuse_mode(mut self, mode: PermissionMode) -> FakeScript {
+        self.refused_modes.push(mode);
+        self
+    }
+
+    /// Refuses requests for `model`.
+    pub fn refuse_model(mut self, model: &str) -> FakeScript {
+        self.refused_models.push(model.to_owned());
+        self
+    }
+
+    /// Reports `models` as offered whenever a session starts.
+    pub fn offer_models(mut self, models: impl IntoIterator<Item = ModelChoice>) -> FakeScript {
+        self.models = models.into_iter().collect();
+        self
+    }
+
+    fn answer_mode(&self, mode: PermissionMode) -> AdapterEvent {
+        if self.refused_modes.contains(&mode) {
+            AdapterEvent::PermissionModeRefused {
+                mode,
+                reason: REFUSE_REASON.to_owned(),
+            }
+        } else {
+            AdapterEvent::PermissionModeSet(mode)
+        }
+    }
+
+    fn answer_model(&self, model: String) -> AdapterEvent {
+        if self.refused_models.contains(&model) {
+            AdapterEvent::ModelRefused {
+                model,
+                reason: REFUSE_REASON.to_owned(),
+            }
+        } else {
+            AdapterEvent::ModelSet(model)
+        }
     }
 
     /// Appends a turn made of `steps`.
@@ -226,6 +279,8 @@ pub enum FakeInput {
     /// An answer and the rule it grants, if any.
     Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
+    SetPermissionMode(PermissionMode),
+    SetModel(String),
     Shutdown,
 }
 
@@ -300,14 +355,32 @@ impl AgentAdapter for FakeAgent {
 
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let mut early = Vec::new();
         if !resumed {
             // Known up front, like an agent session id chosen by the adapter.
-            events
-                .try_send(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(
-                    spec.session_id,
-                )))
-                .map_err(|_| AgentError::Closed)?;
+            early.push(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(
+                spec.session_id,
+            )));
         }
+        if !self.script.models.is_empty() {
+            early.push(AdapterEvent::ModelsOffered(self.script.models.clone()));
+        }
+        {
+            let mut shared = lock(&self.shared);
+            let inputs = &mut shared.entry(spec.session_id).or_default().inputs;
+            if let Some(mode) = spec.mode {
+                inputs.push(FakeInput::SetPermissionMode(mode));
+                early.push(self.script.answer_mode(mode));
+            }
+            if let Some(model) = spec.model {
+                inputs.push(FakeInput::SetModel(model.clone()));
+                early.push(self.script.answer_model(model));
+            }
+        }
+        for event in early {
+            events.try_send(event).map_err(|_| AgentError::Closed)?;
+        }
+        let answers = events.clone();
         let runner = Runner {
             session_id: spec.session_id,
             script: Arc::clone(&self.script),
@@ -319,8 +392,10 @@ impl AgentAdapter for FakeAgent {
         let task = tokio::spawn(runner.run());
         let session = FakeSession {
             session_id: spec.session_id,
+            script: Arc::clone(&self.script),
             shared: Arc::clone(&self.shared),
             commands,
+            answers,
             task,
         };
         Ok((session, events_rx))
@@ -331,8 +406,11 @@ impl AgentAdapter for FakeAgent {
 #[derive(Debug)]
 pub struct FakeSession {
     session_id: SessionId,
+    script: Arc<FakeScript>,
     shared: Arc<Mutex<HashMap<SessionId, Progress>>>,
     commands: mpsc::UnboundedSender<FakeInput>,
+    /// Answers to mode and model requests go straight out, idle or not.
+    answers: mpsc::Sender<AdapterEvent>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -347,6 +425,22 @@ impl FakeSession {
             .inputs
             .push(input.clone());
         self.commands.send(input).map_err(|_| AgentError::Closed)
+    }
+
+    /// Records `input` and sends `answer` to it.
+    async fn answer(&self, input: FakeInput, answer: AdapterEvent) -> Result<(), AgentError> {
+        if self.commands.is_closed() {
+            return Err(AgentError::Closed);
+        }
+        lock(&self.shared)
+            .entry(self.session_id)
+            .or_default()
+            .inputs
+            .push(input);
+        self.answers
+            .send(answer)
+            .await
+            .map_err(|_| AgentError::Closed)
     }
 }
 
@@ -368,9 +462,21 @@ impl AgentSession for FakeSession {
         self.request(FakeInput::Interrupt)
     }
 
+    async fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), AgentError> {
+        let answer = self.script.answer_mode(mode);
+        self.answer(FakeInput::SetPermissionMode(mode), answer)
+            .await
+    }
+
+    async fn set_model(&mut self, model: String) -> Result<(), AgentError> {
+        let answer = self.script.answer_model(model.clone());
+        self.answer(FakeInput::SetModel(model), answer).await
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(FakeInput::Shutdown);
+        drop(self.answers);
         self.task
             .await
             .map_err(|e| AgentError::Io(std::io::Error::other(e)))
@@ -418,7 +524,11 @@ impl Runner {
                     Some(FakeInput::Message(text)) => text,
                     // Idle: nothing to interrupt or answer.
                     Some(
-                        FakeInput::Interrupt | FakeInput::Answer(..) | FakeInput::Started { .. },
+                        FakeInput::Interrupt
+                        | FakeInput::Answer(..)
+                        | FakeInput::Started { .. }
+                        | FakeInput::SetPermissionMode(_)
+                        | FakeInput::SetModel(_),
                     ) => {
                         continue;
                     }
@@ -575,7 +685,12 @@ impl Runner {
                 self.queued.push_back(text);
                 Ok(())
             }
-            Some(FakeInput::Answer(..) | FakeInput::Started { .. }) => Ok(()),
+            Some(
+                FakeInput::Answer(..)
+                | FakeInput::Started { .. }
+                | FakeInput::SetPermissionMode(_)
+                | FakeInput::SetModel(_),
+            ) => Ok(()),
         }
     }
 

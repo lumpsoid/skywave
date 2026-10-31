@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::blobs::read_head;
-use crate::view::{BlobId, BlobState, BlobView, Entry, TimelineItem, ToolOutcome};
+use crate::view::{AgentSetting, BlobId, BlobState, BlobView, Entry, TimelineItem, ToolOutcome};
 
 /// Most of a downloaded blob a search reads: the head of a longer one.
 pub const HEAD_BYTES: u64 = 1024 * 1024;
@@ -261,6 +261,16 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::ToolResult { summary, .. } => vec![summary],
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
         Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
+        Entry::AgentSetting {
+            setting, refused, ..
+        } => {
+            let mut out: Vec<&str> = match setting {
+                AgentSetting::Model(model) => vec![model],
+                AgentSetting::Mode(_) => Vec::new(),
+            };
+            out.extend(refused.as_deref());
+            out
+        }
         Entry::Interrupted | Entry::Stopped | Entry::Archived { .. } | Entry::TurnUsage(_) => {
             Vec::new()
         }

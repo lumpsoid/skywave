@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use skywave_proto::Fingerprint;
 
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, RejectReason, RuleScope,
-    RuleSuggestion, Seq, SessionId, ToolKind, TurnUsage,
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, ModelChoice,
+    PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, ToolKind,
+    TurnUsage,
 };
 
 pub use crate::projection::SessionUsage;
@@ -451,6 +452,8 @@ pub struct SessionView {
     /// What the session's turns took, the newest one and the sums; `None`
     /// until the agent reports any.
     pub usage: Option<SessionUsage>,
+    /// The agent's permission mode and model, and the switches on their way.
+    pub agent: AgentView,
     /// This device's latest interrupt of the session, until its effect is in
     /// the replica.
     pub interrupt: Option<Outgoing>,
@@ -495,6 +498,63 @@ impl SessionView {
         }
         prompts
     }
+}
+
+/// A session's agent settings as the session view shows them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentView {
+    /// The mode the agent last said it runs in; `None` until it says.
+    pub mode: Option<PermissionMode>,
+    /// The model the agent last said it runs, as it names it.
+    pub model: Option<String>,
+    /// A mode switch not yet answered: this device's while on its way, else
+    /// any device's waiting for the agent.
+    pub mode_change: Option<SettingChange<PermissionMode>>,
+    /// A model switch likewise.
+    pub model_change: Option<SettingChange<String>>,
+    /// The agent's newest refusal of a mode, until the next switch.
+    pub mode_refused: Option<Refusal<PermissionMode>>,
+    /// The agent's newest refusal of a model, until the next switch.
+    pub model_refused: Option<Refusal<String>>,
+    /// What [`Action::SetModel`](crate::Action::SetModel) offers: the
+    /// newest list any session's agent reported. Empty until one did; a
+    /// head may still send a model by name.
+    pub models: Vec<ModelChoice>,
+}
+
+impl AgentView {
+    /// The offered model that is `model` (an id the agent resolves, or the
+    /// name it resolves to), preferring one whose id is `model`.
+    pub fn choice(&self, model: &str) -> Option<&ModelChoice> {
+        self.models.iter().find(|m| m.id == model).or_else(|| {
+            self.models
+                .iter()
+                .find(|m| m.resolved.as_deref() == Some(model))
+        })
+    }
+
+    /// What to call the model running: its offered label, else its name.
+    pub fn model_label(&self) -> Option<&str> {
+        let model = self.model.as_deref()?;
+        Some(self.choice(model).map_or(model, |m| m.label.as_str()))
+    }
+}
+
+/// A switch of a setting not yet answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingChange<T> {
+    pub value: T,
+    /// This device's command while it is on its way; `None` once it is in
+    /// the log and only the agent's answer is awaited.
+    pub outgoing: Option<Outgoing>,
+}
+
+/// A mode or model as a timeline entry names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSetting {
+    Mode(PermissionMode),
+    /// As the agent names it.
+    Model(String),
 }
 
 /// A message being written on this device, kept in the local store and never
@@ -623,6 +683,15 @@ pub enum Entry {
     /// A turn ended and its agent reported what it took. A figure the agent
     /// does not report is `None`.
     TurnUsage(TurnUsage),
+    /// The agent switched its mode or model, or refused to (`refused` holds
+    /// why; it keeps what it had). `by` is the device that asked for it;
+    /// `None` when the agent switched on its own (leaving plan mode) or
+    /// restored what it ran with before.
+    AgentSetting {
+        setting: AgentSetting,
+        by: Option<DeviceRef>,
+        refused: Option<String>,
+    },
 }
 
 /// A tool call as one timeline item: what it does (decided by the server,
@@ -818,6 +887,7 @@ mod tests {
             pending_approval: None,
             rules: Vec::new(),
             usage: None,
+            agent: AgentView::default(),
             interrupt: None,
             stop: None,
             draft: None,

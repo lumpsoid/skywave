@@ -3,23 +3,25 @@
 //! worded here as the TUI words it without its key hints.
 
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion, CompletionStatus,
-    Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession,
-    RuleSuggestion, Screen, SessionListView, SessionRow, SessionState, SessionUsage, SessionView,
-    SettingsView, TimelineItem, ViewState,
+    AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
+    CompletionStatus, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView,
+    PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView, SessionRow,
+    SessionState, SessionUsage, SessionView, SettingsView, TimelineItem, ViewState,
 };
 use skywave_present::format::{
-    answer_words, blob_size, bytes, delivery_label, dollars, fail_reason, outgoing_label,
-    scope_label, tokens, turn_time,
+    agent_mode_label, agent_model_label, answer_words, blob_size, bytes, delivery_label, dollars,
+    fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal,
+    outgoing_label, scope_label, tokens, turn_time,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
 use crate::link::count;
 use crate::signals::{
-    AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup, ComposerView,
-    CreatePrompt, CreatingView, ListKindView, PairForm, PairingState, RenamePrompt, RuleOption,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, ToolKindView,
+    AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
+    ComposerView, CreatePrompt, CreatingView, ListKindView, ModeOption, ModelOption, PairForm,
+    PairingState, PermissionModeView, RenamePrompt, RuleOption, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -277,7 +279,12 @@ fn session_view(session: &SessionView, link: &Link, ui: Ui, wall_ms: i64) -> Ses
             1 => Some("1 rule".to_owned()),
             n => Some(format!("{n} rules")),
         },
-        usage: session.usage.as_ref().map(usage_fields).unwrap_or_default(),
+        agent: agent_settings(&session.agent),
+        usage: session
+            .usage
+            .as_ref()
+            .map(|usage| usage_fields(usage, session.agent.model.is_none()))
+            .unwrap_or_default(),
         approval: session
             .pending_approval
             .as_ref()
@@ -306,9 +313,98 @@ impl SessionScreen {
     }
 }
 
+/// The agent's mode and model with every choice to switch to. A switch
+/// the server refused is not waiting: it shows as the refusal.
+fn agent_settings(agent: &AgentView) -> AgentSettingsView {
+    let failed = |outgoing: Option<&Outgoing>| match outgoing {
+        Some(Outgoing::Failed(reason)) => Some(fail_reason(*reason)),
+        _ => None,
+    };
+    let mode_failed = agent
+        .mode_change
+        .as_ref()
+        .and_then(|c| failed(c.outgoing.as_ref()).map(|why| (mode_label(c.value), why)));
+    let model_failed = agent.model_change.as_ref().and_then(|c| {
+        let label = agent
+            .choice(&c.value)
+            .map_or(c.value.as_str(), |m| m.label.as_str());
+        failed(c.outgoing.as_ref()).map(|why| (label, why))
+    });
+    let waiting = AgentView {
+        mode_change: agent.mode_change.clone().filter(|_| mode_failed.is_none()),
+        model_change: agent
+            .model_change
+            .clone()
+            .filter(|_| model_failed.is_none()),
+        ..agent.clone()
+    };
+    let failure = |(what, why): (&str, &str)| format!("{what} failed: {why}");
+    let current_model = agent
+        .model
+        .as_deref()
+        .and_then(|m| agent.choice(m))
+        .map(|m| m.id.as_str());
+    let pending_model = waiting.model_change.as_ref().map(|c| {
+        agent
+            .choice(&c.value)
+            .map_or(c.value.as_str(), |m| m.id.as_str())
+    });
+    AgentSettingsView {
+        mode_label: clean_line(&agent_mode_label(&waiting)),
+        model_label: agent_model_label(&waiting).map(|l| clean_line(&l)),
+        model_name: agent.model.as_deref().map(clean_line),
+        mode_refusal: mode_failed
+            .map(failure)
+            .or_else(|| mode_refusal(agent))
+            .map(|r| clean_line(&r)),
+        model_refusal: model_failed
+            .map(failure)
+            .or_else(|| model_refusal(agent))
+            .map(|r| clean_line(&r)),
+        modes: PermissionMode::ALL
+            .into_iter()
+            .map(|mode| ModeOption {
+                mode: mode_view(mode),
+                label: mode_label(mode).to_owned(),
+                detail: mode_detail(mode).to_owned(),
+                needs_confirmation: mode_needs_confirmation(mode),
+                current: agent.mode == Some(mode),
+                pending: agent.mode != Some(mode)
+                    && waiting
+                        .mode_change
+                        .as_ref()
+                        .is_some_and(|c| c.value == mode),
+            })
+            .collect(),
+        models: agent
+            .models
+            .iter()
+            .map(|m| ModelOption {
+                id: m.id.clone(),
+                label: clean_line(&m.label),
+                detail: m.detail.as_deref().map(clean_line),
+                current: current_model == Some(m.id.as_str()),
+                pending: pending_model != current_model && pending_model == Some(m.id.as_str()),
+            })
+            .collect(),
+    }
+}
+
+fn mode_view(mode: PermissionMode) -> PermissionModeView {
+    match mode {
+        PermissionMode::Ask => PermissionModeView::Ask,
+        PermissionMode::AcceptEdits => PermissionModeView::AcceptEdits,
+        PermissionMode::Plan => PermissionModeView::Plan,
+        PermissionMode::Auto => PermissionModeView::Auto,
+        PermissionMode::DontAsk => PermissionModeView::DontAsk,
+        PermissionMode::Bypass => PermissionModeView::Bypass,
+    }
+}
+
 /// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `session $1.27`,
-/// `<model>`, with the figures the agent did not report left out.
-fn usage_fields(usage: &SessionUsage) -> Vec<String> {
+/// `<model>` (with `model`: the model chip names it once the agent has),
+/// with the figures the agent did not report left out.
+fn usage_fields(usage: &SessionUsage, model: bool) -> Vec<String> {
     let turn = &usage.last_turn;
     let mut fields = Vec::new();
     if let Some(ms) = turn.duration_ms {
@@ -331,8 +427,8 @@ fn usage_fields(usage: &SessionUsage) -> Vec<String> {
     if let Some(cost) = usage.total.cost_usd {
         fields.push(format!("session {}", dollars(cost)));
     }
-    if let Some(model) = &usage.total.model {
-        fields.push(clean_line(model));
+    if let Some(name) = usage.total.model.as_ref().filter(|_| model) {
+        fields.push(clean_line(name));
     }
     fields
 }

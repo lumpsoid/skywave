@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision, Delivery, Entry,
-    Link, LinkRejection, ListKind, PairUri, PairingView, Route, Screen, Seq, SessionId,
-    SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision,
+    Delivery, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
+    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome,
+    ViewState, parse_pair_uri,
 };
-use skywave_present::format::bytes;
+use skywave_present::format::{bytes, mode_needs_confirmation};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
     looks_like_pair_uri, unanswered,
@@ -337,6 +338,8 @@ pub struct SessionUi {
     /// The list of rules `A` opened in the approval prompt; see
     /// [`SessionUi::rule_pick`].
     rule_pick: Option<RulePick>,
+    /// The mode or model list `p`/`m` opened, while it is up.
+    pub picker: Option<Picker>,
 }
 
 /// The rules an approval offers, listed to grant one: which approval, and
@@ -345,6 +348,125 @@ pub struct SessionUi {
 struct RulePick {
     approval: ApprovalId,
     selected: usize,
+}
+
+/// The list `p` or `m` opens over the session to switch the agent's
+/// permission mode or model. Switching works at any time; the agent's
+/// answer shows in the status line and the timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Picker {
+    /// The modes, [`PermissionMode::ALL`] in order. `confirm` once Enter
+    /// chose one that lets every tool run unasked, until `y` sends it.
+    Mode { selected: usize, confirm: bool },
+    /// The models the agent offers, and a name typed instead: sent as it
+    /// is when not blank, so a model can be asked for before any list came.
+    Model { selected: usize, name: String },
+}
+
+impl Picker {
+    /// The mode list, on the mode asked for last, else the one in effect.
+    fn mode(agent: &AgentView) -> Picker {
+        let mode = agent.mode_change.as_ref().map(|c| c.value).or(agent.mode);
+        let selected = mode
+            .and_then(|mode| PermissionMode::ALL.iter().position(|m| *m == mode))
+            .unwrap_or(0);
+        Picker::Mode {
+            selected,
+            confirm: false,
+        }
+    }
+
+    /// The model list, on the model asked for last, else the one running.
+    fn model(agent: &AgentView) -> Picker {
+        let model = agent
+            .model_change
+            .as_ref()
+            .map(|c| c.value.as_str())
+            .or(agent.model.as_deref());
+        let selected = model
+            .and_then(|model| agent.choice(model))
+            .and_then(|choice| agent.models.iter().position(|m| m == choice))
+            .unwrap_or(0);
+        Picker::Model {
+            selected,
+            name: String::new(),
+        }
+    }
+
+    /// Keys while the picker is up: ↑↓ choose, Enter switches, Esc closes
+    /// (`true` once it should close). On the model list text keys type a
+    /// name. Nothing else reaches the session.
+    fn key(&mut self, view: &SessionView, key: KeyEvent, ctrl: bool) -> (bool, Option<Action>) {
+        let session_id = view.id;
+        match self {
+            // y/N, as deleting asks: only `y` switches.
+            Picker::Mode {
+                selected,
+                confirm: confirm @ true,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => (
+                    true,
+                    Some(Action::SetPermissionMode {
+                        session_id,
+                        mode: PermissionMode::ALL[*selected],
+                    }),
+                ),
+                _ => {
+                    *confirm = false;
+                    (false, None)
+                }
+            },
+            Picker::Mode { selected, confirm } => match key.code {
+                KeyCode::Esc => (true, None),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                    (false, None)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(PermissionMode::ALL.len() - 1);
+                    (false, None)
+                }
+                KeyCode::Enter => {
+                    let mode = PermissionMode::ALL[*selected];
+                    if mode_needs_confirmation(mode) {
+                        *confirm = true;
+                        return (false, None);
+                    }
+                    (true, Some(Action::SetPermissionMode { session_id, mode }))
+                }
+                _ => (false, None),
+            },
+            Picker::Model { selected, name } => {
+                let models = &view.agent.models;
+                let last = models.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => return (true, None),
+                    KeyCode::Up => *selected = (*selected).min(last).saturating_sub(1),
+                    KeyCode::Down => *selected = (*selected + 1).min(last),
+                    // The core trims the name and takes a blank one as no
+                    // switch; with nothing typed, the highlighted model.
+                    KeyCode::Enter => {
+                        let model = if !name.trim().is_empty() {
+                            name.clone()
+                        } else {
+                            match models.get((*selected).min(last)) {
+                                Some(choice) => choice.id.clone(),
+                                None => return (false, None),
+                            }
+                        };
+                        return (true, Some(Action::SetModel { session_id, model }));
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                    }
+                    KeyCode::Char('u') if ctrl => name.clear(),
+                    KeyCode::Char(c) if !ctrl && !c.is_control() => name.push(c),
+                    _ => {}
+                }
+                (false, None)
+            }
+        }
+    }
 }
 
 /// A search through the open session's timeline: the head-independent
@@ -407,6 +529,7 @@ impl SessionUi {
             search: None,
             reveal: None,
             rule_pick: None,
+            picker: None,
         }
     }
 
@@ -1032,8 +1155,11 @@ impl App {
                 Screen::Pairing(_) => true,
                 Screen::SessionList(_) => self.ui.prompt.is_some(),
                 Screen::Session(_) if self.ui.prompt.is_some() => true,
-                Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| {
-                    s.focus == Focus::Composer || s.search.as_ref().is_some_and(|s| s.editing)
+                Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| match &s.picker {
+                    Some(picker) => matches!(picker, Picker::Model { .. }),
+                    None => {
+                        s.focus == Focus::Composer || s.search.as_ref().is_some_and(|s| s.editing)
+                    }
                 }),
                 _ => false,
             }
@@ -1052,6 +1178,13 @@ impl App {
         if let Some(prompt) = &mut self.ui.prompt {
             prompt.insert(text.trim());
             prompt.completion.pasted();
+            return;
+        }
+        // A model name; the mode list takes no text.
+        if let Some(picker) = self.ui.session.as_mut().and_then(|s| s.picker.as_mut()) {
+            if let Picker::Model { name, .. } = picker {
+                name.extend(text.trim().chars().filter(|c| !c.is_control()));
+            }
             return;
         }
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session)
@@ -1370,6 +1503,13 @@ impl App {
         session.settle();
         // Not laid out yet: the revealed item stays at the top.
         session.reveal = None;
+        if let Some(picker) = &mut session.picker {
+            let (close, action) = picker.key(view, key, ctrl);
+            if close {
+                session.picker = None;
+            }
+            return action;
+        }
         if let Some(search) = &mut session.search {
             search.search.wrapped = false;
             if search.editing {
@@ -1539,6 +1679,14 @@ impl App {
                 KeyCode::Char('S') => Some(Action::StopSession {
                     session_id: view.id,
                 }),
+                KeyCode::Char('p') => {
+                    session.picker = Some(Picker::mode(&view.agent));
+                    None
+                }
+                KeyCode::Char('m') => {
+                    session.picker = Some(Picker::model(&view.agent));
+                    None
+                }
                 KeyCode::Char('R') => {
                     let name = if view.named {
                         view.title.clone()

@@ -438,8 +438,9 @@ That changes the protocol and the UI, so it is not part of d29758.
 
 Recorded with 2.1.310 on 2026-10-31 (`permission_modes.ndjson`,
 `permission_modes_plan.ndjson`, `permission_mode_errors.ndjson`). This is
-what the interactive CLI cycles with shift+tab. skywaved does not send it
-yet.
+what the interactive CLI cycles with shift+tab. skywaved sends it for a
+`SetPermissionMode` command and to reapply a session's mode on start
+(§3.9).
 
 **Request (stdin → CLI)**, at any time, also before the first user message
 and while an approval is pending:
@@ -501,6 +502,63 @@ status line, not assume one.
 `acceptEdits` while a Write's `can_use_tool` waited sent no
 `control_cancel_request`. The CLI went on waiting until it got the answer
 (10 s here). The client still has to answer every approval it shows.
+
+### 3.8 Changing the model mid-session [C]
+
+Recorded with 2.1.310 on 2026-10-31 (`model_switch.ndjson`): control
+requests only, no user message, so no model call. A turn after a switch
+confirmed it takes effect: `system/init.model` and the `result`'s
+`model_usage_since_last_result` named the new model.
+
+**Request (stdin → CLI)**, at any time, like `set_permission_mode`:
+
+```json
+{"type":"control_request","request_id":"<uuid>","request":{"subtype":"set_model","model":"sonnet"}}
+```
+
+`model` is an alias or id: one of the `value`s in the `models` list of the
+`initialize` answer (`default`, `opus`, `sonnet`, `haiku`, full ids …) or any
+model id the CLI knows. `default` (or no `model` at all) switches to the
+account's default.
+
+**Success**: a `control_response` with the model **as the CLI resolved
+it**; no status line follows, and `initialize` does not report the current
+model (only `system/init` at the next turn does):
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"model":"claude-sonnet-5-5"}}}
+```
+
+**Rejection**: the model stays as it was.
+
+```json
+{"type":"control_response","response":{"subtype":"error","request_id":"…","error":"Model 'bogus-model' not found","error_code":"not_found","model":"claude-opus-4-7"}}
+```
+
+**Offered models.** The `initialize` answer lists them: `value` (what
+`set_model` takes), `displayName`, `description`, `resolvedModel`, plus
+effort and thinking capabilities Skywave does not use.
+
+### 3.9 How skywaved drives mode and model
+
+- A `SetPermissionMode` / `SetModel` command logs a `…Requested` event; the
+  supervisor sends `set_permission_mode` / `set_model` and logs the
+  `control_response` as `PermissionModeChanged` / `ModelChanged` or
+  `…Refused`, naming the command (`answers`). A session whose agent is not
+  running is started for it (no message, so no model call).
+- Every agent start asks for the mode and model the log wants (the open
+  request, else what the agent last ran with), with these same control
+  requests after `initialize`, so a resumed or restarted process keeps
+  both (§3.2: they die with the process otherwise).
+- What the CLI says unasked is logged when it differs from the log:
+  `current_permission_mode` from `initialize`, `permissionMode` and `model`
+  from each `system/init`, and a `system/status` that is not the echo of a
+  switch the adapter asked for (an approved `ExitPlanMode`, §3.7). The
+  `models` of `initialize` are logged as `ModelsOffered` when they differ
+  from the newest list in the log.
+- Bypass is offered like any mode; without `--dangerously-skip-permissions`
+  in `agent.args` the CLI refuses it (`bypass_not_launched`) and the
+  refusal is logged (§3.6 is about rule suggestions, not this switch).
 
 ## 4. Interrupt
 
@@ -692,7 +750,6 @@ output when a field is missing.
 - removing rules granted with "always allow" (they live in the CLI's
   settings, out of Skywave's sight)
 - hooks over the control channel
-- sending `set_permission_mode` from skywaved (the CLI side is in §3.7)
 - MCP over stdio
 - `--replay-user-messages`
 - sending a second user message while a turn runs (`still_queued` suggests the

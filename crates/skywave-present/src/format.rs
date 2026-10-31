@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use skywave_core::{
-    BlobState, Decision, Delivery, FailReason, Outgoing, RejectReason, RuleScope, RuleSuggestion,
+    AgentSetting, AgentView, BlobState, Decision, Delivery, DeviceRef, FailReason, Outgoing,
+    PermissionMode, RejectReason, RuleScope, RuleSuggestion,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -190,7 +191,116 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ApprovalCancelled => "the approval was cancelled first",
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",
+        RejectReason::UnknownModel => "no model named",
     }
+}
+
+/// A permission mode in words, short enough for a status line: "ask",
+/// "accept edits", "plan", "auto", "don't ask", "bypass".
+pub fn mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::AcceptEdits => "accept edits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Auto => "auto",
+        PermissionMode::DontAsk => "don't ask",
+        PermissionMode::Bypass => "bypass",
+    }
+}
+
+/// What a mode lets the agent do, one line for a picker.
+pub fn mode_detail(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "asks before any tool no rule allows",
+        PermissionMode::AcceptEdits => "file edits run without asking",
+        PermissionMode::Plan => "plans only, asks to leave with the plan",
+        PermissionMode::Auto => "the agent decides what to ask about",
+        PermissionMode::DontAsk => "never asks; what no rule allows is denied",
+        PermissionMode::Bypass => "never asks; everything runs",
+    }
+}
+
+/// Whether switching to `mode` lets every tool run unasked: a head asks
+/// once more before sending it.
+pub fn mode_needs_confirmation(mode: PermissionMode) -> bool {
+    mode == PermissionMode::Bypass
+}
+
+/// The mode for a status line: the one in effect, `→` a switch not yet
+/// answered (`ask → plan`), `?` while the agent has not said.
+pub fn agent_mode_label(agent: &AgentView) -> String {
+    let current = agent.mode.map_or("?", mode_label);
+    match &agent.mode_change {
+        Some(change) if Some(change.value) != agent.mode => {
+            format!("{current} → {}", mode_label(change.value))
+        }
+        _ => current.to_owned(),
+    }
+}
+
+/// The model for a status line, as [`agent_mode_label`] does for the mode:
+/// its offered label, else its name.
+pub fn agent_model_label(agent: &AgentView) -> Option<String> {
+    let current = agent.model_label();
+    let change = agent.model_change.as_ref().map(|change| {
+        agent
+            .choice(&change.value)
+            .map_or(change.value.as_str(), |m| m.label.as_str())
+    });
+    match (current, change) {
+        (Some(current), Some(change)) if current != change => Some(format!("{current} → {change}")),
+        (None, Some(change)) => Some(format!("? → {change}")),
+        (current, _) => current.map(str::to_owned),
+    }
+}
+
+/// The agent's newest refusal of a mode, in words: `bypass refused: …`.
+pub fn mode_refusal(agent: &AgentView) -> Option<String> {
+    let refused = agent.mode_refused.as_ref()?;
+    Some(format!(
+        "{} refused: {}",
+        mode_label(refused.value),
+        refused.reason
+    ))
+}
+
+/// The agent's newest refusal of a model, in words: `bogus refused: …`.
+pub fn model_refusal(agent: &AgentView) -> Option<String> {
+    let refused = agent.model_refused.as_ref()?;
+    Some(format!("{} refused: {}", refused.value, refused.reason))
+}
+
+/// Both refusals, mode first, for a head that shows them together.
+pub fn agent_refusal(agent: &AgentView) -> Vec<String> {
+    mode_refusal(agent)
+        .into_iter()
+        .chain(model_refusal(agent))
+        .collect()
+}
+
+/// A timeline line for a mode or model change or refusal: `mode → plan`,
+/// `model → claude-sonnet-5-5`, `mode bypass refused: …`. `who` names the
+/// device that asked, when one did; the head words it.
+pub fn agent_setting_line(setting: &AgentSetting, refused: Option<&str>) -> String {
+    let (what, value) = match setting {
+        AgentSetting::Mode(mode) => ("mode", mode_label(*mode).to_owned()),
+        AgentSetting::Model(model) => ("model", model.clone()),
+    };
+    match refused {
+        Some(reason) => format!("{what} {value} refused: {reason}"),
+        None => format!("{what} → {value}"),
+    }
+}
+
+/// Who asked for a setting change, for after [`agent_setting_line`]: `by
+/// laptop`, `by this device`, or nothing when the agent changed on its own.
+pub fn asked_by(by: Option<&DeviceRef>) -> Option<String> {
+    let by = by?;
+    Some(if by.me {
+        "by this device".to_owned()
+    } else {
+        format!("by {}", by.name.as_deref().unwrap_or("another device"))
+    })
 }
 
 /// A decision in words: "approved", "denied".
@@ -220,7 +330,41 @@ pub fn scope_label(scope: RuleScope) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use skywave_core::{ModelChoice, SettingChange};
+
     use super::*;
+
+    #[test]
+    fn agent_settings_read_as_current_then_switch() {
+        let mut agent = AgentView {
+            mode: Some(PermissionMode::Ask),
+            model: Some("model-s".into()),
+            models: vec![ModelChoice {
+                id: "sonnet".into(),
+                label: "Sonnet".into(),
+                detail: None,
+                resolved: Some("model-s".into()),
+            }],
+            ..AgentView::default()
+        };
+        assert_eq!(agent_mode_label(&agent), "ask");
+        assert_eq!(agent_model_label(&agent).as_deref(), Some("Sonnet"));
+        agent.mode_change = Some(SettingChange {
+            value: PermissionMode::Plan,
+            outgoing: None,
+        });
+        agent.model_change = Some(SettingChange {
+            value: "opus".into(),
+            outgoing: None,
+        });
+        assert_eq!(agent_mode_label(&agent), "ask → plan");
+        assert_eq!(agent_model_label(&agent).as_deref(), Some("Sonnet → opus"));
+        assert_eq!(agent_mode_label(&AgentView::default()), "?");
+        assert_eq!(
+            agent_setting_line(&AgentSetting::Mode(PermissionMode::Bypass), Some("no")),
+            "mode bypass refused: no"
+        );
+    }
 
     #[test]
     fn usage_figures_are_compact() {

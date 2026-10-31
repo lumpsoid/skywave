@@ -65,11 +65,12 @@ pub use store::{
 };
 pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
 pub use view::{
-    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
-    BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId, Completion,
-    CompletionStatus, Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason,
-    Link, LinkRejection, ListKind, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingApprovalRef, PendingSession, RejectReason, RuleScope, RuleSuggestion, Screen, Seq,
-    SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView, TimelineItem,
-    ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
+    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
+    BlobState, BlobView, BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId,
+    Completion, CompletionStatus, Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo,
+    FailReason, Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
+    PairingView, PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason,
+    RuleScope, RuleSuggestion, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState,
+    SessionView, SettingChange, SettingsView, TimelineItem, ToolApproval, ToolKind, ToolOutcome,
+    ToolView, TurnUsage, ViewState,
 };

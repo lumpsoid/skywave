@@ -103,6 +103,10 @@ pub enum RowKind {
     Archived,
     AgentError,
     TurnUsage,
+    /// The agent switched its mode or model.
+    AgentSetting,
+    /// The agent refused a switch and kept what it had: a warning.
+    SettingRefused,
 }
 
 /// A command's delivery state with its words.

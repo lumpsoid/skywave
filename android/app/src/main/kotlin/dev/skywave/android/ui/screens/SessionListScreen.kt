@@ -442,6 +442,7 @@ internal fun failText(reason: FailReason): String = stringResource(
         FailReason.APPROVAL_CANCELLED -> R.string.fail_approval_cancelled
         FailReason.NO_ACTIVE_TURN -> R.string.fail_no_active_turn
         FailReason.UNKNOWN_RULE -> R.string.fail_unknown_rule
+        FailReason.UNKNOWN_MODEL -> R.string.fail_unknown_model
         FailReason.UNDELIVERABLE -> R.string.fail_undeliverable
     },
 )

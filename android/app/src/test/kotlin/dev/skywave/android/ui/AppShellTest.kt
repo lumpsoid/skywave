@@ -18,6 +18,7 @@ import dev.skywave.android.core.CoreClient
 import dev.skywave.android.core.CoreMessage
 import dev.skywave.android.ui.screens.SettingsSamples
 import dev.skywave.core.Action
+import dev.skywave.core.AgentView
 import dev.skywave.core.BlobPolicy
 import dev.skywave.core.Entry
 import dev.skywave.core.Link
@@ -295,6 +296,7 @@ internal fun sessionView(archived: Boolean, items: Int = 0) = SessionView(
     pendingApproval = null,
     rules = emptyList(),
     usage = null,
+    agent = AgentView(null, null, null, null, null, null, null, emptyList()),
     interrupt = null,
     stop = null,
     draft = null,

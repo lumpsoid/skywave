@@ -9,13 +9,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, SessionState,
-    SessionUsage, SessionView, TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, PermissionMode,
+    RuleSuggestion, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
-    answer_words, blob_size, bytes, delivery_label, dollars, outgoing_label, tokens, turn_time,
+    agent_mode_label, agent_model_label, agent_refusal, answer_words, blob_size, bytes,
+    delivery_label, dollars, mode_detail, mode_label, outgoing_label, tokens, turn_time,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -24,7 +25,7 @@ use super::timeline::{
     title_spans, wall_ms,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
-use crate::app::{App, Focus, Geometry, SessionUi};
+use crate::app::{App, Focus, Geometry, Picker, SessionUi};
 
 /// Most composer rows on screen; longer drafts scroll.
 const COMPOSER_ROWS: usize = 6;
@@ -95,6 +96,9 @@ pub(super) fn render(
         Some(prompt) => render_prompt(frame, composer, app, prompt),
         None => render_composer(frame, composer, app, ui),
     }
+    if let Some(picker) = &ui.picker {
+        render_picker(frame, inner, composer, app, session, picker);
+    }
 }
 
 /// The agent's state and what is on its way, then what the session takes,
@@ -107,6 +111,18 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         SessionState::Errored(info) => Span::raw(format!("agent error: {}", info.message)).red(),
         SessionState::Stopped => Span::raw("agent stopped · a message restarts it").dark_gray(),
     }];
+    // The mode and model once the agent said them or one was asked for,
+    // then what it refused, until the next switch.
+    let agent = &session.agent;
+    if agent.mode.is_some() || agent.mode_change.is_some() {
+        spans.push(Span::raw(format!(" · mode {}", agent_mode_label(agent))));
+    }
+    if let Some(model) = agent_model_label(agent) {
+        spans.push(Span::raw(format!(" · {}", clean(&model))));
+    }
+    for refusal in agent_refusal(agent) {
+        spans.push(Span::raw(format!(" · {}", clean(&refusal))).yellow());
+    }
     if let Some(interrupt) = &session.interrupt {
         spans.push(Span::raw(" · interrupt ").dark_gray());
         spans.push(Span::styled(
@@ -140,8 +156,10 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
     }
     // What the session takes, right-aligned in what the rest leaves.
     let used = Line::from(spans.clone()).width();
+    // The model is on the left once the agent named it.
+    let model = session.agent.model.is_none();
     if let Some(usage) = &session.usage
-        && let Some(summary) = usage_summary(usage, width.saturating_sub(used + 2))
+        && let Some(summary) = usage_summary(usage, model, width.saturating_sub(used + 2))
     {
         let gap = width - used - summary.chars().count();
         spans.push(Span::raw(" ".repeat(gap)));
@@ -151,9 +169,10 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
 }
 
 /// `last turn 12.4s · 3.1k in / 812 out · $0.04 · session $1.27 · <model>`,
-/// with the figures the agent did not report left out, and fields dropped
-/// from the left until it fits in `room` columns; `None` if nothing does.
-fn usage_summary(usage: &SessionUsage, room: usize) -> Option<String> {
+/// with the figures the agent did not report left out (and the model unless
+/// `model`), and fields dropped from the left until it fits in `room`
+/// columns; `None` if nothing does.
+fn usage_summary(usage: &SessionUsage, model: bool, room: usize) -> Option<String> {
     let turn = &usage.last_turn;
     let mut fields = Vec::new();
     if let Some(ms) = turn.duration_ms {
@@ -176,7 +195,7 @@ fn usage_summary(usage: &SessionUsage, room: usize) -> Option<String> {
     if let Some(cost) = usage.total.cost_usd {
         fields.push(format!("session {}", dollars(cost)));
     }
-    if let Some(model) = &usage.total.model {
+    if let Some(model) = usage.total.model.as_ref().filter(|_| model) {
         fields.push(clean(model));
     }
     (0..fields.len())
@@ -409,6 +428,150 @@ fn gated_content(sections: &[Section], width: usize, max_rows: usize) -> Vec<Lin
 fn input_line(input: &BlobView) -> Line<'static> {
     let size = blob_size(&input.state).map_or_else(String::new, |size| format!(" {}", bytes(size)));
     Line::from(format!("  full input{size} · v to see it")).dark_gray()
+}
+
+/// The mode or model list, just above the composer (`below`) and as wide,
+/// over the timeline; at most as tall as the session view (`area`) leaves.
+fn render_picker(
+    frame: &mut Frame,
+    area: Rect,
+    below: Rect,
+    app: &App,
+    session: &SessionView,
+    picker: &Picker,
+) {
+    let room = below.y.saturating_sub(area.y);
+    let rows = usize::from(room.saturating_sub(2)).max(1);
+    let agent = &session.agent;
+    let (title, lines, input) = match picker {
+        Picker::Mode {
+            selected,
+            confirm: true,
+        } => {
+            let mode = PermissionMode::ALL[*selected];
+            let lines = vec![
+                Line::from(format!("Switch to {}?", mode_label(mode))).bold(),
+                Line::from(format!("{}.", capitalised(mode_detail(mode)))).yellow(),
+                Line::from("y switch · any other key back").yellow().bold(),
+            ];
+            (" Permission mode ".to_owned(), lines, None)
+        }
+        Picker::Mode { selected, .. } => {
+            let modes = PermissionMode::ALL.map(|mode| {
+                let mut spans = vec![
+                    Span::raw(format!("{:<14}", mode_label(mode))),
+                    Span::raw(mode_detail(mode)).dark_gray(),
+                ];
+                if agent.mode == Some(mode) {
+                    spans.push(Span::raw(" · now").green());
+                }
+                spans
+            });
+            let lines = list_lines(modes.into(), *selected, rows);
+            (
+                format!(" Permission mode · now {} ", agent_mode_label(agent)),
+                lines,
+                None,
+            )
+        }
+        Picker::Model { selected, name } => {
+            let current = agent.model.as_deref().and_then(|m| agent.choice(m));
+            let models: Vec<Vec<Span<'static>>> = agent
+                .models
+                .iter()
+                .map(|choice| {
+                    let mut spans = vec![Span::raw(clean(&choice.label))];
+                    if let Some(detail) = &choice.detail {
+                        spans.push(Span::raw(format!("  {}", clean(detail))).dark_gray());
+                    }
+                    if current == Some(choice) {
+                        spans.push(Span::raw(" · now").green());
+                    }
+                    spans
+                })
+                .collect();
+            let mut lines = if models.is_empty() {
+                vec![Line::from("No list yet: it comes once the agent has run.").dark_gray()]
+            } else if name.trim().is_empty() {
+                let selected = (*selected).min(models.len() - 1);
+                list_lines(models, selected, rows.saturating_sub(1))
+            } else {
+                // Typing: Enter sends the name, not the highlighted model.
+                let shown = rows.saturating_sub(1);
+                models
+                    .into_iter()
+                    .take(shown)
+                    .map(|spans| {
+                        let mut row = vec![Span::raw("  ")];
+                        row.extend(spans);
+                        Line::from(row).dark_gray()
+                    })
+                    .collect()
+            };
+            let typed = if name.is_empty() {
+                Line::from(vec![
+                    Span::raw("> "),
+                    Span::raw("or type a model name").dark_gray(),
+                ])
+            } else {
+                Line::from(format!("> {}", clean(name)))
+            };
+            lines.push(typed);
+            let now = agent_model_label(agent).unwrap_or_else(|| "?".to_owned());
+            let input = (lines.len() - 1, clean(name).chars().count() + 2);
+            (format!(" Model · now {} ", clean(&now)), lines, Some(input))
+        }
+    };
+    let height = (lines.len() as u16 + 2).min(room);
+    if height < 3 {
+        return;
+    }
+    let popup = Rect::new(below.x, below.y - height, below.width, height);
+    let block = Block::bordered().title(title).cyan();
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    if let Some((row, column)) = input
+        && app.typing()
+        && !app.ui().help
+        && (row as u16) < inner.height
+    {
+        let x = inner.x + (column as u16).min(inner.width.saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, inner.y + row as u16));
+    }
+}
+
+/// Rows of a list, `selected` marked, at most `max_rows` of them with the
+/// selected one in view.
+fn list_lines(
+    rows: Vec<Vec<Span<'static>>>,
+    selected: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let shown = max_rows.max(1);
+    let first = (selected + 1).saturating_sub(shown);
+    rows.into_iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(i, spans)| {
+            let mut row = vec![Span::raw(if i == selected { "› " } else { "  " })];
+            row.extend(spans);
+            if i == selected {
+                Line::from(row).reversed()
+            } else {
+                Line::from(row)
+            }
+        })
+        .collect()
+}
+
+/// `text` with its first letter upper-case.
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, app: &App, ui: &SessionUi) {

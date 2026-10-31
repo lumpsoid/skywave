@@ -1,7 +1,7 @@
 {
-  "protocol_version": 6,
+  "protocol_version": 7,
   "hello": {
-    "protocol_version": 6,
+    "protocol_version": 7,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -369,6 +369,94 @@
           "cost_usd": null,
           "model": null
         }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "kind": {
+          "type": "permission_mode_requested",
+          "mode": "plan",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "permission_mode_changed",
+          "mode": "plan",
+          "answers": "01920000-0000-7000-8000-000000000002"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "permission_mode_changed",
+          "mode": "ask",
+          "answers": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "permission_mode_refused",
+          "mode": "bypass",
+          "reason": "not launched for it",
+          "answers": "01920000-0000-7000-8000-000000000002"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "kind": {
+          "type": "model_requested",
+          "model": "sonnet",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "model_changed",
+          "model": "model-b",
+          "answers": "01920000-0000-7000-8000-000000000002"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "model_refused",
+          "model": "bogus",
+          "reason": "not found",
+          "answers": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "models_offered",
+          "models": [
+            {
+              "id": "sonnet",
+              "label": "Sonnet",
+              "detail": "Efficient",
+              "resolved": "model-b"
+            }
+          ]
+        }
       }
     ]
   },
@@ -460,6 +548,22 @@
         "session_id": "01920000-0000-7000-8000-000000000001",
         "archived": false
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "set_permission_mode",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "mode": "accept_edits"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "set_model",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "model": "sonnet"
+      }
     }
   ],
   "command_results": [
@@ -498,6 +602,10 @@
     {
       "result": "rejected",
       "reason": "unknown_rule"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_model"
     }
   ]
 }
