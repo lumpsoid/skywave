@@ -765,6 +765,7 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
                 label: "Sonnet".into(),
                 detail: Some("fast".into()),
                 resolved: Some("model-s".into()),
+                efforts: Vec::new(),
             }],
         },
         EventKind::ModelChanged {

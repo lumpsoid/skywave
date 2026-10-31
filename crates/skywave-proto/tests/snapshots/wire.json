@@ -1,7 +1,7 @@
 {
-  "protocol_version": 7,
+  "protocol_version": 8,
   "hello": {
-    "protocol_version": 7,
+    "protocol_version": 8,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -453,9 +453,55 @@
               "id": "sonnet",
               "label": "Sonnet",
               "detail": "Efficient",
-              "resolved": "model-b"
+              "resolved": "model-b",
+              "efforts": [
+                "low",
+                "high",
+                "xhigh"
+              ]
             }
           ]
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "kind": {
+          "type": "effort_requested",
+          "effort": "xhigh",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "effort_changed",
+          "effort": "medium",
+          "answers": "01920000-0000-7000-8000-000000000002"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "effort_changed",
+          "effort": null,
+          "answers": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "kind": {
+          "type": "effort_refused",
+          "effort": "max",
+          "reason": "not on this model",
+          "answers": "01920000-0000-7000-8000-000000000002"
         }
       }
     ]
@@ -563,6 +609,14 @@
         "type": "set_model",
         "session_id": "01920000-0000-7000-8000-000000000001",
         "model": "sonnet"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "set_effort",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "effort": "high"
       }
     }
   ],

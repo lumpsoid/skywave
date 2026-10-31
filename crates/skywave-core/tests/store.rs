@@ -1831,6 +1831,7 @@ fn agent_settings_and_offered_models_are_kept() {
         label: "Sonnet".into(),
         detail: None,
         resolved: None,
+        efforts: Vec::new(),
     }];
     let mut store = Store::open(&dir).unwrap();
     let event = |session_id, kind| Event {

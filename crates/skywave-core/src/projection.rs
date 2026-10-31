@@ -186,7 +186,10 @@ impl SessionSummary {
             | EventKind::ModelRequested { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
-            | EventKind::ModelsOffered { .. } => {}
+            | EventKind::ModelsOffered { .. }
+            | EventKind::EffortRequested { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. } => {}
         }
     }
 
@@ -257,7 +260,10 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ModelRequested { .. }
         | EventKind::ModelChanged { .. }
         | EventKind::ModelRefused { .. }
-        | EventKind::ModelsOffered { .. } => false,
+        | EventKind::ModelsOffered { .. }
+        | EventKind::EffortRequested { .. }
+        | EventKind::EffortChanged { .. }
+        | EventKind::EffortRefused { .. } => false,
     }
 }
 
@@ -288,7 +294,10 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ModelRequested { .. }
         | EventKind::ModelChanged { .. }
         | EventKind::ModelRefused { .. }
-        | EventKind::ModelsOffered { .. } => (None, None),
+        | EventKind::ModelsOffered { .. }
+        | EventKind::EffortRequested { .. }
+        | EventKind::EffortChanged { .. }
+        | EventKind::EffortRefused { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }

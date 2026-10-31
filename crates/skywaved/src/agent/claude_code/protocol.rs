@@ -177,6 +177,7 @@ pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
                 detail: text("description"),
                 resolved: text("resolvedModel"),
                 id,
+                efforts: Vec::new(),
             })
         })
         .collect()
