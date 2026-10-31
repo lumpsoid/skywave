@@ -275,7 +275,8 @@ mod tests {
 
     use super::*;
     use crate::view::{
-        BodyFormat, BodyView, CallId, CommandId, DeviceId, Outgoing, Seq, ToolKind, ToolView,
+        BodyFormat, BodyView, CallId, CommandId, DeviceId, DeviceRef, Outgoing, Seq, ToolKind,
+        ToolView,
     };
 
     /// The matching items' indices, no blob downloaded.
@@ -367,8 +368,11 @@ mod tests {
             logged(Entry::UserMessage {
                 command_id: commands,
                 text: "find the user".into(),
-                from: DeviceId::new(),
-                own: false,
+                from: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: false,
+                },
                 outgoing: None,
                 delivery: None,
             }),

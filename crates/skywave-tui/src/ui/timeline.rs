@@ -18,7 +18,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
-    Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, Delivery, DeviceId, Entry,
+    Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, Delivery, DeviceRef, Entry,
     Outgoing, Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
     read_head,
 };
@@ -261,15 +261,14 @@ impl Layout<'_> {
             Entry::UserMessage {
                 text,
                 from,
-                own,
                 outgoing,
                 ..
             } => {
-                let label = if *own {
+                let label = if from.me {
                     you(outgoing.as_ref())
                 } else {
                     vec![
-                        Span::raw(device_label(*from)).magenta().bold(),
+                        Span::raw(device_label(from)).magenta().bold(),
                         Span::raw(": "),
                     ]
                 };
@@ -290,11 +289,11 @@ impl Layout<'_> {
                 );
                 return vec![Line::from(spans)];
             }
-            Entry::Renamed { name, by, own } => {
-                let who = if *own {
+            Entry::Renamed { name, by } => {
+                let who = if by.me {
                     "you".to_owned()
                 } else {
-                    device_label(*by)
+                    device_label(by)
                 };
                 let what = match name {
                     Some(name) => format!("renamed to “{}” by {who}", clean(name)),
@@ -304,11 +303,11 @@ impl Layout<'_> {
                 spans.push(Span::raw(what).dark_gray());
                 return vec![Line::from(spans)];
             }
-            Entry::Archived { archived, by, own } => {
-                let who = if *own {
+            Entry::Archived { archived, by } => {
+                let who = if by.me {
                     "you".to_owned()
                 } else {
-                    device_label(*by)
+                    device_label(by)
                 };
                 let what = if *archived {
                     format!("archived by {who}")
@@ -922,12 +921,9 @@ pub(super) fn detail_lines(
 fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
     let approval = view.approval.as_ref().map(|a| &a.status);
     let answered = match approval {
-        Some(ApprovalStatus::Resolved {
-            decision,
-            by,
-            by_me,
-            rule,
-        }) => Some(resolved_label(*decision, *by, *by_me, rule.as_ref())),
+        Some(ApprovalStatus::Resolved { decision, by, rule }) => {
+            Some(resolved_label(*decision, by, rule.as_ref()))
+        }
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
@@ -967,8 +963,8 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
             };
             (parts.join(" · "), style)
         }
-        ToolOutcome::Denied { by, by_me } => (
-            format!("{} {}", decision_label(Decision::Deny), where_(*by, *by_me)),
+        ToolOutcome::Denied { by } => (
+            format!("{} {}", decision_label(Decision::Deny), where_(by)),
             Style::new().magenta(),
         ),
         ToolOutcome::Cancelled { reason } => {
@@ -1005,13 +1001,8 @@ fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String>
 pub(super) fn approval_state(status: &ApprovalStatus) -> (String, Style) {
     match status {
         ApprovalStatus::Pending => ("needs approval".to_owned(), Style::new().yellow().bold()),
-        ApprovalStatus::Resolved {
-            decision,
-            by,
-            by_me,
-            rule,
-        } => (
-            resolved_label(*decision, *by, *by_me, rule.as_ref()),
+        ApprovalStatus::Resolved { decision, by, rule } => (
+            resolved_label(*decision, by, rule.as_ref()),
             match decision {
                 Decision::Approve => Style::new().green(),
                 Decision::Deny => Style::new().magenta(),
@@ -1025,20 +1016,15 @@ pub(super) fn approval_state(status: &ApprovalStatus) -> (String, Style) {
 
 /// How an approval was answered and where, with the rule it granted:
 /// `approved always on <device> · <rule>`.
-fn resolved_label(
-    decision: Decision,
-    by: DeviceId,
-    by_me: bool,
-    rule: Option<&RuleSuggestion>,
-) -> String {
+fn resolved_label(decision: Decision, by: &DeviceRef, rule: Option<&RuleSuggestion>) -> String {
     let words = answer_words(decision, rule);
     let rule = rule.map_or_else(String::new, |rule| format!(" · {}", clean(&rule.label)));
-    format!("{words} {}{rule}", where_(by, by_me))
+    format!("{words} {}{rule}", where_(by))
 }
 
 /// Who answered an approval: "here" or the other device.
-fn where_(by: DeviceId, by_me: bool) -> String {
-    if by_me {
+fn where_(by: &DeviceRef) -> String {
+    if by.me {
         "here".to_owned()
     } else {
         format!("on {}", device_label(by))
@@ -1230,11 +1216,9 @@ fn group(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
     spans
 }
 
-/// Another device, by the end of its id: the start of a UUIDv7 is a
-/// timestamp, the end is random.
-pub(super) fn device_label(id: DeviceId) -> String {
-    let id = id.0.simple().to_string();
-    format!("device …{}", &id[id.len() - 8..])
+/// Another device, by its name or the end of its id, safe for the grid.
+pub(super) fn device_label(device: &DeviceRef) -> String {
+    clean(&device.label())
 }
 
 /// Text made safe for a terminal cell grid: tabs become spaces, other

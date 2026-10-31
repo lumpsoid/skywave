@@ -18,9 +18,9 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DirsResult, EventBatch,
-    EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq,
-    SessionId, path,
+    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo, DirsResult,
+    EventBatch, EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse,
+    RejectReason, Seq, SessionId, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -101,6 +101,11 @@ impl Fixture {
 
     /// Pairs a new device through `POST /v1/pair`, like a real client.
     async fn pair(&self) -> Credentials {
+        self.pair_as("laptop").await
+    }
+
+    /// [`Fixture::pair`] with the device name `name`.
+    async fn pair_as(&self, name: &str) -> Credentials {
         let issued =
             pairing::issue_code(self.storage.db.conn(), Utc::now(), pairing::DEFAULT_TTL).unwrap();
         let key = KeyPair::generate().unwrap();
@@ -111,7 +116,7 @@ impl Fixture {
                 .unwrap()
                 .pem()
                 .unwrap(),
-            device_name: "laptop".into(),
+            device_name: name.into(),
         };
         let resp = self
             .anonymous()
@@ -356,12 +361,34 @@ async fn hello_names_the_caller_and_records_last_seen() {
             server_id: f.identity.server_id(),
             device_id: creds.id,
             head: Seq::ZERO,
+            devices: vec![DeviceInfo {
+                id: creds.id,
+                name: "laptop".into(),
+            }],
         }
     );
     let device = devices::get(f.storage.db.conn(), creds.id)
         .unwrap()
         .unwrap();
     assert!(device.last_seen.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_names_every_paired_device_revoked_ones_too() {
+    let f = Fixture::start().await;
+    let laptop = f.pair_as("laptop").await;
+    let phone = f.pair_as("Pixel 8").await;
+    devices::revoke(f.storage.db.conn(), phone.id, Utc::now()).unwrap();
+    let hello: HelloResponse = f.client(&laptop).await.get(path::HELLO).await.json();
+    let mut named: Vec<(DeviceId, String)> =
+        hello.devices.into_iter().map(|d| (d.id, d.name)).collect();
+    named.sort();
+    let mut expected = vec![
+        (laptop.id, "laptop".to_owned()),
+        (phone.id, "Pixel 8".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(named, expected);
 }
 
 #[tokio::test(flavor = "multi_thread")]

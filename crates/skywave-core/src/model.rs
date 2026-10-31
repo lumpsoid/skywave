@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
-    BlobRef, Command, CommandKind, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    Fingerprint, RuleSuggestion, SessionState as LogState, ToolCall,
+    BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
+    EventKind, Fingerprint, RuleSuggestion, SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -26,10 +26,10 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
-    BodyView, CallId, CommandId, Decision, Delivery, DeviceId, Draft, Entry, ErrorInfo, Link,
-    ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession,
-    Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo,
+    Link, ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
+    PendingSession, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView,
+    SettingsView, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -158,6 +158,8 @@ pub(crate) struct Model {
     alerted_at: HashMap<ApprovalId, u64>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
+    /// The server's devices by name, as stored.
+    devices: HashMap<DeviceId, String>,
 }
 
 impl Model {
@@ -192,6 +194,7 @@ impl Model {
             alerts: 0,
             alerted_at: HashMap::new(),
             completer: Completer::default(),
+            devices: HashMap::new(),
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -211,6 +214,7 @@ impl Model {
         self.drafts = snapshot.drafts;
         self.read_marks = snapshot.read_marks;
         self.deleted = snapshot.deleted;
+        self.devices = snapshot.devices;
         self.open = None;
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
@@ -724,6 +728,32 @@ impl Model {
         first
     }
 
+    /// The device `id` as the views name it.
+    fn device_ref(&self, id: DeviceId) -> DeviceRef {
+        DeviceRef {
+            id,
+            name: self.devices.get(&id).cloned(),
+            me: self.device() == Some(id),
+        }
+    }
+
+    /// The server listed its devices: keep their names (already stored).
+    pub(crate) fn devices_named(&mut self, devices: &[DeviceInfo]) {
+        for device in devices {
+            self.devices.insert(device.id, device.name.clone());
+        }
+    }
+
+    /// Devices the events name that this device knows no name for.
+    pub(crate) fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
+        batch
+            .events
+            .iter()
+            .filter_map(|event| event.kind.device())
+            .filter(|id| !self.devices.contains_key(id))
+            .collect()
+    }
+
     /// A logged user message is this device's own if it is still in the
     /// outbox (`sent`) or carries this device's id.
     fn is_own_message(&self, sent: bool, device_id: DeviceId) -> bool {
@@ -1139,8 +1169,10 @@ impl Model {
                     Some(Entry::UserMessage {
                         command_id: *command_id,
                         text: text.clone(),
-                        from: *device_id,
-                        own: self.is_own_message(sent.is_some(), *device_id),
+                        from: DeviceRef {
+                            me: self.is_own_message(sent.is_some(), *device_id),
+                            ..self.device_ref(*device_id)
+                        },
                         outgoing: sent.map(|e| Outgoing::from(&e.status)),
                         delivery: sent.and_then(|e| Delivery::of(e)),
                     })
@@ -1248,15 +1280,14 @@ impl Model {
                     by,
                     rule,
                 } => {
-                    let by_me = self.device() == Some(*by);
+                    let by = self.device_ref(*by);
+                    let ends = (*decision == Decision::Deny)
+                        .then(|| ToolOutcome::Denied { by: by.clone() });
                     let status = ApprovalStatus::Resolved {
                         decision: *decision,
-                        by: *by,
-                        by_me,
+                        by,
                         rule: tools.grant(*id, *decision, *rule),
                     };
-                    let ends = (*decision == Decision::Deny)
-                        .then_some(ToolOutcome::Denied { by: *by, by_me });
                     tools.settle(&mut items, *id, status, ends);
                     None
                 }
@@ -1274,13 +1305,11 @@ impl Model {
                 EventKind::SessionStopped => Some(Entry::Stopped),
                 EventKind::SessionRenamed { name, by } => Some(Entry::Renamed {
                     name: name.clone(),
-                    by: *by,
-                    own: self.device() == Some(*by),
+                    by: self.device_ref(*by),
                 }),
                 EventKind::SessionArchived { archived, by } => Some(Entry::Archived {
                     archived: *archived,
-                    by: *by,
-                    own: self.device() == Some(*by),
+                    by: self.device_ref(*by),
                 }),
                 EventKind::SessionStateChanged(state) => {
                     // Every state change ends a turn or starts the next.
@@ -1659,6 +1688,7 @@ mod tests {
             read_marks: HashMap::new(),
             deleted: HashSet::new(),
             alerted: HashSet::new(),
+            devices: HashMap::new(),
         }
     }
 
@@ -1888,8 +1918,11 @@ mod tests {
                 &Entry::UserMessage {
                     command_id: command.id,
                     text: "hello".into(),
-                    from: me,
-                    own: true,
+                    from: DeviceRef {
+                        id: me,
+                        name: None,
+                        me: true,
+                    },
                     outgoing: Some(Outgoing::Accepted(Seq(2))),
                     delivery: Some(done),
                 },
@@ -1935,7 +1968,7 @@ mod tests {
             TimelineItem::Logged {
                 entry: Entry::UserMessage {
                     command_id,
-                    own: false,
+                    from: DeviceRef { me: false, .. },
                     outgoing: None,
                     delivery: None,
                     ..
@@ -2079,8 +2112,11 @@ mod tests {
                 input: Some(blob),
                 status: ApprovalStatus::Resolved {
                     decision: Decision::Deny,
-                    by: phone,
-                    by_me: false,
+                    by: DeviceRef {
+                        id: phone,
+                        name: None,
+                        me: false,
+                    },
                     rule: None,
                 },
                 answer: Some(refused),
@@ -2251,19 +2287,119 @@ mod tests {
             [
                 &ApprovalStatus::Resolved {
                     decision: Decision::Approve,
-                    by: me,
-                    by_me: true,
+                    by: DeviceRef {
+                        id: me,
+                        name: None,
+                        me: true,
+                    },
                     rule: Some(edits.clone()),
                 },
                 &ApprovalStatus::Resolved {
                     decision: Decision::Approve,
-                    by: phone,
-                    by_me: false,
+                    by: DeviceRef {
+                        id: phone,
+                        name: None,
+                        me: false,
+                    },
                     rule: Some(ls.clone()),
                 },
             ]
         );
         assert_eq!(view.rules, [edits, ls]);
+    }
+
+    #[test]
+    fn devices_show_by_the_names_the_server_lists() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (phone, approval) = (DeviceId::new(), ApprovalId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: phone,
+                    text: "from the phone".into(),
+                },
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: None,
+                    tool: "edit".into(),
+                    summary: "main.rs".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                },
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: phone,
+                    rule: None,
+                },
+            ],
+        );
+        f.open(sid);
+        let devices = |f: &Fixture| -> Vec<DeviceRef> {
+            f.session_view()
+                .timeline
+                .iter()
+                .filter_map(|item| match item {
+                    TimelineItem::Logged {
+                        entry: Entry::UserMessage { from: device, .. },
+                        ..
+                    }
+                    | TimelineItem::Logged {
+                        entry:
+                            Entry::Approval {
+                                status: ApprovalStatus::Resolved { by: device, .. },
+                                ..
+                            },
+                        ..
+                    } => Some(device.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Not listed yet: the end of its id stands in.
+        let unnamed = DeviceRef {
+            id: phone,
+            name: None,
+            me: false,
+        };
+        assert_eq!(devices(&f), [unnamed.clone(), unnamed.clone()]);
+        let tail = &phone.0.simple().to_string()[24..];
+        assert_eq!(unnamed.label(), format!("device …{tail}"));
+        let batch = EventBatch {
+            from: Seq(1),
+            events: vec![Event {
+                session_id: sid,
+                at: Utc::now(),
+                kind: EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: phone,
+                    text: "again".into(),
+                },
+            }],
+        };
+        assert_eq!(f.model.unnamed_devices(&batch), HashSet::from([phone]));
+
+        let me = f.me;
+        f.model.devices_named(&[
+            DeviceInfo {
+                id: phone,
+                name: "Pixel 8".into(),
+            },
+            DeviceInfo {
+                id: me,
+                name: "laptop".into(),
+            },
+        ]);
+        let named = DeviceRef {
+            name: Some("Pixel 8".into()),
+            ..unnamed
+        };
+        assert_eq!(devices(&f), [named.clone(), named.clone()]);
+        assert_eq!(named.label(), "Pixel 8");
+        assert!(f.model.unnamed_devices(&batch).is_empty());
     }
 
     #[test]
@@ -2437,8 +2573,11 @@ mod tests {
             entries(&f),
             vec![Entry::Renamed {
                 name: Some("flakytests".into()),
-                by: f.me,
-                own: true,
+                by: DeviceRef {
+                    id: f.me,
+                    name: None,
+                    me: true,
+                },
             }]
         );
 
@@ -2574,8 +2713,11 @@ mod tests {
             entries(&f),
             vec![Entry::Archived {
                 archived: true,
-                by: f.me,
-                own: true,
+                by: DeviceRef {
+                    id: f.me,
+                    name: None,
+                    me: true,
+                },
             }]
         );
         f.open(new);
@@ -3445,8 +3587,11 @@ mod tests {
                 id: approval,
                 status: ApprovalStatus::Resolved {
                     decision: Decision::Approve,
-                    by: f.me,
-                    by_me: true,
+                    by: DeviceRef {
+                        id: f.me,
+                        name: None,
+                        me: true,
+                    },
                     rule: None,
                 },
                 answer: None,
@@ -3535,8 +3680,11 @@ mod tests {
         assert_eq!(
             view.outcome,
             ToolOutcome::Denied {
-                by: phone,
-                by_me: false
+                by: DeviceRef {
+                    id: phone,
+                    name: None,
+                    me: false
+                }
             }
         );
         assert_eq!(
@@ -3545,8 +3693,11 @@ mod tests {
                 id: approval,
                 status: ApprovalStatus::Resolved {
                     decision: Decision::Deny,
-                    by: phone,
-                    by_me: false,
+                    by: DeviceRef {
+                        id: phone,
+                        name: None,
+                        me: false,
+                    },
                     rule: None,
                 },
                 answer: None,
@@ -3669,8 +3820,11 @@ mod tests {
                     input: None,
                     status: ApprovalStatus::Resolved {
                         decision: Decision::Deny,
-                        by: f.me,
-                        by_me: true,
+                        by: DeviceRef {
+                            id: f.me,
+                            name: None,
+                            me: true,
+                        },
                         rule: None,
                     },
                     answer: None,
@@ -3904,6 +4058,7 @@ mod tests {
             read_marks: model.read_marks.clone(),
             deleted: model.deleted.clone(),
             alerted: model.alerted.clone(),
+            devices: model.devices.clone(),
         }
     }
 

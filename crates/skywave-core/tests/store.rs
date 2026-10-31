@@ -10,8 +10,8 @@ use skywave_core::{
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
-    DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState, ToolResult,
-    TurnUsage,
+    DeviceId, DeviceInfo, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState,
+    ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -526,6 +526,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -654,6 +655,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
@@ -716,6 +718,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_archived(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
     assert!(!summary(&store, a).archived);
@@ -795,6 +798,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_usage(&dir);
     drop_archived(&dir);
     drop_titles(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
     for expected in before {
@@ -885,6 +889,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_archived(&dir);
     drop_titles(&dir);
     drop_unread(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
@@ -993,6 +998,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_titles(&dir);
     drop_unread(&dir);
     drop_drafts(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -1622,7 +1628,39 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
 
     // A replica from before the table: what is pending is old news.
     drop_alerted(&dir);
+    drop_devices(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
+}
+
+fn drop_devices(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE devices;").unwrap();
+}
+
+#[test]
+fn device_names_survive_a_reopen_and_go_with_the_server() {
+    let (_tmp, dir) = data_dir();
+    let (laptop, phone) = (DeviceId::new(), DeviceId::new());
+    let named = |id, name: &str| DeviceInfo {
+        id,
+        name: name.into(),
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .set_devices(&[named(laptop, "laptop"), named(phone, "phone")])
+        .unwrap();
+    // A later list renames; one it leaves out keeps its name.
+    store.set_devices(&[named(phone, "Pixel 8")]).unwrap();
+    drop(store);
+
+    let mut store = Store::open(&dir).unwrap();
+    let devices = store.load().unwrap().devices;
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[&laptop], "laptop");
+    assert_eq!(devices[&phone], "Pixel 8");
+
+    store.reset_for_server("other:7443").unwrap();
+    assert!(store.devices().unwrap().is_empty());
 }

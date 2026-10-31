@@ -14,6 +14,7 @@ import dev.skywave.core.BodyFormat
 import dev.skywave.core.BodyView
 import dev.skywave.core.Decision
 import dev.skywave.core.Delivery
+import dev.skywave.core.DeviceRef
 import dev.skywave.core.Draft
 import dev.skywave.core.Entry
 import dev.skywave.core.FailReason
@@ -30,8 +31,10 @@ import dev.skywave.core.TurnUsage
 
 /** Hand-made sessions for previews and UI tests; nothing here talks to a core. */
 internal object SessionSamples {
-    const val ME = "0192f3a4-0000-7000-8000-000000000001"
-    const val OTHER = "0192f3a4-0000-7000-8000-000000000002"
+    private const val ME = "0192f3a4-0000-7000-8000-000000000001"
+    private const val OTHER = "0192f3a4-0000-7000-8000-000000000002"
+    val meDevice = DeviceRef(ME, "Pixel 8", "Pixel 8", true)
+    val otherDevice = DeviceRef(OTHER, "laptop", "laptop", false)
     private const val T0 = 1_761_800_000_000L
 
     val noChrome = ShellChrome(banners = {}, snackbarHost = {}, onUp = {})
@@ -44,8 +47,7 @@ internal object SessionSamples {
         Entry.UserMessage(
             commandId = commandId,
             text = text,
-            from = if (own) ME else OTHER,
-            own = own,
+            from = if (own) meDevice else otherDevice,
             outgoing = if (own) Outgoing.Accepted(seq.toULong()) else null,
             delivery = if (own) Delivery(T0, T0 + 200, T0 + 900, 1u) else null,
         ),
@@ -84,7 +86,7 @@ internal object SessionSamples {
             tool(
                 ToolKind.FILE_EDIT, "src/sync.rs", name = "Edit",
                 body = BodyView(BodyFormat.DIFF, "@@ -1 +1 @@\n-old line\n+new line", 3u, null),
-                approval = ToolApproval("ap1", ApprovalStatus.Resolved(Decision.APPROVE, ME, true, null)),
+                approval = ToolApproval("ap1", ApprovalStatus.Resolved(Decision.APPROVE, meDevice, null)),
             ),
         ),
         logged(
@@ -96,7 +98,7 @@ internal object SessionSamples {
         ),
         logged(6, tool(ToolKind.FILE_WRITE, "notes.md", name = "Write", body = BodyView(BodyFormat.TEXT, "# Notes", 1u, null))),
         logged(7, tool(ToolKind.SEARCH, "fn sync", name = "Grep", detail = "in src/")),
-        logged(8, tool(ToolKind.FETCH, "https://example.com", name = "WebFetch", outcome = ToolOutcome.Denied(OTHER, false))),
+        logged(8, tool(ToolKind.FETCH, "https://example.com", name = "WebFetch", outcome = ToolOutcome.Denied(otherDevice))),
         logged(9, tool(ToolKind.SUBAGENT, "Explore the tests", name = "Task", outcome = ToolOutcome.Cancelled("turn ended"))),
         logged(10, tool(ToolKind.OTHER, "do a thing", name = "Frobnicate", outcome = ToolOutcome.NoResult)),
         logged(11, tool(ToolKind.SHELL, "sleep 60", name = "Bash", outcome = ToolOutcome.Running(T0))),
@@ -106,8 +108,8 @@ internal object SessionSamples {
         logged(15, Entry.AgentErrored("rate limited")),
         logged(16, Entry.Interrupted),
         logged(17, Entry.Stopped),
-        logged(18, Entry.Renamed("Sync fix", ME, true)),
-        logged(19, Entry.Archived(true, OTHER, false)),
+        logged(18, Entry.Renamed("Sync fix", meDevice)),
+        logged(19, Entry.Archived(true, otherDevice)),
         logged(20, Entry.TurnUsage(usage)),
         message(21, "And from my laptop", own = false),
     )

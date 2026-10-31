@@ -2,7 +2,8 @@
 //! (spec §7, D6).
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
-//! the pull cursor, blob rows, settings and this device's drafts, read
+//! the pull cursor, blob rows, settings, the server's device names (from
+//! `hello`) and this device's drafts, read
 //! marks, locally deleted sessions and alerted approvals (D5: never
 //! synced). Startup always reads everything back from here
 //! ([`Store::load`]), so a cold start is the normal start.
@@ -17,8 +18,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, Seq,
-    SessionId,
+    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo,
+    Event, EventBatch, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -167,6 +168,14 @@ CREATE TABLE alerted_approvals (
 );
 INSERT OR IGNORE INTO alerted_approvals (id, session_id)
     SELECT approval.value, sessions.id FROM sessions, json_each(sessions.pending_approvals) AS approval;
+"#,
+    r#"
+-- The names of the server's devices, as its last `hello` listed them, so
+-- the views name who answered or wrote while offline too.
+CREATE TABLE devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
 "#,
 ];
 
@@ -356,6 +365,8 @@ pub struct Snapshot {
     /// Pending approvals this device alerted on or judged no news
     /// ([`Store::mark_alerted`]).
     pub alerted: HashSet<ApprovalId>,
+    /// The server's devices by name ([`Store::set_devices`]).
+    pub devices: HashMap<DeviceId, String>,
 }
 
 /// Handle to the replica database.
@@ -406,6 +417,7 @@ impl Store {
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
             alerted: self.alerted()?,
+            devices: self.devices()?,
         })
     }
 
@@ -580,7 +592,8 @@ impl Store {
 
     /// Makes the replica a fresh one for the server at `address`, in one
     /// transaction: the event log, session summaries, cursor, outbox and
-    /// blob rows the old server's log produced go, and so does what this
+    /// blob rows the old server's log produced go, as do its device names,
+    /// and so does what this
     /// device kept beside them — drafts, read marks, locally deleted
     /// sessions and alerted approvals. Of the settings, the server address becomes `address`;
     /// the blob policy, a preference of this device, stays, as do keys a
@@ -602,7 +615,8 @@ impl Store {
              DELETE FROM drafts;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
-             DELETE FROM alerted_approvals;",
+             DELETE FROM alerted_approvals;
+             DELETE FROM devices;",
         )?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -917,6 +931,31 @@ impl Store {
                 "INSERT INTO alerted_approvals (id, session_id) VALUES (?1, ?2)
                  ON CONFLICT (id) DO NOTHING",
                 params![approval.0.to_string(), session.0.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ---- device names ---------------------------------------------------------
+
+    /// The server's devices by name.
+    pub fn devices(&self) -> Result<HashMap<DeviceId, String>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM devices")?;
+        let rows = stmt.query_map([], |row| Ok((DeviceId(uuid_col(row, 0)?), row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps the server's device names, in one transaction. A device the
+    /// server no longer lists keeps its last known name: old events still
+    /// name it.
+    pub fn set_devices(&mut self, devices: &[DeviceInfo]) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        for device in devices {
+            tx.execute(
+                "INSERT INTO devices (id, name) VALUES (?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+                params![device.id.0.to_string(), device.name],
             )?;
         }
         tx.commit()?;

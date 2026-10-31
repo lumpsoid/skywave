@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, ApprovalStatus, Backoff, Core, DeviceId, EngineConfig, Entry, Jitter, Link, ListKind,
-    OutboxEntry, OutboxStatus, Screen, Seam, SessionRow, SessionView, TimelineItem,
+    Action, ApprovalStatus, Backoff, Core, DeviceId, DeviceRef, EngineConfig, Entry, Jitter, Link,
+    ListKind, OutboxEntry, OutboxStatus, Screen, Seam, SessionRow, SessionView, TimelineItem,
     TransportConfig, ViewState,
 };
 use skywave_proto::{CommandId, CommandKind, CommandResult, Event, EventKind, Seq, SessionId};
@@ -617,7 +617,17 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     assert_eq!(ids.len(), logged("UserMessage"), "no message twice");
 }
 
-/// A timeline with what differs per device (own, delivery state, by_me)
+/// A device as every device shows it: who is `me` differs, and a name
+/// may come a `hello` later on one than on another.
+fn shared_device(device: DeviceRef) -> DeviceRef {
+    DeviceRef {
+        name: None,
+        me: false,
+        ..device
+    }
+}
+
+/// A timeline with what differs per device (who is `me`, delivery state)
 /// blanked, for comparing devices.
 pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
     timeline
@@ -636,8 +646,7 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                     } => Entry::UserMessage {
                         command_id,
                         text,
-                        from,
-                        own: false,
+                        from: shared_device(from),
                         outgoing: None,
                         delivery: None,
                     },
@@ -657,8 +666,7 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                             ApprovalStatus::Resolved { decision, by, .. } => {
                                 ApprovalStatus::Resolved {
                                     decision,
-                                    by,
-                                    by_me: false,
+                                    by: shared_device(by),
                                     rule: None,
                                 }
                             }
@@ -668,13 +676,11 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                     },
                     Entry::Renamed { name, by, .. } => Entry::Renamed {
                         name,
-                        by,
-                        own: false,
+                        by: shared_device(by),
                     },
                     Entry::Archived { archived, by, .. } => Entry::Archived {
                         archived,
-                        by,
-                        own: false,
+                        by: shared_device(by),
                     },
                     other => other,
                 },

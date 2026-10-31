@@ -18,9 +18,9 @@ use skywave_core::{
     Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    BlobRef, Body, BodyFormat, CallId, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ToolCall, ToolDisplay,
-    ToolKind, ToolResult, TurnUsage,
+    BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
+    EventKind, RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ToolCall,
+    ToolDisplay, ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -1232,9 +1232,77 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
-/// The last 8 hex digits of a device id, as the timeline names devices.
+/// The last 8 hex digits of a device id, as the timeline names devices
+/// whose name it does not know.
 fn tail(device: DeviceId) -> String {
     device.0.simple().to_string()[24..].to_owned()
+}
+
+#[test]
+fn other_devices_show_by_name_once_the_server_lists_them() {
+    let (mut h, id, me) = open_session();
+    let (phone, approval) = (DeviceId::new(), ApprovalId::new());
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::UserMessage {
+                    command_id: CommandId::new(),
+                    device_id: phone,
+                    text: "from the phone".into(),
+                },
+            ),
+            event(
+                id,
+                2,
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: None,
+                    tool: "Bash".into(),
+                    summary: "rm -rf target".into(),
+                    input: None,
+                    suggestions: Vec::new(),
+                },
+            ),
+            event(
+                id,
+                3,
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: phone,
+                    rule: None,
+                },
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        &format!("12:01 device …{}: from the phone", tail(phone)),
+    );
+    assert_contains(&screen, &format!("approved on device …{}", tail(phone)));
+
+    // Listed at `hello`; a control character in a name never reaches the grid.
+    h.seam
+        .devices_listed(&[
+            DeviceInfo {
+                id: phone,
+                name: "Pixel\u{7} 8".into(),
+            },
+            DeviceInfo {
+                id: me,
+                name: "laptop".into(),
+            },
+        ])
+        .unwrap();
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "12:01 Pixel 8: from the phone");
+    assert_contains(&screen, "approved on Pixel 8");
+    assert!(!screen.contains("laptop"), "{screen}");
 }
 
 fn blob(size: u64) -> (BlobId, BlobRef) {

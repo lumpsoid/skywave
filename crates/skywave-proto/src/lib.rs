@@ -31,7 +31,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v5: `RejectReason::ApprovalCancelled`, so an answer that arrives after
 /// its approval was cancelled is not reported as answered elsewhere.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6: `devices` on [`HelloResponse`], so a device names the others by the
+/// names they paired with.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -208,6 +211,26 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// The device whose command logged the event, for events that name one.
+    pub fn device(&self) -> Option<DeviceId> {
+        match self {
+            EventKind::UserMessage { device_id, .. } => Some(*device_id),
+            EventKind::ApprovalResolved { by, .. }
+            | EventKind::SessionRenamed { by, .. }
+            | EventKind::SessionArchived { by, .. } => Some(*by),
+            EventKind::SessionCreated { .. }
+            | EventKind::AgentMessage { .. }
+            | EventKind::ToolCall(_)
+            | EventKind::ToolResult(_)
+            | EventKind::ApprovalRequested { .. }
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped
+            | EventKind::SessionStateChanged(_)
+            | EventKind::TurnUsage(_) => None,
+        }
+    }
+
     /// What the event does to its session's archived flag, the one rule the
     /// server and every client fold: `SessionArchived` sets it, a
     /// `UserMessage` from any device brings the session back, anything else
@@ -683,6 +706,18 @@ pub struct HelloResponse {
     pub device_id: DeviceId,
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
     pub head: Seq,
+    /// Every device ever paired with the server, revoked ones included:
+    /// the log names devices by id only, and its old events still name
+    /// the revoked.
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// A paired device as other devices show it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub id: DeviceId,
+    /// The name it paired with ([`PairRequest::device_name`]).
+    pub name: String,
 }
 
 /// Query string of `GET /v1/events`.

@@ -223,12 +223,12 @@ class ApprovalPanelTest {
         tag(ApprovalTags.PANEL).assertDoesNotExist()
         tag(ApprovalTags.APPROVE).assertDoesNotExist()
         tag(ApprovalTags.ANSWER).assertDoesNotExist()
-        // No device names in the view yet (e4d763): the device's id stands in.
-        seeGated("Approved on another device (…000002)")
+        // Named as it paired.
+        seeGated("Approved on laptop")
 
         view = ApprovalSamples.answeredElsewhere(ApprovalSamples.editTool, Decision.DENY)
         compose.waitForIdle()
-        seeGated("Denied on another device (…000002)")
+        seeGated("Denied on laptop")
     }
 
     @Test
@@ -239,12 +239,12 @@ class ApprovalPanelTest {
             gated.tool.copy(
                 approval = ToolApproval(
                     ApprovalSamples.ID,
-                    ApprovalStatus.Resolved(Decision.APPROVE, SessionSamples.OTHER, false, null),
+                    ApprovalStatus.Resolved(Decision.APPROVE, SessionSamples.otherDevice, null),
                 ),
             ),
         )
         show(ApprovalSamples.blocked(settled, ApprovalSamples.prompt(gated, ApprovalSamples.rules)))
-        tag(ApprovalTags.SETTLED).assert(hasText("Approved on another device (…000002)"))
+        tag(ApprovalTags.SETTLED).assert(hasText("Approved on laptop"))
         tag(ApprovalTags.APPROVE).assertDoesNotExist()
         tag(ApprovalTags.rule(0)).assertDoesNotExist()
     }

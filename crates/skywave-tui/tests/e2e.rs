@@ -18,7 +18,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::json;
 use skywave_core::{
-    Backoff, Core, DeviceId, EngineConfig, Jitter, Link, Screen, Store, TransportConfig, ViewState,
+    Backoff, Core, EngineConfig, Jitter, Link, Screen, Store, TransportConfig, ViewState,
 };
 use skywave_proto::{Event, EventKind, Seq, SessionState};
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
@@ -152,8 +152,17 @@ struct Tui {
 
 impl Tui {
     fn open() -> Tui {
+        Tui::open_as("tui test")
+    }
+
+    /// A head whose device pairs as `name`.
+    fn open_as(name: &str) -> Tui {
         let dir = tempfile::tempdir().unwrap();
-        let core = Core::open_with(dir.path(), config()).unwrap();
+        let config = EngineConfig {
+            device_name: Some(name.into()),
+            ..config()
+        };
+        let core = Core::open_with(dir.path(), config).unwrap();
         let (tx, views) = mpsc::unbounded_channel();
         core.subscribe(move |view| {
             let _ = tx.send(view);
@@ -167,10 +176,6 @@ impl Tui {
         };
         tui.settle();
         tui
-    }
-
-    fn device(&self) -> DeviceId {
-        self.core.seam().identity().unwrap().device_id()
     }
 
     /// Takes every snapshot already pushed.
@@ -314,11 +319,6 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
-/// The last 8 hex digits of a device id, as the timeline names devices.
-fn tail(device: DeviceId) -> String {
-    device.0.simple().to_string()[24..].to_owned()
-}
-
 /// A tool output well over the 4 KiB blob threshold: 400 numbered lines.
 fn listing() -> String {
     (0..400).map(|i| format!("file-{i:03}.txt\n")).collect()
@@ -417,9 +417,9 @@ async fn f6_approvals() {
     )
     .await;
     let address = daemon.addr.to_string();
-    let mut a = Tui::open();
+    let mut a = Tui::open_as("laptop");
     a.pair(&daemon, &address).await;
-    let mut b = Tui::open();
+    let mut b = Tui::open_as("phone");
     b.pair(&daemon, &address).await;
     a.create_session(&daemon).await;
     b.open_session().await;
@@ -448,8 +448,9 @@ async fn f6_approvals() {
         })
         .await;
     assert!(!screen.contains("Approval needed"), "{screen}");
-    let on_a = format!("approved on device …{}", tail(a.device()));
-    let screen = b.wait(&on_a, |_, s| write_approval(s, &on_a)).await;
+    // By the name it paired with.
+    let on_a = "approved on laptop";
+    let screen = b.wait(on_a, |_, s| write_approval(s, on_a)).await;
     assert!(!screen.contains("a approve"), "{screen}");
 
     // Deny here.
@@ -473,10 +474,10 @@ async fn f6_approvals() {
     a.wait_for("Approval needed").await;
     b.key(KeyCode::Esc);
     b.key(KeyCode::Char('a'));
-    let on_b = format!("approved on device …{}", tail(b.device()));
+    let on_b = "approved on phone";
     let screen = a
         .wait("resolved elsewhere", |_, s| {
-            write_approval(s, &on_b)
+            write_approval(s, on_b)
                 && !s.contains("Approval needed")
                 && lines_with(s, "agent: written") == 2
         })

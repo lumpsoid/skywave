@@ -87,8 +87,8 @@ internal object ApprovalSamples {
 
     /** [gated] answered by another device: settled, no prompt any more. */
     fun answeredElsewhere(gated: Entry.Tool, decision: Decision = Decision.APPROVE): SessionView {
-        val status = ApprovalStatus.Resolved(decision, SessionSamples.OTHER, false, null)
-        val outcome = if (decision == Decision.DENY) ToolOutcome.Denied(SessionSamples.OTHER, false) else gated.tool.outcome
+        val status = ApprovalStatus.Resolved(decision, SessionSamples.otherDevice, null)
+        val outcome = if (decision == Decision.DENY) ToolOutcome.Denied(SessionSamples.otherDevice) else gated.tool.outcome
         val settled = Entry.Tool(gated.tool.copy(approval = ToolApproval(ID, status), outcome = outcome))
         return SessionSamples.view(timeline = before() + logged(3, settled), state = SessionState.AgentWorking)
     }

@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use skywave_core::{
-    Action, ApprovalStatus, Decision, EngineConfig, Entry, FailReason, Link, OutboxStatus,
-    Outgoing, RejectReason, SessionState as ViewSessionState, TimelineItem, TransportConfig,
+    Action, ApprovalStatus, Decision, DeviceRef, EngineConfig, Entry, FailReason, Link,
+    OutboxStatus, Outgoing, RejectReason, SessionState as ViewSessionState, TimelineItem,
+    TransportConfig,
 };
 use skywave_proto::{
     ApprovalId, CommandKind, CommandResult, Event, EventKind, SessionId, SessionState,
@@ -541,10 +542,30 @@ async fn first_answer_wins_across_devices() {
     };
     assert_eq!(followed, 1);
 
-    // Both devices show the same resolution, by the winner.
+    // Both devices show the same resolution, by the winner, named as it
+    // paired: the loser may first see it a `hello` before its name.
+    let winner_name = if by == a.device() {
+        "device a"
+    } else {
+        "device b"
+    };
+    let named = |s: &skywave_core::SessionView| {
+        s.timeline.iter().any(|item| {
+            matches!(
+                item,
+                TimelineItem::Logged {
+                    entry: Entry::Approval {
+                        status: ApprovalStatus::Resolved { by, .. },
+                        ..
+                    },
+                    ..
+                } if by.name.is_some()
+            )
+        })
+    };
     for client in [&a, &b] {
         let view = client
-            .open_session(session, |s| s.pending_approval.is_none())
+            .open_session(session, |s| s.pending_approval.is_none() && named(s))
             .await;
         assert_eq!(view.state, ViewSessionState::Idle);
         let statuses: Vec<&ApprovalStatus> = view
@@ -562,8 +583,11 @@ async fn first_answer_wins_across_devices() {
             statuses,
             vec![&ApprovalStatus::Resolved {
                 decision,
-                by,
-                by_me: client.device() == by,
+                by: DeviceRef {
+                    id: by,
+                    name: Some(winner_name.into()),
+                    me: client.device() == by,
+                },
                 rule: None,
             }]
         );

@@ -277,8 +277,11 @@ mod tests {
                 sc::Entry::UserMessage {
                     command_id: message,
                     text: "Run the tests 🚀 then fix the needle".into(),
-                    from: sc::DeviceId::new(),
-                    own: true,
+                    from: sc::DeviceRef {
+                        id: sc::DeviceId::new(),
+                        name: None,
+                        me: true,
+                    },
                     outgoing: None,
                     delivery: None,
                 },

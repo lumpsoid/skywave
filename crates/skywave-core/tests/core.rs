@@ -8,8 +8,8 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, Core, CoreError, Delivery, Draft, Entry, Fingerprint, Link,
-    Outgoing, PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView,
+    Action, BlobState, BlobStatus, Core, CoreError, Delivery, DeviceRef, Draft, Entry, Fingerprint,
+    Link, Outgoing, PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView,
     SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
@@ -320,8 +320,11 @@ fn offline_send_is_persisted_first_and_appears_once() {
             entry: Entry::UserMessage {
                 command_id: command.id,
                 text: "fix the build".into(),
-                from: device,
-                own: true,
+                from: DeviceRef {
+                    id: device,
+                    name: None,
+                    me: true,
+                },
                 outgoing: Some(Outgoing::Accepted(Seq(2))),
                 delivery: Some(done),
             },
