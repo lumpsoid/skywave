@@ -49,13 +49,13 @@ pub struct CreateUi {
     pub settle: CompletionSettle,
 }
 
-/// The screen for `view` with the head's `ui`, at `wall_ms`.
-pub fn update(view: &ViewState, ui: Ui, wall_ms: i64) -> ScreenUpdate {
+/// The screen for `view` with the head's `ui`.
+pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
     let screen = match &view.screen {
         Screen::Pairing(pairing) => pairing_view(pairing, ui.form),
         Screen::SessionList(list) => list_view(list, &view.link, ui),
         Screen::Session(session) => ScreenView::Session {
-            session: session_view(session, &view.link, ui, wall_ms),
+            session: session_view(session, &view.link, ui),
         },
         Screen::Settings(settings) => settings_view(settings),
     };
@@ -240,7 +240,7 @@ fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link
     }
 }
 
-fn session_view(session: &SessionView, link: &Link, ui: Ui, wall_ms: i64) -> SessionScreen {
+fn session_view(session: &SessionView, link: &Link, ui: Ui) -> SessionScreen {
     SessionScreen {
         session_id: session.id.0.to_string(),
         title: clean_line(&session.title),
@@ -290,7 +290,7 @@ fn session_view(session: &SessionView, link: &Link, ui: Ui, wall_ms: i64) -> Ses
         approval: session
             .pending_approval
             .as_ref()
-            .map(|prompt| approval_panel(prompt, session, wall_ms)),
+            .map(|prompt| approval_panel(prompt, session)),
         composer: ui.composer.cloned().unwrap_or_else(|| ComposerView {
             text: String::new(),
             cursor_utf16: 0,
@@ -444,7 +444,7 @@ fn usage_fields(usage: &SessionUsage, model: bool) -> Vec<String> {
 /// The panel over the composer while the agent is blocked: the call it
 /// gates as the timeline shows it, what it will do, the rules offered, and
 /// this device's answer.
-fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView, wall_ms: i64) -> ApprovalPanel {
+fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPanel {
     let gated = gated_item(session);
     let gated_key = gated.map(|(_, item)| key_string(ItemKey::of(item)));
     // The legacy entry an approval with no logged call stands for.
@@ -506,7 +506,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView, wall_ms: i64) 
         // On its way: how long it has waited says more than "queued".
         let label = match (&answer.outgoing, &answer.delivery) {
             (Outgoing::Queued | Outgoing::Sending, Some(delivery)) => {
-                delivery_label(delivery, &answer.outgoing, wall_ms)
+                delivery_label(delivery, &answer.outgoing)
             }
             _ => outgoing_label(&answer.outgoing),
         };

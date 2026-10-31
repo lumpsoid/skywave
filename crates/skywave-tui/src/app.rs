@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision,
-    Delivery, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
-    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome,
-    ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision, Entry,
+    Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route, Screen, Seq,
+    SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState,
+    parse_pair_uri,
 };
 use skywave_present::format::{bytes, mode_needs_confirmation};
 use skywave_present::policy::{
@@ -22,8 +22,8 @@ use skywave_present::policy::{
     looks_like_pair_uri, unanswered,
 };
 use skywave_present::sections::{
-    Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
-    sections, selectable, starts_turn, wanted_blob,
+    Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
+    selectable, starts_turn, wanted_blob,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -886,31 +886,16 @@ impl App {
         }
     }
 
-    /// The screen shows a clock that runs: a tool call's elapsed time, or
-    /// how long an unanswered own message (selected, so its delivery line
-    /// shows) or approval answer has waited.
+    /// The screen shows a clock that runs: a tool call's elapsed time.
     pub fn live(&self) -> bool {
-        let waiting = |delivery: &Delivery| delivery.answered_at.is_none();
-        self.session().is_some_and(|(view, ui)| {
-            let running = view.timeline.iter().any(|item| {
+        self.session().is_some_and(|(view, _)| {
+            view.timeline.iter().any(|item| {
                 matches!(
                     item,
                     TimelineItem::Logged { entry: Entry::Tool(tool), .. }
                         if matches!(tool.outcome, ToolOutcome::Running { .. })
                 )
-            });
-            let selected = ui.focus == Focus::Timeline
-                && ui
-                    .selected
-                    .and_then(|key| find(view, key))
-                    .and_then(|index| delivery(&view.timeline[index]))
-                    .is_some_and(|(_, d)| waiting(&d));
-            let answer = view
-                .pending_approval
-                .as_ref()
-                .and_then(|p| p.answer.as_ref()?.delivery.as_ref())
-                .is_some_and(waiting);
-            running || selected || answer
+            })
         })
     }
 

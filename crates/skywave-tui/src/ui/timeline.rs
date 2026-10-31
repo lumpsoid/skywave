@@ -238,7 +238,7 @@ impl Layout<'_> {
             out.extend(wrap(
                 vec![indent(LEAD)],
                 vec![indent(LEAD)],
-                vec![Span::raw(delivery_label(&delivery, &outgoing, self.wall_ms)).dark_gray()],
+                vec![Span::raw(delivery_label(&delivery, &outgoing)).dark_gray()],
                 self.width,
             ));
         }

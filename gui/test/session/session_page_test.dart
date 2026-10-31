@@ -56,7 +56,7 @@ void main() {
           state: OutgoingState.queued,
           label: 'queued',
         ),
-        deliveryLabel: 'queued 3s ago',
+        deliveryLabel: 'queued 14:02:11',
       ),
       anyRow('s:2', RowKind.agentMessage, 'agent says', author: 'agent'),
       anyRow(
@@ -106,7 +106,7 @@ void main() {
       '14:02',
       'on its way',
       'queued',
-      'queued 3s ago',
+      'queued 14:02:11',
       'Edit',
       'Discard',
       'agent says',
@@ -511,13 +511,13 @@ void main() {
             canAnswer: false,
             suggestions: [],
             alwaysPicks: false,
-            answerLabel: 'you approved · queued 3s ago',
+            answerLabel: 'you approved · queued 14:02:11',
           ),
         ),
         timeline: holding([]),
         sent: [],
       );
-      expect(find.text('you approved · queued 3s ago'), findsOneWidget);
+      expect(find.text('you approved · queued 14:02:11'), findsOneWidget);
       expect(find.text('Approve'), findsNothing);
       expect(find.text('Show call'), findsNothing);
     });

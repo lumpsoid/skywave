@@ -306,7 +306,7 @@ pub struct ApprovalPanel {
     pub always_label: Option<String>,
     /// Several rules: pick one before approving always.
     pub always_picks: bool,
-    /// This device's answer: `you approved · queued 3s ago`.
+    /// This device's answer: `you approved · queued 14:02:11`.
     pub answer_label: Option<String>,
     pub answer: Option<OutgoingView>,
 }

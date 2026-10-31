@@ -22,7 +22,7 @@ use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sec
 
 use super::timeline::{
     approval_state, clean, detail_lines, glyph, head_lines, item_lines, preview_lines, rule_index,
-    title_spans, wall_ms,
+    title_spans,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
 use crate::app::{App, Focus, Geometry, Picker, SessionUi};
@@ -66,7 +66,6 @@ pub(super) fn render(
             ui.rule_pick(session),
             inner.width.saturating_sub(2) as usize,
             approval_rows,
-            wall_ms(wall),
         )
     });
     let approval_height = approval.as_ref().map_or(0, |lines| lines.len() as u16 + 2);
@@ -282,7 +281,6 @@ fn approval_lines(
     pick: Option<usize>,
     width: usize,
     max_rows: usize,
-    wall_ms: i64,
 ) -> Vec<Line<'static>> {
     let (mut lines, content) = match gated_item(session) {
         Some((
@@ -342,7 +340,7 @@ fn approval_lines(
             // On its way: how long it has waited says more than "queued".
             let label = match (&answer.outgoing, &answer.delivery) {
                 (Outgoing::Queued | Outgoing::Sending, Some(delivery)) => {
-                    delivery_label(delivery, &answer.outgoing, wall_ms)
+                    delivery_label(delivery, &answer.outgoing)
                 }
                 _ => outgoing_label(&answer.outgoing),
             };
