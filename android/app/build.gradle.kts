@@ -26,9 +26,36 @@ android {
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
+    // Release signing comes from local.properties, which is untracked, so no
+    // key material is committed:
+    //   skywave.release.storeFile=/absolute/path/to/release.jks
+    //   skywave.release.storePassword=...
+    //   skywave.release.keyAlias=...
+    //   skywave.release.keyPassword=...
+    // With none set, release still builds, unsigned (app-release-unsigned.apk);
+    // a partial set fails the build rather than silently dropping the signature.
+    val releaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+        .associateWith { localProperty("skywave.release.$it").orNull }
+    val missingSigning = releaseSigning.filterValues { it == null }.keys
+    if (missingSigning.isNotEmpty() && missingSigning.size < releaseSigning.size) {
+        throw GradleException(
+            "Release signing is half configured; local.properties is missing " +
+                missingSigning.joinToString { "skywave.release.$it" },
+        )
+    }
+    if (missingSigning.isEmpty()) {
+        signingConfigs.create("release") {
+            storeFile = file(releaseSigning.getValue("storeFile")!!)
+            storePassword = releaseSigning.getValue("storePassword")
+            keyAlias = releaseSigning.getValue("keyAlias")
+            keyPassword = releaseSigning.getValue("keyPassword")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
