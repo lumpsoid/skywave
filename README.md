@@ -222,11 +222,12 @@ Admin commands work on the database directly, so `serve` can keep running.
    server certificate for the new names and keeps the CA, so devices paired
    already keep working. Open TCP port 7443 in the server's firewall.
 
-3. **Pair.** Run `skywaved pair` on the server. In the app, type the address,
-   code and fingerprint it printed and tap **Pair**. A wrong fingerprint is
+3. **Pair.** Run `skywaved pair` on the server. In the app, tap **Scan QR
+   code** and point the camera at the QR code it printed, or type the
+   address, code and fingerprint, then tap **Pair**. A wrong fingerprint is
    refused before the code is sent, so the code stays usable.
-   `skywaved devices list` now shows the phone. QR scanning and
-   `skywave://pair` links are not supported yet.
+   `skywaved devices list` now shows the phone. Opening
+   `skywave://pair` links is not supported yet.
 
 4. **Answer an approval.** Tap **New session**, enter a folder under one of
    your `roots` and tap **Create**; open the session and send a message.
@@ -290,7 +291,7 @@ fresh checkout, are in [`gui/README.md`](gui/README.md).
 
 ## Roadmap
 
-- Background approval alerts, QR pairing and pairing links in the Android app
+- Background approval alerts and pairing links in the Android app
 - More agents beyond Claude Code
 - QUIC transport and compact encoding
 - Several servers per client

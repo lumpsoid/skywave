@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -9,18 +10,23 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// The fields are the user's; they take Rust's values only when the
 /// form's `rev` changes (a pasted URI filled them, a re-pair prefilled
 /// the address). Text pasted into any field also goes to Rust as
-/// `PairPasted`: a `skywave://` URI fills the whole form.
+/// `PairPasted`: a `skywave://` URI fills the whole form. With a [scan],
+/// the QR code `skywaved pair` printed goes to Rust as `PairScanned`.
 class PairingPage extends StatefulWidget {
   const PairingPage({
     required this.screen,
     required this.send,
     this.canGoBack = false,
+    this.scan,
     super.key,
   });
 
   final ScreenViewPairing screen;
   final bool canGoBack;
   final SendIntent send;
+
+  /// The camera scanner, where the platform has one.
+  final ScanQr? scan;
 
   @override
   State<PairingPage> createState() => _PairingPageState();
@@ -55,6 +61,11 @@ class _PairingPageState extends State<PairingPage> {
   }
 
   void _pasted(String text) => widget.send(GuiIntentPairPasted(text: text));
+
+  Future<void> _scan(ScanQr scan) async {
+    final text = await scan();
+    if (text != null && mounted) widget.send(GuiIntentPairScanned(text: text));
+  }
 
   void _submit() => widget.send(
     GuiIntentPairSubmit(
@@ -95,10 +106,21 @@ class _PairingPageState extends State<PairingPage> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Text(
-                    'Enter what `skywaved pair` printed on the server, '
-                    'or paste its skywave:// link into any field.',
+                    widget.scan == null
+                        ? 'Enter what `skywaved pair` printed on the server, '
+                              'or paste its skywave:// link into any field.'
+                        : 'Scan the QR code `skywaved pair` printed on the '
+                              'server, or enter what it printed.',
                     style: theme.textTheme.bodyLarge,
                   ),
+                  if (widget.scan case final scan?) ...[
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.qr_code_scanner),
+                      onPressed: busy ? null : () => _scan(scan),
+                      label: const Text('Scan QR code'),
+                    ),
+                  ],
                   if (screen.pairedDevice case final device?) ...[
                     const SizedBox(height: 12),
                     Card.outlined(

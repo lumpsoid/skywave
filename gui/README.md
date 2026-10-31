@@ -53,7 +53,8 @@ flutter build apk --debug    # or: flutter run -d <device>
 
 This is skywave's Android app (D28); its id is `dev.skywave.gui`. At
 launch it asks for ACCESS_LOCAL_NETWORK (API 37+, until granted) and
-POST_NOTIFICATIONS (API 33+, once).
+POST_NOTIFICATIONS (API 33+, once). The pairing screen's **Scan QR code**
+opens ZXing's scanner (D20), which asks for the camera when it opens.
 
 ## macOS (scaffolded, never built)
 

@@ -130,4 +130,32 @@ void main() {
     await tester.tap(find.byType(BackButton));
     expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
   });
+
+  testWidgets('a scan goes to Rust; cancelling sends nothing', (tester) async {
+    String? scanned;
+    Future<void> pumpScanning() => tester.pumpWidget(
+      MaterialApp(
+        home: PairingPage(
+          screen: pairing(),
+          send: sent.add,
+          scan: () async => scanned,
+        ),
+      ),
+    );
+    await pumpScanning();
+    sent.clear();
+    await tester.tap(find.text('Scan QR code'));
+    await tester.pump();
+    expect(sent, isEmpty, reason: 'cancelled');
+
+    scanned = 'skywave://pair?addr=h%3A7443&code=ABCDE12345&fp=ab';
+    await tester.tap(find.text('Scan QR code'));
+    await tester.pump();
+    expect(sent, [GuiIntentPairScanned(text: scanned)]);
+  });
+
+  testWidgets('without a scanner there is no scan button', (tester) async {
+    await pump(tester, pairing());
+    expect(find.text('Scan QR code'), findsNothing);
+  });
 }
