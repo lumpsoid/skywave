@@ -193,14 +193,41 @@ impl Seam {
     }
 
     /// The server refused the command's request without an answer
-    /// ([`TransportError::refuses_command`]): it fails for good and the
-    /// outbox moves on.
+    /// ([`TransportError::refuses_command`]), or never logged it
+    /// ([`Seam::command_unlogged`]): it fails for good and the outbox moves
+    /// on.
     pub fn command_undeliverable(&self, id: CommandId) -> Result<(), CoreError> {
         let now = Utc::now();
         self.update(|state| {
             state.store.record_undeliverable(id, now)?;
             state.model.command_undeliverable(id, now);
             Ok(((), Vec::new()))
+        })
+    }
+
+    /// Settles the command `id`, whose reply was unreadable, from the log:
+    /// returns whether it is settled. `head` is the server's log head read
+    /// after that reply. An accepted command logs its event before the
+    /// server replies, so once the replica has applied the log through
+    /// `head` without settling it, the server never logged it, so never
+    /// applied it: it fails as [`Seam::command_undeliverable`] would. Before
+    /// then it stays pending and the answer is `false`.
+    ///
+    /// The cursor and the outbox are read under one lock with the write, so
+    /// a batch applied meanwhile cannot make an accepted command fail.
+    pub fn command_unlogged(&self, id: CommandId, head: Seq) -> Result<bool, CoreError> {
+        let now = Utc::now();
+        self.update(|state| {
+            let pending = state.store.pending_outbox()?;
+            if !pending.iter().any(|e| e.command.id == id) {
+                return Ok((true, Vec::new()));
+            }
+            if state.store.cursor()? < head {
+                return Ok((false, Vec::new()));
+            }
+            state.store.record_undeliverable(id, now)?;
+            state.model.command_undeliverable(id, now);
+            Ok((true, Vec::new()))
         })
     }
 
