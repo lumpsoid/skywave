@@ -51,6 +51,11 @@ class _SkywaveAppState extends State<SkywaveApp> {
       },
       // Mobile: the engine is going away without an exit request.
       onDetach: _finalize,
+      // Leaving the screen is reported, not decided: Rust knows what it
+      // means on this platform. Pausing always passes through hidden and
+      // resuming through shown, so each move is reported once.
+      onHide: () => widget.send(const GuiIntentAppBackgrounded()),
+      onShow: () => widget.send(const GuiIntentAppForegrounded()),
     );
   }
 

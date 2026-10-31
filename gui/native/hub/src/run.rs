@@ -9,7 +9,6 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::boot::{self, Running};
-use crate::dispatcher::Dispatcher;
 use crate::head::{Clock, Head, Out};
 use crate::signals::{Boot, BootFailed, Booted, GuiIntent, ScreenUpdate, ScreenView};
 
@@ -74,14 +73,15 @@ async fn run(
                 head.on_wake(Clock::read())
             }
         };
-        perform(outs, &hub.dispatcher, &mut shown);
+        perform(outs, &hub, &mut shown);
     }
     hub.close();
 }
 
 /// Carries out a step's outputs in order: signals to Dart, actions to the
-/// dispatcher.
-fn perform(outs: Vec<Out>, dispatcher: &Dispatcher, shown: &mut Option<&'static str>) {
+/// dispatcher, suspend and resume to the core (neither blocks: each only
+/// flips the engine's flag).
+fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
     for out in outs {
         match out {
             Out::Link(update) => update.send_signal_to_dart(),
@@ -98,7 +98,15 @@ fn perform(outs: Vec<Out>, dispatcher: &Dispatcher, shown: &mut Option<&'static 
             Out::Effect(effect) => effect.send_signal_to_dart(),
             Out::Dispatch(tag, action) => {
                 tracing::debug!(tag, ?action, "dispatch");
-                dispatcher.send(tag, action);
+                hub.dispatcher.send(tag, action);
+            }
+            Out::Suspend => {
+                tracing::info!("app backgrounded: suspending the engine");
+                hub.core.suspend();
+            }
+            Out::Resume => {
+                tracing::info!("app foregrounded: resuming the engine");
+                hub.core.resume();
             }
         }
     }

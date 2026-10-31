@@ -116,6 +116,11 @@ pub enum GuiIntent {
     },
     /// Browse local data behind the revoked notice.
     RevokedDismiss,
+    /// The app went off screen (hidden or paused). Reported, not decided:
+    /// the hub knows what that means on this platform.
+    AppBackgrounded,
+    /// The app is on screen again (shown or resumed).
+    AppForegrounded,
 }
 
 /// A core action the GUI asks for directly.

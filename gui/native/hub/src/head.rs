@@ -22,6 +22,7 @@ use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
 use crate::clip::{COPY_MAX, Copied, copy};
 use crate::dispatcher::{Dispatched, Tag};
+use crate::lifecycle::{self, Call, Moved, Target};
 use crate::screen::{CreateUi, Ui, rename_initial, revoked};
 use crate::signals::{
     ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
@@ -81,6 +82,10 @@ pub enum Out {
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
     Dispatch(Tag, Action),
+    /// Pause the engine's network loops (`Core::suspend`).
+    Suspend,
+    /// Start them again (`Core::resume`).
+    Resume,
 }
 
 /// What a dispatched action was for, so its result reaches its owner.
@@ -719,6 +724,8 @@ impl Head {
                 Err(_) => {}
             },
             GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
+            GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, out),
+            GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, out),
         }
         Ok(())
     }
@@ -740,6 +747,20 @@ impl Head {
             self.mark_read(clock, true, out);
         }
         self.dispatch(action, purpose, out)
+    }
+
+    /// The app left or came back to the screen: what that does to the core
+    /// on this platform is [`lifecycle::calls`]'s to say.
+    fn moved(&mut self, moved: Moved, out: &mut Vec<Out>) {
+        for call in lifecycle::calls(moved, Target::BUILT) {
+            match call {
+                Call::Suspend => out.push(Out::Suspend),
+                Call::Resume => out.push(Out::Resume),
+                Call::Dispatch(action) => {
+                    self.dispatch(action, Purpose::Plain, out);
+                }
+            }
+        }
     }
 
     fn dispatch(&mut self, action: Action, purpose: Purpose, out: &mut Vec<Out>) -> Tag {
