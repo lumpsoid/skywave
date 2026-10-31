@@ -13,7 +13,7 @@ use skywave_proto::Fingerprint;
 use uuid::Uuid;
 
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, ModelChoice,
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Effort, ModelChoice,
     PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, ToolKind,
     TurnUsage,
 };
@@ -515,10 +515,17 @@ pub struct AgentView {
     pub mode_change: Option<SettingChange<PermissionMode>>,
     /// A model switch likewise.
     pub model_change: Option<SettingChange<String>>,
+    /// The effort the agent last said it runs at: `None` until it says,
+    /// `Some(None)` when its model takes no effort level.
+    pub effort: Option<Option<Effort>>,
+    /// An effort switch likewise.
+    pub effort_change: Option<SettingChange<Effort>>,
     /// The agent's newest refusal of a mode, until the next switch.
     pub mode_refused: Option<Refusal<PermissionMode>>,
     /// The agent's newest refusal of a model, until the next switch.
     pub model_refused: Option<Refusal<String>>,
+    /// The agent's newest refusal of an effort, until the next switch.
+    pub effort_refused: Option<Refusal<Effort>>,
     /// What [`Action::SetModel`](crate::Action::SetModel) offers: the
     /// newest list any session's agent reported. Empty until one did; a
     /// head may still send a model by name.
@@ -541,6 +548,22 @@ impl AgentView {
         let model = self.model.as_deref()?;
         Some(self.choice(model).map_or(model, |m| m.label.as_str()))
     }
+
+    /// The effort levels to offer: those the model running takes, or the one
+    /// a pending switch asks for. All of them when no offered model matches
+    /// (one typed by name, or no list yet), for the agent's answer to
+    /// settle; none when the model takes none.
+    pub fn efforts(&self) -> &[Effort] {
+        let model = self
+            .model_change
+            .as_ref()
+            .map(|change| change.value.as_str())
+            .or(self.model.as_deref());
+        match model.and_then(|model| self.choice(model)) {
+            Some(choice) => &choice.efforts,
+            None => &Effort::ALL,
+        }
+    }
 }
 
 /// A switch of a setting not yet answered.
@@ -552,12 +575,14 @@ pub struct SettingChange<T> {
     pub outgoing: Option<Outgoing>,
 }
 
-/// A mode or model as a timeline entry names it.
+/// A mode, model or effort as a timeline entry names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSetting {
     Mode(PermissionMode),
     /// As the agent names it.
     Model(String),
+    /// `None` when the model now takes no effort level.
+    Effort(Option<Effort>),
 }
 
 /// A message being written on this device, kept in the local store and never
