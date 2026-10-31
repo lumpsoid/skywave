@@ -260,7 +260,6 @@ class _SessionPageState extends State<SessionPage> {
             ),
             body: Column(
               children: [
-                _WorkingBar(working: screen.state == AgentState.working),
                 if (screen.archivedLabel case final archived?)
                   Material(
                     color: theme.colorScheme.secondaryContainer,
@@ -385,31 +384,6 @@ class _InterruptButton extends StatelessWidget {
       icon: refusal == null
           ? const Icon(Icons.pan_tool_outlined)
           : Icon(Icons.pan_tool, color: Theme.of(context).colorScheme.error),
-    );
-  }
-}
-
-/// A thin bar under the header while the agent works, next to the state
-/// on the status line: it runs, or holds still where animations are
-/// off. Its room is kept when it is gone, so the timeline never shifts.
-class _WorkingBar extends StatelessWidget {
-  const _WorkingBar({required this.working});
-
-  /// The bar's thickness.
-  static const height = 2.0;
-
-  final bool working;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!working) return const SizedBox(height: height);
-    final still = MediaQuery.disableAnimationsOf(context);
-    return LinearProgressIndicator(
-      minHeight: height,
-      value: still ? 1 : null,
-      semanticsLabel: 'Agent working',
-      color: SkyColors.of(context).agent(AgentState.working),
-      backgroundColor: Colors.transparent,
     );
   }
 }

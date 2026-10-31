@@ -968,56 +968,14 @@ void main() {
     expect(find.byTooltip('bogus refused: unknown model'), findsOneWidget);
   });
 
-  testWidgets('a bar runs under the header only while the agent works', (
-    tester,
-  ) async {
-    Future<void> show(AgentState state, {bool still = false}) async {
-      await tester.pumpWidget(
-        MaterialApp(
-          home: MediaQuery(
-            data: MediaQueryData(disableAnimations: still),
-            child: SessionPage(
-              screen: screenWith(state: state),
-              timeline: holding([row('s:1', 'first row')]),
-              send: (_) {},
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-    }
-
-    LinearProgressIndicator bar() =>
-        tester.widget(find.byType(LinearProgressIndicator));
-
-    await show(AgentState.working);
-    expect(bar().value, isNull, reason: 'it runs');
-    final at = tester.getRect(find.byType(LinearProgressIndicator));
-    expect(at.top, tester.getRect(find.byType(AppBar)).bottom);
-    expect(at.height, lessThanOrEqualTo(4));
-    final first = tester.getRect(find.text('first row')).top;
-
-    await show(AgentState.working, still: true);
-    expect(bar().value, 1, reason: 'reduced motion: it holds still');
-
-    for (final state in [
-      AgentState.idle,
-      AgentState.awaitingApproval,
-      AgentState.errored,
-      AgentState.stopped,
-    ]) {
-      await show(state);
-      expect(
-        find.byType(LinearProgressIndicator),
-        findsNothing,
-        reason: '$state',
-      );
-      expect(
-        tester.getRect(find.text('first row')).top,
-        first,
-        reason: 'the timeline does not shift',
-      );
-    }
+  testWidgets('no progress bar runs while the agent works', (tester) async {
+    await pumpSession(
+      tester,
+      screen: screenWith(state: AgentState.working),
+      timeline: holding([row('s:1', 'first row')]),
+      sent: <GuiIntent>[],
+    );
+    expect(find.byType(LinearProgressIndicator), findsNothing);
   });
 
   testWidgets('Stop agent is offered unless the agent is stopped', (
@@ -1416,9 +1374,7 @@ void main() {
       semantics.dispose();
     });
 
-    testWidgets('the icon buttons and the working bar have names', (
-      tester,
-    ) async {
+    testWidgets('the icon buttons have names', (tester) async {
       final semantics = tester.ensureSemantics();
       await tester.pumpWidget(
         MaterialApp(
@@ -1430,7 +1386,6 @@ void main() {
         ),
       );
       await tester.pump();
-      expect(find.bySemanticsLabel('Agent working'), findsOneWidget);
       for (final (tooltip, menu) in [
         ('Search (Ctrl+F)', false),
         ('Interrupt (Ctrl+X)', false),
