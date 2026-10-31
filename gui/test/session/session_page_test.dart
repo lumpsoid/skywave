@@ -3,6 +3,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -636,6 +637,55 @@ void main() {
       const GuiIntentSearchTyped(query: ''),
       const GuiIntentAct(action: ActionIntentInterrupt(sessionId: 's1')),
     ]);
+  });
+
+  testWidgets('interrupt only while there is a turn and none on its way', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    Future<void> show(SessionScreen screen) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            screen: screen,
+            timeline: holding([row('s:1', 'a')]),
+            send: sent.add,
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    Future<void> ctrlX() async {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    }
+
+    await show(screenWith(canInterrupt: false));
+    await tester.tap(find.text('a'));
+    await tester.tap(find.byTooltip('Interrupt (Ctrl+X)'));
+    await ctrlX();
+    expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'agent idle');
+
+    await show(screenWith(interruptBusy: true));
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    await tester.tap(find.byTooltip('Interrupting…'));
+    await ctrlX();
+    expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'on its way');
+
+    await show(screenWith(interruptRefusal: 'the server could not take it'));
+    expect(
+      find.byTooltip('Interrupt failed: the server could not take it'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('interrupt'), findsNothing);
+    await ctrlX();
+    expect(
+      sent.last,
+      const GuiIntentAct(action: ActionIntentInterrupt(sessionId: 's1')),
+      reason: 'a failed interrupt can be tried again',
+    );
   });
 
   testWidgets('header actions and the rename prompt', (tester) async {

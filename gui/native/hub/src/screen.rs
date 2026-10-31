@@ -265,10 +265,18 @@ fn session_view(session: &SessionView, link: &Link, ui: Ui, wall_ms: i64) -> Ses
             SessionState::Errored(info) => format!("agent error: {}", clean_line(&info.message)),
             SessionState::Stopped => "agent stopped · a message restarts it".to_owned(),
         },
-        interrupt_label: session
-            .interrupt
-            .as_ref()
-            .map(|o| format!("interrupt {}", outgoing_label(o))),
+        can_interrupt: matches!(
+            session.state,
+            SessionState::AgentWorking | SessionState::AwaitingApproval(_)
+        ),
+        interrupt_busy: matches!(
+            session.interrupt,
+            Some(Outgoing::Queued | Outgoing::Sending | Outgoing::Accepted(_))
+        ),
+        interrupt_refusal: match session.interrupt {
+            Some(Outgoing::Failed(reason)) => Some(fail_reason(reason).to_owned()),
+            _ => None,
+        },
         stop_label: session
             .stop
             .as_ref()

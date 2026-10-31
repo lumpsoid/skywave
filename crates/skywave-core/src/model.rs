@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, Fingerprint, RuleSuggestion, SessionState as LogState, ToolCall,
+    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -27,10 +27,10 @@ use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
     BlobState, BlobView, BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef,
-    Draft, Entry, ErrorInfo, Link, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
-    PairingView, PendingApprovalRef, PendingSession, Screen, Seq, SessionId, SessionListView,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, TimelineItem, ToolApproval,
-    ToolOutcome, ToolView, ViewState,
+    Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice, Outgoing, PairedInfo,
+    PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen, Seq, SessionId,
+    SessionListView, SessionRow, SessionState, SessionView, SettingChange, SettingsView,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -1059,9 +1059,12 @@ impl Model {
                 _ => None,
             })
         });
-        let interrupt = self.latest_outgoing(
-            |kind| matches!(kind, CommandKind::Interrupt { session_id } if *session_id == id),
-        );
+        let state = session_state(summary);
+        let interrupt = self
+            .latest_outgoing(
+                |kind| matches!(kind, CommandKind::Interrupt { session_id } if *session_id == id),
+            )
+            .filter(|outgoing| interrupt_matters(*outgoing, &state));
         let stop = self.latest_outgoing(
             |kind| matches!(kind, CommandKind::StopSession { session_id } if *session_id == id),
         );
@@ -1074,7 +1077,7 @@ impl Model {
             rename: title.rename,
             archived: self.archived(summary),
             workdir: summary.workdir.clone(),
-            state: session_state(summary),
+            state,
             timeline,
             pending_approval,
             rules,
@@ -1681,6 +1684,20 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
 }
 
 /// A pending approval overrides the logged agent state.
+/// Whether this device's interrupt is still worth showing. A refusal
+/// for want of a turn means the agent was already not working, as asked;
+/// any other failure stops mattering once the agent is not working.
+fn interrupt_matters(outgoing: Outgoing, state: &SessionState) -> bool {
+    match outgoing {
+        Outgoing::Failed(FailReason::Rejected(RejectReason::NoActiveTurn)) => false,
+        Outgoing::Failed(_) => matches!(
+            state,
+            SessionState::AgentWorking | SessionState::AwaitingApproval(_)
+        ),
+        _ => true,
+    }
+}
+
 fn session_state(summary: &SessionSummary) -> SessionState {
     if let Some(id) = summary.pending_approval() {
         return SessionState::AwaitingApproval(id);
@@ -2737,6 +2754,37 @@ mod tests {
         assert_eq!(devices(&f), [named.clone(), named.clone()]);
         assert_eq!(named.label(), "Pixel 8");
         assert!(f.model.unnamed_devices(&batch).is_empty());
+    }
+
+    #[test]
+    fn a_refused_interrupt_shows_only_while_the_agent_works() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let refuse = |f: &mut Fixture, reason| {
+            let command = queued(&f.dispatch(Action::Interrupt { session_id: sid }));
+            f.model
+                .command_result(command.id, CommandResult::Rejected { reason }, Utc::now());
+        };
+
+        // Nothing to interrupt: the agent already does what was asked.
+        refuse(&mut f, RejectReason::NoActiveTurn);
+        assert_eq!(f.session_view().interrupt, None);
+
+        f.log(
+            sid,
+            vec![EventKind::SessionStateChanged(LogState::AgentWorking)],
+        );
+        refuse(&mut f, RejectReason::UnknownSession);
+        assert_eq!(
+            f.session_view().interrupt,
+            Some(Outgoing::Failed(FailReason::Rejected(
+                RejectReason::UnknownSession
+            )))
+        );
+
+        f.log(sid, vec![EventKind::SessionStateChanged(LogState::Idle)]);
+        assert_eq!(f.session_view().interrupt, None, "the turn is over");
     }
 
     #[test]

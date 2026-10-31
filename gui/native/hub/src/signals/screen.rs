@@ -193,8 +193,13 @@ pub struct SessionScreen {
     pub archived_label: Option<String>,
     /// `agent idle`, `agent working`, `agent error: <message>`.
     pub agent_label: String,
-    /// `interrupt queued`, `stop failed: <why>`, while on their way.
-    pub interrupt_label: Option<String>,
+    /// The agent has a turn to interrupt.
+    pub can_interrupt: bool,
+    /// This device's interrupt is on its way.
+    pub interrupt_busy: bool,
+    /// Why this device's interrupt failed, while the agent still works.
+    pub interrupt_refusal: Option<String>,
+    /// `stop queued`, `stop failed: <why>`, while on its way.
     pub stop_label: Option<String>,
     /// The lasting rules granted here, `label (scope)`.
     pub rules: Vec<String>,
