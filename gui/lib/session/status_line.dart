@@ -260,38 +260,51 @@ class _Chip extends StatelessWidget {
     final color = refusal == null
         ? theme.colorScheme.primary
         : theme.colorScheme.error;
+    // A screen reader hears what it sets, its value and any refusal as
+    // one button, rather than the tooltip standing in for its name.
     return Tooltip(
       message: refusal ?? tooltip,
+      excludeFromSemantics: true,
       child: InkWell(
         borderRadius: BorderRadius.circular(8),
         onTap: onTap,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(
-            minWidth: kMinInteractiveDimension,
-            minHeight: kMinInteractiveDimension,
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  refusal == null ? icon : Icons.error_outline,
-                  size: 14,
-                  color: color,
-                ),
-                const SizedBox(width: 4),
-                Flexible(
-                  child: Text(
-                    label,
-                    style: theme.textTheme.labelMedium!.copyWith(color: color),
-                    maxLines: 1,
-                    softWrap: false,
-                    overflow: TextOverflow.ellipsis,
+        child: Semantics(
+          button: true,
+          label: [
+            '$tooltip: $label',
+            if (refusal case final refusal?) 'refused: $refusal',
+          ].join(', '),
+          excludeSemantics: true,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              minWidth: kMinInteractiveDimension,
+              minHeight: kMinInteractiveDimension,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    refusal == null ? icon : Icons.error_outline,
+                    size: 14,
+                    color: color,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 4),
+                  Flexible(
+                    child: Text(
+                      label,
+                      style: theme.textTheme.labelMedium!.copyWith(
+                        color: color,
+                      ),
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),

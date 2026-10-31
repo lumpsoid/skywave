@@ -312,6 +312,7 @@ class _UnreadRule extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 8),
             child: Text(
               'new',
+              semanticsLabel: 'new messages below',
               style: Theme.of(context).textTheme.labelSmall
                   ?.copyWith(color: color, fontWeight: FontWeight.bold),
             ),

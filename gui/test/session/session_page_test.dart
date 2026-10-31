@@ -1350,4 +1350,90 @@ void main() {
       }
     });
   });
+  group('semantics', () {
+    testWidgets('the status-line chips read as named buttons', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'ask',
+            modelLabel: 'Sonnet',
+            modelRefusal: 'no such model',
+            modes: askAgent.modes,
+            models: askAgent.models,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(
+        tester.getSemantics(find.bySemanticsLabel('Permission mode: ask')),
+        matchesSemantics(
+          label: 'Permission mode: ask',
+          isButton: true,
+          isFocusable: true,
+          hasTapAction: true,
+          hasFocusAction: true,
+        ),
+      );
+      expect(
+        find.bySemanticsLabel('Model: Sonnet, refused: no such model'),
+        findsOneWidget,
+      );
+      semantics.dispose();
+    });
+
+    testWidgets('the icon buttons and the working bar have names', (
+      tester,
+    ) async {
+      final semantics = tester.ensureSemantics();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            screen: screenWith(state: AgentState.working),
+            timeline: holding([]),
+            send: (_) {},
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.bySemanticsLabel('Agent working'), findsOneWidget);
+      for (final (tooltip, menu) in [
+        ('Search (Ctrl+F)', false),
+        ('Interrupt (Ctrl+X)', false),
+        ('More', true),
+      ]) {
+        expect(
+          tester.getSemantics(find.byTooltip(tooltip)),
+          matchesSemantics(
+            tooltip: tooltip,
+            isButton: true,
+            isFocusable: true,
+            hasEnabledState: true,
+            isEnabled: true,
+            hasTapAction: true,
+            hasFocusAction: true,
+            hasExpandedState: menu,
+          ),
+          reason: tooltip,
+        );
+      }
+      semantics.dispose();
+    });
+
+    testWidgets('the unread rule says new messages follow', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([
+          anyRow('a', RowKind.agentMessage, 'hi', unreadRule: true),
+        ]),
+        sent: [],
+      );
+      expect(find.bySemanticsLabel('new messages below'), findsOneWidget);
+      semantics.dispose();
+    });
+  });
 }
