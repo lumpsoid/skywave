@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/app.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
+import 'package:skywave_gui/screen/screen_navigator.dart';
+import 'package:skywave_gui/src/bindings/bindings.dart';
+
+import '../fakes.dart';
 
 void main() {
   test('starts pending', () {
@@ -52,7 +56,10 @@ void main() {
     tester,
   ) async {
     final holder = BootHolder();
-    await tester.pumpWidget(SkywaveApp(boot: holder));
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      SkywaveApp(boot: holder, holders: fakeHolders(), send: sent.add),
+    );
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
 
     holder.fail('Cannot open the data: disk full');
@@ -62,6 +69,8 @@ void main() {
 
     holder.booted();
     await tester.pump();
-    expect(find.text('Booted'), findsOneWidget);
+    expect(find.byType(ScreenNavigator), findsOneWidget);
+    // Booted asks Rust for the whole state.
+    expect(sent, [const GuiIntentAppReady()]);
   });
 }

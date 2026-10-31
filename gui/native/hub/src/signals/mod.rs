@@ -5,7 +5,7 @@
 //! so names are unique across files and avoid Flutter's own.
 //!
 //! - [`boot`]: `Boot` in, `Booted`/`BootFailed` out.
-//! - [`intents`]: every GUI intent after boot, as one ordered `Intent`.
+//! - [`intents`]: every GUI intent after boot, as one ordered `GuiIntent`.
 //! - [`link`]: the banner (`LinkUpdate`).
 //! - [`screen`]: the screen and its data but the timeline (`ScreenUpdate`).
 //! - [`timeline`]: the open session's timeline, snapshot then keyed diffs.
@@ -22,7 +22,7 @@ mod timeline;
 
 pub use boot::{Boot, BootFailed, Booted};
 pub use effects::PlatformEffect;
-pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, Intent, RouteView};
+pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, RouteView};
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup, ComposerView,

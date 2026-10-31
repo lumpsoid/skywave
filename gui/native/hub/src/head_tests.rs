@@ -70,7 +70,7 @@ impl Rig {
             done: Vec::new(),
         };
         rig.view();
-        rig.intent(Intent::Act {
+        rig.intent(GuiIntent::Act {
             action: ActionIntent::OpenSession {
                 session_id: session.0.to_string(),
             },
@@ -101,7 +101,7 @@ impl Rig {
         self.apply(outs)
     }
 
-    fn intent(&mut self, intent: Intent) -> Vec<Out> {
+    fn intent(&mut self, intent: GuiIntent) -> Vec<Out> {
         let outs = self.head.on_intent(intent, self.clock);
         self.apply(outs)
     }
@@ -122,7 +122,7 @@ impl Rig {
     }
 
     fn edit(&mut self, text: &str) {
-        self.intent(Intent::DraftEdited {
+        self.intent(GuiIntent::DraftEdited {
             session_id: self.session.0.to_string(),
             text: text.into(),
             cursor_utf16: u32::try_from(text.encode_utf16().count()).unwrap(),
@@ -130,7 +130,7 @@ impl Rig {
     }
 
     fn submit(&mut self) -> Vec<Out> {
-        self.intent(Intent::ComposerSubmit {
+        self.intent(GuiIntent::ComposerSubmit {
             session_id: self.session.0.to_string(),
         })
     }
@@ -185,15 +185,15 @@ fn errors(outs: &[Out]) -> Vec<String> {
 #[test]
 fn a_malformed_id_is_an_error_not_an_action() {
     let mut rig = Rig::new();
-    let outs = rig.intent(Intent::Act {
+    let outs = rig.intent(GuiIntent::Act {
         action: ActionIntent::Interrupt {
             session_id: "not-a-uuid".into(),
         },
     });
     assert_eq!(errors(&outs), ["not a session id: \"not-a-uuid\""]);
-    let outs = rig.intent(Intent::ExpandItem { key: "s:x".into() });
+    let outs = rig.intent(GuiIntent::ExpandItem { key: "s:x".into() });
     assert_eq!(errors(&outs).len(), 1);
-    let outs = rig.intent(Intent::OpenFull {
+    let outs = rig.intent(GuiIntent::OpenFull {
         blob_id: "?".into(),
     });
     assert_eq!(errors(&outs).len(), 1);
@@ -222,7 +222,7 @@ fn an_idle_draft_is_saved_before_the_message_that_follows() {
 fn leaving_saves_the_draft_first() {
     let mut rig = Rig::new();
     rig.edit("unsent");
-    rig.intent(Intent::Act {
+    rig.intent(GuiIntent::Act {
         action: ActionIntent::Back,
     });
     let kinds = rig.kinds();
@@ -296,7 +296,7 @@ fn a_failed_draft_save_is_retried() {
 #[test]
 fn an_emoji_cursor_crosses_in_utf16() {
     let mut rig = Rig::new();
-    rig.intent(Intent::DraftEdited {
+    rig.intent(GuiIntent::DraftEdited {
         session_id: rig.session.0.to_string(),
         text: "a😀b".into(),
         cursor_utf16: 3,
@@ -312,10 +312,10 @@ fn history_recalls_and_restores_the_stash() {
     rig.results();
     rig.view();
     rig.edit("half");
-    rig.intent(Intent::HistoryOlder);
+    rig.intent(GuiIntent::HistoryOlder);
     assert_eq!(rig.composer().text, "first");
     assert_eq!(rig.composer().history_label.as_deref(), Some("1 of 1"));
-    rig.intent(Intent::HistoryNewer);
+    rig.intent(GuiIntent::HistoryNewer);
     assert_eq!(rig.composer().text, "half");
     assert_eq!(rig.composer().history_label, None);
 }
@@ -324,7 +324,7 @@ fn history_recalls_and_restores_the_stash() {
 fn app_ready_resends_everything() {
     let mut rig = Rig::new();
     assert!(rig.wait(Duration::ZERO).is_empty(), "nothing changed");
-    let outs = rig.intent(Intent::AppReady);
+    let outs = rig.intent(GuiIntent::AppReady);
     assert!(outs.iter().any(|o| matches!(o, Out::Link(_))));
     assert!(outs.iter().any(|o| matches!(o, Out::Screen(_))));
     assert!(outs.iter().any(|o| matches!(o, Out::Search(_))));
@@ -351,7 +351,7 @@ fn a_pasted_pairing_uri_fills_the_form_and_a_malformed_one_is_reported() {
         "skywave://pair?addr=host%3A7443&code=ABCDE12345&fp={}",
         fp.to_hex()
     );
-    head.on_intent(Intent::PairPasted { text: uri }, clock);
+    head.on_intent(GuiIntent::PairPasted { text: uri }, clock);
     let filled = form(&head);
     assert_eq!(
         (filled.address.as_str(), filled.code.as_str()),
@@ -361,7 +361,7 @@ fn a_pasted_pairing_uri_fills_the_form_and_a_malformed_one_is_reported() {
     assert!(filled.rev > before.rev);
 
     let outs = head.on_intent(
-        Intent::PairPasted {
+        GuiIntent::PairPasted {
             text: "skywave://pair?addr=x".into(),
         },
         clock,
@@ -369,7 +369,7 @@ fn a_pasted_pairing_uri_fills_the_form_and_a_malformed_one_is_reported() {
     assert_eq!(errors(&outs).len(), 1);
     assert_eq!(form(&head), filled, "a malformed URI is not form text");
     let outs = head.on_intent(
-        Intent::PairPasted {
+        GuiIntent::PairPasted {
             text: "host".into(),
         },
         clock,

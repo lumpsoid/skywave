@@ -8,7 +8,7 @@ use serde::Deserialize;
 /// Ids and keys are strings as the hub sent them; one that does not parse
 /// is answered with `PlatformEffect::Error`, never acted on.
 #[derive(Debug, Clone, PartialEq, Deserialize, DartSignal)]
-pub enum Intent {
+pub enum GuiIntent {
     /// The holders are subscribed: resend the banner, the screen, a
     /// timeline snapshot and the search.
     AppReady,
