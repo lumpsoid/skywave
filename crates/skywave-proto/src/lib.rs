@@ -40,7 +40,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v7: `CommandKind::SetPermissionMode` and `CommandKind::SetModel`; their
 /// `…Requested` events, the agent's `…Changed` and `…Refused` answers, and
 /// `EventKind::ModelsOffered`.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// v8: `CommandKind::SetEffort` with its `EffortRequested`, `EffortChanged`
+/// and `EffortRefused` events, and the levels each model takes in
+/// [`ModelChoice::efforts`].
+pub const PROTOCOL_VERSION: u32 = 8;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -267,6 +271,24 @@ pub enum EventKind {
     ModelsOffered {
         models: Vec<ModelChoice>,
     },
+    /// A `SetEffort` command asked the agent to reason at `effort`.
+    EffortRequested {
+        effort: Effort,
+        by: DeviceId,
+    },
+    /// The agent reasons at `effort` from here on; `None` when the model it
+    /// runs takes no effort level. `answers` as for `PermissionModeChanged`.
+    EffortChanged {
+        effort: Option<Effort>,
+        answers: Option<CommandId>,
+    },
+    /// The agent refused to reason at `effort` and keeps the level it had.
+    /// `answers` as for `PermissionModeRefused`.
+    EffortRefused {
+        effort: Effort,
+        reason: String,
+        answers: Option<CommandId>,
+    },
 }
 
 impl EventKind {
@@ -278,7 +300,8 @@ impl EventKind {
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
-            | EventKind::ModelRequested { by, .. } => Some(*by),
+            | EventKind::ModelRequested { by, .. }
+            | EventKind::EffortRequested { by, .. } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -293,7 +316,9 @@ impl EventKind {
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
-            | EventKind::ModelsOffered { .. } => None,
+            | EventKind::ModelsOffered { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. } => None,
         }
     }
 
@@ -310,7 +335,8 @@ impl EventKind {
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
             | EventKind::PermissionModeRequested { .. }
-            | EventKind::ModelRequested { .. } => true,
+            | EventKind::ModelRequested { .. }
+            | EventKind::EffortRequested { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -322,7 +348,9 @@ impl EventKind {
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
-            | EventKind::ModelsOffered { .. } => false,
+            | EventKind::ModelsOffered { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. } => false,
         }
     }
 
@@ -352,7 +380,10 @@ impl EventKind {
             | EventKind::ModelRequested { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
-            | EventKind::ModelsOffered { .. } => None,
+            | EventKind::ModelsOffered { .. }
+            | EventKind::EffortRequested { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. } => None,
         }
     }
 }
@@ -426,6 +457,32 @@ impl PermissionMode {
     ];
 }
 
+/// How hard the model reasons before answering. Agent-agnostic (D3): the
+/// adapter maps each onto what its agent calls it, and an agent may refuse
+/// one its model does not take (`EffortRefused`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    /// Above `High`; `snake_case` alone would name it `x_high`.
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    /// Every level, from the least reasoning to the most.
+    pub const ALL: [Effort; 5] = [
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::XHigh,
+        Effort::Max,
+    ];
+}
+
 /// A model the agent offers. Agent-agnostic (D3): clients show `label`
 /// and `detail` and send `id` back in `SetModel`; they never parse them.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
@@ -439,15 +496,24 @@ pub struct ModelChoice {
     /// The model `ModelChanged` names once this choice runs, when the agent
     /// says; several choices may resolve to one model.
     pub resolved: Option<String>,
+    /// The effort levels this model takes, least first; empty when it takes
+    /// none. Defaults to empty, so a choice logged before v8 still decodes.
+    #[serde(default)]
+    pub efforts: Vec<Effort>,
 }
 
-/// A session's permission mode and model as its log has them: the one rule
+/// A session's permission mode, model and effort as its log has them: the one rule
 /// the server and every client fold (see [`AgentSettings::apply`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct AgentSettings {
     pub mode: Setting<PermissionMode>,
     pub model: Setting<String>,
+    /// `current: Some(None)` when the running model takes no effort level,
+    /// as against `None`, not known yet. Requests and refusals always hold
+    /// a level: read them as one with [`Setting::requested_effort`] and
+    /// [`Setting::refused_effort`].
+    pub effort: Setting<Option<Effort>>,
 }
 
 /// One setting of a session's agent, folded from the log.
@@ -528,6 +594,30 @@ impl<T: Clone> Setting<T> {
     }
 }
 
+impl Setting<Option<Effort>> {
+    /// The open request as the level asked for. Every request holds one
+    /// (`EffortRequested` carries a plain [`Effort`]), so `None` only when
+    /// no request is open.
+    pub fn requested_effort(&self) -> Option<Requested<Effort>> {
+        let requested = self.requested.as_ref()?;
+        Some(Requested {
+            value: requested.value?,
+            command: requested.command,
+            by: requested.by,
+        })
+    }
+
+    /// The newest refusal as the level refused, as
+    /// [`requested_effort`](Self::requested_effort) is for the request.
+    pub fn refused_effort(&self) -> Option<Refusal<Effort>> {
+        let refused = self.refused.as_ref()?;
+        Some(Refusal {
+            value: refused.value?,
+            reason: refused.reason.clone(),
+        })
+    }
+}
+
 impl AgentSettings {
     /// Folds one event of the session, logged by command `command_id`.
     ///
@@ -554,6 +644,15 @@ impl AgentSettings {
                 reason,
                 answers,
             } => self.model.refuse(model, reason, *answers),
+            EventKind::EffortRequested { effort, by } => {
+                self.effort.request(&Some(*effort), command_id, *by);
+            }
+            EventKind::EffortChanged { effort, answers } => self.effort.change(effort, *answers),
+            EventKind::EffortRefused {
+                effort,
+                reason,
+                answers,
+            } => self.effort.refuse(&Some(*effort), reason, *answers),
             _ => {}
         }
     }
@@ -568,6 +667,9 @@ impl AgentSettings {
                 | EventKind::ModelRequested { .. }
                 | EventKind::ModelChanged { .. }
                 | EventKind::ModelRefused { .. }
+                | EventKind::EffortRequested { .. }
+                | EventKind::EffortChanged { .. }
+                | EventKind::EffortRefused { .. }
         )
     }
 }
@@ -918,6 +1020,15 @@ pub enum CommandKind {
         session_id: SessionId,
         model: String,
     },
+    /// Ask the session's agent to reason at `effort`, as
+    /// [`SetPermissionMode`] does for a mode; the answer is an
+    /// `EffortChanged` or `EffortRefused` naming this command.
+    ///
+    /// [`SetPermissionMode`]: CommandKind::SetPermissionMode
+    SetEffort {
+        session_id: SessionId,
+        effort: Effort,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1196,6 +1307,86 @@ mod tests {
         );
         settings.apply(Some(CommandId::new()), &request);
         assert_eq!(settings.model.refused, None);
+    }
+
+    #[test]
+    fn an_effort_request_settles_on_its_change_and_survives_older_answers() {
+        let by = DeviceId::new();
+        let (first, second) = (CommandId::new(), CommandId::new());
+        let mut settings = AgentSettings::default();
+        let request = |effort| EventKind::EffortRequested { effort, by };
+        let changed = |effort, answers| EventKind::EffortChanged { effort, answers };
+
+        settings.apply(Some(first), &request(Effort::Low));
+        settings.apply(Some(second), &request(Effort::XHigh));
+        assert_eq!(settings.effort.wanted(), Some(&Some(Effort::XHigh)));
+        // The older request's answer changes the level but leaves the newer open.
+        settings.apply(None, &changed(Some(Effort::Low), Some(first)));
+        assert_eq!(settings.effort.current, Some(Some(Effort::Low)));
+        assert_eq!(
+            settings.effort.requested_effort(),
+            Some(Requested {
+                value: Effort::XHigh,
+                command: second,
+                by
+            })
+        );
+        settings.apply(None, &changed(Some(Effort::XHigh), Some(second)));
+        assert_eq!(settings.effort.requested, None);
+        assert_eq!(settings.effort.requested_effort(), None);
+        assert_eq!(settings.effort.current, Some(Some(Effort::XHigh)));
+    }
+
+    #[test]
+    fn an_effort_refusal_keeps_the_current_level() {
+        let by = DeviceId::new();
+        let command = CommandId::new();
+        let mut settings = AgentSettings::default();
+        settings.apply(
+            None,
+            &EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: None,
+            },
+        );
+        settings.apply(
+            Some(command),
+            &EventKind::EffortRequested {
+                effort: Effort::Max,
+                by,
+            },
+        );
+        settings.apply(
+            None,
+            &EventKind::EffortRefused {
+                effort: Effort::Max,
+                reason: "not on this model".into(),
+                answers: Some(command),
+            },
+        );
+        assert_eq!(settings.effort.current, Some(Some(Effort::High)));
+        assert_eq!(settings.effort.requested, None);
+        assert_eq!(
+            settings.effort.refused_effort(),
+            Some(Refusal {
+                value: Effort::Max,
+                reason: "not on this model".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_model_without_effort_folds_to_not_applicable() {
+        let mut settings = AgentSettings::default();
+        assert_eq!(settings.effort.current, None);
+        let kind = EventKind::EffortChanged {
+            effort: None,
+            answers: None,
+        };
+        assert!(AgentSettings::folds(&kind));
+        settings.apply(None, &kind);
+        assert_eq!(settings.effort.current, Some(None));
+        assert_eq!(settings.effort.wanted(), Some(&None));
     }
 
     #[test]

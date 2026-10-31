@@ -1083,6 +1083,7 @@ fn the_initialize_answer_offers_its_models() {
             label: "Default (recommended)".into(),
             detail: Some("Opus 5.5 · Best for everyday, complex tasks".into()),
             resolved: Some("claude-opus-5-5".into()),
+            efforts: Vec::new(),
         }
     );
     assert!(models.iter().any(|m| m.id == "haiku"));

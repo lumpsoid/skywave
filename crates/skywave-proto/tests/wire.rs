@@ -242,7 +242,25 @@ fn all_event_kinds() -> Vec<EventKind> {
                 label: "Sonnet".into(),
                 detail: Some("Efficient".into()),
                 resolved: Some("model-b".into()),
+                efforts: vec![Effort::Low, Effort::High, Effort::XHigh],
             }],
+        },
+        EventKind::EffortRequested {
+            effort: Effort::XHigh,
+            by: device(),
+        },
+        EventKind::EffortChanged {
+            effort: Some(Effort::Medium),
+            answers: Some(command()),
+        },
+        EventKind::EffortChanged {
+            effort: None,
+            answers: None,
+        },
+        EventKind::EffortRefused {
+            effort: Effort::Max,
+            reason: "not on this model".into(),
+            answers: Some(command()),
         },
     ]
 }
@@ -300,6 +318,10 @@ fn all_command_kinds() -> Vec<CommandKind> {
         CommandKind::SetModel {
             session_id: session(),
             model: "sonnet".into(),
+        },
+        CommandKind::SetEffort {
+            session_id: session(),
+            effort: Effort::High,
         },
     ]
 }
@@ -538,6 +560,26 @@ fn turn_usage_decodes_with_figures_left_out() {
         })
     );
     assert!(TurnUsage::default().is_empty());
+}
+
+#[test]
+fn v7_model_choice_decodes_without_efforts() {
+    let kind = decode(
+        r#"{"type":"models_offered","models":[{"id":"sonnet","label":"Sonnet","detail":null,"resolved":null}]}"#,
+    );
+    let EventKind::ModelsOffered { models } = kind else {
+        panic!("not ModelsOffered: {kind:?}");
+    };
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].efforts, Vec::<Effort>::new());
+    // The same choice with its levels keeps them, by their wire names.
+    let kind = decode(
+        r#"{"type":"models_offered","models":[{"id":"sonnet","label":"Sonnet","detail":null,"resolved":null,"efforts":["low","xhigh"]}]}"#,
+    );
+    let EventKind::ModelsOffered { models } = kind else {
+        panic!("not ModelsOffered: {kind:?}");
+    };
+    assert_eq!(models[0].efforts, vec![Effort::Low, Effort::XHigh]);
 }
 
 #[test]

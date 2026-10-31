@@ -1,6 +1,6 @@
 //! Maps one session's [`AdapterEvent`]s to log events.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
@@ -622,8 +622,9 @@ fn bounded_suggestions(mut suggestions: Vec<proto::RuleSuggestion>) -> Vec<proto
     suggestions
 }
 
-/// The first [`MODELS_MAX`] models, each field cut to one line of its cap;
-/// a model with a blank id is dropped.
+/// The first [`MODELS_MAX`] models, each field cut to one line of its cap
+/// and each effort level kept once, first place wins; a model with a blank
+/// id is dropped.
 pub(crate) fn bounded_models(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
     models
         .into_iter()
@@ -638,11 +639,15 @@ pub(crate) fn bounded_models(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
                 .resolved
                 .map(|resolved| cut_line(&resolved, MODEL_MAX_CHARS).0)
                 .filter(|resolved| !resolved.is_empty());
+            let mut efforts = model.efforts;
+            let mut seen = HashSet::new();
+            efforts.retain(|effort| seen.insert(*effort));
             (!id.is_empty()).then(|| ModelChoice {
                 label: if label.is_empty() { id.clone() } else { label },
                 id,
                 detail,
                 resolved,
+                efforts,
             })
         })
         .take(MODELS_MAX)
@@ -732,5 +737,32 @@ mod tests {
         );
         assert_eq!(generic_text(&json!("echo")), ("echo".to_owned(), true));
         assert_eq!(generic_text(&Value::Null), (String::new(), true));
+    }
+
+    #[test]
+    fn bounded_models_keep_each_effort_once_in_order() {
+        use skywave_proto::Effort;
+        let choice = |id: &str, efforts| ModelChoice {
+            id: id.into(),
+            label: id.into(),
+            detail: None,
+            resolved: None,
+            efforts,
+        };
+        let models = bounded_models(vec![
+            choice(
+                "a",
+                vec![
+                    Effort::High,
+                    Effort::Low,
+                    Effort::High,
+                    Effort::Max,
+                    Effort::Low,
+                ],
+            ),
+            choice("b", Vec::new()),
+        ]);
+        assert_eq!(models[0].efforts, [Effort::High, Effort::Low, Effort::Max]);
+        assert_eq!(models[1].efforts, []);
     }
 }

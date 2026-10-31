@@ -12,7 +12,8 @@
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
 //! - `SetSessionArchived` → `SessionArchived`;
 //! - `SetPermissionMode` → `PermissionModeRequested`;
-//! - `SetModel` → `ModelRequested` with the normalised model.
+//! - `SetModel` → `ModelRequested` with the normalised model;
+//! - `SetEffort` → `EffortRequested`.
 //!
 //! Each appends exactly that one event and nothing else, carrying the
 //! command's id ([`Event::command_id`](skywave_proto::Event::command_id)),
@@ -57,7 +58,7 @@
 //! it); clients fold [`EventKind::archived_effect`], under which a later
 //! message brings the session back. Archiving does not stop the agent.
 //!
-//! **SetPermissionMode, SetModel.** Accepted for any known session, whether
+//! **SetPermissionMode, SetModel, SetEffort.** Accepted for any known session, whether
 //! its agent runs or not, even asking for what it already has: the event
 //! records the request, not its outcome. The supervisor reacts by asking
 //! the agent (starting it if needed), and logs its answer as a `…Changed`
@@ -227,6 +228,16 @@ impl EventLog {
                     return Ok(Err(RejectReason::UnknownModel));
                 };
                 (*session_id, EventKind::ModelRequested { model, by: device })
+            }
+            CommandKind::SetEffort { session_id, effort } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let kind = EventKind::EffortRequested {
+                    effort: *effort,
+                    by: device,
+                };
+                (*session_id, kind)
             }
         };
         Ok(Ok(event_log::append_in(

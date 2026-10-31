@@ -1110,6 +1110,7 @@ async fn offered_models_are_logged_only_when_they_change() {
         label: "Fast".into(),
         detail: None,
         resolved: Some("model-f".into()),
+        efforts: Vec::new(),
     }];
     let agent = FakeAgent::new(FakeScript::new().offer_models(models.clone()));
     let config = SupervisorConfig {

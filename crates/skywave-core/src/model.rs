@@ -1481,7 +1481,8 @@ impl Model {
                 }
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
                 EventKind::PermissionModeRequested { by, .. }
-                | EventKind::ModelRequested { by, .. } => {
+                | EventKind::ModelRequested { by, .. }
+                | EventKind::EffortRequested { by, .. } => {
                     if let Some(command) = event.command_id {
                         asked_by.insert(command, *by);
                     }
@@ -1518,6 +1519,8 @@ impl Model {
                 }),
                 // Shown in the header.
                 EventKind::SessionCreated { .. } | EventKind::ModelsOffered { .. } => None,
+                // Not in the timeline yet: no `AgentSetting` names a level.
+                EventKind::EffortChanged { .. } | EventKind::EffortRefused { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -1749,7 +1752,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::RenameSession { session_id, .. }
         | CommandKind::SetSessionArchived { session_id, .. }
         | CommandKind::SetPermissionMode { session_id, .. }
-        | CommandKind::SetModel { session_id, .. } => Some(*session_id),
+        | CommandKind::SetModel { session_id, .. }
+        | CommandKind::SetEffort { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -2661,6 +2665,7 @@ mod tests {
             label: "Sonnet".into(),
             detail: None,
             resolved: Some("model-s".into()),
+            efforts: Vec::new(),
         };
         f.log(
             a,

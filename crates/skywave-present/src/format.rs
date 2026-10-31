@@ -342,6 +342,7 @@ mod tests {
                 label: "Sonnet".into(),
                 detail: None,
                 resolved: Some("model-s".into()),
+                efforts: Vec::new(),
             }],
             ..AgentView::default()
         };
