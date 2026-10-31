@@ -272,6 +272,7 @@ mod tests {
         Event {
             session_id,
             at: Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap(),
+            command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
             kind,
         }
     }
@@ -364,7 +365,6 @@ mod tests {
         assert_eq!(summary.title(), "app");
 
         let message = |text: &str| EventKind::UserMessage {
-            command_id: skywave_proto::CommandId::new(),
             device_id: DeviceId::new(),
             text: text.into(),
         };
@@ -441,7 +441,6 @@ mod tests {
         summary.apply(Seq(6), &event(sid, 11, archive(true)));
         assert!(summary.archived, "absolute: a repeat does not flip it");
         let message = EventKind::UserMessage {
-            command_id: skywave_proto::CommandId::new(),
             device_id: DeviceId::new(),
             text: "back".into(),
         };

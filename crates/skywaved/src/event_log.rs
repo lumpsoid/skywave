@@ -27,7 +27,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use skywave_proto::{ApprovalId, Event, EventBatch, EventKind, Seq, SessionId, SessionState};
+use skywave_proto::{
+    ApprovalId, CommandId, Event, EventBatch, EventKind, Seq, SessionId, SessionState,
+};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -109,20 +111,22 @@ impl EventLog {
     pub fn read(&self, db: &Db, after: Seq, limit: u32) -> Result<EventBatch> {
         let limit = limit.clamp(1, MAX_BATCH_LIMIT);
         let mut stmt = db.conn().prepare_cached(
-            "SELECT seq, session_id, at, kind FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            "SELECT seq, session_id, at, command_id, kind FROM events
+             WHERE seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![seq_to_sql(after), limit], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?;
         let from = after.next();
         let mut events = Vec::new();
         for row in rows {
-            let (seq, session_id, at, kind) = row?;
+            let (seq, session_id, at, command_id, kind) = row?;
             let expected = from.0 + events.len() as u64;
             if seq_from_sql(seq)? != Seq(expected) {
                 return Err(Error::Corrupt(format!(
@@ -132,6 +136,7 @@ impl EventLog {
             events.push(Event {
                 session_id: parse_id(&session_id)?,
                 at: parse_time(&at)?,
+                command_id: command_id.as_deref().map(parse_id).transpose()?,
                 kind: serde_json::from_str(&kind)?,
             });
         }
@@ -182,7 +187,7 @@ impl EventLog {
                 id.0
             )));
         }
-        let seq = append_in(&tx, session_id, &kind)?;
+        let seq = append_in(&tx, session_id, None, &kind)?;
         tx.commit()?;
         self.published(seq);
         Ok(seq)
@@ -211,7 +216,7 @@ impl EventLog {
             id,
             reason: reason.to_owned(),
         };
-        let seq = append_in(&tx, session_id, &kind)?;
+        let seq = append_in(&tx, session_id, None, &kind)?;
         tx.commit()?;
         self.published(seq);
         Ok(Some(seq))
@@ -286,13 +291,28 @@ pub(crate) fn begin(db: &mut Db) -> Result<rusqlite::Transaction<'_>> {
 
 /// Appends one event at the next seq and updates the projections. Must run
 /// inside a transaction from [`begin`]; preconditions are the caller's.
-pub(crate) fn append_in(conn: &Connection, session_id: SessionId, kind: &EventKind) -> Result<Seq> {
+/// `command` is the command logging it ([`Event::command_id`]), `None` for
+/// agent and daemon events.
+pub(crate) fn append_in(
+    conn: &Connection,
+    session_id: SessionId,
+    command: Option<CommandId>,
+    kind: &EventKind,
+) -> Result<Seq> {
     let seq = head_in(conn)?.next();
     let sql_seq = seq_to_sql(seq);
     let session = session_id.0.to_string();
     let at = Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true);
-    conn.prepare_cached("INSERT INTO events (seq, session_id, at, kind) VALUES (?1, ?2, ?3, ?4)")?
-        .execute(params![sql_seq, session, at, serde_json::to_string(kind)?])?;
+    conn.prepare_cached(
+        "INSERT INTO events (seq, session_id, at, command_id, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        sql_seq,
+        session,
+        at,
+        command.map(|id| id.0.to_string()),
+        serde_json::to_string(kind)?
+    ])?;
 
     match kind {
         EventKind::SessionCreated { workdir } => {

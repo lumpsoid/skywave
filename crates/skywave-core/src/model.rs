@@ -705,12 +705,10 @@ impl Model {
         let mut first = None;
         for (seq, event) in unseen {
             match &event.kind {
-                EventKind::UserMessage {
-                    command_id,
-                    device_id,
-                    ..
-                } => {
-                    let sent = self.outbox.iter().any(|e| e.command.id == *command_id);
+                EventKind::UserMessage { device_id, .. } => {
+                    let sent = event
+                        .command_id
+                        .is_some_and(|id| self.outbox.iter().any(|e| e.command.id == id));
                     if self.is_own_message(sent, *device_id) {
                         first = None;
                         continue;
@@ -1159,15 +1157,13 @@ impl Model {
         let mut tools = ToolIndex::default();
         for (seq, event) in events {
             let entry = match &event.kind {
-                EventKind::UserMessage {
-                    command_id,
-                    device_id,
-                    text,
-                } => {
-                    logged.insert(*command_id);
-                    let sent = outbox.get(command_id);
-                    Some(Entry::UserMessage {
-                        command_id: *command_id,
+                // The server logs every message with its command id, the
+                // entry's key; one without would have none to show under.
+                EventKind::UserMessage { device_id, text } => event.command_id.map(|command_id| {
+                    logged.insert(command_id);
+                    let sent = outbox.get(&command_id);
+                    Entry::UserMessage {
+                        command_id,
                         text: text.clone(),
                         from: DeviceRef {
                             me: self.is_own_message(sent.is_some(), *device_id),
@@ -1175,8 +1171,8 @@ impl Model {
                         },
                         outgoing: sent.map(|e| Outgoing::from(&e.status)),
                         delivery: sent.and_then(|e| Delivery::of(e)),
-                    })
-                }
+                    }
+                }),
                 EventKind::AgentMessage { text } => {
                     Some(Entry::AgentMessage { text: text.clone() })
                 }
@@ -1613,16 +1609,32 @@ mod tests {
             }
         }
 
-        /// Appends events to the log and delivers them as one batch.
+        /// Appends events to the log and delivers them as one batch; each
+        /// one a command logs names a fresh command.
         fn log(&mut self, session_id: SessionId, kinds: Vec<EventKind>) {
+            let events = kinds
+                .into_iter()
+                .map(|kind| (kind.logged_by_command().then(CommandId::new), kind))
+                .collect();
+            self.log_commands(session_id, events);
+        }
+
+        /// Appends events, each logged by the command named with it, and
+        /// delivers them as one batch.
+        fn log_commands(
+            &mut self,
+            session_id: SessionId,
+            kinds: Vec<(Option<CommandId>, EventKind)>,
+        ) {
             let from = Seq(self.events.len() as u64 + 1);
             let events: Vec<Event> = kinds
                 .into_iter()
-                .map(|kind| {
+                .map(|(command_id, kind)| {
                     let minute = (self.events.len() % 60) as u32;
                     let event = Event {
                         session_id,
                         at: Utc.with_ymd_and_hms(2026, 10, 29, 10, minute, 0).unwrap(),
+                        command_id,
                         kind,
                     };
                     self.events.push(event.clone());
@@ -1890,16 +1902,18 @@ mod tests {
         assert_eq!(f.model.view().queued, 0);
 
         let me = f.me;
-        f.log(
+        f.log_commands(
             sid,
             vec![
-                EventKind::UserMessage {
-                    command_id: command.id,
-                    device_id: me,
-                    text: "hello".into(),
-                },
-                EventKind::SessionStateChanged(LogState::AgentWorking),
-                EventKind::AgentMessage { text: "hi".into() },
+                (
+                    Some(command.id),
+                    EventKind::UserMessage {
+                        device_id: me,
+                        text: "hello".into(),
+                    },
+                ),
+                (None, EventKind::SessionStateChanged(LogState::AgentWorking)),
+                (None, EventKind::AgentMessage { text: "hi".into() }),
             ],
         );
         let view = f.session_view();
@@ -1954,13 +1968,15 @@ mod tests {
             Utc::now(),
         );
         let phone = CommandId::new();
-        f.log(
+        f.log_commands(
             sid,
-            vec![EventKind::UserMessage {
-                command_id: phone,
-                device_id: DeviceId::new(),
-                text: "from the phone".into(),
-            }],
+            vec![(
+                Some(phone),
+                EventKind::UserMessage {
+                    device_id: DeviceId::new(),
+                    text: "from the phone".into(),
+                },
+            )],
         );
         let timeline = f.session_view().timeline;
         assert!(matches!(
@@ -2317,7 +2333,6 @@ mod tests {
             sid,
             vec![
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: phone,
                     text: "from the phone".into(),
                 },
@@ -2373,8 +2388,8 @@ mod tests {
             events: vec![Event {
                 session_id: sid,
                 at: Utc::now(),
+                command_id: Some(CommandId::new()),
                 kind: EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: phone,
                     text: "again".into(),
                 },
@@ -2480,7 +2495,6 @@ mod tests {
 
     fn message(text: &str) -> EventKind {
         EventKind::UserMessage {
-            command_id: CommandId::new(),
             device_id: DeviceId::new(),
             text: text.into(),
         }
@@ -2899,6 +2913,7 @@ mod tests {
             events: vec![Event {
                 session_id: gone,
                 at: minute(9),
+                command_id: Some(CommandId::new()),
                 kind: message("again"),
             }],
         });
@@ -3905,7 +3920,6 @@ mod tests {
         let sid = f.session("/srv/a");
         let me = f.me;
         let message = |device_id| EventKind::UserMessage {
-            command_id: CommandId::new(),
             device_id,
             text: "hi".into(),
         };
@@ -3949,7 +3963,6 @@ mod tests {
             sid,
             vec![
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: DeviceId::new(),
                     text: "go on".into(),
                 },
@@ -3981,7 +3994,6 @@ mod tests {
         let mut f = Fixture::paired();
         let me = f.me;
         let message = |device_id| EventKind::UserMessage {
-            command_id: CommandId::new(),
             device_id,
             text: "hi".into(),
         };

@@ -495,10 +495,10 @@ pub fn is_reconnecting(link: &Link) -> bool {
 pub fn user_messages(events: &[Event]) -> Vec<(CommandId, String)> {
     events
         .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::UserMessage {
-                command_id, text, ..
-            } => Some((*command_id, text.clone())),
+        .filter_map(|e| match (&e.kind, e.command_id) {
+            (EventKind::UserMessage { text, .. }, Some(command_id)) => {
+                Some((command_id, text.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -544,6 +544,11 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                 continue;
             };
             let kind = event_at(*seq);
+            assert_eq!(
+                events[(seq.0 - 1) as usize].command_id,
+                Some(id),
+                "seq {seq:?} names the command it acknowledges"
+            );
             let name = match (&entry.command.kind, kind) {
                 (CommandKind::CreateSession { .. }, EventKind::SessionCreated { .. }) => {
                     "SessionCreated"
@@ -551,12 +556,10 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                 (
                     CommandKind::SendMessage { session_id, text },
                     EventKind::UserMessage {
-                        command_id,
                         device_id,
                         text: logged,
                     },
                 ) => {
-                    assert_eq!(*command_id, id);
                     assert_eq!(*device_id, device);
                     assert_eq!(logged, text);
                     assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);

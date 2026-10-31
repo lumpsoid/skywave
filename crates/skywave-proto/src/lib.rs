@@ -33,7 +33,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// its approval was cancelled is not reported as answered elsewhere.
 ///
 /// v6: `devices` on [`HelloResponse`], so a device names the others by the
-/// names they paired with.
+/// names they paired with; `command_id` on [`Event`], the command that
+/// logged it, so a pulled event settles its command when the reply was lost
+/// (it moves there from `EventKind::UserMessage`).
 pub const PROTOCOL_VERSION: u32 = 6;
 
 macro_rules! uuid_id {
@@ -129,6 +131,11 @@ pub struct BlobRef {
 pub struct Event {
     pub session_id: SessionId,
     pub at: DateTime<Utc>,
+    /// The command that logged the event; `None` for the events the agent
+    /// and the daemon produce. Every accepted command logs exactly one
+    /// event, so it is that command's `Accepted { seq }` too: a device whose
+    /// reply was lost settles the command from the log.
+    pub command_id: Option<CommandId>,
     pub kind: EventKind,
 }
 
@@ -140,7 +147,6 @@ pub enum EventKind {
         workdir: String,
     },
     UserMessage {
-        command_id: CommandId,
         device_id: DeviceId,
         text: String,
     },
@@ -228,6 +234,28 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_) => None,
+        }
+    }
+
+    /// Whether only a command logs this kind, so an event of it carries
+    /// the [`Event::command_id`] of the command that did. The agent and the
+    /// daemon log the rest, `ApprovalCancelled` included.
+    pub fn logged_by_command(&self) -> bool {
+        match self {
+            EventKind::SessionCreated { .. }
+            | EventKind::UserMessage { .. }
+            | EventKind::ApprovalResolved { .. }
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped
+            | EventKind::SessionRenamed { .. }
+            | EventKind::SessionArchived { .. } => true,
+            EventKind::AgentMessage { .. }
+            | EventKind::ToolCall(_)
+            | EventKind::ToolResult(_)
+            | EventKind::ApprovalRequested { .. }
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::SessionStateChanged(_)
+            | EventKind::TurnUsage(_) => false,
         }
     }
 
@@ -797,7 +825,6 @@ mod tests {
             );
         }
         let message = EventKind::UserMessage {
-            command_id: CommandId::new(),
             device_id: by,
             text: "back".into(),
         };

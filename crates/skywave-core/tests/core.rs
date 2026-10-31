@@ -88,6 +88,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
     Event {
         session_id,
         at: Utc.with_ymd_and_hms(2026, 10, 29, 11, minute, 0).unwrap(),
+        command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
         kind,
     }
 }
@@ -291,15 +292,17 @@ fn offline_send_is_persisted_first_and_appears_once() {
         .unwrap();
     seam.apply_events(&EventBatch {
         from: Seq(2),
-        events: vec![event(
-            sid,
-            1,
-            EventKind::UserMessage {
-                command_id: command.id,
-                device_id: device,
-                text: "fix the build".into(),
-            },
-        )],
+        events: vec![Event {
+            command_id: Some(command.id),
+            ..event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: device,
+                    text: "fix the build".into(),
+                },
+            )
+        }],
     })
     .unwrap();
     let live = views.last();
