@@ -15,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.withResumed
 import dev.skywave.android.core.CoreClient
 import dev.skywave.android.core.CoreStartup
+import dev.skywave.android.core.LocalNetworkPermission
 import dev.skywave.android.core.coreBlobHeadReader
 import dev.skywave.android.core.corePairUriParser
 import dev.skywave.android.notifications.ApprovalTap
@@ -45,6 +46,12 @@ class MainActivity : ComponentActivity() {
     /** The POST_NOTIFICATIONS prompt; the answer needs no handling (asked once either way). */
     private val notificationPrompt = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
+    /** The ACCESS_LOCAL_NETWORK prompt; once granted, a link waiting out a backoff tries now. */
+    private val localNetworkPrompt = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val startup = (application as SkywaveApp).core
+        if (granted && startup is CoreStartup.Ready) startup.repository.dispatch(Action.RetryNow)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -60,6 +67,8 @@ class MainActivity : ComponentActivity() {
                 openPairLink(intent, startup.repository)
                 openApproval(intent, startup.repository)
             }
+            // Not on recreation (rotation): the prompt from this launch may still be up.
+            if (savedInstanceState == null) askForLocalNetwork()
             askForNotificationsOnFirstSession(startup.repository)
         }
         setContent {
@@ -103,6 +112,12 @@ class MainActivity : ComponentActivity() {
     private fun openApproval(intent: Intent?, client: CoreClient) {
         val sessionId = ApprovalTap.sessionId(intent) ?: return
         client.dispatch(Action.OpenSession(sessionId))
+    }
+
+    /** Asks for ACCESS_LOCAL_NETWORK on launch until granted: no server is reachable on the LAN without it. */
+    private fun askForLocalNetwork() {
+        if (LocalNetworkPermission.granted(this)) return
+        localNetworkPrompt.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
     }
 
     /**
