@@ -13,12 +13,12 @@ use std::io::{self, Write};
 
 use crossterm::execute;
 use crossterm::style::Print;
+/// The longest session title sent, and how a title is made safe to send:
+/// shared with the other heads' alerts.
+pub use skywave_present::policy::{TITLE_MAX, sanitise};
 
 /// Environment variable used when `--notify` is not given.
 pub const VAR: &str = "SKYWAVE_NOTIFY";
-
-/// Longest session title sent, in `char`s.
-pub const TITLE_MAX: usize = 100;
 
 /// How to alert; any combination, all off for `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,15 +67,6 @@ impl Notify {
         }
         Ok(notify)
     }
-}
-
-/// `text` safe inside an OSC sequence and on one line: control characters
-/// (C0, DEL, C1) and `;` dropped, at most [`TITLE_MAX`] `char`s kept.
-pub fn sanitise(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() && *c != ';')
-        .take(TITLE_MAX)
-        .collect()
 }
 
 /// The notification's text for an approval in the session titled `title`.

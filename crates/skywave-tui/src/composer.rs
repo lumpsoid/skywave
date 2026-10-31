@@ -2,8 +2,6 @@
 //! cursor, and its layout into rows of a given width. Pure text editing; what
 //! a message may contain is the core's call.
 
-use std::time::Instant;
-
 /// Spaces a tab is expanded to; a terminal cell grid has no tab stops here.
 const TAB: &str = "    ";
 
@@ -15,9 +13,10 @@ pub struct Composer {
     /// Enter was pressed; the draft is cleared once the core takes the
     /// message and kept if dispatching fails.
     pub(crate) submitted: bool,
-    /// When the first edit the core has not saved yet was made; `None`
-    /// while the core has the text and cursor as shown.
-    pub(crate) dirty_since: Option<Instant>,
+    /// Edited since the head last told its
+    /// [`DraftSaver`](skywave_present::policy::DraftSaver), which keeps
+    /// when.
+    pub(crate) edited: bool,
 }
 
 /// One screen row of the composer: a slice of the text.
@@ -39,7 +38,7 @@ impl Composer {
             text,
             cursor,
             submitted: false,
-            dirty_since: None,
+            edited: false,
         }
     }
 
@@ -58,7 +57,7 @@ impl Composer {
 
     /// Marks an edit (the cursor counts: it is saved too).
     fn touch(&mut self) {
-        self.dirty_since.get_or_insert_with(Instant::now);
+        self.edited = true;
     }
 
     pub fn is_blank(&self) -> bool {
@@ -285,10 +284,10 @@ mod tests {
         assert!(!c.vertical(true), "already on the first line");
         assert_eq!(c.cursor(), 2);
         let mut c = composer("a long line that wraps");
-        c.dirty_since = None;
+        c.edited = false;
         assert!(!c.vertical(true), "a wrapped line is one line");
         assert!(!c.vertical(false));
-        assert_eq!(c.dirty_since, None, "nothing moved");
+        assert!(!c.edited, "nothing moved");
     }
 
     #[test]
@@ -296,7 +295,7 @@ mod tests {
         let mut c = Composer::from_draft("old".into(), 0);
         c.replace("néw");
         assert_eq!((c.text(), c.cursor()), ("néw", "néw".len()));
-        assert!(c.dirty_since.is_some());
+        assert!(c.edited);
     }
 
     #[test]
@@ -304,15 +303,15 @@ mod tests {
         let c = Composer::from_draft("héllo wörld".into(), 8);
         assert_eq!(c.cursor(), "héllo wö".len());
         assert_eq!(c.cursor_chars(), 8);
-        assert_eq!(c.dirty_since, None, "the core has it already");
+        assert!(!c.edited, "the core has it already");
         let c = Composer::from_draft("ñ".into(), 5);
         assert_eq!((c.cursor(), c.cursor_chars()), (2, 1));
         let mut c = Composer::from_draft(String::new(), 3);
         assert_eq!(c.cursor(), 0);
         c.left();
-        assert_eq!(c.dirty_since, None, "nothing moved");
+        assert!(!c.edited, "nothing moved");
         c.insert("x");
-        assert!(c.dirty_since.is_some());
+        assert!(c.edited);
     }
 
     #[test]

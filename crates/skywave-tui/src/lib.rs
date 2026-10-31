@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent};
 use crossterm::execute;
 use skywave_core::{Action, Core, Link, ViewState};
+use skywave_present::policy::{DraftSaver, ReadMarker};
 
 pub use app::App;
 pub use notify::Notify;
@@ -140,13 +141,10 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
 pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
     let action = app.on_key(key);
     if let Some(action) = &action {
-        if !matches!(action, Action::SendMessage { .. }) {
+        if DraftSaver::flushes_before(action) {
             save_draft(app, core, Instant::now(), true);
         }
-        if matches!(
-            action,
-            Action::Navigate(_) | Action::Back | Action::OpenSession(_) | Action::OpenNextApproval
-        ) {
+        if ReadMarker::marks_before(action) {
             mark_read(app, core, Instant::now(), true);
         }
         app.dispatched(core.dispatch(action.clone()));

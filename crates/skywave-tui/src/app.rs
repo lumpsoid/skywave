@@ -4,36 +4,32 @@
 //! this module decides anything about pairing, sync or delivery (D2).
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use skywave_core::search::{self, BlobLine, BlobText, Found, HEAD_BYTES, Hit};
+use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, ApprovalId, ApprovalPrompt, BlobId, BlobPolicy, BlobState, Completion,
-    CompletionStatus, CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind,
-    Outgoing, PairUri, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId,
+    Action, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision, Delivery, Entry,
+    Link, LinkRejection, ListKind, PairUri, PairingView, Route, Screen, Seq, SessionId,
     SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::bytes;
+use skywave_present::policy::{
+    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
+    looks_like_pair_uri, unanswered,
+};
 use skywave_present::sections::{
     Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
-    match_hidden, sections, selectable, starts_turn, wanted_blob,
+    sections, selectable, starts_turn, wanted_blob,
 };
 
 use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
 use crate::notify;
 
-/// How old the first unsaved composer edit gets before the draft is saved
-/// anyway: at most this much typing is lost to a crash. Saves are durable
-/// writes, so never one per keystroke.
-pub const DRAFT_SAVE_AFTER: Duration = Duration::from_secs(1);
-
-/// Least time between two read marks of the open session while it follows
-/// new items: an agent streaming many small batches must not cost a durable
-/// write each. Leaving the session or quitting marks at once.
-pub const READ_MARK_EVERY: Duration = Duration::from_secs(2);
+pub use skywave_present::policy::{DRAFT_SAVE_AFTER, READ_MARK_EVERY, dismissable};
 
 /// One of the pairing form's fields, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -123,15 +119,6 @@ impl PairingForm {
     }
 }
 
-/// Whether `text` is meant as a pairing URI (spec §6), so a malformed one
-/// is reported rather than typed into a field.
-fn looks_like_pair_uri(text: &str) -> bool {
-    let scheme = "skywave://";
-    text.trim()
-        .get(..scheme.len())
-        .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
-}
-
 /// Rows of completion candidates shown at most.
 pub const POPUP_ROWS: usize = 8;
 
@@ -155,14 +142,9 @@ pub struct Prompt {
     /// Enter was pressed; the prompt closes once the core takes the action
     /// and stays open with the text if dispatching fails.
     submitted: bool,
-    /// [`PromptKind::Create`]: the completion popup is open, showing the
-    /// core's [`Completion`].
-    popup: bool,
-    /// Highlighted candidate in the popup.
-    selected: usize,
-    /// Tab was pressed: once the core's candidates for this input are
-    /// settled, fill in the completion. Any other key cancels it.
-    tab: bool,
+    /// [`PromptKind::Create`]: Tab completion of the workdir; its popup
+    /// shows the core's [`Completion`].
+    completion: CompletionSettle,
 }
 
 impl Prompt {
@@ -171,9 +153,7 @@ impl Prompt {
             kind,
             text,
             submitted: false,
-            popup: false,
-            selected: 0,
-            tab: false,
+            completion: CompletionSettle::new(),
         }
     }
 
@@ -183,30 +163,7 @@ impl Prompt {
 
     /// The workdir changed: while the popup is open, complete it again.
     fn edited(&mut self) -> Option<Action> {
-        self.popup.then(|| {
-            self.selected = 0;
-            Action::CompleteWorkdir {
-                input: self.text.clone(),
-            }
-        })
-    }
-
-    /// Applies a settled completion Tab asked for: the only candidate fills
-    /// in and the popup closes; several extend the common prefix and stay
-    /// listed.
-    fn settle(&mut self, completion: &Completion) {
-        if !self.tab
-            || completion.input != self.text
-            || completion.status == CompletionStatus::Loading
-        {
-            return;
-        }
-        self.tab = false;
-        if let Some(fill) = completion.fill() {
-            self.text = fill;
-        }
-        self.popup = completion.candidates.len() != 1;
-        self.selected = 0;
+        self.completion.edited(&self.text)
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
@@ -361,16 +318,16 @@ pub struct SessionUi {
     /// rewrites the draft itself (`draft_rev`, e.g. a queued message taken
     /// back to edit); the core hears of it through [`App::draft_save`].
     pub composer: Composer,
-    /// The core's [`SessionView::draft_rev`] the composer was filled at.
-    draft_rev: u64,
+    /// When the composer's edits are saved as the core's draft.
+    saver: DraftSaver,
     /// Earlier prompts being recalled into the composer; any edit ends it.
-    history: Option<HistoryNav>,
+    history: PromptHistory<Composer>,
     /// The session opened with news and where to scroll is not settled: it
     /// needs the first frame's geometry ([`Geometry::opening`]). Until then
     /// the renderer shows that scroll state itself and nothing is read.
     pub opening: bool,
-    /// What the last [`App::read_mark`] marked read through, and when.
-    marked: Option<(Seq, Instant)>,
+    /// When what is seen is marked read ([`App::read_mark`]).
+    marker: ReadMarker,
     /// The search through the timeline (`/`), while one is open or kept.
     pub search: Option<Search>,
     /// The item `v` revealed, scrolled to its top, while that waits for a
@@ -390,163 +347,47 @@ struct RulePick {
     selected: usize,
 }
 
-/// A search through the open session's timeline. What matches is the
-/// core's ([`skywave_core::search`]); the query and which match is current
-/// are presentation state.
+/// A search through the open session's timeline: the head-independent
+/// part is a [`TimelineSearch`] (deref to it); whether its prompt is open
+/// and where its match scrolls to are the terminal's.
 #[derive(Debug, Clone)]
 pub struct Search {
-    pub query: Query,
+    search: TimelineSearch,
     /// The prompt is open: keys edit the query.
     pub editing: bool,
-    /// The matching items, oldest first, and how much blob content went
-    /// unsearched.
-    pub found: Found,
-    /// The match jumped to last, by key so it stays put as items arrive.
-    pub current: Option<ItemKey>,
-    /// The last jump went round an end of the timeline; said until the
-    /// next key.
-    pub wrapped: bool,
     /// The current match's line in its blob waits to be scrolled to: the
     /// next frame shows it ([`Geometry::match_scroll`]), the next key
     /// keeps that scroll state.
     pub pin: bool,
-    /// The heads of the downloaded blobs read so far (at most
-    /// [`HEAD_BYTES`] each), so a search reads each file once; `None`
-    /// for one that could not be read.
-    blob_cache: HashMap<BlobId, Option<BlobText>>,
+}
+
+impl Deref for Search {
+    type Target = TimelineSearch;
+
+    fn deref(&self) -> &TimelineSearch {
+        &self.search
+    }
 }
 
 impl Search {
     fn new() -> Search {
         Search {
-            query: Query::new(""),
+            search: TimelineSearch::new(),
             editing: true,
-            found: Found::default(),
-            current: None,
-            wrapped: false,
             pin: false,
-            blob_cache: HashMap::new(),
         }
-    }
-
-    /// The matching items, oldest first.
-    pub fn hits(&self) -> &[Hit] {
-        &self.found.hits
-    }
-
-    /// The match on the item at timeline index `index`, if it matches.
-    pub fn hit(&self, index: usize) -> Option<&Hit> {
-        let at = self
-            .found
-            .hits
-            .binary_search_by_key(&index, |hit| hit.index)
-            .ok()?;
-        Some(&self.found.hits[at])
-    }
-
-    /// What the search read of a downloaded blob, if it did.
-    pub fn blob_text(&self, id: BlobId) -> Option<&BlobText> {
-        self.blob_cache.get(&id)?.as_ref()
-    }
-
-    /// Finds the matches in `view`, reading the downloaded blobs not read
-    /// yet; a blob that became downloaded since is read now.
-    fn find(&mut self, view: &SessionView) {
-        let cache = &mut self.blob_cache;
-        self.found = search::find(&view.timeline, &self.query, &mut |blob| {
-            cache
-                .entry(blob.id)
-                .or_insert_with(|| BlobText::read(blob))
-                .clone()
-        });
     }
 
     /// Edits the query and finds its matches again.
     fn edit(&mut self, view: &SessionView, edit: impl FnOnce(&mut String)) {
-        let mut text = self.query.as_str().to_owned();
-        edit(&mut text);
-        self.query = Query::new(&text);
-        self.find(view);
-        self.current = None;
+        self.search.edit(view, edit, BlobText::read);
         self.pin = false;
     }
 
-    /// Finds the matches in a new snapshot. The current match stays on its
-    /// item; if that is gone, the match nearest its old index `old` is.
+    /// Finds the matches in a new snapshot; see [`TimelineSearch::refresh`].
     fn refresh(&mut self, view: &SessionView, old: Option<usize>) {
-        self.find(view);
-        let Some(key) = self.current else {
-            return;
-        };
-        let index = find(view, key).or_else(|| {
-            let old = old?;
-            self.hits()
-                .iter()
-                .map(|hit| hit.index)
-                .min_by_key(|&i| i.abs_diff(old))
-        });
-        self.current = index.map(|i| ItemKey::of(&view.timeline[i]));
+        self.search.refresh(view, old, BlobText::read);
     }
-
-    /// The current match's place among the matches, 1 the oldest.
-    pub fn position(&self, view: &SessionView) -> Option<usize> {
-        let index = find(view, self.current?)?;
-        Some(self.hits().iter().position(|hit| hit.index == index)? + 1)
-    }
-
-    /// The current match's line in its blob, with its timeline index.
-    pub fn current_line(&self, view: &SessionView) -> Option<(usize, BlobLine)> {
-        let index = find(view, self.current?)?;
-        Some((index, self.hit(index)?.blob?))
-    }
-
-    /// What the search could not look through, if anything: `3 outputs not
-    /// downloaded`, `1 output searched only in its first 1.0 MiB`.
-    pub fn partial(&self) -> Option<String> {
-        let outputs = |n: usize| if n == 1 { "output" } else { "outputs" };
-        let mut out = Vec::new();
-        match self.found.not_downloaded {
-            0 => {}
-            n => out.push(format!("{n} {} not downloaded", outputs(n))),
-        }
-        match self.found.cut {
-            0 => {}
-            n => out.push(format!(
-                "{n} {} searched only in {} first {}",
-                outputs(n),
-                if n == 1 { "its" } else { "their" },
-                bytes(HEAD_BYTES)
-            )),
-        }
-        (!out.is_empty()).then(|| out.join(" · "))
-    }
-
-    /// How the search stands: `3 of 17`, `17 matches` before a jump, `no
-    /// matches`.
-    pub fn count(&self, view: &SessionView) -> String {
-        match (self.hits().len(), self.position(view)) {
-            (0, _) => "no matches".to_owned(),
-            (of, Some(at)) => format!("{at} of {of}"),
-            (1, None) => "1 match".to_owned(),
-            (of, None) => format!("{of} matches"),
-        }
-    }
-
-    /// The query and how it stands: `/foo · 3 of 17`.
-    pub fn status(&self, view: &SessionView) -> String {
-        format!("/{} · {}", self.query.as_str(), self.count(view))
-    }
-}
-
-/// Browsing [`SessionView::prompts`] in the composer.
-#[derive(Debug, Clone)]
-struct HistoryNav {
-    /// Taken when browsing starts, so new prompts do not shift `index`.
-    list: Vec<String>,
-    /// The prompt shown; 0 is the newest.
-    index: usize,
-    /// What was being written before browsing, restored past the newest.
-    stash: Composer,
 }
 
 impl SessionUi {
@@ -559,10 +400,10 @@ impl SessionUi {
             expanded: HashSet::new(),
             geometry: RefCell::default(),
             composer: composer_of(view),
-            draft_rev: view.draft_rev,
-            history: None,
+            saver: DraftSaver::new(view),
+            history: PromptHistory::new(),
             opening: view.unread_from.is_some(),
-            marked: None,
+            marker: ReadMarker::new(view.id),
             search: None,
             reveal: None,
             rule_pick: None,
@@ -694,62 +535,52 @@ impl SessionUi {
         }
     }
 
-    /// The newest item is on screen, so everything up to `last_seq` is
-    /// seen, and that is past what was last marked read.
-    fn unmarked(&self, view: &SessionView) -> bool {
-        !self.opening
-            && self.scroll.is_none()
-            && self.marked.is_none_or(|(seq, _)| view.last_seq > seq)
+    /// The newest item is on screen and the opening scroll settled: what
+    /// reaches the session is seen.
+    fn following(&self) -> bool {
+        !self.opening && self.scroll.is_none()
     }
 
     /// While browsing earlier prompts: the shown one's place, 1 the newest,
     /// and how many there are.
     pub fn history_position(&self) -> Option<(usize, usize)> {
-        self.history
-            .as_ref()
-            .map(|nav| (nav.index + 1, nav.list.len()))
+        self.history.position()
+    }
+
+    /// Tells the draft saver of composer edits made since it last heard,
+    /// as made at `now`.
+    fn note_edits(&mut self, now: Instant) {
+        if std::mem::take(&mut self.composer.edited) {
+            self.saver.edited(now);
+        }
     }
 
     /// Shows the next older (`older`) or newer earlier prompt; newer than
     /// the newest is the text that was being written. The shown text is
     /// the draft: it is saved like typed text.
     fn recall(&mut self, view: &SessionView, older: bool) {
-        let Some(nav) = &mut self.history else {
-            let list: Vec<String> = view.prompts().into_iter().map(str::to_owned).collect();
-            if older && let Some(newest) = list.first() {
-                let stash = self.composer.clone();
-                self.composer.replace(newest);
-                self.history = Some(HistoryNav {
-                    list,
-                    index: 0,
-                    stash,
-                });
-            }
-            return;
-        };
         if older {
-            if nav.index + 1 == nav.list.len() {
-                return;
-            }
-            nav.index += 1;
-        } else if nav.index == 0 {
-            if let Some(nav) = self.history.take() {
-                self.composer = nav.stash;
-                self.composer.dirty_since.get_or_insert_with(Instant::now);
+            let composer = &self.composer;
+            if let Some(prompt) = self.history.older(view, || composer.clone()) {
+                self.composer.replace(prompt);
             }
             return;
-        } else {
-            nav.index -= 1;
         }
-        self.composer.replace(&nav.list[nav.index]);
+        match self.history.newer() {
+            Some(Recall::Prompt(prompt)) => self.composer.replace(prompt),
+            Some(Recall::Stash(stash)) => {
+                self.composer = stash;
+                self.composer.edited = true;
+            }
+            None => {}
+        }
     }
 
     /// Refills the composer, focused, when the core rewrote the draft.
     fn follow_draft(&mut self, view: &SessionView) {
-        if view.draft_rev != self.draft_rev {
-            self.draft_rev = view.draft_rev;
+        if self.saver.refill(view) {
             self.composer = composer_of(view);
-            self.history = None;
+            self.history.end();
             self.focus = Focus::Composer;
         }
     }
@@ -792,9 +623,9 @@ pub struct UiState {
     /// A copy to the terminal's clipboard, for the event loop to send
     /// ([`App::take_copy`]).
     pub copy: Option<Clip>,
-    /// The core's [`alerts`](skywave_core::Attention::alerts) count last
-    /// seen; the first snapshot's needs no alert.
-    pub seen_alerts: u64,
+    /// Watches the core's [`alerts`](skywave_core::Attention::alerts)
+    /// count; the first snapshot's needs no alert.
+    pub alerts: AlertWatcher,
     /// An alert that new approvals came in, for the event loop to send
     /// ([`App::take_alert`]): the newest one's session title.
     pub alert: Option<String>,
@@ -828,7 +659,7 @@ impl App {
                 error: None,
                 notice: None,
                 copy: None,
-                seen_alerts: view.attention.alerts,
+                alerts: AlertWatcher::new(&view.attention),
                 alert: None,
                 jumped: false,
                 quit: false,
@@ -870,16 +701,10 @@ impl App {
         {
             self.ui.prompt = None;
         }
-        let attention = &view.attention;
-        if attention.alerts > self.ui.seen_alerts {
-            let title = attention.approvals.last().map(|a| a.title.clone());
-            self.ui.notice = Some(match &title {
-                Some(title) => format!("approval needed · {}", notify::sanitise(title)),
-                None => "approval needed".to_owned(),
-            });
-            self.ui.alert = Some(title.unwrap_or_default());
+        if let Some(alert) = self.ui.alerts.observe(&view.attention) {
+            self.ui.notice = Some(alert.notice());
+            self.ui.alert = Some(alert.title.unwrap_or_default());
         }
-        self.ui.seen_alerts = self.ui.seen_alerts.max(attention.alerts);
         let old_index = self
             .session_list()
             .and_then(|list| self.selected_index(list));
@@ -894,10 +719,7 @@ impl App {
             && create.kind == PromptKind::Create
             && let Some(completion) = &list.completion
         {
-            create.settle(completion);
-            create.selected = create
-                .selected
-                .min(completion.candidates.len().saturating_sub(1));
+            create.completion.settle(&mut create.text, completion);
         }
         // The question goes with its row, e.g. when a message brings the
         // session back.
@@ -995,6 +817,7 @@ impl App {
                 // next save drops its draft; otherwise that save writes
                 // nothing.
                 session.composer.clear();
+                session.note_edits(Instant::now());
             }
         }
         if result.is_err() {
@@ -1080,36 +903,28 @@ impl App {
     /// [`App::draft_saved`], not [`App::dispatched`].
     pub fn draft_save(&mut self, now: Instant, force: bool) -> Option<Action> {
         let session = self.ui.session.as_mut()?;
-        let since = session.composer.dirty_since?;
-        if !force && now.saturating_duration_since(since) < DRAFT_SAVE_AFTER {
-            return None;
-        }
-        session.composer.dirty_since = None;
-        Some(Action::SaveDraft {
-            session_id: session.id,
-            text: session.composer.text().to_owned(),
-            cursor: session.composer.cursor_chars(),
-        })
+        let composer = &session.composer;
+        session
+            .saver
+            .save(now, force, composer.text(), composer.cursor_chars())
     }
 
     /// How long from `now` until [`App::draft_save`] has something to save
     /// unforced; `None` while there are no unsaved edits.
     pub fn draft_due_in(&self, now: Instant) -> Option<Duration> {
-        let since = self.ui.session.as_ref()?.composer.dirty_since?;
-        Some((since + DRAFT_SAVE_AFTER).saturating_duration_since(now))
+        let wake = self.ui.session.as_ref()?.saver.next_wake()?;
+        Some(wake.saturating_duration_since(now))
     }
 
     /// Records the outcome, at `now`, of dispatching a [`App::draft_save`]
     /// action. Only an error matters: the composer is not a submitted
     /// message and must not be cleared like one, and its edits are unsaved
-    /// again, due one [`DRAFT_SAVE_AFTER`] from `now` so a save that keeps
-    /// failing is retried at that pace. An edit made since the save was
-    /// taken has marked them unsaved already and keeps its own time.
+    /// again ([`DraftSaver::failed`]).
     pub fn draft_saved(&mut self, now: Instant, result: Result<(), CoreError>) {
         if let Err(err) = result {
             self.ui.error = Some(err.to_string());
             if let Some(session) = self.ui.session.as_mut() {
-                session.composer.dirty_since.get_or_insert(now);
+                session.saver.failed(now);
             }
         }
     }
@@ -1125,20 +940,8 @@ impl App {
         };
         let session = self.ui.session.as_mut().filter(|s| s.id == view.id)?;
         session.settle();
-        if !session.unmarked(view) {
-            return None;
-        }
-        if let Some((_, at)) = session.marked
-            && !force
-            && now.saturating_duration_since(at) < READ_MARK_EVERY
-        {
-            return None;
-        }
-        session.marked = Some((view.last_seq, now));
-        Some(Action::MarkRead {
-            session_id: view.id,
-            through: view.last_seq,
-        })
+        let following = session.following();
+        session.marker.mark(now, view.last_seq, following, force)
     }
 
     /// How long from `now` until [`App::read_mark`] has something to mark
@@ -1149,12 +952,8 @@ impl App {
             // Settles as soon as a frame was drawn.
             return (ui.geometry.borrow().height > 0).then_some(Duration::ZERO);
         }
-        if !ui.unmarked(view) {
-            return None;
-        }
-        Some(ui.marked.map_or(Duration::ZERO, |(_, at)| {
-            (at + READ_MARK_EVERY).saturating_duration_since(now)
-        }))
+        let wake = ui.marker.next_wake(now, view.last_seq, ui.following())?;
+        Some(wake.saturating_duration_since(now))
     }
 
     /// Records the outcome of dispatching a [`App::read_mark`] action; only
@@ -1252,9 +1051,7 @@ impl App {
         }
         if let Some(prompt) = &mut self.ui.prompt {
             prompt.insert(text.trim());
-            // The candidates were for the text before the paste.
-            prompt.popup = false;
-            prompt.tab = false;
+            prompt.completion.pasted();
             return;
         }
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session)
@@ -1268,8 +1065,9 @@ impl App {
         }
         if let Some(session) = &mut self.ui.session {
             session.focus = Focus::Composer;
-            session.history = None;
+            session.history.end();
             session.composer.insert(text);
+            session.note_edits(Instant::now());
             return;
         }
         if !self.typing() {
@@ -1284,6 +1082,14 @@ impl App {
 
     /// Handles a key press; returns the action to dispatch, if any.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let action = self.key(key);
+        if let Some(session) = &mut self.ui.session {
+            session.note_edits(Instant::now());
+        }
+        action
+    }
+
+    fn key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.kind == KeyEventKind::Release {
             return None;
         }
@@ -1469,12 +1275,12 @@ impl App {
     /// The completion popup of the new-session prompt, if it is open and
     /// has something to show, with the highlighted row.
     pub fn completion_popup(&self) -> Option<(&Completion, usize)> {
-        let create = self.ui.prompt.as_ref().filter(|c| c.popup)?;
+        let create = self.ui.prompt.as_ref().filter(|c| c.completion.open())?;
         let Screen::SessionList(list) = &self.view.screen else {
             return None;
         };
         let completion = list.completion.as_ref()?;
-        Some((completion, create.selected))
+        Some((completion, create.completion.selected()))
     }
 
     /// Keys while the new-session prompt is open. Tab completes the
@@ -1488,32 +1294,22 @@ impl App {
         let completing =
             matches!(&self.view.screen, Screen::SessionList(list) if list.completion.is_some());
         let create = self.ui.prompt.as_mut()?;
-        create.tab = false;
+        create.completion.input();
         match key.code {
-            KeyCode::Esc if create.popup => create.popup = false,
+            KeyCode::Esc if create.completion.open() => create.completion.close(),
             KeyCode::Esc => {
+                let end = create.completion.cancel(completing);
                 self.ui.prompt = None;
-                return completing.then_some(Action::EndCompletion);
+                return end;
             }
-            KeyCode::Up if !candidates.is_empty() => {
-                create.selected = create.selected.saturating_sub(1);
-            }
-            KeyCode::Down if !candidates.is_empty() => {
-                create.selected = (create.selected + 1).min(candidates.len() - 1);
-            }
+            KeyCode::Up if !candidates.is_empty() => create.completion.up(),
+            KeyCode::Down if !candidates.is_empty() => create.completion.down(candidates.len()),
             KeyCode::Tab | KeyCode::Enter if !candidates.is_empty() => {
-                let chosen = &candidates[create.selected.min(candidates.len() - 1)];
-                create.text = format!("{}/", chosen.path);
-                create.popup = false;
+                if let Some(chosen) = create.completion.choose(&candidates) {
+                    create.text = chosen;
+                }
             }
-            KeyCode::Tab => {
-                create.tab = true;
-                create.popup = true;
-                create.selected = 0;
-                return Some(Action::CompleteWorkdir {
-                    input: create.text.clone(),
-                });
-            }
+            KeyCode::Tab => return Some(create.completion.complete(&create.text)),
             // Blank or unacceptable paths are refused by the core or the
             // server, not here.
             KeyCode::Enter => {
@@ -1575,7 +1371,7 @@ impl App {
         // Not laid out yet: the revealed item stays at the top.
         session.reveal = None;
         if let Some(search) = &mut session.search {
-            search.wrapped = false;
+            search.search.wrapped = false;
             if search.editing {
                 session.search_key(view, key, ctrl);
                 return None;
@@ -1627,7 +1423,7 @@ impl App {
                     }
                     return None;
                 }
-                session.history = None;
+                session.history.end();
                 let draft = &mut session.composer;
                 match key.code {
                     KeyCode::Esc => session.focus = Focus::Timeline,
@@ -1776,14 +1572,6 @@ impl App {
     }
 }
 
-/// The refused session creation `Delete` dismisses from the list: the
-/// oldest.
-pub fn dismissable(list: &SessionListView) -> Option<&PendingSession> {
-    list.creating
-        .iter()
-        .find(|p| p.discardable && matches!(p.outgoing, Outgoing::Failed(_)))
-}
-
 /// Answers the approval the session is blocked on, if any. Whether it may
 /// still be answered is the core's call.
 fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
@@ -1793,12 +1581,6 @@ fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
         decision,
         rule: None,
     })
-}
-
-/// This device has not answered `prompt`, or its answer was refused in a
-/// way that leaves it open to another.
-fn unanswered(prompt: &ApprovalPrompt) -> bool {
-    prompt.answer.as_ref().is_none_or(|answer| answer.retryable)
 }
 
 impl SessionUi {
@@ -2002,63 +1784,30 @@ impl SessionUi {
     /// only expanded, and scrolled into view: to its line, for a match in
     /// a blob's content.
     fn jump(&mut self, view: &SessionView, older: Option<bool>) {
-        let Some(search) = &self.search else {
+        let from = self.search_from(view);
+        let Some(search) = &mut self.search else {
             return;
         };
-        let hits: Vec<usize> = search.hits().iter().map(|hit| hit.index).collect();
-        let (Some(&oldest), Some(&newest)) = (hits.first(), hits.last()) else {
+        let Some(jump) = search.search.jump(view, older, from) else {
             return;
         };
-        let current = search
-            .current
-            .and_then(|key| find(view, key))
-            .filter(|_| older.is_some());
-        let newer = older == Some(false);
-        let target = match current {
-            Some(at) if newer => hits.iter().find(|&&i| i > at),
-            Some(at) => hits.iter().rev().find(|&&i| i < at),
-            None => {
-                let from = self.search_from(view);
-                if newer {
-                    hits.iter().find(|&&i| i >= from)
-                } else {
-                    hits.iter().rev().find(|&&i| i <= from)
-                }
-            }
-        };
-        let wrapped = target.is_none();
-        let target = target
-            .copied()
-            .unwrap_or(if newer { oldest } else { newest });
-        let query = search.query.clone();
-        let in_blob = search.hit(target).and_then(|hit| hit.blob).is_some();
-        let item = &view.timeline[target];
-        let hidden = match item {
-            TimelineItem::Logged { seq, entry, .. } if match_hidden(entry, &query) => {
-                Some(self.expanded.insert(*seq))
-            }
-            _ => None,
-        };
-        if let Some(search) = &mut self.search {
-            search.current = Some(ItemKey::of(item));
-            search.wrapped = wrapped;
-            // A match deep in a blob is scrolled to by the next frame,
-            // which lays its line out.
-            search.pin = hidden.is_some() && in_blob;
-        }
+        let hidden = jump.expand.map(|seq| self.expanded.insert(seq));
+        // A match deep in a blob is scrolled to by the next frame, which
+        // lays its line out.
+        search.pin = hidden.is_some() && jump.in_blob;
         // Items that cannot be selected (an agent error) only scroll.
-        if let Some(key) = selectable(item) {
+        if let Some(key) = selectable(&view.timeline[jump.index]) {
             self.selected = Some(key);
         }
-        if hidden == Some(true) || (hidden.is_some() && in_blob) {
+        if hidden == Some(true) || (hidden.is_some() && jump.in_blob) {
             // It grows by expanding: anchored to its top, as `v` does,
             // until the match's line is laid out.
             self.scroll = Some(Anchor {
-                key: ItemKey::of(item),
+                key: jump.key,
                 offset: 0,
             });
         } else {
-            self.reveal(target);
+            self.reveal(jump.index);
         }
     }
 
