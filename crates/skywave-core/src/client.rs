@@ -274,6 +274,8 @@ impl Core {
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
                     Effect::SaveDraft(id, draft) => state.store.set_draft(id, draft.as_ref()),
                     Effect::SaveReadMark(id, mark) => state.store.set_read_mark(id, mark),
+                    Effect::SaveSnippet(snippet) => state.store.set_snippet(&snippet),
+                    Effect::DeleteSnippet(id) => state.store.delete_snippet(id),
                     // Refused when the store disagrees with the model; the
                     // resync below then shows what the store holds.
                     Effect::Withdraw { id, draft } => state

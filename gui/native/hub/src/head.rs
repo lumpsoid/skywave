@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use skywave_core::search::BlobText;
 use skywave_core::{
     Action, BlobId, BlobState, Entry, PairUri, PairingView, Screen, Seq, SessionId, SessionView,
-    TimelineItem, ViewState, parse_pair_uri,
+    SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
@@ -433,6 +433,55 @@ impl Head {
             }
             GuiIntent::HistoryOlder => self.recall(true, clock),
             GuiIntent::HistoryNewer => self.recall(false, clock),
+            GuiIntent::SaveSnippet { key, name } => {
+                let key = parse_key(&key)?;
+                let text = open_session(&self.view)
+                    .and_then(|view| prompt(&view.timeline[find(view, key)?]))
+                    .map(str::to_owned);
+                if let Some(text) = text {
+                    self.save_snippet(name, text, clock, out);
+                }
+            }
+            GuiIntent::SaveComposerSnippet { session_id, name } => {
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                let text = session.composer.text.clone();
+                self.save_snippet(name, text, clock, out);
+            }
+            GuiIntent::InsertSnippet {
+                session_id,
+                snippet_id,
+            } => {
+                let id: SnippetId = intents::id("snippet", &snippet_id)?;
+                let Some(snippet) = self
+                    .view
+                    .as_ref()
+                    .and_then(|view| view.snippets.iter().find(|s| s.id == id))
+                    .map(|s| s.text.clone())
+                else {
+                    return Ok(());
+                };
+                self.revs += 1;
+                let rev = self.revs;
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                let composer = &session.composer;
+                let at = composer
+                    .text
+                    .char_indices()
+                    .nth(composer.cursor)
+                    .map_or(composer.text.len(), |(at, _)| at);
+                let mut text = composer.text.clone();
+                text.insert_str(at, &snippet);
+                let cursor = composer.cursor + snippet.chars().count();
+                session.composer = Composer::new(text, cursor, rev);
+                session.saver.edited(clock.now);
+                session.history.end();
+                // Saving the draft first keeps the inserted text too.
+                self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
+            }
             GuiIntent::FollowingChanged { following } => {
                 if let Some(session) = &mut self.session {
                     session.following = following;
@@ -778,6 +827,23 @@ impl Head {
         tag
     }
 
+    /// Keeps `text` as a snippet named `name` and says so; blank text is
+    /// the core's to refuse, and not worth a word.
+    fn save_snippet(&mut self, name: String, text: String, clock: Clock, out: &mut Vec<Out>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.dispatch_user(
+            Action::SaveSnippet { name, text },
+            Purpose::Plain,
+            clock,
+            out,
+        );
+        out.push(Out::Effect(PlatformEffect::Notice {
+            text: "saved as a snippet".to_owned(),
+        }));
+    }
+
     /// Saves the open session's draft when [`DraftSaver::save`] says so.
     fn save_draft(&mut self, clock: Clock, force: bool, out: &mut Vec<Out>) {
         let Some(session) = &mut self.session else {
@@ -1021,6 +1087,18 @@ fn open_session(view: &Option<ViewState>) -> Option<&SessionView> {
     match &view.as_ref()?.screen {
         Screen::Session(session) => Some(session),
         _ => None,
+    }
+}
+
+/// A message the user wrote, logged or still on its way.
+fn prompt(item: &TimelineItem) -> Option<&str> {
+    match item {
+        TimelineItem::Pending { text, .. }
+        | TimelineItem::Logged {
+            entry: Entry::UserMessage { text, .. },
+            ..
+        } => Some(text),
+        TimelineItem::Logged { .. } => None,
     }
 }
 

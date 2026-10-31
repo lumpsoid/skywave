@@ -1,7 +1,9 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
 use crate::store::BlobPolicy;
-use crate::view::{ApprovalId, BlobId, CommandId, Decision, PermissionMode, Seq, SessionId};
+use crate::view::{
+    ApprovalId, BlobId, CommandId, Decision, PermissionMode, Seq, SessionId, SnippetId,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -40,6 +42,18 @@ pub enum Action {
         text: String,
         cursor: usize,
     },
+    /// Keep `text` on this device as a snippet, to use again in any
+    /// session, named `name` (blank for none; normalised as a session
+    /// name). It lists first. Saving a text saved already moves that
+    /// snippet first instead, renamed unless `name` is blank. Blank text
+    /// is a no-op.
+    SaveSnippet {
+        name: String,
+        text: String,
+    },
+    /// The snippet was put into a composer: it lists first.
+    UseSnippet(SnippetId),
+    DeleteSnippet(SnippetId),
     /// Take back one of this device's messages or session creations that
     /// the server never saw, or dismiss one it refused. Only items shown as
     /// `discardable` can be; anything else is a no-op.

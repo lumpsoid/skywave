@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
+import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Whether Enter sends (a hardware keyboard is the norm) or makes a new
@@ -24,6 +25,7 @@ class Composer extends StatefulWidget {
     required this.sessionId,
     required this.composer,
     required this.send,
+    this.snippets = const [],
     this.focusNode,
     super.key,
   });
@@ -31,6 +33,9 @@ class Composer extends StatefulWidget {
   final String sessionId;
   final ComposerView composer;
   final SendIntent send;
+
+  /// What the snippet button offers to put in.
+  final List<SnippetView> snippets;
 
   /// The field's focus, owned by the caller.
   final FocusNode? focusNode;
@@ -127,6 +132,16 @@ class ComposerState extends State<Composer> {
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
 
+  /// Opens the snippets; one put in brings the focus back to the field.
+  Future<void> _snippets() => pickSnippet(
+    context,
+    sessionId: widget.sessionId,
+    snippets: widget.snippets,
+    composerBlank: _blank,
+    send: widget.send,
+    onInserted: _focus.requestFocus,
+  );
+
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
@@ -179,7 +194,7 @@ class ComposerState extends State<Composer> {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+          padding: const EdgeInsets.fromLTRB(4, 8, 8, 8),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -215,6 +230,12 @@ class ComposerState extends State<Composer> {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
+                  IconButton(
+                    tooltip: 'Snippets',
+                    onPressed: _snippets,
+                    icon: const Icon(Icons.bookmark_outline),
+                  ),
+                  const SizedBox(width: 2),
                   Expanded(
                     child: TextField(
                       controller: _field,
