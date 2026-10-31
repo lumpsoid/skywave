@@ -18,6 +18,10 @@ pub enum Action {
     CreateSession {
         workdir: String,
     },
+    /// Start a session in the open session's workdir, and open it once its
+    /// `SessionCreated` reaches the replica, unless the user went elsewhere
+    /// meanwhile.
+    CreateSessionLike(SessionId),
     /// Complete `input` as a workdir: the session list's
     /// [`completion`](crate::SessionListView::completion) shows the
     /// candidates. Heads send it on Tab and on every edit while the

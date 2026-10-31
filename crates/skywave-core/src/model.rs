@@ -164,6 +164,10 @@ pub(crate) struct Model {
     alerted_at: HashMap<ApprovalId, u64>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
+    /// A [`Action::CreateSessionLike`] whose session is not in the replica
+    /// yet: its command, and the session it was asked from, still on
+    /// screen. In memory only.
+    opening: Option<(CommandId, SessionId)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
@@ -203,6 +207,7 @@ impl Model {
             alerts: 0,
             alerted_at: HashMap::new(),
             completer: Completer::default(),
+            opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
         };
@@ -250,6 +255,13 @@ impl Model {
         }
     }
 
+    /// The session on screen when its events are not loaded: one
+    /// [`Model::apply_batch`] opened for a [`Action::CreateSessionLike`].
+    pub(crate) fn unloaded_session(&self) -> Option<SessionId> {
+        self.open_session()
+            .filter(|id| self.open.as_ref().is_none_or(|open| open.id != *id))
+    }
+
     // ---- actions ----------------------------------------------------------
 
     /// Folds a user action into the model. Actions that make no sense in the
@@ -271,6 +283,20 @@ impl Model {
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
                 })
+            }
+            Action::CreateSessionLike(from) => {
+                let Some(workdir) = self
+                    .summary(from)
+                    .and_then(|s| s.workdir.clone())
+                    .filter(|_| self.place == Place::Session(from))
+                else {
+                    return Vec::new();
+                };
+                let effects = self.enqueue(CommandKind::CreateSession { workdir });
+                if let Some(Effect::Enqueue(command)) = effects.first() {
+                    self.opening = Some((command.id, from));
+                }
+                effects
             }
             Action::CompleteWorkdir { input } => {
                 if self.device().is_none() || self.place != Place::SessionList {
@@ -737,6 +763,16 @@ impl Model {
             }
             if let Some(open) = self.open.as_mut().filter(|o| o.id == event.session_id) {
                 open.events.push((seq, event.clone()));
+            }
+            if let Some((command, from)) = self.opening
+                && event.command_id == Some(command)
+            {
+                self.opening = None;
+                // Its events come from the store: see `unloaded_session`.
+                if self.place == Place::Session(from) {
+                    self.place = Place::Session(event.session_id);
+                    self.open = None;
+                }
             }
         }
         self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
@@ -3681,6 +3717,43 @@ mod tests {
         let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![new, old], "most recently active first");
         assert_eq!(list.sessions[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_session_created_like_the_open_one_opens_once_it_is_logged() {
+        let mut f = Fixture::paired();
+        let old = f.session("/srv/a");
+        let list = f.session("/srv/b");
+        // Only from the session on screen.
+        assert!(f.dispatch(Action::CreateSessionLike(old)).is_empty());
+        f.open(old);
+        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: "/srv/a".into()
+            }
+        );
+        assert_eq!(f.model.unloaded_session(), None);
+
+        // Another device's session in the same place is not it.
+        f.session("/srv/a");
+        assert_eq!(f.model.open_session(), Some(old));
+
+        let new = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/a".into(),
+        };
+        f.log_commands(new, vec![(Some(command.id), created.clone())]);
+        assert_eq!(f.model.open_session(), Some(new));
+        assert_eq!(f.model.unloaded_session(), Some(new));
+
+        // Gone elsewhere meanwhile: stays there.
+        f.open(old);
+        let command = queued(&f.dispatch(Action::CreateSessionLike(old)));
+        f.open(list);
+        f.log_commands(SessionId::new(), vec![(Some(command.id), created)]);
+        assert_eq!(f.model.open_session(), Some(list));
     }
 
     fn send(f: &mut Fixture, session_id: SessionId, text: &str) -> Command {

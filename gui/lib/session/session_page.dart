@@ -222,6 +222,20 @@ class _SessionPageState extends State<SessionPage> {
                           ),
                         ),
                         PopupMenuItem(
+                          enabled: screen.workdir != null,
+                          value: () => widget.send.act(
+                            ActionIntentCreateSessionLike(
+                              sessionId: screen.sessionId,
+                            ),
+                          ),
+                          child: ListTile(
+                            enabled: screen.workdir != null,
+                            leading: const Icon(Icons.add),
+                            title: const Text('New session here'),
+                            subtitle: const Text('In the same workdir'),
+                          ),
+                        ),
+                        PopupMenuItem(
                           enabled: !stopped,
                           value: () => widget.send.act(
                             ActionIntentStopSession(
