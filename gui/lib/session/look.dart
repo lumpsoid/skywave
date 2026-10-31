@@ -5,6 +5,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 const monoFamily = 'monospace';
 const monoFallback = ['DejaVu Sans Mono', 'Menlo', 'Consolas', 'Roboto Mono'];
 
+/// The height of one line of [style] at the context's text scale.
+double lineHeightOf(BuildContext context, TextStyle style) =>
+    MediaQuery.textScalerOf(context).scale(style.fontSize ?? 14) *
+    (style.height ?? 1.2);
+
 /// A tool kind's icon.
 IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.fileWrite => Icons.edit_document,
