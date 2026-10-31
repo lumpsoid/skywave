@@ -310,6 +310,7 @@ class _SessionPageState extends State<SessionPage> {
                 Expanded(
                   child: TimelineView(
                     key: _timelineView,
+                    sessionId: screen.sessionId,
                     timeline: widget.timeline,
                     search: _search,
                     send: widget.send,

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/row_tile.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
@@ -22,14 +23,21 @@ const timelineMaxWidth = 920.0;
 /// tells the hub whenever that changes (`FollowingChanged`: the read marks
 /// depend on it); a button brings it back. It scrolls to the current
 /// search match (and its line), and [reveal]s rows on request.
+///
+/// With no rows it says how to start, once the hub's rows are of
+/// [sessionId]: until then the rows are another session's or none sent
+/// yet, so it shows nothing.
 class TimelineView extends StatefulWidget {
   const TimelineView({
+    required this.sessionId,
     required this.timeline,
     required this.search,
     required this.send,
     super.key,
   });
 
+  /// The session shown.
+  final String sessionId;
   final TimelineHolder timeline;
   final SearchHolder search;
   final SendIntent send;
@@ -342,6 +350,20 @@ class TimelineViewState extends State<TimelineView> {
                 },
               ),
             ),
+            if (rows.isEmpty && widget.timeline.sessionId == widget.sessionId)
+              Positioned.fill(
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'Send a message to start the agent.',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium
+                          ?.copyWith(color: SkyColors.of(context).muted),
+                    ),
+                  ),
+                ),
+              ),
             Positioned(
               right: 16,
               bottom: 16,
