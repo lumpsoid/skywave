@@ -197,6 +197,58 @@ skywaved devices revoke <id>
 
 Admin commands work on the database directly, so `serve` can keep running.
 
+### Pair a phone
+
+1. **Install the app.** Build it as in [Android build](#android-build) and
+   install it with the phone connected over USB (USB debugging on):
+
+   ```sh
+   cd android && ./gradlew :app:installDebug
+   # or: adb install -r app/build/outputs/apk/debug/app-debug.apk
+   ```
+
+2. **Make the server reachable.** The phone must reach `listen` and find the
+   address it dials in the server certificate. Listen on all interfaces and
+   put the server's LAN address (or a name the phone resolves) first in
+   `server_names`; `skywaved pair` advertises that first entry:
+
+   ```toml
+   listen = "0.0.0.0:7443"
+   server_names = ["192.168.1.20"]
+   ```
+
+   Restart `skywaved serve` after changing `server_names`: it reissues the
+   server certificate for the new names and keeps the CA, so devices paired
+   already keep working. Open TCP port 7443 in the server's firewall.
+
+3. **Pair.** Run `skywaved pair` on the server. In the app, tap **Scan QR
+   code** and scan the code it printed, or open the printed
+   `skywave://pair?...` link on the phone (the app fills in the form), or
+   type the address, code and fingerprint. Check that the fingerprint matches,
+   then tap **Pair**. A wrong fingerprint is refused before the code is sent,
+   so the code stays usable. `skywaved devices list` now shows the phone.
+
+4. **Answer an approval.** Tap **New session**, pick a folder under one of
+   your `roots` (the folder button lists them from the server) and tap
+   **Create**; open the session and send a message. When the agent asks, the
+   session shows an **Approval needed** panel with what it wants to do: tap
+   **Approve** or **Deny**, or one of the **Always allow** rules it offers.
+   Answers given offline are queued and go out when the phone is back
+   online; one given on another device shows as "Approved on another device".
+
+5. **Get alerts.** Allow notifications when asked. To be alerted within
+   seconds while the app is in the background, turn on **Settings → Stay
+   connected** (see [Approval alerts on Android](#approval-alerts-on-android)).
+
+6. **Revoke.** `skywaved devices revoke <id>` on the server. Within about a
+   minute (when its open request ends) the app shows **This device was
+   revoked**: **Keep reading** keeps the sessions on the phone readable,
+   **Pair again** takes a new `skywaved pair` code.
+
+`scripts/android-acceptance/` holds the rig used to check all of this on an
+emulator over a bad link: a stub agent, the link harness as a standalone
+proxy, and adb helpers. `run.sh` without arguments prints how to use it.
+
 ### Approval alerts on Android
 
 The Android app posts one notification per approval (tap it to open the
