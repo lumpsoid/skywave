@@ -6,7 +6,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 ScreenViewSessionList withPrompt(CreatePrompt? create) => ScreenViewSessionList(
   kind: ListKindView.active,
-  title: 'Sessions (0)',
+  title: 'Sessions',
   rows: const [],
   otherCount: 0,
   creating: const [],

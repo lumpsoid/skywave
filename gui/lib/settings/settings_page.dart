@@ -1,20 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Settings: the blob policy, and the server and device this one is
-/// paired as, with the fingerprint to compare with what `skywaved`
-/// prints, and Re-pair.
+/// paired as, the link to it with its round trip, the fingerprint to
+/// compare with what `skywaved` prints, and Re-pair.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
     required this.screen,
+    required this.link,
     required this.send,
     this.canGoBack = false,
     super.key,
   });
 
   final ScreenViewSettings screen;
+  final LinkHolder link;
   final bool canGoBack;
   final SendIntent send;
 
@@ -92,6 +95,7 @@ class SettingsPage extends StatelessWidget {
               title: const Text('Server'),
               subtitle: SelectableText(screen.server),
             ),
+            ConnectionTile(holder: link),
             ListTile(
               leading: const Icon(Icons.devices),
               title: const Text('Device'),
@@ -120,6 +124,31 @@ class SettingsPage extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The link to the server as Rust says it, `Connected · 12 ms` while
+/// online. The latency changes on every ping, so only this tile listens.
+class ConnectionTile extends StatelessWidget {
+  const ConnectionTile({required this.holder, super.key});
+
+  final LinkHolder holder;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: holder,
+      builder: (context, _) => ListTile(
+        leading: Icon(
+          holder.link?.state == LinkState.online ? Icons.link : Icons.link_off,
+        ),
+        title: const Text('Connection'),
+        subtitle: Text(
+          holder.link?.connectionLabel ?? 'Not known yet',
+          key: const Key('connection-label'),
         ),
       ),
     );

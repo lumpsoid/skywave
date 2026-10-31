@@ -118,7 +118,10 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         spans.push(Span::raw(format!(" · mode {}", agent_mode_label(agent))));
     }
     if let Some(model) = agent_model_label(agent) {
-        spans.push(Span::raw(format!(" · {}", clean(&model))));
+        // A known model names itself; `unknown → opus` alone would not say
+        // what is unknown.
+        let what = if agent.model.is_none() { "model " } else { "" };
+        spans.push(Span::raw(format!(" · {what}{}", clean(&model))));
     }
     for refusal in agent_refusal(agent) {
         spans.push(Span::raw(format!(" · {}", clean(&refusal))).yellow());
@@ -517,7 +520,7 @@ fn render_picker(
                 Line::from(format!("> {}", clean(name)))
             };
             lines.push(typed);
-            let now = agent_model_label(agent).unwrap_or_else(|| "?".to_owned());
+            let now = agent_model_label(agent).unwrap_or_else(|| "unknown".to_owned());
             let input = (lines.len() - 1, clean(name).chars().count() + 2);
             (format!(" Model · now {} ", clean(&now)), lines, Some(input))
         }

@@ -6,8 +6,8 @@ import 'package:skywave_gui/session/agent_pickers.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The session's status under its header: the agent's state, a stop on
-/// its way, the agent's mode and model (a tap switches them; a refusal
+/// The session's status under its header: the agent's state (the one
+/// place it shows; its full label is the tooltip), a stop on its way, the agent's mode and model (a tap switches them; a refusal
 /// turns them red), the rules granted here (a tap lists them), and the
 /// usage summary at the end, its fields dropped from the front when the
 /// line is short of room.
@@ -16,6 +16,14 @@ class StatusLine extends StatelessWidget {
 
   final SessionScreen screen;
   final SendIntent send;
+
+  /// The line's height at the context's text scale: one line of its
+  /// labels and a margin (16), at least a chip's hit area.
+  static double heightOf(BuildContext context) => max(
+    kMinInteractiveDimension,
+    (lineHeightOf(context, Theme.of(context).textTheme.labelMedium!) + 16)
+        .ceilToDouble(),
+  );
 
   void _showRules(BuildContext context) {
     showDialog<void>(
@@ -47,6 +55,49 @@ class StatusLine extends StatelessWidget {
     );
   }
 
+  /// The chips' settings in full, one per row, for a line too narrow to
+  /// show them: a tap opens that setting's picker.
+  void _showSettings(BuildContext context, List<_Chip> chips) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheet) {
+        final error = Theme.of(sheet).colorScheme.error;
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final chip in chips)
+                ListTile(
+                  leading: Icon(
+                    chip.refusal == null ? chip.icon : Icons.error_outline,
+                    color: chip.refusal == null ? null : error,
+                  ),
+                  title: Text(chip.tooltip),
+                  subtitle: Text.rich(
+                    TextSpan(
+                      children: [
+                        TextSpan(text: chip.label),
+                        if (chip.refusal case final refusal?)
+                          TextSpan(
+                            text: '\n$refusal',
+                            style: TextStyle(color: error),
+                          ),
+                      ],
+                    ),
+                  ),
+                  onTap: () {
+                    Navigator.of(sheet).pop();
+                    chip.onTap();
+                  },
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -61,7 +112,7 @@ class StatusLine extends StatelessWidget {
     final settings = screen.agent;
 
     final left = <InlineSpan>[
-      TextSpan(text: screen.agentLabel, style: agent),
+      TextSpan(text: screen.badgeLabel, style: agent),
       if (screen.stopLabel case final label?)
         TextSpan(text: ' · $label', style: muted),
     ];
@@ -82,7 +133,13 @@ class StatusLine extends StatelessWidget {
           return w;
         }
 
-        final chips = [
+        double chipWidth(_Chip chip, double room) => max(
+          kMinInteractiveDimension,
+          min(width(TextSpan(text: chip.label, style: style)), room) +
+              _Chip.chrome,
+        );
+
+        var chips = [
           _Chip(
             icon: Icons.shield_outlined,
             label: settings.modeLabel,
@@ -92,7 +149,7 @@ class StatusLine extends StatelessWidget {
           ),
           _Chip(
             icon: Icons.memory,
-            label: settings.modelLabel ?? 'model',
+            label: settings.modelLabel,
             refusal: settings.modelRefusal,
             tooltip: 'Model',
             onTap: () => pickModel(context, screen, send),
@@ -105,39 +162,61 @@ class StatusLine extends StatelessWidget {
               onTap: () => _showRules(context),
             ),
         ];
-        // A chip takes its label plus the gap, its padding and icon (44);
-        // a label longer than its share of the line is cut short.
-        final labelRoom = (constraints.maxWidth - 32) / chips.length - 44;
+        // Each chip's share of the line, less its gap (8) and chrome; a
+        // line too narrow for every label in full folds the chips into
+        // one that lists them.
+        // The state takes what it needs, up to a third of the line.
+        final leftWidth = width(TextSpan(children: left));
+        final stateRoom = 0.3 * constraints.maxWidth;
+        final line = constraints.maxWidth - 32 - min(leftWidth, stateRoom);
+        var labelRoom = line / chips.length - 8 - _Chip.chrome;
+        if (chips.any(
+          (chip) => width(TextSpan(text: chip.label, style: style)) > labelRoom,
+        )) {
+          final all = chips;
+          chips = [
+            _Chip(
+              icon: Icons.tune,
+              label: all.map((chip) => chip.label).join(' · '),
+              refusal: settings.modeRefusal ?? settings.modelRefusal,
+              tooltip: 'Agent settings',
+              onTap: () => _showSettings(context, all),
+            ),
+          ];
+          labelRoom = line / 2 - 8 - _Chip.chrome;
+        }
         final chipsWidth = chips.fold(
           0.0,
-          (sum, chip) =>
-              sum +
-              min(width(TextSpan(text: chip.label, style: style)), labelRoom) +
-              44,
+          (sum, chip) => sum + chipWidth(chip, labelRoom) + 8,
         );
-        final leftWidth = width(TextSpan(children: left)) + chipsWidth;
         final usage = fitTail(
           screen.usage,
           (text) => width(TextSpan(text: text, style: muted)),
-          // Less the line's padding (32), the gaps, and a margin.
-          constraints.maxWidth - leftWidth - 64,
+          // Less the line's padding (32), the gap, and a margin.
+          constraints.maxWidth - leftWidth - chipsWidth - 56,
         );
 
         return Padding(
-          padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              Flexible(
-                child: Text.rich(
-                  TextSpan(children: left),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+              ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: stateRoom),
+                child: Tooltip(
+                  message: screen.agentLabel,
+                  child: Text.rich(
+                    TextSpan(children: left),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
               ),
               for (final chip in chips) ...[
                 const SizedBox(width: 8),
                 ConstrainedBox(
-                  constraints: BoxConstraints(maxWidth: max(0, labelRoom) + 36),
+                  constraints: BoxConstraints(
+                    maxWidth: max(0, labelRoom) + _Chip.chrome,
+                  ),
                   child: chip,
                 ),
               ],
@@ -153,7 +232,8 @@ class StatusLine extends StatelessWidget {
 }
 
 /// A tappable label on the status line: primary, or the error colour
-/// with the refusal as its tooltip.
+/// with the refusal as its tooltip. It looks compact but takes taps over
+/// a full interactive square around it.
 class _Chip extends StatelessWidget {
   const _Chip({
     required this.icon,
@@ -162,6 +242,9 @@ class _Chip extends StatelessWidget {
     required this.onTap,
     this.refusal,
   });
+
+  /// Its padding (6 a side), icon (14) and gap (4) around the label.
+  static const chrome = 30.0;
 
   final IconData icon;
   final String label;
@@ -177,32 +260,52 @@ class _Chip extends StatelessWidget {
     final color = refusal == null
         ? theme.colorScheme.primary
         : theme.colorScheme.error;
+    // A screen reader hears what it sets, its value and any refusal as
+    // one button, rather than the tooltip standing in for its name.
     return Tooltip(
       message: refusal ?? tooltip,
+      excludeFromSemantics: true,
       child: InkWell(
         borderRadius: BorderRadius.circular(8),
         onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                refusal == null ? icon : Icons.error_outline,
-                size: 14,
-                color: color,
+        child: Semantics(
+          button: true,
+          label: [
+            '$tooltip: $label',
+            if (refusal case final refusal?) 'refused: $refusal',
+          ].join(', '),
+          excludeSemantics: true,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              minWidth: kMinInteractiveDimension,
+              minHeight: kMinInteractiveDimension,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    refusal == null ? icon : Icons.error_outline,
+                    size: 14,
+                    color: color,
+                  ),
+                  const SizedBox(width: 4),
+                  Flexible(
+                    child: Text(
+                      label,
+                      style: theme.textTheme.labelMedium!.copyWith(
+                        color: color,
+                      ),
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 4),
-              Flexible(
-                child: Text(
-                  label,
-                  style: theme.textTheme.labelMedium!.copyWith(color: color),
-                  maxLines: 1,
-                  softWrap: false,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),

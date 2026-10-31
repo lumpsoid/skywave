@@ -5,6 +5,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 const monoFamily = 'monospace';
 const monoFallback = ['DejaVu Sans Mono', 'Menlo', 'Consolas', 'Roboto Mono'];
 
+/// The height of one line of [style] at the context's text scale.
+double lineHeightOf(BuildContext context, TextStyle style) =>
+    MediaQuery.textScalerOf(context).scale(style.fontSize ?? 14) *
+    (style.height ?? 1.2);
+
 /// A tool kind's icon.
 IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.fileWrite => Icons.edit_document,
@@ -17,8 +22,10 @@ IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.other => Icons.build_outlined,
 };
 
-/// Colours that are not in the Material scheme: success and the TUI's
-/// magenta for a denial, picked for the theme's brightness.
+/// Colours that are not in the Material scheme: success, the TUI's
+/// magenta for a denial, the agent working, the link banner's, picked
+/// for the theme's brightness. Each text colour meets WCAG AA (4.5:1) on
+/// the theme's surfaces, and each banner's text on its background.
 @immutable
 class SkyColors {
   const SkyColors._(this.scheme, this.dark);
@@ -35,6 +42,9 @@ class SkyColors {
   Color get warning => dark ? const Color(0xFFFDD663) : const Color(0xFF8A5A00);
   Color get denied => dark ? const Color(0xFFE3A1F0) : const Color(0xFF8E24AA);
   Color get running => scheme.primary;
+
+  /// The agent at work: its state's label and the bar under the header.
+  Color get working => dark ? const Color(0xFF81D4FA) : const Color(0xFF01579B);
   Color get muted => scheme.onSurfaceVariant;
 
   /// A tool state's colour (the TUI's: yellow, cyan, green, red, magenta,
@@ -59,11 +69,47 @@ class SkyColors {
   /// The agent's state, for the header's dot.
   Color agent(AgentState state) => switch (state) {
     AgentState.idle => muted,
-    AgentState.working => running,
+    AgentState.working => working,
     AgentState.awaitingApproval => warning,
     AgentState.errored => scheme.error,
     AgentState.stopped => muted,
   };
+
+  /// The link banner's background and text for [state]: online green,
+  /// syncing blue, offline amber, refused red, unpaired plain. Dark mode
+  /// keeps them deep so the banner does not glare.
+  ({Color background, Color foreground}) link(LinkState state) =>
+      switch (state) {
+        LinkState.online =>
+          dark
+              ? (
+                  background: const Color(0xFF1B5E20),
+                  foreground: const Color(0xFFE8F5E9),
+                )
+              : (background: const Color(0xFF2E7D32), foreground: Colors.white),
+        LinkState.connecting || LinkState.catchingUp =>
+          dark
+              ? (
+                  background: const Color(0xFF01579B),
+                  foreground: const Color(0xFFE1F5FE),
+                )
+              : (background: const Color(0xFF0277BD), foreground: Colors.white),
+        LinkState.reconnecting =>
+          dark
+              ? (
+                  background: const Color(0xFF4A3800),
+                  foreground: const Color(0xFFFFE082),
+                )
+              : (background: const Color(0xFFFFB300), foreground: Colors.black),
+        LinkState.revoked || LinkState.protocolMismatch => (
+          background: scheme.error,
+          foreground: scheme.onError,
+        ),
+        LinkState.unpaired => (
+          background: scheme.surfaceContainerHighest,
+          foreground: scheme.onSurface,
+        ),
+      };
 
   /// A content line's text style over [base].
   TextStyle line(LineStyle style, TextStyle base) => switch (style) {

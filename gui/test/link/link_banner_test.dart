@@ -14,6 +14,7 @@ LinkUpdate link(
 }) => LinkUpdate(
   state: state,
   label: label,
+  connectionLabel: '',
   canRetryNow: canRetryNow,
   rejected: state == LinkState.revoked || state == LinkState.protocolMismatch,
   queued: 0,
@@ -50,7 +51,7 @@ void main() {
 
     for (final (state, label) in [
       (LinkState.connecting, 'connecting…'),
-      (LinkState.online, 'online · 12 ms · 2 queued'),
+      (LinkState.online, 'online · 2 queued'),
       (LinkState.catchingUp, 'syncing · 4/9'),
       (LinkState.reconnecting, 'offline · retry in 07s (attempt 3)'),
       (LinkState.revoked, 'device revoked · re-pair to reconnect'),
@@ -66,12 +67,44 @@ void main() {
     expect(find.text('Retry now'), findsNothing);
   });
 
+  testWidgets('the banner slides away once online with nothing waiting', (
+    tester,
+  ) async {
+    await pump(tester);
+    holder.apply(link(LinkState.connecting, 'connecting…'));
+    await tester.pumpAndSettle();
+    expect(find.text('connecting…'), findsOneWidget);
+
+    // Rust says nothing while online with nothing queued or elsewhere.
+    holder.apply(link(LinkState.online, ''));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('connecting…'), findsOneWidget, reason: 'still sliding');
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('link-label')), findsNothing);
+  });
+
+  testWidgets('the banner comes and goes at once with reduced motion', (
+    tester,
+  ) async {
+    tester.platformDispatcher.accessibilityFeaturesTestValue =
+        const FakeAccessibilityFeatures(disableAnimations: true);
+    addTearDown(tester.platformDispatcher.clearAccessibilityFeaturesTestValue);
+    await pump(tester);
+    holder.apply(link(LinkState.connecting, 'connecting…'));
+    await tester.pump();
+    expect(find.text('connecting…'), findsOneWidget);
+    holder.apply(link(LinkState.online, ''));
+    await tester.pump();
+    expect(find.byKey(const Key('link-label')), findsNothing);
+  });
+
   testWidgets('Retry now and Ctrl+R send RetryNow', (tester) async {
     await pump(tester);
     holder.apply(
       link(LinkState.reconnecting, 'offline · retry in 07s', canRetryNow: true),
     );
-    await tester.pump();
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Retry now'));
     await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
     await tester.sendKeyEvent(LogicalKeyboardKey.keyR);
@@ -89,12 +122,12 @@ void main() {
     holder.apply(
       link(
         LinkState.online,
-        'online · 3 ms',
+        'online',
         elsewhere: 2,
         elsewhereLabel: '2 approvals elsewhere',
       ),
     );
-    await tester.pump();
+    await tester.pumpAndSettle();
     await tester.tap(find.text('2 approvals elsewhere'));
     await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
     await tester.sendKeyEvent(LogicalKeyboardKey.keyG);

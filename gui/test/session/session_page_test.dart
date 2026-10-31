@@ -3,9 +3,13 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/session/composer.dart';
+import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/search_holder.dart';
+import 'package:skywave_gui/session/status_line.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
+import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 import '../fakes.dart';
@@ -260,6 +264,174 @@ void main() {
     expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.call));
   });
 
+  testWidgets('a message\'s text selects; its menu copies it or the whole '
+      'message; a tap and the row menu still work', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    try {
+      final timeline = holding([
+        anyRow(
+          's:1',
+          RowKind.agentMessage,
+          'hello brave new world',
+          author: 'agent',
+        ),
+      ]);
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: timeline,
+        sent: sent,
+      );
+      final text = find.text('hello brave new world', findRichText: true);
+      expect(
+        find.ancestor(of: text, matching: find.byType(SelectionArea)),
+        findsOneWidget,
+      );
+
+      // A tap on the text is the row's.
+      await tester.tap(text);
+      await tester.pump();
+      expect(timeline.selectedKey, 's:1');
+
+      // A mouse drag selects part of it; Copy takes just that.
+      final box = tester.getRect(text);
+      final drag = await tester.startGesture(
+        box.centerLeft + const Offset(1, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+      await drag.moveTo(box.center);
+      await tester.pump();
+      await drag.up();
+      await tester.pumpAndSettle();
+      await tester.tapAt(
+        box.centerLeft + const Offset(4, 0),
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Copy message'), findsOneWidget);
+      await tester.tap(find.text('Copy'));
+      await tester.pumpAndSettle();
+      expect(copied, hasLength(1));
+      expect('hello brave new world', startsWith(copied.single));
+      expect(copied.single, isNot('hello brave new world'));
+
+      // Copy message is the whole message, through the hub.
+      await tester.tapAt(
+        box.center,
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      sent.clear();
+      await tester.tap(find.text('Copy message'));
+      await tester.pumpAndSettle();
+      expect(sent, [const GuiIntentCopy(key: 's:1', what: CopyWhat.main)]);
+      expect(find.text('Copy message'), findsNothing);
+
+      // Off the text, the row's menu.
+      await tester.tapAt(
+        tester.getCenter(find.text('agent')),
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Copy message'), findsNothing);
+      await tester.tap(find.text('Copy'));
+      await tester.pumpAndSettle();
+      expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('on touch a long press on the text selects; off it, the row '
+      'menu', (tester) async {
+    final timeline = holding([
+      anyRow('s:1', RowKind.agentMessage, 'hello world', author: 'agent'),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    await tester.longPress(find.text('hello world', findRichText: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsOneWidget);
+    expect(find.text('Edit queued'), findsNothing);
+
+    // A tap clears the selection; it does not also select the row.
+    await tester.tap(find.text('hello world', findRichText: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsNothing);
+    expect(timeline.selectedKey, isNull);
+
+    await tester.longPress(find.text('agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsNothing);
+    await tester.tap(find.text('Copy'));
+    await tester.pumpAndSettle();
+    expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
+  });
+
+  testWidgets('an empty timeline says how to start, once it is loaded', (
+    tester,
+  ) async {
+    const hint = 'Send a message to start the agent.';
+    // No rows sent yet: not known to be empty.
+    final timeline = TimelineHolder();
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: [],
+    );
+    expect(find.text(hint), findsNothing);
+    // Another session's rows, still shown while this one's are on the way.
+    timeline.apply(const TimelineUpdateSnapshot(sessionId: 's0', items: []));
+    await tester.pump();
+    expect(find.text(hint), findsNothing);
+
+    timeline.apply(const TimelineUpdateSnapshot(sessionId: 's1', items: []));
+    await tester.pump();
+    expect(find.text(hint), findsOneWidget);
+    final context = tester.element(find.text(hint));
+    expect(
+      tester.widget<Text>(find.text(hint)).style?.color,
+      SkyColors.of(context).muted,
+    );
+
+    timeline.apply(
+      TimelineUpdateUpserted(
+        key: 'p:c1',
+        item: anyRow('p:c1', RowKind.pendingMessage, 'hi', own: true),
+        index: 0,
+      ),
+    );
+    await tester.pump();
+    expect(find.text(hint), findsNothing);
+  });
+
   group('approval', () {
     ApprovalPanel panel(List<RuleOption> suggestions) => ApprovalPanel(
       approvalId: 'a1',
@@ -387,7 +559,7 @@ void main() {
       );
     });
 
-    testWidgets('on desktop Enter sends and Shift+Enter does not', (
+    testWidgets('on desktop Enter sends text and Shift+Enter does not', (
       tester,
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.linux;
@@ -399,6 +571,14 @@ void main() {
           timeline: holding([]),
           sent: sent,
         );
+        // A blank field sends nothing, and Enter adds no line to it.
+        await tester.tap(composer());
+        await tester.enterText(composer(), '  ');
+        sent.clear();
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        expect(sent.whereType<GuiIntentComposerSubmit>(), isEmpty);
+        expect(tester.widget<TextField>(composer()).controller!.text, '  ');
+
         await tester.enterText(composer(), 'hi');
         sent.clear();
         await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
@@ -418,16 +598,56 @@ void main() {
       }
     });
 
-    testWidgets('the send button sends', (tester) async {
+    testWidgets('the send button sends, only once there is text', (
+      tester,
+    ) async {
       final sent = <GuiIntent>[];
+      final timeline = holding([]);
       await pumpSession(
         tester,
         screen: screenWith(),
-        timeline: holding([]),
+        timeline: timeline,
         sent: sent,
       );
+      IconButton send() => tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byIcon(Icons.arrow_upward),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(send().onPressed, isNull);
+      await tester.enterText(composer(), ' \n\t ');
+      await tester.pump();
+      expect(send().onPressed, isNull, reason: 'whitespace is blank');
+      await tester.tap(find.byTooltip('Send'));
+      expect(sent.whereType<GuiIntentComposerSubmit>(), isEmpty);
+
+      await tester.enterText(composer(), 'hi');
+      await tester.pump();
+      expect(send().onPressed, isNotNull);
       await tester.tap(find.byTooltip('Send'));
       expect(sent.last, const GuiIntentComposerSubmit(sessionId: 's1'));
+
+      // The hub clears the sent message: off again.
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(text: '', cursorUtf16: 0, rev: 2),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(send().onPressed, isNull);
+      // A queued message taken back to edit fills the field: on.
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(text: 'queued', cursorUtf16: 6, rev: 3),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(send().onPressed, isNotNull);
     });
 
     testWidgets('a new rev overwrites the field, the same one does not', (
@@ -688,6 +908,157 @@ void main() {
     );
   });
 
+  testWidgets('a refusal that arrives is said once in a snack bar', (
+    tester,
+  ) async {
+    Future<void> show(SessionScreen screen) =>
+        pumpSession(tester, screen: screen, timeline: holding([]), sent: []);
+    AgentSettingsView refusing({String? mode, String? model}) =>
+        AgentSettingsView(
+          modeLabel: 'ask',
+          modelLabel: 'Sonnet',
+          modeRefusal: mode,
+          modelRefusal: model,
+          modes: askAgent.modes,
+          models: askAgent.models,
+        );
+    Finder snack(String text) =>
+        find.descendant(of: find.byType(SnackBar), matching: find.text(text));
+    Future<void> dismiss() async {
+      await tester.tap(find.byIcon(Icons.close));
+      await tester.pumpAndSettle();
+    }
+
+    // Already refused when the page opened: not news.
+    await show(screenWith(interruptRefusal: 'old news'));
+    expect(find.byType(SnackBar), findsNothing);
+
+    await show(screenWith(interruptRefusal: 'the server could not take it'));
+    expect(
+      snack('Interrupt failed: the server could not take it'),
+      findsOneWidget,
+    );
+    await dismiss();
+    // The same refusal again, as on any rebuild: said once.
+    await show(screenWith(interruptRefusal: 'the server could not take it'));
+    expect(find.byType(SnackBar), findsNothing);
+    // It stays on the button.
+    expect(
+      find.byTooltip('Interrupt failed: the server could not take it'),
+      findsOneWidget,
+    );
+
+    await show(screenWith());
+    await show(
+      screenWith(agent: refusing(mode: 'bypass refused: not launched for it')),
+    );
+    expect(snack('bypass refused: not launched for it'), findsOneWidget);
+    await dismiss();
+    await show(
+      screenWith(
+        agent: refusing(
+          mode: 'bypass refused: not launched for it',
+          model: 'bogus refused: unknown model',
+        ),
+      ),
+    );
+    expect(snack('bogus refused: unknown model'), findsOneWidget);
+    expect(snack('bypass refused: not launched for it'), findsNothing);
+    await dismiss();
+    expect(find.byTooltip('bogus refused: unknown model'), findsOneWidget);
+  });
+
+  testWidgets('a bar runs under the header only while the agent works', (
+    tester,
+  ) async {
+    Future<void> show(AgentState state, {bool still = false}) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MediaQuery(
+            data: MediaQueryData(disableAnimations: still),
+            child: SessionPage(
+              screen: screenWith(state: state),
+              timeline: holding([row('s:1', 'first row')]),
+              send: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    LinearProgressIndicator bar() =>
+        tester.widget(find.byType(LinearProgressIndicator));
+
+    await show(AgentState.working);
+    expect(bar().value, isNull, reason: 'it runs');
+    final at = tester.getRect(find.byType(LinearProgressIndicator));
+    expect(at.top, tester.getRect(find.byType(AppBar)).bottom);
+    expect(at.height, lessThanOrEqualTo(4));
+    final first = tester.getRect(find.text('first row')).top;
+
+    await show(AgentState.working, still: true);
+    expect(bar().value, 1, reason: 'reduced motion: it holds still');
+
+    for (final state in [
+      AgentState.idle,
+      AgentState.awaitingApproval,
+      AgentState.errored,
+      AgentState.stopped,
+    ]) {
+      await show(state);
+      expect(
+        find.byType(LinearProgressIndicator),
+        findsNothing,
+        reason: '$state',
+      );
+      expect(
+        tester.getRect(find.text('first row')).top,
+        first,
+        reason: 'the timeline does not shift',
+      );
+    }
+  });
+
+  testWidgets('Stop agent is offered unless the agent is stopped', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    Future<void> openMore(AgentState state) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(state: state),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+    }
+
+    await openMore(AgentState.stopped);
+    expect(
+      find.text('Already stopped · a message restarts it'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Stop agent'));
+    await tester.pumpAndSettle();
+    expect(sent.whereType<GuiIntentAct>(), isEmpty);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    // An idle agent is kept warm a while; an errored one may still run.
+    for (final state in [AgentState.idle, AgentState.errored]) {
+      sent.clear();
+      await openMore(state);
+      expect(find.textContaining('Already stopped'), findsNothing);
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentStopSession(sessionId: 's1')),
+      ], reason: '$state');
+    }
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -824,6 +1195,7 @@ void main() {
         screen: screenWith(
           agent: AgentSettingsView(
             modeLabel: 'ask',
+            modelLabel: 'model unknown',
             modeRefusal: 'bypass refused: not launched for it',
             modes: askAgent.modes,
             models: const [],
@@ -833,11 +1205,53 @@ void main() {
         sent: sent,
       );
       // No model named yet: the chip still opens the name field.
-      expect(find.text('model'), findsOneWidget);
+      expect(find.text('model unknown'), findsOneWidget);
+      expect(find.bySemanticsLabel('Model: model unknown'), findsOneWidget);
       expect(find.byTooltip('bypass refused: not launched for it'), findsOne);
       await tester.tap(find.text('ask'));
       await tester.pumpAndSettle();
       expect(find.text('bypass refused: not launched for it'), findsOneWidget);
+    });
+
+    testWidgets('the header grows with the text scale; nothing clips', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(360, 760)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => MediaQuery(
+              data: MediaQuery.of(context)
+                  .copyWith(textScaler: const TextScaler.linear(1.5)),
+              child: SessionPage(
+                screen: screenWith(usage: [r'$0.04']),
+                timeline: holding([row('s:1', 'first row')]),
+                send: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      final bar = tester.getRect(find.byType(AppBar));
+      final title = tester.getRect(find.text('work'));
+      final workdir = tester.getRect(
+        find.textContaining('/home/me/work', findRichText: true),
+      );
+      final state = tester.getRect(
+        find.textContaining('idle', findRichText: true),
+      );
+      final first = tester.getRect(find.text('first row'));
+      expect(title.top, greaterThanOrEqualTo(bar.top));
+      expect(workdir.top, greaterThanOrEqualTo(title.bottom));
+      expect(state.top, greaterThanOrEqualTo(workdir.bottom));
+      expect(state.bottom, lessThanOrEqualTo(bar.bottom));
+      expect(first.top, greaterThanOrEqualTo(bar.bottom));
     });
 
     testWidgets('long labels are cut short on a phone', (tester) async {
@@ -860,6 +1274,198 @@ void main() {
         sent: [],
       );
       expect(tester.takeException(), isNull);
+      // Too narrow for both labels: one chip lists them in full.
+      expect(find.byTooltip('Permission mode'), findsNothing);
+      await tester.tap(find.byTooltip('Agent settings'));
+      await tester.pumpAndSettle();
+      expect(find.text("accept edits → don't ask"), findsOneWidget);
+      expect(
+        find.text('claude-sonnet-5-5-20261001 → claude-opus-5-5'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Permission mode'));
+      await tester.pumpAndSettle();
+      expect(find.text('accept edits detail'), findsOneWidget);
+    });
+
+    testWidgets('an unknown mode and model say so, folded too', (tester) async {
+      tester.view
+        ..physicalSize = const Size(360, 700)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'mode unknown',
+            modelLabel: 'unknown → claude-opus-5-5',
+            modes: askAgent.modes,
+            models: const [],
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(
+        find.bySemanticsLabel(
+          'Agent settings: mode unknown · unknown → claude-opus-5-5',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byTooltip('Agent settings'));
+      await tester.pumpAndSettle();
+      expect(find.text('mode unknown'), findsOneWidget);
+      expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
+    });
+
+    testWidgets('the agent state shows once, its full label as a tooltip', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            screen: screenWith(state: AgentState.working),
+            timeline: holding([]),
+            send: (_) {},
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.textContaining('working', findRichText: true), findsOne);
+      expect(find.byTooltip('agent working'), findsOneWidget);
+      expect(find.text('/home/me/work'), findsOneWidget);
+    });
+
+    testWidgets('on a wide window the header keeps to the timeline column', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(1600, 900)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(usage: [r'$0.04']),
+        timeline: holding([]),
+        sent: [],
+      );
+      const left = (1600 - timelineMaxWidth) / 2;
+      const right = left + timelineMaxWidth;
+      final back = tester.getRect(find.byType(BackButton));
+      final more = tester.getRect(find.byTooltip('More'));
+      final status = tester.getRect(find.byType(StatusLine));
+      final composer = tester.getRect(find.byType(Composer));
+      expect(back.left, greaterThanOrEqualTo(left));
+      expect(more.right, lessThanOrEqualTo(right));
+      expect(status.left, left);
+      expect(status.right, right);
+      expect(composer.left, left);
+      expect(tester.getRect(find.text(r'$0.04')).right, lessThan(right));
+    });
+
+    testWidgets('the chips take taps over 48 dp', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: [],
+      );
+      for (final tooltip in ['Permission mode', 'Model']) {
+        final size = tester.getSize(
+          find.descendant(
+            of: find.byTooltip(tooltip),
+            matching: find.byType(InkWell),
+          ),
+        );
+        expect(size.width, greaterThanOrEqualTo(48), reason: tooltip);
+        expect(size.height, greaterThanOrEqualTo(48), reason: tooltip);
+      }
+    });
+  });
+  group('semantics', () {
+    testWidgets('the status-line chips read as named buttons', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'ask',
+            modelLabel: 'Sonnet',
+            modelRefusal: 'no such model',
+            modes: askAgent.modes,
+            models: askAgent.models,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(
+        tester.getSemantics(find.bySemanticsLabel('Permission mode: ask')),
+        matchesSemantics(
+          label: 'Permission mode: ask',
+          isButton: true,
+          isFocusable: true,
+          hasTapAction: true,
+          hasFocusAction: true,
+        ),
+      );
+      expect(
+        find.bySemanticsLabel('Model: Sonnet, refused: no such model'),
+        findsOneWidget,
+      );
+      semantics.dispose();
+    });
+
+    testWidgets('the icon buttons and the working bar have names', (
+      tester,
+    ) async {
+      final semantics = tester.ensureSemantics();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            screen: screenWith(state: AgentState.working),
+            timeline: holding([]),
+            send: (_) {},
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.bySemanticsLabel('Agent working'), findsOneWidget);
+      for (final (tooltip, menu) in [
+        ('Search (Ctrl+F)', false),
+        ('Interrupt (Ctrl+X)', false),
+        ('More', true),
+      ]) {
+        expect(
+          tester.getSemantics(find.byTooltip(tooltip)),
+          matchesSemantics(
+            tooltip: tooltip,
+            isButton: true,
+            isFocusable: true,
+            hasEnabledState: true,
+            isEnabled: true,
+            hasTapAction: true,
+            hasFocusAction: true,
+            hasExpandedState: menu,
+          ),
+          reason: tooltip,
+        );
+      }
+      semantics.dispose();
+    });
+
+    testWidgets('the unread rule says new messages follow', (tester) async {
+      final semantics = tester.ensureSemantics();
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([
+          anyRow('a', RowKind.agentMessage, 'hi', unreadRule: true),
+        ]),
+        sent: [],
+      );
+      expect(find.bySemanticsLabel('new messages below'), findsOneWidget);
+      semantics.dispose();
     });
   });
 }

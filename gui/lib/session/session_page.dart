@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
@@ -12,9 +14,10 @@ import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The open session: its header and status line, the search bar while a
-/// search is open, the timeline, the approval it waits on, and the
-/// composer; the rename prompt over it while open.
+/// The open session: its header and status line, a bar under them while
+/// the agent works, the search bar while a search is open, the timeline,
+/// the approval it waits on, and the composer; the rename prompt over it
+/// while open.
 ///
 /// Desktop keys, as in the TUI: Ctrl+X interrupts (unless text is
 /// selected: then it cuts), Ctrl+F searches, PgUp/PgDn scroll, Esc closes
@@ -48,6 +51,47 @@ class _SessionPageState extends State<SessionPage> {
   SearchHolder get _search => widget.search ?? (_ownSearch ??= SearchHolder());
 
   SessionScreen get _screen => widget.screen;
+
+  @override
+  void didUpdateWidget(SessionPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _announceRefusals(oldWidget.screen);
+  }
+
+  /// What the agent or server refused, in words, for each thing this page
+  /// asks of it: an interrupt, a mode, a model.
+  static List<String?> _refusalsOf(SessionScreen screen) => [
+    if (screen.interruptRefusal case final refusal?)
+      'Interrupt failed: $refusal'
+    else
+      null,
+    screen.agent.modeRefusal,
+    screen.agent.modelRefusal,
+  ];
+
+  /// Says each refusal that arrived since [before] once, in a snack bar;
+  /// its control keeps it afterwards. Those already there when the page
+  /// opened, or another session was shown, were not news here.
+  void _announceRefusals(SessionScreen before) {
+    if (before.sessionId != _screen.sessionId) return;
+    final was = _refusalsOf(before);
+    final now = _refusalsOf(_screen);
+    final news = [
+      for (var i = 0; i < now.length; i++)
+        if (now[i] case final refusal? when refusal != was[i]) refusal,
+    ];
+    if (news.isEmpty) return;
+    // Not mid-build: the messenger above rebuilds to show it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      for (final refusal in news) {
+        messenger?.showSnackBar(
+          SnackBar(content: Text(refusal), showCloseIcon: true),
+        );
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -134,6 +178,9 @@ class _SessionPageState extends State<SessionPage> {
     final screen = _screen;
     final theme = Theme.of(context);
     final rename = screen.renamePrompt;
+    // Only a stopped agent surely has no process: an idle one stays warm a
+    // while, an errored one may have failed a turn and still run.
+    final stopped = screen.state == AgentState.stopped;
 
     return Stack(
       children: [
@@ -141,56 +188,79 @@ class _SessionPageState extends State<SessionPage> {
           onKeyEvent: _onKey,
           child: Scaffold(
             appBar: AppBar(
-              leading: BackButton(
-                onPressed: () => widget.send.act(const ActionIntentBack()),
-              ),
+              // The header's content keeps to the timeline's column.
+              automaticallyImplyLeading: false,
               titleSpacing: 0,
-              title: _Title(screen: screen),
-              actions: [
-                IconButton(
-                  tooltip: 'Search (Ctrl+F)',
-                  onPressed: _openSearch,
-                  icon: const Icon(Icons.search),
-                ),
-                _InterruptButton(screen: screen, onPressed: _interrupt),
-                PopupMenuButton<VoidCallback>(
-                  tooltip: 'More',
-                  onSelected: (action) => action(),
-                  itemBuilder: (context) => [
-                    PopupMenuItem(
-                      value: () => widget.send(
-                        GuiIntentRenameOpen(sessionId: screen.sessionId),
-                      ),
-                      child: const ListTile(
-                        leading: Icon(Icons.drive_file_rename_outline),
-                        title: Text('Rename'),
-                      ),
+              toolbarHeight: _Title.heightOf(context),
+              title: _Column(
+                child: Row(
+                  children: [
+                    const SizedBox(width: 4),
+                    BackButton(
+                      onPressed: () =>
+                          widget.send.act(const ActionIntentBack()),
                     ),
-                    PopupMenuItem(
-                      value: () => widget.send.act(
-                        ActionIntentStopSession(sessionId: screen.sessionId),
-                      ),
-                      child: ListTile(
-                        leading: Icon(
-                          Icons.power_settings_new,
-                          color: theme.colorScheme.error,
+                    const SizedBox(width: 4),
+                    Expanded(child: _Title(screen: screen)),
+                    IconButton(
+                      tooltip: 'Search (Ctrl+F)',
+                      onPressed: _openSearch,
+                      icon: const Icon(Icons.search),
+                    ),
+                    _InterruptButton(screen: screen, onPressed: _interrupt),
+                    PopupMenuButton<VoidCallback>(
+                      tooltip: 'More',
+                      onSelected: (action) => action(),
+                      itemBuilder: (context) => [
+                        PopupMenuItem(
+                          value: () => widget.send(
+                            GuiIntentRenameOpen(sessionId: screen.sessionId),
+                          ),
+                          child: const ListTile(
+                            leading: Icon(Icons.drive_file_rename_outline),
+                            title: Text('Rename'),
+                          ),
                         ),
-                        title: const Text('Stop agent'),
-                        subtitle: screen.stopLabel == null
-                            ? null
-                            : Text(screen.stopLabel!),
-                      ),
+                        PopupMenuItem(
+                          enabled: !stopped,
+                          value: () => widget.send.act(
+                            ActionIntentStopSession(
+                              sessionId: screen.sessionId,
+                            ),
+                          ),
+                          child: ListTile(
+                            enabled: !stopped,
+                            leading: Icon(
+                              Icons.power_settings_new,
+                              color: stopped ? null : theme.colorScheme.error,
+                            ),
+                            title: const Text('Stop agent'),
+                            subtitle: stopped
+                                ? const Text(
+                                    'Already stopped · a message restarts it',
+                                  )
+                                : switch (screen.stopLabel) {
+                                    final label? => Text(label),
+                                    null => null,
+                                  },
+                          ),
+                        ),
+                      ],
                     ),
+                    const SizedBox(width: 4),
                   ],
                 ),
-              ],
+              ),
               bottom: PreferredSize(
-                preferredSize: const Size.fromHeight(26),
-                child: StatusLine(screen: screen, send: widget.send),
+                preferredSize: Size.fromHeight(StatusLine.heightOf(context)),
+                child: _Column(
+                  child: StatusLine(screen: screen, send: widget.send),
+                ),
               ),
             ),
             body: Column(
               children: [
+                _WorkingBar(working: screen.state == AgentState.working),
                 if (screen.archivedLabel case final archived?)
                   Material(
                     color: theme.colorScheme.secondaryContainer,
@@ -240,6 +310,7 @@ class _SessionPageState extends State<SessionPage> {
                 Expanded(
                   child: TimelineView(
                     key: _timelineView,
+                    sessionId: screen.sessionId,
                     timeline: widget.timeline,
                     search: _search,
                     send: widget.send,
@@ -284,7 +355,6 @@ class _SessionPageState extends State<SessionPage> {
   }
 }
 
-/// The timeline's column width, for what sits under it.
 /// Interrupts the agent's turn: off while there is none, a spinner while
 /// the interrupt is on its way, the error colour with the reason as its
 /// tooltip when it failed and the agent still works.
@@ -319,6 +389,32 @@ class _InterruptButton extends StatelessWidget {
   }
 }
 
+/// A thin bar under the header while the agent works, next to the state
+/// on the status line: it runs, or holds still where animations are
+/// off. Its room is kept when it is gone, so the timeline never shifts.
+class _WorkingBar extends StatelessWidget {
+  const _WorkingBar({required this.working});
+
+  /// The bar's thickness.
+  static const height = 2.0;
+
+  final bool working;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!working) return const SizedBox(height: height);
+    final still = MediaQuery.disableAnimationsOf(context);
+    return LinearProgressIndicator(
+      minHeight: height,
+      value: still ? 1 : null,
+      semanticsLabel: 'Agent working',
+      color: SkyColors.of(context).agent(AgentState.working),
+      backgroundColor: Colors.transparent,
+    );
+  }
+}
+
+/// The timeline's column width, for what sits over and under it.
 class _Column extends StatelessWidget {
   const _Column({required this.child});
 
@@ -336,11 +432,21 @@ class _Column extends StatelessWidget {
 }
 
 /// The header's title: the session's name with its rename on the way,
-/// then the workdir and the agent's state.
+/// then the workdir. The agent's state is on the status line.
 class _Title extends StatelessWidget {
   const _Title({required this.screen});
 
   final SessionScreen screen;
+
+  /// The toolbar's height: the standard one, or taller when the text
+  /// scale makes the title's two lines and a margin (8) need more.
+  static double heightOf(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final lines =
+        lineHeightOf(context, text.titleMedium!) +
+        lineHeightOf(context, text.labelMedium!);
+    return max(kToolbarHeight, (lines + 8).ceilToDouble());
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -373,20 +479,13 @@ class _Title extends StatelessWidget {
             ],
           ],
         ),
-        Row(
-          children: [
-            Icon(Icons.circle, size: 8, color: colors.agent(screen.state)),
-            const SizedBox(width: 6),
-            Flexible(
-              child: Text(
-                [?screen.workdir, screen.badgeLabel].join(' · '),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: sub,
-              ),
-            ),
-          ],
-        ),
+        if (screen.workdir case final workdir?)
+          Text(
+            workdir,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: sub,
+          ),
       ],
     );
   }
