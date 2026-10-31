@@ -5417,7 +5417,7 @@ fn the_mode_list_switches_and_bypass_asks_once_more() {
     // Esc closes the list and sends nothing.
     assert_eq!(h.key(KeyCode::Char('p')), None);
     let screen = h.screen();
-    assert_contains(&screen, "Permission mode · now ?");
+    assert_contains(&screen, "Permission mode · now unknown");
     assert_contains(&screen, "never asks; everything runs");
     assert_contains(&screen, "Enter switch · Esc cancel");
     assert!(!h.app.typing(), "the mode list takes no text");
@@ -5437,7 +5437,10 @@ fn the_mode_list_switches_and_bypass_asks_once_more() {
         })
     );
     assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
-    assert_contains(&status_line(&h, 100), "agent idle · mode ? → accept edits");
+    assert_contains(
+        &status_line(&h, 100),
+        "agent idle · mode unknown → accept edits",
+    );
     let command = logged_command(
         &mut h,
         id,
