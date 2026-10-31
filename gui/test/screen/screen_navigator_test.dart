@@ -46,8 +46,9 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.byType(SessionPage), findsOneWidget);
-    expect(find.text('agent: hello'), findsOneWidget);
-    expect(sent, isEmpty);
+    expect(find.text('hello'), findsOneWidget);
+    // The session view reports that it shows the newest row.
+    expect(sent, [const GuiIntentFollowingChanged(following: true)]);
   });
 
   testWidgets('system back is Back only where Rust says it goes somewhere', (
@@ -63,6 +64,7 @@ void main() {
     holders.screen.apply(sessionScreen());
     await tester.pumpAndSettle();
 
+    sent.clear();
     await tester.binding.handlePopRoute();
     await tester.pump();
     expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);

@@ -73,6 +73,9 @@ pub struct TimelineRow {
     pub delivery_label: Option<String>,
     /// `EditQueued` and `Discard` take this pending message back.
     pub discardable: bool,
+    /// This device's pending message's command id, for `EditQueued` and
+    /// `Discard`; `None` for logged rows.
+    pub command_id: Option<String>,
     /// What a tool item (or a legacy call, result or approval) did.
     pub tool: Option<ToolFacts>,
     /// The content shown beneath the title, as it shows now (collapsed or
