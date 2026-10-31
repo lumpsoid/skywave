@@ -327,6 +327,8 @@ mod tests {
         for bad in [
             "https://pair?addr=h:1&code=ABCDE12345".to_owned(),
             "skywave://other?addr=h:1".to_owned(),
+            "srv:7443".to_owned(),
+            "skywave://pair?addr=h:1&code=ABCDE12345".to_owned(),
             format!("skywave://pair?code=ABCDE12345&fp={fp}"),
             format!("skywave://pair?addr=h:1&code=ABCDE12345&fp={fp}%"),
             "skywave://pair?addr=h:1&code=ABCDE12345&fp=00".to_owned(),
