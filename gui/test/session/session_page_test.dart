@@ -390,7 +390,7 @@ void main() {
       );
     });
 
-    testWidgets('on desktop Enter sends and Shift+Enter does not', (
+    testWidgets('on desktop Enter sends text and Shift+Enter does not', (
       tester,
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.linux;
@@ -402,6 +402,14 @@ void main() {
           timeline: holding([]),
           sent: sent,
         );
+        // A blank field sends nothing, and Enter adds no line to it.
+        await tester.tap(composer());
+        await tester.enterText(composer(), '  ');
+        sent.clear();
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        expect(sent.whereType<GuiIntentComposerSubmit>(), isEmpty);
+        expect(tester.widget<TextField>(composer()).controller!.text, '  ');
+
         await tester.enterText(composer(), 'hi');
         sent.clear();
         await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
@@ -421,16 +429,56 @@ void main() {
       }
     });
 
-    testWidgets('the send button sends', (tester) async {
+    testWidgets('the send button sends, only once there is text', (
+      tester,
+    ) async {
       final sent = <GuiIntent>[];
+      final timeline = holding([]);
       await pumpSession(
         tester,
         screen: screenWith(),
-        timeline: holding([]),
+        timeline: timeline,
         sent: sent,
       );
+      IconButton send() => tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byIcon(Icons.arrow_upward),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(send().onPressed, isNull);
+      await tester.enterText(composer(), ' \n\t ');
+      await tester.pump();
+      expect(send().onPressed, isNull, reason: 'whitespace is blank');
+      await tester.tap(find.byTooltip('Send'));
+      expect(sent.whereType<GuiIntentComposerSubmit>(), isEmpty);
+
+      await tester.enterText(composer(), 'hi');
+      await tester.pump();
+      expect(send().onPressed, isNotNull);
       await tester.tap(find.byTooltip('Send'));
       expect(sent.last, const GuiIntentComposerSubmit(sessionId: 's1'));
+
+      // The hub clears the sent message: off again.
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(text: '', cursorUtf16: 0, rev: 2),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(send().onPressed, isNull);
+      // A queued message taken back to edit fills the field: on.
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          composer: const ComposerView(text: 'queued', cursorUtf16: 6, rev: 3),
+        ),
+        timeline: timeline,
+        sent: sent,
+      );
+      expect(send().onPressed, isNotNull);
     });
 
     testWidgets('a new rev overwrites the field, the same one does not', (
