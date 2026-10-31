@@ -776,6 +776,10 @@ impl Head {
                 Err(err) if looks_like_pair_uri(&text) => return Err(err.to_string()),
                 Err(_) => {}
             },
+            GuiIntent::PairScanned { text } => {
+                let uri = parse_pair_uri(&text).map_err(|err| err.to_string())?;
+                self.fill(uri);
+            }
             GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),

@@ -170,8 +170,9 @@ dependency.
 **Why:** works on de-Googled devices and emulators; one small dependency.
 CameraX + ZXing core stays the fallback if the embedded library's camera
 handling proves inadequate.
-**Superseded by D28:** the Flutter head has no QR scanning yet (D24); the
-no-Play-Services constraint still applies when it gets one.
+**Superseded by D28, then restored:** the Flutter head scans with the same
+library, launched from `MainActivity` over the `dev.skywave.gui/scan`
+method channel; the scanned text goes to the hub as `PairScanned`.
 
 ## D21. Background: suspend on stop, resume on start
 The head calls `suspend()` when the app goes to the background
@@ -247,7 +248,8 @@ holder per signal and performs platform effects with one plugin call each.
 **Why:** one owner per rule (D2, D23) and a bridge thin enough to read;
 rinf's message passing keeps Rust's state off the Dart side.
 **Deferred:** Android background work (A15's service and periodic
-catch-up), notifications while suspended, deep links and QR scanning.
+catch-up), notifications while suspended and deep links. QR scanning
+returned on Android (D20).
 
 ## D25. The GUI has its own data dir and pairs as its own device
 The hub opens the core in `<application support dir>/skywave`, which Dart
@@ -291,5 +293,5 @@ the Kotlin one kept its own presentation outside `skywave-present` (D23).
 One head over the shared hub keeps one owner per rule (D2).
 **Lost until the Flutter head gains them (D24's deferred list):** periodic
 catch-up and "Stay connected" in the background (D21), approval
-notifications while suspended, `skywave://pair` links and QR scanning
-(D20). Git history keeps the Kotlin implementation as a reference.
+notifications while suspended and `skywave://pair` links. QR scanning
+(D20) is back. Git history keeps the Kotlin implementation as a reference.

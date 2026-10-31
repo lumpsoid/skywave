@@ -133,6 +133,11 @@ pub enum GuiIntent {
     PairPasted {
         text: String,
     },
+    /// A QR code was scanned on the pairing screen: a pairing URI fills the
+    /// form; anything else is reported, as no field asked for it.
+    PairScanned {
+        text: String,
+    },
     /// Browse local data behind the revoked notice.
     RevokedDismiss,
     /// The app went off screen (hidden or paused). Reported, not decided:

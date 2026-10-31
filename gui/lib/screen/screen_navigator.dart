@@ -3,6 +3,7 @@ import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
+import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/revoked_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
@@ -72,6 +73,7 @@ class ScreenNavigator extends StatelessWidget {
       screen: screen,
       canGoBack: update.canGoBack,
       send: send,
+      scan: platformScanQr,
     ),
     final ScreenViewSessionList screen => SessionListPage(
       screen: screen,
