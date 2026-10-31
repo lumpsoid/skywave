@@ -66,7 +66,11 @@ TimelineRow message(String key, String text, {required bool pending}) =>
 const _composer = ComposerView(text: '', cursorUtf16: 0, rev: 1);
 
 /// An agent that has not said its mode or model yet.
-const unknownAgent = AgentSettingsView(modeLabel: '?', modes: [], models: []);
+const unknownAgent = AgentSettingsView(
+  modeLabel: 'mode unknown',
+  modes: [],
+  models: [],
+);
 
 ScreenUpdate pairingScreen({bool canGoBack = false}) => ScreenUpdate(
   screen: const ScreenViewPairing(

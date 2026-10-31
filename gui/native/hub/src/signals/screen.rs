@@ -222,8 +222,8 @@ pub struct SessionScreen {
 /// chips and their pickers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct AgentSettingsView {
-    /// `ask`, `ask → plan` while a switch waits for the agent, `?` until
-    /// it says.
+    /// `ask`, `ask → plan` while a switch waits for the agent, `mode
+    /// unknown` until it says (`unknown → plan` once one is asked for).
     pub mode_label: String,
     /// `Sonnet`, `Sonnet → Opus`; `None` until the agent names one and
     /// none was asked for.

@@ -687,6 +687,7 @@ impl Rig {
 fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     use skywave_proto::{ModelChoice, PermissionMode};
     let mut rig = Rig::new();
+    assert_eq!(rig.agent().mode_label, "mode unknown", "not said yet");
     rig.log(vec![
         EventKind::PermissionModeChanged {
             mode: PermissionMode::Ask,

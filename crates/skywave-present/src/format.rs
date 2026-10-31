@@ -227,9 +227,10 @@ pub fn mode_needs_confirmation(mode: PermissionMode) -> bool {
 }
 
 /// The mode for a status line: the one in effect, `→` a switch not yet
-/// answered (`ask → plan`), `?` while the agent has not said.
+/// answered (`ask → plan`), `unknown` while the agent has not said
+/// (`unknown → plan`).
 pub fn agent_mode_label(agent: &AgentView) -> String {
-    let current = agent.mode.map_or("?", mode_label);
+    let current = agent.mode.map_or("unknown", mode_label);
     match &agent.mode_change {
         Some(change) if Some(change.value) != agent.mode => {
             format!("{current} → {}", mode_label(change.value))
@@ -359,7 +360,7 @@ mod tests {
         });
         assert_eq!(agent_mode_label(&agent), "ask → plan");
         assert_eq!(agent_model_label(&agent).as_deref(), Some("Sonnet → opus"));
-        assert_eq!(agent_mode_label(&AgentView::default()), "?");
+        assert_eq!(agent_mode_label(&AgentView::default()), "unknown");
         assert_eq!(
             agent_setting_line(&AgentSetting::Mode(PermissionMode::Bypass), Some("no")),
             "mode bypass refused: no"
