@@ -1,6 +1,13 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- The core talks to the paired server. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- open_filex declares these to open shared-storage media. The GUI
+         opens only its own blob files, which need none of them. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" tools:node="remove"/>
     <application
         android:label="Skywave GUI"
         android:name="${applicationName}"
@@ -27,6 +34,21 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- open_filex hands a file to another app through this FileProvider.
+             Its own paths cover the whole filesystem; this narrows them to
+             the core's blob files, as the Kotlin head's provider does
+             (res/xml/blob_paths.xml). Read-only, one URI per grant. -->
+        <provider
+            android:name="com.crazecoder.openfile.FileProvider"
+            android:authorities="${applicationId}.fileProvider.com.crazecoder.openfile"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            tools:replace="android:authorities">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/blob_paths"
+                tools:replace="android:resource"/>
+        </provider>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

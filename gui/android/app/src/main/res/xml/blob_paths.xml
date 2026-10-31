@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the open_filex FileProvider may hand out: only the core's blob
+     files, <filesDir>/skywave/blobs. Dart's application support dir is
+     filesDir, the hub opens the core in <dir>/skywave, and the core keeps
+     blobs in <data_dir>/blobs. Mirrors the Kotlin head's blob_paths.xml. -->
+<paths>
+    <files-path name="blobs" path="skywave/blobs/" />
+</paths>
