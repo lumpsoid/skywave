@@ -36,6 +36,7 @@ pub mod pairing;
 pub mod projection;
 pub mod seam;
 pub mod search;
+mod snippets;
 pub mod store;
 mod tls;
 pub mod transport;
@@ -71,6 +72,6 @@ pub use view::{
     FailReason, Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
     PairingView, PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason,
     RuleScope, RuleSuggestion, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, TimelineItem, ToolApproval, ToolKind, ToolOutcome,
-    ToolView, TurnUsage, ViewState,
+    SessionView, SettingChange, SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval,
+    ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
 };

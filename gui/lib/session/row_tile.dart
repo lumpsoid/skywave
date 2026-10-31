@@ -3,12 +3,14 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/section_block.dart';
+import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// One timeline row as Rust sent it: the turn separator or "new" rule
 /// above it, its time, then the item by kind, with its content sections.
 /// A tap selects it and expands or collapses it; a long press or right
-/// click opens its menu (copy, download, edit or discard). A message's
+/// click opens its menu (copy, save as snippet, download, edit or
+/// discard). A message's
 /// text selects, with its own menu.
 class RowTile extends StatelessWidget {
   const RowTile({
@@ -75,7 +77,14 @@ class RowTile extends StatelessWidget {
           ),
       ],
     );
-    if (chosen != null) send(chosen);
+    if (chosen is GuiIntentSaveSnippet) {
+      // The name comes first; the menu only says which message.
+      if (!context.mounted) return;
+      final name = await askSnippetName(context);
+      if (name != null) send(GuiIntentSaveSnippet(key: row.key, name: name));
+    } else if (chosen != null) {
+      send(chosen);
+    }
   }
 
   List<(String, IconData, GuiIntent)> _menuItems() => [
@@ -84,6 +93,12 @@ class RowTile extends StatelessWidget {
         row.tool == null ? 'Copy' : 'Copy output',
         Icons.copy,
         GuiIntentCopy(key: row.key, what: CopyWhat.main),
+      ),
+    if (row.kind == RowKind.userMessage || row.kind == RowKind.pendingMessage)
+      (
+        'Save as snippet',
+        Icons.bookmark_add_outlined,
+        GuiIntentSaveSnippet(key: row.key, name: ''),
       ),
     if (row.tool != null)
       (

@@ -359,6 +359,71 @@ fn history_recalls_and_restores_the_stash() {
 }
 
 #[test]
+fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
+    let mut rig = Rig::new();
+    rig.edit("run the tests");
+    rig.submit();
+    rig.results();
+    rig.view();
+    let key = rig.head.sent.timeline.as_ref().unwrap().1[0].key.clone();
+    let outs = rig.intent(GuiIntent::SaveSnippet {
+        key,
+        name: "tests".into(),
+    });
+    assert!(outs.iter().any(|o| matches!(
+        o,
+        Out::Effect(PlatformEffect::Notice { text }) if text == "saved as a snippet"
+    )));
+    rig.edit("commit this\nand push");
+    rig.intent(GuiIntent::SaveComposerSnippet {
+        session_id: rig.session.0.to_string(),
+        name: " ".into(),
+    });
+    rig.view();
+    let snippets = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Session { session } => session.snippets.clone(),
+        other => panic!("not a session: {other:?}"),
+    };
+    let listed: Vec<_> = snippets(&rig)
+        .into_iter()
+        .map(|s| (s.label, s.detail))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("commit this".to_owned(), None),
+            ("tests".to_owned(), Some("run the tests".to_owned())),
+        ]
+    );
+
+    rig.intent(GuiIntent::DraftEdited {
+        session_id: rig.session.0.to_string(),
+        text: "😀: now".into(),
+        cursor_utf16: 3,
+    });
+    let tests = snippets(&rig)[1].snippet_id.clone();
+    rig.actions.clear();
+    rig.intent(GuiIntent::InsertSnippet {
+        session_id: rig.session.0.to_string(),
+        snippet_id: tests,
+    });
+    assert_eq!(rig.text(), "😀:run the tests now");
+    assert_eq!(rig.head.session.as_ref().unwrap().composer.cursor, 15);
+    assert_eq!(
+        rig.composer().text,
+        "😀:run the tests now",
+        "the field is set"
+    );
+    assert_eq!(
+        rig.kinds(),
+        ["save draft", "other"],
+        "the draft is kept first"
+    );
+    rig.view();
+    assert_eq!(snippets(&rig)[0].label, "tests", "used, so first");
+}
+
+#[test]
 fn app_ready_resends_everything() {
     let mut rig = Rig::new();
     assert!(rig.wait(Duration::ZERO).is_empty(), "nothing changed");

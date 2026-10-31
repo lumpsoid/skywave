@@ -109,6 +109,7 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
       agent: unknownAgent,
       usage: [],
       composer: _composer,
+      snippets: [],
     ),
   ),
   canGoBack: true,

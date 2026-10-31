@@ -394,6 +394,132 @@ void main() {
     expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
   });
 
+  testWidgets('a message of the user saves as a snippet, named or not', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([
+        anyRow('s:1', RowKind.userMessage, 'run the tests', author: 'you'),
+        anyRow('s:2', RowKind.agentMessage, 'done', author: 'agent'),
+      ]),
+      sent: sent,
+    );
+    await tester.longPress(find.text('agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Save as snippet'), findsNothing);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    await tester.longPress(find.text('you'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save as snippet'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('snippet-name-field')),
+      'tests',
+    );
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(sent.last, const GuiIntentSaveSnippet(key: 's:1', name: 'tests'));
+  });
+
+  testWidgets('the snippet button inserts, edits, deletes and saves', (
+    tester,
+  ) async {
+    const tests = SnippetView(
+      snippetId: 'a',
+      label: 'tests',
+      detail: 'run the tests',
+      name: 'tests',
+      text: 'run the tests',
+    );
+    const commit = SnippetView(
+      snippetId: 'b',
+      label: 'commit this',
+      text: 'commit this',
+    );
+    final sent = <GuiIntent>[];
+    final timeline = holding([]);
+    Future<void> show(List<SnippetView> snippets) => pumpSession(
+      tester,
+      screen: screenWith(snippets: snippets),
+      timeline: timeline,
+      sent: sent,
+    );
+    await show([tests, commit]);
+    await tester.tap(find.byTooltip('Snippets'));
+    await tester.pumpAndSettle();
+    expect(find.text('run the tests'), findsOneWidget);
+    expect(find.text('Save the message as a snippet'), findsNothing);
+
+    await tester.tap(find.byTooltip('Edit snippet').first);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('snippet-edit-name')), '');
+    await tester.enterText(find.byKey(const Key('snippet-edit-text')), ' ');
+    await tester.pump();
+    expect(
+      tester
+          .widget<FilledButton>(find.widgetWithText(FilledButton, 'Save'))
+          .onPressed,
+      isNull,
+      reason: 'blank text is not saved',
+    );
+    await tester.enterText(
+      find.byKey(const Key('snippet-edit-text')),
+      'run every test',
+    );
+    await tester.pump();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.whereType<GuiIntentAct>().last,
+      const GuiIntentAct(
+        action: ActionIntentEditSnippet(
+          snippetId: 'a',
+          name: '',
+          text: 'run every test',
+        ),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Delete snippet').last);
+    await tester.pumpAndSettle();
+    expect(
+      sent.whereType<GuiIntentAct>().last,
+      const GuiIntentAct(action: ActionIntentDeleteSnippet(snippetId: 'b')),
+    );
+    // The open sheet follows what the hub sends next.
+    await show([
+      const SnippetView(
+        snippetId: 'a',
+        label: 'run every test',
+        text: 'run every test',
+      ),
+    ]);
+    expect(find.text('commit this'), findsNothing);
+    await tester.tap(find.text('run every test'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.whereType<GuiIntentInsertSnippet>().last,
+      const GuiIntentInsertSnippet(sessionId: 's1', snippetId: 'a'),
+    );
+
+    await tester.enterText(find.byType(TextField), 'ship it');
+    await tester.tap(find.byTooltip('Snippets'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save the message as a snippet'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.whereType<GuiIntentSaveComposerSnippet>().last,
+      const GuiIntentSaveComposerSnippet(sessionId: 's1', name: ''),
+    );
+  });
+
   testWidgets('an empty timeline says how to start, once it is loaded', (
     tester,
   ) async {
