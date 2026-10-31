@@ -1195,6 +1195,7 @@ void main() {
         screen: screenWith(
           agent: AgentSettingsView(
             modeLabel: 'ask',
+            modelLabel: 'model unknown',
             modeRefusal: 'bypass refused: not launched for it',
             modes: askAgent.modes,
             models: const [],
@@ -1204,7 +1205,8 @@ void main() {
         sent: sent,
       );
       // No model named yet: the chip still opens the name field.
-      expect(find.text('model'), findsOneWidget);
+      expect(find.text('model unknown'), findsOneWidget);
+      expect(find.bySemanticsLabel('Model: model unknown'), findsOneWidget);
       expect(find.byTooltip('bypass refused: not launched for it'), findsOne);
       await tester.tap(find.text('ask'));
       await tester.pumpAndSettle();
@@ -1284,6 +1286,36 @@ void main() {
       await tester.tap(find.text('Permission mode'));
       await tester.pumpAndSettle();
       expect(find.text('accept edits detail'), findsOneWidget);
+    });
+
+    testWidgets('an unknown mode and model say so, folded too', (tester) async {
+      tester.view
+        ..physicalSize = const Size(360, 700)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'mode unknown',
+            modelLabel: 'unknown → claude-opus-5-5',
+            modes: askAgent.modes,
+            models: const [],
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(
+        find.bySemanticsLabel(
+          'Agent settings: mode unknown · unknown → claude-opus-5-5',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byTooltip('Agent settings'));
+      await tester.pumpAndSettle();
+      expect(find.text('mode unknown'), findsOneWidget);
+      expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
     });
 
     testWidgets('the agent state shows once, its full label as a tooltip', (

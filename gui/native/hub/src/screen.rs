@@ -353,12 +353,13 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
     });
     AgentSettingsView {
         // A bare `unknown` would not say what is unknown, alone on a chip
-        // or folded with the model's.
+        // or folded with the other's; likewise the model below.
         mode_label: match (waiting.mode, &waiting.mode_change) {
             (None, None) => "mode unknown".to_owned(),
             _ => clean_line(&agent_mode_label(&waiting)),
         },
-        model_label: agent_model_label(&waiting).map(|l| clean_line(&l)),
+        model_label: agent_model_label(&waiting)
+            .map_or_else(|| "model unknown".to_owned(), |l| clean_line(&l)),
         model_name: agent.model.as_deref().map(clean_line),
         mode_refusal: mode_failed
             .map(failure)

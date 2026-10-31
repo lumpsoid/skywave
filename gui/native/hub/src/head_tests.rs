@@ -688,6 +688,7 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     use skywave_proto::{ModelChoice, PermissionMode};
     let mut rig = Rig::new();
     assert_eq!(rig.agent().mode_label, "mode unknown", "not said yet");
+    assert_eq!(rig.agent().model_label, "model unknown", "not said yet");
     rig.log(vec![
         EventKind::PermissionModeChanged {
             mode: PermissionMode::Ask,
@@ -708,7 +709,7 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     ]);
     let agent = rig.agent();
     assert_eq!(agent.mode_label, "ask");
-    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(agent.model_label, "Sonnet");
     assert_eq!(agent.modes.len(), 6);
     assert!(agent.modes[0].current);
     assert!(agent.modes[5].needs_confirmation);
@@ -739,10 +740,25 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
         answers: None,
     }]);
     let agent = rig.agent();
-    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(agent.model_label, "Sonnet");
     assert_eq!(
         agent.model_refusal.as_deref(),
         Some("big refused: no model named")
     );
     assert_eq!(agent.mode_refusal, None);
+}
+
+#[test]
+fn a_model_asked_for_before_the_agent_names_one_reads_unknown() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetModel {
+            session_id: rig.session.0.to_string(),
+            model: "opus".into(),
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(rig.agent().model_label, "unknown → opus");
+    assert_eq!(rig.agent().mode_label, "mode unknown");
 }
