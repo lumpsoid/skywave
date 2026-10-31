@@ -694,12 +694,8 @@ void main() {
   testWidgets('a refusal that arrives is said once in a snack bar', (
     tester,
   ) async {
-    Future<void> show(SessionScreen screen) => pumpSession(
-      tester,
-      screen: screen,
-      timeline: holding([]),
-      sent: [],
-    );
+    Future<void> show(SessionScreen screen) =>
+        pumpSession(tester, screen: screen, timeline: holding([]), sent: []);
     AgentSettingsView refusing({String? mode, String? model}) =>
         AgentSettingsView(
           modeLabel: 'ask',
@@ -804,6 +800,45 @@ void main() {
         first,
         reason: 'the timeline does not shift',
       );
+    }
+  });
+
+  testWidgets('Stop agent is offered unless the agent is stopped', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    Future<void> openMore(AgentState state) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(state: state),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+    }
+
+    await openMore(AgentState.stopped);
+    expect(
+      find.text('Already stopped · a message restarts it'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Stop agent'));
+    await tester.pumpAndSettle();
+    expect(sent.whereType<GuiIntentAct>(), isEmpty);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    // An idle agent is kept warm a while; an errored one may still run.
+    for (final state in [AgentState.idle, AgentState.errored]) {
+      sent.clear();
+      await openMore(state);
+      expect(find.textContaining('Already stopped'), findsNothing);
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentStopSession(sessionId: 's1')),
+      ], reason: '$state');
     }
   });
 
@@ -970,9 +1005,8 @@ void main() {
         MaterialApp(
           home: Builder(
             builder: (context) => MediaQuery(
-              data: MediaQuery.of(
-                context,
-              ).copyWith(textScaler: const TextScaler.linear(1.5)),
+              data: MediaQuery.of(context)
+                  .copyWith(textScaler: const TextScaler.linear(1.5)),
               child: SessionPage(
                 screen: screenWith(usage: [r'$0.04']),
                 timeline: holding([row('s:1', 'first row')]),
