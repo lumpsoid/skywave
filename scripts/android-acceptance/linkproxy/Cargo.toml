@@ -1,0 +1,13 @@
+[package]
+name = "skywave-linkproxy"
+description = "Runs the skywave-testkit link harness as a standalone proxy for manual acceptance passes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Not a workspace member: test tooling only, built on demand.
+[workspace]
+
+[dependencies]
+skywave-testkit = { path = "../../../crates/skywave-testkit" }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "fs"] }
