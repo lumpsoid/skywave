@@ -871,12 +871,14 @@ void main() {
       final workdir = tester.getRect(
         find.textContaining('/home/me/work', findRichText: true),
       );
-      final mode = tester.getRect(find.text('ask'));
+      final state = tester.getRect(
+        find.textContaining('working', findRichText: true),
+      );
       final first = tester.getRect(find.text('first row'));
       expect(title.top, greaterThanOrEqualTo(bar.top));
       expect(workdir.top, greaterThanOrEqualTo(title.bottom));
-      expect(mode.top, greaterThanOrEqualTo(workdir.bottom));
-      expect(mode.bottom, lessThanOrEqualTo(bar.bottom));
+      expect(state.top, greaterThanOrEqualTo(workdir.bottom));
+      expect(state.bottom, lessThanOrEqualTo(bar.bottom));
       expect(first.top, greaterThanOrEqualTo(bar.bottom));
     });
 
@@ -912,6 +914,20 @@ void main() {
       await tester.tap(find.text('Permission mode'));
       await tester.pumpAndSettle();
       expect(find.text('accept edits detail'), findsOneWidget);
+    });
+
+    testWidgets('the agent state shows once, its full label as a tooltip', (
+      tester,
+    ) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.textContaining('working', findRichText: true), findsOne);
+      expect(find.byTooltip('agent working'), findsOneWidget);
+      expect(find.text('/home/me/work'), findsOneWidget);
     });
 
     testWidgets('the chips take taps over 48 dp', (tester) async {
