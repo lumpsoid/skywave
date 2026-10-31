@@ -199,12 +199,13 @@ Admin commands work on the database directly, so `serve` can keep running.
 
 ### Pair a phone
 
-1. **Install the app.** Build it as in [Android build](#android-build) and
-   install it with the phone connected over USB (USB debugging on):
+1. **Install the app.** Build the Flutter head for Android as in
+   [`gui/README.md`](gui/README.md#android-verified) and install it with the
+   phone connected over USB (USB debugging on):
 
    ```sh
-   cd android && ./gradlew :app:installDebug
-   # or: adb install -r app/build/outputs/apk/debug/app-debug.apk
+   cd gui && flutter run -d <device>
+   # or: flutter build apk --debug && adb install -r build/app/outputs/flutter-apk/app-debug.apk
    ```
 
 2. **Make the server reachable.** The phone must reach `listen` and find the
@@ -221,51 +222,30 @@ Admin commands work on the database directly, so `serve` can keep running.
    server certificate for the new names and keeps the CA, so devices paired
    already keep working. Open TCP port 7443 in the server's firewall.
 
-3. **Pair.** Run `skywaved pair` on the server. In the app, tap **Scan QR
-   code** and scan the code it printed, or open the printed
-   `skywave://pair?...` link on the phone (the app fills in the form), or
-   type the address, code and fingerprint. Check that the fingerprint matches,
-   then tap **Pair**. A wrong fingerprint is refused before the code is sent,
-   so the code stays usable. `skywaved devices list` now shows the phone.
+3. **Pair.** Run `skywaved pair` on the server. In the app, type the address,
+   code and fingerprint it printed and tap **Pair**. A wrong fingerprint is
+   refused before the code is sent, so the code stays usable.
+   `skywaved devices list` now shows the phone. QR scanning and
+   `skywave://pair` links are not supported yet.
 
-4. **Answer an approval.** Tap **New session**, pick a folder under one of
-   your `roots` (the folder button lists them from the server) and tap
-   **Create**; open the session and send a message. When the agent asks, the
-   session shows an **Approval needed** panel with what it wants to do: tap
-   **Approve** or **Deny**, or one of the **Always allow** rules it offers.
+4. **Answer an approval.** Tap **New session**, enter a folder under one of
+   your `roots` and tap **Create**; open the session and send a message.
+   When the agent asks, the session shows an **Approval needed** panel with
+   what it wants to do: tap **Approve** or **Deny**, or **Always allow**.
    Answers given offline are queued and go out when the phone is back
-   online; one given on another device shows as "Approved on another device".
+   online.
 
-5. **Get alerts.** Allow notifications when asked. To be alerted within
-   seconds while the app is in the background, turn on **Settings → Stay
-   connected** (see [Approval alerts on Android](#approval-alerts-on-android)).
+5. **Get alerts.** Allow notifications when asked. The app posts one
+   notification per new approval while it is open. In the background it
+   suspends its connection, so alerts wait until you return to it.
 
 6. **Revoke.** `skywaved devices revoke <id>` on the server. Within about a
    minute (when its open request ends) the app shows **This device was
-   revoked**: **Keep reading** keeps the sessions on the phone readable,
-   **Pair again** takes a new `skywaved pair` code.
+   revoked**; the sessions on the phone stay readable.
 
 `scripts/android-acceptance/` holds the rig used to check all of this on an
 emulator over a bad link: a stub agent, the link harness as a standalone
 proxy, and adb helpers. `run.sh` without arguments prints how to use it.
-
-### Approval alerts on Android
-
-The Android app posts one notification per approval (tap it to open the
-session), including when it is in the background or not running:
-
-- **By default**, the app stops its connection when you leave it and checks
-  in about every 15 minutes while a network is up (WorkManager, so Android
-  batches the wake-up with other apps'). Each check takes seconds: it
-  connects, catches up, posts what is new and disconnects. In Doze Android
-  may stretch the interval.
-- **Settings → Stay connected** keeps the connection open while the app is in
-  the background, so alerts arrive within seconds while agents work. It shows
-  an ongoing "Staying connected" notification (on its own low-importance
-  "Connection" channel, which you can silence) and costs more battery: the
-  phone holds one long-poll to your server open. It keeps running when you
-  swipe the app away; after a reboot it comes back the next time you open the
-  app. Turn it off in the same place.
 
 ---
 
@@ -278,8 +258,7 @@ session), including when it is in the background or not running:
 | `skywave-tui` | Terminal head built on ratatui; renders the core's view state and nothing else |
 | `skywave-proto` | Versioned, agent-agnostic wire types |
 | `skywave-present` | Head-side presentation the TUI and the GUI share: timeline sections, wording, draft, read-mark and alert policies |
-| `skywave-core-ffi` | UniFFI bindings the Android head (`android/`) builds against |
-| `gui/` | Flutter GUI head over rinf; its Rust bridge `hub` is in `gui/native/hub` |
+| `gui/` | Flutter GUI head (desktop and Android) over rinf; its Rust bridge `hub` is in `gui/native/hub` |
 | `skywave-testkit` | Link harness: a proxy that injects latency, jitter, bandwidth caps and drops |
 
 A few design choices that make it hold up:
@@ -308,89 +287,6 @@ decide, with system notifications for approvals. Linux and Android are
 built and run; macOS, iOS and Windows are scaffolded but not yet built; web
 is not supported. Build steps per platform, including `rinf gen` after a
 fresh checkout, are in [`gui/README.md`](gui/README.md).
-
-### Android build
-
-The Android head lives in [`android/`](android), a Gradle project (Kotlin,
-Jetpack Compose, Material 3) that builds the Rust core as part of the app
-build.
-
-Prerequisites:
-
-- JDK 17 or newer.
-- The Android SDK with the platform the app compiles against (API 37). Gradle
-  finds it through `sdk.dir` in `android/local.properties` or `ANDROID_HOME`.
-- Rust (`cargo` on `PATH`, or `skywave.cargo=/path/to/cargo` in
-  `android/local.properties`) with the Android targets:
-  `rustup target add aarch64-linux-android x86_64-linux-android`.
-- [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
-  `cargo install cargo-ndk`.
-- An Android NDK. `cargo-ndk` builds the `.so`, and Gradle tells it which NDK
-  to use (as `ANDROID_NDK_HOME`). The first of these wins:
-  1. `ANDROID_NDK_HOME` in the environment;
-  2. `skywave.ndk=/path/to/ndk` in `android/local.properties`;
-  3. the NDK pinned by `ndkVersion` in `android/app/build.gradle.kts`
-     (currently `28.2.13676358`), looked up under the SDK's `ndk/` directory.
-
-  No NDK environment variable is needed, so a build started from Android
-  Studio's desktop entry works. Install the pinned NDK with
-  `sdkmanager "ndk;28.2.13676358"`, or override it with option 1 or 2. Any
-  recent NDK (r26+) works. The `cargoBuildAndroid<Variant>` log prints the
-  NDK it used (`Using NDK ...`). Don't use `ndk.dir` for this: AGP reads that
-  key itself and rejects an NDK that doesn't match `ndkVersion`.
-
-Build and install:
-
-```sh
-cd android
-./gradlew :app:assembleDebug    # app/build/outputs/apk/debug/app-debug.apk
-./gradlew :app:installDebug     # onto the connected device or emulator
-```
-
-Release builds are signed with a key you keep outside the repo. Create one
-once, somewhere private, and back it up: updates must be signed with the same
-key, or every install has to be removed (and re-paired) first.
-
-```sh
-install -d -m 700 ~/.local/share/android-keys
-keytool -genkeypair -v -keystore ~/.local/share/android-keys/skywave-release.jks \
-  -alias skywave -keyalg RSA -keysize 4096 -validity 10000
-```
-
-Point the build at it in `android/local.properties` (untracked):
-
-```properties
-skywave.release.storeFile=/home/you/.local/share/android-keys/skywave-release.jks
-skywave.release.storePassword=...
-skywave.release.keyAlias=skywave
-skywave.release.keyPassword=...
-```
-
-Then:
-
-```sh
-./gradlew :app:assembleRelease  # app/build/outputs/apk/release/app-release.apk
-```
-
-Without these keys the release APK is built unsigned
-(`app-release-unsigned.apk`); setting only some of them fails the build. A
-release build can't be installed over a debug one (different keys):
-`adb uninstall dev.skywave.android` first.
-
-Each variant runs two tasks before compiling:
-
-- `cargoBuildAndroid<Variant>` runs `crates/skywave-core-ffi/build-android.sh`,
-  which builds `libskywave_core_ffi.so` for `arm64-v8a` and `x86_64` (API 26).
-  Debug uses cargo's `dev` profile; release uses the size-optimised
-  `release-android` profile.
-- `generateUniffiBindings<Variant>` runs
-  `crates/skywave-core-ffi/gen-kotlin.sh`, which generates the Kotlin
-  bindings (package `dev.skywave.core`) with the crate's own `uniffi-bindgen`.
-  They are build output and never checked in.
-
-Both tasks are skipped when nothing under `crates/`, `Cargo.toml` or
-`Cargo.lock` has changed. The scripts also work on their own, e.g.
-`crates/skywave-core-ffi/build-android.sh <dir>/jniLibs`.
 
 ## License
 

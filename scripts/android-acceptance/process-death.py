@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import burst  # noqa: E402
 import ui  # noqa: E402
 
-PKG = "dev.skywave.android"
+PKG = "dev.skywave.gui"
 
 
 def launch():

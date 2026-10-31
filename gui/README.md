@@ -3,7 +3,7 @@
 The Flutter head of skywave. Flutter renders and performs platform effects;
 everything else is Rust: `native/hub` is the [rinf](https://pub.dev/packages/rinf)
 bridge to `skywave-core` and `skywave-present`, and a member of the root
-Cargo workspace. See `docs/architecture.md` ("Flutter head") and D23–D27 in
+Cargo workspace. See `docs/architecture.md` ("Flutter head") and D23–D28 in
 `docs/decisions.md`.
 
 ## Every platform
@@ -51,9 +51,9 @@ from Gradle.
 flutter build apk --debug    # or: flutter run -d <device>
 ```
 
-The app id is `dev.skywave.gui`, so it installs beside the Kotlin app
-(`dev.skywave.android`). At launch it asks for ACCESS_LOCAL_NETWORK
-(API 37+, until granted) and POST_NOTIFICATIONS (API 33+, once).
+This is skywave's Android app (D28); its id is `dev.skywave.gui`. At
+launch it asks for ACCESS_LOCAL_NETWORK (API 37+, until granted) and
+POST_NOTIFICATIONS (API 33+, once).
 
 ## macOS (scaffolded, never built)
 

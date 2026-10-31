@@ -3,8 +3,8 @@
 //!
 //! On a phone the system may freeze or kill a backgrounded app, so the
 //! engine's network loops are paused while away and the link is retried at
-//! once on return, as the Android head does (D21). A desktop app keeps
-//! running behind other windows: its engine is left alone.
+//! once on return (D21). A desktop app keeps running behind other windows:
+//! its engine is left alone.
 //!
 //! Leaving is treated like quitting on every platform: the system may kill
 //! a phone app within the draft saver's debounce, and a desktop window can

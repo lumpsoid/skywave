@@ -10,25 +10,25 @@ server; nothing else names a concrete agent.
 ## Topology
 
 ```
- ┌──────────── server ────────────┐          ┌───────────────── device ──────────────────┐
- │ agent process (e.g. claude -p) │          │ head: TUI     head: GUI      head: Android│
- │      ▲ agent adapter           │          │ (ratatui)     (Flutter)      (Kotlin/     │
- │ skywaved                       │          │    ▲            ▲ rinf        Compose)    │
- │  - agent supervisor            │◄────────►│    │          hub              ▲ UniFFI   │
- │  - event log (SQLite)          │ mTLS +   │    │            ▲            core-ffi     │
- │  - device registry / CA        │ own proto│ present: sections, wording,     ▲         │
- └────────────────────────────────┘          │          policies               │         │
-                                             │    ▲                            │         │
-                                             │ core: state, sync, outbox, full replica   │
-                                             └───────────────────────────────────────────┘
+ ┌──────────── server ────────────┐          ┌─────────────── device ───────────────┐
+ │ agent process (e.g. claude -p) │          │ head: TUI     head: GUI              │
+ │      ▲ agent adapter           │          │ (ratatui)     (Flutter: desktop,     │
+ │ skywaved                       │          │    ▲           Android)              │
+ │  - agent supervisor            │◄────────►│    │            ▲ rinf               │
+ │  - event log (SQLite)          │ mTLS +   │    │          hub                    │
+ │  - device registry / CA        │ own proto│    │            ▲                    │
+ └────────────────────────────────┘          │ present: sections, wording, policies │
+                                             │    ▲                                 │
+                                             │ core: state, sync, outbox, replica   │
+                                             └──────────────────────────────────────┘
 ```
 
 One server = one account. Many devices = many views of the same data.
 
 Each head is its own device. The head-side logic the TUI and the GUI share
 (timeline sections, neutral wording, draft, read-mark and alert policies)
-lives in `skywave-present`, above the core (D23). The Android head predates
-it and does not use it: present has no UniFFI mirror.
+lives in `skywave-present`, above the core (D23). The Flutter head is the
+Android app; the Kotlin head it replaced is gone (D28).
 
 ## Workspace
 
@@ -37,11 +37,9 @@ it and does not use it: present has no UniFFI mirror.
 | `skywave-proto`    | Versioned wire types shared by daemon and core |
 | `skywaved`         | Server daemon: agent supervisor, event log, HTTPS API, admin CLI |
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
-| `skywave-core-ffi` | UniFFI wrapper over `skywave-core`; `skywave-core` has no FFI dependency |
 | `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors; pure, on `skywave-core` only |
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
-| `android/`         | Gradle project, Kotlin head, builds `skywave-core-ffi` via `cargo-ndk` |
 | `gui/`             | Flutter head; its rinf bridge crate `hub` lives at `gui/native/hub` |
 
 Crates live under `crates/`. Every crate carries the `skywave-` prefix (the
@@ -132,38 +130,9 @@ enum BlobState {
 | `Rejected(Revoked)` | Full-screen state with re-pair action; local data stays readable. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
 
-## Android head
-
-Post-MVP (D13). Decisions D16–D22.
-
-```
-Compose UI (single Activity, Material 3)      renders ViewState.screen, sends Actions
-   ▲ collectAsState            │ dispatch
-CoreRepository                                owns the StateFlow<ViewState>
-   ▲ listener (skywave-deliver)│
-SkywaveCore (UniFFI, skywave-core-ffi)        mirror types + From/TryFrom
-   ▲                           │
-skywave-core                                  all logic, sync, replica
-```
-
-- The listener runs on the core's delivery thread, one at a time, never on
-  the IO coroutine that consumes actions: `dispatch` only persists and
-  returns. It only sets the `MutableStateFlow` and returns (D17).
-
-- One core per process, owned by the `Application`; suspended on app stop,
-  resumed on start.
-- The core's data dir (replica and device key) is under `filesDir`.
-
-Build pipeline:
-
-```
-Gradle ─► cargo-ndk ─► libskywave_core_ffi.so (arm64-v8a, x86_64) ─► jniLibs
-       └► uniffi-bindgen (crate's own binary) ─► generated Kotlin ─► compiled with the app
-```
-
 ## Flutter head
 
-`gui/`. Decisions D23–D27. Flutter only renders and performs platform
+`gui/`. Decisions D23–D28. Flutter only renders and performs platform
 effects; what the head decides is Rust's.
 
 ```
