@@ -1,6 +1,8 @@
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
+use super::screen::PermissionModeView;
+
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
 /// signals only within a type, and the order matters (an edit before the
 /// `Back` that saves it, a typed query before the step through it).
@@ -147,6 +149,17 @@ pub enum ActionIntent {
     },
     StopSession {
         session_id: String,
+    },
+    /// Switch the session's agent to `mode`, starting it if need be.
+    SetPermissionMode {
+        session_id: String,
+        mode: PermissionModeView,
+    },
+    /// Switch the session's agent to `model`: an offered model's `id`, or
+    /// a name typed in. Blank does nothing.
+    SetModel {
+        session_id: String,
+        model: String,
     },
     SetSessionArchived {
         session_id: String,

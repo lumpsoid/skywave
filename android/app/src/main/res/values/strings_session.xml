@@ -26,6 +26,19 @@
     <string name="sv_unarchived">Brought back from the archive</string>
     <string name="sv_by_you">by you</string>
     <string name="sv_by_device">by %1$s</string>
+    <string name="sv_mode_set">Mode → %1$s</string>
+    <string name="sv_model_set">Model → %1$s</string>
+    <string name="sv_mode_refused">Mode %1$s refused: %2$s</string>
+    <string name="sv_model_refused">Model %1$s refused: %2$s</string>
+    <string name="sv_asked_by_you">(asked by you)</string>
+    <string name="sv_asked_by_device">(asked by %1$s)</string>
+    <!-- PermissionMode names, as the agent-setting notes show them -->
+    <string name="mode_ask">ask</string>
+    <string name="mode_accept_edits">accept edits</string>
+    <string name="mode_plan">plan</string>
+    <string name="mode_auto">auto</string>
+    <string name="mode_dont_ask">don\'t ask</string>
+    <string name="mode_bypass">bypass</string>
     <string name="sv_agent_error">Agent error</string>
     <string name="sv_tokens_in">in</string>
     <string name="sv_tokens_out">out</string>

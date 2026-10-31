@@ -148,6 +148,20 @@ class RowTile extends StatelessWidget {
         hit: hit,
         mark: mark,
       ),
+      RowKind.agentSetting => _Notice(
+        row: row,
+        icon: Icons.tune,
+        color: colors.muted,
+        hit: hit,
+        mark: mark,
+      ),
+      RowKind.settingRefused => _Notice(
+        row: row,
+        icon: Icons.error_outline,
+        color: colors.warning,
+        hit: hit,
+        mark: mark,
+      ),
       RowKind.archived => _Notice(
         row: row,
         icon: Icons.inventory_2_outlined,
@@ -571,7 +585,7 @@ class _ToolCard extends StatelessWidget {
 }
 
 /// A line that is not a message: interrupted, stopped, renamed, archived,
-/// a turn's usage.
+/// a mode or model switch or its refusal, a turn's usage.
 class _Notice extends StatelessWidget {
   const _Notice({
     required this.row,

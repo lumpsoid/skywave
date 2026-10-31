@@ -1,6 +1,7 @@
 package dev.skywave.android.ui.screens
 
 import androidx.compose.runtime.Immutable
+import dev.skywave.core.AgentSetting
 import dev.skywave.core.Answer
 import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.BlobView
@@ -304,6 +305,10 @@ internal fun copyText(item: TimelineItem): String? = when (item) {
         is Entry.AgentErrored -> e.message
         is Entry.TurnUsage -> usageLine(e.usage, "in", "out")
         is Entry.Renamed -> e.name
+        // The text in it that came from the agent, as search reads it.
+        is Entry.AgentSetting -> listOfNotNull((e.setting as? AgentSetting.Model)?.model, e.refused)
+            .joinToString(": ")
+            .ifEmpty { null }
         Entry.Interrupted, Entry.Stopped, is Entry.Archived -> null
     }
 }

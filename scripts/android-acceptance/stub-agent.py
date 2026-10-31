@@ -309,6 +309,8 @@ class Stub:
             return True
         elif sub == "set_permission_mode":
             emit(self.set_permission_mode(rid, (m.get("request") or {}).get("mode")))
+        elif sub == "set_model":
+            emit(self.set_model(rid, (m.get("request") or {}).get("model")))
         else:
             emit({"type": "control_response",
                   "response": {"subtype": "error", "request_id": rid,
@@ -390,13 +392,25 @@ class Stub:
                 "permissionMode": mode, "uuid": str(uuid.uuid4()),
                 "session_id": self.sid}
 
+    def set_model(self, rid, model):
+        """The reply to set_model, shaped like the real CLI's: the stub runs
+        one model, offered as "default"; any other is not found."""
+        if model not in (None, "default", MODEL):
+            return {"type": "control_response", "response": {
+                "subtype": "error", "request_id": rid, "error_code": "not_found",
+                "error": f"Model '{model}' not found", "model": MODEL}}
+        log("RUL", f"model set to {MODEL}")
+        return {"type": "control_response", "response": {
+            "subtype": "success", "request_id": rid, "response": {"model": MODEL}}}
+
     def initialize_response(self, rid):
         return {"type": "control_response", "response": {
             "subtype": "success", "request_id": rid, "response": {
                 "commands": [], "agents": [], "output_style": "default",
                 "available_output_styles": ["default"],
                 "models": [{"value": "default", "displayName": "Stub (default)",
-                            "description": "stub-agent, no model"}],
+                            "description": "stub-agent, no model",
+                            "resolvedModel": MODEL}],
                 "account": {"email": "user@example.com",
                             "organization": "<stub-organization>"},
                 "pid": os.getpid(), "claude_code_version": VERSION,

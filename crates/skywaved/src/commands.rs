@@ -10,7 +10,9 @@
 //! - `Interrupt` → `TurnInterrupted`;
 //! - `StopSession` → `SessionStopped`;
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
-//! - `SetSessionArchived` → `SessionArchived`.
+//! - `SetSessionArchived` → `SessionArchived`;
+//! - `SetPermissionMode` → `PermissionModeRequested`;
+//! - `SetModel` → `ModelRequested` with the normalised model.
 //!
 //! Each appends exactly that one event and nothing else, carrying the
 //! command's id ([`Event::command_id`](skywave_proto::Event::command_id)),
@@ -54,6 +56,14 @@
 //! changes nothing. The server keeps no archived flag (nothing here reads
 //! it); clients fold [`EventKind::archived_effect`], under which a later
 //! message brings the session back. Archiving does not stop the agent.
+//!
+//! **SetPermissionMode, SetModel.** Accepted for any known session, whether
+//! its agent runs or not, even asking for what it already has: the event
+//! records the request, not its outcome. The supervisor reacts by asking
+//! the agent (starting it if needed), and logs its answer as a `…Changed`
+//! or `…Refused` naming the command. A model is logged as
+//! [`skywave_proto::normalise_model`] leaves it; a blank one is
+//! `UnknownModel`.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
@@ -198,6 +208,25 @@ impl EventLog {
                     by: device,
                 };
                 (*session_id, kind)
+            }
+            CommandKind::SetPermissionMode { session_id, mode } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let kind = EventKind::PermissionModeRequested {
+                    mode: *mode,
+                    by: device,
+                };
+                (*session_id, kind)
+            }
+            CommandKind::SetModel { session_id, model } => {
+                if event_log::session_in(tx, *session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                let Some(model) = skywave_proto::normalise_model(model) else {
+                    return Ok(Err(RejectReason::UnknownModel));
+                };
+                (*session_id, EventKind::ModelRequested { model, by: device })
             }
         };
         Ok(Ok(event_log::append_in(

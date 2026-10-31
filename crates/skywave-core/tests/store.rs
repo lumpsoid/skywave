@@ -533,6 +533,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_unread(&dir);
     drop_drafts(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -662,6 +663,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_deleted(&dir);
     drop_usage(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
@@ -724,6 +726,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_usage(&dir);
     drop_archived(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
     assert!(!summary(&store, a).archived);
@@ -803,6 +806,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_archived(&dir);
     drop_titles(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
     for expected in before {
@@ -893,6 +897,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_titles(&dir);
     drop_unread(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
@@ -1058,6 +1063,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_unread(&dir);
     drop_drafts(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -1721,6 +1727,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     // A replica from before the table: what is pending is old news.
     drop_alerted(&dir);
     drop_devices(&dir);
+    drop_agent(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
@@ -1729,6 +1736,13 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
 fn drop_devices(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE devices;").unwrap();
+}
+
+/// Undoes the agent settings migration.
+fn drop_agent(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN agent; DROP TABLE offered_models;")
+        .unwrap();
 }
 
 #[test]
@@ -1755,4 +1769,63 @@ fn device_names_survive_a_reopen_and_go_with_the_server() {
 
     store.reset_for_server("other:7443").unwrap();
     assert!(store.devices().unwrap().is_empty());
+}
+
+#[test]
+fn agent_settings_and_offered_models_are_kept() {
+    use skywave_proto::{ModelChoice, PermissionMode};
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let other = SessionId::new();
+    let models = vec![ModelChoice {
+        id: "sonnet".into(),
+        label: "Sonnet".into(),
+        detail: None,
+        resolved: None,
+    }];
+    let mut store = Store::open(&dir).unwrap();
+    let event = |session_id, kind| Event {
+        session_id,
+        at: chrono::Utc::now(),
+        command_id: None,
+        kind,
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                id,
+                EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                },
+            ),
+            event(
+                id,
+                EventKind::PermissionModeChanged {
+                    mode: PermissionMode::Plan,
+                    answers: None,
+                },
+            ),
+            event(
+                other,
+                EventKind::SessionCreated {
+                    workdir: "/srv/b".into(),
+                },
+            ),
+            event(
+                other,
+                EventKind::ModelsOffered {
+                    models: models.clone(),
+                },
+            ),
+        ],
+    };
+    store.apply_batch(&batch, chrono::Utc::now()).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let summary = store.session(id).unwrap().unwrap();
+    assert_eq!(summary.agent.mode.current, Some(PermissionMode::Plan));
+    // A mode is not activity.
+    assert_eq!(summary.last_seq, Seq(1));
+    assert_eq!(store.load().unwrap().models, models);
 }

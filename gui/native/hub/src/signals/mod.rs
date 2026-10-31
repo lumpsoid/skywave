@@ -25,9 +25,10 @@ pub use effects::PlatformEffect;
 pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, RouteView};
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
-    AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup, ComposerView,
-    CreatePrompt, CreatingView, ListKindView, PairForm, PairingState, RenamePrompt, RuleOption,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
+    AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
+    ComposerView, CreatePrompt, CreatingView, ListKindView, ModeOption, ModelOption, PairForm,
+    PairingState, PermissionModeView, RenamePrompt, RuleOption, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use timeline::{

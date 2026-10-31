@@ -1,15 +1,17 @@
 //! Maps one session's [`AdapterEvent`]s to log events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, RULE_LABEL_MAX_CHARS,
+    DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX,
+    PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
     RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, ApprovalId, BlobRef, Body, BodyFormat, CallId, EventKind, Seq, SessionId,
-    SessionState, ToolCall, ToolKind, ToolResult,
+    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
+    EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState, ToolCall, ToolKind,
+    ToolResult,
 };
 
 use super::{
@@ -41,7 +43,18 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
-/// | `Exited` | leftover approvals cancelled; `Errored` if a turn was open or the exit was abnormal |
+/// | `PermissionMode` / `Model` | `PermissionModeChanged` / `ModelChanged` answering nothing, only when it differs from what the log has |
+/// | `PermissionModeSet` / `ModelSet` | `PermissionModeChanged` / `ModelChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
+/// | `PermissionModeRefused` / `ModelRefused` | `PermissionModeRefused` / `ModelRefused` answering the oldest request asked |
+/// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
+/// | `Exited` | leftover approvals cancelled, leftover mode and model requests refused; `Errored` if a turn was open or the exit was abnormal |
+///
+/// **Settings.** The supervisor tells the mapper of every mode or model
+/// request it hands the agent ([`EventMapper::asked_mode`],
+/// [`EventMapper::asked_model`]), with the command asking, if any. The agent
+/// answers requests in order, so each answer names the oldest one asked.
+/// What the agent reports unasked is logged only when it changes what the
+/// log has, starting from the [`AgentSettings`] the mapper is made with.
 ///
 /// **Calls.** Every `ToolCall` gets a fresh [`CallId`]. The mapper remembers
 /// which [`AgentCallId`] it stands for until the turn ends; a result or
@@ -93,6 +106,13 @@ pub struct EventMapper {
     calls: HashMap<AgentCallId, LoggedCall>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
     turn_open: bool,
+    /// The session's mode and model as the log has them.
+    settings: AgentSettings,
+    /// Mode requests the agent has not answered, oldest first, with the
+    /// command asking.
+    asked_modes: VecDeque<(PermissionMode, Option<CommandId>)>,
+    /// Model requests likewise.
+    asked_models: VecDeque<(String, Option<CommandId>)>,
 }
 
 /// What the mapper keeps of a logged call to link its result and approval.
@@ -105,13 +125,27 @@ struct LoggedCall {
 }
 
 impl EventMapper {
-    pub fn new(session_id: SessionId) -> EventMapper {
+    /// A mapper for `session_id`, whose log holds `settings`.
+    pub fn new(session_id: SessionId, settings: AgentSettings) -> EventMapper {
         EventMapper {
             session_id,
             approvals: Vec::new(),
             calls: HashMap::new(),
             turn_open: false,
+            settings,
+            asked_modes: VecDeque::new(),
+            asked_models: VecDeque::new(),
         }
+    }
+
+    /// The agent was asked to run in `mode`, for `command` if one asked.
+    pub fn asked_mode(&mut self, mode: PermissionMode, command: Option<CommandId>) {
+        self.asked_modes.push_back((mode, command));
+    }
+
+    /// The agent was asked to run `model`, for `command` if one asked.
+    pub fn asked_model(&mut self, model: String, command: Option<CommandId>) {
+        self.asked_models.push_back((model, command));
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -265,8 +299,63 @@ impl EventMapper {
             AdapterEvent::ResumeHandle(handle) => {
                 store_resume_handle(&storage.db, self.session_id, &handle)?;
             }
+            AdapterEvent::PermissionMode(mode) => {
+                if self.settings.mode.current != Some(mode) {
+                    let kind = EventKind::PermissionModeChanged {
+                        mode,
+                        answers: None,
+                    };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::PermissionModeSet(mode) => {
+                let answers = self.answer_mode();
+                // Restoring what the log has, for no request, says nothing new.
+                if answers.is_some() || self.settings.mode.current != Some(mode) {
+                    let kind = EventKind::PermissionModeChanged { mode, answers };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::PermissionModeRefused { mode, reason } => {
+                let kind = EventKind::PermissionModeRefused {
+                    mode,
+                    reason: cut_line(&reason, REFUSAL_MAX_CHARS).0,
+                    answers: self.answer_mode(),
+                };
+                seqs.push(self.append(log, storage, kind)?);
+            }
+            AdapterEvent::Model(model) => {
+                let model = cut_line(&model, MODEL_MAX_CHARS).0;
+                if !model.is_empty() && self.settings.model.current.as_ref() != Some(&model) {
+                    let kind = EventKind::ModelChanged {
+                        model,
+                        answers: None,
+                    };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::ModelSet(model) => {
+                let model = cut_line(&model, MODEL_MAX_CHARS).0;
+                let answers = self.answer_model();
+                if answers.is_some() || self.settings.model.current.as_ref() != Some(&model) {
+                    let kind = EventKind::ModelChanged { model, answers };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::ModelRefused { model, reason } => {
+                let kind = EventKind::ModelRefused {
+                    model: cut_line(&model, MODEL_MAX_CHARS).0,
+                    reason: cut_line(&reason, REFUSAL_MAX_CHARS).0,
+                    answers: self.answer_model(),
+                };
+                seqs.push(self.append(log, storage, kind)?);
+            }
+            AdapterEvent::ModelsOffered(_) => {
+                tracing::debug!("models offered reach the log through the supervisor");
+            }
             AdapterEvent::Exited { error } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
+                self.refuse_asked(log, storage, &mut seqs)?;
                 self.calls.clear();
                 let message = match error {
                     Some(error) => Some(format!("agent exited: {error}")),
@@ -286,8 +375,55 @@ impl EventMapper {
         Ok(seqs)
     }
 
-    fn append(&self, log: &EventLog, storage: &mut Storage, kind: EventKind) -> Result<Seq> {
+    fn append(&mut self, log: &EventLog, storage: &mut Storage, kind: EventKind) -> Result<Seq> {
+        if AgentSettings::folds(&kind) {
+            self.settings.apply(None, &kind);
+        }
         log.append(&mut storage.db, self.session_id, kind)
+    }
+
+    /// The command of the oldest mode request, now answered.
+    fn answer_mode(&mut self) -> Option<CommandId> {
+        let asked = self.asked_modes.pop_front();
+        if asked.is_none() {
+            tracing::debug!("agent answered a mode request nobody asked");
+        }
+        asked.and_then(|(_, command)| command)
+    }
+
+    /// The command of the oldest model request, now answered.
+    fn answer_model(&mut self) -> Option<CommandId> {
+        let asked = self.asked_models.pop_front();
+        if asked.is_none() {
+            tracing::debug!("agent answered a model request nobody asked");
+        }
+        asked.and_then(|(_, command)| command)
+    }
+
+    /// Refuses every mode and model request the agent left unanswered.
+    fn refuse_asked(
+        &mut self,
+        log: &EventLog,
+        storage: &mut Storage,
+        seqs: &mut Vec<Seq>,
+    ) -> Result<()> {
+        for (mode, answers) in std::mem::take(&mut self.asked_modes) {
+            let kind = EventKind::PermissionModeRefused {
+                mode,
+                reason: AGENT_EXITED.to_owned(),
+                answers,
+            };
+            seqs.push(self.append(log, storage, kind)?);
+        }
+        for (model, answers) in std::mem::take(&mut self.asked_models) {
+            let kind = EventKind::ModelRefused {
+                model,
+                reason: AGENT_EXITED.to_owned(),
+                answers,
+            };
+            seqs.push(self.append(log, storage, kind)?);
+        }
+        Ok(())
     }
 
     /// The call logged in this turn for the agent's `call`, if any.
@@ -484,6 +620,33 @@ fn bounded_suggestions(mut suggestions: Vec<proto::RuleSuggestion>) -> Vec<proto
         suggestion.label = cut_line(&suggestion.label, RULE_LABEL_MAX_CHARS).0;
     }
     suggestions
+}
+
+/// The first [`MODELS_MAX`] models, each field cut to one line of its cap;
+/// a model with a blank id is dropped.
+pub(crate) fn bounded_models(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
+    models
+        .into_iter()
+        .filter_map(|model| {
+            let id = cut_line(&model.id, MODEL_MAX_CHARS).0;
+            let label = cut_line(&model.label, MODEL_LABEL_MAX_CHARS).0;
+            let detail = model
+                .detail
+                .map(|detail| cut_line(&detail, MODEL_DETAIL_MAX_CHARS).0)
+                .filter(|detail| !detail.is_empty());
+            let resolved = model
+                .resolved
+                .map(|resolved| cut_line(&resolved, MODEL_MAX_CHARS).0)
+                .filter(|resolved| !resolved.is_empty());
+            (!id.is_empty()).then(|| ModelChoice {
+                label: if label.is_empty() { id.clone() } else { label },
+                id,
+                detail,
+                resolved,
+            })
+        })
+        .take(MODELS_MAX)
+        .collect()
 }
 
 /// The head of `text`: at most [`PREVIEW_MAX_LINES`] lines and
