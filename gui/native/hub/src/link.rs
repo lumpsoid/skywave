@@ -18,10 +18,10 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
     let (state, label) = match link {
         Link::Unpaired => (LinkState::Unpaired, String::new()),
         Link::Connecting => (LinkState::Connecting, format!("connecting…{queued_part}")),
-        Link::Online { latency_ms } => (
-            LinkState::Online,
-            format!("online · {latency_ms} ms{queued_part}"),
-        ),
+        // Nothing to say while online with nothing waiting: the banner
+        // hides. No latency: it changes on every ping and buys no action.
+        Link::Online { .. } if queued == 0 && elsewhere == 0 => (LinkState::Online, String::new()),
+        Link::Online { .. } => (LinkState::Online, format!("online{queued_part}")),
         Link::CatchingUp { have, server } => (
             LinkState::CatchingUp,
             format!("syncing · {}/{}{queued_part}", have.0, server.0),
@@ -115,7 +115,7 @@ mod tests {
         let cases = [
             (Link::Unpaired, ""),
             (Link::Connecting, "connecting… · 2 queued"),
-            (Link::Online { latency_ms: 12 }, "online · 12 ms · 2 queued"),
+            (Link::Online { latency_ms: 12 }, "online · 2 queued"),
             (
                 Link::CatchingUp {
                     have: Seq(4),
@@ -135,6 +135,13 @@ mod tests {
         for (link, label) in cases {
             assert_eq!(update(&link, 2, 0, now).label, label, "{link:?}");
         }
+        let online = Link::Online { latency_ms: 12 };
+        assert_eq!(update(&online, 0, 0, now).label, "", "nothing to say");
+        assert_eq!(
+            update(&online, 0, 1, now).label,
+            "online",
+            "a button to show"
+        );
         let banner = update(&reconnecting, 0, 1, now);
         assert_eq!(banner.retry_in_s, Some(7));
         assert!(banner.can_retry_now);
