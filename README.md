@@ -336,6 +336,36 @@ cd android
 ./gradlew :app:installDebug     # onto the connected device or emulator
 ```
 
+Release builds are signed with a key you keep outside the repo. Create one
+once, somewhere private, and back it up: updates must be signed with the same
+key, or every install has to be removed (and re-paired) first.
+
+```sh
+install -d -m 700 ~/.local/share/android-keys
+keytool -genkeypair -v -keystore ~/.local/share/android-keys/skywave-release.jks \
+  -alias skywave -keyalg RSA -keysize 4096 -validity 10000
+```
+
+Point the build at it in `android/local.properties` (untracked):
+
+```properties
+skywave.release.storeFile=/home/you/.local/share/android-keys/skywave-release.jks
+skywave.release.storePassword=...
+skywave.release.keyAlias=skywave
+skywave.release.keyPassword=...
+```
+
+Then:
+
+```sh
+./gradlew :app:assembleRelease  # app/build/outputs/apk/release/app-release.apk
+```
+
+Without these keys the release APK is built unsigned
+(`app-release-unsigned.apk`); setting only some of them fails the build. A
+release build can't be installed over a debug one (different keys):
+`adb uninstall dev.skywave.android` first.
+
 Each variant runs two tasks before compiling:
 
 - `cargoBuildAndroid<Variant>` runs `crates/skywave-core-ffi/build-android.sh`,
