@@ -350,9 +350,10 @@ struct RulePick {
     selected: usize,
 }
 
-/// The list `p` or `m` opens over the session to switch the agent's
-/// permission mode or model. Switching works at any time; the agent's
-/// answer shows in the status line and the timeline.
+/// The list `p` opens over the session to switch the agent's permission
+/// mode, and the menu `m` opens to switch its model or effort. Switching
+/// works at any time; the agent's answer shows in the status line and the
+/// timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Picker {
     /// The modes, [`PermissionMode::ALL`] in order. `confirm` once Enter
@@ -361,7 +362,15 @@ pub enum Picker {
     /// The models the agent offers, and a name typed instead: sent as it
     /// is when not blank, so a model can be asked for before any list came.
     Model { selected: usize, name: String },
+    /// The menu `m` opens: row 0 is the model, row 1 the effort. `m` and
+    /// `e` jump straight to either picker.
+    Agent { selected: usize },
+    /// The levels the model takes, [`AgentView::efforts`] in order.
+    Effort { selected: usize },
 }
+
+/// The rows of [`Picker::Agent`].
+const AGENT_ROWS: usize = 2;
 
 impl Picker {
     /// The mode list, on the mode asked for last, else the one in effect.
@@ -393,8 +402,27 @@ impl Picker {
         }
     }
 
+    /// The menu, on the model row.
+    fn agent() -> Picker {
+        Picker::Agent { selected: 0 }
+    }
+
+    /// The effort list, on the level asked for last, else the one in force.
+    fn effort(agent: &AgentView) -> Picker {
+        let effort = agent
+            .effort_change
+            .as_ref()
+            .map(|c| c.value)
+            .or(agent.effort.flatten());
+        let selected = effort
+            .and_then(|effort| agent.efforts().iter().position(|e| *e == effort))
+            .unwrap_or(0);
+        Picker::Effort { selected }
+    }
+
     /// Keys while the picker is up: ↑↓ choose, Enter switches, Esc closes
-    /// (`true` once it should close). On the model list text keys type a
+    /// (`true` once it should close); Esc in the model or effort list goes
+    /// back to the menu. On the model list text keys type a
     /// name. Nothing else reaches the session.
     fn key(&mut self, view: &SessionView, key: KeyEvent, ctrl: bool) -> (bool, Option<Action>) {
         let session_id = view.id;
@@ -440,7 +468,10 @@ impl Picker {
                 let models = &view.agent.models;
                 let last = models.len().saturating_sub(1);
                 match key.code {
-                    KeyCode::Esc => return (true, None),
+                    KeyCode::Esc => {
+                        *self = Picker::agent();
+                        return (false, None);
+                    }
                     KeyCode::Up => *selected = (*selected).min(last).saturating_sub(1),
                     KeyCode::Down => *selected = (*selected + 1).min(last),
                     // The core trims the name and takes a blank one as no
@@ -464,6 +495,63 @@ impl Picker {
                     _ => {}
                 }
                 (false, None)
+            }
+            Picker::Agent { selected } => match key.code {
+                KeyCode::Esc => (true, None),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                    (false, None)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(AGENT_ROWS - 1);
+                    (false, None)
+                }
+                KeyCode::Char('m') => {
+                    *self = Picker::model(&view.agent);
+                    (false, None)
+                }
+                KeyCode::Char('e') => {
+                    *self = Picker::effort(&view.agent);
+                    (false, None)
+                }
+                KeyCode::Enter => {
+                    *self = if *selected == 0 {
+                        Picker::model(&view.agent)
+                    } else {
+                        Picker::effort(&view.agent)
+                    };
+                    (false, None)
+                }
+                _ => (false, None),
+            },
+            Picker::Effort { selected } => {
+                let efforts = view.agent.efforts();
+                let last = efforts.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => {
+                        *self = Picker::agent();
+                        (false, None)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = (*selected).min(last).saturating_sub(1);
+                        (false, None)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(last);
+                        (false, None)
+                    }
+                    KeyCode::Enter => match efforts.get((*selected).min(last)) {
+                        Some(effort) => (
+                            true,
+                            Some(Action::SetEffort {
+                                session_id,
+                                effort: *effort,
+                            }),
+                        ),
+                        None => (false, None),
+                    },
+                    _ => (false, None),
+                }
             }
         }
     }
@@ -1669,7 +1757,7 @@ impl App {
                     None
                 }
                 KeyCode::Char('m') => {
-                    session.picker = Some(Picker::model(&view.agent));
+                    session.picker = Some(Picker::agent());
                     None
                 }
                 KeyCode::Char('R') => {

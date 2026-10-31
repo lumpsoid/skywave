@@ -18,8 +18,8 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    BodyFormat, DisplayBody, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
+    RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -54,10 +54,36 @@ fn normalized(message: &Value) -> Value {
 /// except those listed in `dropped`, for which it must write nothing. A
 /// recorded allow that grants a rule is answered by granting the offered
 /// rule that is its `updatedPermissions`. The CLI must be the pinned version.
+///
+/// A `get_settings` the protocol writes where the recording has none (the
+/// fixtures made before effort reads) is dropped: the recorded CLI never saw
+/// it, so no answer comes. [`replay_strict`] fails on one instead.
 fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec<AdapterEvent> {
-    let (events, version) = replay_any_version(name, session_id, resumed, dropped);
+    let (events, version) = replay_any_version(name, session_id, resumed, dropped, false);
     assert_eq!(version.as_deref(), Some(PINNED_VERSION));
     events
+}
+
+/// [`replay`] of a recording that has every line the protocol writes.
+fn replay_strict(name: &str, session_id: Uuid, dropped: &[usize]) -> Vec<AdapterEvent> {
+    let (events, version) = replay_any_version(name, session_id, false, dropped, true);
+    assert_eq!(version.as_deref(), Some(PINNED_VERSION));
+    events
+}
+
+fn is_get_settings(message: &Value) -> bool {
+    message["type"] == "control_request" && message["request"]["subtype"] == "get_settings"
+}
+
+/// Drops the effort reads at the front of `written` that the recording does
+/// not have, unless `strict`; `next` is the next recorded stdin line.
+fn drop_unrecorded_reads(written: &mut VecDeque<Value>, next: Option<&Value>, strict: bool) {
+    if strict || next.is_some_and(is_get_settings) {
+        return;
+    }
+    while written.front().is_some_and(is_get_settings) {
+        written.pop_front();
+    }
 }
 
 /// [`replay`] for a CLI of any version; returns the version it reported.
@@ -66,6 +92,7 @@ fn replay_any_version(
     session_id: Uuid,
     resumed: bool,
     dropped: &[usize],
+    strict: bool,
 ) -> (Vec<AdapterEvent>, Option<String>) {
     let mut protocol = Protocol::new(session_id, resumed);
     let start = protocol.start();
@@ -98,6 +125,14 @@ fn replay_any_version(
                         .as_str()
                         .map(|model| protocol.set_model(model.to_owned()))
                         .unwrap_or_default(),
+                    ("control_request", Some("apply_flag_settings")) => msg["request"]["settings"]
+                        ["effortLevel"]
+                        .as_str()
+                        .and_then(protocol::parse_effort)
+                        .map(|effort| protocol.set_effort(effort))
+                        .unwrap_or_default(),
+                    // Written by the protocol on the answer it follows.
+                    ("control_request", Some("get_settings")) => Default::default(),
                     ("user", _) => protocol
                         .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
                     ("control_response", _) => {
@@ -114,6 +149,7 @@ fn replay_any_version(
                 };
                 events.extend(out.events);
                 written.extend(out.writes);
+                drop_unrecorded_reads(&mut written, Some(msg), strict);
                 if dropped.contains(&n_in) {
                     assert!(
                         written.is_empty(),
@@ -150,16 +186,13 @@ fn replay_any_version(
                 }
                 let line = serde_json::to_string(&msg).unwrap();
                 let out = protocol.on_line(&line);
-                assert!(
-                    out.writes.is_empty(),
-                    "{name}: unexpected writes {:?}",
-                    out.writes
-                );
+                written.extend(out.writes);
                 events.extend(out.events);
             }
             _ => {}
         }
     }
+    drop_unrecorded_reads(&mut written, None, strict);
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
     (events, protocol.version().map(str::to_owned))
@@ -224,6 +257,11 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::ModelRefused { model, reason } => {
                 format!("model refused {model}: {}", cut(reason))
             }
+            AdapterEvent::Effort(effort) => format!("effort: {effort:?}"),
+            AdapterEvent::EffortSet(effort) => format!("effort set: {effort:?}"),
+            AdapterEvent::EffortRefused { effort, reason } => {
+                format!("effort refused {effort:?}: {}", cut(reason))
+            }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
         })
         .collect()
@@ -233,7 +271,10 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
 fn observes_settings(event: &AdapterEvent) -> bool {
     matches!(
         event,
-        AdapterEvent::PermissionMode(_) | AdapterEvent::Model(_) | AdapterEvent::ModelsOffered(_)
+        AdapterEvent::PermissionMode(_)
+            | AdapterEvent::Model(_)
+            | AdapterEvent::Effort(_)
+            | AdapterEvent::ModelsOffered(_)
     )
 }
 
@@ -258,6 +299,9 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
                     | AdapterEvent::Model(_)
                     | AdapterEvent::ModelSet(_)
                     | AdapterEvent::ModelRefused { .. }
+                    | AdapterEvent::Effort(_)
+                    | AdapterEvent::EffortSet(_)
+                    | AdapterEvent::EffortRefused { .. }
                     | AdapterEvent::ModelsOffered(_)
             )
         })
@@ -268,6 +312,7 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
         .map(|event| match event {
             AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
             AdapterEvent::Model(model) => format!("model: {model}"),
+            AdapterEvent::Effort(effort) => format!("effort: {effort:?}"),
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
             other => describe(std::slice::from_ref(other)).remove(0),
         })
@@ -656,7 +701,7 @@ fn replay_granted_rules_are_applied_by_the_cli() {
 
     // (a) Every stdin line is what the adapter writes, a rule grant
     // included: the update offered, unchanged, as `updatedPermissions`.
-    let (events, version) = replay_any_version(NAME, uuid(session), false, &[]);
+    let (events, version) = replay_any_version(NAME, uuid(session), false, &[], false);
     assert!(version.is_some(), "{NAME}: no claude_code_version");
     assert!(
         events
@@ -1083,9 +1128,29 @@ fn the_initialize_answer_offers_its_models() {
             label: "Default (recommended)".into(),
             detail: Some("Opus 5.5 · Best for everyday, complex tasks".into()),
             resolved: Some("claude-opus-5-5".into()),
+            efforts: Effort::ALL.to_vec(),
         }
     );
     assert!(models.iter().any(|m| m.id == "haiku"));
+    // Read from `supportedEffortLevels`: some models take fewer levels, and
+    // one that does not say `supportsEffort` takes none.
+    let efforts = |id: &str| &models.iter().find(|m| m.id == id).unwrap().efforts;
+    assert_eq!(
+        *efforts("claude-opus-4-6"),
+        [Effort::Low, Effort::Medium, Effort::High, Effort::Max]
+    );
+    assert_eq!(*efforts("claude-haiku-4-5-20251001"), []);
+}
+
+#[test]
+fn offered_efforts_skip_unknown_levels_and_need_supports_effort() {
+    let models = protocol::offered_models(Some(&json!([
+        {"value": "a", "supportsEffort": true, "supportedEffortLevels": ["low", "ultra", "max"]},
+        {"value": "b", "supportsEffort": false, "supportedEffortLevels": ["low"]},
+        {"value": "c", "supportedEffortLevels": ["low"]},
+    ])));
+    let efforts: Vec<_> = models.iter().map(|m| m.efforts.clone()).collect();
+    assert_eq!(efforts, [vec![Effort::Low, Effort::Max], vec![], vec![]]);
 }
 
 #[test]
@@ -1317,6 +1382,7 @@ fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
         resume,
         mode: None,
         model: None,
+        effort: None,
     }
 }
 
@@ -1741,12 +1807,15 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
         AdapterEvent::ResumeHandle(_)
     ));
     // Asked for after the handshake, answered like any request; the
-    // status echo of the switch is not reported.
+    // status echo of the switch is not reported. The handshake and the
+    // model switch each read the effort back.
     assert_eq!(
-        take_raw(&mut events, 2).await,
+        take_raw(&mut events, 4).await,
         [
+            AdapterEvent::Effort(Some(Effort::Medium)),
             AdapterEvent::PermissionModeSet(PermissionMode::Plan),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
+            AdapterEvent::Effort(Some(Effort::Medium)),
         ]
     );
 
@@ -1790,6 +1859,501 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
                 reason: "Model 'bogus' not found".to_owned(),
             },
             AdapterEvent::PermissionModeSet(PermissionMode::AcceptEdits),
+        ]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next_raw(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Effort
+
+/// The success answering control request `request` with `body`; with none,
+/// the empty success an `apply_flag_settings` gets.
+fn answered(request: &Value, body: Option<Value>) -> String {
+    let mut response = json!({ "subtype": "success", "request_id": request["request_id"] });
+    if let Some(body) = body {
+        response["response"] = body;
+    }
+    json!({ "type": "control_response", "response": response }).to_string()
+}
+
+fn failed(request: &Value, error: &str) -> String {
+    json!({
+        "type": "control_response",
+        "response": { "subtype": "error", "request_id": request["request_id"], "error": error },
+    })
+    .to_string()
+}
+
+/// A `get_settings` answer naming `effort` in force on `model`, beside the
+/// merged settings layers the adapter must not read.
+fn settings_read(request: &Value, model: &str, effort: Value) -> String {
+    answered(
+        request,
+        Some(json!({
+            "effective": { "effortLevel": "low", "env": { "SECRET": "x" } },
+            "sources": [],
+            "applied": { "model": model, "effort": effort },
+        })),
+    )
+}
+
+/// The one line `out` writes.
+fn one_write(out: &protocol::Output) -> Value {
+    let [line] = out.writes.as_slice() else {
+        panic!("expected one line, wrote {:?}", out.writes);
+    };
+    line.clone()
+}
+
+fn is_read(line: &Value) -> bool {
+    normalized(line)
+        == json!({ "type": "control_request", "request": { "subtype": "get_settings" } })
+}
+
+fn applied_level(line: &Value) -> &Value {
+    assert_eq!(line["request"]["subtype"], "apply_flag_settings");
+    &line["request"]["settings"]["effortLevel"]
+}
+
+/// A protocol past the handshake, and the unasked effort read the
+/// initialize answer wrote.
+fn ready_protocol() -> (Protocol, Value) {
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let start = protocol.start();
+    let body = json!({ "claude_code_version": PINNED_VERSION });
+    let out = protocol.on_line(&answered(&start.writes[0], Some(body)));
+    assert!(protocol.ready());
+    let read = one_write(&out);
+    assert!(is_read(&read), "{read}");
+    (protocol, read)
+}
+
+/// Asks for `effort` with no chain in flight, acks the apply, and returns
+/// the read the ack wrote.
+fn asked_read(protocol: &mut Protocol, effort: Effort) -> Value {
+    let apply = one_write(&protocol.set_effort(effort));
+    assert_eq!(*applied_level(&apply), protocol::effort_name(effort));
+    let out = protocol.on_line(&answered(&apply, None));
+    assert_eq!(out.events, []);
+    let read = one_write(&out);
+    assert!(is_read(&read), "{read}");
+    read
+}
+
+fn refused(effort: Effort, reason: &str) -> AdapterEvent {
+    AdapterEvent::EffortRefused {
+        effort,
+        reason: reason.to_owned(),
+    }
+}
+
+#[test]
+fn effort_names_round_trip() {
+    for effort in Effort::ALL {
+        assert_eq!(
+            protocol::parse_effort(protocol::effort_name(effort)),
+            Some(effort)
+        );
+    }
+    assert_eq!(protocol::effort_name(Effort::XHigh), "xhigh");
+    assert_eq!(protocol::parse_effort("ultra"), None);
+}
+
+#[test]
+fn the_initialize_answer_reads_the_effort() {
+    let (mut protocol, read) = ready_protocol();
+    let out = protocol.on_line(&settings_read(&read, "claude-haiku-5-5", json!("medium")));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::Effort(Some(Effort::Medium))],
+        }
+    );
+}
+
+#[test]
+fn an_effort_is_applied_then_read_back() {
+    let (mut protocol, _) = ready_protocol();
+    let out = protocol.set_effort(Effort::High);
+    assert_eq!(out.events, []);
+    let apply = one_write(&out);
+    assert_eq!(
+        normalized(&apply),
+        json!({
+            "type": "control_request",
+            "request": { "subtype": "apply_flag_settings", "settings": { "effortLevel": "high" } },
+        })
+    );
+    // The ack proves nothing: it only lets the read go out.
+    let out = protocol.on_line(&answered(&apply, None));
+    assert_eq!(out.events, []);
+    let read = one_write(&out);
+    assert!(is_read(&read), "{read}");
+    let out = protocol.on_line(&settings_read(&read, "claude-haiku-5-5", json!("high")));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::EffortSet(Some(Effort::High))],
+        }
+    );
+}
+
+#[test]
+fn a_read_back_effort_other_than_asked_refuses_it_and_reports_what_runs() {
+    let (mut protocol, _) = ready_protocol();
+    let read = asked_read(&mut protocol, Effort::Max);
+    let out = protocol.on_line(&settings_read(&read, "claude-haiku-5-5", json!("high")));
+    assert_eq!(
+        out.events,
+        [
+            refused(Effort::Max, "kept high"),
+            AdapterEvent::Effort(Some(Effort::High)),
+        ]
+    );
+    // `null`: the running model takes no effort level.
+    let read = asked_read(&mut protocol, Effort::High);
+    let model = "claude-haiku-4-5-20251001";
+    let out = protocol.on_line(&settings_read(&read, model, Value::Null));
+    assert_eq!(
+        out.events,
+        [
+            refused(Effort::High, &format!("{model} takes no effort level")),
+            AdapterEvent::Effort(None),
+        ]
+    );
+}
+
+#[test]
+fn an_apply_error_refuses_without_a_read() {
+    let (mut protocol, _) = ready_protocol();
+    let apply = one_write(&protocol.set_effort(Effort::High));
+    let error = "apply_flag_settings: CLAUDE_CODE_EFFORT_LEVEL overrides effort for this session";
+    let out = protocol.on_line(&failed(&apply, error));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![refused(Effort::High, error)],
+        }
+    );
+}
+
+#[test]
+fn efforts_asked_together_run_one_chain_at_a_time() {
+    let (mut protocol, _) = ready_protocol();
+    let low = one_write(&protocol.set_effort(Effort::Low));
+    // Asked while low's chain runs: nothing goes out yet.
+    for effort in [Effort::Medium, Effort::High, Effort::Max] {
+        assert_eq!(protocol.set_effort(effort), protocol::Output::default());
+    }
+    // Low's ack writes only its read.
+    let read = one_write(&protocol.on_line(&answered(&low, None)));
+    assert!(is_read(&read), "{read}");
+    // Its read ends the chain: the answer, then medium's apply.
+    let out = protocol.on_line(&settings_read(&read, "m", json!("low")));
+    assert_eq!(out.events, [AdapterEvent::EffortSet(Some(Effort::Low))]);
+    let medium = one_write(&out);
+    assert_eq!(*applied_level(&medium), "medium");
+    // An apply error ends a chain too.
+    let out = protocol.on_line(&failed(&medium, "unrecognized effortLevel"));
+    assert_eq!(
+        out.events,
+        [refused(Effort::Medium, "unrecognized effortLevel")]
+    );
+    let high = one_write(&out);
+    assert_eq!(*applied_level(&high), "high");
+    // And so does a read error.
+    let read = one_write(&protocol.on_line(&answered(&high, None)));
+    let out = protocol.on_line(&failed(&read, "cannot read the settings"));
+    assert_eq!(
+        out.events,
+        [refused(Effort::High, "cannot read the settings")]
+    );
+    let max = one_write(&out);
+    assert_eq!(*applied_level(&max), "max");
+    let read = one_write(&protocol.on_line(&answered(&max, None)));
+    let out = protocol.on_line(&settings_read(&read, "m", json!("max")));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::EffortSet(Some(Effort::Max))],
+        }
+    );
+}
+
+#[test]
+fn a_chain_ending_without_a_read_reads_again_what_it_dropped() {
+    let (mut protocol, _) = ready_protocol();
+    // Positive control: with nothing dropped, an apply error writes nothing.
+    let apply = one_write(&protocol.set_effort(Effort::High));
+    let out = protocol.on_line(&failed(&apply, "unrecognized effortLevel"));
+    assert_eq!(out.writes, Vec::<Value>::new());
+    // A model switch mid-chain writes a look, answered and dropped.
+    let apply = one_write(&protocol.set_effort(Effort::High));
+    let model = one_write(&protocol.set_model("sonnet".to_owned()));
+    let body = json!({ "model": "claude-sonnet-5-5" });
+    let look = one_write(&protocol.on_line(&answered(&model, Some(body.clone()))));
+    let out = protocol.on_line(&settings_read(&look, "claude-sonnet-5-5", json!("low")));
+    assert_eq!(out, protocol::Output::default());
+    // The apply errors: no read of its own, so the dropped look goes again.
+    let out = protocol.on_line(&failed(&apply, "unrecognized effortLevel"));
+    assert_eq!(
+        out.events,
+        [refused(Effort::High, "unrecognized effortLevel")]
+    );
+    let look = one_write(&out);
+    assert!(is_read(&look), "{look}");
+    let out = protocol.on_line(&settings_read(&look, "claude-sonnet-5-5", json!("low")));
+    assert_eq!(out.events, [AdapterEvent::Effort(Some(Effort::Low))]);
+
+    // A read error ends a chain without a read the same way.
+    let apply = one_write(&protocol.set_effort(Effort::Max));
+    let model = one_write(&protocol.set_model("sonnet".to_owned()));
+    let look = one_write(&protocol.on_line(&answered(&model, Some(body.clone()))));
+    let read = one_write(&protocol.on_line(&answered(&apply, None)));
+    assert_eq!(
+        protocol.on_line(&settings_read(&look, "claude-sonnet-5-5", json!("low"))),
+        protocol::Output::default()
+    );
+    let out = protocol.on_line(&failed(&read, "cannot read the settings"));
+    assert_eq!(
+        out.events,
+        [refused(Effort::Max, "cannot read the settings")]
+    );
+    assert!(is_read(&one_write(&out)));
+
+    // A queued chain's own read covers it: the next apply goes out instead.
+    let (mut protocol, _) = ready_protocol();
+    let apply = one_write(&protocol.set_effort(Effort::High));
+    assert_eq!(
+        protocol.set_effort(Effort::Low),
+        protocol::Output::default()
+    );
+    let model = one_write(&protocol.set_model("sonnet".to_owned()));
+    let look = one_write(&protocol.on_line(&answered(&model, Some(body))));
+    protocol.on_line(&settings_read(&look, "claude-sonnet-5-5", json!("medium")));
+    let out = protocol.on_line(&failed(&apply, "unrecognized effortLevel"));
+    let low = one_write(&out);
+    assert_eq!(*applied_level(&low), "low");
+    // Its read answers, and nothing more is read.
+    let read = one_write(&protocol.on_line(&answered(&low, None)));
+    let out = protocol.on_line(&settings_read(&read, "claude-sonnet-5-5", json!("low")));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::EffortSet(Some(Effort::Low))],
+        }
+    );
+}
+
+#[test]
+fn an_unreadable_effort_still_answers_its_request() {
+    let (mut protocol, _) = ready_protocol();
+    let read = asked_read(&mut protocol, Effort::High);
+    let out = protocol.on_line(&settings_read(&read, "m", json!("ultra")));
+    assert_eq!(
+        out.events,
+        [refused(Effort::High, "agent reports effort ultra")]
+    );
+    // An answer with no `applied` at all.
+    let read = asked_read(&mut protocol, Effort::Low);
+    let out = protocol.on_line(&answered(&read, Some(json!({}))));
+    assert_eq!(
+        out.events,
+        [refused(Effort::Low, "agent reports effort nothing")]
+    );
+    // Each ended its chain, so the next answer names the next request.
+    let read = asked_read(&mut protocol, Effort::Medium);
+    let out = protocol.on_line(&settings_read(&read, "m", json!("medium")));
+    assert_eq!(out.events, [AdapterEvent::EffortSet(Some(Effort::Medium))]);
+    // Unasked, an unreadable effort reports nothing.
+    let model = one_write(&protocol.set_model("sonnet".to_owned()));
+    let look = one_write(&protocol.on_line(&answered(&model, Some(json!({ "model": "s" })))));
+    let out = protocol.on_line(&settings_read(&look, "s", json!("ultra")));
+    assert_eq!(out, protocol::Output::default());
+}
+
+#[test]
+fn an_unasked_read_answered_during_an_effort_chain_reports_nothing() {
+    let (mut protocol, initial) = ready_protocol();
+    let apply = one_write(&protocol.set_effort(Effort::High));
+    assert_eq!(
+        protocol.set_effort(Effort::Low),
+        protocol::Output::default()
+    );
+    // The look from before the chain is older than the chain's own read.
+    let out = protocol.on_line(&settings_read(&initial, "m", json!("medium")));
+    assert_eq!(out, protocol::Output::default());
+    // A model switch mid-chain writes a look, dropped the same.
+    let model = one_write(&protocol.set_model("sonnet".to_owned()));
+    let body = json!({ "model": "claude-sonnet-5-5" });
+    let out = protocol.on_line(&answered(&model, Some(body)));
+    assert_eq!(
+        out.events,
+        [AdapterEvent::ModelSet("claude-sonnet-5-5".to_owned())]
+    );
+    let look = one_write(&out);
+    assert!(is_read(&look), "{look}");
+    let read = one_write(&protocol.on_line(&answered(&apply, None)));
+    let out = protocol.on_line(&settings_read(&look, "claude-sonnet-5-5", json!("high")));
+    assert_eq!(out, protocol::Output::default());
+    // High's read answers it, and low's chain starts.
+    let out = protocol.on_line(&settings_read(&read, "claude-sonnet-5-5", json!("high")));
+    assert_eq!(out.events, [AdapterEvent::EffortSet(Some(Effort::High))]);
+    let low = one_write(&out);
+    assert_eq!(*applied_level(&low), "low");
+    // A look answered while only that chain runs is dropped too.
+    let model = one_write(&protocol.set_model("opus".to_owned()));
+    let body = json!({ "model": "claude-opus-5-5" });
+    let look = one_write(&protocol.on_line(&answered(&model, Some(body.clone()))));
+    let out = protocol.on_line(&settings_read(&look, "claude-opus-5-5", json!("high")));
+    assert_eq!(out, protocol::Output::default());
+    let read = one_write(&protocol.on_line(&answered(&low, None)));
+    let out = protocol.on_line(&settings_read(&read, "claude-opus-5-5", json!("low")));
+    assert_eq!(out.events, [AdapterEvent::EffortSet(Some(Effort::Low))]);
+    // With no chain, the same look reports what runs.
+    let model = one_write(&protocol.set_model("opus".to_owned()));
+    let look = one_write(&protocol.on_line(&answered(&model, Some(body))));
+    let out = protocol.on_line(&settings_read(&look, "claude-opus-5-5", json!("low")));
+    assert_eq!(out.events, [AdapterEvent::Effort(Some(Effort::Low))]);
+}
+
+#[test]
+fn a_model_switch_reads_the_effort_and_a_refused_one_does_not() {
+    let (mut protocol, _) = ready_protocol();
+    let haiku = "claude-haiku-4-5-20251001";
+    let model = one_write(&protocol.set_model(haiku.to_owned()));
+    let out = protocol.on_line(&answered(&model, Some(json!({ "model": haiku }))));
+    assert_eq!(out.events, [AdapterEvent::ModelSet(haiku.to_owned())]);
+    let look = one_write(&out);
+    assert!(is_read(&look), "{look}");
+    let out = protocol.on_line(&settings_read(&look, haiku, Value::Null));
+    assert_eq!(out.events, [AdapterEvent::Effort(None)]);
+
+    let model = one_write(&protocol.set_model("bogus".to_owned()));
+    let out = protocol.on_line(&failed(&model, "Model 'bogus' not found"));
+    assert_eq!(
+        out,
+        protocol::Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::ModelRefused {
+                model: "bogus".to_owned(),
+                reason: "Model 'bogus' not found".to_owned(),
+            }],
+        }
+    );
+}
+
+#[test]
+fn replay_effort_switches_settle_from_get_settings() {
+    let events = replay_strict("effort_switch", Uuid::new_v4(), &[]);
+    let [
+        AdapterEvent::ResumeHandle(_),
+        AdapterEvent::PermissionMode(PermissionMode::Ask),
+        AdapterEvent::ModelsOffered(_),
+        rest @ ..,
+    ] = events.as_slice()
+    else {
+        panic!("unexpected start: {events:?}");
+    };
+    let haiku = "claude-haiku-4-5-20251001";
+    let set = |effort| AdapterEvent::EffortSet(Some(effort));
+    let model_set = |model: &str| AdapterEvent::ModelSet(model.to_owned());
+    assert_eq!(
+        rest,
+        [
+            // 1: the look after the handshake.
+            AdapterEvent::Effort(Some(Effort::Medium)),
+            // 2-4: each settled by its own read.
+            set(Effort::High),
+            set(Effort::Max),
+            set(Effort::Low),
+            set(Effort::Medium),
+            // 5: a model that takes none; the apply is acked all the same.
+            model_set(haiku),
+            AdapterEvent::Effort(None),
+            refused(Effort::High, &format!("{haiku} takes no effort level")),
+            AdapterEvent::Effort(None),
+            // 6: the level outlasted the model that took none.
+            model_set("claude-sonnet-5-5"),
+            AdapterEvent::Effort(Some(Effort::High)),
+            // 7: the look after the switch is answered mid-chain: dropped.
+            model_set("claude-opus-5-5"),
+            set(Effort::XHigh),
+        ]
+    );
+}
+
+#[test]
+#[should_panic(expected = "model_switch: stdin #1")]
+fn a_strict_replay_fails_on_a_read_the_recording_lacks() {
+    // Replayed leniently in `replay_refused_modes_and_models_keep_what_the_agent_had`.
+    replay_strict("model_switch", Uuid::new_v4(), &[2, 6, 7]);
+}
+
+#[tokio::test]
+async fn a_session_starts_with_and_switches_its_effort() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = spec(tmp.path(), None);
+    spec.model = Some("sonnet".to_owned());
+    spec.effort = Some(Effort::High);
+    let (mut session, mut events) = adapter().start(spec).await.unwrap();
+    assert!(matches!(
+        next_raw(&mut events).await,
+        AdapterEvent::ResumeHandle(_)
+    ));
+    // The looks after the handshake and the model switch are answered while
+    // the start's effort chain runs, so they report nothing.
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
+            AdapterEvent::EffortSet(Some(Effort::High)),
+        ]
+    );
+    // Asked back to back, answered in order.
+    session.set_effort(Effort::Low).await.unwrap();
+    session.set_effort(Effort::XHigh).await.unwrap();
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::EffortSet(Some(Effort::Low)),
+            AdapterEvent::EffortSet(Some(Effort::XHigh)),
+        ]
+    );
+    // A model that takes none: the look says so, and an effort is refused.
+    session.set_model("no-effort".to_owned()).await.unwrap();
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::ModelSet("resolved-no-effort".to_owned()),
+            AdapterEvent::Effort(None),
+        ]
+    );
+    session.set_effort(Effort::Max).await.unwrap();
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            refused(Effort::Max, "resolved-no-effort takes no effort level"),
+            AdapterEvent::Effort(None),
+        ]
+    );
+    // The level was kept for a model that takes one.
+    session.set_model("sonnet".to_owned()).await.unwrap();
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
+            AdapterEvent::Effort(Some(Effort::Max)),
         ]
     );
     session.shutdown().await.unwrap();

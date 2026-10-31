@@ -43,12 +43,13 @@
 //! Tool steps name no call unless given one with [`Step::call`], and carry
 //! no display of their own, so the mapper's generic display applies.
 //!
-//! **Mode and model.** A request to set either is answered at once, idle or
-//! mid-turn: `PermissionModeSet` / `ModelSet` with what was asked, or a
-//! refusal for a mode or model the script refuses
-//! ([`FakeScript::refuse_mode`], [`FakeScript::refuse_model`]). A start
-//! naming a mode or model asks for it the same way, after reporting the
-//! models the script offers ([`FakeScript::offer_models`]), if any.
+//! **Mode, model and effort.** A request to set any of them is answered at
+//! once, idle or mid-turn: `PermissionModeSet` / `ModelSet` / `EffortSet`
+//! with what was asked, or a refusal for a mode, model or effort the script
+//! refuses ([`FakeScript::refuse_mode`], [`FakeScript::refuse_model`],
+//! [`FakeScript::refuse_effort`]). A start naming a mode, model or effort
+//! asks for it the same way, after reporting the models the script offers
+//! ([`FakeScript::offer_models`]), if any.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -60,7 +61,7 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
+    AgentSession, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
     RuleSuggestion, StartSpec, TurnOutcome,
 };
 
@@ -69,7 +70,7 @@ const EVENT_CAPACITY: usize = 64;
 
 /// The reason a fake reports for an approval it drops on interrupt.
 pub const INTERRUPT_REASON: &str = "interrupted";
-/// The reason a fake refuses a mode or model with.
+/// The reason a fake refuses a mode, model or effort with.
 pub const REFUSE_REASON: &str = "refused by the script";
 
 /// Turns a [`FakeAgent`] plays, in order, for every session.
@@ -78,6 +79,7 @@ pub struct FakeScript {
     turns: Vec<Vec<Step>>,
     refused_modes: Vec<PermissionMode>,
     refused_models: Vec<String>,
+    refused_efforts: Vec<Effort>,
     models: Vec<ModelChoice>,
 }
 
@@ -95,6 +97,12 @@ impl FakeScript {
     /// Refuses requests for `model`.
     pub fn refuse_model(mut self, model: &str) -> FakeScript {
         self.refused_models.push(model.to_owned());
+        self
+    }
+
+    /// Refuses requests for `effort`.
+    pub fn refuse_effort(mut self, effort: Effort) -> FakeScript {
+        self.refused_efforts.push(effort);
         self
     }
 
@@ -123,6 +131,17 @@ impl FakeScript {
             }
         } else {
             AdapterEvent::ModelSet(model)
+        }
+    }
+
+    fn answer_effort(&self, effort: Effort) -> AdapterEvent {
+        if self.refused_efforts.contains(&effort) {
+            AdapterEvent::EffortRefused {
+                effort,
+                reason: REFUSE_REASON.to_owned(),
+            }
+        } else {
+            AdapterEvent::EffortSet(Some(effort))
         }
     }
 
@@ -281,6 +300,7 @@ pub enum FakeInput {
     Interrupt,
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    SetEffort(Effort),
     Shutdown,
 }
 
@@ -375,6 +395,10 @@ impl AgentAdapter for FakeAgent {
             if let Some(model) = spec.model {
                 inputs.push(FakeInput::SetModel(model.clone()));
                 early.push(self.script.answer_model(model));
+            }
+            if let Some(effort) = spec.effort {
+                inputs.push(FakeInput::SetEffort(effort));
+                early.push(self.script.answer_effort(effort));
             }
         }
         for event in early {
@@ -473,6 +497,11 @@ impl AgentSession for FakeSession {
         self.answer(FakeInput::SetModel(model), answer).await
     }
 
+    async fn set_effort(&mut self, effort: Effort) -> Result<(), AgentError> {
+        let answer = self.script.answer_effort(effort);
+        self.answer(FakeInput::SetEffort(effort), answer).await
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(FakeInput::Shutdown);
@@ -528,7 +557,8 @@ impl Runner {
                         | FakeInput::Answer(..)
                         | FakeInput::Started { .. }
                         | FakeInput::SetPermissionMode(_)
-                        | FakeInput::SetModel(_),
+                        | FakeInput::SetModel(_)
+                        | FakeInput::SetEffort(_),
                     ) => {
                         continue;
                     }
@@ -689,7 +719,8 @@ impl Runner {
                 FakeInput::Answer(..)
                 | FakeInput::Started { .. }
                 | FakeInput::SetPermissionMode(_)
-                | FakeInput::SetModel(_),
+                | FakeInput::SetModel(_)
+                | FakeInput::SetEffort(_),
             ) => Ok(()),
         }
     }

@@ -1,7 +1,7 @@
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
-use super::screen::PermissionModeView;
+use super::screen::{EffortView, PermissionModeView};
 
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
 /// signals only within a type, and the order matters (an edit before the
@@ -182,6 +182,12 @@ pub enum ActionIntent {
     SetModel {
         session_id: String,
         model: String,
+    },
+    /// Switch the session's agent to reasoning effort `effort`, starting
+    /// it if need be.
+    SetEffort {
+        session_id: String,
+        effort: EffortView,
     },
     SetSessionArchived {
         session_id: String,

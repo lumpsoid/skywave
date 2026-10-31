@@ -14,8 +14,8 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, Delivery,
-    DeviceId, Draft, Entry, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam,
-    Seq, SessionId, TimelineItem, ViewState,
+    DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request, Route, Screen,
+    Seam, Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
@@ -5519,6 +5519,7 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
 
     // No list yet: a name is typed, `q` and `?` included.
     assert_eq!(h.key(KeyCode::Char('m')), None);
+    assert_eq!(h.key(KeyCode::Char('m')), None);
     let screen = h.screen();
     assert_contains(&screen, "Model · now unknown");
     assert_contains(&screen, "No list yet");
@@ -5562,12 +5563,14 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
                             label: "Opus".into(),
                             detail: Some("most capable".into()),
                             resolved: Some("claude-opus-9".into()),
+                            efforts: Vec::new(),
                         },
                         ModelChoice {
                             id: "haiku".into(),
                             label: "Haiku".into(),
                             detail: None,
                             resolved: None,
+                            efforts: Vec::new(),
                         },
                     ],
                 },
@@ -5588,6 +5591,7 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
     // The list opens on the running model, marked; ↓ Enter sends the
     // highlighted one's id.
     h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Char('m'));
     let screen = h.screen();
     assert_contains(&screen, "Model · now Opus");
     assert_contains(&screen, "› Opus  most capable · now");
@@ -5604,6 +5608,7 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
 
     // A typed name wins over the highlighted model; Ctrl-U clears it.
     h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Char('m'));
     h.type_text("x");
     h.key_with(ctrl('u'));
     h.app.on_paste("  sonnet-5\n");
@@ -5614,6 +5619,142 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
             model: "sonnet-5".into(),
         })
     );
+}
+
+#[test]
+fn m_opens_a_menu_to_the_model_and_effort_pickers() {
+    let (mut h, id, _) = open_session();
+    h.key(KeyCode::Esc);
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ModelsOffered {
+                    models: vec![ModelChoice {
+                        id: "opus".into(),
+                        label: "Opus".into(),
+                        detail: None,
+                        resolved: Some("claude-opus-9".into()),
+                        efforts: vec![Effort::Low, Effort::High, Effort::Max],
+                    }],
+                },
+            ),
+            event(
+                id,
+                2,
+                EventKind::ModelChanged {
+                    model: "claude-opus-9".into(),
+                    answers: None,
+                },
+            ),
+            event(
+                id,
+                3,
+                EventKind::EffortChanged {
+                    effort: Some(Effort::High),
+                    answers: None,
+                },
+            ),
+        ],
+    );
+    assert_contains(&status_line(&h, 100), "Opus · effort high");
+
+    // `m` opens the menu, not the model list.
+    assert_eq!(h.key(KeyCode::Char('m')), None);
+    let screen = h.screen();
+    assert_contains(&screen, " Agent ");
+    assert_contains(&screen, "model   Opus");
+    assert_contains(&screen, "effort  high");
+    assert!(!screen.contains("or type a model name"));
+    assert!(!h.app.typing());
+
+    // `m` and `e` jump; Esc goes back to the menu, and again closes it.
+    h.key(KeyCode::Char('m'));
+    assert_contains(&h.screen(), "or type a model name");
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), " Agent ");
+    h.key(KeyCode::Char('e'));
+    let screen = h.screen();
+    assert_contains(&screen, "Effort · now effort high");
+    assert_contains(&screen, "› high · now");
+    assert_contains(&screen, "  low");
+    assert_contains(&screen, "  max");
+    assert!(!screen.contains("medium"), "only the model's levels");
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), " Agent ");
+    h.key(KeyCode::Esc);
+    let screen = h.screen();
+    assert!(!screen.contains(" Agent ") && !screen.contains("Effort · now"));
+
+    // The menu's rows open the pickers too.
+    h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Down);
+    h.key(KeyCode::Enter);
+    assert_contains(&h.screen(), "Effort · now");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    assert_contains(&h.screen(), "or type a model name");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+
+    // Enter sends the highlighted level and closes everything.
+    h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Char('e'));
+    h.key(KeyCode::Down);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetEffort {
+            session_id: id,
+            effort: Effort::Max,
+        })
+    );
+    assert!(!h.screen().contains("Effort · now"));
+    assert_contains(&status_line(&h, 100), "effort high → max");
+
+    // The picker opens on the level asked for last.
+    h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Char('e'));
+    assert_contains(&h.screen(), "› max");
+}
+
+#[test]
+fn an_empty_effort_list_sends_nothing() {
+    let (mut h, id, _) = open_session();
+    h.key(KeyCode::Esc);
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ModelsOffered {
+                    models: vec![ModelChoice {
+                        id: "haiku".into(),
+                        label: "Haiku".into(),
+                        detail: None,
+                        resolved: None,
+                        efforts: Vec::new(),
+                    }],
+                },
+            ),
+            event(
+                id,
+                2,
+                EventKind::ModelChanged {
+                    model: "haiku".into(),
+                    answers: None,
+                },
+            ),
+        ],
+    );
+    h.key(KeyCode::Char('m'));
+    h.key(KeyCode::Char('e'));
+    assert_contains(&h.screen(), "Haiku takes no effort level");
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "takes no effort level");
 }
 
 #[test]

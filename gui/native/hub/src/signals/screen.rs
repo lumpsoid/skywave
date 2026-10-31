@@ -234,8 +234,8 @@ pub struct SnippetView {
     pub text: String,
 }
 
-/// The session agent's permission mode and model: the status line's two
-/// chips and their pickers.
+/// The session agent's permission mode, model and reasoning effort: the
+/// status line's three chips and their pickers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct AgentSettingsView {
     /// `ask`, `ask → plan` while a switch waits for the agent, `mode
@@ -244,6 +244,10 @@ pub struct AgentSettingsView {
     /// `Sonnet`, `Sonnet → Opus`, `model unknown` until the agent names
     /// one (`unknown → Opus` once one is asked for).
     pub model_label: String,
+    /// `effort high`, `high → max` while a switch waits for the agent,
+    /// `no effort` for a model that takes none, `effort unknown` until the
+    /// agent says (`unknown → max` once one is asked for).
+    pub effort_label: String,
     /// The model as the agent names it, for the picker's name field.
     pub model_name: Option<String>,
     /// `bypass refused: <why>`, `plan failed: <why>`: the newest refusal
@@ -251,11 +255,16 @@ pub struct AgentSettingsView {
     pub mode_refusal: Option<String>,
     /// Likewise for a model.
     pub model_refusal: Option<String>,
+    /// Likewise for an effort.
+    pub effort_refusal: Option<String>,
     /// Every mode, from the most asking to the least.
     pub modes: Vec<ModeOption>,
     /// The models the agents offer; empty until one has, when only a name
     /// typed in switches.
     pub models: Vec<ModelOption>,
+    /// The efforts the running model takes, least to most; empty when it
+    /// takes none.
+    pub efforts: Vec<EffortOption>,
 }
 
 /// A mode the picker lists.
@@ -285,6 +294,27 @@ pub struct ModelOption {
     pub current: bool,
     /// A switch to it waits for the agent.
     pub pending: bool,
+}
+
+/// An effort the picker lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct EffortOption {
+    pub effort: EffortView,
+    /// `extra high`.
+    pub label: String,
+    /// The agent runs at it.
+    pub current: bool,
+    /// A switch to it waits for the agent.
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum EffortView {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
