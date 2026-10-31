@@ -723,7 +723,7 @@ async fn an_answer_to_an_approval_cancelled_while_offline_is_shown_refused() {
     assert_eq!(answer.decision, Decision::Approve);
     assert_eq!(
         answer.outgoing,
-        Outgoing::Failed(FailReason::ApprovalCancelled)
+        Outgoing::Failed(FailReason::Rejected(RejectReason::ApprovalCancelled))
     );
     assert!(!answer.retryable, "a cancelled approval takes no answer");
 

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use skywave_core::{
     Action, ApprovalStatus, Decision, EngineConfig, Entry, FailReason, Link, OutboxStatus,
-    Outgoing, SessionState as ViewSessionState, TimelineItem, TransportConfig,
+    Outgoing, RejectReason, SessionState as ViewSessionState, TimelineItem, TransportConfig,
 };
 use skywave_proto::{
     ApprovalId, CommandKind, CommandResult, Event, EventKind, SessionId, SessionState,
@@ -518,7 +518,7 @@ async fn first_answer_wins_across_devices() {
     ));
     assert_eq!(
         Outgoing::from(&answer(loser).status),
-        Outgoing::Failed(FailReason::ApprovalAlreadyResolved)
+        Outgoing::Failed(FailReason::Rejected(RejectReason::ApprovalAlreadyResolved))
     );
     assert_exactly_once(&daemon, &[&a, &b]);
 

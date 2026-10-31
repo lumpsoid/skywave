@@ -675,7 +675,8 @@ async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, Li
 
 /// Claims and sends one outbox entry read earlier. An entry that can no
 /// longer be claimed (gone from the outbox, or answered meanwhile) is
-/// skipped.
+/// skipped. One the server refuses for good fails and the link stays up:
+/// resending it would only hold back every later command.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -685,8 +686,14 @@ async fn send_entry(
     if !ctx.seam.command_sending(id)? {
         return Ok(());
     }
-    let result = transport.send_command(&entry.command).await?;
-    ctx.seam.command_result(id, &result)?;
+    match transport.send_command(&entry.command).await {
+        Ok(result) => ctx.seam.command_result(id, &result)?,
+        Err(error) if error.refuses_command() => {
+            tracing::warn!(%error, ?id, "server refused the command; giving up on it");
+            ctx.seam.command_undeliverable(id)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -705,8 +712,9 @@ mod tests {
     use crate::Core;
     use crate::backoff::Jitter;
     use crate::identity::PairedCredentials;
+    use crate::store::OutboxStatus;
     use crate::transport::{BlobDownload, BoxFuture};
-    use crate::view::DeviceId;
+    use crate::view::{DeviceId, FailReason, Outgoing, Screen};
 
     /// A server that is down until `up` is set, then answers `hello` and
     /// long-polls that never end.
@@ -1361,6 +1369,132 @@ mod tests {
             .unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].tries, 0, "a refused claim counts nothing");
+    }
+
+    /// Fails the command for `workdir` with `error` and accepts every
+    /// other one, noting each command it is sent.
+    struct RefusingServer {
+        workdir: &'static str,
+        error: TransportError,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Transport for RefusingServer {
+        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                let CommandKind::CreateSession { workdir } = &command.kind else {
+                    panic!("only creations are sent here");
+                };
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(workdir.clone());
+                if workdir == self.workdir {
+                    return Err(self.error.clone());
+                }
+                Ok(CommandResult::Accepted {
+                    seq: Seq(seen.len() as u64),
+                })
+            })
+        }
+
+        fn events(&self, _query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async { Err(TransportError::Io("unused".into())) })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+    }
+
+    fn create(seam: &Seam, workdir: &str) {
+        seam.core
+            .dispatch(crate::Action::CreateSession {
+                workdir: workdir.into(),
+            })
+            .unwrap();
+    }
+
+    /// A command the server refuses with a 400 fails for good and is not
+    /// sent again; the ones behind it still go out, on the same link.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_command_fails_and_the_next_still_goes_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        create(&seam, "/bad");
+        create(&seam, "/good");
+        let server = RefusingServer {
+            workdir: "/bad",
+            error: TransportError::BadStatus(400),
+            seen: Mutex::new(Vec::new()),
+        };
+        let ctx = sender_ctx(&seam);
+
+        let drained = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        assert!(drained.is_err(), "the refusal does not end the sender");
+        assert_eq!(*server.seen.lock().unwrap(), ["/bad", "/good"]);
+        assert!(seam.pending_outbox().unwrap().is_empty());
+
+        let Screen::SessionList(list) = seam.core.view().screen else {
+            panic!("not on the session list");
+        };
+        let creating: Vec<_> = list
+            .creating
+            .iter()
+            .map(|p| (p.workdir.as_str(), p.outgoing))
+            .collect();
+        assert_eq!(
+            creating,
+            [
+                ("/bad", Outgoing::Failed(FailReason::Undeliverable)),
+                ("/good", Outgoing::Accepted(Seq(2))),
+            ]
+        );
+        assert!(list.creating[0].discardable, "a refused creation can go");
+
+        // Settled on disk too: a restart neither resends nor forgets it.
+        drop(ctx);
+        drop(seam);
+        let reopened = Core::open_detached(dir.path()).unwrap();
+        let outbox = crate::client::lock(&reopened.shared.state)
+            .store
+            .outbox()
+            .unwrap();
+        assert_eq!(outbox[0].status, OutboxStatus::Undeliverable);
+        assert!(outbox[0].answered_at.is_some());
+    }
+
+    /// A 5xx is the server's trouble, not the command's: the sender ends
+    /// so the link backs off and sends the same command again.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_error_keeps_the_command_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        create(&seam, "/busy");
+        create(&seam, "/later");
+        let server = RefusingServer {
+            workdir: "/busy",
+            error: TransportError::BadStatus(503),
+            seen: Mutex::new(Vec::new()),
+        };
+        let ctx = sender_ctx(&seam);
+
+        let ended = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        assert!(matches!(
+            ended,
+            Ok(Err(LinkError::Transport(TransportError::BadStatus(503))))
+        ));
+        assert_eq!(*server.seen.lock().unwrap(), ["/busy"]);
+        assert_eq!(seam.pending_outbox().unwrap().len(), 2);
     }
 
     #[test]

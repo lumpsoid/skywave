@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, Seq,
     SessionId,
@@ -231,6 +231,26 @@ pub enum OutboxStatus {
     Sending,
     /// The server's answer; final.
     Done(CommandResult),
+    /// The server refused the request without an answer
+    /// ([`TransportError::refuses_command`](crate::TransportError::refuses_command));
+    /// final, never sent again.
+    Undeliverable,
+}
+
+/// What the outbox `result` column holds once a command is settled: the
+/// server's answer, or a marker the core wrote itself. Both are objects
+/// tagged `result`, so `json_extract(result, '$.result')` tells them apart.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Settled {
+    Answered(CommandResult),
+    Local(LocalResult),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum LocalResult {
+    Undeliverable,
 }
 
 impl OutboxStatus {
@@ -251,7 +271,7 @@ pub struct OutboxEntry {
     pub tries: u32,
     /// When the first claim was made.
     pub first_sent_at: Option<DateTime<Utc>>,
-    /// When the server's answer was recorded.
+    /// When the server's answer, or its refusal of the request, was recorded.
     pub answered_at: Option<DateTime<Utc>>,
 }
 
@@ -267,6 +287,7 @@ impl OutboxEntry {
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
+            OutboxStatus::Undeliverable => true,
             OutboxStatus::Queued | OutboxStatus::Sending => self.tries == 0,
         }
     }
@@ -647,9 +668,12 @@ impl Store {
         let rows = stmt.query_map([], |row| {
             let command = json_col(row, 0)?;
             let sending: bool = row.get(1)?;
-            let result: Option<CommandResult> = opt_json_col(row, 2)?;
+            let result: Option<Settled> = opt_json_col(row, 2)?;
             let status = match (result, sending) {
-                (Some(result), _) => OutboxStatus::Done(result),
+                (Some(Settled::Answered(result)), _) => OutboxStatus::Done(result),
+                (Some(Settled::Local(LocalResult::Undeliverable)), _) => {
+                    OutboxStatus::Undeliverable
+                }
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
             };
@@ -689,10 +713,30 @@ impl Store {
         result: &CommandResult,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
+        self.settle(id, &Settled::Answered(result.clone()), now)
+    }
+
+    /// Gives up on a command the server refused without an answer, at
+    /// `now` ([`OutboxStatus::Undeliverable`]). Like an answer, it is final
+    /// and the first one is kept.
+    pub fn record_undeliverable(
+        &self,
+        id: CommandId,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.settle(id, &Settled::Local(LocalResult::Undeliverable), now)
+    }
+
+    fn settle(
+        &self,
+        id: CommandId,
+        settled: &Settled,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "UPDATE outbox SET result = ?2, sending = 0, answered_at = ?3
              WHERE command_id = ?1 AND result IS NULL",
-            params![id.0.to_string(), to_json(result)?, now.to_rfc3339()],
+            params![id.0.to_string(), to_json(settled)?, now.to_rfc3339()],
         )?;
         if changed == 0 {
             self.require_command(id)?;
@@ -701,7 +745,7 @@ impl Store {
     }
 
     /// Takes a command back: deletes it from the outbox if it was never
-    /// attempted or the server refused it, and keeps `draft` as its
+    /// attempted or the server refused it (or its request), and keeps `draft` as its
     /// session's draft, in one transaction, so a crash keeps the text in
     /// exactly one place. Any other row stays and the call fails with
     /// [`StoreError::NotWithdrawable`], writing nothing: it may have reached
@@ -716,7 +760,7 @@ impl Store {
         let deleted = tx.execute(
             "DELETE FROM outbox WHERE command_id = ?1
                 AND (tries = 0 AND result IS NULL
-                    OR json_extract(result, '$.result') = 'rejected')",
+                    OR json_extract(result, '$.result') IN ('rejected', 'undeliverable'))",
             [id.0.to_string()],
         )?;
         if deleted == 0 {

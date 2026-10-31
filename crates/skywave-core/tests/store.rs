@@ -1072,18 +1072,33 @@ fn withdraw_only_never_attempted_or_refused() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     let session = SessionId::new();
-    let [fresh, claimed, requeued, refused, accepted] =
-        ["fresh", "claimed", "requeued", "refused", "accepted"].map(|text| send(session, text));
-    for command in [&fresh, &claimed, &requeued, &refused, &accepted] {
+    let [fresh, claimed, requeued, refused, undeliverable, accepted] = [
+        "fresh",
+        "claimed",
+        "requeued",
+        "refused",
+        "undeliverable",
+        "accepted",
+    ]
+    .map(|text| send(session, text));
+    for command in [
+        &fresh,
+        &claimed,
+        &requeued,
+        &refused,
+        &undeliverable,
+        &accepted,
+    ] {
         store.enqueue(command).unwrap();
     }
-    for command in [&claimed, &requeued, &refused, &accepted] {
+    for command in [&claimed, &requeued, &refused, &undeliverable, &accepted] {
         assert!(store.claim_send(command.id, at(1)).unwrap());
     }
     let rejected = CommandResult::Rejected {
         reason: RejectReason::UnknownSession,
     };
     store.record_result(refused.id, &rejected, at(2)).unwrap();
+    store.record_undeliverable(undeliverable.id, at(2)).unwrap();
     store
         .record_result(accepted.id, &CommandResult::Accepted { seq: Seq(1) }, at(2))
         .unwrap();
@@ -1108,6 +1123,7 @@ fn withdraw_only_never_attempted_or_refused() {
             ("claimed", false),
             ("requeued", false),
             ("refused", true),
+            ("undeliverable", true),
             ("accepted", false),
         ]
         .map(|(text, discardable)| (text.to_owned(), discardable))
@@ -1126,6 +1142,7 @@ fn withdraw_only_never_attempted_or_refused() {
     ));
     store.withdraw(fresh.id, None).unwrap();
     store.withdraw(refused.id, None).unwrap();
+    store.withdraw(undeliverable.id, None).unwrap();
     let left: Vec<CommandId> = store
         .outbox()
         .unwrap()
