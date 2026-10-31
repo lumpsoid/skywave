@@ -7,6 +7,7 @@ import 'package:skywave_gui/boot/boot_failure_page.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -77,11 +78,8 @@ class _SkywaveAppState extends State<SkywaveApp> {
     return MaterialApp(
       title: 'Skywave',
       scaffoldMessengerKey: widget.messenger,
-      theme: ThemeData(colorSchemeSeed: Colors.indigo),
-      darkTheme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.dark,
-      ),
+      theme: skywaveTheme(Brightness.light),
+      darkTheme: skywaveTheme(Brightness.dark),
       home: ListenableBuilder(
         listenable: widget.boot,
         builder: (context, _) => switch (widget.boot.status) {
@@ -92,12 +90,23 @@ class _SkywaveAppState extends State<SkywaveApp> {
             message: message,
             onRetry: () => unawaited(widget.boot.boot()),
           ),
-          BootReady() => ScreenNavigator(
-            holders: widget.holders,
+          BootReady() => LinkShortcuts(
             send: widget.send,
+            child: ScreenNavigator(holders: widget.holders, send: widget.send),
           ),
         },
       ),
     );
   }
 }
+
+/// Material 3 from one seed, light or dark as the system is. Dense on
+/// desktop, where a pointer and keys are the input.
+ThemeData skywaveTheme(Brightness brightness) => ThemeData(
+  colorSchemeSeed: Colors.indigo,
+  brightness: brightness,
+  visualDensity: VisualDensity.adaptivePlatformDensity,
+  inputDecorationTheme: const InputDecorationTheme(
+    border: OutlineInputBorder(),
+  ),
+);

@@ -87,6 +87,11 @@ pub enum GuiIntent {
     CompletionAccept,
     /// Esc: close the candidate list, or else the prompt.
     CompletionCancel,
+    /// A tap on a listed candidate: take the one at `index` (of the
+    /// popup's `candidates`). One no longer listed is ignored.
+    CompletionPick {
+        index: u32,
+    },
     /// Open the rename prompt for a session.
     RenameOpen {
         session_id: String,
