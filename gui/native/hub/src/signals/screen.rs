@@ -36,7 +36,7 @@ pub enum ScreenView {
     },
     SessionList {
         kind: ListKindView,
-        /// `Sessions (3) · 2 archived`, `Archived (2) · 3 active`.
+        /// `Sessions`: the Active/Archived toggle carries the counts.
         title: String,
         /// What an empty list says; `None` when it has rows.
         empty_label: Option<String>,

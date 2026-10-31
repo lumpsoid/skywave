@@ -6,7 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ScreenView};
+use crate::signals::{ActionIntent, ListKindView, RouteView, ScreenView};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -447,6 +447,38 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
         !outs
             .iter()
             .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
+    );
+}
+
+#[test]
+fn the_list_title_leaves_the_counts_to_the_toggle() {
+    let mut rig = Rig::new();
+    let list = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionList {
+            kind,
+            title,
+            rows,
+            other_count,
+            ..
+        } => (*kind, title.clone(), rows.len(), *other_count),
+        other => panic!("not the list: {other:?}"),
+    };
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(list(&rig), (ListKindView::Active, "Sessions".into(), 1, 0));
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(
+        list(&rig),
+        (ListKindView::Archived, "Sessions".into(), 0, 1)
     );
 }
 

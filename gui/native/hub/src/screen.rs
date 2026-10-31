@@ -101,18 +101,12 @@ fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
 }
 
 fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
-    let rows = list.sessions.len();
-    let (kind, title) = match (list.kind, list.other_count) {
-        (ListKind::Active, 0) => (ListKindView::Active, format!("Sessions ({rows})")),
-        (ListKind::Active, archived) => (
-            ListKindView::Active,
-            format!("Sessions ({rows}) · {archived} archived"),
-        ),
-        (ListKind::Archived, active) => (
-            ListKindView::Archived,
-            format!("Archived ({rows}) · {active} active"),
-        ),
+    // The Active/Archived toggle carries the counts and which list shows.
+    let kind = match list.kind {
+        ListKind::Active => ListKindView::Active,
+        ListKind::Archived => ListKindView::Archived,
     };
+    let title = "Sessions".to_owned();
     let empty_label = list.sessions.is_empty().then(|| {
         match list.kind {
             ListKind::Archived => "No archived sessions.",

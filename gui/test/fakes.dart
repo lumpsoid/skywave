@@ -80,7 +80,7 @@ ScreenUpdate pairingScreen({bool canGoBack = false}) => ScreenUpdate(
 ScreenUpdate listScreen() => const ScreenUpdate(
   screen: ScreenViewSessionList(
     kind: ListKindView.active,
-    title: 'Sessions (0)',
+    title: 'Sessions',
     emptyLabel: 'No sessions yet. Start one.',
     rows: [],
     otherCount: 0,
