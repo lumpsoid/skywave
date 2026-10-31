@@ -10,13 +10,14 @@ Future<String?> askSnippetName(BuildContext context) => showDialog<String>(
   builder: (context) => const _NameDialog(),
 );
 
-/// Lists the snippets: a tap puts one into the composer at its cursor
-/// (`onInserted` follows), the bin deletes one. While the composer holds
-/// text, the first entry saves it as a snippet.
+/// Lists the snippets as `snippets` holds them now: a tap puts one into
+/// the composer at its cursor (`onInserted` follows), the pencil edits
+/// one, the bin deletes one. While the composer holds text, the first
+/// entry saves it as a snippet.
 Future<void> pickSnippet(
   BuildContext context, {
   required String sessionId,
-  required List<SnippetView> snippets,
+  required ValueNotifier<List<SnippetView>> snippets,
   required bool composerBlank,
   required SendIntent send,
   required VoidCallback onInserted,
@@ -55,29 +56,31 @@ class _SaveComposer extends _Picked {
   const _SaveComposer();
 }
 
-class _SnippetSheet extends StatefulWidget {
+class _SnippetSheet extends StatelessWidget {
   const _SnippetSheet({
     required this.snippets,
     required this.canSave,
     required this.send,
   });
 
-  final List<SnippetView> snippets;
+  final ValueNotifier<List<SnippetView>> snippets;
   final bool canSave;
   final SendIntent send;
 
-  @override
-  State<_SnippetSheet> createState() => _SnippetSheetState();
-}
-
-class _SnippetSheetState extends State<_SnippetSheet> {
-  /// What the sheet lists: the snippets as it opened, less those deleted
-  /// from it since.
-  late final _shown = [...widget.snippets];
-
-  void _delete(SnippetView snippet) {
-    widget.send.act(ActionIntentDeleteSnippet(snippetId: snippet.snippetId));
-    setState(() => _shown.remove(snippet));
+  Future<void> _edit(BuildContext context, SnippetView snippet) async {
+    final edited = await showDialog<(String, String)>(
+      context: context,
+      builder: (context) => _EditDialog(snippet: snippet),
+    );
+    if (edited case (final name, final text)) {
+      send.act(
+        ActionIntentEditSnippet(
+          snippetId: snippet.snippetId,
+          name: name,
+          text: text,
+        ),
+      );
+    }
   }
 
   @override
@@ -89,55 +92,72 @@ class _SnippetSheetState extends State<_SnippetSheet> {
         constraints: BoxConstraints(
           maxHeight: MediaQuery.sizeOf(context).height * 0.6,
         ),
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-              child: Text('Snippets', style: theme.textTheme.titleMedium),
-            ),
-            if (widget.canSave)
-              ListTile(
-                leading: const Icon(Icons.bookmark_add_outlined),
-                title: const Text('Save the message as a snippet'),
-                onTap: () => Navigator.of(context).pop(const _SaveComposer()),
-              ),
-            if (_shown.isEmpty)
+        child: ValueListenableBuilder(
+          valueListenable: snippets,
+          builder: (context, shown, _) => ListView(
+            shrinkWrap: true,
+            children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                child: Text(
-                  'No snippets yet. Save a message you sent from its menu, '
-                  'or what you are writing from here.',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: colors.muted,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Text('Snippets', style: theme.textTheme.titleMedium),
+              ),
+              if (canSave)
+                ListTile(
+                  leading: const Icon(Icons.bookmark_add_outlined),
+                  title: const Text('Save the message as a snippet'),
+                  onTap: () => Navigator.of(context).pop(const _SaveComposer()),
+                ),
+              if (shown.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                  child: Text(
+                    'No snippets yet. Save a message you sent from its menu, '
+                    'or what you are writing from here.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: colors.muted,
+                    ),
                   ),
                 ),
-              ),
-            for (final snippet in _shown)
-              ListTile(
-                key: ValueKey(snippet.snippetId),
-                leading: const Icon(Icons.bookmark_outline),
-                title: Text(
-                  snippet.label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: snippet.detail == null
-                    ? null
-                    : Text(
-                        snippet.detail!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+              for (final snippet in shown)
+                ListTile(
+                  key: ValueKey(snippet.snippetId),
+                  leading: const Icon(Icons.bookmark_outline),
+                  title: Text(
+                    snippet.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: snippet.detail == null
+                      ? null
+                      : Text(
+                          snippet.detail!,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: 'Edit snippet',
+                        icon: const Icon(Icons.edit_outlined),
+                        onPressed: () => _edit(context, snippet),
                       ),
-                trailing: IconButton(
-                  tooltip: 'Delete snippet',
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () => _delete(snippet),
+                      IconButton(
+                        tooltip: 'Delete snippet',
+                        icon: const Icon(Icons.delete_outline),
+                        onPressed: () => send.act(
+                          ActionIntentDeleteSnippet(
+                            snippetId: snippet.snippetId,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  onTap: () =>
+                      Navigator.of(context).pop(_Insert(snippet.snippetId)),
                 ),
-                onTap: () =>
-                    Navigator.of(context).pop(_Insert(snippet.snippetId)),
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -185,6 +205,80 @@ class _NameDialogState extends State<_NameDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(onPressed: _submit, child: const Text('Save')),
+      ],
+    );
+  }
+}
+
+/// Edits a snippet's name and text: pops both, or `null` when cancelled.
+/// Blank text cannot be saved.
+class _EditDialog extends StatefulWidget {
+  const _EditDialog({required this.snippet});
+
+  final SnippetView snippet;
+
+  @override
+  State<_EditDialog> createState() => _EditDialogState();
+}
+
+class _EditDialogState extends State<_EditDialog> {
+  late final _name = TextEditingController(text: widget.snippet.name ?? '');
+  late final _text = TextEditingController(text: widget.snippet.text);
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _text.dispose();
+    super.dispose();
+  }
+
+  void _submit() => Navigator.of(context).pop((_name.text, _text.text));
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edit snippet'),
+      content: SizedBox(
+        width: 520,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              key: const Key('snippet-edit-name'),
+              controller: _name,
+              decoration: const InputDecoration(
+                labelText: 'Name (optional)',
+                helperText: 'Empty shows its first line.',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('snippet-edit-text'),
+              controller: _text,
+              autofocus: true,
+              minLines: 3,
+              maxLines: 10,
+              keyboardType: TextInputType.multiline,
+              decoration: const InputDecoration(
+                labelText: 'Text',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ListenableBuilder(
+          listenable: _text,
+          builder: (context, _) => FilledButton(
+            onPressed: _text.text.trim().isEmpty ? null : _submit,
+            child: const Text('Save'),
+          ),
+        ),
       ],
     );
   }

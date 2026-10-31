@@ -409,8 +409,16 @@ fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     });
     assert_eq!(rig.text(), "😀:run the tests now");
     assert_eq!(rig.head.session.as_ref().unwrap().composer.cursor, 15);
-    assert_eq!(rig.composer().text, "😀:run the tests now", "the field is set");
-    assert_eq!(rig.kinds(), ["save draft", "other"], "the draft is kept first");
+    assert_eq!(
+        rig.composer().text,
+        "😀:run the tests now",
+        "the field is set"
+    );
+    assert_eq!(
+        rig.kinds(),
+        ["save draft", "other"],
+        "the draft is kept first"
+    );
     rig.view();
     assert_eq!(snippets(&rig)[0].label, "tests", "used, so first");
 }

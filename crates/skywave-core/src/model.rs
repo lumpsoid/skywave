@@ -316,6 +316,14 @@ impl Model {
                 .map(Effect::SaveSnippet)
                 .into_iter()
                 .collect(),
+            Action::EditSnippet { id, name, text } => match self.snippets.edit(id, &name, text) {
+                Some((edited, gone)) => gone
+                    .map(Effect::DeleteSnippet)
+                    .into_iter()
+                    .chain([Effect::SaveSnippet(edited)])
+                    .collect(),
+                None => Vec::new(),
+            },
             Action::DeleteSnippet(id) => {
                 if self.snippets.delete(id) {
                     vec![Effect::DeleteSnippet(id)]
@@ -3505,12 +3513,28 @@ mod tests {
             vec![Effect::DeleteSnippet(commit.id)]
         );
         assert!(f.dispatch(Action::DeleteSnippet(commit.id)).is_empty());
-        assert_eq!(texts(&f), ["run the tests"]);
+
+        let edit = Action::EditSnippet {
+            id: tests.id,
+            name: "".into(),
+            text: "run every test".into(),
+        };
+        let edited = f.dispatch(edit);
+        assert!(matches!(&edited[..], [Effect::SaveSnippet(s)] if s.name.is_none()));
+        let texts = |f: &Fixture| -> Vec<String> {
+            f.model
+                .view()
+                .snippets
+                .into_iter()
+                .map(|s| s.text)
+                .collect()
+        };
+        assert_eq!(texts(&f), ["run every test"]);
 
         // A reload shows what the store holds.
         let stored = snapshot(&f.model);
         f.model.reload(stored);
-        assert_eq!(texts(&f), ["run the tests"]);
+        assert_eq!(texts(&f), ["run every test"]);
     }
 
     fn save_draft(session_id: SessionId, text: &str, cursor: usize) -> Action {
