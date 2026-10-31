@@ -339,7 +339,7 @@ class _Column extends StatelessWidget {
 }
 
 /// The header's title: the session's name with its rename on the way,
-/// then the workdir and the agent's state.
+/// then the workdir. The agent's state is on the status line.
 class _Title extends StatelessWidget {
   const _Title({required this.screen});
 
@@ -386,20 +386,13 @@ class _Title extends StatelessWidget {
             ],
           ],
         ),
-        Row(
-          children: [
-            Icon(Icons.circle, size: 8, color: colors.agent(screen.state)),
-            const SizedBox(width: 6),
-            Flexible(
-              child: Text(
-                [?screen.workdir, screen.badgeLabel].join(' · '),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: sub,
-              ),
-            ),
-          ],
-        ),
+        if (screen.workdir case final workdir?)
+          Text(
+            workdir,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: sub,
+          ),
       ],
     );
   }

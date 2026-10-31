@@ -6,8 +6,8 @@ import 'package:skywave_gui/session/agent_pickers.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The session's status under its header: the agent's state, a stop on
-/// its way, the agent's mode and model (a tap switches them; a refusal
+/// The session's status under its header: the agent's state (the one
+/// place it shows; its full label is the tooltip), a stop on its way, the agent's mode and model (a tap switches them; a refusal
 /// turns them red), the rules granted here (a tap lists them), and the
 /// usage summary at the end, its fields dropped from the front when the
 /// line is short of room.
@@ -112,7 +112,7 @@ class StatusLine extends StatelessWidget {
     final settings = screen.agent;
 
     final left = <InlineSpan>[
-      TextSpan(text: screen.agentLabel, style: agent),
+      TextSpan(text: screen.badgeLabel, style: agent),
       if (screen.stopLabel case final label?)
         TextSpan(text: ' · $label', style: muted),
     ];
@@ -165,7 +165,10 @@ class StatusLine extends StatelessWidget {
         // Each chip's share of the line, less its gap (8) and chrome; a
         // line too narrow for every label in full folds the chips into
         // one that lists them.
-        final line = constraints.maxWidth - 32;
+        // The state takes what it needs, up to a third of the line.
+        final leftWidth = width(TextSpan(children: left));
+        final stateRoom = 0.3 * constraints.maxWidth;
+        final line = constraints.maxWidth - 32 - min(leftWidth, stateRoom);
         var labelRoom = line / chips.length - 8 - _Chip.chrome;
         if (chips.any(
           (chip) => width(TextSpan(text: chip.label, style: style)) > labelRoom,
@@ -186,23 +189,26 @@ class StatusLine extends StatelessWidget {
           0.0,
           (sum, chip) => sum + chipWidth(chip, labelRoom) + 8,
         );
-        final leftWidth = width(TextSpan(children: left)) + chipsWidth;
         final usage = fitTail(
           screen.usage,
           (text) => width(TextSpan(text: text, style: muted)),
           // Less the line's padding (32), the gap, and a margin.
-          constraints.maxWidth - leftWidth - 56,
+          constraints.maxWidth - leftWidth - chipsWidth - 56,
         );
 
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              Flexible(
-                child: Text.rich(
-                  TextSpan(children: left),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+              ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: stateRoom),
+                child: Tooltip(
+                  message: screen.agentLabel,
+                  child: Text.rich(
+                    TextSpan(children: left),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
               ),
               for (final chip in chips) ...[
