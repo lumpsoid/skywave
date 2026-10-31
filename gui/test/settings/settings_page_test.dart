@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/revoked_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -19,6 +20,7 @@ void main() {
             device: 'dev-1',
             fingerprint: 'AB:CD',
           ),
+          link: LinkHolder(),
           canGoBack: true,
           send: sent.add,
         ),
@@ -46,6 +48,44 @@ void main() {
       ),
       const GuiIntentAct(action: ActionIntentBack()),
     ]);
+  });
+
+  testWidgets('the connection tile follows the link and its latency', (
+    tester,
+  ) async {
+    final holder = LinkHolder();
+    addTearDown(holder.dispose);
+    LinkUpdate link(LinkState state, String connection) => LinkUpdate(
+      state: state,
+      label: '',
+      connectionLabel: connection,
+      canRetryNow: false,
+      rejected: false,
+      queued: 0,
+      approvalsElsewhere: 0,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: ConnectionTile(holder: holder)),
+      ),
+    );
+    String shown() =>
+        tester.widget<Text>(find.byKey(const Key('connection-label'))).data!;
+    expect(shown(), 'Not known yet');
+
+    holder.apply(link(LinkState.online, 'Connected · 12 ms'));
+    await tester.pump();
+    expect(shown(), 'Connected · 12 ms');
+    expect(find.byIcon(Icons.link), findsOneWidget);
+
+    holder.apply(link(LinkState.online, 'Connected · 30 ms'));
+    await tester.pump();
+    expect(shown(), 'Connected · 30 ms');
+
+    holder.apply(link(LinkState.reconnecting, 'Offline · retry in 07s'));
+    await tester.pump();
+    expect(shown(), 'Offline · retry in 07s');
+    expect(find.byIcon(Icons.link_off), findsOneWidget);
   });
 
   testWidgets('the revoked notice re-pairs or browses local data', (

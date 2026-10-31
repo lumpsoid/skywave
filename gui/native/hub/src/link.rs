@@ -15,11 +15,13 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
         n => format!(" · {n} queued"),
     };
     let mut retry_in_s = None;
+    let mut retry = String::new();
     let (state, label) = match link {
         Link::Unpaired => (LinkState::Unpaired, String::new()),
         Link::Connecting => (LinkState::Connecting, format!("connecting…{queued_part}")),
         // Nothing to say while online with nothing waiting: the banner
-        // hides. No latency: it changes on every ping and buys no action.
+        // hides. No latency: it changes on every ping and buys no action;
+        // Settings shows it.
         Link::Online { .. } if queued == 0 && elsewhere == 0 => (LinkState::Online, String::new()),
         Link::Online { .. } => (LinkState::Online, format!("online{queued_part}")),
         Link::CatchingUp { have, server } => (
@@ -31,7 +33,7 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
         } => {
             let left = seconds_left(retry_at.timestamp_millis(), wall_ms);
             retry_in_s = Some(left);
-            let retry = match left {
+            retry = match left {
                 0 => "retrying…".to_owned(),
                 // Two digits (the cap is 30s) keep the banner from shifting.
                 n => format!("retry in {n:02}s"),
@@ -55,6 +57,7 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
     LinkUpdate {
         state,
         label,
+        connection_label: connection_label(link, &retry),
         retry_in_s,
         can_retry_now: matches!(link, Link::Reconnecting { .. }),
         rejected: matches!(link, Link::Rejected(_)),
@@ -65,6 +68,22 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
             1 => Some("1 approval elsewhere".to_owned()),
             n => Some(format!("{n} approvals elsewhere")),
         },
+    }
+}
+
+/// The link as Settings says it, with the round trip while online;
+/// `retry` is the countdown while reconnecting.
+fn connection_label(link: &Link, retry: &str) -> String {
+    match link {
+        Link::Unpaired => "Not paired".to_owned(),
+        Link::Connecting => "Connecting…".to_owned(),
+        Link::Online { latency_ms } => format!("Connected · {latency_ms} ms"),
+        Link::CatchingUp { have, server } => format!("Syncing · {}/{}", have.0, server.0),
+        Link::Reconnecting { .. } => format!("Offline · {retry}"),
+        Link::Rejected(LinkRejection::Revoked) => "Device revoked".to_owned(),
+        Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => {
+            format!("Protocol mismatch · client v{client}, server v{server}")
+        }
     }
 }
 
@@ -143,6 +162,7 @@ mod tests {
             "a button to show"
         );
         let banner = update(&reconnecting, 0, 1, now);
+        assert_eq!(banner.connection_label, "Offline · retry in 07s");
         assert_eq!(banner.retry_in_s, Some(7));
         assert!(banner.can_retry_now);
         assert_eq!(
@@ -157,6 +177,36 @@ mod tests {
         let due = update(&reconnecting, 0, 0, at.timestamp_millis() + 10);
         assert_eq!(due.retry_in_s, Some(0));
         assert!(due.label.contains("retrying…"));
+        assert_eq!(due.connection_label, "Offline · retrying…");
         assert_eq!(next_change(&reconnecting, at.timestamp_millis()), None);
+    }
+
+    #[test]
+    fn settings_says_the_link_with_its_latency_while_online() {
+        let cases = [
+            (Link::Unpaired, "Not paired"),
+            (Link::Connecting, "Connecting…"),
+            (Link::Online { latency_ms: 12 }, "Connected · 12 ms"),
+            (
+                Link::CatchingUp {
+                    have: Seq(4),
+                    server: Seq(9),
+                },
+                "Syncing · 4/9",
+            ),
+            (Link::Rejected(LinkRejection::Revoked), "Device revoked"),
+            (
+                Link::Rejected(LinkRejection::ProtocolMismatch {
+                    client: 3,
+                    server: 4,
+                }),
+                "Protocol mismatch · client v3, server v4",
+            ),
+        ];
+        for (link, label) in cases {
+            // Said whatever is queued, and even while the banner hides.
+            assert_eq!(update(&link, 0, 0, 0).connection_label, label, "{link:?}");
+            assert_eq!(update(&link, 2, 1, 0).connection_label, label, "{link:?}");
+        }
     }
 }
