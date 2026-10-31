@@ -4,14 +4,16 @@
 
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
-    CompletionStatus, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView,
-    PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView, SessionRow,
-    SessionState, SessionUsage, SessionView, SettingsView, Snippet, TimelineItem, ViewState,
+    CompletionStatus, Effort, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
+    PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView,
+    SessionRow, SessionState, SessionUsage, SessionView, SettingsView, Snippet, TimelineItem,
+    ViewState,
 };
 use skywave_present::format::{
-    agent_mode_label, agent_model_label, answer_words, blob_size, bytes, delivery_label, dollars,
-    fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal,
-    outgoing_label, scope_label, tokens, turn_time,
+    agent_effort_label, agent_mode_label, agent_model_label, answer_words, blob_size, bytes,
+    delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail, mode_label,
+    mode_needs_confirmation, mode_refusal, model_refusal, outgoing_label, scope_label, tokens,
+    turn_time,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -19,9 +21,9 @@ use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sec
 use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerView, CreatePrompt, CreatingView, ListKindView, ModeOption, ModelOption, PairForm,
-    PairingState, PermissionModeView, RenamePrompt, RuleOption, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, SnippetView, ToolKindView,
+    ComposerView, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
+    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -347,7 +349,15 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
             .map_or(c.value.as_str(), |m| m.label.as_str());
         failed(c.outgoing.as_ref()).map(|why| (label, why))
     });
+    let effort_failed = agent
+        .effort_change
+        .as_ref()
+        .and_then(|c| failed(c.outgoing.as_ref()).map(|why| (effort_label(c.value), why)));
     let waiting = AgentView {
+        effort_change: agent
+            .effort_change
+            .clone()
+            .filter(|_| effort_failed.is_none()),
         mode_change: agent.mode_change.clone().filter(|_| mode_failed.is_none()),
         model_change: agent
             .model_change
@@ -375,6 +385,8 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
         },
         model_label: agent_model_label(&waiting)
             .map_or_else(|| "model unknown".to_owned(), |l| clean_line(&l)),
+        effort_label: agent_effort_label(&waiting)
+            .map_or_else(|| "effort unknown".to_owned(), |l| clean_line(&l)),
         model_name: agent.model.as_deref().map(clean_line),
         mode_refusal: mode_failed
             .map(failure)
@@ -383,6 +395,10 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
         model_refusal: model_failed
             .map(failure)
             .or_else(|| model_refusal(agent))
+            .map(|r| clean_line(&r)),
+        effort_refusal: effort_failed
+            .map(failure)
+            .or_else(|| effort_refusal(agent))
             .map(|r| clean_line(&r)),
         modes: PermissionMode::ALL
             .into_iter()
@@ -410,6 +426,27 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
                 pending: pending_model != current_model && pending_model == Some(m.id.as_str()),
             })
             .collect(),
+        efforts: agent
+            .efforts()
+            .iter()
+            .map(|&e| EffortOption {
+                effort: effort_view(e),
+                label: effort_label(e).to_owned(),
+                current: agent.effort == Some(Some(e)),
+                pending: agent.effort != Some(Some(e))
+                    && waiting.effort_change.as_ref().is_some_and(|c| c.value == e),
+            })
+            .collect(),
+    }
+}
+
+fn effort_view(effort: Effort) -> EffortView {
+    match effort {
+        Effort::Low => EffortView::Low,
+        Effort::Medium => EffortView::Medium,
+        Effort::High => EffortView::High,
+        Effort::XHigh => EffortView::XHigh,
+        Effort::Max => EffortView::Max,
     }
 }
 

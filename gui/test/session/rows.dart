@@ -85,11 +85,12 @@ ModeOption _mode(
   pending: false,
 );
 
-/// An agent in ask mode running Sonnet, with every mode and two models
-/// to switch to.
+/// An agent in ask mode running Sonnet at medium effort, with every mode
+/// and two models to switch to, and three efforts.
 final askAgent = AgentSettingsView(
   modeLabel: 'ask',
   modelLabel: 'Sonnet',
+  effortLabel: 'effort medium',
   modelName: 'model-s',
   modes: [
     _mode(PermissionModeView.ask, 'ask', current: true),
@@ -108,6 +109,26 @@ final askAgent = AgentSettingsView(
       pending: false,
     ),
     ModelOption(id: 'opus', label: 'Opus', current: false, pending: false),
+  ],
+  efforts: const [
+    EffortOption(
+      effort: EffortView.low,
+      label: 'low',
+      current: false,
+      pending: false,
+    ),
+    EffortOption(
+      effort: EffortView.medium,
+      label: 'medium',
+      current: true,
+      pending: false,
+    ),
+    EffortOption(
+      effort: EffortView.high,
+      label: 'high',
+      current: false,
+      pending: false,
+    ),
   ],
 );
 

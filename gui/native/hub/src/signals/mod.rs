@@ -26,9 +26,9 @@ pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiInt
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerView, CreatePrompt, CreatingView, ListKindView, ModeOption, ModelOption, PairForm,
-    PairingState, PermissionModeView, RenamePrompt, RuleOption, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, SnippetView,
+    ComposerView, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
+    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use timeline::{

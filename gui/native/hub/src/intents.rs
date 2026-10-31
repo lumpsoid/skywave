@@ -1,10 +1,12 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
-use skywave_core::{Action, BlobPolicy, Decision, PermissionMode, Route};
+use skywave_core::{Action, BlobPolicy, Decision, Effort, PermissionMode, Route};
 use uuid::Uuid;
 
-use crate::signals::{ActionIntent, BlobPolicyChoice, DecisionView, PermissionModeView, RouteView};
+use crate::signals::{
+    ActionIntent, BlobPolicyChoice, DecisionView, EffortView, PermissionModeView, RouteView,
+};
 
 /// `intent` as a core action, or why it is not one.
 pub fn action(intent: ActionIntent) -> Result<Action, String> {
@@ -41,6 +43,13 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::SetModel { session_id, model } => Action::SetModel {
             session_id: id("session", &session_id)?,
             model,
+        },
+        ActionIntent::SetEffort {
+            session_id,
+            effort: e,
+        } => Action::SetEffort {
+            session_id: id("session", &session_id)?,
+            effort: effort(e),
         },
         ActionIntent::SetSessionArchived {
             session_id,
@@ -95,6 +104,16 @@ fn permission_mode(mode: PermissionModeView) -> PermissionMode {
     }
 }
 
+fn effort(effort: EffortView) -> Effort {
+    match effort {
+        EffortView::Low => Effort::Low,
+        EffortView::Medium => Effort::Medium,
+        EffortView::High => Effort::High,
+        EffortView::XHigh => Effort::XHigh,
+        EffortView::Max => Effort::Max,
+    }
+}
+
 /// A UUID id of the kind `what`, as core's id types take it.
 pub fn id<T: From<Uuid>>(what: &str, text: &str) -> Result<T, String> {
     Uuid::parse_str(text)
@@ -142,6 +161,16 @@ mod tests {
             Ok(Action::SetModel {
                 session_id: session,
                 model: "opus".into(),
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::SetEffort {
+                session_id: session.0.to_string(),
+                effort: EffortView::XHigh,
+            }),
+            Ok(Action::SetEffort {
+                session_id: session,
+                effort: Effort::XHigh,
             })
         );
         assert!(
