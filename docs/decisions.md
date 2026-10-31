@@ -190,3 +190,80 @@ service) and the core is suspended once none does.
 MVP per D9: the core's data dir, including the device key, lives under
 `Context.filesDir`, which only the app can read.
 **Deferred (A19):** Keystore-backed signer via an FFI callback.
+
+## D23. Head-side presentation and policies live in `skywave-present`
+What a head decides beyond `ViewState` (timeline sections and which item is
+selectable or discardable, neutral wording for bytes, durations, failures
+and rejections, UTF-16 cursor conversion, and the clock-free policies:
+draft debounce, read marks, approval alerts, prompt history, completion,
+timeline search) lives in one crate above `skywave-core`. The TUI and the
+Flutter hub both import it; each keeps only what is purely UI (key maps,
+key hints, geometry, colours).
+- Policies never read the clock: they take `Instant` and return the actions
+  due plus their next wake-up, so they test without timers.
+- It has no rinf and no UI framework. The TUI is the proof: if the GUI
+  needed something the TUI could not use, it would have leaked.
+- D16's rule ("logic goes into core's `ViewState`, not into the mirror")
+  is about the FFI mirror gaining logic, and still holds there. Present is
+  a separate crate, so the spirit holds: one Rust owner per rule.
+- The Android head keeps its own Kotlin presentation; moving it onto
+  present would need UniFFI mirrors of present's types.
+**Why:** reimplementing in Dart would make a third copy after the TUI and
+Kotlin, and break "heads only render" (D2). The hub must stay pure mapping,
+so it cannot own the logic either. Core's `ViewState` is the wrong home for
+head wording ("press d").
+
+## D24. Flutter head over rinf; Flutter only renders
+The GUI head (`gui/`) is Flutter, bridged to Rust by rinf 8.11. Its Rust
+side, `hub`, owns the head's state and does the mapping; Dart holds one
+holder per signal and performs platform effects with one plugin call each.
+- **Intents:** one `GuiIntent` DartSignal enum. rinf orders signals only
+  within a type, and order matters: an edit before the `Back` that saves
+  it, a typed query before the step through it.
+- **Timeline:** sent as a `Snapshot`, then `Upserted`/`Removed` diffs keyed
+  by item (`s:<seq>`, `p:<command id>`). The core pushes the whole
+  `ViewState` on every change; resending a long timeline per keystroke
+  would rebuild all of it in Dart.
+- **Dispatch:** one dedicated thread takes actions from a FIFO queue.
+  `dispatch` blocks on SQLite, so it cannot run on the hub task, and
+  `spawn_blocking` would not keep the order the policies rely on (a draft
+  saved before the send that follows it).
+- Leaving the app is reported, not decided: Dart sends
+  `AppBackgrounded`/`AppForegrounded`, and the hub suspends and resumes the
+  core on Android and iOS only.
+**Why:** one owner per rule (D2, D23) and a bridge thin enough to read;
+rinf's message passing keeps Rust's state off the Dart side.
+**Deferred:** Android background work (A15's service and periodic
+catch-up), notifications while suspended, deep links and QR scanning.
+
+## D25. The GUI has its own data dir and pairs as its own device
+The hub opens the core in `<application support dir>/skywave`, which Dart
+resolves with `path_provider`, and pairs under the host name (desktop) or
+platform name (mobile). On desktop too it never shares the TUI's data.
+**Why:** two processes driving one replica is outside D17 (one core per
+process): two engines would race on the cursor and the outbox. Separate
+devices is what the server already models (D5). On Android the app id is
+`dev.skywave.gui`, so it installs beside the Kotlin head.
+
+## D26. GUI platforms: Linux and Android verified, Apple and Windows scaffolded, no web
+- **Built and run:** Linux desktop and Android.
+- **Scaffolded, never built:** macOS, iOS, Windows. Their platform folders,
+  cargokit wiring, entitlements, local-network usage string and
+  notification setup are in place, but no toolchain was at hand, so nothing
+  says they build.
+- **Web: not supported.** `skywave-core` cannot target wasm32: it needs
+  tokio's multi-threaded runtime, `std::thread`, TCP sockets, bundled
+  SQLite (C), `std::time::Instant` (panics on wasm32), and ring and
+  getrandom built without their wasm backends. A web head would need a fetch- or WebSocket-based `Transport`,
+  IndexedDB or OPFS storage, and no threads: its own project. `gui/` has no
+  `web/` folder, so nothing suggests support that is not there.
+
+## D27. A hot restart reopens the core, one at a time
+rinf 8.11 reruns the whole Rust `main` on a Flutter hot restart, while the
+old runtime is still shutting down. The hub closes the core on
+`dart_shutdown`, and a process-wide `CORE_SLOT` lock makes the new
+runtime's open wait until the old core has closed.
+**Why:** D17 allows one core per process; two engines on one data dir
+would race. Reopening costs a cold start from the replica, which is the
+normal path anyway. Within one runtime, `AppReady` asks the hub to resend
+everything, so a rebuilt widget tree starts whole.

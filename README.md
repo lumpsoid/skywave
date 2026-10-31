@@ -277,7 +277,9 @@ session), including when it is in the background or not running:
 | `skywave-core` | All client logic: local replica, outbox, sync engine, blob downloads, view state |
 | `skywave-tui` | Terminal head built on ratatui; renders the core's view state and nothing else |
 | `skywave-proto` | Versioned, agent-agnostic wire types |
+| `skywave-present` | Head-side presentation the TUI and the GUI share: timeline sections, wording, draft, read-mark and alert policies |
 | `skywave-core-ffi` | UniFFI bindings the Android head (`android/`) builds against |
+| `gui/` | Flutter GUI head over rinf; its Rust bridge `hub` is in `gui/native/hub` |
 | `skywave-testkit` | Link harness: a proxy that injects latency, jitter, bandwidth caps and drops |
 
 A few design choices that make it hold up:
@@ -297,6 +299,15 @@ A few design choices that make it hold up:
 More detail in [`docs/architecture.md`](docs/architecture.md),
 [`docs/mvp-spec.md`](docs/mvp-spec.md) and
 [`docs/decisions.md`](docs/decisions.md).
+
+### GUI build
+
+A Flutter GUI head lives in [`gui/`](gui): a desktop and mobile app that
+pairs as its own device and renders what the core and `skywave-present`
+decide, with system notifications for approvals. Linux and Android are
+built and run; macOS, iOS and Windows are scaffolded but not yet built; web
+is not supported. Build steps per platform, including `rinf gen` after a
+fresh checkout, are in [`gui/README.md`](gui/README.md).
 
 ### Android build
 
