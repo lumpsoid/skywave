@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
@@ -145,6 +147,7 @@ class _SessionPageState extends State<SessionPage> {
                 onPressed: () => widget.send.act(const ActionIntentBack()),
               ),
               titleSpacing: 0,
+              toolbarHeight: _Title.heightOf(context),
               title: _Title(screen: screen),
               actions: [
                 IconButton(
@@ -185,7 +188,7 @@ class _SessionPageState extends State<SessionPage> {
                 ),
               ],
               bottom: PreferredSize(
-                preferredSize: const Size.fromHeight(26),
+                preferredSize: Size.fromHeight(StatusLine.heightOf(context)),
                 child: StatusLine(screen: screen, send: widget.send),
               ),
             ),
@@ -341,6 +344,16 @@ class _Title extends StatelessWidget {
   const _Title({required this.screen});
 
   final SessionScreen screen;
+
+  /// The toolbar's height: the standard one, or taller when the text
+  /// scale makes the title's two lines and a margin (8) need more.
+  static double heightOf(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final lines =
+        lineHeightOf(context, text.titleMedium!) +
+        lineHeightOf(context, text.labelMedium!);
+    return max(kToolbarHeight, (lines + 8).ceilToDouble());
+  }
 
   @override
   Widget build(BuildContext context) {

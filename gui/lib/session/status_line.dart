@@ -17,6 +17,12 @@ class StatusLine extends StatelessWidget {
   final SessionScreen screen;
   final SendIntent send;
 
+  /// The line's height at the context's text scale: one line of its
+  /// labels, the chips' padding (4) and the line's (8).
+  static double heightOf(BuildContext context) =>
+      (lineHeightOf(context, Theme.of(context).textTheme.labelMedium!) + 12)
+          .ceilToDouble();
+
   void _showRules(BuildContext context) {
     showDialog<void>(
       context: context,

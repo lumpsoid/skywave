@@ -840,6 +840,46 @@ void main() {
       expect(find.text('bypass refused: not launched for it'), findsOneWidget);
     });
 
+    testWidgets('the header grows with the text scale; nothing clips', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(360, 760)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: const TextScaler.linear(1.5)),
+              child: SessionPage(
+                screen: screenWith(usage: [r'$0.04']),
+                timeline: holding([row('s:1', 'first row')]),
+                send: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      final bar = tester.getRect(find.byType(AppBar));
+      final title = tester.getRect(find.text('work'));
+      final workdir = tester.getRect(
+        find.textContaining('/home/me/work', findRichText: true),
+      );
+      final mode = tester.getRect(find.text('ask'));
+      final first = tester.getRect(find.text('first row'));
+      expect(title.top, greaterThanOrEqualTo(bar.top));
+      expect(workdir.top, greaterThanOrEqualTo(title.bottom));
+      expect(mode.top, greaterThanOrEqualTo(workdir.bottom));
+      expect(mode.bottom, lessThanOrEqualTo(bar.bottom));
+      expect(first.top, greaterThanOrEqualTo(bar.bottom));
+    });
+
     testWidgets('long labels are cut short on a phone', (tester) async {
       tester.view
         ..physicalSize = const Size(360, 700)
