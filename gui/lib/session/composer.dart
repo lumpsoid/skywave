@@ -225,9 +225,7 @@ class ComposerState extends State<Composer> {
                       textInputAction: TextInputAction.newline,
                       textCapitalization: TextCapitalization.sentences,
                       decoration: InputDecoration(
-                        hintText: enterSends
-                            ? 'Message the agent  ·  Enter sends, Shift+Enter new line'
-                            : 'Message the agent',
+                        hintText: 'Message the agent',
                         filled: true,
                         fillColor: theme.colorScheme.surfaceContainerHighest,
                         isDense: true,
