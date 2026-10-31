@@ -14,13 +14,13 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, Delivery,
-    DeviceId, Draft, Entry, FailReason, Link, LinkRejection, PairedCredentials, Request, Route,
-    Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
+    DeviceId, Draft, Entry, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam,
+    Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    RuleScope, RuleSuggestion, SessionState as LogState, ToolCall, ToolDisplay, ToolKind,
-    ToolResult, TurnUsage,
+    RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ToolCall, ToolDisplay,
+    ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -1010,12 +1010,12 @@ fn refused_creations_say_why() {
     let cases = [
         (
             "/etc",
-            FailReason::WorkdirNotAllowed,
+            RejectReason::WorkdirNotAllowed,
             "not under a configured root on the server",
         ),
         (
             "/srv/missing",
-            FailReason::WorkdirNotFound,
+            RejectReason::WorkdirNotFound,
             "no such directory on the server",
         ),
     ];
@@ -1382,7 +1382,7 @@ fn own_messages_show_their_delivery_state() {
         .command_result(
             command,
             &CommandResult::Rejected {
-                reason: FailReason::UnknownSession,
+                reason: RejectReason::UnknownSession,
             },
         )
         .unwrap();
@@ -1589,7 +1589,7 @@ fn interrupt_key_and_its_delivery_state() {
         .command_result(
             command,
             &CommandResult::Rejected {
-                reason: FailReason::NoActiveTurn,
+                reason: RejectReason::NoActiveTurn,
             },
         )
         .unwrap();
@@ -3827,7 +3827,7 @@ fn edit_and_cancel_a_queued_message() {
         .command_result(
             sent[0],
             &CommandResult::Rejected {
-                reason: FailReason::UnknownSession,
+                reason: RejectReason::UnknownSession,
             },
         )
         .unwrap();
@@ -3861,7 +3861,7 @@ fn dismiss_refused_creation() {
         .command_result(
             refused,
             &CommandResult::Rejected {
-                reason: FailReason::WorkdirNotAllowed,
+                reason: RejectReason::WorkdirNotAllowed,
             },
         )
         .unwrap();
@@ -4003,7 +4003,7 @@ fn selected_own_message_shows_delivery_detail() {
         .command_result(
             refused,
             &CommandResult::Rejected {
-                reason: FailReason::UnknownSession,
+                reason: RejectReason::UnknownSession,
             },
         )
         .unwrap();

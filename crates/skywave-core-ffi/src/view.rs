@@ -261,7 +261,8 @@ impl From<sc::Outgoing> for Outgoing {
     }
 }
 
-/// Why the server refused a command.
+/// Why a command failed for good: the server's reject reasons and
+/// `Undeliverable`, flat so Kotlin sees a plain enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FailReason {
     WorkdirNotAllowed,
@@ -273,19 +274,25 @@ pub enum FailReason {
     ApprovalCancelled,
     NoActiveTurn,
     UnknownRule,
+    /// The server refused the request itself, without an answer.
+    Undeliverable,
 }
 
 impl From<sc::FailReason> for FailReason {
     fn from(r: sc::FailReason) -> Self {
-        match r {
-            sc::FailReason::WorkdirNotAllowed => FailReason::WorkdirNotAllowed,
-            sc::FailReason::WorkdirNotFound => FailReason::WorkdirNotFound,
-            sc::FailReason::UnknownSession => FailReason::UnknownSession,
-            sc::FailReason::UnknownApproval => FailReason::UnknownApproval,
-            sc::FailReason::ApprovalAlreadyResolved => FailReason::ApprovalAlreadyResolved,
-            sc::FailReason::ApprovalCancelled => FailReason::ApprovalCancelled,
-            sc::FailReason::NoActiveTurn => FailReason::NoActiveTurn,
-            sc::FailReason::UnknownRule => FailReason::UnknownRule,
+        use sc::RejectReason as R;
+        let sc::FailReason::Rejected(reason) = r else {
+            return FailReason::Undeliverable;
+        };
+        match reason {
+            R::WorkdirNotAllowed => FailReason::WorkdirNotAllowed,
+            R::WorkdirNotFound => FailReason::WorkdirNotFound,
+            R::UnknownSession => FailReason::UnknownSession,
+            R::UnknownApproval => FailReason::UnknownApproval,
+            R::ApprovalAlreadyResolved => FailReason::ApprovalAlreadyResolved,
+            R::ApprovalCancelled => FailReason::ApprovalCancelled,
+            R::NoActiveTurn => FailReason::NoActiveTurn,
+            R::UnknownRule => FailReason::UnknownRule,
         }
     }
 }
@@ -1579,7 +1586,7 @@ mod tests {
             sc::Outgoing::Queued,
             sc::Outgoing::Sending,
             sc::Outgoing::Accepted(sc::Seq(11)),
-            sc::Outgoing::Failed(sc::FailReason::NoActiveTurn),
+            sc::Outgoing::Failed(sc::FailReason::Rejected(sc::RejectReason::NoActiveTurn)),
         ]);
         assert_eq!(
             converted,
@@ -1597,14 +1604,15 @@ mod tests {
     #[test]
     fn fail_reason_converts_every_variant() {
         let converted: Vec<FailReason> = convert(vec![
-            sc::FailReason::WorkdirNotAllowed,
-            sc::FailReason::WorkdirNotFound,
-            sc::FailReason::UnknownSession,
-            sc::FailReason::UnknownApproval,
-            sc::FailReason::ApprovalAlreadyResolved,
-            sc::FailReason::ApprovalCancelled,
-            sc::FailReason::NoActiveTurn,
-            sc::FailReason::UnknownRule,
+            sc::FailReason::Rejected(sc::RejectReason::WorkdirNotAllowed),
+            sc::FailReason::Rejected(sc::RejectReason::WorkdirNotFound),
+            sc::FailReason::Rejected(sc::RejectReason::UnknownSession),
+            sc::FailReason::Rejected(sc::RejectReason::UnknownApproval),
+            sc::FailReason::Rejected(sc::RejectReason::ApprovalAlreadyResolved),
+            sc::FailReason::Rejected(sc::RejectReason::ApprovalCancelled),
+            sc::FailReason::Rejected(sc::RejectReason::NoActiveTurn),
+            sc::FailReason::Rejected(sc::RejectReason::UnknownRule),
+            sc::FailReason::Undeliverable,
         ]);
         assert_eq!(
             converted,
@@ -1617,6 +1625,7 @@ mod tests {
                 FailReason::ApprovalCancelled,
                 FailReason::NoActiveTurn,
                 FailReason::UnknownRule,
+                FailReason::Undeliverable,
             ]
         );
     }
@@ -2205,7 +2214,9 @@ mod tests {
                 answer: Some(sc::Answer {
                     decision: sc::Decision::Deny,
                     rule: None,
-                    outgoing: sc::Outgoing::Failed(sc::FailReason::ApprovalCancelled),
+                    outgoing: sc::Outgoing::Failed(sc::FailReason::Rejected(
+                        sc::RejectReason::ApprovalCancelled,
+                    )),
                     delivery: None,
                     retryable: false,
                 }),

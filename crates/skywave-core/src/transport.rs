@@ -139,6 +139,23 @@ impl TransportError {
         }
     }
 
+    /// The server refused this one command for good, so the outbox gives
+    /// up on it rather than resend it ahead of every later one: a 4xx that
+    /// is about the request (not the device, 401/403, nor the endpoint,
+    /// 404; 408 and 429 only ask to come back later). An unreadable
+    /// response is not a refusal: the server may have taken the command,
+    /// and failing it would invite the user to send it twice. A
+    /// [`CommandResult`] rejection is an answer, not an error, and never
+    /// gets here.
+    pub fn refuses_command(&self) -> bool {
+        match self {
+            TransportError::BadStatus(status) => {
+                (400..500).contains(status) && !matches!(status, 408 | 429)
+            }
+            _ => false,
+        }
+    }
+
     /// The server refuses this device for good: the link becomes
     /// [`Link::Rejected`](crate::Link::Rejected) until the user re-pairs.
     pub fn rejection(&self) -> Option<LinkRejection> {
@@ -184,5 +201,13 @@ mod tests {
             })
         );
         assert_eq!(TransportError::Io("x".into()).rejection(), None);
+        assert!(TransportError::BadStatus(400).refuses_command());
+        assert!(TransportError::BadStatus(413).refuses_command());
+        assert!(!TransportError::Decode("x".into()).refuses_command());
+        assert!(!TransportError::BadStatus(429).refuses_command());
+        assert!(!TransportError::BadStatus(500).refuses_command());
+        assert!(!TransportError::NotFound.refuses_command());
+        assert!(!TransportError::Revoked.refuses_command());
+        assert!(!TransportError::Timeout.refuses_command());
     }
 }

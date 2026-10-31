@@ -24,8 +24,8 @@ use ratatui::widgets::{
 };
 use skywave_core::{
     BlobPolicy, CandidateSource, Completion, CompletionStatus, Decision, FailReason, Link,
-    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RuleScope,
-    RuleSuggestion, Screen, SessionListView, SessionRow, SessionState, SettingsView,
+    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RejectReason,
+    RuleScope, RuleSuggestion, Screen, SessionListView, SessionRow, SessionState, SettingsView,
 };
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
@@ -941,17 +941,25 @@ pub(crate) fn outgoing_label(outgoing: &Outgoing) -> String {
     }
 }
 
-/// Why the server refused a command, in words.
+/// Why a command failed, in words.
 fn fail_reason(reason: FailReason) -> &'static str {
     match reason {
-        FailReason::WorkdirNotAllowed => "not under a configured root on the server",
-        FailReason::WorkdirNotFound => "no such directory on the server",
-        FailReason::UnknownSession => "the server does not know this session",
-        FailReason::UnknownApproval => "the server does not know this approval",
-        FailReason::ApprovalAlreadyResolved => "already answered on another device",
-        FailReason::ApprovalCancelled => "the approval was cancelled first",
-        FailReason::NoActiveTurn => "the agent was not working",
-        FailReason::UnknownRule => "the agent did not offer that rule",
+        FailReason::Rejected(reason) => reject_reason(reason),
+        FailReason::Undeliverable => "the server could not take it",
+    }
+}
+
+/// Why the server refused a command, in words.
+fn reject_reason(reason: RejectReason) -> &'static str {
+    match reason {
+        RejectReason::WorkdirNotAllowed => "not under a configured root on the server",
+        RejectReason::WorkdirNotFound => "no such directory on the server",
+        RejectReason::UnknownSession => "the server does not know this session",
+        RejectReason::UnknownApproval => "the server does not know this approval",
+        RejectReason::ApprovalAlreadyResolved => "already answered on another device",
+        RejectReason::ApprovalCancelled => "the approval was cancelled first",
+        RejectReason::NoActiveTurn => "the agent was not working",
+        RejectReason::UnknownRule => "the agent did not offer that rule",
     }
 }
 

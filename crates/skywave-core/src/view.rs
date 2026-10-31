@@ -11,9 +11,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use skywave_proto::Fingerprint;
 
-pub use skywave_proto::RejectReason as FailReason;
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, RuleScope,
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, RejectReason, RuleScope,
     RuleSuggestion, Seq, SessionId, ToolKind, TurnUsage,
 };
 
@@ -145,7 +144,32 @@ impl From<&OutboxStatus> for Outgoing {
             OutboxStatus::Queued => Outgoing::Queued,
             OutboxStatus::Sending => Outgoing::Sending,
             OutboxStatus::Done(CommandResult::Accepted { seq }) => Outgoing::Accepted(*seq),
-            OutboxStatus::Done(CommandResult::Rejected { reason }) => Outgoing::Failed(*reason),
+            OutboxStatus::Done(CommandResult::Rejected { reason }) => {
+                Outgoing::Failed(FailReason::Rejected(*reason))
+            }
+            OutboxStatus::Undeliverable => Outgoing::Failed(FailReason::Undeliverable),
+        }
+    }
+}
+
+/// Why one of this device's commands failed for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailReason {
+    /// The server answered with a refusal.
+    Rejected(RejectReason),
+    /// The server refused the request itself rather than answer it: a bug
+    /// or a version skew, not a domain answer. Sending it again would fail
+    /// the same way.
+    Undeliverable,
+}
+
+impl FailReason {
+    /// [`RejectReason::rules_out_answers`]; an undeliverable answer never
+    /// applied, so another may be given.
+    pub fn rules_out_answers(self) -> bool {
+        match self {
+            FailReason::Rejected(reason) => reason.rules_out_answers(),
+            FailReason::Undeliverable => false,
         }
     }
 }
@@ -160,7 +184,7 @@ pub struct Delivery {
     /// When it was first claimed for sending; `None` before that, and for
     /// commands sent before this was recorded (`tries` is then 1).
     pub first_sent_at: Option<DateTime<Utc>>,
-    /// When the server's answer was recorded.
+    /// When the server's answer, or its refusal of the request, was recorded.
     pub answered_at: Option<DateTime<Utc>>,
     /// How often it was claimed for sending; more than once means resends.
     pub tries: u32,

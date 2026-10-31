@@ -774,6 +774,14 @@ impl Model {
         }
     }
 
+    /// Mirrors [`Store::record_undeliverable`](crate::Store::record_undeliverable).
+    pub(crate) fn command_undeliverable(&mut self, id: CommandId, now: DateTime<Utc>) {
+        if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
+            entry.status = OutboxStatus::Undeliverable;
+            entry.answered_at = Some(now);
+        }
+    }
+
     /// Returns the approvals newly marked alerted, as
     /// [`apply_batch`](Model::apply_batch).
     pub(crate) fn set_link(&mut self, link: Link) -> Vec<(SessionId, ApprovalId)> {
@@ -1549,7 +1557,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::view::{CandidateSource, Completion, CompletionStatus, LinkRejection};
+    use crate::view::{CandidateSource, Completion, CompletionStatus, FailReason, LinkRejection};
 
     /// Paired as `device` with a server CA whose DER is `b"ca"`.
     fn paired_as(device: DeviceId) -> Paired {
@@ -1940,7 +1948,7 @@ mod tests {
             TimelineItem::Pending {
                 command_id,
                 text,
-                outgoing: Outgoing::Failed(RejectReason::UnknownSession),
+                outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::UnknownSession)),
                 discardable: true,
                 delivery: Some(Delivery {
                     first_sent_at: None,
@@ -2040,7 +2048,7 @@ mod tests {
         let refused = f.session_view().pending_approval.unwrap().answer.unwrap();
         assert_eq!(
             refused.outgoing,
-            Outgoing::Failed(RejectReason::ApprovalAlreadyResolved)
+            Outgoing::Failed(FailReason::Rejected(RejectReason::ApprovalAlreadyResolved))
         );
         assert!(!refused.retryable);
         assert!(f.dispatch(answer.clone()).is_empty());
@@ -2149,7 +2157,7 @@ mod tests {
         );
         assert_eq!(
             answer.outgoing,
-            Outgoing::Failed(RejectReason::ApprovalCancelled)
+            Outgoing::Failed(FailReason::Rejected(RejectReason::ApprovalCancelled))
         );
         assert!(!answer.retryable);
     }
@@ -2463,7 +2471,9 @@ mod tests {
         assert_eq!((row.title.as_str(), row.named), ("app", false));
         assert_eq!(
             row.rename,
-            Some(Outgoing::Failed(RejectReason::UnknownSession))
+            Some(Outgoing::Failed(FailReason::Rejected(
+                RejectReason::UnknownSession
+            )))
         );
         assert!(
             f.dispatch(rename(SessionId::new(), "x")).is_empty(),

@@ -166,6 +166,18 @@ impl Seam {
         })
     }
 
+    /// The server refused the command's request without an answer
+    /// ([`TransportError::refuses_command`]): it fails for good and the
+    /// outbox moves on.
+    pub fn command_undeliverable(&self, id: CommandId) -> Result<(), CoreError> {
+        let now = Utc::now();
+        self.update(|state| {
+            state.store.record_undeliverable(id, now)?;
+            state.model.command_undeliverable(id, now);
+            Ok(((), Vec::new()))
+        })
+    }
+
     pub fn set_link(&self, link: Link) {
         self.core
             .shared
