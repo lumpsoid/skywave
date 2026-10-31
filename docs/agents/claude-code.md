@@ -537,28 +537,109 @@ model (only `system/init` at the next turn does):
 
 **Offered models.** The `initialize` answer lists them: `value` (what
 `set_model` takes), `displayName`, `description`, `resolvedModel`, plus
-effort and thinking capabilities Skywave does not use.
+effort and thinking capabilities. The effort ones are read: a model with
+`supportsEffort: true` takes the levels in `supportedEffortLevels` (e.g.
+`["low","medium","high","xhigh","max"]`; `claude-opus-4-6` has no `xhigh`),
+which become `ModelChoice.efforts`; a level skywaved has no name for is
+skipped. `claude-haiku-4-5-20251001` has neither field and takes none. The
+thinking capabilities are not used.
 
-### 3.9 How skywaved drives mode and model
+### 3.9 How skywaved drives mode, model and effort
 
-- A `SetPermissionMode` / `SetModel` command logs a `…Requested` event; the
-  supervisor sends `set_permission_mode` / `set_model` and logs the
-  `control_response` as `PermissionModeChanged` / `ModelChanged` or
+- A `SetPermissionMode` / `SetModel` / `SetEffort` command logs a
+  `…Requested` event; the supervisor sends `set_permission_mode` /
+  `set_model` / the effort chain (§3.10) and logs the answer as
+  `PermissionModeChanged` / `ModelChanged` / `EffortChanged` or
   `…Refused`, naming the command (`answers`). A session whose agent is not
   running is started for it (no message, so no model call).
-- Every agent start asks for the mode and model the log wants (the open
-  request, else what the agent last ran with), with these same control
-  requests after `initialize`, so a resumed or restarted process keeps
-  both (§3.2: they die with the process otherwise).
+- Every agent start asks for the mode, model and effort the log wants (the
+  open request, else what the agent last ran with), in that order, with
+  these same control requests after `initialize`, so a resumed or restarted
+  process keeps all three (§3.2: they die with the process otherwise).
 - What the CLI says unasked is logged when it differs from the log:
   `current_permission_mode` from `initialize`, `permissionMode` and `model`
   from each `system/init`, and a `system/status` that is not the echo of a
   switch the adapter asked for (an approved `ExitPlanMode`, §3.7). The
   `models` of `initialize` are logged as `ModelsOffered` when they differ
-  from the newest list in the log.
+  from the newest list in the log. The effort is said by nobody unasked,
+  so the adapter reads it (`get_settings`, §3.10) after the `initialize`
+  answer and after every successful `set_model`, and logs it like the rest.
 - Bypass is offered like any mode; without `--dangerously-skip-permissions`
   in `agent.args` the CLI refuses it (`bypass_not_launched`) and the
   refusal is logged (§3.6 is about rule suggestions, not this switch).
+
+### 3.10 Changing effort mid-session [C]
+
+Recorded with 2.1.310 on 2026-10-31 (`effort_switch.ndjson`): control
+requests only, no user message, so no model call.
+
+**Request (stdin → CLI)**: the flag-settings layer, at any time:
+
+```json
+{"type":"control_request","request_id":"<uuid>","request":{"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}}}
+```
+
+`effortLevel` is one of `low`, `medium`, `high`, `xhigh`, `max`.
+
+**The ack proves nothing.** Success is an empty `control_response`, with
+no `response` body:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"…"}}
+```
+
+and the same comes back for `"bogus"`, which is silently ignored, and for
+a level the running model does not take. The binary can also answer an
+error (`apply_flag_settings: CLAUDE_CODE_EFFORT_LEVEL overrides effort for
+this session`, `…unrecognized effortLevel`); none was recorded.
+
+**The effort in force** comes from `get_settings`:
+
+```json
+{"type":"control_request","request_id":"<uuid>","request":{"subtype":"get_settings"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"applied":{"model":"claude-haiku-5-5","effort":"high", …},"effective":{…},"sources":[…]}}}
+```
+
+`applied.effort` is a level, or `null` when the running model takes none
+(`claude-haiku-4-5-20251001`). Don't read `effective.effortLevel`: that is
+the flag layer, and it is `null` for `max`, which is session-only. The
+answer's `effective` (the merged settings layers) and `sources` can hold the
+user's `env`, hooks and permission rules: **never log the body**; the
+adapter reads only `applied.effort` and `applied.model`, and the fixture
+keeps only `applied`. Neither `initialize` nor `system/init` reports the
+effort.
+
+**The level outlasts model switches.** It is a flag, not a property of the
+model: `high` on haiku 5.5, then `set_model sonnet`, reads `high`. On a
+model that takes none it reads `null`, but it is kept: `high` asked on
+haiku 4.5 reads `null`, and switching back to sonnet reads `high`.
+
+**How skywaved settles a request** (prefer the CLI's own read over the ack):
+
+- An `EffortRequested` writes the apply; its success writes a
+  `get_settings`, which is the answer: `EffortChanged` when `applied.effort`
+  is the level asked, else `EffortRefused` (`kept <level>`, or `<model>
+  takes no effort level` for `null`) followed by the level in force,
+  logged unasked. An apply error, a read error, or an `applied.effort`
+  skywaved has no name for refuses the request; each request gets exactly
+  one answer.
+- **One chain at a time.** The read goes out only once the apply is
+  answered (they are not pipelined), and an effort asked while a chain
+  runs waits for it. The supervisor asks every open request as it reaches
+  it, so two requests can reach the adapter back to back; without the wait,
+  stdin would be `apply A, apply B, read, read`, the first read would see
+  B, and A would be refused though the CLI applied it.
+- The unasked reads (after `initialize`, after each successful `set_model`)
+  report what runs. One answered while a chain runs or waits reports
+  nothing: the chain's own read is written later, so it is newer. A chain
+  that ends without a read (an apply or read error) with no other waiting
+  writes the dropped read again, so what it saw still reaches the log.
+- **Start order.** `start` writes `set_model` and the effort's apply back to
+  back. The CLI handles stdin in order, and in the recording (step 7:
+  `set_model opus` and `xhigh` pipelined) the read after the apply showed
+  `xhigh` on opus, so the start effort is not held for the model's answer.
+  Since the level outlasts the switch, the order would only matter for the
+  reply to a model that takes none, which reads `null` either way.
 
 ## 4. Interrupt
 

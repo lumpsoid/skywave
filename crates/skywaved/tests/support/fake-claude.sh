@@ -11,6 +11,11 @@
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id.
 # `set_permission_mode` and `set_model` are answered like the real CLI's
 # (§3.7): bypassPermissions and the model "bogus" are refused.
+# `apply_flag_settings` and `get_settings` are answered like the real CLI's
+# (§3.10): the apply is acked with an empty success and sets `effortLevel`
+# only when it is a level the CLI knows, and `get_settings` reads back
+# `applied.effort`, `medium` at first and `null` while the model is
+# "no-effort" (a model that takes none, whose level is kept for the next).
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
@@ -19,6 +24,7 @@ sid=""
 mode="default"
 # No model until one is set, so a turn reports no usage by default.
 model=""
+effort="medium"
 prev=""
 for arg in "$@"; do
   case "$prev" in --session-id|--resume) sid="$arg" ;; esac
@@ -76,6 +82,15 @@ while IFS= read -r line; do
         model="resolved-$asked"
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"%s"}}}\n' "$(reqid "$line")" "$model"
       fi
+      ;;
+    *'"subtype":"apply_flag_settings"'*)
+      asked=$(printf '%s' "$line" | sed -n 's/.*"effortLevel":"\([^"]*\)".*/\1/p')
+      case "$asked" in low|medium|high|xhigh|max) effort="$asked" ;; esac
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$(reqid "$line")"
+      ;;
+    *'"subtype":"get_settings"'*)
+      if [ "$model" = "resolved-no-effort" ]; then applied="null"; else applied="\"$effort\""; fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"applied":{"model":"%s","effort":%s}}}}\n' "$(reqid "$line")" "$model" "$applied"
       ;;
     *'"type":"user"'*)
       if [ -n "$model" ]; then
