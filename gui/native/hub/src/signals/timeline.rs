@@ -179,9 +179,9 @@ pub struct SectionView {
     /// The call's whole input rather than what it did.
     pub input: bool,
     pub lines: Vec<SectionLine>,
-    /// What else there is, after the lines: `… +12 lines · full 4.0 KiB ·
-    /// not downloaded`, `downloading · 1.0 of 4.0 MiB (25%)`, `cut short:
-    /// 400 lines of 1.2 MiB shown`.
+    /// What the lines leave out: `… +12 lines` collapsed, `cut short: 400
+    /// lines of 1.2 MiB shown` expanded. Never the blob's state: that is
+    /// [`BlobFacts::label`], shown beside it.
     pub note: Option<String>,
     /// The whole content's blob, if the lines are not all of it.
     pub blob: Option<BlobFacts>,
@@ -224,7 +224,8 @@ pub struct BlobFacts {
     /// For `DownloadBlob`.
     pub blob_id: String,
     pub state: BlobStateKind,
-    /// `not downloaded · 4.0 KiB`, `downloading 25%`, `downloaded`.
+    /// Where its download stands: `not downloaded · 4.0 KiB`,
+    /// `downloading · 1.0 KiB of 4.0 KiB (25%)`, `downloaded`.
     pub label: String,
     /// `DownloadBlob` would fetch it: not downloaded, or failed.
     pub can_download: bool,

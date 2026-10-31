@@ -114,9 +114,7 @@ class SectionBlock extends StatelessWidget {
                     note,
                     style: small?.copyWith(fontStyle: FontStyle.italic),
                   ),
-                // The note may already say what the blob's label does.
-                if (blob != null && blob.label != section.note)
-                  Text(blob.label, style: small),
+                if (blob != null) Text(blob.label, style: small),
                 if (blob != null && blob.canDownload)
                   _SmallButton(
                     icon: Icons.download,
