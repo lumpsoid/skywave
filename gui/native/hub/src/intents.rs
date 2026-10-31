@@ -49,6 +49,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::DeleteSessionLocally { session_id } => Action::DeleteSessionLocally {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::DeleteSnippet { snippet_id } => {
+            Action::DeleteSnippet(id("snippet", &snippet_id)?)
+        }
         ActionIntent::OpenSession { session_id } => {
             Action::OpenSession(id("session", &session_id)?)
         }

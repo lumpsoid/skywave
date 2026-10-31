@@ -214,8 +214,21 @@ pub struct SessionScreen {
     /// The approval the agent is blocked on.
     pub approval: Option<ApprovalPanel>,
     pub composer: ComposerView,
+    /// This device's snippets for the composer's picker, the most recently
+    /// used or saved first.
+    pub snippets: Vec<SnippetView>,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+}
+
+/// A saved prompt, as the composer's picker lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SnippetView {
+    pub snippet_id: String,
+    /// Its name, or else its text's first line.
+    pub label: String,
+    /// Its text's first line under a name; `None` without one.
+    pub detail: Option<String>,
 }
 
 /// The session agent's permission mode and model: the status line's two

@@ -332,6 +332,7 @@ class _SessionPageState extends State<SessionPage> {
                       sessionId: screen.sessionId,
                       composer: screen.composer,
                       send: widget.send,
+                      snippets: screen.snippets,
                       focusNode: _composerFocus,
                     ),
                   ),

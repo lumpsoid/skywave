@@ -19,6 +19,7 @@ use crate::completion::Completer;
 use crate::identity::Identity;
 use crate::projection::{SessionSummary, blob_refs, is_notable};
 use crate::seam::Request;
+use crate::snippets::Snippets;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
@@ -29,8 +30,8 @@ use crate::view::{
     BlobState, BlobView, BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef,
     Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice, Outgoing, PairedInfo,
     PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen, Seq, SessionId,
-    SessionListView, SessionRow, SessionState, SessionView, SettingChange, SettingsView,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    SessionListView, SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet,
+    SnippetId, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -43,6 +44,8 @@ pub(crate) enum Effect {
     /// Keep the session's draft; `None` deletes it.
     SaveDraft(SessionId, Option<Draft>),
     SaveReadMark(SessionId, ReadMark),
+    SaveSnippet(Snippet),
+    DeleteSnippet(SnippetId),
     /// Take the command out of the outbox and, if given, keep the draft, as
     /// one write: the text is never lost nor kept twice.
     Withdraw {
@@ -142,6 +145,8 @@ pub(crate) struct Model {
     draft_rev: u64,
     /// How far this device has read each session, as stored.
     read_marks: HashMap<SessionId, ReadMark>,
+    /// This device's saved prompts, as stored.
+    snippets: Snippets,
     /// Sessions deleted from this device, as stored: their events are
     /// skipped for good.
     deleted: HashSet<SessionId>,
@@ -191,6 +196,7 @@ impl Model {
             drafts: HashMap::new(),
             draft_rev: 0,
             read_marks: HashMap::new(),
+            snippets: Snippets::default(),
             deleted: HashSet::new(),
             open: None,
             alerted: HashSet::new(),
@@ -217,6 +223,7 @@ impl Model {
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
         self.drafts = snapshot.drafts;
         self.read_marks = snapshot.read_marks;
+        self.snippets = Snippets::new(snapshot.snippets);
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
         self.models = snapshot.models;
@@ -297,6 +304,25 @@ impl Model {
                 text,
                 cursor,
             } => self.save_draft(session_id, text, cursor),
+            Action::SaveSnippet { name, text } => self
+                .snippets
+                .save(&name, text)
+                .map(Effect::SaveSnippet)
+                .into_iter()
+                .collect(),
+            Action::UseSnippet(id) => self
+                .snippets
+                .used(id)
+                .map(Effect::SaveSnippet)
+                .into_iter()
+                .collect(),
+            Action::DeleteSnippet(id) => {
+                if self.snippets.delete(id) {
+                    vec![Effect::DeleteSnippet(id)]
+                } else {
+                    Vec::new()
+                }
+            }
             Action::Discard(id) => self.withdraw(id, false),
             Action::EditQueued(id) => self.withdraw(id, true),
             Action::ResolveApproval { id, decision, rule } => {
@@ -911,6 +937,7 @@ impl Model {
             attention: self.attention(),
             screen: self.screen(),
             can_go_back: self.back().is_some(),
+            snippets: self.snippets.list().to_vec(),
         }
     }
 
@@ -1852,6 +1879,7 @@ mod tests {
             alerted: HashSet::new(),
             devices: HashMap::new(),
             models: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 
@@ -3442,6 +3470,49 @@ mod tests {
         assert!(f.dispatch(Action::DownloadBlob(output.id)).is_empty());
     }
 
+    #[test]
+    fn snippets_are_saved_used_and_deleted_on_any_screen() {
+        let mut f = Fixture::paired();
+        let save = |name: &str, text: &str| Action::SaveSnippet {
+            name: name.into(),
+            text: text.into(),
+        };
+        let [Effect::SaveSnippet(tests)] = &f.dispatch(save("tests", "run the tests"))[..] else {
+            panic!("one snippet to store");
+        };
+        let tests = tests.clone();
+        assert!(f.dispatch(save("", "  ")).is_empty());
+        let [Effect::SaveSnippet(commit)] = &f.dispatch(save("", "commit this"))[..] else {
+            panic!("one snippet to store");
+        };
+        let commit = commit.clone();
+        let texts = |f: &Fixture| -> Vec<String> {
+            f.model
+                .view()
+                .snippets
+                .into_iter()
+                .map(|s| s.text)
+                .collect()
+        };
+        assert_eq!(texts(&f), ["commit this", "run the tests"]);
+
+        let used = f.dispatch(Action::UseSnippet(tests.id));
+        assert!(matches!(&used[..], [Effect::SaveSnippet(s)] if s.id == tests.id));
+        assert_eq!(texts(&f), ["run the tests", "commit this"]);
+
+        assert_eq!(
+            f.dispatch(Action::DeleteSnippet(commit.id)),
+            vec![Effect::DeleteSnippet(commit.id)]
+        );
+        assert!(f.dispatch(Action::DeleteSnippet(commit.id)).is_empty());
+        assert_eq!(texts(&f), ["run the tests"]);
+
+        // A reload shows what the store holds.
+        let stored = snapshot(&f.model);
+        f.model.reload(stored);
+        assert_eq!(texts(&f), ["run the tests"]);
+    }
+
     fn save_draft(session_id: SessionId, text: &str, cursor: usize) -> Action {
         Action::SaveDraft {
             session_id,
@@ -4442,6 +4513,7 @@ mod tests {
             alerted: model.alerted.clone(),
             devices: model.devices.clone(),
             models: model.models.clone(),
+            snippets: model.snippets.list().to_vec(),
         }
     }
 

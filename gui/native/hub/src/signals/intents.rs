@@ -33,6 +33,23 @@ pub enum GuiIntent {
     /// Recall the next older or newer earlier prompt into the composer.
     HistoryOlder,
     HistoryNewer,
+    /// Keep a message's text (a `UserMessage` or `PendingMessage` row's)
+    /// as a snippet named `name`, blank for none.
+    SaveSnippet {
+        key: String,
+        name: String,
+    },
+    /// Keep the composer's text as a snippet, as `SaveSnippet`.
+    SaveComposerSnippet {
+        session_id: String,
+        name: String,
+    },
+    /// Put a snippet's text into the composer at its cursor, to edit or
+    /// send; the snippet lists first.
+    InsertSnippet {
+        session_id: String,
+        snippet_id: String,
+    },
     /// Whether the newest timeline row is on screen; what reaches the
     /// session while it is counts as read.
     FollowingChanged {
@@ -167,6 +184,9 @@ pub enum ActionIntent {
     },
     DeleteSessionLocally {
         session_id: String,
+    },
+    DeleteSnippet {
+        snippet_id: String,
     },
     OpenSession {
         session_id: String,

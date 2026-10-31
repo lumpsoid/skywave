@@ -24,7 +24,7 @@ use skywave_proto::{
 use uuid::Uuid;
 
 use crate::projection::{SessionSummary, blob_refs};
-use crate::view::Draft;
+use crate::view::{Draft, Snippet, SnippetId};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -185,6 +185,16 @@ ALTER TABLE sessions ADD COLUMN agent TEXT;
 CREATE TABLE offered_models (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     models TEXT NOT NULL
+);
+"#,
+    r#"
+-- Prompts saved to use again in any session (D5: never synced). `used`
+-- orders them: higher was saved or used later.
+CREATE TABLE snippets (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    text TEXT NOT NULL,
+    used INTEGER NOT NULL
 );
 "#,
 ];
@@ -383,6 +393,8 @@ pub struct Snapshot {
     /// The models of the newest `ModelsOffered` in the log, in any session;
     /// empty until one comes.
     pub models: Vec<ModelChoice>,
+    /// This device's saved prompts, in no order ([`Store::set_snippet`]).
+    pub snippets: Vec<Snippet>,
 }
 
 /// Handle to the replica database.
@@ -435,6 +447,7 @@ impl Store {
             alerted: self.alerted()?,
             devices: self.devices()?,
             models: self.offered_models()?,
+            snippets: self.snippets()?,
         })
     }
 
@@ -655,7 +668,7 @@ impl Store {
     /// device kept beside them — drafts, read marks, locally deleted
     /// sessions and alerted approvals. Of the settings, the server address becomes `address`;
     /// the blob policy, a preference of this device, stays, as do keys a
-    /// newer build wrote. Returns the blobs that were known, whose files
+    /// newer build wrote. Snippets, this device's too, stay. Returns the blobs that were known, whose files
     /// the caller removes.
     pub fn reset_for_server(&mut self, address: &str) -> Result<Vec<BlobId>, StoreError> {
         let tx = self.conn.transaction()?;
@@ -925,6 +938,46 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    // ---- snippets -----------------------------------------------------------
+
+    /// This device's saved prompts, in no order.
+    pub fn snippets(&self) -> Result<Vec<Snippet>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, text, used FROM snippets")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Snippet {
+                id: SnippetId(uuid_col(row, 0)?),
+                name: row.get(1)?,
+                text: row.get(2)?,
+                used: u64_col(row, 3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps the snippet, replacing the one with its id.
+    pub fn set_snippet(&self, snippet: &Snippet) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO snippets (id, name, text, used) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET
+                name = excluded.name, text = excluded.text, used = excluded.used",
+            params![
+                snippet.id.0.to_string(),
+                snippet.name,
+                snippet.text,
+                u64_sql(snippet.used)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_snippet(&self, id: SnippetId) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM snippets WHERE id = ?1", [id.0.to_string()])?;
+        Ok(())
     }
 
     // ---- read marks -------------------------------------------------------
