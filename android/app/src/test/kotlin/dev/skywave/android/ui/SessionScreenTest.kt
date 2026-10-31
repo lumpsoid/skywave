@@ -99,9 +99,9 @@ class SessionScreenTest {
         seeAt("s:16", "Turn interrupted")
         seeAt("s:17", "Agent stopped")
         seeAt("s:18", "Renamed to “Sync fix” by you")
-        seeAt("s:19", "Archived from another device")
+        seeAt("s:19", "Archived by laptop")
         seeAt("s:20", "12.3k in · 840 out · $0.0123 · 4.1s · sonnet")
-        seeAt("m:c21", "And from my laptop", "Another device")
+        seeAt("m:c21", "And from my laptop", "laptop")
     }
 
     @Test
@@ -112,7 +112,7 @@ class SessionScreenTest {
         seeAt("s:5", "Shell", "cargo test -p sync", "test sync ... FAILED\nfailures: 1", "Failed (exit 101) in 8.3s")
         seeAt("s:6", "Write", "# Notes")
         seeAt("s:7", "Search", "in src/")
-        seeAt("s:8", "Fetch", "Denied on another device (…000002)")
+        seeAt("s:8", "Fetch", "Denied on laptop")
         seeAt("s:9", "Subagent", "Cancelled: turn ended")
         seeAt("s:10", "Tool Frobnicate", "No result")
         seeAt("s:11", "Running since")

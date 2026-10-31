@@ -508,6 +508,10 @@ pub struct Draft {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "nearly every item is `Logged`; boxing it would cost an allocation per item to save space only on the few `Pending` ones"
+)]
 pub enum TimelineItem {
     /// An event from the server log.
     Logged {
@@ -528,6 +532,31 @@ pub enum TimelineItem {
     },
 }
 
+/// A device the log names, as the views show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRef {
+    pub id: DeviceId,
+    /// The name it paired with, once the server listed it; `None` for a
+    /// device this one has not heard of yet.
+    pub name: Option<String>,
+    /// This device.
+    pub me: bool,
+}
+
+impl DeviceRef {
+    /// How heads name the device: its name, or else the end of its id
+    /// (the start of a UUIDv7 is a timestamp, the end is random).
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(name) => name.clone(),
+            None => {
+                let id = self.id.0.simple().to_string();
+                format!("device …{}", &id[id.len() - 8..])
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     UserMessage {
@@ -535,9 +564,8 @@ pub enum Entry {
         /// this id became this message.
         command_id: CommandId,
         text: String,
-        from: DeviceId,
-        /// Sent from this device.
-        own: bool,
+        /// Who sent it; [`DeviceRef::me`] when this device did.
+        from: DeviceRef,
         /// Delivery state when this device sent it.
         outgoing: Option<Outgoing>,
         /// How it went out, when this device sent it.
@@ -580,17 +608,13 @@ pub enum Entry {
     /// The session was renamed; `None` restored its default title.
     Renamed {
         name: Option<String>,
-        by: DeviceId,
-        /// Renamed from this device.
-        own: bool,
+        by: DeviceRef,
     },
     /// The session was archived (`true`) or brought back from the archive.
     /// A message brings it back too, without an entry of its own.
     Archived {
         archived: bool,
-        by: DeviceId,
-        /// From this device.
-        own: bool,
+        by: DeviceRef,
     },
     /// The agent reported an error.
     AgentErrored {
@@ -665,9 +689,8 @@ pub enum ToolOutcome {
         output: Option<BlobView>,
         took: Duration,
     },
-    /// Its approval was denied, so the tool did not run; `by_me` is false
-    /// when another device answered.
-    Denied { by: DeviceId, by_me: bool },
+    /// Its approval was denied, so the tool did not run.
+    Denied { by: DeviceRef },
     /// Its approval was cancelled before anyone answered.
     Cancelled { reason: String },
     /// The turn ended without a result.
@@ -677,12 +700,11 @@ pub enum ToolOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalStatus {
     Pending,
-    /// First answer wins (D5); `by_me` is false when another device answered.
-    /// `rule` is the lasting rule granted with an approval, if any.
+    /// First answer wins (D5); `by` is who answered. `rule` is the lasting
+    /// rule granted with an approval, if any.
     Resolved {
         decision: Decision,
-        by: DeviceId,
-        by_me: bool,
+        by: DeviceRef,
         rule: Option<RuleSuggestion>,
     },
     Cancelled {
@@ -752,8 +774,11 @@ mod tests {
             Entry::UserMessage {
                 command_id: CommandId::new(),
                 text: text.into(),
-                from: DeviceId::new(),
-                own,
+                from: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: own,
+                },
                 outgoing: None,
                 delivery: None,
             },

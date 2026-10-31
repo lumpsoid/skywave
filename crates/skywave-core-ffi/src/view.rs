@@ -837,6 +837,28 @@ impl From<sc::TimelineItem> for TimelineItem {
     }
 }
 
+/// A device the log names. `label` is how to show it: its name, or the end
+/// of its id while its name is not known.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceRef {
+    pub id: String,
+    pub name: Option<String>,
+    pub label: String,
+    /// This device.
+    pub me: bool,
+}
+
+impl From<sc::DeviceRef> for DeviceRef {
+    fn from(d: sc::DeviceRef) -> Self {
+        DeviceRef {
+            id: id(d.id.0),
+            label: d.label(),
+            name: d.name,
+            me: d.me,
+        }
+    }
+}
+
 /// One logged event as the timeline shows it.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 #[expect(
@@ -847,8 +869,8 @@ pub enum Entry {
     UserMessage {
         command_id: String,
         text: String,
-        from: String,
-        own: bool,
+        /// Who sent it; `from.me` when this device did.
+        from: DeviceRef,
         outgoing: Option<Outgoing>,
         delivery: Option<Delivery>,
     },
@@ -883,13 +905,11 @@ pub enum Entry {
     /// `name` is `None` when the default title was restored.
     Renamed {
         name: Option<String>,
-        by: String,
-        own: bool,
+        by: DeviceRef,
     },
     Archived {
         archived: bool,
-        by: String,
-        own: bool,
+        by: DeviceRef,
     },
     AgentErrored {
         message: String,
@@ -906,14 +926,12 @@ impl From<sc::Entry> for Entry {
                 command_id,
                 text,
                 from,
-                own,
                 outgoing,
                 delivery,
             } => Entry::UserMessage {
                 command_id: id(command_id.0),
                 text,
-                from: id(from.0),
-                own,
+                from: from.into(),
                 outgoing: opt(outgoing),
                 delivery: opt(delivery),
             },
@@ -951,15 +969,13 @@ impl From<sc::Entry> for Entry {
             },
             sc::Entry::Interrupted => Entry::Interrupted,
             sc::Entry::Stopped => Entry::Stopped,
-            sc::Entry::Renamed { name, by, own } => Entry::Renamed {
+            sc::Entry::Renamed { name, by } => Entry::Renamed {
                 name,
-                by: id(by.0),
-                own,
+                by: by.into(),
             },
-            sc::Entry::Archived { archived, by, own } => Entry::Archived {
+            sc::Entry::Archived { archived, by } => Entry::Archived {
                 archived,
-                by: id(by.0),
-                own,
+                by: by.into(),
             },
             sc::Entry::AgentErrored { message } => Entry::AgentErrored { message },
             sc::Entry::TurnUsage(usage) => Entry::TurnUsage {
@@ -1077,8 +1093,7 @@ pub enum ToolOutcome {
         took_ms: u64,
     },
     Denied {
-        by: String,
-        by_me: bool,
+        by: DeviceRef,
     },
     Cancelled {
         reason: String,
@@ -1107,10 +1122,7 @@ impl From<sc::ToolOutcome> for ToolOutcome {
                 output: opt(output),
                 took_ms: duration_ms(took),
             },
-            sc::ToolOutcome::Denied { by, by_me } => ToolOutcome::Denied {
-                by: id(by.0),
-                by_me,
-            },
+            sc::ToolOutcome::Denied { by } => ToolOutcome::Denied { by: by.into() },
             sc::ToolOutcome::Cancelled { reason } => ToolOutcome::Cancelled { reason },
             sc::ToolOutcome::NoResult => ToolOutcome::NoResult,
         }
@@ -1123,8 +1135,7 @@ pub enum ApprovalStatus {
     /// First answer wins; `rule` is the lasting rule granted, if any.
     Resolved {
         decision: Decision,
-        by: String,
-        by_me: bool,
+        by: DeviceRef,
         rule: Option<RuleSuggestion>,
     },
     Cancelled {
@@ -1136,15 +1147,9 @@ impl From<sc::ApprovalStatus> for ApprovalStatus {
     fn from(s: sc::ApprovalStatus) -> Self {
         match s {
             sc::ApprovalStatus::Pending => ApprovalStatus::Pending,
-            sc::ApprovalStatus::Resolved {
-                decision,
-                by,
-                by_me,
-                rule,
-            } => ApprovalStatus::Resolved {
+            sc::ApprovalStatus::Resolved { decision, by, rule } => ApprovalStatus::Resolved {
                 decision: decision.into(),
-                by: id(by.0),
-                by_me,
+                by: by.into(),
                 rule: opt(rule),
             },
             sc::ApprovalStatus::Cancelled { reason } => ApprovalStatus::Cancelled { reason },
@@ -1849,8 +1854,11 @@ mod tests {
             entry: sc::Entry::UserMessage {
                 command_id: sc::CommandId::new(),
                 text: text.into(),
-                from: sc::DeviceId::new(),
-                own: false,
+                from: sc::DeviceRef {
+                    id: sc::DeviceId::new(),
+                    name: None,
+                    me: false,
+                },
                 outgoing: None,
                 delivery: None,
             },
@@ -2157,6 +2165,48 @@ mod tests {
         );
     }
 
+    /// A device named "phone" in the core's view.
+    fn dev(device: sc::DeviceId, me: bool) -> sc::DeviceRef {
+        sc::DeviceRef {
+            id: device,
+            name: Some("phone".into()),
+            me,
+        }
+    }
+
+    /// [`dev`] as mirrored.
+    fn dev_mirror(device: sc::DeviceId, me: bool) -> DeviceRef {
+        DeviceRef {
+            id: s(device.0),
+            name: Some("phone".into()),
+            label: "phone".into(),
+            me,
+        }
+    }
+
+    #[test]
+    fn device_ref_carries_its_label() {
+        let device = sc::DeviceId::new();
+        assert_eq!(
+            DeviceRef::from(dev(device, false)),
+            dev_mirror(device, false)
+        );
+        let tail = &device.0.simple().to_string()[24..];
+        assert_eq!(
+            DeviceRef::from(sc::DeviceRef {
+                id: device,
+                name: None,
+                me: true,
+            }),
+            DeviceRef {
+                id: s(device.0),
+                name: None,
+                label: format!("device …{tail}"),
+                me: true,
+            }
+        );
+    }
+
     #[test]
     fn entry_converts_every_variant() {
         let command = sc::CommandId::new();
@@ -2168,8 +2218,7 @@ mod tests {
             sc::Entry::UserMessage {
                 command_id: command,
                 text: "hi".into(),
-                from: device,
-                own: true,
+                from: dev(device, true),
                 outgoing: Some(sc::Outgoing::Accepted(sc::Seq(1))),
                 delivery: Some(delivery()),
             },
@@ -2225,13 +2274,11 @@ mod tests {
             sc::Entry::Stopped,
             sc::Entry::Renamed {
                 name: Some("n".into()),
-                by: device,
-                own: false,
+                by: dev(device, false),
             },
             sc::Entry::Archived {
                 archived: true,
-                by: device,
-                own: true,
+                by: dev(device, true),
             },
             sc::Entry::AgentErrored {
                 message: "boom".into(),
@@ -2244,8 +2291,7 @@ mod tests {
                 Entry::UserMessage {
                     command_id: s(command.0),
                     text: "hi".into(),
-                    from: s(device.0),
-                    own: true,
+                    from: dev_mirror(device, true),
                     outgoing: Some(Outgoing::Accepted { seq: 1 }),
                     delivery: Some(delivery_mirror()),
                 },
@@ -2303,13 +2349,11 @@ mod tests {
                 Entry::Stopped,
                 Entry::Renamed {
                     name: Some("n".into()),
-                    by: s(device.0),
-                    own: false,
+                    by: dev_mirror(device, false),
                 },
                 Entry::Archived {
                     archived: true,
-                    by: s(device.0),
-                    own: true,
+                    by: dev_mirror(device, true),
                 },
                 Entry::AgentErrored {
                     message: "boom".into()
@@ -2336,8 +2380,7 @@ mod tests {
                 took: Duration::from_millis(1234),
             },
             sc::ToolOutcome::Denied {
-                by: device,
-                by_me: true,
+                by: dev(device, true),
             },
             sc::ToolOutcome::Cancelled { reason: "r".into() },
             sc::ToolOutcome::NoResult,
@@ -2355,8 +2398,7 @@ mod tests {
                     took_ms: 1234,
                 },
                 ToolOutcome::Denied {
-                    by: s(device.0),
-                    by_me: true
+                    by: dev_mirror(device, true),
                 },
                 ToolOutcome::Cancelled { reason: "r".into() },
                 ToolOutcome::NoResult,
@@ -2371,8 +2413,7 @@ mod tests {
             sc::ApprovalStatus::Pending,
             sc::ApprovalStatus::Resolved {
                 decision: sc::Decision::Deny,
-                by: device,
-                by_me: false,
+                by: dev(device, false),
                 rule: Some(rule()),
             },
             sc::ApprovalStatus::Cancelled { reason: "r".into() },
@@ -2383,8 +2424,7 @@ mod tests {
                 ApprovalStatus::Pending,
                 ApprovalStatus::Resolved {
                     decision: Decision::Deny,
-                    by: s(device.0),
-                    by_me: false,
+                    by: dev_mirror(device, false),
                     rule: Some(rule_mirror()),
                 },
                 ApprovalStatus::Cancelled { reason: "r".into() },

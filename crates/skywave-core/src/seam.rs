@@ -6,13 +6,14 @@
 //! results flow back in through the [`Seam`] methods, each of which persists
 //! first, then updates the model and pushes a new snapshot.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
-use skywave_proto::{CommandResult, DirsResult, EventBatch};
+use skywave_proto::{CommandResult, DeviceInfo, DirsResult, EventBatch};
 
 use crate::blobs::remove_all_blob_files;
 use crate::client::{Core, CoreError, State, lock};
@@ -20,7 +21,7 @@ use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
 use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
 use crate::transport::TransportError;
-use crate::view::{ApprovalId, BlobId, CommandId, Link, Seq, SessionId};
+use crate::view::{ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId};
 
 /// Work the core asks the engine to do. Sent only after the action that
 /// caused it is persisted.
@@ -138,6 +139,22 @@ impl Seam {
             mark_alerted(state, &alerted);
             Ok((applied, Vec::new()))
         })
+    }
+
+    /// The server listed its devices (`hello`): keep their names and show
+    /// them wherever the views name a device.
+    pub fn devices_listed(&self, devices: &[DeviceInfo]) -> Result<(), CoreError> {
+        self.update(|state| {
+            state.store.set_devices(devices)?;
+            state.model.devices_named(devices);
+            Ok(((), Vec::new()))
+        })
+    }
+
+    /// Devices `batch` names that this device knows no name for: paired
+    /// since the last `hello`, or never listed.
+    pub fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
+        lock(&self.core.shared.state).model.unnamed_devices(batch)
     }
 
     /// Claims the command for the transport, durably, before it is sent

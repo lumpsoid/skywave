@@ -306,6 +306,10 @@ fn hello() -> HelloResponse {
         server_id: server(),
         device_id: device(),
         head: Seq(16),
+        devices: vec![DeviceInfo {
+            id: device(),
+            name: "phone".into(),
+        }],
     }
 }
 

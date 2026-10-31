@@ -47,7 +47,7 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, DeviceId, DirsQuery, EventsQuery, Fingerprint, HelloResponse,
+    BlobId, Command, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloResponse,
     PROTOCOL_VERSION, ServerId, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -184,13 +184,28 @@ async fn hello(
     State(api): State<Arc<Api>>,
     Extension(Caller(device)): Extension<Caller>,
 ) -> Response {
-    Json(HelloResponse {
-        protocol_version: PROTOCOL_VERSION,
-        server_id: api.server_id,
-        device_id: device,
-        head: api.log.head(),
-    })
-    .into_response()
+    let devices = api
+        .blocking(|_, db| {
+            Ok(devices::list(db.conn())?
+                .into_iter()
+                .map(|d| DeviceInfo {
+                    id: d.id,
+                    name: d.name,
+                })
+                .collect())
+        })
+        .await;
+    match devices {
+        Ok(devices) => Json(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: api.server_id,
+            device_id: device,
+            head: api.log.head(),
+            devices,
+        })
+        .into_response(),
+        Err(status) => status.into_response(),
+    }
 }
 
 async fn commands(

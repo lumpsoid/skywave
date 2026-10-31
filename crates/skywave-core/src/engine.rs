@@ -62,6 +62,7 @@
 //! server they started for, which refuses their writes from then on, until
 //! the `Connect` that follows restarts them.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
@@ -601,6 +602,9 @@ async fn connection(
         Err(error) => return error.into(),
     };
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    if let Err(error) = ctx.seam.devices_listed(&hello.devices) {
+        return error.into();
+    }
     let ended = tokio::select! {
         ended = pull(ctx, transport, reporter, retry, hello.head, latency_ms) => ended,
         ended = send(ctx, transport) => ended,
@@ -619,6 +623,9 @@ async fn pull(
     latency_ms: u32,
 ) -> Result<Infallible, LinkError> {
     let wait = ctx.config.wait_secs;
+    // Devices asked the server about on this connection, so one it does
+    // not list costs one more `hello`, not one per batch.
+    let mut asked = HashSet::new();
     loop {
         let cursor = ctx.seam.cursor()?;
         reporter.set(if cursor < head {
@@ -644,6 +651,12 @@ async fn pull(
             Ok(applied) => {
                 head = head.max(applied.cursor);
                 ctx.blobs.registered(&applied.blobs);
+                // A device paired since this connection's `hello`: ask
+                // again, so its name shows without waiting for a reconnect.
+                let unnamed = ctx.seam.unnamed_devices(&batch);
+                if unnamed.into_iter().filter(|id| asked.insert(*id)).count() > 0 {
+                    ctx.seam.devices_listed(&transport.hello().await?.devices)?;
+                }
             }
             Err(CoreError::Store(StoreError::Gap { cursor, from })) => {
                 // The log is contiguous, so the server misbehaved; the next
@@ -736,6 +749,7 @@ mod tests {
                     server_id: ServerId::new(),
                     device_id: DeviceId::new(),
                     head: Seq::ZERO,
+                    devices: Vec::new(),
                 })
             })
         }

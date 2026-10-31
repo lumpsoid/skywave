@@ -15,7 +15,6 @@ import dev.skywave.android.ui.screens.formatTokens
 import dev.skywave.android.ui.screens.gatedRowKey
 import dev.skywave.android.ui.screens.gatedTool
 import dev.skywave.android.ui.screens.inlineCodeSpans
-import dev.skywave.android.ui.screens.shortDevice
 import dev.skywave.android.ui.screens.textBlocks
 import dev.skywave.android.ui.screens.timelineKey
 import dev.skywave.android.ui.screens.timelineRows
@@ -170,6 +169,5 @@ class SessionTimelineModelTest {
         // Refused because the approval closed meanwhile: final.
         assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_ALREADY_RESOLVED))))
         assertTrue(answered(ApprovalSamples.answer(outgoing = Outgoing.Failed(FailReason.APPROVAL_CANCELLED))))
-        assertEquals("…000002", shortDevice(SessionSamples.OTHER))
     }
 }

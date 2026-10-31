@@ -18,7 +18,6 @@
         <item quantity="other">%1$d new</item>
     </plurals>
     <string name="sv_you">You</string>
-    <string name="sv_other_device">Another device</string>
     <string name="sv_interrupted">Turn interrupted</string>
     <string name="sv_stopped">Agent stopped</string>
     <string name="sv_renamed">Renamed to “%1$s”</string>
@@ -26,7 +25,7 @@
     <string name="sv_archived">Archived</string>
     <string name="sv_unarchived">Brought back from the archive</string>
     <string name="sv_by_you">by you</string>
-    <string name="sv_by_other">from another device</string>
+    <string name="sv_by_device">by %1$s</string>
     <string name="sv_agent_error">Agent error</string>
     <string name="sv_tokens_in">in</string>
     <string name="sv_tokens_out">out</string>
@@ -68,7 +67,7 @@
     <string name="sv_tool_failed">Failed in %1$s</string>
     <string name="sv_tool_failed_status">Failed (%1$s) in %2$s</string>
     <string name="sv_tool_denied_me">Denied by you</string>
-    <string name="sv_tool_denied_other">Denied on another device (%1$s)</string>
+    <string name="sv_tool_denied_other">Denied on %1$s</string>
     <string name="sv_tool_cancelled">Cancelled: %1$s</string>
     <string name="sv_tool_no_result">No result</string>
     <string name="sv_tool_expand">Show details</string>
@@ -84,9 +83,9 @@
     <string name="sv_approval">Approval for %1$s: %2$s</string>
     <string name="sv_approval_pending">Waiting for approval</string>
     <string name="sv_approval_approved_me">Approved by you</string>
-    <string name="sv_approval_approved_other">Approved on another device (%1$s)</string>
+    <string name="sv_approval_approved_other">Approved on %1$s</string>
     <string name="sv_approval_denied_me">Denied by you</string>
-    <string name="sv_approval_denied_other">Denied on another device (%1$s)</string>
+    <string name="sv_approval_denied_other">Denied on %1$s</string>
     <string name="sv_approval_rule">, with rule: %1$s</string>
     <string name="sv_approval_cancelled">Approval cancelled: %1$s</string>
 

@@ -183,9 +183,6 @@ private fun String.lineCount(): UInt = (count { it == '\n' } + 1).toUInt()
  */
 internal fun answered(answer: Answer?): Boolean = answer != null && !answer.retryable
 
-/** A device id short enough for a status line: its random tail. */
-internal fun shortDevice(id: String): String = "…" + id.filter { it != '-' }.takeLast(6)
-
 /** A piece of agent text: prose, or a fenced code block. */
 internal sealed interface TextBlock {
     data class Prose(val text: String) : TextBlock

@@ -49,6 +49,7 @@ import dev.skywave.core.ApprovalStatus
 import dev.skywave.core.BodyFormat
 import dev.skywave.core.Decision
 import dev.skywave.core.Delivery
+import dev.skywave.core.DeviceRef
 import dev.skywave.core.Entry
 import dev.skywave.core.Outgoing
 import dev.skywave.core.TimelineItem
@@ -142,7 +143,7 @@ internal fun TimelineItemView(
                 when (item) {
                     is TimelineItem.Pending -> MessageBubble(
                         text = item.text,
-                        own = true,
+                        from = null,
                         outgoing = item.outgoing,
                         delivery = item.delivery,
                         expanded = expanded,
@@ -198,7 +199,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
     when (val e = item.entry) {
         is Entry.UserMessage -> MessageBubble(
             text = e.text,
-            own = e.own,
+            from = e.from,
             outgoing = e.outgoing,
             delivery = e.delivery,
             expanded = expanded,
@@ -226,7 +227,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
             markedParts(
                 listOf(
                     e.name?.let { stringResource(R.string.sv_renamed, it) } ?: stringResource(R.string.sv_renamed_default),
-                    byText(e.own),
+                    byText(e.by),
                 ).joinToString(" "),
                 e.name,
             ),
@@ -234,7 +235,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
         is Entry.Archived -> SystemLine(
             listOf(
                 stringResource(if (e.archived) R.string.sv_archived else R.string.sv_unarchived),
-                byText(e.own),
+                byText(e.by),
             ).joinToString(" "),
         )
         is Entry.AgentErrored -> Surface(
@@ -259,13 +260,17 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
 }
 
 @Composable
-private fun byText(own: Boolean) = stringResource(if (own) R.string.sv_by_you else R.string.sv_by_other)
+private fun byText(by: DeviceRef) = if (by.me) stringResource(R.string.sv_by_you) else stringResource(R.string.sv_by_device, by.label)
 
-/** A message sent into the session; this device's on the right with its delivery state. */
+/**
+ * A message sent into the session; this device's on the right with its
+ * delivery state. [from] is `null` for one not logged yet, always this
+ * device's.
+ */
 @Composable
 private fun MessageBubble(
     text: String,
-    own: Boolean,
+    from: DeviceRef?,
     outgoing: Outgoing?,
     delivery: Delivery?,
     expanded: Boolean,
@@ -274,12 +279,13 @@ private fun MessageBubble(
     onEdit: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
+    val own = from?.me ?: true
     Column(
         Modifier.fillMaxWidth(),
         horizontalAlignment = if (own) Alignment.End else Alignment.Start,
     ) {
         Text(
-            stringResource(if (own) R.string.sv_you else R.string.sv_other_device),
+            from?.takeUnless { it.me }?.label ?: stringResource(R.string.sv_you),
             style = MaterialTheme.typography.labelSmall,
             color = colors.onSurfaceVariant,
         )
@@ -536,10 +542,10 @@ private fun outcomeText(outcome: ToolOutcome): String = when (outcome) {
             else -> stringResource(R.string.sv_tool_done, took)
         }
     }
-    is ToolOutcome.Denied -> if (outcome.byMe) {
+    is ToolOutcome.Denied -> if (outcome.by.me) {
         stringResource(R.string.sv_tool_denied_me)
     } else {
-        stringResource(R.string.sv_tool_denied_other, shortDevice(outcome.by))
+        stringResource(R.string.sv_tool_denied_other, outcome.by.label)
     }
     is ToolOutcome.Cancelled -> stringResource(R.string.sv_tool_cancelled, outcome.reason)
     ToolOutcome.NoResult -> stringResource(R.string.sv_tool_no_result)
@@ -548,21 +554,18 @@ private fun outcomeText(outcome: ToolOutcome): String = when (outcome) {
 private fun ApprovalStatus.isPlainDenial() =
     this is ApprovalStatus.Resolved && decision == Decision.DENY && rule == null
 
-/**
- * An approval's status as text. Another device is named by its id: the
- * view carries no device names yet (e4d763).
- */
+/** An approval's status as text; another device by its label. */
 @Composable
 internal fun approvalText(status: ApprovalStatus): String = when (status) {
     ApprovalStatus.Pending -> stringResource(R.string.sv_approval_pending)
     is ApprovalStatus.Resolved -> {
         val base = when {
-            status.byMe -> stringResource(
+            status.by.me -> stringResource(
                 if (status.decision == Decision.APPROVE) R.string.sv_approval_approved_me else R.string.sv_approval_denied_me,
             )
             else -> stringResource(
                 if (status.decision == Decision.APPROVE) R.string.sv_approval_approved_other else R.string.sv_approval_denied_other,
-                shortDevice(status.by),
+                status.by.label,
             )
         }
         base + (status.rule?.let { stringResource(R.string.sv_approval_rule, ruleText(it)) } ?: "")
