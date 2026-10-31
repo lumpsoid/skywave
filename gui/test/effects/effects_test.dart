@@ -36,14 +36,14 @@ void main() {
       ..apply(
         const LinkUpdate(
           state: LinkState.online,
-          label: 'online · 12 ms',
+          label: 'online · 2 queued',
           canRetryNow: false,
           rejected: false,
-          queued: 0,
+          queued: 2,
           approvalsElsewhere: 0,
         ),
       );
-    expect(link.link?.label, 'online · 12 ms');
+    expect(link.link?.label, 'online · 2 queued');
 
     final search = SearchHolder()
       ..apply(

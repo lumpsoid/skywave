@@ -6,10 +6,11 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub struct LinkUpdate {
     pub state: LinkState,
-    /// The banner's text, e.g. `online · 12 ms · 2 queued`, `offline · 2
-    /// queued · retry in 07s (attempt 3)`, `device revoked · re-pair to
-    /// reconnect`. Empty while unpaired: the pairing screen says what to
-    /// do. No key hints.
+    /// The banner's text, e.g. `online · 2 queued`, `offline · 2 queued ·
+    /// retry in 07s (attempt 3)`, `device revoked · re-pair to reconnect`.
+    /// Empty when there is nothing to say, and the banner hides: while
+    /// unpaired (the pairing screen says what to do), and while online
+    /// with nothing queued and no approvals elsewhere. No key hints.
     pub label: String,
     /// While reconnecting: whole seconds until the next attempt, rounded
     /// up; 0 once it is due. `None` in every other state.
