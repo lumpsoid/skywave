@@ -75,6 +75,7 @@ impl Fixture {
             resume: load_resume_handle(&self.storage.db, self.session_id).unwrap(),
             mode: None,
             model: None,
+            effort: None,
         }
     }
 
@@ -1227,4 +1228,139 @@ fn a_huge_command_blobs_the_body() {
     assert_eq!(body.lines, 4001);
     let full = body.full.expect("the body is a blob");
     assert_eq!(full.size, huge.trim().len() as u64);
+}
+
+#[test]
+fn an_unasked_effort_is_logged_only_when_it_changes() {
+    use skywaved::agent::Effort;
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::Effort(Some(Effort::High)),
+            AdapterEvent::Effort(Some(Effort::High)),
+            AdapterEvent::Effort(None),
+            AdapterEvent::Effort(None),
+            AdapterEvent::Effort(Some(Effort::Low)),
+        ],
+    );
+    assert_eq!(
+        f.kinds(),
+        [
+            EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: None,
+            },
+            EventKind::EffortChanged {
+                effort: None,
+                answers: None,
+            },
+            EventKind::EffortChanged {
+                effort: Some(Effort::Low),
+                answers: None,
+            },
+        ]
+    );
+
+    // A mapper made later starts from what the log has.
+    let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
+    let mut mapper = EventMapper::new(f.session_id, settings);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Effort(Some(Effort::Low))],
+    );
+    assert_eq!(f.kinds().len(), 3);
+}
+
+#[test]
+fn effort_answers_name_the_requests_in_the_order_asked() {
+    use skywaved::agent::Effort;
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let (high, low, max) = (CommandId::new(), CommandId::new(), CommandId::new());
+    mapper.asked_effort(Effort::High, Some(high));
+    mapper.asked_effort(Effort::Low, Some(low));
+    mapper.asked_effort(Effort::Max, Some(max));
+    // Asked under no command for what the log already has: nothing to say.
+    mapper.asked_effort(Effort::Max, None);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::EffortSet(Some(Effort::High)),
+            AdapterEvent::EffortSet(Some(Effort::Low)),
+            AdapterEvent::EffortRefused {
+                effort: Effort::Max,
+                reason: "not this one".into(),
+            },
+            AdapterEvent::EffortSet(Some(Effort::Low)),
+        ],
+    );
+    // Under no command, a change is still logged.
+    mapper.asked_effort(Effort::Medium, None);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::EffortSet(Some(Effort::Medium))],
+    );
+    assert_eq!(
+        f.kinds(),
+        [
+            EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: Some(high),
+            },
+            EventKind::EffortChanged {
+                effort: Some(Effort::Low),
+                answers: Some(low),
+            },
+            EventKind::EffortRefused {
+                effort: Effort::Max,
+                reason: "not this one".into(),
+                answers: Some(max),
+            },
+            EventKind::EffortChanged {
+                effort: Some(Effort::Medium),
+                answers: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn exit_refuses_the_efforts_left_unanswered() {
+    use skywaved::agent::Effort;
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let (high, low) = (CommandId::new(), CommandId::new());
+    mapper.asked_effort(Effort::High, Some(high));
+    mapper.asked_effort(Effort::Low, Some(low));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::EffortSet(Some(Effort::High)),
+            AdapterEvent::Exited { error: None },
+        ],
+    );
+    assert_eq!(
+        f.kinds(),
+        [
+            EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: Some(high),
+            },
+            EventKind::EffortRefused {
+                effort: Effort::Low,
+                reason: "agent exited".into(),
+                answers: Some(low),
+            },
+        ]
+    );
 }

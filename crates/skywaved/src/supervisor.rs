@@ -21,9 +21,9 @@
 //!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
 //!   session whose agent is not running is left alone. Like an idle
 //!   shutdown, the next `UserMessage` resumes the agent.
-//! - `PermissionModeRequested` / `ModelRequested` →
-//!   [`AgentSession::set_permission_mode`] / [`AgentSession::set_model`],
-//!   noted with the mapper so the agent's answer names the command. A
+//! - `PermissionModeRequested` / `ModelRequested` / `EffortRequested` →
+//!   [`AgentSession::set_permission_mode`] / [`AgentSession::set_model`] /
+//!   [`AgentSession::set_effort`], noted with the mapper so the agent's answer names the command. A
 //!   session whose agent is not running is started for it (no message is
 //!   sent, so no turn runs) and kept like any idle session. Only the
 //!   session's open request goes out, once per agent: one a newer request
@@ -31,10 +31,11 @@
 //!   never land out of order, and one the agent's start already asked for
 //!   is not asked again.
 //!
-//! **Mode and model.** Every agent starts with the mode and model the
-//! session's log wants ([`Setting::wanted`](skywave_proto::Setting::wanted)):
-//! an open request, else what the agent last ran with. So a restarted or
-//! resumed agent keeps both, and a start made for a request carries that
+//! **Mode, model and effort.** Every agent starts with the mode, model and
+//! effort the session's log wants
+//! ([`Setting::wanted`](skywave_proto::Setting::wanted)): an open request,
+//! else what the agent last ran with (an effort its model takes none of is
+//! not asked for). So a restarted or resumed agent keeps all three, and a start made for a request carries that
 //! request out; each is asked for under the open request's command, if
 //! any, so its answer settles that request. An agent start that fails
 //! refuses the request it was made for. The models an agent offers are
@@ -71,7 +72,7 @@
 //!   ([`TURN_LOST`]);
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
-//! - a mode or model request still open whose event the supervisor had
+//! - a mode, model or effort request still open whose event the supervisor had
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
 //!   handed to is gone. One after the cursor is handled as usual.
 //!
@@ -97,7 +98,7 @@ use std::time::Duration;
 
 use rusqlite::OptionalExtension;
 use skywave_proto::{
-    CommandId, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
+    CommandId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -290,6 +291,15 @@ impl<A: AgentAdapter> Supervisor<A> {
                     answers: Some(request.command),
                 });
             }
+            if let Some(request) = settings.effort.requested_effort()
+                && handled(request.command)?
+            {
+                lost.push(EventKind::EffortRefused {
+                    effort: request.value,
+                    reason: DAEMON_RESTARTED.to_owned(),
+                    answers: Some(request.command),
+                });
+            }
             for kind in lost {
                 tracing::info!(session = %session.id.0, ?kind, "refusing a request lost with the daemon");
                 self.log.append(db, session.id, kind)?;
@@ -403,6 +413,10 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.set(session_id, event.command_id, Setting::Model(model))
                     .await?;
             }
+            EventKind::EffortRequested { effort, .. } => {
+                self.set(session_id, event.command_id, Setting::Effort(effort))
+                    .await?;
+            }
             _ => {}
         }
         Ok(())
@@ -432,6 +446,11 @@ impl<A: AgentAdapter> Supervisor<A> {
                         reason,
                         answers: command,
                     },
+                    Setting::Effort(effort) => EventKind::EffortRefused {
+                        effort,
+                        reason,
+                        answers: command,
+                    },
                 };
                 self.log.append(&mut self.storage.db, session_id, kind)?;
             }
@@ -443,6 +462,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         let open = match &setting {
             Setting::Mode(_) => settings.mode.requested.as_ref().map(|r| r.command),
             Setting::Model(_) => settings.model.requested.as_ref().map(|r| r.command),
+            Setting::Effort(_) => settings.effort.requested_effort().map(|r| r.command),
         };
         let Some(running) = self.running.get_mut(&session_id) else {
             return Ok(());
@@ -460,6 +480,10 @@ impl<A: AgentAdapter> Supervisor<A> {
             Setting::Model(model) => {
                 running.mapper.asked_model(model.clone(), command);
                 running.session.set_model(model).await
+            }
+            Setting::Effort(effort) => {
+                running.mapper.asked_effort(effort, command);
+                running.session.set_effort(effort).await
             }
         };
         if let Err(error) = sent {
@@ -516,12 +540,16 @@ impl<A: AgentAdapter> Supervisor<A> {
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
+        // An effort the running model takes none of, like an unknown one,
+        // asks for nothing.
+        let effort = settings.effort.wanted().copied().flatten();
         let spec = StartSpec {
             session_id,
             workdir: info.workdir.into(),
             resume,
             mode,
             model: model.clone(),
+            effort,
         };
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
@@ -536,6 +564,11 @@ impl<A: AgentAdapter> Supervisor<A> {
                 if let Some(model) = model {
                     let command = settings.model.requested.as_ref().map(|r| r.command);
                     mapper.asked_model(model, command);
+                    asked.insert(command);
+                }
+                if let Some(effort) = effort {
+                    let command = settings.effort.requested_effort().map(|r| r.command);
+                    mapper.asked_effort(effort, command);
                     asked.insert(command);
                 }
                 self.running.insert(
@@ -719,6 +752,7 @@ fn run_thread<A: AgentAdapter>(
 enum Setting {
     Mode(PermissionMode),
     Model(String),
+    Effort(Effort),
 }
 
 /// Logs `models`, offered by session `id`'s agent, as `ModelsOffered` when

@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use super::{display, rules, usage};
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, ModelChoice, PermissionMode, ResumeHandle,
+    AdapterEvent, AgentCallId, AgentRequestId, Effort, ModelChoice, PermissionMode, ResumeHandle,
     TurnOutcome,
 };
 
@@ -62,6 +62,8 @@ pub const INTERRUPT_REASON: &str = "interrupted";
 pub const WITHDRAWN_REASON: &str = "withdrawn by the agent";
 /// Reason for approvals still pending when their turn ended.
 pub const TURN_ENDED_REASON: &str = "turn ended";
+/// Reason for every effort request until the adapter can switch effort.
+pub const EFFORT_UNSUPPORTED: &str = "this agent cannot switch effort yet";
 
 /// What one protocol step produces, in order.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -446,6 +448,18 @@ impl Protocol {
         Output {
             writes: vec![write],
             events: Vec::new(),
+        }
+    }
+
+    /// Asks the CLI to run at `effort`. For now the adapter cannot switch
+    /// it, so this writes nothing and answers `EffortRefused` at once.
+    pub fn set_effort(&mut self, effort: Effort) -> Output {
+        Output {
+            writes: Vec::new(),
+            events: vec![AdapterEvent::EffortRefused {
+                effort,
+                reason: EFFORT_UNSUPPORTED.to_owned(),
+            }],
         }
     }
 
