@@ -1,0 +1,18 @@
+[package]
+name = "skywave-present"
+description = "Head-side presentation shared by every head: timeline sections, wording, UTF-16 cursors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Core types only: no UI toolkit, no FFI, no serialisation, so every head
+# (terminal, UniFFI, rinf) can use it.
+skywave-core.workspace = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

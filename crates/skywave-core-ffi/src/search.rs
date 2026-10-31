@@ -14,11 +14,11 @@
 //! in UTF-16 code units for highlighting.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use skywave_core as sc;
 use skywave_core::search::{self, BlobText, HEAD_BYTES, Query};
+use skywave_present::utf16::byte_ranges_to_utf16;
 
 use crate::action::parse;
 use crate::client::SkywaveCore;
@@ -138,7 +138,13 @@ impl TimelineSearch {
 /// text as the head renders it.
 #[uniffi::export]
 pub fn search_ranges(query: String, text: String) -> Vec<Utf16Range> {
-    utf16_ranges(&text, &Query::new(&query).ranges(&text))
+    byte_ranges_to_utf16(&text, &Query::new(&query).ranges(&text))
+        .into_iter()
+        .map(|range| Utf16Range {
+            start: range.start,
+            end: range.end,
+        })
+        .collect()
 }
 
 /// [`search::find`] over `timeline`, as the FFI returns it.
@@ -190,24 +196,6 @@ fn item(item: &sc::TimelineItem) -> SearchItem {
 
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
-}
-
-/// Byte `ranges` of `text` (on char boundaries, in order) as UTF-16 code
-/// units, counted in one pass.
-fn utf16_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Utf16Range> {
-    let (mut at, mut units) = (0usize, 0u64);
-    let mut to = |byte: usize| {
-        units += count(text[at..byte].encode_utf16().count());
-        at = byte;
-        units
-    };
-    ranges
-        .iter()
-        .map(|range| Utf16Range {
-            start: to(range.start),
-            end: to(range.end),
-        })
-        .collect()
 }
 
 #[cfg(test)]

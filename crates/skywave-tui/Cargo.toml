@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 skywave-core.workspace = true
+# Timeline sections and wording shared with the other heads.
+skywave-present.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 # OSC 52 copies are base64.

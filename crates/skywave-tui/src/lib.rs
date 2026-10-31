@@ -14,7 +14,6 @@ pub mod app;
 pub mod clipboard;
 pub mod composer;
 pub mod notify;
-pub mod timeline;
 pub mod ui;
 
 use std::io::{self, Write};
