@@ -15,8 +15,9 @@ use skywave_core::{
     RuleSuggestion, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
-    agent_mode_label, agent_model_label, agent_refusal, answer_words, blob_size, bytes,
-    delivery_label, dollars, mode_detail, mode_label, outgoing_label, tokens, turn_time,
+    agent_effort_label, agent_mode_label, agent_model_label, agent_refusal, answer_words,
+    blob_size, bytes, delivery_label, dollars, effort_label, mode_detail, mode_label,
+    outgoing_label, tokens, turn_time,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -121,6 +122,15 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         // what is unknown.
         let what = if agent.model.is_none() { "model " } else { "" };
         spans.push(Span::raw(format!(" · {what}{}", clean(&model))));
+    }
+    if let Some(effort) = agent_effort_label(agent) {
+        // As the model: `high → max` alone would not say what changes.
+        let what = if effort.starts_with("effort ") || effort.starts_with("no effort") {
+            ""
+        } else {
+            "effort "
+        };
+        spans.push(Span::raw(format!(" · {what}{}", clean(&effort))));
     }
     for refusal in agent_refusal(agent) {
         spans.push(Span::raw(format!(" · {}", clean(&refusal))).yellow());
@@ -521,6 +531,44 @@ fn render_picker(
             let now = agent_model_label(agent).unwrap_or_else(|| "unknown".to_owned());
             let input = (lines.len() - 1, clean(name).chars().count() + 2);
             (format!(" Model · now {} ", clean(&now)), lines, Some(input))
+        }
+        Picker::Agent { selected } => {
+            let model = agent_model_label(agent).unwrap_or_else(|| "unknown".to_owned());
+            let effort = agent_effort_label(agent).unwrap_or_else(|| "unknown".to_owned());
+            let items = vec![
+                vec![Span::raw(format!("{:<8}{}", "model", clean(&model)))],
+                vec![Span::raw(format!(
+                    "{:<8}{}",
+                    "effort",
+                    clean(effort.strip_prefix("effort ").unwrap_or(&effort))
+                ))],
+            ];
+            (
+                " Agent ".to_owned(),
+                list_lines(items, *selected, rows),
+                None,
+            )
+        }
+        Picker::Effort { selected } => {
+            let efforts = agent.efforts();
+            let lines = if efforts.is_empty() {
+                let model = agent_model_label(agent).unwrap_or_else(|| "this model".to_owned());
+                vec![Line::from(format!("{} takes no effort level", clean(&model))).dark_gray()]
+            } else {
+                let items = efforts
+                    .iter()
+                    .map(|effort| {
+                        let mut spans = vec![Span::raw(effort_label(*effort))];
+                        if agent.effort == Some(Some(*effort)) {
+                            spans.push(Span::raw(" · now").green());
+                        }
+                        spans
+                    })
+                    .collect();
+                list_lines(items, (*selected).min(efforts.len() - 1), rows)
+            };
+            let now = agent_effort_label(agent).unwrap_or_else(|| "unknown".to_owned());
+            (format!(" Effort · now {} ", clean(&now)), lines, None)
         }
     };
     let height = (lines.len() as u16 + 2).min(room);
