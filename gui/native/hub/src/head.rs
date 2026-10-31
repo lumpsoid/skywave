@@ -866,7 +866,7 @@ impl Head {
             composer: composer.as_ref(),
             revoked_dismissed: self.revoked_dismissed,
         };
-        let shown = screen::update(view, ui, clock.wall_ms);
+        let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {
             self.sent.screen = Some(shown.clone());
             out.push(Out::Screen(shown));

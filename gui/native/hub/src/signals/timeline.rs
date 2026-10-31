@@ -68,8 +68,8 @@ pub struct TimelineRow {
     pub expanded: bool,
     /// Delivery state of this device's message.
     pub outgoing: Option<OutgoingView>,
-    /// How this device's message went out: `queued 2m10s ago · sending,
-    /// try 3`; ticks while unanswered.
+    /// How this device's message went out: `queued 14:02:11 · sending,
+    /// try 3`.
     pub delivery_label: Option<String>,
     /// `EditQueued` and `Discard` take this pending message back.
     pub discardable: bool,

@@ -8,9 +8,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use skywave_core::{
-    Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, Delivery, DeviceRef,
-    Entry, Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome,
-    ToolView, read_head,
+    Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
+    Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    read_head,
 };
 use skywave_present::format::{
     agent_setting_line, answer_words, asked_by, bytes, decision_label, delivery_label, dollars,
@@ -168,7 +168,7 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
         expandable: false,
         expanded: false,
         outgoing: None,
-        delivery_label: delivery(item).map(|(o, d)| delivery_label(&d, &o, wall_ms)),
+        delivery_label: delivery(item).map(|(o, d)| delivery_label(&d, &o)),
         discardable: false,
         command_id: None,
         tool: None,
@@ -316,23 +316,15 @@ fn set(row: &mut TimelineRow, kind: RowKind, text: String) {
     row.text = text;
 }
 
-/// Whether the rows show a clock that runs: a tool call's elapsed time, or
-/// how long an own message or approval answer has waited for the server.
+/// Whether the rows show a clock that runs: a tool call's elapsed time.
 pub fn live(view: &SessionView) -> bool {
-    let waiting = |d: &Delivery| d.answered_at.is_none();
-    let items = view.timeline.iter().any(|item| {
+    view.timeline.iter().any(|item| {
         matches!(
             item,
             TimelineItem::Logged { entry: Entry::Tool(tool), .. }
                 if matches!(tool.outcome, ToolOutcome::Running { .. })
-        ) || delivery(item).is_some_and(|(_, d)| waiting(&d))
-    });
-    let answer = view
-        .pending_approval
-        .as_ref()
-        .and_then(|p| p.answer.as_ref()?.delivery.as_ref())
-        .is_some_and(waiting);
-    items || answer
+        )
+    })
 }
 
 /// The rows Dart holds after applying `updates` to `old`, as the diff

@@ -11,20 +11,19 @@ use skywave_core::{
 
 /// How an own command went out, all by this device's clock. Once answered,
 /// what each step took from the queueing: `queued 14:02:11 · sent +3.2s ·
-/// 2 tries · answered +8.1s`. Until then, how long it has waited and where
-/// it is: `queued 2m10s ago · sending, try 3`, or `… · sent once, waiting
-/// for the server` (sent, so it can no longer be taken back). `wall_ms` is
-/// now, in milliseconds since the Unix epoch.
-pub fn delivery_label(delivery: &Delivery, outgoing: &Outgoing, wall_ms: i64) -> String {
+/// 2 tries · answered +8.1s`. Until then, when it was queued and where it
+/// is: `queued 14:02:11 · sending, try 3`, or `… · sent once, waiting for
+/// the server` (sent, so it can no longer be taken back). No running
+/// count: a wait is read off the clock, not watched second by second.
+pub fn delivery_label(delivery: &Delivery, outgoing: &Outgoing) -> String {
     let queued = delivery.queued_at;
     // From the queueing to `ms`; never negative, should the clock step back.
     let since =
         |ms: i64| Duration::from_millis(u64::try_from(ms - queued.timestamp_millis()).unwrap_or(0));
     let tries = delivery.tries;
-    let mut parts = Vec::new();
+    let mut parts = vec![format!("queued {}", queued.format("%H:%M:%S"))];
     match delivery.answered_at {
         Some(answered) => {
-            parts.push(format!("queued {}", queued.format("%H:%M:%S")));
             match delivery.first_sent_at {
                 Some(sent) => {
                     parts.push(format!(
@@ -48,19 +47,16 @@ pub fn delivery_label(delivery: &Delivery, outgoing: &Outgoing, wall_ms: i64) ->
                 took_label(since(answered.timestamp_millis()))
             ));
         }
-        None => {
-            parts.push(format!("queued {} ago", seconds(since(wall_ms))));
-            match (outgoing, tries) {
-                (Outgoing::Sending, 0 | 1) => parts.push("sending".to_owned()),
-                (Outgoing::Sending, n) => parts.push(format!("sending, try {n}")),
-                (Outgoing::Queued, 0) => {}
-                (Outgoing::Queued, 1) => parts.push("sent once, waiting for the server".to_owned()),
-                (Outgoing::Queued, n) => {
-                    parts.push(format!("sent {n} times, waiting for the server"));
-                }
-                (Outgoing::Accepted(_) | Outgoing::Failed(_), _) => {}
+        None => match (outgoing, tries) {
+            (Outgoing::Sending, 0 | 1) => parts.push("sending".to_owned()),
+            (Outgoing::Sending, n) => parts.push(format!("sending, try {n}")),
+            (Outgoing::Queued, 0) => {}
+            (Outgoing::Queued, 1) => parts.push("sent once, waiting for the server".to_owned()),
+            (Outgoing::Queued, n) => {
+                parts.push(format!("sent {n} times, waiting for the server"));
             }
-        }
+            (Outgoing::Accepted(_) | Outgoing::Failed(_), _) => {}
+        },
     }
     parts.join(" · ")
 }

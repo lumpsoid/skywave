@@ -4089,12 +4089,11 @@ fn pending_message_shows_try_count() {
     h.key(KeyCode::Up);
     let key = ItemKey::Pending(command);
     assert_eq!(selected(&h), Some(key));
-    let later = delivery_of(&h, key).queued_at + chrono::Duration::seconds(130);
+    let queued_at = delivery_of(&h, key).queued_at;
+    let queued = format!("queued {}", queued_at.format("%H:%M:%S"));
+    let later = queued_at + chrono::Duration::seconds(130);
     let screen = trimmed(&h.frame(100, 24, later));
-    assert_eq!(
-        line_after(&screen, "you [queued]: hello"),
-        "queued 2m10s ago"
-    );
+    assert_eq!(line_after(&screen, "you [queued]: hello"), queued);
 
     for _ in 0..3 {
         assert!(h.seam.command_sending(command).unwrap());
@@ -4103,7 +4102,7 @@ fn pending_message_shows_try_count() {
     let screen = trimmed(&h.frame(100, 24, later));
     assert_eq!(
         line_after(&screen, "you [sending]: hello"),
-        "queued 2m10s ago · sending, try 3"
+        format!("{queued} · sending, try 3")
     );
 }
 
@@ -4121,52 +4120,43 @@ fn attempted_queued_message_says_sent_once() {
     h.key(KeyCode::Up);
     let key = ItemKey::Pending(command);
     assert_eq!(selected(&h), Some(key));
-    let later = delivery_of(&h, key).queued_at + chrono::Duration::seconds(7);
-    let screen = trimmed(&h.frame(100, 24, later));
+    let queued_at = delivery_of(&h, key).queued_at;
+    let screen = trimmed(&h.frame(100, 24, queued_at + chrono::Duration::seconds(7)));
     assert_eq!(
         line_after(&screen, "you [queued]: hello"),
-        "queued 7s ago · sent once, waiting for the server"
+        format!(
+            "queued {} · sent once, waiting for the server",
+            queued_at.format("%H:%M:%S")
+        )
     );
     // Which is why it can no longer be taken back.
     assert!(!footer(&h).contains("e edit"), "{}", footer(&h));
 }
 
 #[test]
-fn delivery_line_ticks_while_selected() {
+fn delivery_line_holds_still_while_waiting() {
     let (mut h, _, _) = open_session();
     h.type_text("hello");
     h.key(KeyCode::Enter);
     let command = last_command(&h);
-    assert!(!h.app.live(), "nothing selected, nothing counts");
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
     let key = ItemKey::Pending(command);
     assert_eq!(selected(&h), Some(key));
-    assert!(h.app.live(), "the event loop ticks for the count");
+    // A waiting message is no reason to redraw every second.
+    assert!(!h.app.live(), "nothing counts up");
     let queued_at = delivery_of(&h, key).queued_at;
     for seconds in [10, 20] {
         let wall = queued_at + chrono::Duration::seconds(seconds);
         assert_eq!(
             line_after(&trimmed(&h.frame(100, 24, wall)), "you [queued]: hello"),
-            format!("queued {seconds}s ago")
+            format!("queued {}", queued_at.format("%H:%M:%S"))
         );
     }
-    // Not shown while typing: nothing to count.
-    h.key(KeyCode::Tab);
-    assert!(!h.app.live());
-    h.key(KeyCode::Tab);
-    assert!(h.app.live());
-    // Answered: the times are final.
-    let seq = Seq(h.seam.cursor().unwrap().0 + 1);
-    h.seam
-        .command_result(command, &CommandResult::Accepted { seq })
-        .unwrap();
-    h.sync();
-    assert!(!h.app.live());
 }
 
 #[test]
-fn approval_answer_says_how_long_it_waited() {
+fn approval_answer_says_when_it_was_queued() {
     let (mut h, _, _, _) = gated(
         Vec::new(),
         call(CallId::new(), "Bash", ToolKind::Shell, "cargo test"),
@@ -4174,7 +4164,6 @@ fn approval_answer_says_how_long_it_waited() {
     h.key(KeyCode::Esc);
     h.key(KeyCode::Char('a'));
     let command = last_command(&h);
-    assert!(h.app.live(), "the answer's wait counts up");
     let answer = |h: &Harness| {
         let (view, _) = h.app.session().unwrap();
         view.pending_approval
@@ -4186,15 +4175,13 @@ fn approval_answer_says_how_long_it_waited() {
     };
     let queued_at = answer(&h).delivery.unwrap().queued_at;
     let wall = queued_at + chrono::Duration::seconds(40);
-    assert_contains(
-        &trimmed(&h.frame(100, 30, wall)),
-        "you approved · queued 40s ago",
-    );
+    let queued = format!("you approved · queued {}", queued_at.format("%H:%M:%S"));
+    assert_contains(&trimmed(&h.frame(100, 30, wall)), &queued);
     h.seam.command_sending(command).unwrap();
     h.sync();
     assert_contains(
         &trimmed(&h.frame(100, 30, wall)),
-        "you approved · queued 40s ago · sending",
+        &format!("{queued} · sending"),
     );
 }
 
