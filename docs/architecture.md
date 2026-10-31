@@ -34,11 +34,17 @@ One server = one account. Many devices = many views of the same data.
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `android/`         | Gradle project, Kotlin head, builds `skywave-core-ffi` via `cargo-ndk` |
+| `gui/`             | Flutter head; its rinf bridge crate `hub` lives at `gui/native/hub` |
 
 Crates live under `crates/`. Every crate carries the `skywave-` prefix (the
 daemon binary is `skywaved`); a crate named `core` would shadow Rust's
 built-in `core`. Heads depend on `skywave-core` (and `skywave-present`),
 never on `skywave-proto`.
+
+One exception to the prefix: the Flutter head's bridge crate is named `hub`
+and lives at `gui/native/hub`, because rinf's build tooling (cargokit) finds
+the library by its package name and its Android, Linux and Apple builds link
+`libhub`. It is still a workspace member.
 
 ## Core / head contract
 

@@ -1,0 +1,36 @@
+[package]
+# Must be `hub`, not `skywave-hub`: cargokit (rinf 8.11) builds `-p <package
+# name>` and then looks for the artifact `lib<package name>.so`/`.a`, while
+# the gradle task, the CMake link and the podspecs want `libhub`. A package
+# named otherwise builds, but nothing is copied and linking `-lhub` fails.
+name = "hub"
+description = "Skywave GUI head: the rinf bridge between the core and Flutter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# `lib` for tests, `cdylib` for Linux, Android and Windows, `staticlib` for
+# iOS and macOS.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+# No panics in the hub: a panic would leave Dart waiting. Return `Result`.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[dependencies]
+skywave-core.workspace = true
+rinf.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+skywave-proto.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
