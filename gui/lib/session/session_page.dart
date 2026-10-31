@@ -52,6 +52,47 @@ class _SessionPageState extends State<SessionPage> {
   SessionScreen get _screen => widget.screen;
 
   @override
+  void didUpdateWidget(SessionPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _announceRefusals(oldWidget.screen);
+  }
+
+  /// What the agent or server refused, in words, for each thing this page
+  /// asks of it: an interrupt, a mode, a model.
+  static List<String?> _refusalsOf(SessionScreen screen) => [
+    if (screen.interruptRefusal case final refusal?)
+      'Interrupt failed: $refusal'
+    else
+      null,
+    screen.agent.modeRefusal,
+    screen.agent.modelRefusal,
+  ];
+
+  /// Says each refusal that arrived since [before] once, in a snack bar;
+  /// its control keeps it afterwards. Those already there when the page
+  /// opened, or another session was shown, were not news here.
+  void _announceRefusals(SessionScreen before) {
+    if (before.sessionId != _screen.sessionId) return;
+    final was = _refusalsOf(before);
+    final now = _refusalsOf(_screen);
+    final news = [
+      for (var i = 0; i < now.length; i++)
+        if (now[i] case final refusal? when refusal != was[i]) refusal,
+    ];
+    if (news.isEmpty) return;
+    // Not mid-build: the messenger above rebuilds to show it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      for (final refusal in news) {
+        messenger?.showSnackBar(
+          SnackBar(content: Text(refusal), showCloseIcon: true),
+        );
+      }
+    });
+  }
+
+  @override
   void dispose() {
     _composerFocus.dispose();
     _searchFocus.dispose();
