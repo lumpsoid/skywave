@@ -24,6 +24,9 @@ panic = "deny"
 
 [dependencies]
 skywave-core.workspace = true
+skywave-present.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 rinf.workspace = true
 serde.workspace = true
 tokio.workspace = true

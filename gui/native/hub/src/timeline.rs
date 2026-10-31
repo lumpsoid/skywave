@@ -1,0 +1,1035 @@
+//! The open session's timeline as [`TimelineRow`]s, and the keyed diff
+//! between the rows last sent and the rows now. Every label is worded
+//! here, from present's sections and formatters, as the TUI words it
+//! without its key hints; the diff is transport only.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::Duration;
+
+use skywave_core::{
+    Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, Delivery, DeviceRef,
+    Entry, Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome,
+    ToolView, read_head,
+};
+use skywave_present::format::{
+    answer_words, bytes, decision_label, delivery_label, dollars, fail_reason, outgoing_label,
+    percent, seconds, took_label, turn_time,
+};
+use skywave_present::sections::{
+    ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
+};
+
+use crate::signals::{
+    BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
+    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+};
+
+/// Most of a blob an expanded section shows.
+pub const SHOW_BYTES: u64 = 64 * 1024;
+/// Most lines of a blob an expanded section shows.
+pub const SHOW_LINES: usize = 400;
+
+/// `key` as the contract carries it: `s:<seq>` or `p:<command id>`.
+pub fn key_string(key: ItemKey) -> String {
+    match key {
+        ItemKey::Logged(seq) => format!("s:{}", seq.0),
+        ItemKey::Pending(id) => format!("p:{}", id.0),
+    }
+}
+
+/// A key Dart sent back, or why it is not one.
+pub fn parse_key(text: &str) -> Result<ItemKey, String> {
+    let bad = || format!("not a timeline key: {text:?}");
+    match text.split_once(':') {
+        Some(("s", seq)) => seq
+            .parse()
+            .map(|seq| ItemKey::Logged(Seq(seq)))
+            .map_err(|_| bad()),
+        Some(("p", id)) => uuid::Uuid::parse_str(id)
+            .map(|id| ItemKey::Pending(id.into()))
+            .map_err(|_| bad()),
+        _ => Err(bad()),
+    }
+}
+
+/// What expanded sections showed of downloaded blobs, by blob, so a file
+/// is read once and not on every snapshot. A downloaded blob's file does
+/// not change.
+#[derive(Debug, Default)]
+pub struct BlobHeads {
+    read: HashMap<BlobId, Result<Head, String>>,
+}
+
+/// The head of a blob's file, as an expanded section shows it.
+#[derive(Debug, Clone)]
+struct Head {
+    lines: Vec<String>,
+    /// More lines, or more bytes, than shown.
+    cut: Option<String>,
+}
+
+impl BlobHeads {
+    fn get(&mut self, id: BlobId, path: &Path) -> Result<Head, String> {
+        self.read.entry(id).or_insert_with(|| read(path)).clone()
+    }
+}
+
+fn read(path: &Path) -> Result<Head, String> {
+    let (text, size) = read_head(path, SHOW_BYTES)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let all = content_lines(&text);
+    let cut = (all.len() > SHOW_LINES || size > SHOW_BYTES).then(|| {
+        let shown = if all.len() > SHOW_LINES {
+            format!("{SHOW_LINES} lines")
+        } else {
+            bytes(SHOW_BYTES)
+        };
+        format!("cut short: {shown} of {} shown", bytes(size))
+    });
+    Ok(Head {
+        lines: all.into_iter().take(SHOW_LINES).map(clean_line).collect(),
+        cut,
+    })
+}
+
+/// A session's rows, and for each the pending key its logged message
+/// replaced, if it is one: what a diff's `replaces` names.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rows {
+    pub rows: Vec<TimelineRow>,
+    pub was: Vec<Option<String>>,
+}
+
+/// Every row of `view`'s timeline at `wall_ms`, the items whose seq is in
+/// `expanded` expanded.
+pub fn rows(
+    view: &SessionView,
+    expanded: &HashSet<Seq>,
+    heads: &mut BlobHeads,
+    wall_ms: i64,
+) -> Rows {
+    let rule = rule_index(view);
+    let mut minute: Option<String> = None;
+    let mut out = Rows::default();
+    for (index, item) in view.timeline.iter().enumerate() {
+        let time_label = match item {
+            TimelineItem::Logged { at, .. } => {
+                let this = at.format("%Y-%m-%d %H:%M").to_string();
+                (minute.as_ref() != Some(&this)).then(|| {
+                    minute = Some(this);
+                    at.format("%H:%M").to_string()
+                })
+            }
+            TimelineItem::Pending { .. } => None,
+        };
+        let key = ItemKey::of(item);
+        let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
+        let mut row = row(item, open, heads, wall_ms);
+        row.time_label = time_label;
+        row.unread_rule = rule == Some(index);
+        row.turn_start = !row.unread_rule && index > 0 && starts_turn(item);
+        out.was.push(match item {
+            TimelineItem::Logged {
+                entry: Entry::UserMessage { command_id, .. },
+                ..
+            } => Some(key_string(ItemKey::Pending(*command_id))),
+            _ => None,
+        });
+        out.rows.push(row);
+    }
+    out
+}
+
+/// The timeline index the "new" rule goes above: the first logged item at
+/// or after [`SessionView::unread_from`].
+fn rule_index(view: &SessionView) -> Option<usize> {
+    let from = view.unread_from?;
+    view.timeline
+        .iter()
+        .position(|item| matches!(item, TimelineItem::Logged { seq, .. } if *seq >= from))
+}
+
+/// One item, `expanded` or not, without the facts that depend on its
+/// neighbours (time label, separators).
+fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64) -> TimelineRow {
+    let key = ItemKey::of(item);
+    let mut row = TimelineRow {
+        key: key_string(key),
+        kind: RowKind::PendingMessage,
+        author: None,
+        own: false,
+        text: String::new(),
+        time_label: None,
+        at_ms: None,
+        turn_start: false,
+        unread_rule: false,
+        selectable: selectable(item).is_some(),
+        expandable: false,
+        expanded: false,
+        outgoing: None,
+        delivery_label: delivery(item).map(|(o, d)| delivery_label(&d, &o, wall_ms)),
+        discardable: false,
+        tool: None,
+        sections: Vec::new(),
+    };
+    let (at, entry) = match item {
+        TimelineItem::Pending {
+            text,
+            outgoing,
+            discardable,
+            ..
+        } => {
+            row.author = Some("you".to_owned());
+            row.own = true;
+            row.text = clean_text(text);
+            row.outgoing = Some(outgoing_view(outgoing));
+            row.discardable = *discardable;
+            return row;
+        }
+        TimelineItem::Logged { at, entry, .. } => (at, entry),
+    };
+    row.at_ms = Some(at.timestamp_millis());
+    match entry {
+        Entry::UserMessage {
+            text,
+            from,
+            outgoing,
+            ..
+        } => {
+            set(&mut row, RowKind::UserMessage, clean_text(text));
+            row.own = from.me;
+            row.author = Some(if from.me {
+                "you".to_owned()
+            } else {
+                clean_line(&from.label())
+            });
+            row.outgoing = outgoing.as_ref().map(outgoing_view);
+        }
+        Entry::AgentMessage { text } => {
+            set(&mut row, RowKind::AgentMessage, clean_text(text));
+            row.author = Some("agent".to_owned());
+        }
+        Entry::AgentErrored { message } => {
+            set(&mut row, RowKind::AgentError, clean_text(message));
+            row.author = Some("agent error".to_owned());
+        }
+        Entry::Interrupted => set(
+            &mut row,
+            RowKind::Interrupted,
+            "interrupted · the agent stopped its turn".to_owned(),
+        ),
+        Entry::Stopped => set(
+            &mut row,
+            RowKind::Stopped,
+            "stopped · the agent was shut down, a message restarts it".to_owned(),
+        ),
+        Entry::Renamed { name, by } => set(
+            &mut row,
+            RowKind::Renamed,
+            match name {
+                Some(name) => format!("renamed to “{}” by {}", clean_line(name), who(by)),
+                None => format!("default title restored by {}", who(by)),
+            },
+        ),
+        Entry::Archived { archived, by } => set(
+            &mut row,
+            RowKind::Archived,
+            if *archived {
+                format!("archived by {}", who(by))
+            } else {
+                format!("brought back from the archive by {}", who(by))
+            },
+        ),
+        Entry::TurnUsage(usage) => {
+            let mut text = "turn".to_owned();
+            if let Some(ms) = usage.duration_ms {
+                text.push_str(&format!(" · {}", turn_time(ms)));
+            }
+            if let Some(cost) = usage.cost_usd {
+                text.push_str(&format!(" · {}", dollars(cost)));
+            }
+            set(&mut row, RowKind::TurnUsage, text);
+        }
+        Entry::Tool(view) => {
+            row.kind = RowKind::Tool;
+            row.tool = Some(tool_facts(view, wall_ms, expanded, entry));
+        }
+        Entry::ToolCall { name, summary, .. } => {
+            row.kind = RowKind::ToolCall;
+            row.tool = Some(plain_facts(name, summary, expanded, entry));
+        }
+        Entry::ToolResult { .. } => {
+            row.kind = RowKind::ToolResult;
+            row.tool = Some(plain_facts("result", "", expanded, entry));
+        }
+        Entry::Approval {
+            tool,
+            summary,
+            status,
+            answer,
+            ..
+        } => {
+            row.kind = RowKind::Approval;
+            let (state, mut label) = approval_state(status);
+            if let Some(note) = unapplied(status, answer.as_ref()) {
+                label = format!("{label} · {note}");
+            }
+            row.tool = Some(ToolFacts {
+                state,
+                state_label: label,
+                ..plain_facts(tool, summary, expanded, entry)
+            });
+        }
+    }
+    let all = sections(entry);
+    row.expandable = !all.is_empty();
+    row.expanded = expanded && row.expandable;
+    row.sections = all
+        .iter()
+        .filter(|s| row.expanded || !s.hidden)
+        .filter_map(|s| section_view(s, row.expanded, heads))
+        .collect();
+    row
+}
+
+fn set(row: &mut TimelineRow, kind: RowKind, text: String) {
+    row.kind = kind;
+    row.text = text;
+}
+
+/// Whether the rows show a clock that runs: a tool call's elapsed time, or
+/// how long an own message or approval answer has waited for the server.
+pub fn live(view: &SessionView) -> bool {
+    let waiting = |d: &Delivery| d.answered_at.is_none();
+    let items = view.timeline.iter().any(|item| {
+        matches!(
+            item,
+            TimelineItem::Logged { entry: Entry::Tool(tool), .. }
+                if matches!(tool.outcome, ToolOutcome::Running { .. })
+        ) || delivery(item).is_some_and(|(_, d)| waiting(&d))
+    });
+    let answer = view
+        .pending_approval
+        .as_ref()
+        .and_then(|p| p.answer.as_ref()?.delivery.as_ref())
+        .is_some_and(waiting);
+    items || answer
+}
+
+/// The rows Dart holds after applying `updates` to `old`, as the diff
+/// promises: removals, then upserts by ascending index.
+///
+/// `None` when the change is not a keyed diff (rows that stayed changed
+/// order): send a snapshot.
+pub fn diff(old: &[TimelineRow], new: &Rows) -> Option<Vec<TimelineUpdate>> {
+    let new_keys: HashSet<&str> = new.rows.iter().map(|r| r.key.as_str()).collect();
+    let old_at: HashMap<&str, usize> = old
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.key.as_str(), i))
+        .collect();
+    let stayed_old = old
+        .iter()
+        .map(|r| r.key.as_str())
+        .filter(|k| new_keys.contains(k));
+    let stayed_new = new
+        .rows
+        .iter()
+        .map(|r| r.key.as_str())
+        .filter(|k| old_at.contains_key(k));
+    if !stayed_old.eq(stayed_new) {
+        return None;
+    }
+    let mut out: Vec<TimelineUpdate> = old
+        .iter()
+        .filter(|r| !new_keys.contains(r.key.as_str()))
+        .map(|r| TimelineUpdate::Removed { key: r.key.clone() })
+        .collect();
+    for (index, (row, was)) in new.rows.iter().zip(&new.was).enumerate() {
+        if old_at
+            .get(row.key.as_str())
+            .is_some_and(|&i| old[i] == *row)
+        {
+            continue;
+        }
+        let replaces = was
+            .as_ref()
+            .filter(|p| old_at.contains_key(p.as_str()) && !new_keys.contains(p.as_str()))
+            .cloned();
+        out.push(TimelineUpdate::Upserted {
+            key: row.key.clone(),
+            item: row.clone(),
+            index: crate::link::count(index),
+            replaces,
+        });
+    }
+    Some(out)
+}
+
+/// A grouped call's head line.
+fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> ToolFacts {
+    let (state, mut label) = tool_state(view, wall_ms);
+    if let Some(note) = view
+        .approval
+        .as_ref()
+        .and_then(|a| unapplied(&a.status, a.answer.as_ref()))
+    {
+        label = format!("{label} · {note}");
+    }
+    ToolFacts {
+        kind: tool_kind(view.kind),
+        name: clean_line(&view.name),
+        title: clean_line(&view.title),
+        detail: view.detail.as_deref().map(clean_line),
+        state,
+        state_label: label,
+        aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
+    }
+}
+
+/// A legacy call or result: its name and the first line of its summary.
+fn plain_facts(name: &str, summary: &str, expanded: bool, entry: &Entry) -> ToolFacts {
+    ToolFacts {
+        kind: ToolKindView::Other,
+        name: clean_line(name),
+        title: clean_line(summary),
+        detail: None,
+        state: ToolState::Plain,
+        state_label: String::new(),
+        aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
+    }
+}
+
+pub fn tool_kind(kind: ToolKind) -> ToolKindView {
+    match kind {
+        ToolKind::FileWrite => ToolKindView::FileWrite,
+        ToolKind::FileEdit => ToolKindView::FileEdit,
+        ToolKind::FileRead => ToolKindView::FileRead,
+        ToolKind::Shell => ToolKindView::Shell,
+        ToolKind::Search => ToolKindView::Search,
+        ToolKind::Fetch => ToolKindView::Fetch,
+        ToolKind::Subagent => ToolKindView::Subagent,
+        ToolKind::Other => ToolKindView::Other,
+    }
+}
+
+/// How a grouped call stands. A denial or cancellation is said once, by
+/// the outcome.
+fn tool_state(view: &ToolView, wall_ms: i64) -> (ToolState, String) {
+    let approval = view.approval.as_ref().map(|a| &a.status);
+    let answered = match approval {
+        Some(ApprovalStatus::Resolved { decision, by, rule }) => {
+            Some(resolved_label(*decision, by, rule.as_ref()))
+        }
+        Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
+        Some(ApprovalStatus::Pending) | None => None,
+    };
+    match &view.outcome {
+        ToolOutcome::Running { .. } if approval == Some(&ApprovalStatus::Pending) => {
+            (ToolState::NeedsApproval, "needs approval".to_owned())
+        }
+        ToolOutcome::Running { since } => {
+            let elapsed = u64::try_from(wall_ms - since.timestamp_millis()).unwrap_or(0);
+            let parts: Vec<String> = answered
+                .into_iter()
+                .chain([format!(
+                    "running {}",
+                    seconds(Duration::from_millis(elapsed))
+                )])
+                .collect();
+            (ToolState::Running, parts.join(" · "))
+        }
+        ToolOutcome::Done {
+            is_error,
+            status,
+            took,
+            ..
+        } => {
+            let status = status
+                .clone()
+                .or_else(|| is_error.then(|| "error".to_owned()));
+            let parts: Vec<String> = status
+                .into_iter()
+                .chain(answered)
+                .chain([took_label(*took)])
+                .collect();
+            let state = if *is_error {
+                ToolState::Failed
+            } else {
+                ToolState::Done
+            };
+            (state, parts.join(" · "))
+        }
+        ToolOutcome::Denied { by } => (
+            ToolState::Denied,
+            format!("{} {}", decision_label(Decision::Deny), where_(by)),
+        ),
+        ToolOutcome::Cancelled { reason } => (
+            ToolState::Cancelled,
+            format!("cancelled: {}", clean_line(reason)),
+        ),
+        ToolOutcome::NoResult => {
+            let parts: Vec<String> = answered
+                .into_iter()
+                .chain(["no result".to_owned()])
+                .collect();
+            (ToolState::NoResult, parts.join(" · "))
+        }
+    }
+}
+
+/// A standalone approval's state.
+fn approval_state(status: &ApprovalStatus) -> (ToolState, String) {
+    match status {
+        ApprovalStatus::Pending => (ToolState::NeedsApproval, "needs approval".to_owned()),
+        ApprovalStatus::Resolved { decision, by, rule } => (
+            match decision {
+                Decision::Approve => ToolState::Done,
+                Decision::Deny => ToolState::Denied,
+            },
+            resolved_label(*decision, by, rule.as_ref()),
+        ),
+        ApprovalStatus::Cancelled { reason } => (
+            ToolState::Cancelled,
+            format!("cancelled: {}", clean_line(reason)),
+        ),
+    }
+}
+
+/// This device's answer to a settled approval, when it did not apply:
+/// `you approved · not applied: the approval was cancelled first`.
+fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String> {
+    let answer = answer?;
+    match (status, answer.outgoing) {
+        (
+            ApprovalStatus::Resolved { .. } | ApprovalStatus::Cancelled { .. },
+            Outgoing::Failed(reason),
+        ) => Some(format!(
+            "you {} · not applied: {}",
+            answer_words(answer.decision, answer.rule.as_ref()),
+            fail_reason(reason)
+        )),
+        _ => None,
+    }
+}
+
+/// `approved always on <device> · <rule>`.
+fn resolved_label(decision: Decision, by: &DeviceRef, rule: Option<&RuleSuggestion>) -> String {
+    let words = answer_words(decision, rule);
+    let rule = rule.map_or_else(String::new, |rule| {
+        format!(" · {}", clean_line(&rule.label))
+    });
+    format!("{words} {}{rule}", where_(by))
+}
+
+/// Who answered: `here`, or `on <device>`.
+fn where_(by: &DeviceRef) -> String {
+    if by.me {
+        "here".to_owned()
+    } else {
+        format!("on {}", clean_line(&by.label()))
+    }
+}
+
+/// Who did something: `you`, or the other device.
+fn who(by: &DeviceRef) -> String {
+    if by.me {
+        "you".to_owned()
+    } else {
+        clean_line(&by.label())
+    }
+}
+
+pub fn outgoing_view(outgoing: &Outgoing) -> OutgoingView {
+    OutgoingView {
+        state: match outgoing {
+            Outgoing::Queued => OutgoingState::Queued,
+            Outgoing::Sending => OutgoingState::Sending,
+            Outgoing::Accepted(_) => OutgoingState::Accepted,
+            Outgoing::Failed(_) => OutgoingState::Failed,
+        },
+        label: outgoing_label(outgoing),
+    }
+}
+
+/// While collapsed, the state of a blob no visible section shows: `input
+/// 4.2 KiB`, `output 1.0 MiB · requested`.
+fn unseen_blob(entry: &Entry) -> Option<String> {
+    let sections = sections(entry);
+    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
+    if sections.iter().any(|s| shown(s) && s.blob.is_some()) {
+        return None;
+    }
+    let section = sections.iter().find(|s| s.blob.is_some())?;
+    let what = match (section.input, section.hidden) {
+        (true, _) => "input",
+        (false, true) => "output",
+        (false, false) => "full",
+    };
+    let state = match &section.blob?.state {
+        BlobState::NotDownloaded { size } => bytes(*size),
+        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
+        BlobState::Downloading { got, size, paused } => format!(
+            "{} · downloading {}%{}",
+            bytes(*size),
+            percent(*got, *size),
+            if *paused { " · paused, offline" } else { "" }
+        ),
+        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
+        BlobState::Available { .. } => return None,
+    };
+    Some(format!("{what} {state}"))
+}
+
+/// One section as shown: collapsed, its preview's head and what more
+/// there is; expanded, all of it (the blob's head once here). `None` for
+/// a collapsed section with nothing to show.
+fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Option<SectionView> {
+    let preview = content_lines(section.text);
+    let mut note = None;
+    let mut cut_short = false;
+    let lines: Vec<String> = if expanded {
+        match section.blob.map(|blob| (blob.id, &blob.state)) {
+            Some((id, BlobState::Available { path })) => match heads.get(id, path) {
+                Ok(head) => {
+                    cut_short = head.cut.is_some();
+                    note = head.cut;
+                    head.lines
+                }
+                Err(err) => {
+                    note = Some(err);
+                    preview.into_iter().map(clean_line).collect()
+                }
+            },
+            Some((_, state)) => {
+                note = Some(fetch_note(state));
+                preview.into_iter().map(clean_line).collect()
+            }
+            None => preview.into_iter().map(clean_line).collect(),
+        }
+    } else {
+        if preview.is_empty() {
+            // Nothing worth a line, e.g. a write's output beside its status.
+            return None;
+        }
+        let shown: Vec<String> = preview
+            .iter()
+            .take(PREVIEW_LINES)
+            .map(|l| clean_line(l))
+            .collect();
+        note = more_note(section, preview.len(), shown.len());
+        shown
+    };
+    Some(view_of(section, lines, note, cut_short))
+}
+
+/// A section's head as the approval panel shows it: at most `max` lines of
+/// its preview, then what was left out.
+pub fn preview_view(section: &Section, max: usize) -> SectionView {
+    let preview = content_lines(section.text);
+    let shown: Vec<String> = preview.iter().take(max).map(|l| clean_line(l)).collect();
+    let note = more_note(section, preview.len(), shown.len());
+    view_of(section, shown, note, false)
+}
+
+fn view_of(
+    section: &Section,
+    lines: Vec<String>,
+    note: Option<String>,
+    cut_short: bool,
+) -> SectionView {
+    SectionView {
+        format: match section.format {
+            BodyFormat::Text => SectionFormat::Text,
+            BodyFormat::Diff => SectionFormat::Diff,
+        },
+        numbered: section.numbered,
+        first_line: 1,
+        input: section.input,
+        lines: lines
+            .into_iter()
+            .map(|text| SectionLine {
+                style: line_style(section, &text),
+                text,
+            })
+            .collect(),
+        note,
+        blob: section.blob.map(blob_facts),
+        cut_short,
+    }
+}
+
+/// While collapsed: how many more lines there are, and the blob's state:
+/// `… +12 lines · full 4.0 KiB · not downloaded`.
+fn more_note(section: &Section, preview: usize, shown: usize) -> Option<String> {
+    let whole = section
+        .lines
+        .map_or(preview, |lines| lines as usize)
+        .max(preview);
+    let mut more = Vec::new();
+    if whole > shown {
+        let rest = whole - shown;
+        more.push(format!(
+            "+{rest} {}",
+            if rest == 1 { "line" } else { "lines" }
+        ));
+    }
+    if let Some(blob) = section.blob {
+        more.push(match &blob.state {
+            BlobState::NotDownloaded { size } => format!("full {} · not downloaded", bytes(*size)),
+            BlobState::Requested { size } => format!("full {} · requested", bytes(*size)),
+            BlobState::Downloading { got, size, paused } => {
+                let progress = format!("downloading {}%", percent(*got, *size));
+                if *paused {
+                    format!("{progress} · paused, offline")
+                } else {
+                    progress
+                }
+            }
+            BlobState::Failed { size, .. } => format!("full {} · download failed", bytes(*size)),
+            BlobState::Available { .. } => "downloaded".to_owned(),
+        });
+    }
+    (!more.is_empty()).then(|| format!("… {}", more.join(" · ")))
+}
+
+/// While expanded and the blob is not here: where its download stands.
+fn fetch_note(state: &BlobState) -> String {
+    match state {
+        BlobState::NotDownloaded { size } => format!("not downloaded · {}", bytes(*size)),
+        BlobState::Requested { size } => {
+            format!("requested · waiting for a slot · {}", bytes(*size))
+        }
+        BlobState::Downloading { got, size, paused } => {
+            let progress = format!(
+                "downloading · {} of {} ({}%)",
+                bytes(*got),
+                bytes(*size),
+                percent(*got, *size)
+            );
+            if *paused {
+                format!("{progress} · paused, offline")
+            } else {
+                progress
+            }
+        }
+        BlobState::Failed { size, reason } => {
+            format!("download failed: {} · {}", clean_line(reason), bytes(*size))
+        }
+        BlobState::Available { .. } => "downloaded".to_owned(),
+    }
+}
+
+fn blob_facts(blob: &BlobView) -> BlobFacts {
+    let (state, label) = match &blob.state {
+        BlobState::NotDownloaded { size } => (
+            BlobStateKind::NotDownloaded,
+            format!("not downloaded · {}", bytes(*size)),
+        ),
+        BlobState::Requested { size } => (
+            BlobStateKind::Requested,
+            format!("requested · {}", bytes(*size)),
+        ),
+        BlobState::Downloading {
+            got,
+            size,
+            paused: false,
+        } => (
+            BlobStateKind::Downloading,
+            format!("downloading {}%", percent(*got, *size)),
+        ),
+        BlobState::Downloading {
+            got,
+            size,
+            paused: true,
+        } => (
+            BlobStateKind::Paused,
+            format!("downloading {}% · paused, offline", percent(*got, *size)),
+        ),
+        BlobState::Failed { size, .. } => (
+            BlobStateKind::Failed,
+            format!("download failed · {}", bytes(*size)),
+        ),
+        BlobState::Available { .. } => (BlobStateKind::Available, "downloaded".to_owned()),
+    };
+    BlobFacts {
+        blob_id: blob.id.0.to_string(),
+        state,
+        label,
+        can_download: matches!(
+            blob.state,
+            BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+        ),
+    }
+}
+
+/// A content line's colour: diff lines by their sign, an error's all red.
+fn line_style(section: &Section, line: &str) -> LineStyle {
+    if section.error {
+        return LineStyle::Error;
+    }
+    if section.format != BodyFormat::Diff {
+        return LineStyle::Plain;
+    }
+    if line.starts_with("+++") || line.starts_with("---") {
+        LineStyle::FileHeader
+    } else if line.starts_with('+') {
+        LineStyle::Added
+    } else if line.starts_with('-') {
+        LineStyle::Removed
+    } else if line.starts_with("@@") {
+        LineStyle::Hunk
+    } else {
+        LineStyle::Plain
+    }
+}
+
+/// The lines of some content; a final line break ends the last line, it
+/// does not start one. Nothing for empty content.
+fn content_lines(text: &str) -> Vec<&str> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect()
+}
+
+/// The first line of `text`, safe for a one-line label: tabs as spaces,
+/// other control characters dropped.
+pub fn clean_line(text: &str) -> String {
+    clean(text.split('\n').next().unwrap_or_default())
+}
+
+/// `text` with its line breaks, otherwise as [`clean_line`].
+pub fn clean_text(text: &str) -> String {
+    text.split('\n')
+        .map(|line| clean(line.strip_suffix('\r').unwrap_or(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use skywave_core::{CommandId, DeviceId, SessionId, SessionState};
+
+    use super::*;
+
+    fn session(timeline: Vec<TimelineItem>) -> SessionView {
+        SessionView {
+            id: SessionId::new(),
+            title: "x".into(),
+            named: false,
+            rename: None,
+            archived: false,
+            workdir: None,
+            state: SessionState::Idle,
+            timeline,
+            pending_approval: None,
+            rules: Vec::new(),
+            usage: None,
+            interrupt: None,
+            stop: None,
+            draft: None,
+            draft_rev: 0,
+            last_seq: Seq(0),
+            unread_from: None,
+        }
+    }
+
+    fn agent(seq: u64, minute: u32, text: &str) -> TimelineItem {
+        TimelineItem::Logged {
+            seq: Seq(seq),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, minute, 0).unwrap(),
+            entry: Entry::AgentMessage { text: text.into() },
+        }
+    }
+
+    fn pending(id: CommandId, text: &str) -> TimelineItem {
+        TimelineItem::Pending {
+            command_id: id,
+            text: text.into(),
+            outgoing: Outgoing::Queued,
+            discardable: true,
+            delivery: None,
+        }
+    }
+
+    fn logged_message(seq: u64, id: CommandId, text: &str) -> TimelineItem {
+        TimelineItem::Logged {
+            seq: Seq(seq),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
+            entry: Entry::UserMessage {
+                command_id: id,
+                text: text.into(),
+                from: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: true,
+                },
+                outgoing: Some(Outgoing::Accepted(Seq(seq))),
+                delivery: None,
+            },
+        }
+    }
+
+    fn rows_of(timeline: Vec<TimelineItem>) -> Rows {
+        rows(
+            &session(timeline),
+            &HashSet::new(),
+            &mut BlobHeads::default(),
+            0,
+        )
+    }
+
+    /// Applies `updates` to `rows` as the Dart holder does.
+    fn apply(rows: &mut Vec<TimelineRow>, updates: Vec<TimelineUpdate>) {
+        for update in updates {
+            match update {
+                TimelineUpdate::Snapshot { items, .. } => *rows = items,
+                TimelineUpdate::Upserted {
+                    key,
+                    item,
+                    index,
+                    replaces,
+                } => {
+                    rows.retain(|r| r.key != key && Some(&r.key) != replaces.as_ref());
+                    rows.insert(index as usize, item);
+                }
+                TimelineUpdate::Removed { key } => rows.retain(|r| r.key != key),
+            }
+        }
+    }
+
+    fn keys(updates: &[TimelineUpdate]) -> Vec<String> {
+        updates
+            .iter()
+            .map(|u| match u {
+                TimelineUpdate::Snapshot { .. } => "snapshot".to_owned(),
+                TimelineUpdate::Upserted {
+                    key,
+                    index,
+                    replaces,
+                    ..
+                } => format!("upsert {key}@{index} replaces {replaces:?}"),
+                TimelineUpdate::Removed { key } => format!("remove {key}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keys_round_trip_and_bad_ones_are_errors() {
+        let pending = ItemKey::Pending(CommandId::new());
+        for key in [ItemKey::Logged(Seq(42)), pending] {
+            assert_eq!(parse_key(&key_string(key)), Ok(key));
+        }
+        for bad in ["", "s:", "s:x", "p:nope", "q:1", "42"] {
+            assert!(parse_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_changed_row_and_a_new_one_are_upserted() {
+        let old = rows_of(vec![agent(1, 0, "A"), agent(2, 0, "B")]);
+        let new = rows_of(vec![agent(1, 0, "A"), agent(2, 0, "B'"), agent(3, 0, "C")]);
+        let updates = diff(&old.rows, &new).unwrap();
+        assert_eq!(
+            keys(&updates),
+            ["upsert s:2@1 replaces None", "upsert s:3@2 replaces None"]
+        );
+        let mut held = old.rows;
+        apply(&mut held, updates);
+        assert_eq!(held, new.rows);
+    }
+
+    #[test]
+    fn a_logged_message_replaces_its_pending_one() {
+        let id = CommandId::new();
+        let old = rows_of(vec![agent(1, 0, "A"), pending(id, "hi")]);
+        let new = rows_of(vec![agent(1, 0, "A"), logged_message(2, id, "hi")]);
+        let updates = diff(&old.rows, &new).unwrap();
+        let p = key_string(ItemKey::Pending(id));
+        assert_eq!(
+            keys(&updates),
+            [
+                format!("remove {p}"),
+                format!("upsert s:2@1 replaces Some({p:?})"),
+            ]
+        );
+        let mut held = old.rows;
+        apply(&mut held, updates);
+        assert_eq!(held, new.rows);
+    }
+
+    #[test]
+    fn a_conflated_snapshot_diffs_from_what_was_sent() {
+        let (p, q) = (CommandId::new(), CommandId::new());
+        let sent = rows_of(vec![agent(1, 0, "A"), agent(2, 0, "B"), pending(p, "one")]);
+        // Skipped: [A, B, logged one, C]. Now B is gone (deleted
+        // locally? edited), one is logged, C and D arrived, and another
+        // message is pending.
+        let now = rows_of(vec![
+            agent(1, 0, "A"),
+            logged_message(3, p, "one"),
+            agent(4, 1, "C"),
+            agent(5, 1, "D"),
+            pending(q, "two"),
+        ]);
+        let updates = diff(&sent.rows, &now).unwrap();
+        let mut held = sent.rows.clone();
+        apply(&mut held, updates);
+        assert_eq!(held, now.rows);
+    }
+
+    #[test]
+    fn rows_that_change_order_are_a_snapshot() {
+        let old = rows_of(vec![agent(1, 0, "A"), agent(2, 0, "B")]);
+        let mut new = old.clone();
+        new.rows.swap(0, 1);
+        new.was.swap(0, 1);
+        assert_eq!(diff(&old.rows, &new), None);
+    }
+
+    #[test]
+    fn the_time_shows_when_the_minute_changes() {
+        let rows = rows_of(vec![agent(1, 0, "A"), agent(2, 0, "B"), agent(3, 1, "C")]);
+        let labels: Vec<_> = rows.rows.iter().map(|r| r.time_label.clone()).collect();
+        assert_eq!(
+            labels,
+            [Some("12:00".to_owned()), None, Some("12:01".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_unread_rule_stands_in_for_the_turn_separator() {
+        let mut view = session(vec![
+            agent(1, 0, "A"),
+            logged_message(2, CommandId::new(), "go"),
+            agent(3, 0, "B"),
+            logged_message(4, CommandId::new(), "again"),
+        ]);
+        view.unread_from = Some(Seq(2));
+        let rows = rows(&view, &HashSet::new(), &mut BlobHeads::default(), 0).rows;
+        let facts: Vec<_> = rows.iter().map(|r| (r.unread_rule, r.turn_start)).collect();
+        assert_eq!(
+            facts,
+            [(false, false), (true, false), (false, false), (false, true)]
+        );
+    }
+}
