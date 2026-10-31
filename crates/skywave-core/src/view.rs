@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use skywave_proto::Fingerprint;
 
 pub use skywave_proto::RejectReason as FailReason;
 pub use skywave_proto::{
@@ -19,7 +20,6 @@ pub use skywave_proto::{
 pub use crate::projection::SessionUsage;
 
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
-use crate::tls::Fingerprint;
 
 /// One full snapshot of everything a head shows. Pushed whole after every
 /// change; there are no diffs.

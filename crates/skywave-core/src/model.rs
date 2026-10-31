@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, DirsResult, Event, EventBatch, EventKind,
-    RuleSuggestion, SessionState as LogState, ToolCall,
+    Fingerprint, RuleSuggestion, SessionState as LogState, ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -22,7 +22,7 @@ use crate::seam::Request;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
-use crate::tls::{self, Fingerprint};
+use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,

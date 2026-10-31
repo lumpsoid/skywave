@@ -9,10 +9,9 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use skywave_proto::DeviceId;
+use skywave_proto::{DeviceId, Fingerprint};
 
 use crate::error::{Error, Result};
-use crate::identity::Fingerprint;
 
 /// A row of the registry.
 #[derive(Debug, Clone, PartialEq)]

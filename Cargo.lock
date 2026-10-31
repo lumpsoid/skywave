@@ -1565,7 +1565,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
- "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1575,7 +1574,6 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2",
  "skywave-proto",
  "skywave-testkit",
  "skywaved",
@@ -1608,8 +1606,10 @@ name = "skywave-proto"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 

@@ -15,56 +15,10 @@ use rustls::{
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use sha2::{Digest, Sha256};
+use skywave_proto::Fingerprint;
 
 use crate::identity::{DeviceKey, Identity};
 use crate::transport::TransportError;
-
-/// SHA-256 of a certificate's DER: what `skywaved pair` prints for the CA.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fingerprint([u8; 32]);
-
-impl Fingerprint {
-    pub fn of_der(der: &[u8]) -> Fingerprint {
-        Fingerprint(Sha256::digest(der).into())
-    }
-
-    /// Reads a fingerprint as typed or scanned: 64 hex digits, any case,
-    /// with or without `:` separators and spaces. `None` otherwise.
-    pub fn parse(input: &str) -> Option<Fingerprint> {
-        let digits: String = input
-            .chars()
-            .filter(|c| !matches!(c, ':' | ' ' | '\t'))
-            .collect();
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(digits, &mut bytes).ok()?;
-        Some(Fingerprint(bytes))
-    }
-
-    /// 64 lowercase hex digits, the pairing URI form.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-}
-
-/// Uppercase colon-separated pairs (`AB:CD:…`), as `skywaved pair` prints.
-impl fmt::Display for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, b) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str(":")?;
-            }
-            write!(f, "{b:02X}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Fingerprint({self})")
-    }
-}
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -228,22 +182,4 @@ impl ServerCertVerifier for PinnedCaVerifier {
 /// DER of the first certificate in `pem`.
 pub(crate) fn first_cert_der(pem: &str) -> Option<CertificateDer<'static>> {
     CertificateDer::pem_slice_iter(pem.as_bytes()).next()?.ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fingerprint_input_is_lenient_and_displays_like_the_server() {
-        let fp = Fingerprint::of_der(b"ca");
-        let shown = fp.to_string();
-        assert_eq!(shown.len(), 32 * 3 - 1);
-        assert_eq!(Fingerprint::parse(&shown), Some(fp));
-        assert_eq!(Fingerprint::parse(&shown.to_lowercase()), Some(fp));
-        assert_eq!(Fingerprint::parse(&shown.replace(':', " ")), Some(fp));
-        assert_eq!(Fingerprint::parse(&fp.to_hex()), Some(fp));
-        assert_eq!(Fingerprint::parse(&fp.to_hex()[2..]), None);
-        assert_eq!(Fingerprint::parse("zz"), None);
-    }
 }

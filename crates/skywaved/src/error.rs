@@ -47,8 +47,6 @@ pub enum Error {
     InvalidServerName(String),
     #[error("invalid certificate signing request: {0}")]
     InvalidCsr(#[source] rcgen::Error),
-    #[error("invalid fingerprint {0:?}: expected 32 hex bytes")]
-    InvalidFingerprint(String),
     #[error("invalid device id {0:?}: expected a UUID")]
     InvalidDeviceId(String),
     #[error("no device with id {}", .0.0)]

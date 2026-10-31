@@ -37,8 +37,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
-use sha2::{Digest, Sha256};
-use skywave_proto::{DeviceId, ServerId};
+use skywave_proto::{DeviceId, Fingerprint, ServerId};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 
@@ -49,62 +48,6 @@ const KEY_FILE: &str = "key.pem";
 const CERT_FILE: &str = "cert.pem";
 const SERVER_ID_FILE: &str = "server_id";
 const LOCK_FILE: &str = "identity.lock";
-
-/// SHA-256 of a certificate's DER encoding.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fingerprint([u8; 32]);
-
-impl Fingerprint {
-    pub fn of_der(der: &[u8]) -> Fingerprint {
-        Fingerprint(Sha256::digest(der).into())
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Lowercase hex without separators: the form stored in the database.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-}
-
-/// Uppercase hex pairs separated by colons (`AB:CD:…`), for people to read
-/// and compare.
-impl fmt::Display for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, byte) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str(":")?;
-            }
-            write!(f, "{byte:02X}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Fingerprint({self})")
-    }
-}
-
-/// Accepts the [`Display`](fmt::Display) form, plain hex, any case, and
-/// ignores colons and whitespace.
-impl FromStr for Fingerprint {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Fingerprint> {
-        let digits: String = s
-            .chars()
-            .filter(|c| *c != ':' && !c.is_whitespace())
-            .collect();
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(&digits, &mut bytes)
-            .map_err(|_| Error::InvalidFingerprint(s.to_owned()))?;
-        Ok(Fingerprint(bytes))
-    }
-}
 
 /// A device certificate issued by [`ServerIdentity::sign_device_csr`].
 #[derive(Debug, Clone)]
@@ -620,26 +563,6 @@ mod tests {
             id.sign_device_csr("not a csr", DeviceId::new()),
             Err(Error::InvalidCsr(_))
         ));
-    }
-
-    #[test]
-    fn fingerprint_formats_and_parses() {
-        let fp = Fingerprint::of_der(b"cert");
-        let shown = fp.to_string();
-        assert_eq!(shown.len(), 32 * 3 - 1);
-        assert!(shown.chars().all(|c| c == ':' || c.is_ascii_hexdigit()));
-        assert_eq!(shown, shown.to_uppercase());
-        assert_eq!(shown.parse::<Fingerprint>().unwrap(), fp);
-        assert_eq!(fp.to_hex().parse::<Fingerprint>().unwrap(), fp);
-        assert_eq!(
-            shown
-                .to_lowercase()
-                .replace(':', " ")
-                .parse::<Fingerprint>()
-                .unwrap(),
-            fp
-        );
-        assert!("AB:CD".parse::<Fingerprint>().is_err());
     }
 
     #[test]

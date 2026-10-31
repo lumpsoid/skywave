@@ -47,8 +47,8 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, DeviceId, DirsQuery, EventsQuery, HelloResponse, PROTOCOL_VERSION, ServerId,
-    path,
+    BlobId, Command, DeviceId, DirsQuery, EventsQuery, Fingerprint, HelloResponse,
+    PROTOCOL_VERSION, ServerId, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
@@ -60,7 +60,6 @@ use crate::devices;
 use crate::dirs;
 use crate::error::Result;
 use crate::event_log::DEFAULT_BATCH_LIMIT;
-use crate::identity::Fingerprint;
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);

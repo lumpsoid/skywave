@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use hyper::{Method, StatusCode, header};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
-use skywave_proto::{PairRequest, PairResponse, path};
+use skywave_proto::{Fingerprint, PairRequest, PairResponse, path};
 
 use crate::address::{AddressError, ServerAddress};
 use crate::https::{Http, TransportConfig};
 use crate::identity::PairedCredentials;
 use crate::seam::Seam;
-use crate::tls::{self, Fingerprint};
+use crate::tls;
 use crate::transport::TransportError;
 
 /// Crockford base32: digits and letters without I, L, O, U.
@@ -100,9 +100,9 @@ pub fn normalize_code(input: &str) -> Result<String, PairError> {
     Ok(code)
 }
 
-/// The fingerprint as typed (any case, `:` or spaces between pairs).
+/// The fingerprint as typed (any case, `:` or whitespace between pairs).
 pub fn parse_fingerprint(input: &str) -> Result<Fingerprint, PairError> {
-    Fingerprint::parse(input).ok_or(PairError::InvalidFingerprint)
+    input.parse().map_err(|_| PairError::InvalidFingerprint)
 }
 
 /// What a pairing QR code holds, validated and in canonical form, ready

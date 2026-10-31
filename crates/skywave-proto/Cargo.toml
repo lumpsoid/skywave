@@ -9,7 +9,9 @@ publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
+hex.workspace = true
 serde.workspace = true
+sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
