@@ -167,6 +167,11 @@ pub enum ActionIntent {
     StopSession {
         session_id: String,
     },
+    /// Start a session in the open session's workdir and open it once
+    /// the server logged it.
+    CreateSessionLike {
+        session_id: String,
+    },
     /// Switch the session's agent to `mode`, starting it if need be.
     SetPermissionMode {
         session_id: String,

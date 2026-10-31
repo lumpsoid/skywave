@@ -145,6 +145,13 @@ impl Seam {
                 let accepted = CommandResult::Accepted { seq: *seq };
                 state.model.command_result(*id, accepted, now);
             }
+            // The batch is stored either way; a failed load leaves the
+            // session empty until it is opened again.
+            if let Some(id) = state.model.unloaded_session()
+                && let Ok(events) = state.store.session_events(id)
+            {
+                state.model.session_loaded(id, events);
+            }
             mark_alerted(state, &alerted);
             Ok((applied, Vec::new()))
         })

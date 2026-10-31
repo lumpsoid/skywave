@@ -31,6 +31,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::StopSession { session_id } => Action::StopSession {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::CreateSessionLike { session_id } => {
+            Action::CreateSessionLike(id("session", &session_id)?)
+        }
         ActionIntent::SetPermissionMode { session_id, mode } => Action::SetPermissionMode {
             session_id: id("session", &session_id)?,
             mode: permission_mode(mode),
