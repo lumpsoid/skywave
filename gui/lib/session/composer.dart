@@ -117,8 +117,15 @@ class ComposerState extends State<Composer> {
     );
   }
 
-  void submit() =>
-      widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
+  /// Nothing to send: the hub refuses blank text, so the button is off
+  /// and Enter does nothing.
+  bool get _blank => _field.text.trim().isEmpty;
+
+  /// Sends the field's text, unless it is blank.
+  void submit() {
+    if (_blank) return;
+    widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
+  }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -134,6 +141,7 @@ class ComposerState extends State<Composer> {
     if (key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter) {
       if (!enterSends || keyboard.isShiftPressed) return KeyEventResult.ignored;
+      // Blank or not, Enter is the send key here: no stray new line.
       submit();
       return KeyEventResult.handled;
     }
@@ -235,10 +243,15 @@ class ComposerState extends State<Composer> {
                     ),
                   ),
                   const SizedBox(width: 6),
-                  IconButton.filled(
-                    tooltip: 'Send',
-                    onPressed: submit,
-                    icon: const Icon(Icons.arrow_upward),
+                  // Follows the field: typing, the hub's text (a recalled
+                  // prompt, an edited queued message) and a sent clear.
+                  ValueListenableBuilder(
+                    valueListenable: _field,
+                    builder: (context, _, _) => IconButton.filled(
+                      tooltip: 'Send',
+                      onPressed: _blank ? null : submit,
+                      icon: const Icon(Icons.arrow_upward),
+                    ),
                   ),
                 ],
               ),
