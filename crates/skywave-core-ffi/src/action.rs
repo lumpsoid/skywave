@@ -7,10 +7,11 @@
 //! `OpenSession { session_id }`, ...) so Kotlin reads naturally.
 
 use skywave_core as sc;
+use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 use uuid::Uuid;
 
 use crate::error::SkywaveError;
-use crate::view::{BlobPolicy, Decision, chars_to_utf16, id, utf16_to_chars};
+use crate::view::{BlobPolicy, Decision, id};
 
 /// A user intent for the core.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]

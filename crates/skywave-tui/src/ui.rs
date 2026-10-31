@@ -10,7 +10,7 @@ mod session;
 mod timeline;
 
 use timeline::wall_ms;
-pub use timeline::{SHOW_BYTES, SHOW_LINES, bytes};
+pub use timeline::{SHOW_BYTES, SHOW_LINES};
 
 use std::borrow::Cow;
 use std::time::SystemTime;
@@ -23,14 +23,15 @@ use ratatui::widgets::{
     Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use skywave_core::{
-    BlobPolicy, CandidateSource, Completion, CompletionStatus, Decision, FailReason, Link,
-    LinkRejection, ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RejectReason,
-    RuleScope, RuleSuggestion, Screen, SessionListView, SessionRow, SessionState, SettingsView,
+    BlobPolicy, CandidateSource, Completion, CompletionStatus, Link, LinkRejection, ListKind,
+    Outgoing, PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen, SessionListView,
+    SessionRow, SessionState, SettingsView,
 };
+use skywave_present::format::{blob_size, bytes, dollars, fail_reason, scope_label};
+use skywave_present::sections::{discardable, wanted_blob};
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
 use crate::notify;
-use crate::timeline::{discardable, wanted_blob};
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -439,9 +440,9 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
         spans.push(Span::raw("  ✎ draft").dark_gray());
     }
     // What the session has cost, when its agent says.
-    let cost = row.cost_usd.map_or_else(String::new, |cost| {
-        format!("{} · ", timeline::dollars(cost))
-    });
+    let cost = row
+        .cost_usd
+        .map_or_else(String::new, |cost| format!("{} · ", dollars(cost)));
     spans.push(
         Span::raw(format!(
             "  · {cost}{}",
@@ -580,7 +581,7 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
         && let Some(size) = ui
             .selected_entry(view)
             .and_then(wanted_blob)
-            .and_then(|blob| timeline::blob_size(&blob.state))
+            .and_then(|blob| blob_size(&blob.state))
     {
         return keys
             .replacen("d download", &format!("d download ({})", bytes(size)), 1)
@@ -929,61 +930,6 @@ pub(crate) fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
         Outgoing::Sending => ("sending", Style::new().cyan()),
         Outgoing::Accepted(_) => ("accepted", Style::new().green()),
         Outgoing::Failed(_) => ("failed", Style::new().red().bold()),
-    }
-}
-
-pub(crate) fn outgoing_label(outgoing: &Outgoing) -> String {
-    match outgoing {
-        Outgoing::Queued => "queued".to_owned(),
-        Outgoing::Sending => "sending".to_owned(),
-        Outgoing::Accepted(_) => "accepted".to_owned(),
-        Outgoing::Failed(reason) => format!("failed: {}", fail_reason(*reason)),
-    }
-}
-
-/// Why a command failed, in words.
-fn fail_reason(reason: FailReason) -> &'static str {
-    match reason {
-        FailReason::Rejected(reason) => reject_reason(reason),
-        FailReason::Undeliverable => "the server could not take it",
-    }
-}
-
-/// Why the server refused a command, in words.
-fn reject_reason(reason: RejectReason) -> &'static str {
-    match reason {
-        RejectReason::WorkdirNotAllowed => "not under a configured root on the server",
-        RejectReason::WorkdirNotFound => "no such directory on the server",
-        RejectReason::UnknownSession => "the server does not know this session",
-        RejectReason::UnknownApproval => "the server does not know this approval",
-        RejectReason::ApprovalAlreadyResolved => "already answered on another device",
-        RejectReason::ApprovalCancelled => "the approval was cancelled first",
-        RejectReason::NoActiveTurn => "the agent was not working",
-        RejectReason::UnknownRule => "the agent did not offer that rule",
-    }
-}
-
-pub(crate) fn decision_label(decision: Decision) -> &'static str {
-    match decision {
-        Decision::Approve => "approved",
-        Decision::Deny => "denied",
-    }
-}
-
-/// An answer in words: `approved always` when it granted a rule.
-pub(crate) fn answer_words(decision: Decision, rule: Option<&RuleSuggestion>) -> &'static str {
-    match rule {
-        Some(_) => "approved always",
-        None => decision_label(decision),
-    }
-}
-
-/// How far a rule reaches, in words.
-fn scope_label(scope: RuleScope) -> &'static str {
-    match scope {
-        RuleScope::Session => "this session",
-        RuleScope::Project => "project",
-        RuleScope::User => "user",
     }
 }
 

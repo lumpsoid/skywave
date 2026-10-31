@@ -1,8 +1,8 @@
 //! How the head reads a session timeline: which items can be selected,
 //! where turns start, and what content an item shows beneath its title,
-//! with the blobs behind it. Keys ([`app`](crate::app)) and rendering
-//! ([`ui`](crate::ui)) both go through here, so what Enter opens is what the
-//! screen shows, and what `y` copies is what it shows.
+//! with the blobs behind it. A head's input handling and its rendering both
+//! go through here, so what opening an item shows is what the screen shows,
+//! and what a copy takes is what it shows.
 
 use skywave_core::{
     BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, Outgoing, Query, Seq,
@@ -73,7 +73,7 @@ pub fn find(view: &SessionView, key: ItemKey) -> Option<usize> {
 }
 
 /// The pending message `selected` names, with its delivery state, if the
-/// core marks it discardable: what `e` and `Delete` take back.
+/// core marks it discardable: what a head may edit or take back.
 pub fn discardable(view: &SessionView, selected: Option<ItemKey>) -> Option<(CommandId, Outgoing)> {
     let Some(ItemKey::Pending(id)) = selected else {
         return None;
@@ -193,8 +193,8 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
 
 /// A grouped call: its body (e.g. the file written or the diff), then its
 /// output. Output beside a body is shown only when it is an error or the
-/// body is a shell command; the rest waits for Enter. The whole input is
-/// offered when nothing else has a blob.
+/// body is a shell command; the rest waits for the item to expand. The
+/// whole input is offered when nothing else has a blob.
 pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     let mut out = Vec::new();
     if let Some(body) = &view.body {
@@ -296,7 +296,7 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
 }
 
 /// The first blob behind `entry` that nobody asked for yet, or whose
-/// download failed; what `d` fetches.
+/// download failed; what a download request fetches.
 pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
     sections(entry)
         .into_iter()
@@ -309,7 +309,7 @@ pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
         })
 }
 
-/// What `y` or `Y` copies from an item: text at hand, or a blob's whole
+/// What a copy takes from an item: text at hand, or a blob's whole
 /// content, never the preview of one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Content {
@@ -349,9 +349,9 @@ fn message(item: &TimelineItem) -> Option<&str> {
     }
 }
 
-/// What `y` copies: a message's text; else the last section shown while
-/// collapsed: a call's output, the diff or file an edit or write shows in
-/// its stead, its body while no result is here; else the call, as
+/// The main copy target: a message's text; else the last section shown
+/// while collapsed: a call's output, the diff or file an edit or write
+/// shows in its stead, its body while no result is here; else the call, as
 /// [`call_content`].
 pub fn main_content(item: &TimelineItem) -> Option<Content> {
     if let Some(text) = message(item) {
@@ -368,9 +368,9 @@ pub fn main_content(item: &TimelineItem) -> Option<Content> {
         .or_else(|| call_content(item))
 }
 
-/// What `Y` copies: the call. A shell call's whole command (its body when
-/// it has one, else its title) without the `$ ` prompt; title and detail
-/// of any other call; a message's text.
+/// The call copy target: a shell call's whole command (its body when it
+/// has one, else its title) without the `$ ` prompt; title and detail of
+/// any other call; a message's text.
 pub fn call_content(item: &TimelineItem) -> Option<Content> {
     if let Some(text) = message(item) {
         return Some(Content::Text(text.to_owned()));

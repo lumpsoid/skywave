@@ -15,15 +15,15 @@ use skywave_core::{
     Outgoing, PairUri, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId,
     SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
+use skywave_present::format::bytes;
+use skywave_present::sections::{
+    Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
+    match_hidden, sections, selectable, starts_turn, wanted_blob,
+};
 
 use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
 use crate::notify;
-use crate::timeline::{
-    Content, ItemKey, call_content, delivery, discardable, find, gated_item, main_content,
-    match_hidden, sections, selectable, starts_turn, wanted_blob,
-};
-use crate::ui::bytes;
 
 /// How old the first unsaved composer edit gets before the draft is saved
 /// anyway: at most this much typing is lost to a crash. Saves are durable

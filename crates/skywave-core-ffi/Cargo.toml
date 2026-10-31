@@ -22,6 +22,8 @@ bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 
 [dependencies]
 skywave-core.workspace = true
+# Head-side presentation shared with the other heads (UTF-16 cursors).
+skywave-present.workspace = true
 uniffi.workspace = true
 chrono.workspace = true
 thiserror.workspace = true

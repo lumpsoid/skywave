@@ -30,14 +30,15 @@ One server = one account. Many devices = many views of the same data.
 | `skywaved`         | Server daemon: agent supervisor, event log, HTTPS API, admin CLI |
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
 | `skywave-core-ffi` | UniFFI wrapper over `skywave-core`; `skywave-core` has no FFI dependency |
+| `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors; pure, on `skywave-core` only |
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `android/`         | Gradle project, Kotlin head, builds `skywave-core-ffi` via `cargo-ndk` |
 
 Crates live under `crates/`. Every crate carries the `skywave-` prefix (the
 daemon binary is `skywaved`); a crate named `core` would shadow Rust's
-built-in `core`. Heads depend on `skywave-core` only, never on
-`skywave-proto`.
+built-in `core`. Heads depend on `skywave-core` (and `skywave-present`),
+never on `skywave-proto`.
 
 ## Core / head contract
 

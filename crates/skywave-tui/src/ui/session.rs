@@ -14,17 +14,17 @@ use skywave_core::{
     ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, SessionState,
     SessionUsage, SessionView, TimelineItem, ToolView,
 };
+use skywave_present::format::{
+    answer_words, blob_size, bytes, delivery_label, dollars, outgoing_label, tokens, turn_time,
+};
+use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
 use super::timeline::{
-    approval_state, blob_size, bytes, clean, delivery_label, detail_lines, dollars, glyph,
-    head_lines, item_lines, preview_lines, rule_index, title_spans, tokens, turn_time, wall_ms,
+    approval_state, clean, detail_lines, glyph, head_lines, item_lines, preview_lines, rule_index,
+    title_spans, wall_ms,
 };
-use super::{
-    answer_words, outgoing_badge, outgoing_label, rename_badge, render_prompt, rule_text,
-    state_badge,
-};
+use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
 use crate::app::{App, Focus, Geometry, SessionUi};
-use crate::timeline::{ItemKey, Section, gated_item, sections, tool_sections};
 
 /// Most composer rows on screen; longer drafts scroll.
 const COMPOSER_ROWS: usize = 6;

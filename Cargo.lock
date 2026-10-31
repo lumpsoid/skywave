@@ -1591,6 +1591,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "skywave-core",
+ "skywave-present",
  "skywaved",
  "tempfile",
  "thiserror",
@@ -1599,6 +1600,13 @@ dependencies = [
  "tracing-subscriber",
  "uniffi",
  "uuid",
+]
+
+[[package]]
+name = "skywave-present"
+version = "0.1.0"
+dependencies = [
+ "skywave-core",
 ]
 
 [[package]]
@@ -1632,6 +1640,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "skywave-core",
+ "skywave-present",
  "skywave-proto",
  "skywave-testkit",
  "skywaved",

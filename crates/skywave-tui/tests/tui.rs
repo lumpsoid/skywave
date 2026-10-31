@@ -17,6 +17,7 @@ use skywave_core::{
     DeviceId, Draft, Entry, Link, LinkRejection, PairedCredentials, Request, Route, Screen, Seam,
     Seq, SessionId, TimelineItem, ViewState,
 };
+use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
     EventKind, RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ToolCall,
@@ -25,7 +26,6 @@ use skywave_proto::{
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
 use skywave_tui::clipboard::{self, Clip};
-use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
 
 const FP: &str = "ab:cd:ef";
