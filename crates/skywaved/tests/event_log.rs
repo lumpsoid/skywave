@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Event,
+    EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState,
 };
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
 use skywaved::{Error, EventLog, Storage};
@@ -97,8 +97,14 @@ impl Fixture {
     }
 
     fn all_kinds(&self) -> Vec<EventKind> {
-        let batch = self.log.read(&self.storage.db, Seq::ZERO, 5000).unwrap();
-        batch.events.into_iter().map(|e| e.kind).collect()
+        self.all_events().into_iter().map(|e| e.kind).collect()
+    }
+
+    fn all_events(&self) -> Vec<Event> {
+        self.log
+            .read(&self.storage.db, Seq::ZERO, 5000)
+            .unwrap()
+            .events
     }
 }
 
@@ -203,13 +209,96 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
         );
     }
     assert_eq!(f.log.head(), seq);
+    let logged = f.all_events().pop().unwrap();
+    assert_eq!(logged.command_id, Some(command.id));
     assert_eq!(
-        f.all_kinds().last().unwrap(),
-        &EventKind::UserMessage {
-            command_id: command.id,
+        logged.kind,
+        EventKind::UserMessage {
             device_id: device,
             text: "hello".into(),
         }
+    );
+}
+
+/// Every command logs exactly one event, carrying the command's id at the
+/// seq its `Accepted` names, so the log alone acknowledges it; agent and
+/// daemon events carry none, and a rejected command logs nothing.
+#[test]
+fn each_accepted_command_logs_one_event_naming_it() {
+    let mut f = Fixture::new();
+    let device = DeviceId::new();
+    let send = |f: &mut Fixture, kind: CommandKind| {
+        let command = Command {
+            id: CommandId::new(),
+            kind,
+        };
+        let before = f.log.head();
+        let result = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+        (command.id, result, before)
+    };
+    let workdir = workdir(&f.root.join("project"));
+    let (id, result, before) = send(&mut f, CommandKind::CreateSession { workdir });
+    let seq = accepted(result);
+    assert_eq!(seq, before.next(), "one event, nothing else");
+    let session = f.all_events()[(seq.0 - 1) as usize].session_id;
+    let mut logged = vec![(id, seq)];
+
+    f.start_turn(session);
+    let approval = f.request_approval(session);
+    let commands = [
+        CommandKind::SendMessage {
+            session_id: session,
+            text: "hi".into(),
+        },
+        CommandKind::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        },
+        CommandKind::Interrupt {
+            session_id: session,
+        },
+        CommandKind::StopSession {
+            session_id: session,
+        },
+        CommandKind::RenameSession {
+            session_id: session,
+            name: Some("name".into()),
+        },
+        CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+    ];
+    for kind in commands {
+        let (id, result, before) = send(&mut f, kind);
+        let seq = accepted(result);
+        assert_eq!(seq, before.next(), "one event, nothing else");
+        logged.push((id, seq));
+    }
+    let head = f.log.head();
+    let (_, refused, _) = send(
+        &mut f,
+        CommandKind::Interrupt {
+            session_id: session,
+        },
+    );
+    assert_eq!(refused, rejected(RejectReason::NoActiveTurn));
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    let events = f.all_events();
+    for (id, seq) in &logged {
+        let event = &events[(seq.0 - 1) as usize];
+        assert_eq!(event.command_id, Some(*id), "{event:?}");
+        assert!(event.kind.logged_by_command(), "{event:?}");
+    }
+    let named: Vec<_> = events.iter().filter_map(|e| e.command_id).collect();
+    assert_eq!(named.len(), logged.len(), "agent events name no command");
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.command_id.is_none())
+            .all(|e| !e.kind.logged_by_command())
     );
 }
 

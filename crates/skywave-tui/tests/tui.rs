@@ -262,7 +262,29 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
     Event {
         session_id,
         at: at(minute),
+        command_id: kind.logged_by_command().then(CommandId::new),
         kind,
+    }
+}
+
+/// A message `command` sent from `device_id`, as the log holds it.
+fn message(
+    session_id: SessionId,
+    minute: u32,
+    command: CommandId,
+    device_id: DeviceId,
+    text: impl Into<String>,
+) -> Event {
+    Event {
+        command_id: Some(command),
+        ..event(
+            session_id,
+            minute,
+            EventKind::UserMessage {
+                device_id,
+                text: text.into(),
+            },
+        )
     }
 }
 
@@ -1249,7 +1271,6 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
                 id,
                 1,
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: phone,
                     text: "from the phone".into(),
                 },
@@ -1323,7 +1344,6 @@ fn every_timeline_entry_renders_distinctly() {
                 id,
                 1,
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: other,
                     text: "from the laptop".into(),
                 },
@@ -1427,15 +1447,7 @@ fn own_messages_show_their_delivery_state() {
     assert_contains(&h.screen(), "you [accepted]: q? line one");
     pull(
         &mut h,
-        vec![event(
-            id,
-            1,
-            EventKind::UserMessage {
-                command_id: command,
-                device_id: me,
-                text: "q? line one\nline two".into(),
-            },
-        )],
+        vec![message(id, 1, command, me, "q? line one\nline two")],
     );
     assert_contains(
         &line_with(&h.screen(), ": q? line one"),
@@ -2768,7 +2780,6 @@ fn result(call: CallId, is_error: bool, status: &str, preview: &str) -> ToolResu
 
 fn user(device: DeviceId, text: &str) -> EventKind {
     EventKind::UserMessage {
-        command_id: CommandId::new(),
         device_id: device,
         text: text.into(),
     }
@@ -2792,9 +2803,10 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
     let (mut h, id, me) = open_session();
     // Fixed, so the snapshot names it.
     let other: DeviceId = serde_json::from_str("\"0192c8a0-0000-7000-8000-0000c0ffee42\"").unwrap();
-    let ev = |minute, second, kind| Event {
+    let ev = |minute, second, kind: EventKind| Event {
         session_id: id,
         at: at_s(minute, second),
+        command_id: kind.logged_by_command().then(CommandId::new),
         kind,
     };
     let ids: Vec<CallId> = (0..8).map(|_| CallId::new()).collect();
@@ -3679,18 +3691,7 @@ fn selection_follows_pending_to_logged() {
     h.sync();
     assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
 
-    pull(
-        &mut h,
-        vec![event(
-            id,
-            2,
-            EventKind::UserMessage {
-                command_id: command,
-                device_id: me,
-                text: "hello".into(),
-            },
-        )],
-    );
+    pull(&mut h, vec![message(id, 2, command, me, "hello")]);
     assert_eq!(selected(&h), Some(ItemKey::Logged(seq)));
     assert_contains(&h.screen(), "> 12:02 you [accepted]: hello");
     // And moves on from there.
@@ -3734,17 +3735,11 @@ fn scroll_follows_pending_to_logged() {
     // move down in the timeline, and the view moves with them.
     let first = h.seam.cursor().unwrap().0 + 1;
     let mut events = vec![event(id, 2, agent("reply"))];
-    events.extend(sent.iter().enumerate().map(|(i, command)| {
-        event(
-            id,
-            3,
-            EventKind::UserMessage {
-                command_id: *command,
-                device_id: me,
-                text: format!("pending {i:02}"),
-            },
-        )
-    }));
+    events.extend(
+        sent.iter()
+            .enumerate()
+            .map(|(i, command)| message(id, 3, *command, me, format!("pending {i:02}"))),
+    );
     pull(&mut h, events);
     let screen = h.screen();
     assert_eq!(pending_rows(&screen), before, "{screen}");
@@ -4007,18 +4002,7 @@ fn selected_own_message_shows_delivery_detail() {
     h.seam
         .command_result(command, &CommandResult::Accepted { seq })
         .unwrap();
-    pull(
-        &mut h,
-        vec![event(
-            id,
-            2,
-            EventKind::UserMessage {
-                command_id: command,
-                device_id: me,
-                text: "hello".into(),
-            },
-        )],
-    );
+    pull(&mut h, vec![message(id, 2, command, me, "hello")]);
     // Only a selected message shows it.
     assert!(!h.screen().contains("queued"), "{}", h.screen());
     h.key(KeyCode::Esc);
@@ -4368,15 +4352,7 @@ fn current_match_survives_new_items() {
     pull(
         &mut h,
         vec![
-            event(
-                id,
-                6,
-                EventKind::UserMessage {
-                    command_id: command,
-                    device_id: me,
-                    text: "test once more".into(),
-                },
-            ),
+            message(id, 6, command, me, "test once more"),
             event(id, 7, agent("tests are green")),
         ],
     );
@@ -5309,7 +5285,6 @@ fn shift_d_confirms_and_removes_row() {
             a,
             5,
             EventKind::UserMessage {
-                command_id: CommandId::new(),
                 device_id: DeviceId::new(),
                 text: "still here?".into(),
             },

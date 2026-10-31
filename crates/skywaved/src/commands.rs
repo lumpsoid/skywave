@@ -12,6 +12,13 @@
 //! - `RenameSession` → `SessionRenamed` with the normalised name;
 //! - `SetSessionArchived` → `SessionArchived`.
 //!
+//! Each appends exactly that one event and nothing else, carrying the
+//! command's id ([`Event::command_id`](skywave_proto::Event::command_id)),
+//! so the log acknowledges an accepted command as its `Accepted` does: a
+//! device whose reply was lost settles the command when it pulls the
+//! event. A rejected command appends nothing; only its stored result
+//! answers it.
+//!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
 //! settled inside the command's transaction like every other command, and
@@ -123,7 +130,6 @@ impl EventLog {
                     return Ok(Err(RejectReason::UnknownSession));
                 }
                 let kind = EventKind::UserMessage {
-                    command_id: command.id,
                     device_id: device,
                     text: text.clone(),
                 };
@@ -194,7 +200,12 @@ impl EventLog {
                 (*session_id, kind)
             }
         };
-        Ok(Ok(event_log::append_in(tx, session_id, &kind)?))
+        Ok(Ok(event_log::append_in(
+            tx,
+            session_id,
+            Some(command.id),
+            &kind,
+        )?))
     }
 }
 

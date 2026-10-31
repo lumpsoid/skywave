@@ -37,6 +37,7 @@ fn event(kind: EventKind) -> Event {
     Event {
         session_id: session(),
         at: at(),
+        command_id: kind.logged_by_command().then(command),
         kind,
     }
 }
@@ -47,7 +48,6 @@ fn all_event_kinds() -> Vec<EventKind> {
             workdir: "/srv/code/skywave".into(),
         },
         EventKind::UserMessage {
-            command_id: command(),
             device_id: device(),
             text: "run the tests".into(),
         },

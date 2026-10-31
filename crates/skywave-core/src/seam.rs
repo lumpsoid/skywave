@@ -132,10 +132,19 @@ impl Seam {
     /// Stores a pulled batch (one transaction, cursor included) and shows
     /// it. A batch that would leave a gap is refused with
     /// [`StoreError::Gap`](crate::StoreError::Gap) and changes nothing.
+    ///
+    /// Its events settle the commands they name that are still unanswered,
+    /// as [`Seam::command_result`] would with their `Accepted`: a command
+    /// whose reply was lost settles from the log, and the sender moves on.
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
+        let now = Utc::now();
         self.update(|state| {
-            let applied = state.store.apply_batch(batch)?;
+            let applied = state.store.apply_batch(batch, now)?;
             let alerted = state.model.apply_batch(batch);
+            for (id, seq) in &applied.settled {
+                let accepted = CommandResult::Accepted { seq: *seq };
+                state.model.command_result(*id, accepted, now);
+            }
             mark_alerted(state, &alerted);
             Ok((applied, Vec::new()))
         })

@@ -337,6 +337,9 @@ pub struct Applied {
     /// Blobs first referenced by this batch, now registered as
     /// [`BlobStatus::NotDownloaded`], in log order.
     pub blobs: Vec<BlobId>,
+    /// Outbox commands still unanswered that the batch settled as accepted
+    /// at the seq of their event, in log order.
+    pub settled: Vec<(CommandId, Seq)>,
 }
 
 /// How far this device has read a session: through `seq`, when the session
@@ -440,11 +443,21 @@ impl Store {
     /// Approvals that stop pending leave the alerted ones
     /// ([`mark_alerted`](Store::mark_alerted)) in the same transaction.
     ///
+    /// The log acknowledges commands too: an event naming an outbox command
+    /// still unanswered settles it as `Accepted` at the event's seq,
+    /// answered at `now` — what the reply would have recorded, had it been
+    /// readable ([`record_result`](Store::record_result)). Whichever comes
+    /// first is kept; the other changes nothing.
+    ///
     /// Events of a session deleted from this device advance the cursor but
     /// are not stored, project no summary and register no blob. Contiguity
     /// is the cursor's alone and events are read per session, so the holes
     /// they leave between stored events are harmless.
-    pub fn apply_batch(&mut self, batch: &EventBatch) -> Result<Applied, StoreError> {
+    pub fn apply_batch(
+        &mut self,
+        batch: &EventBatch,
+        now: DateTime<Utc>,
+    ) -> Result<Applied, StoreError> {
         if batch.from == Seq::ZERO {
             return Err(StoreError::BatchFromZero);
         }
@@ -462,8 +475,15 @@ impl Store {
         let mut new_cursor = cursor;
         let mut new_events = 0;
         let mut blobs = Vec::new();
+        let mut settled = Vec::new();
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
             new_cursor = seq;
+            if let Some(id) = event.command_id {
+                let accepted = Settled::Answered(CommandResult::Accepted { seq });
+                if settle_in(&tx, id, &accepted, now)? {
+                    settled.push((id, seq));
+                }
+            }
             if deleted.contains(&event.session_id) {
                 continue;
             }
@@ -523,6 +543,7 @@ impl Store {
             new_events,
             sessions: touched.into_keys().collect(),
             blobs,
+            settled,
         })
     }
 
@@ -747,12 +768,7 @@ impl Store {
         settled: &Settled,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let changed = self.conn.execute(
-            "UPDATE outbox SET result = ?2, sending = 0, answered_at = ?3
-             WHERE command_id = ?1 AND result IS NULL",
-            params![id.0.to_string(), to_json(settled)?, now.to_rfc3339()],
-        )?;
-        if changed == 0 {
+        if !settle_in(&self.conn, id, settled, now)? {
             self.require_command(id)?;
         }
         Ok(())
@@ -1034,6 +1050,28 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Settles the outbox command `id` as `settled` at `now`, unless it is
+/// already settled; `false` when nothing changed, as also for a command not
+/// in the outbox (another device's, or taken back).
+fn settle_in(
+    conn: &Connection,
+    id: CommandId,
+    settled: &Settled,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let changed = conn
+        .prepare_cached(
+            "UPDATE outbox SET result = ?2, sending = 0, answered_at = ?3
+             WHERE command_id = ?1 AND result IS NULL",
+        )?
+        .execute(params![
+            id.0.to_string(),
+            to_json(settled)?,
+            now.to_rfc3339()
+        ])?;
+    Ok(changed == 1)
 }
 
 fn read_cursor(conn: &Connection) -> Result<Seq, StoreError> {

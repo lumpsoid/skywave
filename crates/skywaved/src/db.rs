@@ -108,6 +108,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE approvals ADD COLUMN
         rules INTEGER NOT NULL DEFAULT 0 CHECK (rules >= 0);
     "#,
+    // v5: `Event::command_id` (protocol v6). Events logged before carry
+    // none.
+    r#"
+    -- The command that logged the event; NULL for agent and daemon events.
+    ALTER TABLE events ADD COLUMN command_id TEXT;
+    "#,
 ];
 
 /// Schema version this build creates and understands.

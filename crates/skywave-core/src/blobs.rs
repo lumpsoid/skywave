@@ -671,9 +671,10 @@ mod tests {
                 size,
             };
             let session_id = SessionId::new();
-            let event = |kind| Event {
+            let event = |kind: EventKind| Event {
                 session_id,
                 at: Utc::now(),
+                command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
                 kind,
             };
             seam.apply_events(&EventBatch {
@@ -784,6 +785,7 @@ mod tests {
             let events = ids.iter().map(|id| Event {
                 session_id: self.session_id,
                 at: Utc::now(),
+                command_id: None,
                 kind: EventKind::ToolResult(ToolResult {
                     call: None,
                     is_error: false,
@@ -929,6 +931,7 @@ mod tests {
                 events: vec![Event {
                     session_id: f.session_id,
                     at: Utc::now(),
+                    command_id: Some(skywave_proto::CommandId::new()),
                     kind: EventKind::SessionArchived {
                         archived: true,
                         by: DeviceId::new(),

@@ -18,6 +18,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
     Event {
         session_id,
         at: Utc.with_ymd_and_hms(2026, 10, 29, 9, minute, 0).unwrap(),
+        command_id: kind.logged_by_command().then(CommandId::new),
         kind,
     }
 }
@@ -87,7 +88,6 @@ impl Log {
                 b,
                 5,
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: DeviceId::new(),
                     text: "hi".into(),
                 },
@@ -154,41 +154,47 @@ fn apply_and_replay_are_idempotent() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
 
-    let first = store.apply_batch(&log.batch(1, 4)).unwrap();
+    let first = store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
     assert_eq!((first.cursor, first.new_events), (Seq(4), 4));
     let after_first = store.load().unwrap();
 
     // Replaying the same batch changes nothing.
-    let replay = store.apply_batch(&log.batch(1, 4)).unwrap();
+    let replay = store.apply_batch(&log.batch(1, 4), Utc::now()).unwrap();
     assert_eq!((replay.cursor, replay.new_events), (Seq(4), 0));
     assert!(replay.sessions.is_empty());
     assert_eq!(store.load().unwrap(), after_first);
     assert_eq!(event_count(&store, &log), 4);
 
     // An overlapping range stores only the new tail.
-    let overlap = store.apply_batch(&log.batch(3, 7)).unwrap();
+    let overlap = store.apply_batch(&log.batch(3, 7), Utc::now()).unwrap();
     assert_eq!((overlap.cursor, overlap.new_events), (Seq(7), 3));
     assert_eq!(event_count(&store, &log), 7);
 
     // An empty long-poll batch (`from = cursor + 1`) and a stale one are no-ops.
     let empty = store
-        .apply_batch(&EventBatch {
-            from: Seq(8),
-            events: vec![],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![],
+            },
+            Utc::now(),
+        )
         .unwrap();
     assert_eq!((empty.cursor, empty.new_events), (Seq(7), 0));
     let stale = store
-        .apply_batch(&EventBatch {
-            from: Seq(2),
-            events: vec![],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(2),
+                events: vec![],
+            },
+            Utc::now(),
+        )
         .unwrap();
     assert_eq!(stale.cursor, Seq(7));
 
     // Applying in one go yields the same replica as applying piecewise.
     let mut whole = Store::open_in_memory().unwrap();
-    whole.apply_batch(&log.batch(1, 7)).unwrap();
+    whole.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
     assert_eq!(whole.load().unwrap(), store.load().unwrap());
     assert_eq!(
         whole.session_events(log.a).unwrap(),
@@ -200,10 +206,10 @@ fn apply_and_replay_are_idempotent() {
 fn batch_with_gap_is_rejected_and_changes_nothing() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
-    store.apply_batch(&log.batch(1, 2)).unwrap();
+    store.apply_batch(&log.batch(1, 2), Utc::now()).unwrap();
     let before = store.load().unwrap();
 
-    let err = store.apply_batch(&log.batch(4, 5)).unwrap_err();
+    let err = store.apply_batch(&log.batch(4, 5), Utc::now()).unwrap_err();
     assert!(
         matches!(
             err,
@@ -222,7 +228,7 @@ fn batch_with_gap_is_rejected_and_changes_nothing() {
         events: log.events[..1].to_vec(),
     };
     assert!(matches!(
-        store.apply_batch(&zero),
+        store.apply_batch(&zero, Utc::now()),
         Err(StoreError::BatchFromZero)
     ));
 }
@@ -231,7 +237,7 @@ fn batch_with_gap_is_rejected_and_changes_nothing() {
 fn sessions_are_projected_from_events() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
-    store.apply_batch(&log.batch(1, 5)).unwrap();
+    store.apply_batch(&log.batch(1, 5), Utc::now()).unwrap();
 
     let a = store.session(log.a).unwrap().unwrap();
     assert_eq!(a.workdir.as_deref(), Some("/srv/a"));
@@ -239,7 +245,7 @@ fn sessions_are_projected_from_events() {
     assert_eq!(a.pending_approval(), Some(log.approval));
     assert_eq!(a.last_seq, Seq(5));
 
-    let applied = store.apply_batch(&log.batch(6, 7)).unwrap();
+    let applied = store.apply_batch(&log.batch(6, 7), Utc::now()).unwrap();
     assert_eq!(applied.sessions.len(), 2);
     let sessions = store.sessions().unwrap();
     // Most recently active first.
@@ -264,7 +270,7 @@ fn sessions_are_projected_from_events() {
 fn referenced_blobs_are_registered_and_track_state() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
-    store.apply_batch(&log.batch(1, 7)).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
 
     let blob = store.blob(log.blob.id).unwrap().unwrap();
     assert_eq!(
@@ -281,7 +287,7 @@ fn referenced_blobs_are_registered_and_track_state() {
     assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, partial);
 
     // Replaying the referencing event does not reset the download.
-    store.apply_batch(&log.batch(4, 4)).unwrap();
+    store.apply_batch(&log.batch(4, 4), Utc::now()).unwrap();
     assert_eq!(store.blob(log.blob.id).unwrap().unwrap().status, partial);
 
     let unknown = BlobId::new();
@@ -297,7 +303,7 @@ fn reopen_restores_state() {
     let (_tmp, dir) = data_dir();
     let (snapshot, a_events) = {
         let mut store = Store::open(&dir).unwrap();
-        store.apply_batch(&log.batch(1, 7)).unwrap();
+        store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
         store.set_blob_policy(BlobPolicy::Eager).unwrap();
         store
             .set_server_address(Some("skywave.example:7443"))
@@ -631,7 +637,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
         ],
     };
     let mut store = Store::open(&dir).unwrap();
-    store.apply_batch(&batch).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
     drop(store);
 
     // Kept over a reopen.
@@ -696,7 +702,6 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
                 b,
                 4,
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: DeviceId::new(),
                     text: "back".into(),
                 },
@@ -704,7 +709,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
         ],
     };
     let mut store = Store::open(&dir).unwrap();
-    store.apply_batch(&batch).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
     let summary = |store: &Store, id| store.session(id).unwrap().unwrap();
     let a_summary = summary(&store, a);
     assert!(a_summary.archived);
@@ -743,7 +748,6 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
             id,
             minute,
             EventKind::UserMessage {
-                command_id: CommandId::new(),
                 device_id: DeviceId::new(),
                 text: text.into(),
             },
@@ -773,7 +777,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
         ],
     };
     let mut store = Store::open(&dir).unwrap();
-    store.apply_batch(&batch).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
     let summary = |store: &Store, id| store.session(id).unwrap().unwrap();
     let a_summary = summary(&store, a);
     assert_eq!(a_summary.name.as_deref(), Some("flaky"));
@@ -835,7 +839,6 @@ fn notable_count_is_projected_and_backfilled() {
                 a,
                 2,
                 EventKind::UserMessage {
-                    command_id: CommandId::new(),
                     device_id: DeviceId::new(),
                     text: "hi".into(),
                 },
@@ -875,7 +878,7 @@ fn notable_count_is_projected_and_backfilled() {
         ],
     };
     let mut store = Store::open(&dir).unwrap();
-    store.apply_batch(&batch).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
     let notable = |store: &Store, id| store.session(id).unwrap().unwrap().notable;
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
     assert!(store.read_marks().unwrap().is_empty(), "nothing read yet");
@@ -931,6 +934,63 @@ fn read_marks_round_trip() {
     assert_eq!(marks[&b], mark(4, 0));
 }
 
+/// A pulled event settles the outbox command it names that is still
+/// unanswered, as accepted at its seq, and leaves an answered one alone,
+/// as it does another device's command.
+#[test]
+fn events_settle_the_commands_they_name() {
+    let mut store = Store::open_in_memory().unwrap();
+    let session_id = SessionId::new();
+    let [lost, answered] = [send(session_id, "lost"), send(session_id, "answered")];
+    for command in [&lost, &answered] {
+        store.enqueue(command).unwrap();
+        assert!(store.claim_send(command.id, at(1)).unwrap());
+    }
+    let rejected = CommandResult::Rejected {
+        reason: RejectReason::UnknownSession,
+    };
+    store.record_result(answered.id, &rejected, at(2)).unwrap();
+    let logged = |command: Option<&Command>| Event {
+        command_id: command.map(|c| c.id).or(Some(CommandId::new())),
+        ..event(
+            session_id,
+            1,
+            EventKind::UserMessage {
+                device_id: DeviceId::new(),
+                text: "x".into(),
+            },
+        )
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![logged(None), logged(Some(&lost)), logged(Some(&answered))],
+    };
+
+    let applied = store.apply_batch(&batch, at(3)).unwrap();
+    assert_eq!(applied.settled, [(lost.id, Seq(2))]);
+    let outbox = store.outbox().unwrap();
+    let statuses: Vec<_> = outbox
+        .iter()
+        .map(|e| (e.status.clone(), e.answered_at))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            (
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) }),
+                Some(at(3))
+            ),
+            (OutboxStatus::Done(rejected), Some(at(2))),
+        ]
+    );
+    // The reply that comes after changes nothing.
+    store
+        .record_result(lost.id, &CommandResult::Accepted { seq: Seq(2) }, at(4))
+        .unwrap();
+    assert_eq!(store.outbox().unwrap(), outbox);
+    assert!(store.pending_outbox().unwrap().is_empty());
+}
+
 #[test]
 fn newer_schema_is_refused() {
     let (_tmp, dir) = data_dir();
@@ -960,7 +1020,6 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
             id,
             minute,
             EventKind::UserMessage {
-                command_id: CommandId::new(),
                 device_id: DeviceId::new(),
                 text: "hi".into(),
             },
@@ -979,7 +1038,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
         ],
     };
     let mut store = Store::open(&dir).unwrap();
-    store.apply_batch(&batch).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
     let stopped = |store: &Store, id| store.session(id).unwrap().unwrap().stopped;
     assert!(stopped(&store, a));
     assert!(!stopped(&store, b));
@@ -1228,7 +1287,7 @@ fn withdraw_into_draft_is_one_transaction() {
 /// session A's blob downloaded.
 fn replica_with_both_sessions(dir: &Path, log: &Log) -> (Store, [Command; 4]) {
     let mut store = Store::open(dir).unwrap();
-    store.apply_batch(&log.batch(1, 7)).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
     let draft = Draft {
         text: "later".into(),
         cursor: 0,
@@ -1312,11 +1371,11 @@ fn local_delete_is_one_transaction() {
 fn events_for_deleted_session_advance_cursor_but_are_not_stored() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
-    store.apply_batch(&log.batch(1, 3)).unwrap();
+    store.apply_batch(&log.batch(1, 3), Utc::now()).unwrap();
     store.delete_session_locally(log.a, at(2)).unwrap();
 
     // The rest of A (its blob and approval among it) arrives with B's message.
-    let applied = store.apply_batch(&log.batch(4, 7)).unwrap();
+    let applied = store.apply_batch(&log.batch(4, 7), Utc::now()).unwrap();
     assert_eq!(applied.cursor, Seq(7));
     assert_eq!(applied.new_events, 1, "only B's message is stored");
     assert_eq!(applied.sessions, [log.b]);
@@ -1336,22 +1395,40 @@ fn events_for_deleted_session_advance_cursor_but_are_not_stored() {
 fn cursor_stays_contiguous_after_local_delete() {
     let log = Log::new();
     let mut store = Store::open_in_memory().unwrap();
-    store.apply_batch(&log.batch(1, 2)).unwrap();
+    store.apply_batch(&log.batch(1, 2), Utc::now()).unwrap();
     store.delete_session_locally(log.a, at(2)).unwrap();
 
     // Batches of only A's events still move the cursor, so the next batch
     // follows on and a gap is still a gap.
-    assert_eq!(store.apply_batch(&log.batch(3, 3)).unwrap().cursor, Seq(3));
-    assert_eq!(store.apply_batch(&log.batch(4, 5)).unwrap().cursor, Seq(5));
+    assert_eq!(
+        store
+            .apply_batch(&log.batch(3, 3), Utc::now())
+            .unwrap()
+            .cursor,
+        Seq(3)
+    );
+    assert_eq!(
+        store
+            .apply_batch(&log.batch(4, 5), Utc::now())
+            .unwrap()
+            .cursor,
+        Seq(5)
+    );
     assert!(matches!(
-        store.apply_batch(&log.batch(7, 7)),
+        store.apply_batch(&log.batch(7, 7), Utc::now()),
         Err(StoreError::Gap {
             cursor: Seq(5),
             from: Seq(7)
         })
     ));
     // A replay of what was skipped stays skipped.
-    assert_eq!(store.apply_batch(&log.batch(1, 7)).unwrap().cursor, Seq(7));
+    assert_eq!(
+        store
+            .apply_batch(&log.batch(1, 7), Utc::now())
+            .unwrap()
+            .cursor,
+        Seq(7)
+    );
     assert!(store.session_events(log.a).unwrap().is_empty());
 
     // B's stored events have holes where A's were; read per session they
@@ -1365,7 +1442,7 @@ fn cursor_stays_contiguous_after_local_delete() {
         ]
     );
     let mut whole = Store::open_in_memory().unwrap();
-    whole.apply_batch(&log.batch(1, 7)).unwrap();
+    whole.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
     assert_eq!(whole.session_events(log.b).unwrap(), b_events);
     assert_eq!(whole.session(log.b).unwrap(), store.session(log.b).unwrap());
 }
@@ -1524,16 +1601,19 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
     let (x, y, z) = (ApprovalId::new(), ApprovalId::new(), ApprovalId::new());
     let mut store = Store::open(&dir).unwrap();
     store
-        .apply_batch(&EventBatch {
-            from: Seq(1),
-            events: vec![
-                created(a, 0),
-                created(b, 1),
-                requested(a, 2, x),
-                requested(a, 3, y),
-                requested(b, 4, z),
-            ],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![
+                    created(a, 0),
+                    created(b, 1),
+                    requested(a, 2, x),
+                    requested(a, 3, y),
+                    requested(b, 4, z),
+                ],
+            },
+            Utc::now(),
+        )
         .unwrap();
     assert!(store.load().unwrap().alerted.is_empty(), "none alerted yet");
     store.mark_alerted(&[(a, x), (b, z)]).unwrap();
@@ -1547,37 +1627,43 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
     // Resolved or cancelled, it goes with the batch that says so; another
     // session's events leave it alone.
     store
-        .apply_batch(&EventBatch {
-            from: Seq(6),
-            events: vec![
-                event(
-                    a,
-                    5,
-                    EventKind::ApprovalResolved {
-                        id: x,
-                        decision: Decision::Approve,
-                        by: DeviceId::new(),
-                        rule: None,
-                    },
-                ),
-                event(a, 6, EventKind::AgentMessage { text: "ok".into() }),
-            ],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(6),
+                events: vec![
+                    event(
+                        a,
+                        5,
+                        EventKind::ApprovalResolved {
+                            id: x,
+                            decision: Decision::Approve,
+                            by: DeviceId::new(),
+                            rule: None,
+                        },
+                    ),
+                    event(a, 6, EventKind::AgentMessage { text: "ok".into() }),
+                ],
+            },
+            Utc::now(),
+        )
         .unwrap();
     assert_eq!(sorted(store.alerted().unwrap()), vec![z]);
     store.mark_alerted(&[(a, y)]).unwrap();
     store
-        .apply_batch(&EventBatch {
-            from: Seq(8),
-            events: vec![event(
-                a,
-                7,
-                EventKind::ApprovalCancelled {
-                    id: y,
-                    reason: "restart".into(),
-                },
-            )],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![event(
+                    a,
+                    7,
+                    EventKind::ApprovalCancelled {
+                        id: y,
+                        reason: "restart".into(),
+                    },
+                )],
+            },
+            Utc::now(),
+        )
         .unwrap();
     assert_eq!(sorted(store.alerted().unwrap()), vec![z]);
 
@@ -1588,10 +1674,13 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
     // As it does with a new server.
     let w = ApprovalId::new();
     store
-        .apply_batch(&EventBatch {
-            from: Seq(9),
-            events: vec![requested(a, 8, w)],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(9),
+                events: vec![requested(a, 8, w)],
+            },
+            Utc::now(),
+        )
         .unwrap();
     store.mark_alerted(&[(a, w)]).unwrap();
     store.reset_for_server("other:7443").unwrap();
@@ -1605,24 +1694,27 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     let (x, y, z) = (ApprovalId::new(), ApprovalId::new(), ApprovalId::new());
     let mut store = Store::open(&dir).unwrap();
     store
-        .apply_batch(&EventBatch {
-            from: Seq(1),
-            events: vec![
-                created(a, 0),
-                created(b, 1),
-                requested(a, 2, x),
-                requested(a, 3, y),
-                requested(b, 4, z),
-                event(
-                    b,
-                    5,
-                    EventKind::ApprovalCancelled {
-                        id: z,
-                        reason: "restart".into(),
-                    },
-                ),
-            ],
-        })
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![
+                    created(a, 0),
+                    created(b, 1),
+                    requested(a, 2, x),
+                    requested(a, 3, y),
+                    requested(b, 4, z),
+                    event(
+                        b,
+                        5,
+                        EventKind::ApprovalCancelled {
+                            id: z,
+                            reason: "restart".into(),
+                        },
+                    ),
+                ],
+            },
+            Utc::now(),
+        )
         .unwrap();
     drop(store);
 

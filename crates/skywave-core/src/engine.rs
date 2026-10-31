@@ -82,7 +82,7 @@ use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{OutboxEntry, StoreError};
 use crate::transport::{Transport, TransportError};
-use crate::view::{Link, LinkRejection};
+use crate::view::{CommandId, Link, LinkRejection};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
@@ -651,6 +651,10 @@ async fn pull(
             Ok(applied) => {
                 head = head.max(applied.cursor);
                 ctx.blobs.registered(&applied.blobs);
+                // A command the log settled may be what the sender waits on.
+                if !applied.settled.is_empty() {
+                    ctx.outbox.notify_one();
+                }
                 // A device paired since this connection's `hello`: ask
                 // again, so its name shows without waiting for a reconnect.
                 let unnamed = ctx.seam.unnamed_devices(&batch);
@@ -690,6 +694,13 @@ async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, Li
 /// longer be claimed (gone from the outbox, or answered meanwhile) is
 /// skipped. One the server refuses for good fails and the link stays up:
 /// resending it would only hold back every later command.
+///
+/// An unreadable reply ([`TransportError::Decode`]) keeps the link up too:
+/// the server answered, so the command's event, if it logged one, is on its
+/// way to the pull on this connection, and settles it
+/// ([`Seam::apply_events`]). The entry waits for that, holding back the
+/// later ones (D7); resending at once would most likely bring back the same
+/// unreadable reply before the pull can apply the event.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -705,9 +716,26 @@ async fn send_entry(
             tracing::warn!(%error, ?id, "server refused the command; giving up on it");
             ctx.seam.command_undeliverable(id)?;
         }
+        Err(TransportError::Decode(error)) => {
+            tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
+            settled_by_log(ctx, id).await?;
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+/// Waits until the outbox command `id` is no longer pending.
+async fn settled_by_log(ctx: &LinkCtx, id: CommandId) -> Result<(), LinkError> {
+    loop {
+        // Asked for before the look, so a settle in between still wakes it.
+        let changed = ctx.outbox.notified();
+        let pending = ctx.seam.pending_outbox()?;
+        if !pending.iter().any(|e| e.command.id == id) {
+            return Ok(());
+        }
+        changed.await;
+    }
 }
 
 #[cfg(test)]
@@ -843,6 +871,7 @@ mod tests {
             events: vec![skywave_proto::Event {
                 session_id: SessionId::new(),
                 at: chrono::Utc::now(),
+                command_id: Some(CommandId::new()),
                 kind: skywave_proto::EventKind::SessionCreated {
                     workdir: "/srv".into(),
                 },
@@ -1509,6 +1538,287 @@ mod tests {
         ));
         assert_eq!(*server.seen.lock().unwrap(), ["/busy"]);
         assert_eq!(seam.pending_outbox().unwrap().len(), 2);
+    }
+
+    /// A server with a log of one session: a message logs its event once
+    /// however often it is sent, and a long-poll wakes when the log grows.
+    /// The reply to the message `lost` is never readable: it fails to decode
+    /// at once, before any pull can bring the event.
+    struct LogServer {
+        session_id: SessionId,
+        log: Mutex<Vec<skywave_proto::Event>>,
+        grew: Notify,
+        sent: Mutex<Vec<String>>,
+        hellos: AtomicUsize,
+        /// Who sends the messages.
+        device: DeviceId,
+    }
+
+    impl LogServer {
+        /// The log holds the session, created by another device.
+        fn new() -> LogServer {
+            let session_id = SessionId::new();
+            LogServer {
+                session_id,
+                log: Mutex::new(vec![skywave_proto::Event {
+                    session_id,
+                    at: Utc::now(),
+                    command_id: Some(CommandId::new()),
+                    kind: skywave_proto::EventKind::SessionCreated {
+                        workdir: "/srv".into(),
+                    },
+                }]),
+                grew: Notify::new(),
+                sent: Mutex::new(Vec::new()),
+                hellos: AtomicUsize::new(0),
+                device: DeviceId::new(),
+            }
+        }
+
+        fn batch(&self, after: Seq) -> EventBatch {
+            let log = self.log.lock().unwrap();
+            EventBatch {
+                from: after.next(),
+                events: log.iter().skip(after.0 as usize).cloned().collect(),
+            }
+        }
+    }
+
+    impl Transport for LogServer {
+        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async move {
+                self.hellos.fetch_add(1, Ordering::SeqCst);
+                Ok(HelloResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_id: ServerId::new(),
+                    device_id: DeviceId::new(),
+                    head: Seq(self.log.lock().unwrap().len() as u64),
+                    // Named, so no event asks `hello` again.
+                    devices: vec![skywave_proto::DeviceInfo {
+                        id: self.device,
+                        name: "phone".into(),
+                    }],
+                })
+            })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                let CommandKind::SendMessage { text, .. } = &command.kind else {
+                    panic!("only messages are sent here");
+                };
+                self.sent.lock().unwrap().push(text.clone());
+                let seq = {
+                    let mut log = self.log.lock().unwrap();
+                    let logged = log.iter().position(|e| e.command_id == Some(command.id));
+                    let at = logged.unwrap_or_else(|| {
+                        log.push(skywave_proto::Event {
+                            session_id: self.session_id,
+                            at: Utc::now(),
+                            command_id: Some(command.id),
+                            kind: skywave_proto::EventKind::UserMessage {
+                                device_id: self.device,
+                                text: text.clone(),
+                            },
+                        });
+                        log.len() - 1
+                    });
+                    Seq(at as u64 + 1)
+                };
+                self.grew.notify_waiters();
+                if text == "lost" {
+                    return Err(TransportError::Decode("garbled".into()));
+                }
+                Ok(CommandResult::Accepted { seq })
+            })
+        }
+
+        fn events(&self, query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async move {
+                // Registered before the look, so no append slips between.
+                let grew = self.grew.notified();
+                let batch = self.batch(query.after);
+                if !batch.events.is_empty() {
+                    return Ok(batch);
+                }
+                let wait = Duration::from_secs(u64::from(query.wait.unwrap_or(0)));
+                let _ = tokio::time::timeout(wait, grew).await;
+                Ok(self.batch(query.after))
+            })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+    }
+
+    fn link_to(seam: &Seam, server: &Arc<LogServer>) -> LinkCtx {
+        let fake = server.clone();
+        let (wall_clock, _) = paused_wall();
+        LinkCtx {
+            config: Arc::new(EngineConfig {
+                backoff: Backoff {
+                    base: Duration::from_secs(1),
+                    cap: Duration::from_secs(8),
+                    jitter: Jitter::fixed(1.0),
+                },
+                connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+                wait_secs: 5,
+                wall_clock,
+                ..EngineConfig::default()
+            }),
+            ..sender_ctx(seam)
+        }
+    }
+
+    fn send_message(seam: &Seam, session_id: SessionId, text: &str) -> CommandId {
+        seam.core
+            .dispatch(crate::Action::SendMessage {
+                session_id,
+                text: text.into(),
+            })
+            .unwrap();
+        let outbox = seam.pending_outbox().unwrap();
+        outbox.last().unwrap().command.id
+    }
+
+    /// The reply to a command is never readable and comes back before the
+    /// pull brings its event, yet the event settles the command as accepted
+    /// at its seq, as the reply would have: the link stays up, the command
+    /// is sent once, and the next goes out after it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_reply_settles_from_the_pulled_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let server = Arc::new(LogServer::new());
+        let sid = server.session_id;
+        seam.apply_events(&server.batch(Seq::ZERO)).unwrap();
+        let lost = send_message(&seam, sid, "lost");
+        let next = send_message(&seam, sid, "next");
+
+        let link = tokio::spawn(run_link(link_to(&seam, &server)));
+        let drained = tokio::time::timeout(Duration::from_secs(600), async {
+            while !seam.pending_outbox().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        assert!(
+            drained.await.is_ok(),
+            "sent {:?}",
+            server.sent.lock().unwrap()
+        );
+        // Long enough for any reconnect and resend to show.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        link.abort();
+
+        assert_eq!(*server.sent.lock().unwrap(), ["lost", "next"]);
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 1, "one connection");
+        let outbox = crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap();
+        let settled: Vec<_> = outbox.iter().map(|e| (e.command.id, &e.status)).collect();
+        assert_eq!(
+            settled,
+            [
+                (
+                    lost,
+                    &OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) })
+                ),
+                (
+                    next,
+                    &OutboxStatus::Done(CommandResult::Accepted { seq: Seq(3) })
+                ),
+            ]
+        );
+        assert!(outbox[0].answered_at.is_some());
+
+        seam.core.dispatch(crate::Action::OpenSession(sid)).unwrap();
+        let Screen::Session(view) = seam.core.view().screen else {
+            panic!("not on the session");
+        };
+        let outgoing: Vec<_> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                crate::view::TimelineItem::Logged {
+                    entry:
+                        crate::view::Entry::UserMessage {
+                            command_id,
+                            outgoing,
+                            ..
+                        },
+                    ..
+                } => Some((*command_id, *outgoing)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outgoing,
+            [
+                (lost, Some(Outgoing::Accepted(Seq(2)))),
+                (next, Some(Outgoing::Accepted(Seq(3)))),
+            ]
+        );
+    }
+
+    /// The reply and the event settle a command alike, whichever comes
+    /// first; the later one changes nothing, in the store or the view.
+    #[test]
+    fn reply_and_event_settle_once_in_either_order() {
+        let settle = |reply_first: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let seam = paired_seam(dir.path());
+            let server = LogServer::new();
+            seam.apply_events(&server.batch(Seq::ZERO)).unwrap();
+            let id = send_message(&seam, server.session_id, "hi");
+            assert!(seam.command_sending(id).unwrap());
+            let mut event = server.log.lock().unwrap()[0].clone();
+            event.command_id = Some(id);
+            event.kind = skywave_proto::EventKind::UserMessage {
+                device_id: DeviceId::new(),
+                text: "hi".into(),
+            };
+            let batch = EventBatch {
+                from: Seq(2),
+                events: vec![event],
+            };
+            let reply = CommandResult::Accepted { seq: Seq(2) };
+            if reply_first {
+                seam.command_result(id, &reply).unwrap();
+                let applied = seam.apply_events(&batch).unwrap();
+                assert!(applied.settled.is_empty(), "the reply came first");
+            } else {
+                let applied = seam.apply_events(&batch).unwrap();
+                assert_eq!(applied.settled, [(id, Seq(2))]);
+                seam.command_result(id, &reply).unwrap();
+            }
+            // A replay of the batch settles nothing either.
+            assert!(seam.apply_events(&batch).unwrap().settled.is_empty());
+            assert!(!seam.command_sending(id).unwrap(), "nothing left to send");
+
+            let state = crate::client::lock(&seam.core.shared.state);
+            let outbox = state.store.outbox().unwrap();
+            let shown = state.model.view().queued;
+            let stored: Vec<_> = outbox.iter().map(|e| (e.status.clone(), e.tries)).collect();
+            (stored, shown)
+        };
+        let settled = (
+            vec![(
+                OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) }),
+                1,
+            )],
+            0,
+        );
+        assert_eq!(settle(true), settled);
+        assert_eq!(settle(false), settled);
     }
 
     #[test]
