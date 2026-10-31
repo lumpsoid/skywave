@@ -605,11 +605,8 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
                     preview.into_iter().map(clean_line).collect()
                 }
             },
-            Some((_, state)) => {
-                note = Some(fetch_note(state));
-                preview.into_iter().map(clean_line).collect()
-            }
-            None => preview.into_iter().map(clean_line).collect(),
+            // Where its download stands is the blob's label.
+            Some(_) | None => preview.into_iter().map(clean_line).collect(),
         }
     } else {
         if preview.is_empty() {
@@ -663,67 +660,23 @@ fn view_of(
     }
 }
 
-/// While collapsed: how many more lines there are, and the blob's state:
-/// `… +12 lines · full 4.0 KiB · not downloaded`.
+/// While collapsed: how many more lines there are, `… +12 lines`. Where
+/// the blob behind them stands is its label, not the note.
 fn more_note(section: &Section, preview: usize, shown: usize) -> Option<String> {
     let whole = section
         .lines
         .map_or(preview, |lines| lines as usize)
         .max(preview);
-    let mut more = Vec::new();
-    if whole > shown {
-        let rest = whole - shown;
-        more.push(format!(
-            "+{rest} {}",
-            if rest == 1 { "line" } else { "lines" }
-        ));
-    }
-    if let Some(blob) = section.blob {
-        more.push(match &blob.state {
-            BlobState::NotDownloaded { size } => format!("full {} · not downloaded", bytes(*size)),
-            BlobState::Requested { size } => format!("full {} · requested", bytes(*size)),
-            BlobState::Downloading { got, size, paused } => {
-                let progress = format!("downloading {}%", percent(*got, *size));
-                if *paused {
-                    format!("{progress} · paused, offline")
-                } else {
-                    progress
-                }
-            }
-            BlobState::Failed { size, .. } => format!("full {} · download failed", bytes(*size)),
-            BlobState::Available { .. } => "downloaded".to_owned(),
-        });
-    }
-    (!more.is_empty()).then(|| format!("… {}", more.join(" · ")))
+    let rest = whole.checked_sub(shown).filter(|&rest| rest > 0)?;
+    Some(format!(
+        "… +{rest} {}",
+        if rest == 1 { "line" } else { "lines" }
+    ))
 }
 
-/// While expanded and the blob is not here: where its download stands.
-fn fetch_note(state: &BlobState) -> String {
-    match state {
-        BlobState::NotDownloaded { size } => format!("not downloaded · {}", bytes(*size)),
-        BlobState::Requested { size } => {
-            format!("requested · waiting for a slot · {}", bytes(*size))
-        }
-        BlobState::Downloading { got, size, paused } => {
-            let progress = format!(
-                "downloading · {} of {} ({}%)",
-                bytes(*got),
-                bytes(*size),
-                percent(*got, *size)
-            );
-            if *paused {
-                format!("{progress} · paused, offline")
-            } else {
-                progress
-            }
-        }
-        BlobState::Failed { size, reason } => {
-            format!("download failed: {} · {}", clean_line(reason), bytes(*size))
-        }
-        BlobState::Available { .. } => "downloaded".to_owned(),
-    }
-}
-
+/// A section's blob with where its download stands, worded as the TUI
+/// words an expanded section's: `not downloaded · 4.0 KiB`, `downloading
+/// · 1.0 KiB of 4.0 KiB (25%)`.
 fn blob_facts(blob: &BlobView) -> BlobFacts {
     let (state, label) = match &blob.state {
         BlobState::NotDownloaded { size } => (
@@ -732,27 +685,27 @@ fn blob_facts(blob: &BlobView) -> BlobFacts {
         ),
         BlobState::Requested { size } => (
             BlobStateKind::Requested,
-            format!("requested · {}", bytes(*size)),
+            format!("requested · waiting for a slot · {}", bytes(*size)),
         ),
-        BlobState::Downloading {
-            got,
-            size,
-            paused: false,
-        } => (
-            BlobStateKind::Downloading,
-            format!("downloading {}%", percent(*got, *size)),
-        ),
-        BlobState::Downloading {
-            got,
-            size,
-            paused: true,
-        } => (
-            BlobStateKind::Paused,
-            format!("downloading {}% · paused, offline", percent(*got, *size)),
-        ),
-        BlobState::Failed { size, .. } => (
+        BlobState::Downloading { got, size, paused } => {
+            let progress = format!(
+                "downloading · {} of {} ({}%)",
+                bytes(*got),
+                bytes(*size),
+                percent(*got, *size)
+            );
+            if *paused {
+                (
+                    BlobStateKind::Paused,
+                    format!("{progress} · paused, offline"),
+                )
+            } else {
+                (BlobStateKind::Downloading, progress)
+            }
+        }
+        BlobState::Failed { size, reason } => (
             BlobStateKind::Failed,
-            format!("download failed · {}", bytes(*size)),
+            format!("download failed: {} · {}", clean_line(reason), bytes(*size)),
         ),
         BlobState::Available { .. } => (BlobStateKind::Available, "downloaded".to_owned()),
     };
@@ -1044,5 +997,64 @@ mod tests {
             facts,
             [(false, false), (true, false), (false, false), (false, true)]
         );
+    }
+
+    #[test]
+    fn a_note_says_what_is_left_out_and_the_label_where_the_blob_stands() {
+        let blob = |state| BlobView {
+            id: BlobId::new(),
+            state,
+        };
+        let text = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
+        let shown = |state, expanded| {
+            let blob = blob(state);
+            let section = Section {
+                text: &text,
+                lines: Some(40),
+                format: BodyFormat::Text,
+                numbered: false,
+                error: false,
+                blob: Some(&blob),
+                hidden: false,
+                input: false,
+            };
+            let view = section_view(&section, expanded, &mut BlobHeads::default()).unwrap();
+            (view.note, view.blob.unwrap().label)
+        };
+        let size = 70 * 1024;
+        assert_eq!(
+            shown(BlobState::NotDownloaded { size }, false),
+            (
+                Some("… +32 lines".to_owned()),
+                "not downloaded · 70.0 KiB".to_owned()
+            )
+        );
+        for (state, label) in [
+            (
+                BlobState::NotDownloaded { size },
+                "not downloaded · 70.0 KiB",
+            ),
+            (
+                BlobState::Requested { size },
+                "requested · waiting for a slot · 70.0 KiB",
+            ),
+            (
+                BlobState::Downloading {
+                    got: size / 2,
+                    size,
+                    paused: true,
+                },
+                "downloading · 35.0 KiB of 70.0 KiB (50%) · paused, offline",
+            ),
+            (
+                BlobState::Failed {
+                    size,
+                    reason: "gone".into(),
+                },
+                "download failed: gone · 70.0 KiB",
+            ),
+        ] {
+            assert_eq!(shown(state, true), (None, label.to_owned()));
+        }
     }
 }

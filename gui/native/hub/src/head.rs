@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobState, Entry, PairUri, PairingView, Screen, Seq, SessionId, SessionView,
+    Action, BlobId, BlobState, Entry, PairUri, PairingView, Screen, Seq, SessionId, SessionView,
     TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
@@ -150,6 +150,9 @@ struct SessionHead {
     following: bool,
     /// Items whose content shows whole; only logged items expand.
     expanded: HashSet<Seq>,
+    /// Blobs fetched because their item was expanded, so each is asked
+    /// for once and not on every snapshot while its request is in flight.
+    fetched: HashSet<BlobId>,
     search: Option<TimelineSearch>,
     heads: BlobHeads,
     /// The composer's message waiting for its result.
@@ -166,6 +169,7 @@ impl SessionHead {
             marker: ReadMarker::new(view.id),
             following: false,
             expanded: HashSet::new(),
+            fetched: HashSet::new(),
             search: None,
             heads: BlobHeads::default(),
             sending: None,
@@ -286,6 +290,7 @@ impl Head {
                 search.refresh(view, old_match, BlobText::read);
             }
         }
+        self.fetch_expanded(clock, &mut out);
         self.after(clock, &mut out);
         out
     }
@@ -443,16 +448,15 @@ impl Head {
                 if sections(entry).is_empty() {
                     return Ok(());
                 }
-                // Expanding downloads what is not here yet (spec §8).
-                let fetch = wanted_blob(entry)
-                    .filter(|b| matches!(b.state, BlobState::NotDownloaded { .. }))
-                    .map(|b| Action::DownloadBlob(b.id));
+                let wanted = expand_fetch(entry);
                 if let Some(session) = &mut self.session {
                     session.expanded.insert(seq);
+                    // Expanding again asks again.
+                    if let Some(id) = wanted {
+                        session.fetched.remove(&id);
+                    }
                 }
-                if let Some(fetch) = fetch {
-                    self.dispatch_user(fetch, Purpose::Plain, clock, out);
-                }
+                self.fetch_expanded(clock, out);
             }
             GuiIntent::CollapseItem { key } => {
                 if let (Some(seq), Some(session)) = (logged(parse_key(&key)?), &mut self.session) {
@@ -801,6 +805,30 @@ impl Head {
 
     /// The end of every step: what is due unforced, then what changed for
     /// Dart.
+    /// Expanding downloads what is not here yet (spec §8), including what
+    /// arrives while the item is open: an edit expanded from the approval
+    /// panel before its result logged gets the result's output once it does.
+    /// Each blob is asked for once per expansion.
+    fn fetch_expanded(&mut self, clock: Clock, out: &mut Vec<Out>) {
+        let Some((view, session)) = open_session(&self.view).zip(self.session.as_mut()) else {
+            return;
+        };
+        let fetches: Vec<BlobId> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged { seq, entry, .. } if session.expanded.contains(seq) => {
+                    expand_fetch(entry)
+                }
+                _ => None,
+            })
+            .filter(|id| session.fetched.insert(*id))
+            .collect();
+        for id in fetches {
+            self.dispatch_user(Action::DownloadBlob(id), Purpose::Plain, clock, out);
+        }
+    }
+
     fn after(&mut self, clock: Clock, out: &mut Vec<Out>) {
         self.save_draft(clock, false, out);
         self.mark_read(clock, false, out);
@@ -978,6 +1006,14 @@ impl Head {
 }
 
 /// The open session in `view`, if a session is the screen.
+/// The blob expanding `entry` downloads: present's [`wanted_blob`], unless
+/// it was asked for already (a failed one waits for an explicit retry).
+fn expand_fetch(entry: &Entry) -> Option<BlobId> {
+    wanted_blob(entry)
+        .filter(|b| matches!(b.state, BlobState::NotDownloaded { .. }))
+        .map(|b| b.id)
+}
+
 fn open_session(view: &Option<ViewState>) -> Option<&SessionView> {
     match &view.as_ref()?.screen {
         Screen::Session(session) => Some(session),

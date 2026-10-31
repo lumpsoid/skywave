@@ -458,3 +458,147 @@ fn a_tapped_candidate_fills_the_create_prompt() {
     assert!(after.input_rev > before);
     assert!(after.popup.is_none(), "taking one closes the list");
 }
+
+impl Rig {
+    /// Logs `kinds` as the agent's events in the open session, and shows
+    /// the head the view that follows.
+    fn log(&mut self, kinds: Vec<EventKind>) {
+        let from = Seq(self.seam.cursor().unwrap().0 + 1);
+        let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+        let events = kinds
+            .into_iter()
+            .map(|kind| Event {
+                session_id: self.session,
+                at,
+                command_id: None,
+                kind,
+            })
+            .collect();
+        self.seam
+            .apply_events(&EventBatch { from, events })
+            .unwrap();
+        self.view();
+    }
+
+    /// The rows the head last sent Dart.
+    fn rows(&self) -> &[TimelineRow] {
+        &self.head.sent.timeline.as_ref().unwrap().1
+    }
+}
+
+/// An edit's call and result as skywaved logs them for the stub agent:
+/// a diff body whole in its preview, the input as a blob, and a result
+/// with no preview whose whole text is a 70 B blob.
+fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
+    use skywave_proto::{BlobId, BlobRef, Body, CallId, ToolCall, ToolDisplay, ToolResult};
+    let call = CallId::new();
+    let output = BlobId::new();
+    let kinds = vec![
+        EventKind::ToolCall(ToolCall {
+            call: Some(call),
+            name: "Edit".into(),
+            display: ToolDisplay {
+                kind: skywave_proto::ToolKind::FileEdit,
+                title: "/srv/work/demo.txt".into(),
+                detail: None,
+                body: Some(Body {
+                    format: skywave_proto::BodyFormat::Diff,
+                    preview: "-old\n+new\n".into(),
+                    lines: 2,
+                    full: None,
+                }),
+            },
+            input: Some(BlobRef {
+                id: BlobId::new(),
+                size: 180,
+            }),
+        }),
+        EventKind::ToolResult(ToolResult {
+            call: Some(call),
+            is_error: false,
+            status: Some("updated +1 -1".into()),
+            preview: String::new(),
+            lines: 1,
+            output: Some(BlobRef {
+                id: output,
+                size: 70,
+            }),
+        }),
+    ];
+    (kinds, output)
+}
+
+#[test]
+fn expanding_an_edit_downloads_its_output() {
+    let mut rig = Rig::new();
+    let (kinds, output) = an_edit();
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    assert!(
+        rig.actions
+            .iter()
+            .any(|a| matches!(a, Action::DownloadBlob(id) if *id == output)),
+        "dispatched {:?}",
+        rig.actions
+    );
+}
+
+#[test]
+fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
+    let mut rig = Rig::new();
+    let (mut kinds, output) = an_edit();
+    let result = kinds.pop().unwrap();
+    // E.g. the approval panel shows the call it gates, expanded.
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    rig.results();
+    rig.view();
+    rig.actions.clear();
+    rig.log(vec![result]);
+    assert!(
+        matches!(rig.actions.as_slice(), [Action::DownloadBlob(id)] if *id == output),
+        "dispatched {:?}",
+        rig.actions
+    );
+    // Asked for once, not on every view while the request is in flight.
+    rig.view();
+    rig.results();
+    rig.view();
+    assert_eq!(rig.actions.len(), 1, "dispatched {:?}", rig.actions);
+}
+
+#[test]
+fn an_expanded_section_says_its_blob_state_once() {
+    let mut rig = Rig::new();
+    let (kinds, output) = an_edit();
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key: key.clone() });
+    let row = rig.rows().last().unwrap();
+    assert!(row.expanded);
+    let section = row
+        .sections
+        .iter()
+        .find(|s| {
+            s.blob
+                .as_ref()
+                .is_some_and(|b| b.blob_id == output.0.to_string())
+        })
+        .unwrap();
+    // The label says where the download stands; the note has nothing to add.
+    assert_eq!(section.note, None);
+    assert_eq!(
+        section.blob.as_ref().unwrap().label,
+        "not downloaded · 70 B"
+    );
+    rig.results();
+    rig.view();
+    let section = &rig.rows().last().unwrap().sections[1];
+    assert_eq!(section.note, None);
+    assert_eq!(
+        section.blob.as_ref().unwrap().label,
+        "requested · waiting for a slot · 70 B"
+    );
+}
