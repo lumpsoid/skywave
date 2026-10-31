@@ -13,7 +13,10 @@
 //! own [`Transport`] (built by the engine's connector on first use), so
 //! blob traffic never shares a connection with the long-poll or the outbox
 //! sender, and the link's `CatchingUp`/`Online` never wait on a blob:
-//! metadata synced counts as synced (D6). Two workers download at a time.
+//! metadata synced counts as synced (D6). Two workers take whatever comes
+//! first in the queue; a third takes only blobs the user asked for, so a
+//! request never waits on eager downloads that are slow, stalled or
+//! waiting out a retry.
 //! A retryable failure (D7) is retried after [`Backoff::delay`], the
 //! attempt count resetting whenever a try received some bytes; a rejection
 //! is retried the same way until the link, which sees it too, stops the
@@ -191,15 +194,19 @@ impl BlobQueue {
         lock(&self.queue).waiting.retain(|q| !ids.contains(&q.id));
     }
 
-    /// Waits for the next blob to download and holds it.
-    async fn next(&self) -> Claim<'_> {
+    /// Waits for the next blob `slot` takes and holds it.
+    async fn next(&self, slot: Slot) -> Claim<'_> {
         loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
                 let mut queue = lock(&self.queue);
-                if let Some(item) = queue.waiting.pop_front() {
+                let at = match slot {
+                    Slot::Any => (!queue.waiting.is_empty()).then_some(0),
+                    Slot::Wanted => queue.waiting.iter().position(|q| q.wanted),
+                };
+                if let Some(item) = at.and_then(|at| queue.waiting.remove(at)) {
                     queue.active.insert(item.id);
                     return Claim {
                         queue: self,
@@ -211,6 +218,15 @@ impl BlobQueue {
             notified.await;
         }
     }
+}
+
+/// Which blobs a worker takes.
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    /// The front of the queue, asked for or not.
+    Any,
+    /// Only blobs the user asked for (or resumed).
+    Wanted,
 }
 
 /// A blob a worker holds. Dropped unfinished (the downloader stopped), it
@@ -248,16 +264,21 @@ pub(crate) struct BlobCtx {
     pub(crate) queue: Arc<BlobQueue>,
 }
 
-/// Downloads queued blobs, two at a time, until stopped.
+/// Downloads queued blobs until stopped: two of any kind at a time, plus
+/// one the user asked for.
 pub(crate) async fn run_downloader(ctx: BlobCtx) -> Infallible {
     let transport = OnceCell::new();
-    let (never, _) = tokio::join!(worker(&ctx, &transport), worker(&ctx, &transport));
+    let (never, _, _) = tokio::join!(
+        worker(&ctx, &transport, Slot::Any),
+        worker(&ctx, &transport, Slot::Any),
+        worker(&ctx, &transport, Slot::Wanted),
+    );
     never
 }
 
-async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>) -> Infallible {
+async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: Slot) -> Infallible {
     loop {
-        let claim = ctx.queue.next().await;
+        let claim = ctx.queue.next(slot).await;
         let id = claim.item.id;
         let mut attempt = 0u32;
         loop {
@@ -514,6 +535,7 @@ async fn complete(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
@@ -543,6 +565,17 @@ mod tests {
         calls: AtomicUsize,
         /// Runs once, as the first response starts.
         on_blob: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Blobs never served.
+        held: Mutex<HashMap<ProtoBlobId, Hold>>,
+    }
+
+    /// How a held blob is never served.
+    #[derive(Debug, Clone, Copy)]
+    enum Hold {
+        /// The response never starts.
+        Stall,
+        /// Every try fails as if offline.
+        Offline,
     }
 
     struct Chunks {
@@ -573,11 +606,17 @@ mod tests {
 
         fn blob(
             &self,
-            _id: ProtoBlobId,
+            id: ProtoBlobId,
             from: u64,
         ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                let hold = self.held.lock().unwrap().get(&id).copied();
+                match hold {
+                    Some(Hold::Stall) => return std::future::pending().await,
+                    Some(Hold::Offline) => return Err(TransportError::Io("offline".into())),
+                    None => {}
+                }
                 self.froms.lock().unwrap().push(from);
                 if let Some(hook) = self.on_blob.lock().unwrap().take() {
                     hook();
@@ -662,6 +701,7 @@ mod tests {
                 froms: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 on_blob: Mutex::new(None),
+                held: Mutex::new(HashMap::new()),
             });
             Fixture {
                 _dir: dir,
@@ -736,6 +776,64 @@ mod tests {
 
         fn part(&self) -> PathBuf {
             part_path(&blob_dir(&self.seam.data_dir()), self.blob.id)
+        }
+
+        /// Registers `count` more blobs, from `from`, held by the server.
+        fn held_blobs(&self, from: u64, count: usize, hold: Hold) -> Vec<BlobId> {
+            let ids: Vec<_> = (0..count).map(|_| ProtoBlobId::new()).collect();
+            let events = ids.iter().map(|id| Event {
+                session_id: self.session_id,
+                at: Utc::now(),
+                kind: EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "held".into(),
+                    lines: 1,
+                    output: Some(BlobRef { id: *id, size: 10 }),
+                }),
+            });
+            self.seam
+                .apply_events(&EventBatch {
+                    from: Seq(from),
+                    events: events.collect(),
+                })
+                .unwrap();
+            let mut held = self.server.held.lock().unwrap();
+            for id in &ids {
+                held.insert(*id, hold);
+            }
+            ids
+        }
+
+        /// Both eager slots take a held blob; then the user asks for the
+        /// fixture's blob, which must still arrive.
+        async fn want_past_held_eager(&self, hold: Hold) {
+            let held = self.held_blobs(3, 2, hold);
+            self.queue.set_policy(BlobPolicy::Eager, &[]);
+            self.queue.registered(&held);
+            let downloader = tokio::spawn(run_downloader(self.ctx()));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while lock(&self.queue.queue).active.len() < 2
+                    || self.server.calls.load(Ordering::SeqCst) < 2
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("both eager slots take a held blob");
+
+            self.queue.want(self.blob.id);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(self.status(), BlobStatus::Available { .. }) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("blob status stuck at {:?}", self.status()));
+            let active = lock(&self.queue.queue).active.clone();
+            downloader.abort();
+            assert_eq!(active, held.into_iter().collect(), "still held");
         }
     }
 
@@ -865,6 +963,23 @@ mod tests {
         assert!(!f.part().exists(), "the part file it wrote is gone");
         let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
         assert!(!done.exists());
+    }
+
+    #[tokio::test]
+    async fn a_wanted_blob_passes_stalled_eager_downloads() {
+        let bytes = content(3000);
+        let f = Fixture::new(3000, bytes.clone(), 3000);
+        f.want_past_held_eager(Hold::Stall).await;
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn a_wanted_blob_passes_eager_downloads_retrying_offline() {
+        let f = Fixture::new(3000, content(3000), 3000);
+        f.want_past_held_eager(Hold::Offline).await;
     }
 
     #[test]
