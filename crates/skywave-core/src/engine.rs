@@ -651,10 +651,9 @@ async fn pull(
             Ok(applied) => {
                 head = head.max(applied.cursor);
                 ctx.blobs.registered(&applied.blobs);
-                // A command the log settled may be what the sender waits on.
-                if !applied.settled.is_empty() {
-                    ctx.outbox.notify_one();
-                }
+                // A command the log settled, or the log applied through a
+                // head, may be what the sender waits on ([`settled_by_log`]).
+                ctx.outbox.notify_one();
                 // A device paired since this connection's `hello`: ask
                 // again, so its name shows without waiting for a reconnect.
                 let unnamed = ctx.seam.unnamed_devices(&batch);
@@ -698,8 +697,9 @@ async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, Li
 /// An unreadable reply ([`TransportError::Decode`]) keeps the link up too:
 /// the server answered, so the command's event, if it logged one, is on its
 /// way to the pull on this connection, and settles it
-/// ([`Seam::apply_events`]). The entry waits for that, holding back the
-/// later ones (D7); resending at once would most likely bring back the same
+/// ([`Seam::apply_events`]); if it logged none, the log shows that too
+/// ([`settled_by_log`]). The entry waits for either, holding back the later
+/// ones (D7); resending at once would most likely bring back the same
 /// unreadable reply before the pull can apply the event.
 async fn send_entry(
     ctx: &LinkCtx,
@@ -718,20 +718,28 @@ async fn send_entry(
         }
         Err(TransportError::Decode(error)) => {
             tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
-            settled_by_log(ctx, id).await?;
+            settled_by_log(ctx, transport, id).await?;
         }
         Err(error) => return Err(error.into()),
     }
     Ok(())
 }
 
-/// Waits until the outbox command `id` is no longer pending.
-async fn settled_by_log(ctx: &LinkCtx, id: CommandId) -> Result<(), LinkError> {
+/// Waits until the log settles the outbox command `id`, whose reply was
+/// unreadable: its event settles it as accepted, or, once the pull has
+/// applied the log through the head read here without one, it fails as
+/// never applied ([`Seam::command_unlogged`]). The head is read after the
+/// reply came back, so it covers any event the command logged.
+async fn settled_by_log(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    id: CommandId,
+) -> Result<(), LinkError> {
+    let head = transport.hello().await?.head;
     loop {
-        // Asked for before the look, so a settle in between still wakes it.
+        // Asked for before the look, so a batch in between still wakes it.
         let changed = ctx.outbox.notified();
-        let pending = ctx.seam.pending_outbox()?;
-        if !pending.iter().any(|e| e.command.id == id) {
+        if ctx.seam.command_unlogged(id, head)? {
             return Ok(());
         }
         changed.await;
@@ -1543,7 +1551,8 @@ mod tests {
     /// A server with a log of one session: a message logs its event once
     /// however often it is sent, and a long-poll wakes when the log grows.
     /// The reply to the message `lost` is never readable: it fails to decode
-    /// at once, before any pull can bring the event.
+    /// at once, before any pull can bring the event. The message `refused`
+    /// is rejected, so logs nothing, and its reply is never readable either.
     struct LogServer {
         session_id: SessionId,
         log: Mutex<Vec<skywave_proto::Event>>,
@@ -1611,6 +1620,9 @@ mod tests {
                     panic!("only messages are sent here");
                 };
                 self.sent.lock().unwrap().push(text.clone());
+                if text == "refused" {
+                    return Err(TransportError::Decode("garbled".into()));
+                }
                 let seq = {
                     let mut log = self.log.lock().unwrap();
                     let logged = log.iter().position(|e| e.command_id == Some(command.id));
@@ -1719,7 +1731,8 @@ mod tests {
         link.abort();
 
         assert_eq!(*server.sent.lock().unwrap(), ["lost", "next"]);
-        assert_eq!(server.hellos.load(Ordering::SeqCst), 1, "one connection");
+        // The connection's, and the head read after the unreadable reply.
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 2, "one connection");
         let outbox = crate::client::lock(&seam.core.shared.state)
             .store
             .outbox()
@@ -1766,6 +1779,92 @@ mod tests {
                 (lost, Some(Outgoing::Accepted(Seq(2)))),
                 (next, Some(Outgoing::Accepted(Seq(3)))),
             ]
+        );
+    }
+
+    /// The reply to a rejected command is unreadable, and the log, applied
+    /// through the head read after it, holds no event for it: it fails as
+    /// undeliverable on the same connection, sent once, and the next goes
+    /// out after it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_rejection_fails_once_the_log_shows_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let server = Arc::new(LogServer::new());
+        let sid = server.session_id;
+        seam.apply_events(&server.batch(Seq::ZERO)).unwrap();
+        let refused = send_message(&seam, sid, "refused");
+        let next = send_message(&seam, sid, "next");
+
+        let link = tokio::spawn(run_link(link_to(&seam, &server)));
+        let drained = tokio::time::timeout(Duration::from_secs(600), async {
+            while !seam.pending_outbox().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        assert!(
+            drained.await.is_ok(),
+            "sent {:?}",
+            server.sent.lock().unwrap()
+        );
+        // Long enough for any reconnect and resend to show.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        link.abort();
+
+        assert_eq!(*server.sent.lock().unwrap(), ["refused", "next"]);
+        // The connection's, and the head read after the unreadable reply.
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 2, "one connection");
+        let outbox = crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap();
+        let settled: Vec<_> = outbox.iter().map(|e| (e.command.id, &e.status)).collect();
+        assert_eq!(
+            settled,
+            [
+                (refused, &OutboxStatus::Undeliverable),
+                (
+                    next,
+                    &OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) })
+                ),
+            ]
+        );
+    }
+
+    /// An event the pull applies after the head was read, but before the
+    /// replica reached it, still settles the command as accepted: it fails
+    /// only once the cursor reaches the head without its event.
+    #[test]
+    fn an_event_behind_the_head_settles_an_unreadable_reply_as_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let server = LogServer::new();
+        let sid = server.session_id;
+        seam.apply_events(&server.batch(Seq::ZERO)).unwrap();
+        let lost = send_message(&seam, sid, "lost");
+        let entry = seam.pending_outbox().unwrap().remove(0);
+        assert!(seam.command_sending(lost).unwrap());
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(server.send_command(&entry.command));
+        assert!(matches!(reply, Err(TransportError::Decode(_))));
+        // The head read after the reply: the command's event is in it.
+        let head = Seq(2);
+
+        assert!(
+            !seam.command_unlogged(lost, head).unwrap(),
+            "behind the head"
+        );
+        seam.apply_events(&server.batch(Seq(1))).unwrap();
+        assert!(seam.command_unlogged(lost, head).unwrap());
+        let outbox = crate::client::lock(&seam.core.shared.state)
+            .store
+            .outbox()
+            .unwrap();
+        assert_eq!(
+            outbox[0].status,
+            OutboxStatus::Done(CommandResult::Accepted { seq: Seq(2) })
         );
     }
 
