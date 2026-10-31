@@ -21,6 +21,25 @@
 //!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
 //!   session whose agent is not running is left alone. Like an idle
 //!   shutdown, the next `UserMessage` resumes the agent.
+//! - `PermissionModeRequested` / `ModelRequested` →
+//!   [`AgentSession::set_permission_mode`] / [`AgentSession::set_model`],
+//!   noted with the mapper so the agent's answer names the command. A
+//!   session whose agent is not running is started for it (no message is
+//!   sent, so no turn runs) and kept like any idle session. Only the
+//!   session's open request goes out, once per agent: one a newer request
+//!   replaced before the supervisor reached it is skipped, so requests
+//!   never land out of order, and one the agent's start already asked for
+//!   is not asked again.
+//!
+//! **Mode and model.** Every agent starts with the mode and model the
+//! session's log wants ([`Setting::wanted`](skywave_proto::Setting::wanted)):
+//! an open request, else what the agent last ran with. So a restarted or
+//! resumed agent keeps both, and a start made for a request carries that
+//! request out; each is asked for under the open request's command, if
+//! any, so its answer settles that request. An agent start that fails
+//! refuses the request it was made for. The models an agent offers are
+//! logged as `ModelsOffered` only when they differ from the newest list in
+//! the whole log.
 //!
 //! Everything the agent reports goes through the session's [`EventMapper`].
 //! An agent that exits on its own (crash) is logged by the mapper (`Errored`
@@ -52,6 +71,9 @@
 //!   ([`TURN_LOST`]);
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
+//! - a mode or model request still open whose event the supervisor had
+//!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
+//!   handed to is gone. One after the cursor is handled as usual.
 //!
 //! [`SupervisorHandle::shutdown`] stops the agents without interrupting them
 //! ([`AgentSession::shutdown`] abandons a running turn, so the agent cancels
@@ -67,20 +89,22 @@
 //! work is serialized there: agent requests are awaited one at a time, so an
 //! adapter must return from them promptly (they only tell the agent).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::path::PathBuf;
 use std::task::Poll;
 use std::time::Duration;
 
 use rusqlite::OptionalExtension;
-use skywave_proto::{Event, EventKind, Seq, SessionId, SessionState};
+use skywave_proto::{
+    CommandId, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
+};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, EventMapper, StartSpec,
-    load_resume_handle,
+    bounded_models, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -145,6 +169,8 @@ pub struct Supervisor<A: AgentAdapter> {
     /// The cursor as last persisted.
     stored_cursor: Seq,
     running: HashMap<SessionId, Running<A::Session>>,
+    /// The models of the newest `ModelsOffered` in the log.
+    models: Option<Vec<ModelChoice>>,
 }
 
 /// One running agent session.
@@ -159,6 +185,8 @@ struct Running<S> {
     owed_turns: usize,
     /// When the session last ran out of work; `None` while it has some.
     idle_since: Option<Instant>,
+    /// The setting requests this agent was asked for, by command.
+    asked: HashSet<Option<CommandId>>,
 }
 
 impl<S> Running<S> {
@@ -235,6 +263,39 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
         self.cursor = load_cursor(db)?;
         self.stored_cursor = self.cursor;
+        for session in self.log.sessions(db)? {
+            let settings = self.log.agent_settings(db, session.id)?;
+            let handled = |command| -> Result<bool> {
+                Ok(self
+                    .log
+                    .command_seq(db, command)?
+                    .is_some_and(|seq| seq <= self.cursor))
+            };
+            let mut lost = Vec::new();
+            if let Some(request) = &settings.mode.requested
+                && handled(request.command)?
+            {
+                lost.push(EventKind::PermissionModeRefused {
+                    mode: request.value,
+                    reason: DAEMON_RESTARTED.to_owned(),
+                    answers: Some(request.command),
+                });
+            }
+            if let Some(request) = &settings.model.requested
+                && handled(request.command)?
+            {
+                lost.push(EventKind::ModelRefused {
+                    model: request.value.clone(),
+                    reason: DAEMON_RESTARTED.to_owned(),
+                    answers: Some(request.command),
+                });
+            }
+            for kind in lost {
+                tracing::info!(session = %session.id.0, ?kind, "refusing a request lost with the daemon");
+                self.log.append(db, session.id, kind)?;
+            }
+        }
+        self.models = self.log.offered_models(db)?;
         Ok(())
     }
 
@@ -334,7 +395,76 @@ impl<A: AgentAdapter> Supervisor<A> {
                 tracing::info!(session = %session_id.0, "stopping agent on request");
                 self.stop_session(session_id, true).await?;
             }
+            EventKind::PermissionModeRequested { mode, .. } => {
+                self.set(session_id, event.command_id, Setting::Mode(mode))
+                    .await?;
+            }
+            EventKind::ModelRequested { model, .. } => {
+                self.set(session_id, event.command_id, Setting::Model(model))
+                    .await?;
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Asks the session's agent for `setting` on behalf of `command`. An
+    /// agent that is not running is started, and the start asks for what
+    /// the log wants, this request included.
+    async fn set(
+        &mut self,
+        session_id: SessionId,
+        command: Option<CommandId>,
+        setting: Setting,
+    ) -> Result<()> {
+        if !self.running.contains_key(&session_id) {
+            if let Err(message) = self.start_session(session_id).await? {
+                tracing::warn!(session = %session_id.0, %message, "agent did not start for a setting");
+                let reason = format!("agent did not start: {message}");
+                let kind = match setting {
+                    Setting::Mode(mode) => EventKind::PermissionModeRefused {
+                        mode,
+                        reason,
+                        answers: command,
+                    },
+                    Setting::Model(model) => EventKind::ModelRefused {
+                        model,
+                        reason,
+                        answers: command,
+                    },
+                };
+                self.log.append(&mut self.storage.db, session_id, kind)?;
+            }
+            return Ok(());
+        }
+        // Only the open request is carried out, once: a newer one replaced
+        // it (and goes out after it), or the start already asked for it.
+        let settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        let open = match &setting {
+            Setting::Mode(_) => settings.mode.requested.as_ref().map(|r| r.command),
+            Setting::Model(_) => settings.model.requested.as_ref().map(|r| r.command),
+        };
+        let Some(running) = self.running.get_mut(&session_id) else {
+            return Ok(());
+        };
+        if command.is_none() || open != command || running.asked.contains(&command) {
+            tracing::debug!(session = %session_id.0, "skipping a setting request already asked or replaced");
+            return Ok(());
+        }
+        running.asked.insert(command);
+        let sent = match setting {
+            Setting::Mode(mode) => {
+                running.mapper.asked_mode(mode, command);
+                running.session.set_permission_mode(mode).await
+            }
+            Setting::Model(model) => {
+                running.mapper.asked_model(model.clone(), command);
+                running.session.set_model(model).await
+            }
+        };
+        if let Err(error) = sent {
+            // The agent is gone; its `Exited` refuses what it was asked.
+            tracing::warn!(session = %session_id.0, %error, "cannot ask the agent for a setting");
         }
         Ok(())
     }
@@ -383,15 +513,31 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let resume = load_resume_handle(&self.storage.db, session_id)?;
         let resumed = resume.is_some();
+        let settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        let mode = settings.mode.wanted().copied();
+        let model = settings.model.wanted().cloned();
         let spec = StartSpec {
             session_id,
             workdir: info.workdir.into(),
             resume,
+            mode,
+            model: model.clone(),
         };
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
                 tracing::info!(session = %session_id.0, resumed, "agent started");
-                let mapper = EventMapper::new(session_id);
+                let mut mapper = EventMapper::new(session_id, settings.clone());
+                let mut asked = HashSet::new();
+                if let Some(mode) = mode {
+                    let command = settings.mode.requested.as_ref().map(|r| r.command);
+                    mapper.asked_mode(mode, command);
+                    asked.insert(command);
+                }
+                if let Some(model) = model {
+                    let command = settings.model.requested.as_ref().map(|r| r.command);
+                    mapper.asked_model(model, command);
+                    asked.insert(command);
+                }
                 self.running.insert(
                     session_id,
                     Running {
@@ -400,7 +546,9 @@ impl<A: AgentAdapter> Supervisor<A> {
                         mapper,
                         turn_started: None,
                         owed_turns: 0,
-                        idle_since: None,
+                        // Nothing to do until a message comes, if one does.
+                        idle_since: Some(Instant::now()),
+                        asked,
                     },
                 );
                 Ok(Ok(()))
@@ -437,6 +585,9 @@ impl<A: AgentAdapter> Supervisor<A> {
             event,
             AdapterEvent::TurnEnded(_) | AdapterEvent::Exited { .. }
         );
+        if let AdapterEvent::ModelsOffered(models) = event {
+            return offer_models(&self.log, &mut self.storage, &mut self.models, id, models);
+        }
         let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
         if started && let Some(&seq) = seqs.first() {
             running.turn_started = Some(seq);
@@ -483,7 +634,11 @@ impl<A: AgentAdapter> Supervisor<A> {
         // Put the mapper back for `map`; the session itself is gone.
         let mut mapper = running.mapper;
         for event in events {
-            mapper.apply(&self.log, &mut self.storage, event)?;
+            if let AdapterEvent::ModelsOffered(models) = event {
+                offer_models(&self.log, &mut self.storage, &mut self.models, id, models)?;
+            } else {
+                mapper.apply(&self.log, &mut self.storage, event)?;
+            }
         }
         tracing::info!(session = %id.0, "agent stopped");
         Ok(())
@@ -541,6 +696,7 @@ fn run_thread<A: AgentAdapter>(
             cursor: Seq::ZERO,
             stored_cursor: Seq::ZERO,
             running: HashMap::new(),
+            models: None,
         };
         supervisor.recover()?;
         Ok((runtime, supervisor))
@@ -557,6 +713,36 @@ fn run_thread<A: AgentAdapter>(
         }
     };
     runtime.block_on(supervisor.run(stop))
+}
+
+/// A setting a device asked a session's agent for.
+enum Setting {
+    Mode(PermissionMode),
+    Model(String),
+}
+
+/// Logs `models`, offered by session `id`'s agent, as `ModelsOffered` when
+/// they differ from `known`, the newest list in the log, and makes them so.
+fn offer_models(
+    log: &EventLog,
+    storage: &mut Storage,
+    known: &mut Option<Vec<ModelChoice>>,
+    id: SessionId,
+    models: Vec<ModelChoice>,
+) -> Result<()> {
+    let models = bounded_models(models);
+    if models.is_empty() || known.as_ref() == Some(&models) {
+        return Ok(());
+    }
+    log.append(
+        &mut storage.db,
+        id,
+        EventKind::ModelsOffered {
+            models: models.clone(),
+        },
+    )?;
+    *known = Some(models);
+    Ok(())
 }
 
 /// The next event from any running agent session. Pending while none runs.

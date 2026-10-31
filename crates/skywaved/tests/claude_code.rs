@@ -18,8 +18,8 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec,
-    ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    BodyFormat, DisplayBody, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
+    RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -74,6 +74,8 @@ fn replay_any_version(
     let mut n_in = 0;
     // The `permission_suggestions` of each recorded `can_use_tool`, by id.
     let mut offers: HashMap<String, Value> = HashMap::new();
+    // The id of each of our control requests, by the recorded one.
+    let mut our_ids: HashMap<String, String> = HashMap::new();
     for record in fixture(name) {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
@@ -85,6 +87,17 @@ fn replay_any_version(
                     // Written by `start`.
                     ("control_request", Some("initialize")) => Default::default(),
                     ("control_request", Some("interrupt")) => protocol.interrupt(),
+                    // A mode the adapter has no name for, or no model, it
+                    // can never send: the test lists it as dropped.
+                    ("control_request", Some("set_permission_mode")) => msg["request"]["mode"]
+                        .as_str()
+                        .and_then(protocol::parse_mode)
+                        .map(|mode| protocol.set_permission_mode(mode))
+                        .unwrap_or_default(),
+                    ("control_request", Some("set_model")) => msg["request"]["model"]
+                        .as_str()
+                        .map(|model| protocol.set_model(model.to_owned()))
+                        .unwrap_or_default(),
                     ("user", _) => protocol
                         .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
                     ("control_response", _) => {
@@ -111,6 +124,11 @@ fn replay_any_version(
                         .pop_front()
                         .unwrap_or_else(|| panic!("{name}: nothing written for stdin #{n_in}"));
                     assert_eq!(normalized(&ours), normalized(msg), "{name}: stdin #{n_in}");
+                    if let (Some(recorded), Some(id)) =
+                        (msg["request_id"].as_str(), ours["request_id"].as_str())
+                    {
+                        our_ids.insert(recorded.to_owned(), id.to_owned());
+                    }
                 }
                 n_in += 1;
             }
@@ -121,7 +139,16 @@ fn replay_any_version(
                         msg["request"]["permission_suggestions"].clone(),
                     );
                 }
-                let line = serde_json::to_string(msg).unwrap();
+                // The CLI answers our control requests under the ids we
+                // chose, not the recorded driver's.
+                let mut msg = msg.clone();
+                if let Some(id) = msg["response"]["request_id"]
+                    .as_str()
+                    .and_then(|recorded| our_ids.get(recorded))
+                {
+                    msg["response"]["request_id"] = json!(id);
+                }
+                let line = serde_json::to_string(&msg).unwrap();
                 let out = protocol.on_line(&line);
                 assert!(
                     out.writes.is_empty(),
@@ -153,7 +180,9 @@ fn granted_rule(offers: &HashMap<String, Value>, request: &str, response: &Value
     Some(u8::try_from(index).unwrap())
 }
 
-/// One line per event, cut short, for readable expectations.
+/// One line per event, cut short, for readable expectations. What the agent
+/// reports unasked about its mode and model is left out ([`settings`] lists
+/// it).
 fn describe(events: &[AdapterEvent]) -> Vec<String> {
     fn cut(text: &str) -> String {
         let first = text.lines().next().unwrap_or("");
@@ -161,6 +190,7 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
     }
     events
         .iter()
+        .filter(|event| !observes_settings(event))
         .map(|event| match event {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
             AdapterEvent::Text(text) => format!("text: {}", cut(text)),
@@ -184,6 +214,62 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 )
             }
             AdapterEvent::Exited { error } => format!("exited: {error:?}"),
+            AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
+            AdapterEvent::PermissionModeSet(mode) => format!("mode set: {mode:?}"),
+            AdapterEvent::PermissionModeRefused { mode, reason } => {
+                format!("mode refused {mode:?}: {}", cut(reason))
+            }
+            AdapterEvent::Model(model) => format!("model: {model}"),
+            AdapterEvent::ModelSet(model) => format!("model set: {model}"),
+            AdapterEvent::ModelRefused { model, reason } => {
+                format!("model refused {model}: {}", cut(reason))
+            }
+            AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+        })
+        .collect()
+}
+
+/// What the agent reports unasked about its mode and model.
+fn observes_settings(event: &AdapterEvent) -> bool {
+    matches!(
+        event,
+        AdapterEvent::PermissionMode(_) | AdapterEvent::Model(_) | AdapterEvent::ModelsOffered(_)
+    )
+}
+
+/// `events` as [`describe`] lists them.
+fn without_settings(events: Vec<AdapterEvent>) -> Vec<AdapterEvent> {
+    events
+        .into_iter()
+        .filter(|e| !observes_settings(e))
+        .collect()
+}
+
+/// One line per event about the mode or model, as [`describe`] puts it.
+fn settings(events: &[AdapterEvent]) -> Vec<String> {
+    let settings: Vec<AdapterEvent> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AdapterEvent::PermissionMode(_)
+                    | AdapterEvent::PermissionModeSet(_)
+                    | AdapterEvent::PermissionModeRefused { .. }
+                    | AdapterEvent::Model(_)
+                    | AdapterEvent::ModelSet(_)
+                    | AdapterEvent::ModelRefused { .. }
+                    | AdapterEvent::ModelsOffered(_)
+            )
+        })
+        .cloned()
+        .collect();
+    settings
+        .iter()
+        .map(|event| match event {
+            AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
+            AdapterEvent::Model(model) => format!("model: {model}"),
+            AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            other => describe(std::slice::from_ref(other)).remove(0),
         })
         .collect()
 }
@@ -377,6 +463,8 @@ fn replay_permissions_allow_then_deny() {
         false,
         &[],
     );
+    // Only the events `describe` shows, so indices match it.
+    let events = without_settings(events);
     assert_eq!(
         describe(&events),
         [
@@ -885,6 +973,122 @@ fn recorded_rejected_permission_modes_keep_the_mode() {
 }
 
 #[test]
+fn replay_mode_switches_answer_requests_and_report_the_mode() {
+    let events = replay("permission_modes", Uuid::new_v4(), false, &[]);
+    let haiku = "model: claude-haiku-5-5";
+    assert_eq!(
+        settings(&events),
+        strings(&[
+            "mode: Ask",
+            "models offered: 13",
+            // default: Write
+            haiku,
+            "mode: Ask",
+            "mode set: AcceptEdits",
+            // acceptEdits: Write; its status echo is dropped.
+            haiku,
+            "mode: AcceptEdits",
+            // acceptEdits: Bash rm
+            haiku,
+            "mode: AcceptEdits",
+            "mode set: Plan",
+            // plan: Write; the approved plan returns to acceptEdits.
+            haiku,
+            "mode: Plan",
+            "mode: AcceptEdits",
+            "mode set: Auto",
+            haiku,
+            "mode: Auto",
+            haiku,
+            "mode: Auto",
+            "mode set: DontAsk",
+            haiku,
+            "mode: DontAsk",
+            "mode set: Ask",
+            haiku,
+            "mode: Ask",
+            // A switch while an approval waits.
+            haiku,
+            "mode: Ask",
+            "mode set: AcceptEdits",
+        ])
+    );
+}
+
+#[test]
+fn replay_an_approved_plan_reports_the_mode_before_it() {
+    let events = replay("permission_modes_plan", Uuid::new_v4(), false, &[]);
+    let haiku = "model: claude-haiku-5-5";
+    assert_eq!(
+        settings(&events),
+        strings(&[
+            "mode: Ask",
+            "models offered: 13",
+            "mode set: Plan",
+            haiku,
+            "mode: Plan",
+            "mode: Ask",
+            haiku,
+            "mode: Ask",
+        ])
+    );
+}
+
+#[test]
+fn replay_refused_modes_and_models_keep_what_the_agent_had() {
+    let events = replay(
+        "permission_mode_errors",
+        Uuid::new_v4(),
+        false,
+        &[2, 4, 5, 6],
+    );
+    assert_eq!(
+        settings(&events),
+        strings(&[
+            "mode: Ask",
+            "models offered: 13",
+            "mode set: Plan",
+            "mode refused Bypass: Cannot set permission mode to bypassPermissions ",
+        ])
+    );
+
+    let events = replay("model_switch", Uuid::new_v4(), false, &[2, 6, 7]);
+    assert_eq!(
+        settings(&events),
+        strings(&[
+            "mode: Ask",
+            "models offered: 13",
+            // Set answers with the model the CLI resolved.
+            "model set: claude-sonnet-5-5",
+            "model set: claude-opus-4-7",
+            "model refused bogus-model: Model 'bogus-model' not found",
+            "model set: claude-opus-5-5",
+        ])
+    );
+}
+
+#[test]
+fn the_initialize_answer_offers_its_models() {
+    let events = replay("model_switch", Uuid::new_v4(), false, &[2, 6, 7]);
+    let Some(AdapterEvent::ModelsOffered(models)) = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::ModelsOffered(_)))
+    else {
+        panic!("no models offered");
+    };
+    assert_eq!(
+        models[0],
+        ModelChoice {
+            id: "default".into(),
+            label: "Default (recommended)".into(),
+            detail: Some("Opus 5.5 · Best for everyday, complex tasks".into()),
+            resolved: Some("claude-opus-5-5".into()),
+        }
+    );
+    assert!(models.iter().any(|m| m.id == "haiku"));
+}
+
+#[test]
 fn replay_interrupt_while_streaming_and_while_idle() {
     // This run had no --session-id: the CLI's own id is adopted.
     let ours = uuid("11111111-1111-4111-8111-111111111111");
@@ -1111,10 +1315,23 @@ fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
         session_id: SessionId::new(),
         workdir: workdir.to_owned(),
         resume,
+        mode: None,
+        model: None,
     }
 }
 
+/// The next event, skipping what the agent reports unasked about its mode
+/// and model (`settings_test` reads those with [`next_raw`]).
 async fn next(events: &mut AdapterEvents) -> AdapterEvent {
+    loop {
+        let event = next_raw(events).await;
+        if !observes_settings(&event) {
+            return event;
+        }
+    }
+}
+
+async fn next_raw(events: &mut AdapterEvents) -> AdapterEvent {
     tokio::time::timeout(WAIT, events.recv())
         .await
         .expect("no adapter event in time")
@@ -1510,4 +1727,82 @@ async fn dropping_the_session_stops_the_agent() {
     );
     assert!(events.recv().await.is_none());
     assert!(!process_exists(pid), "agent process {pid} still exists");
+}
+
+#[tokio::test]
+async fn a_session_starts_with_and_switches_its_mode_and_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = spec(tmp.path(), None);
+    spec.mode = Some(PermissionMode::Plan);
+    spec.model = Some("sonnet".to_owned());
+    let (mut session, mut events) = adapter().start(spec).await.unwrap();
+    assert!(matches!(
+        next_raw(&mut events).await,
+        AdapterEvent::ResumeHandle(_)
+    ));
+    // Asked for after the handshake, answered like any request; the
+    // status echo of the switch is not reported.
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::PermissionModeSet(PermissionMode::Plan),
+            AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
+        ]
+    );
+
+    session.send_message("hello".to_owned()).await.unwrap();
+    let usage = AdapterEvent::TurnUsage(TurnUsage {
+        model: Some("resolved-sonnet".to_owned()),
+        ..TurnUsage::default()
+    });
+    assert_eq!(
+        take_raw(&mut events, 6).await,
+        [
+            AdapterEvent::TurnStarted,
+            AdapterEvent::Model("resolved-sonnet".to_owned()),
+            AdapterEvent::PermissionMode(PermissionMode::Plan),
+            text("echo"),
+            usage,
+            COMPLETED,
+        ]
+    );
+
+    session
+        .set_permission_mode(PermissionMode::Bypass)
+        .await
+        .unwrap();
+    session.set_model("bogus".to_owned()).await.unwrap();
+    session
+        .set_permission_mode(PermissionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let events_now = take_raw(&mut events, 3).await;
+    assert!(matches!(
+        &events_now[0],
+        AdapterEvent::PermissionModeRefused { mode: PermissionMode::Bypass, reason }
+            if reason.contains("--dangerously-skip-permissions")
+    ));
+    assert_eq!(
+        events_now[1..],
+        [
+            AdapterEvent::ModelRefused {
+                model: "bogus".to_owned(),
+                reason: "Model 'bogus' not found".to_owned(),
+            },
+            AdapterEvent::PermissionModeSet(PermissionMode::AcceptEdits),
+        ]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next_raw(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+async fn take_raw(events: &mut AdapterEvents, n: usize) -> Vec<AdapterEvent> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        out.push(next_raw(events).await);
+    }
+    out
 }

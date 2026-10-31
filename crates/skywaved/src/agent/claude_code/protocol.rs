@@ -24,6 +24,18 @@
 //! rule where it said it would. One the CLI keeps in its process only is
 //! also added to the resume handle ([`rules::keep`]), reported anew, so a
 //! resumed process is started with it again.
+//!
+//! **Mode and model** (docs/agents/claude-code.md §3.7). A request is a
+//! `set_permission_mode` / `set_model` control request; its
+//! `control_response` is the answer: success echoes the mode, or the model
+//! as the CLI resolved it, and an error keeps the old one. The CLI also says
+//! what it runs with unasked: `current_permission_mode` and the offered
+//! `models` in the initialize answer, `permissionMode` and `model` in each
+//! `system/init`, and a `system/status` line after every mode change. The
+//! status for a change the adapter asked for may come late, after a later
+//! answer, so such an echo is dropped rather than reported as the mode;
+//! any other status (an approved `ExitPlanMode` returning to the mode before
+//! plan) is reported.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -32,7 +44,10 @@ use skywave_proto::Decision;
 use uuid::Uuid;
 
 use super::{display, rules, usage};
-use crate::agent::{AdapterEvent, AgentCallId, AgentRequestId, ResumeHandle, TurnOutcome};
+use crate::agent::{
+    AdapterEvent, AgentCallId, AgentRequestId, ModelChoice, PermissionMode, ResumeHandle,
+    TurnOutcome,
+};
 
 /// The CLI version the protocol was confirmed against (T07). Another version
 /// is logged as a warning, not refused.
@@ -102,6 +117,69 @@ pub fn initialize_request(request_id: &str) -> Value {
         "request_id": request_id,
         "request": { "subtype": "initialize", "hooks": null },
     })
+}
+
+/// The request that switches the permission mode.
+pub fn set_permission_mode_request(request_id: &str, mode: PermissionMode) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_permission_mode", "mode": mode_name(mode) },
+    })
+}
+
+/// The request that switches the model.
+pub fn set_model_request(request_id: &str, model: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_model", "model": model },
+    })
+}
+
+/// What the CLI calls `mode`.
+pub fn mode_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Auto => "auto",
+        PermissionMode::DontAsk => "dontAsk",
+        PermissionMode::Bypass => "bypassPermissions",
+    }
+}
+
+/// The mode the CLI calls `name`; `None` for one it added since.
+pub fn parse_mode(name: &str) -> Option<PermissionMode> {
+    PermissionMode::ALL
+        .into_iter()
+        .find(|mode| mode_name(*mode) == name)
+}
+
+/// The models an initialize answer offers.
+pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
+    let Some(models) = models.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("value")?.as_str()?.to_owned();
+            let text = |key| {
+                model
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+            };
+            Some(ModelChoice {
+                label: text("displayName").unwrap_or_else(|| id.clone()),
+                detail: text("description"),
+                resolved: text("resolvedModel"),
+                id,
+            })
+        })
+        .collect()
 }
 
 /// The request that stops the current turn.
@@ -191,6 +269,18 @@ pub struct Protocol {
     /// tool-use id: a structured result is read by its tool.
     tools: HashMap<String, String>,
     shutting_down: bool,
+    /// Mode and model requests the CLI has not answered, by request id.
+    settings: HashMap<String, Asked>,
+    /// Modes switched to on request whose `system/status` echo has not
+    /// come yet, oldest first.
+    echoes: VecDeque<PermissionMode>,
+}
+
+/// A mode or model request waiting for its `control_response`.
+#[derive(Debug, Clone)]
+enum Asked {
+    Mode(PermissionMode),
+    Model(String),
 }
 
 impl Protocol {
@@ -215,6 +305,8 @@ impl Protocol {
             pending: Vec::new(),
             tools: HashMap::new(),
             shutting_down: false,
+            settings: HashMap::new(),
+            echoes: VecDeque::new(),
         }
     }
 
@@ -332,6 +424,30 @@ impl Protocol {
         }
     }
 
+    /// Asks the CLI to switch to `mode`; answered by `PermissionModeSet` or
+    /// `PermissionModeRefused` when its `control_response` comes.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) -> Output {
+        let id = self.request_id();
+        let write = set_permission_mode_request(&id, mode);
+        self.settings.insert(id, Asked::Mode(mode));
+        Output {
+            writes: vec![write],
+            events: Vec::new(),
+        }
+    }
+
+    /// Asks the CLI to switch to `model`; answered by `ModelSet` or
+    /// `ModelRefused`.
+    pub fn set_model(&mut self, model: String) -> Output {
+        let id = self.request_id();
+        let write = set_model_request(&id, &model);
+        self.settings.insert(id, Asked::Model(model));
+        Output {
+            writes: vec![write],
+            events: Vec::new(),
+        }
+    }
+
     /// The session is stopping: queued messages are dropped and no new turn
     /// starts.
     pub fn begin_shutdown(&mut self) {
@@ -360,11 +476,14 @@ impl Protocol {
         let mut out = Output::default();
         match str_field(message, "type") {
             "system" if str_field(message, "subtype") == "init" => self.on_init(message, &mut out),
+            "system" if str_field(message, "subtype") == "status" => {
+                self.on_status(message, &mut out);
+            }
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
             "control_cancel_request" => self.on_cancel(message, &mut out),
-            "control_response" => self.on_control_response(message),
+            "control_response" => self.on_control_response(message, &mut out),
             "result" => self.on_result(message, &mut out),
             // rate_limit_event, stream_event, other system subtypes: progress
             // signals only.
@@ -410,6 +529,14 @@ impl Protocol {
         self.check_version(message.get("claude_code_version").and_then(Value::as_str));
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = Some(model.to_owned());
+            out.events.push(AdapterEvent::Model(model.to_owned()));
+        }
+        if let Some(mode) = message
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .and_then(parse_mode)
+        {
+            out.events.push(AdapterEvent::PermissionMode(mode));
         }
         if !self.turn_open {
             // A turn the CLI started on its own; frame it all the same.
@@ -572,20 +699,92 @@ impl Protocol {
         });
     }
 
-    fn on_control_response(&mut self, message: &Value) {
+    /// A `system/status`: the mode now, unless it echoes a switch the
+    /// adapter asked for.
+    fn on_status(&mut self, message: &Value, out: &mut Output) {
+        let Some(mode) = message
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .and_then(parse_mode)
+        else {
+            return;
+        };
+        if let Some(index) = self.echoes.iter().position(|echo| *echo == mode) {
+            // Echoes come in order: older ones that never came are gone.
+            self.echoes.drain(..=index);
+            return;
+        }
+        out.events.push(AdapterEvent::PermissionMode(mode));
+    }
+
+    /// The answer to a mode or model request.
+    fn on_setting_response(&mut self, asked: Asked, response: &Value, out: &mut Output) {
+        let success = str_field(response, "subtype") == "success";
+        let reason = || {
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("refused")
+                .to_owned()
+        };
+        let body = response.get("response").unwrap_or(&Value::Null);
+        out.events.push(match asked {
+            Asked::Mode(mode) if success => {
+                let mode = body
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .and_then(parse_mode)
+                    .unwrap_or(mode);
+                self.echoes.push_back(mode);
+                AdapterEvent::PermissionModeSet(mode)
+            }
+            Asked::Mode(mode) => AdapterEvent::PermissionModeRefused {
+                mode,
+                reason: reason(),
+            },
+            Asked::Model(model) if success => {
+                let resolved = body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .map_or(model, str::to_owned);
+                self.model = Some(resolved.clone());
+                AdapterEvent::ModelSet(resolved)
+            }
+            Asked::Model(model) => AdapterEvent::ModelRefused {
+                model,
+                reason: reason(),
+            },
+        });
+    }
+
+    fn on_control_response(&mut self, message: &Value, out: &mut Output) {
         let response = message.get("response").unwrap_or(&Value::Null);
         let request_id = str_field(response, "request_id");
+        if let Some(asked) = self.settings.remove(request_id) {
+            self.on_setting_response(asked, response, out);
+            return;
+        }
         if self.initialize_id.as_deref() != Some(request_id) || self.ready {
             // Interrupt acknowledgements carry nothing the adapter needs.
             return;
         }
         if str_field(response, "subtype") == "success" {
             // The reply also holds the account (email, org): never log it.
-            let version = response
-                .get("response")
-                .and_then(|r| r.get("claude_code_version"))
-                .and_then(Value::as_str);
+            let body = response.get("response").unwrap_or(&Value::Null);
+            let version = body.get("claude_code_version").and_then(Value::as_str);
             self.check_version(version);
+            if let Some(mode) = body
+                .get("current_permission_mode")
+                .and_then(Value::as_str)
+                .and_then(parse_mode)
+            {
+                out.events.push(AdapterEvent::PermissionMode(mode));
+            }
+            let models = offered_models(body.get("models"));
+            if !models.is_empty() {
+                out.events.push(AdapterEvent::ModelsOffered(models));
+            }
             self.ready = true;
         } else {
             let error = response

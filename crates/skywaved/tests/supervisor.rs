@@ -10,10 +10,13 @@ use std::time::Duration;
 use serde_json::json;
 use skywave_proto::{
     ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState, ToolResult,
+    ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
+    SessionState, ToolResult,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
-use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, Step};
+use skywaved::agent::fake::{
+    FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, REFUSE_REASON, Step,
+};
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
@@ -123,6 +126,35 @@ impl Fixture {
                 session_id: self.session_id,
             },
         )
+    }
+
+    /// Sends a `SetPermissionMode` and returns its command id.
+    fn set_mode(&mut self, mode: PermissionMode) -> CommandId {
+        self.command(CommandKind::SetPermissionMode {
+            session_id: self.session_id,
+            mode,
+        })
+    }
+
+    /// Sends a `SetModel` and returns its command id.
+    fn set_model(&mut self, model: &str) -> CommandId {
+        self.command(CommandKind::SetModel {
+            session_id: self.session_id,
+            model: model.into(),
+        })
+    }
+
+    fn command(&mut self, kind: CommandKind) -> CommandId {
+        let command = Command {
+            id: CommandId::new(),
+            kind,
+        };
+        accepted(
+            self.log
+                .handle(&mut self.storage.db, DeviceId::new(), &command)
+                .unwrap(),
+        );
+        command.id
     }
 
     /// The session's log after `SessionCreated`.
@@ -757,6 +789,8 @@ async fn agent_that_cannot_start_errors_the_session() {
             session_id: f.session_id,
             workdir: workdir.into(),
             resume: None,
+            mode: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -860,4 +894,286 @@ async fn daemon_restart_cancels_a_claude_approval_left_pending_at_shutdown() {
     let pid = fake_cli_pid(&f);
     supervisor.shutdown().await.unwrap();
     assert!(!process_exists(pid), "agent process {pid} still exists");
+}
+
+fn is_setting_answer(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+    )
+}
+
+/// The answers about mode and model in `kinds`, in order.
+fn setting_answers(kinds: &[EventKind]) -> Vec<EventKind> {
+    kinds
+        .iter()
+        .filter(|k| is_setting_answer(k))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_setting_starts_an_idle_session_and_logs_the_answer() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+
+    let plan = f.set_mode(PermissionMode::Plan);
+    let kinds = f.wait_count("mode answer", 1, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::Plan,
+            answers: Some(plan),
+        }]
+    );
+    // Started for it, no turn ran.
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| *k == state(SessionState::AgentWorking))
+    );
+
+    // While it runs, a request goes straight to it.
+    let model = f.set_model("model-b");
+    let kinds = f.wait_count("model answer", 2, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[1],
+        EventKind::ModelChanged {
+            model: "model-b".into(),
+            answers: Some(model),
+        }
+    );
+    let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
+    assert_eq!(settings.mode.current, Some(PermissionMode::Plan));
+    assert_eq!(settings.model.current.as_deref(), Some("model-b"));
+    assert_eq!(
+        (settings.mode.requested, settings.model.requested),
+        (None, None)
+    );
+
+    f.send("hello");
+    f.wait_count("reply", 1, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetPermissionMode(PermissionMode::Plan),
+            FakeInput::SetModel("model-b".into()),
+            message("hello"),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_setting_keeps_what_the_agent_had() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .refuse_mode(PermissionMode::Bypass)
+            .refuse_model("bogus"),
+    );
+    let supervisor = f.start(&agent).await;
+
+    let edits = f.set_mode(PermissionMode::AcceptEdits);
+    f.wait_count("first answer", 1, is_setting_answer).await;
+    let bypass = f.set_mode(PermissionMode::Bypass);
+    let bogus = f.set_model("bogus");
+    let kinds = f.wait_count("answers", 3, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds),
+        [
+            EventKind::PermissionModeChanged {
+                mode: PermissionMode::AcceptEdits,
+                answers: Some(edits),
+            },
+            EventKind::PermissionModeRefused {
+                mode: PermissionMode::Bypass,
+                reason: REFUSE_REASON.into(),
+                answers: Some(bypass),
+            },
+            EventKind::ModelRefused {
+                model: "bogus".into(),
+                reason: REFUSE_REASON.into(),
+                answers: Some(bogus),
+            },
+        ]
+    );
+    let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
+    assert_eq!(settings.mode.current, Some(PermissionMode::AcceptEdits));
+    assert_eq!(settings.mode.wanted(), Some(&PermissionMode::AcceptEdits));
+    assert_eq!(settings.model.current, None);
+    assert_eq!(
+        settings.model.refused.map(|r| r.value).as_deref(),
+        Some("bogus")
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_the_newest_of_queued_requests_goes_out() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    // All logged before the supervisor reads any: a message, then two modes.
+    f.send("hello");
+    f.set_mode(PermissionMode::Plan);
+    let edits = f.set_mode(PermissionMode::AcceptEdits);
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::AcceptEdits,
+            answers: Some(edits),
+        }]
+    );
+    assert_eq!(
+        agent.inputs(f.session_id)[..3],
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
+            message("hello"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_agent_gets_its_mode_and_model_back() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.set_mode(PermissionMode::AcceptEdits);
+    f.set_model("model-b");
+    f.wait_count("answers", 2, is_setting_answer).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !agent.inputs(f.session_id).contains(&FakeInput::Shutdown) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle agent not shut down"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    f.send("again");
+    let kinds = f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    let inputs = agent.inputs(f.session_id);
+    let resumed = inputs
+        .iter()
+        .position(|i| *i == FakeInput::Started { resumed: true })
+        .expect("resumed");
+    assert_eq!(
+        inputs[resumed..resumed + 4],
+        [
+            FakeInput::Started { resumed: true },
+            FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
+            FakeInput::SetModel("model-b".into()),
+            message("again"),
+        ]
+    );
+    // Restoring what the log already has logs nothing new.
+    assert_eq!(setting_answers(&kinds).len(), 2);
+}
+
+#[tokio::test]
+async fn a_setting_accepted_while_down_is_carried_out_on_restart() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let plan = f.set_mode(PermissionMode::Plan);
+
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::Plan,
+            answers: Some(plan),
+        }]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn offered_models_are_logged_only_when_they_change() {
+    let mut f = Fixture::new();
+    let models = [ModelChoice {
+        id: "fast".into(),
+        label: "Fast".into(),
+        detail: None,
+        resolved: Some("model-f".into()),
+    }];
+    let agent = FakeAgent::new(FakeScript::new().offer_models(models.clone()));
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config.clone()).await;
+    f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !agent.inputs(f.session_id).contains(&FakeInput::Shutdown) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle agent not shut down"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    f.send("two");
+    f.wait_count("reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    // A daemon restart knows the list too.
+    f.reopen_log();
+    let supervisor = f.start_with(&agent, config).await;
+    f.send("three");
+    let kinds = f.wait_count("reply", 3, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    let offered: Vec<_> = kinds
+        .iter()
+        .filter(|k| matches!(k, EventKind::ModelsOffered { .. }))
+        .collect();
+    assert_eq!(
+        offered,
+        [&EventKind::ModelsOffered {
+            models: models.to_vec()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_blank_model_is_refused() {
+    let mut f = Fixture::new();
+    let session_id = f.session_id;
+    assert_eq!(
+        f.handle(
+            DeviceId::new(),
+            CommandKind::SetModel {
+                session_id,
+                model: " \n ".into(),
+            },
+        ),
+        CommandResult::Rejected {
+            reason: RejectReason::UnknownModel
+        }
+    );
+    assert_eq!(
+        f.handle(
+            DeviceId::new(),
+            CommandKind::SetPermissionMode {
+                session_id: SessionId::new(),
+                mode: PermissionMode::Plan,
+            },
+        ),
+        CommandResult::Rejected {
+            reason: RejectReason::UnknownSession
+        }
+    );
 }

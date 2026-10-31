@@ -16,7 +16,10 @@
 //! process are added to the handle as `"rules"` and passed to the resumed
 //! process as flags ([`rules::cli_args`]), so they survive a restart. [`AgentAdapter::start`] returns after the CLI answers the
 //! initialize handshake; a CLI that fails before that is a start error, or a
-//! resume error when it does not know the session.
+//! resume error when it does not know the session. The mode and model the
+//! [`StartSpec`] names are then asked for with control requests, like any
+//! later change (docs/agents/claude-code.md §3.7), so each gets the CLI's
+//! own answer.
 //!
 //! The protocol translation lives in [`protocol::Protocol`], which does no
 //! I/O; this module runs the process around it. Requests return once queued
@@ -53,7 +56,8 @@ use uuid::Uuid;
 
 use self::protocol::{Output, Protocol};
 use super::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession, StartSpec,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
+    PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
 
@@ -191,6 +195,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
+        let mut wanted = Vec::new();
+        if let Some(mode) = spec.mode {
+            wanted.extend(protocol.set_permission_mode(mode).writes);
+        }
+        if let Some(model) = spec.model {
+            wanted.extend(protocol.set_model(model).writes);
+        }
+        if let Err(e) = process.write(&wanted).await {
+            // The process is gone or going; the driver reports its exit.
+            tracing::warn!("cannot write to the agent: {e}");
+        }
+
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
         for event in early {
             events.try_send(event).map_err(|_| AgentError::Closed)?;
@@ -280,6 +296,14 @@ impl AgentSession for ClaudeCodeSession {
         self.request(Request::Interrupt)
     }
 
+    async fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), AgentError> {
+        self.request(Request::Mode(mode))
+    }
+
+    async fn set_model(&mut self, model: String) -> Result<(), AgentError> {
+        self.request(Request::Model(model))
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(Request::Shutdown);
@@ -295,6 +319,8 @@ enum Request {
     Message(String),
     Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
+    Mode(PermissionMode),
+    Model(String),
     Shutdown,
 }
 
@@ -432,6 +458,8 @@ impl Driver {
                             self.protocol.answer(&request, decision, rule)
                         }
                         Some(Request::Interrupt) => self.protocol.interrupt(),
+                        Some(Request::Mode(mode)) => self.protocol.set_permission_mode(mode),
+                        Some(Request::Model(model)) => self.protocol.set_model(model),
                         Some(Request::Shutdown) | None => break self.shutdown().await,
                     };
                     if !self.apply(out).await {

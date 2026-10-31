@@ -80,6 +80,12 @@ void main() {
       anyRow('s:10', RowKind.archived, 'archived by you'),
       anyRow('s:11', RowKind.agentError, 'it broke'),
       anyRow('s:12', RowKind.turnUsage, r'turn · 12.4s · $0.04'),
+      anyRow('s:13', RowKind.agentSetting, 'mode → plan by laptop'),
+      anyRow(
+        's:14',
+        RowKind.settingRefused,
+        'mode bypass refused: not launched for it',
+      ),
     ]);
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -111,6 +117,8 @@ void main() {
       'agent error',
       'it broke',
       r'turn · 12.4s · $0.04',
+      'mode → plan by laptop',
+      'mode bypass refused: not launched for it',
     ]) {
       expect(find.text(text, findRichText: true), findsWidgets, reason: text);
     }
@@ -666,5 +674,142 @@ void main() {
     await tester.enterText(find.byType(TextField).last, 'better');
     await tester.tap(find.widgetWithText(FilledButton, 'Rename'));
     expect(sent.last, const GuiIntentRenameSubmit(name: 'better'));
+  });
+
+  group('the status line', () {
+    testWidgets('a mode is picked; bypass only once confirmed', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.pumpAndSettle();
+      expect(find.text('accept edits detail'), findsOneWidget);
+      await tester.tap(find.text('plan'));
+      await tester.pumpAndSettle();
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSetPermissionMode(
+            sessionId: 's1',
+            mode: PermissionModeView.plan,
+          ),
+        ),
+      );
+
+      sent.clear();
+      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('bypass'));
+      await tester.pumpAndSettle();
+      expect(find.text('Switch to bypass?'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(sent, isEmpty);
+
+      await tester.tap(find.byTooltip('Permission mode'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('bypass'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Switch to bypass'));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentSetPermissionMode(
+            sessionId: 's1',
+            mode: PermissionModeView.bypass,
+          ),
+        ),
+      ]);
+    });
+
+    testWidgets('a model is picked from the list or typed in', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('Model'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Opus'));
+      await tester.pumpAndSettle();
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSetModel(sessionId: 's1', model: 'opus'),
+        ),
+      );
+
+      await tester.tap(find.byTooltip('Model'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.byType(TextField),
+        ),
+        ' my-model ',
+      );
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Switch'));
+      await tester.pumpAndSettle();
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSetModel(sessionId: 's1', model: 'my-model'),
+        ),
+      );
+    });
+
+    testWidgets('a refusal shows on its chip and in its picker', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'ask',
+            modeRefusal: 'bypass refused: not launched for it',
+            modes: askAgent.modes,
+            models: const [],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      // No model named yet: the chip still opens the name field.
+      expect(find.text('model'), findsOneWidget);
+      expect(find.byTooltip('bypass refused: not launched for it'), findsOne);
+      await tester.tap(find.text('ask'));
+      await tester.pumpAndSettle();
+      expect(find.text('bypass refused: not launched for it'), findsOneWidget);
+    });
+
+    testWidgets('long labels are cut short on a phone', (tester) async {
+      tester.view
+        ..physicalSize = const Size(360, 700)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          usage: ['last turn 12.4s', r'$0.04'],
+          agent: AgentSettingsView(
+            modeLabel: "accept edits → don't ask",
+            modelLabel: 'claude-sonnet-5-5-20261001 → claude-opus-5-5',
+            modes: askAgent.modes,
+            models: const [],
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(tester.takeException(), isNull);
+    });
   });
 }

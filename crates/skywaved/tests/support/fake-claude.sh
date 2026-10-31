@@ -9,11 +9,16 @@
 # one containing "hang" streams until interrupted; one containing "crash"
 # exits 3 with a stderr line; any other message gets the text "echo".
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id.
+# `set_permission_mode` and `set_model` are answered like the real CLI's
+# (§3.7): bypassPermissions and the model "bogus" are refused.
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
 
 sid=""
+mode="default"
+# No model until one is set, so a turn reports no usage by default.
+model=""
 prev=""
 for arg in "$@"; do
   case "$prev" in --session-id|--resume) sid="$arg" ;; esac
@@ -53,8 +58,31 @@ while IFS= read -r line; do
     *'"subtype":"interrupt"'*)
       ack "$line"
       ;;
+    *'"subtype":"set_permission_mode"'*)
+      asked=$(printf '%s' "$line" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+      if [ "$asked" = "bypassPermissions" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions","error_code":"bypass_not_launched"}}\n' "$(reqid "$line")"
+      else
+        mode="$asked"
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mode":"%s"}}}\n' "$(reqid "$line")" "$mode"
+        printf '{"type":"system","subtype":"status","status":null,"permissionMode":"%s","session_id":"%s"}\n' "$mode" "$sid"
+      fi
+      ;;
+    *'"subtype":"set_model"'*)
+      asked=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      if [ "$asked" = "bogus" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Model '"'"'bogus'"'"' not found","error_code":"not_found","model":"%s"}}\n' "$(reqid "$line")" "$model"
+      else
+        model="resolved-$asked"
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"%s"}}}\n' "$(reqid "$line")" "$model"
+      fi
+      ;;
     *'"type":"user"'*)
-      printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310"}\n' "$PWD" "$sid"
+      if [ -n "$model" ]; then
+        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310","model":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$model" "$mode"
+      else
+        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310","permissionMode":"%s"}\n' "$PWD" "$sid" "$mode"
+      fi
       case "$line" in
         *approve*)
           printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"a.txt","content":"hi"}}]},"session_id":"%s"}\n' "$sid"

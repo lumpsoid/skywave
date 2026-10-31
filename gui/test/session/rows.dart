@@ -71,12 +71,53 @@ SectionView lines(
 
 const composerAt1 = ComposerView(text: '', cursorUtf16: 0, rev: 1);
 
+ModeOption _mode(
+  PermissionModeView mode,
+  String label, {
+  bool current = false,
+  bool confirm = false,
+}) => ModeOption(
+  mode: mode,
+  label: label,
+  detail: '$label detail',
+  needsConfirmation: confirm,
+  current: current,
+  pending: false,
+);
+
+/// An agent in ask mode running Sonnet, with every mode and two models
+/// to switch to.
+final askAgent = AgentSettingsView(
+  modeLabel: 'ask',
+  modelLabel: 'Sonnet',
+  modelName: 'model-s',
+  modes: [
+    _mode(PermissionModeView.ask, 'ask', current: true),
+    _mode(PermissionModeView.acceptEdits, 'accept edits'),
+    _mode(PermissionModeView.plan, 'plan'),
+    _mode(PermissionModeView.auto, 'auto'),
+    _mode(PermissionModeView.dontAsk, "don't ask"),
+    _mode(PermissionModeView.bypass, 'bypass', confirm: true),
+  ],
+  models: const [
+    ModelOption(
+      id: 'sonnet',
+      label: 'Sonnet',
+      detail: 'fast',
+      current: true,
+      pending: false,
+    ),
+    ModelOption(id: 'opus', label: 'Opus', current: false, pending: false),
+  ],
+);
+
 SessionScreen screenWith({
   ComposerView composer = composerAt1,
   ApprovalPanel? approval,
   List<String> usage = const [],
   RenamePrompt? renamePrompt,
   String? archivedLabel,
+  AgentSettingsView? agent,
 }) => SessionScreen(
   sessionId: 's1',
   title: 'work',
@@ -85,6 +126,7 @@ SessionScreen screenWith({
   badgeLabel: 'working',
   agentLabel: 'agent working',
   rules: const [],
+  agent: agent ?? askAgent,
   usage: usage,
   composer: composer,
   approval: approval,

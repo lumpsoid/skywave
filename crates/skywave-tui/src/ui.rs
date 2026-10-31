@@ -30,7 +30,7 @@ use skywave_core::{
 use skywave_present::format::{blob_size, bytes, dollars, fail_reason, scope_label};
 use skywave_present::sections::{discardable, wanted_blob};
 
-use crate::app::{App, Field, Focus, POPUP_ROWS, Prompt, PromptKind, dismissable};
+use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
 use crate::notify;
 
 /// Draws the whole UI: link banner, current screen, footer, help overlay.
@@ -626,6 +626,15 @@ fn footer_keys(app: &App) -> &'static str {
             "Enter open · n new session · r rename · a archive · A archived · s settings · ? help · q quit"
         }
         Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
+            Some((_, ui, _)) if ui.picker.is_some() => match ui.picker {
+                Some(Picker::Mode { confirm: true, .. }) => {
+                    "y switch · any other key back to the list · ? help"
+                }
+                Some(Picker::Mode { .. }) => "↑↓ choose · Enter switch · Esc cancel · ? help",
+                _ => {
+                    "↑↓ choose · type a name instead · Enter switch · Ctrl-U clear · Esc cancel · F1 help"
+                }
+            },
             // A pending message only takes these keys while the core says it
             // can be taken back.
             Some((view, ui, Focus::Timeline)) if ui.rule_pick(view).is_some() => {
@@ -643,13 +652,13 @@ fn footer_keys(app: &App) -> &'static str {
                     .as_ref()
                     .is_some_and(|p| !p.suggestions.is_empty()) =>
                 {
-                    "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
-                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · R rename · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
             _ => {
@@ -782,6 +791,9 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("", "(several: ↑↓ Enter pick one, Esc back to a / x)"),
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
+                    key("p", "switch the agent's permission mode"),
+                    key("", "(bypass lets every tool run: y confirms it)"),
+                    key("m", "switch the agent's model: pick one, or type its name"),
                     key("R", "rename the session"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),
@@ -805,6 +817,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             }
             lines.extend([
                 Line::from(""),
+                Line::from("  Status line, left: the agent's state, mode, model, a refusal"),
                 Line::from(
                     "  Status line, right: last turn's time, tokens, cost; session cost; model",
                 ),

@@ -25,11 +25,12 @@ use crate::store::{
 use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
-    Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId, BlobState, BlobView,
-    BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo,
-    Link, ListKind, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
-    PendingSession, Screen, Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView,
-    SettingsView, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
+    BlobState, BlobView, BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef,
+    Draft, Entry, ErrorInfo, Link, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
+    PairingView, PendingApprovalRef, PendingSession, Screen, Seq, SessionId, SessionListView,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, TimelineItem, ToolApproval,
+    ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -160,6 +161,8 @@ pub(crate) struct Model {
     completer: Completer,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
+    /// The models of the newest `ModelsOffered`, as stored.
+    models: Vec<ModelChoice>,
 }
 
 impl Model {
@@ -195,6 +198,7 @@ impl Model {
             alerted_at: HashMap::new(),
             completer: Completer::default(),
             devices: HashMap::new(),
+            models: Vec::new(),
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -215,6 +219,7 @@ impl Model {
         self.read_marks = snapshot.read_marks;
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
+        self.models = snapshot.models;
         self.open = None;
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
@@ -332,6 +337,22 @@ impl Model {
                     session_id,
                     archived,
                 })
+            }
+            Action::SetPermissionMode { session_id, mode } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SetPermissionMode { session_id, mode })
+            }
+            Action::SetModel { session_id, model } => {
+                // As the server will log it, so the switch shows it unchanged.
+                let Some(model) = skywave_proto::normalise_model(&model) else {
+                    return Vec::new();
+                };
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SetModel { session_id, model })
             }
             Action::DeleteSessionLocally { session_id } => {
                 if !self.summary(session_id).is_some_and(|s| self.deletable(s)) {
@@ -662,6 +683,10 @@ impl Model {
         let cursor = self.cursor;
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
             self.cursor = seq;
+            // Offered for every session, as the store keeps them.
+            if let EventKind::ModelsOffered { models } = &event.kind {
+                self.models.clone_from(models);
+            }
             if self.deleted.contains(&event.session_id) {
                 continue;
             }
@@ -1054,6 +1079,7 @@ impl Model {
             pending_approval,
             rules,
             usage: summary.usage.clone(),
+            agent: self.agent_view(summary),
             interrupt,
             stop,
             draft: self.drafts.get(&id).cloned(),
@@ -1133,6 +1159,65 @@ impl Model {
             && !unanswered
     }
 
+    /// The device whose request `answers` names, if it was seen.
+    fn asker(
+        &self,
+        asked_by: &HashMap<CommandId, DeviceId>,
+        answers: Option<CommandId>,
+    ) -> Option<DeviceRef> {
+        answers
+            .and_then(|command| asked_by.get(&command))
+            .map(|device| self.device_ref(*device))
+    }
+
+    /// The session's agent settings: the summary's fold, with this device's
+    /// switches still on their way in front.
+    fn agent_view(&self, summary: &SessionSummary) -> AgentView {
+        let id = summary.id;
+        let agent = &summary.agent;
+        let local = |is: &dyn Fn(&CommandKind) -> bool| {
+            self.outbox
+                .iter()
+                .rev()
+                .find(|e| is(&e.command.kind))
+                .map(|e| (e.command.kind.clone(), Outgoing::from(&e.status)))
+                .filter(|(_, outgoing)| !self.in_replica(*outgoing))
+        };
+        let mode_change = match local(
+            &|kind| matches!(kind, CommandKind::SetPermissionMode { session_id, .. } if *session_id == id),
+        ) {
+            Some((CommandKind::SetPermissionMode { mode, .. }, outgoing)) => Some(SettingChange {
+                value: mode,
+                outgoing: Some(outgoing),
+            }),
+            _ => agent.mode.requested.as_ref().map(|r| SettingChange {
+                value: r.value,
+                outgoing: None,
+            }),
+        };
+        let model_change = match local(
+            &|kind| matches!(kind, CommandKind::SetModel { session_id, .. } if *session_id == id),
+        ) {
+            Some((CommandKind::SetModel { model, .. }, outgoing)) => Some(SettingChange {
+                value: model,
+                outgoing: Some(outgoing),
+            }),
+            _ => agent.model.requested.as_ref().map(|r| SettingChange {
+                value: r.value.clone(),
+                outgoing: None,
+            }),
+        };
+        AgentView {
+            mode: agent.mode.current,
+            model: agent.model.current.clone(),
+            mode_change,
+            model_change,
+            mode_refused: agent.mode.refused.clone(),
+            model_refused: agent.model.refused.clone(),
+            models: self.models.clone(),
+        }
+    }
+
     /// The latest outbox command matching `kind`, until its effect is in the
     /// replica.
     fn latest_outgoing(&self, kind: impl Fn(&CommandKind) -> bool) -> Option<Outgoing> {
@@ -1155,6 +1240,8 @@ impl Model {
         let mut logged = HashSet::new();
         let mut items = Vec::with_capacity(events.len());
         let mut tools = ToolIndex::default();
+        // The device behind each mode or model request, by its command.
+        let mut asked_by: HashMap<CommandId, DeviceId> = HashMap::new();
         for (seq, event) in events {
             let entry = match &event.kind {
                 // The server logs every message with its command id, the
@@ -1319,8 +1406,44 @@ impl Model {
                     }
                 }
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
+                EventKind::PermissionModeRequested { by, .. }
+                | EventKind::ModelRequested { by, .. } => {
+                    if let Some(command) = event.command_id {
+                        asked_by.insert(command, *by);
+                    }
+                    // Shown in the header until answered.
+                    None
+                }
+                EventKind::PermissionModeChanged { mode, answers } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Mode(*mode),
+                    by: self.asker(&asked_by, *answers),
+                    refused: None,
+                }),
+                EventKind::PermissionModeRefused {
+                    mode,
+                    reason,
+                    answers,
+                } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Mode(*mode),
+                    by: self.asker(&asked_by, *answers),
+                    refused: Some(reason.clone()),
+                }),
+                EventKind::ModelChanged { model, answers } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Model(model.clone()),
+                    by: self.asker(&asked_by, *answers),
+                    refused: None,
+                }),
+                EventKind::ModelRefused {
+                    model,
+                    reason,
+                    answers,
+                } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Model(model.clone()),
+                    by: self.asker(&asked_by, *answers),
+                    refused: Some(reason.clone()),
+                }),
                 // Shown in the header.
-                EventKind::SessionCreated { .. } => None,
+                EventKind::SessionCreated { .. } | EventKind::ModelsOffered { .. } => None,
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -1550,7 +1673,9 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::Interrupt { session_id }
         | CommandKind::StopSession { session_id }
         | CommandKind::RenameSession { session_id, .. }
-        | CommandKind::SetSessionArchived { session_id, .. } => Some(*session_id),
+        | CommandKind::SetSessionArchived { session_id, .. }
+        | CommandKind::SetPermissionMode { session_id, .. }
+        | CommandKind::SetModel { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -1582,7 +1707,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::view::{CandidateSource, Completion, CompletionStatus, FailReason, LinkRejection};
+    use crate::view::{
+        CandidateSource, Completion, CompletionStatus, FailReason, LinkRejection, Refusal,
+    };
 
     /// Paired as `device` with a server CA whose DER is `b"ca"`.
     fn paired_as(device: DeviceId) -> Paired {
@@ -1681,6 +1808,12 @@ mod tests {
             }
         }
 
+        /// The active list, leaving the open session.
+        fn list_view_after_back(&mut self) -> SessionListView {
+            self.dispatch(Action::Back);
+            self.list_view()
+        }
+
         fn list_view(&self) -> SessionListView {
             match self.model.view().screen {
                 Screen::SessionList(view) => view,
@@ -1701,6 +1834,7 @@ mod tests {
             deleted: HashSet::new(),
             alerted: HashSet::new(),
             devices: HashMap::new(),
+            models: Vec::new(),
         }
     }
 
@@ -2322,6 +2456,194 @@ mod tests {
             ]
         );
         assert_eq!(view.rules, [edits, ls]);
+    }
+
+    #[test]
+    fn a_mode_switch_shows_until_the_agent_answers_it() {
+        use skywave_proto::PermissionMode;
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Ask,
+                answers: None,
+            }],
+        );
+        f.open(sid);
+        assert_eq!(f.session_view().agent.mode, Some(PermissionMode::Ask));
+
+        let command = queued(&f.dispatch(Action::SetPermissionMode {
+            session_id: sid,
+            mode: PermissionMode::Plan,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetPermissionMode {
+                session_id: sid,
+                mode: PermissionMode::Plan
+            }
+        );
+        // On its way: this device's command.
+        assert_eq!(
+            f.session_view().agent.mode_change,
+            Some(SettingChange {
+                value: PermissionMode::Plan,
+                outgoing: Some(Outgoing::Queued),
+            })
+        );
+
+        // Logged: only the agent's answer is awaited.
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::PermissionModeRequested {
+                    mode: PermissionMode::Plan,
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        let agent = f.session_view().agent;
+        assert_eq!(agent.mode, Some(PermissionMode::Ask));
+        assert_eq!(
+            agent.mode_change,
+            Some(SettingChange {
+                value: PermissionMode::Plan,
+                outgoing: None,
+            })
+        );
+
+        f.log(
+            sid,
+            vec![EventKind::PermissionModeChanged {
+                mode: PermissionMode::Plan,
+                answers: Some(command.id),
+            }],
+        );
+        let view = f.session_view();
+        assert_eq!(view.agent.mode, Some(PermissionMode::Plan));
+        assert_eq!(view.agent.mode_change, None);
+        // The timeline names who asked, and the change made on its own.
+        let settings: Vec<&Entry> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: entry @ Entry::AgentSetting { .. },
+                    ..
+                } => Some(entry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                &Entry::AgentSetting {
+                    setting: AgentSetting::Mode(PermissionMode::Ask),
+                    by: None,
+                    refused: None,
+                },
+                &Entry::AgentSetting {
+                    setting: AgentSetting::Mode(PermissionMode::Plan),
+                    by: Some(DeviceRef {
+                        id: me,
+                        name: None,
+                        me: true,
+                    }),
+                    refused: None,
+                },
+            ]
+        );
+        // Not activity: the session keeps its place.
+        assert_eq!(f.list_view_after_back().sessions[0].id, sid);
+    }
+
+    #[test]
+    fn a_refused_model_keeps_the_old_one_and_offered_models_reach_every_session() {
+        let mut f = Fixture::paired();
+        let (a, b) = (f.session("/srv/a"), f.session("/srv/b"));
+        let choice = ModelChoice {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+            detail: None,
+            resolved: Some("model-s".into()),
+        };
+        f.log(
+            a,
+            vec![
+                EventKind::ModelsOffered {
+                    models: vec![choice.clone()],
+                },
+                EventKind::ModelChanged {
+                    model: "model-s".into(),
+                    answers: None,
+                },
+            ],
+        );
+        f.open(b);
+        assert_eq!(f.session_view().agent.models, std::slice::from_ref(&choice));
+        assert!(
+            f.dispatch(Action::SetModel {
+                session_id: b,
+                model: "  ".into(),
+            })
+            .is_empty(),
+            "a blank model is not sent"
+        );
+
+        f.open(a);
+        let agent = f.session_view().agent;
+        assert_eq!(agent.model_label(), Some("Sonnet"));
+        let command = queued(&f.dispatch(Action::SetModel {
+            session_id: a,
+            model: " bogus\n".into(),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetModel {
+                session_id: a,
+                model: "bogus".into()
+            }
+        );
+        let me = f.me;
+        f.log_commands(
+            a,
+            vec![
+                (
+                    Some(command.id),
+                    EventKind::ModelRequested {
+                        model: "bogus".into(),
+                        by: me,
+                    },
+                ),
+                (
+                    None,
+                    EventKind::ModelRefused {
+                        model: "bogus".into(),
+                        reason: "not found".into(),
+                        answers: Some(command.id),
+                    },
+                ),
+            ],
+        );
+        let seq = Seq(f.events.len() as u64 - 1);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        let agent = f.session_view().agent;
+        assert_eq!(agent.model.as_deref(), Some("model-s"));
+        assert_eq!(agent.model_change, None);
+        assert_eq!(
+            agent.model_refused,
+            Some(Refusal {
+                value: "bogus".into(),
+                reason: "not found".into(),
+            })
+        );
     }
 
     #[test]
@@ -4071,6 +4393,7 @@ mod tests {
             deleted: model.deleted.clone(),
             alerted: model.alerted.clone(),
             devices: model.devices.clone(),
+            models: model.models.clone(),
         }
     }
 

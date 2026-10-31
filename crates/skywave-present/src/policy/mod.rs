@@ -89,6 +89,7 @@ pub(crate) mod tests {
             pending_approval: None,
             rules: Vec::new(),
             usage: None,
+            agent: Default::default(),
             interrupt: None,
             stop: None,
             draft: None,

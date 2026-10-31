@@ -256,6 +256,8 @@ pub enum FailReason {
     ApprovalCancelled,
     NoActiveTurn,
     UnknownRule,
+    /// The agent offers no such model, or the model was empty.
+    UnknownModel,
     /// The server refused the request itself, without an answer.
     Undeliverable,
 }
@@ -275,6 +277,7 @@ impl From<sc::FailReason> for FailReason {
             R::ApprovalCancelled => FailReason::ApprovalCancelled,
             R::NoActiveTurn => FailReason::NoActiveTurn,
             R::UnknownRule => FailReason::UnknownRule,
+            R::UnknownModel => FailReason::UnknownModel,
         }
     }
 }
@@ -697,6 +700,8 @@ pub struct SessionView {
     pub pending_approval: Option<ApprovalPrompt>,
     pub rules: Vec<RuleSuggestion>,
     pub usage: Option<SessionUsage>,
+    /// The agent's permission mode and model, and the switches on their way.
+    pub agent: AgentView,
     pub interrupt: Option<Outgoing>,
     pub stop: Option<Outgoing>,
     pub draft: Option<Draft>,
@@ -726,6 +731,7 @@ impl From<sc::SessionView> for SessionView {
             pending_approval,
             rules,
             usage,
+            agent,
             interrupt,
             stop,
             draft,
@@ -745,6 +751,7 @@ impl From<sc::SessionView> for SessionView {
             pending_approval: opt(pending_approval),
             rules: vec(rules),
             usage: opt(usage),
+            agent: agent.into(),
             interrupt: opt(interrupt),
             stop: opt(stop),
             draft: opt(draft),
@@ -899,6 +906,14 @@ pub enum Entry {
     TurnUsage {
         usage: TurnUsage,
     },
+    /// The agent switched its mode or model, or refused to (`refused` holds
+    /// why; it keeps what it had). `by` is `None` when the agent switched on
+    /// its own or restored what it ran with before.
+    AgentSetting {
+        setting: AgentSetting,
+        by: Option<DeviceRef>,
+        refused: Option<String>,
+    },
 }
 
 impl From<sc::Entry> for Entry {
@@ -962,6 +977,15 @@ impl From<sc::Entry> for Entry {
             sc::Entry::AgentErrored { message } => Entry::AgentErrored { message },
             sc::Entry::TurnUsage(usage) => Entry::TurnUsage {
                 usage: usage.into(),
+            },
+            sc::Entry::AgentSetting {
+                setting,
+                by,
+                refused,
+            } => Entry::AgentSetting {
+                setting: setting.into(),
+                by: opt(by),
+                refused,
             },
         }
     }
@@ -1387,6 +1411,214 @@ impl From<sc::SessionUsage> for SessionUsage {
     }
 }
 
+/// How freely the agent acts without asking. Converts both ways: actions
+/// carry it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PermissionMode {
+    /// Asks before any tool no rule allows.
+    Ask,
+    /// File edits in the workdir run without asking.
+    AcceptEdits,
+    /// Plans only; the agent asks to leave plan mode with its plan.
+    Plan,
+    /// The agent decides what to ask about.
+    Auto,
+    /// Never asks: what no rule allows is denied.
+    DontAsk,
+    /// Never asks: everything runs.
+    Bypass,
+}
+
+impl From<sc::PermissionMode> for PermissionMode {
+    fn from(m: sc::PermissionMode) -> Self {
+        match m {
+            sc::PermissionMode::Ask => PermissionMode::Ask,
+            sc::PermissionMode::AcceptEdits => PermissionMode::AcceptEdits,
+            sc::PermissionMode::Plan => PermissionMode::Plan,
+            sc::PermissionMode::Auto => PermissionMode::Auto,
+            sc::PermissionMode::DontAsk => PermissionMode::DontAsk,
+            sc::PermissionMode::Bypass => PermissionMode::Bypass,
+        }
+    }
+}
+
+impl From<PermissionMode> for sc::PermissionMode {
+    fn from(m: PermissionMode) -> Self {
+        match m {
+            PermissionMode::Ask => sc::PermissionMode::Ask,
+            PermissionMode::AcceptEdits => sc::PermissionMode::AcceptEdits,
+            PermissionMode::Plan => sc::PermissionMode::Plan,
+            PermissionMode::Auto => sc::PermissionMode::Auto,
+            PermissionMode::DontAsk => sc::PermissionMode::DontAsk,
+            PermissionMode::Bypass => sc::PermissionMode::Bypass,
+        }
+    }
+}
+
+/// A model the agent offers: show `label` and `detail`, send `id` back in
+/// `Action.SetModel`; never parse them.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ModelChoice {
+    pub id: String,
+    pub label: String,
+    pub detail: Option<String>,
+    /// The model the agent names once this choice runs, when it says.
+    pub resolved: Option<String>,
+}
+
+impl From<sc::ModelChoice> for ModelChoice {
+    fn from(m: sc::ModelChoice) -> Self {
+        let sc::ModelChoice {
+            id,
+            label,
+            detail,
+            resolved,
+        } = m;
+        ModelChoice {
+            id,
+            label,
+            detail,
+            resolved,
+        }
+    }
+}
+
+/// A session's agent settings as the session view shows them.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AgentView {
+    /// The mode the agent last said it runs in; `None` until it says.
+    pub mode: Option<PermissionMode>,
+    /// The model the agent last said it runs, as it names it.
+    pub model: Option<String>,
+    /// What to call the running model: its offered label, else its name.
+    pub model_label: Option<String>,
+    /// A mode switch not yet answered.
+    pub mode_change: Option<ModeChange>,
+    /// A model switch not yet answered.
+    pub model_change: Option<ModelChange>,
+    /// The agent's newest refusal of a mode, until the next switch.
+    pub mode_refused: Option<ModeRefusal>,
+    /// The agent's newest refusal of a model, until the next switch.
+    pub model_refused: Option<ModelRefusal>,
+    /// What `Action.SetModel` offers; empty until an agent reported any.
+    pub models: Vec<ModelChoice>,
+}
+
+impl From<sc::AgentView> for AgentView {
+    fn from(a: sc::AgentView) -> Self {
+        let model_label = a.model_label().map(str::to_owned);
+        let sc::AgentView {
+            mode,
+            model,
+            mode_change,
+            model_change,
+            mode_refused,
+            model_refused,
+            models,
+        } = a;
+        AgentView {
+            mode: opt(mode),
+            model,
+            model_label,
+            mode_change: opt(mode_change),
+            model_change: opt(model_change),
+            mode_refused: opt(mode_refused),
+            model_refused: opt(model_refused),
+            models: vec(models),
+        }
+    }
+}
+
+/// A mode switch not yet answered. `outgoing` is this device's command
+/// while it is on its way; `None` once only the agent's answer is awaited.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ModeChange {
+    pub mode: PermissionMode,
+    pub outgoing: Option<Outgoing>,
+}
+
+impl From<sc::SettingChange<sc::PermissionMode>> for ModeChange {
+    fn from(c: sc::SettingChange<sc::PermissionMode>) -> Self {
+        let sc::SettingChange { value, outgoing } = c;
+        ModeChange {
+            mode: value.into(),
+            outgoing: opt(outgoing),
+        }
+    }
+}
+
+/// A model switch not yet answered, as [`ModeChange`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ModelChange {
+    pub model: String,
+    pub outgoing: Option<Outgoing>,
+}
+
+impl From<sc::SettingChange<String>> for ModelChange {
+    fn from(c: sc::SettingChange<String>) -> Self {
+        let sc::SettingChange { value, outgoing } = c;
+        ModelChange {
+            model: value,
+            outgoing: opt(outgoing),
+        }
+    }
+}
+
+/// A mode the agent refused, and why.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ModeRefusal {
+    pub mode: PermissionMode,
+    pub reason: String,
+}
+
+impl From<sc::Refusal<sc::PermissionMode>> for ModeRefusal {
+    fn from(r: sc::Refusal<sc::PermissionMode>) -> Self {
+        let sc::Refusal { value, reason } = r;
+        ModeRefusal {
+            mode: value.into(),
+            reason,
+        }
+    }
+}
+
+/// A model the agent refused, and why.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ModelRefusal {
+    pub model: String,
+    pub reason: String,
+}
+
+impl From<sc::Refusal<String>> for ModelRefusal {
+    fn from(r: sc::Refusal<String>) -> Self {
+        let sc::Refusal { value, reason } = r;
+        ModelRefusal {
+            model: value,
+            reason,
+        }
+    }
+}
+
+/// A mode or model as a timeline entry names it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AgentSetting {
+    Mode {
+        mode: PermissionMode,
+    },
+    /// As the agent names it.
+    Model {
+        model: String,
+    },
+}
+
+impl From<sc::AgentSetting> for AgentSetting {
+    fn from(s: sc::AgentSetting) -> Self {
+        match s {
+            sc::AgentSetting::Mode(mode) => AgentSetting::Mode { mode: mode.into() },
+            sc::AgentSetting::Model(model) => AgentSetting::Model { model },
+        }
+    }
+}
+
 /// Whether blobs download alongside metadata or on explicit intent.
 /// Converts both ways: actions carry it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1497,6 +1729,53 @@ mod tests {
         }
     }
 
+    fn agent() -> sc::AgentView {
+        sc::AgentView {
+            mode: Some(sc::PermissionMode::AcceptEdits),
+            model: Some("claude-opus".into()),
+            mode_change: Some(sc::SettingChange {
+                value: sc::PermissionMode::Plan,
+                outgoing: Some(sc::Outgoing::Sending),
+            }),
+            model_change: None,
+            mode_refused: None,
+            model_refused: Some(sc::Refusal {
+                value: "gpt".into(),
+                reason: "not offered".into(),
+            }),
+            models: vec![sc::ModelChoice {
+                id: "opus".into(),
+                label: "Opus".into(),
+                detail: Some("most capable".into()),
+                resolved: Some("claude-opus".into()),
+            }],
+        }
+    }
+
+    fn agent_mirror() -> AgentView {
+        AgentView {
+            mode: Some(PermissionMode::AcceptEdits),
+            model: Some("claude-opus".into()),
+            model_label: Some("Opus".into()),
+            mode_change: Some(ModeChange {
+                mode: PermissionMode::Plan,
+                outgoing: Some(Outgoing::Sending),
+            }),
+            model_change: None,
+            mode_refused: None,
+            model_refused: Some(ModelRefusal {
+                model: "gpt".into(),
+                reason: "not offered".into(),
+            }),
+            models: vec![ModelChoice {
+                id: "opus".into(),
+                label: "Opus".into(),
+                detail: Some("most capable".into()),
+                resolved: Some("claude-opus".into()),
+            }],
+        }
+    }
+
     fn convert<C, M: From<C>>(values: Vec<C>) -> Vec<M> {
         values.into_iter().map(M::from).collect()
     }
@@ -1599,6 +1878,7 @@ mod tests {
             sc::FailReason::Rejected(sc::RejectReason::ApprovalCancelled),
             sc::FailReason::Rejected(sc::RejectReason::NoActiveTurn),
             sc::FailReason::Rejected(sc::RejectReason::UnknownRule),
+            sc::FailReason::Rejected(sc::RejectReason::UnknownModel),
             sc::FailReason::Undeliverable,
         ]);
         assert_eq!(
@@ -1612,6 +1892,7 @@ mod tests {
                 FailReason::ApprovalCancelled,
                 FailReason::NoActiveTurn,
                 FailReason::UnknownRule,
+                FailReason::UnknownModel,
                 FailReason::Undeliverable,
             ]
         );
@@ -1723,6 +2004,7 @@ mod tests {
             }),
             rules: vec![rule()],
             usage: Some(sc::SessionUsage::new(&turn())),
+            agent: agent(),
             interrupt: None,
             stop: Some(sc::Outgoing::Accepted(sc::Seq(2))),
             draft: Some(sc::Draft {
@@ -1774,6 +2056,7 @@ mod tests {
                 last_turn: turn_mirror(),
                 total: turn_mirror(),
             }),
+            agent: agent_mirror(),
             interrupt: None,
             stop: Some(Outgoing::Accepted { seq: 2 }),
             draft: Some(Draft {
@@ -2234,6 +2517,16 @@ mod tests {
                 message: "boom".into(),
             },
             sc::Entry::TurnUsage(turn()),
+            sc::Entry::AgentSetting {
+                setting: sc::AgentSetting::Mode(sc::PermissionMode::Bypass),
+                by: Some(dev(device, true)),
+                refused: Some("not allowed".into()),
+            },
+            sc::Entry::AgentSetting {
+                setting: sc::AgentSetting::Model("m".into()),
+                by: None,
+                refused: None,
+            },
         ]);
         assert_eq!(
             converted,
@@ -2310,6 +2603,18 @@ mod tests {
                 },
                 Entry::TurnUsage {
                     usage: turn_mirror()
+                },
+                Entry::AgentSetting {
+                    setting: AgentSetting::Mode {
+                        mode: PermissionMode::Bypass
+                    },
+                    by: Some(dev_mirror(device, true)),
+                    refused: Some("not allowed".into()),
+                },
+                Entry::AgentSetting {
+                    setting: AgentSetting::Model { model: "m".into() },
+                    by: None,
+                    refused: None,
                 },
             ]
         );
@@ -2443,6 +2748,34 @@ mod tests {
         assert_eq!(converted, [BlobPolicy::Eager, BlobPolicy::OnDemand]);
         let back: Vec<sc::BlobPolicy> = convert(converted);
         assert_eq!(back, [sc::BlobPolicy::Eager, sc::BlobPolicy::OnDemand]);
+    }
+
+    #[test]
+    fn permission_mode_converts_every_variant_both_ways() {
+        let converted: Vec<PermissionMode> = convert(sc::PermissionMode::ALL.to_vec());
+        assert_eq!(
+            converted,
+            [
+                PermissionMode::Ask,
+                PermissionMode::AcceptEdits,
+                PermissionMode::Plan,
+                PermissionMode::Auto,
+                PermissionMode::DontAsk,
+                PermissionMode::Bypass,
+            ]
+        );
+        let back: Vec<sc::PermissionMode> = convert(converted);
+        assert_eq!(back, sc::PermissionMode::ALL);
+    }
+
+    #[test]
+    fn agent_view_labels_the_model_it_runs() {
+        assert_eq!(AgentView::from(agent()), agent_mirror());
+        let unoffered = AgentView::from(sc::AgentView {
+            model: Some("other".into()),
+            ..agent()
+        });
+        assert_eq!(unoffered.model_label.as_deref(), Some("other"));
     }
 
     #[test]
