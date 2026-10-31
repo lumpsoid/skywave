@@ -728,8 +728,8 @@ impl Head {
                 Err(_) => {}
             },
             GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
-            GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, out),
-            GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, out),
+            GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
+            GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
         }
         Ok(())
     }
@@ -754,10 +754,13 @@ impl Head {
     }
 
     /// The app left or came back to the screen: what that does to the core
-    /// on this platform is [`lifecycle::calls`]'s to say.
-    fn moved(&mut self, moved: Moved, out: &mut Vec<Out>) {
+    /// on this platform is [`lifecycle::calls`]'s to say. The calls go out
+    /// in order, so a save is queued on the dispatcher before the suspend.
+    fn moved(&mut self, moved: Moved, clock: Clock, out: &mut Vec<Out>) {
         for call in lifecycle::calls(moved, Target::BUILT) {
             match call {
+                Call::SaveDraft => self.save_draft(clock, true, out),
+                Call::MarkRead => self.mark_read(clock, true, out),
                 Call::Suspend => out.push(Out::Suspend),
                 Call::Resume => out.push(Out::Resume),
                 Call::Dispatch(action) => {

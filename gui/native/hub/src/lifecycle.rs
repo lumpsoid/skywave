@@ -4,7 +4,14 @@
 //! On a phone the system may freeze or kill a backgrounded app, so the
 //! engine's network loops are paused while away and the link is retried at
 //! once on return, as the Android head does (D21). A desktop app keeps
-//! running behind other windows: nothing changes there.
+//! running behind other windows: its engine is left alone.
+//!
+//! Leaving is treated like quitting on every platform: the system may kill
+//! a phone app within the draft saver's debounce, and a desktop window can
+//! be closed from the background. So the unsaved draft is saved and what
+//! was seen is marked read at once, both forced, as the TUI does on quit.
+//! They go to the dispatcher before the suspend; suspend only pauses the
+//! network loops, and a dispatch still writes the store after it.
 
 use skywave_core::Action;
 
@@ -34,6 +41,10 @@ pub enum Moved {
 /// What to do to the core, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
+    /// Save the open session's unsaved draft now, without the debounce.
+    SaveDraft,
+    /// Mark what the open session shows read now, unthrottled.
+    MarkRead,
     /// `Core::suspend`.
     Suspend,
     /// `Core::resume`.
@@ -45,8 +56,11 @@ pub enum Call {
 /// The calls the app's move makes on `target`.
 pub fn calls(moved: Moved, target: Target) -> Vec<Call> {
     match (target, moved) {
-        (Target::Desktop, _) => Vec::new(),
-        (Target::Mobile, Moved::Backgrounded) => vec![Call::Suspend],
+        (Target::Desktop, Moved::Backgrounded) => vec![Call::SaveDraft, Call::MarkRead],
+        (Target::Mobile, Moved::Backgrounded) => {
+            vec![Call::SaveDraft, Call::MarkRead, Call::Suspend]
+        }
+        (Target::Desktop, Moved::Foregrounded) => Vec::new(),
         // Resumed, the link starts over from `Connecting`; the retry cuts
         // short a backoff wait that began before the app went away.
         (Target::Mobile, Moved::Foregrounded) => {
@@ -60,10 +74,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mobile_suspends_away_and_resumes_then_retries_on_return() {
+    fn mobile_saves_then_suspends_away_and_resumes_then_retries_on_return() {
         assert_eq!(
             calls(Moved::Backgrounded, Target::Mobile),
-            vec![Call::Suspend]
+            vec![Call::SaveDraft, Call::MarkRead, Call::Suspend]
         );
         assert_eq!(
             calls(Moved::Foregrounded, Target::Mobile),
@@ -72,8 +86,11 @@ mod tests {
     }
 
     #[test]
-    fn desktop_ignores_both() {
-        assert_eq!(calls(Moved::Backgrounded, Target::Desktop), vec![]);
+    fn desktop_only_saves_away() {
+        assert_eq!(
+            calls(Moved::Backgrounded, Target::Desktop),
+            vec![Call::SaveDraft, Call::MarkRead]
+        );
         assert_eq!(calls(Moved::Foregrounded, Target::Desktop), vec![]);
     }
 

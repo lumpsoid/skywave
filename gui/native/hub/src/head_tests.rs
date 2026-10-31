@@ -237,6 +237,44 @@ fn leaving_saves_the_draft_first() {
 }
 
 #[test]
+fn backgrounding_saves_an_unsaved_draft_at_once_before_any_suspend() {
+    let mut rig = Rig::new();
+    rig.edit("unsent");
+    assert!(rig.actions.is_empty(), "still within the debounce");
+    let outs = rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    let save = outs
+        .iter()
+        .position(|out| matches!(out, Out::Dispatch(_, Action::SaveDraft { .. })));
+    let suspend = outs.iter().position(|out| matches!(out, Out::Suspend));
+    assert!(save.is_some(), "no save in {outs:?}");
+    assert!(suspend.is_none_or(|s| save < Some(s)), "suspended first");
+    rig.apply(outs);
+    assert_eq!(rig.kinds(), ["save draft"]);
+    assert!(matches!(
+        &rig.actions[0],
+        Action::SaveDraft { text, .. } if text == "unsent"
+    ));
+    rig.results();
+    let Screen::Session(view) = rig.core.view().screen else {
+        panic!("left the session");
+    };
+    assert_eq!(view.draft.map(|d| d.text).as_deref(), Some("unsent"));
+}
+
+#[test]
+fn backgrounding_without_an_unsaved_draft_dispatches_nothing() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::AppBackgrounded);
+    assert!(rig.actions.is_empty(), "{:?}", rig.actions);
+    rig.edit("saved");
+    rig.wait(DRAFT_SAVE_AFTER + Duration::from_millis(10));
+    rig.results();
+    rig.actions.clear();
+    rig.intent(GuiIntent::AppBackgrounded);
+    assert!(rig.actions.is_empty(), "{:?}", rig.actions);
+}
+
+#[test]
 fn the_composer_clears_only_once_the_send_is_taken() {
     let mut rig = Rig::new();
     rig.edit("hello");
