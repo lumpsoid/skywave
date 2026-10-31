@@ -64,6 +64,41 @@ impl Snippets {
         Some(snippet)
     }
 
+    /// Gives the snippet `name` (normalised as in [`save`](Snippets::save);
+    /// blank drops it) and `text`, where it lists. Another snippet with
+    /// that text already goes: a text is saved once. Returns the snippet to
+    /// store and the one gone; `None` for blank text, an unknown snippet,
+    /// or nothing changed.
+    pub(crate) fn edit(
+        &mut self,
+        id: SnippetId,
+        name: &str,
+        text: String,
+    ) -> Option<(Snippet, Option<SnippetId>)> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let at = self.0.iter().position(|s| s.id == id)?;
+        let edited = Snippet {
+            name: skywave_proto::normalise_session_name(name),
+            text,
+            ..self.0[at].clone()
+        };
+        if edited == self.0[at] {
+            return None;
+        }
+        let twin = self
+            .0
+            .iter()
+            .find(|s| s.id != id && s.text == edited.text)
+            .map(|s| s.id);
+        self.0[at] = edited.clone();
+        if let Some(twin) = twin {
+            self.delete(twin);
+        }
+        Some((edited, twin))
+    }
+
     /// Forgets the snippet; false when unknown.
     pub(crate) fn delete(&mut self, id: SnippetId) -> bool {
         let before = self.0.len();
@@ -137,6 +172,36 @@ mod tests {
         assert!(used.used > new.used);
         assert_eq!(texts(&snippets), ["a", "b"]);
         assert_eq!(snippets.used(SnippetId::new()), None);
+    }
+
+    #[test]
+    fn editing_changes_name_and_text_in_place() {
+        let mut snippets = Snippets::default();
+        let old = snippets.save("tests", "run the tests".to_owned()).unwrap();
+        snippets.save("", "commit this".to_owned()).unwrap();
+
+        let (edited, gone) = snippets
+            .edit(old.id, " ", "run every test".to_owned())
+            .unwrap();
+        assert_eq!(gone, None);
+        assert_eq!((edited.id, edited.used), (old.id, old.used));
+        assert_eq!(edited.name, None, "a blank name drops it");
+        assert_eq!(texts(&snippets), ["commit this", "run every test"]);
+
+        assert_eq!(snippets.edit(old.id, "", "run every test".to_owned()), None);
+        assert_eq!(snippets.edit(old.id, "x", "  ".to_owned()), None);
+        assert_eq!(snippets.edit(SnippetId::new(), "x", "y".to_owned()), None);
+    }
+
+    #[test]
+    fn editing_into_a_saved_text_drops_the_other() {
+        let mut snippets = Snippets::default();
+        let kept = snippets.save("", "a".to_owned()).unwrap();
+        let twin = snippets.save("", "b".to_owned()).unwrap();
+        let (edited, gone) = snippets.edit(kept.id, "named", "b".to_owned()).unwrap();
+        assert_eq!(gone, Some(twin.id));
+        assert_eq!(edited.id, kept.id);
+        assert_eq!(texts(&snippets), ["b"]);
     }
 
     #[test]

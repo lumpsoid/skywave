@@ -185,6 +185,12 @@ pub enum ActionIntent {
     DeleteSessionLocally {
         session_id: String,
     },
+    /// Give a snippet `name` (blank for none) and `text`.
+    EditSnippet {
+        snippet_id: String,
+        name: String,
+        text: String,
+    },
     DeleteSnippet {
         snippet_id: String,
     },

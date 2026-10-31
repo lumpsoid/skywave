@@ -53,6 +53,14 @@ pub enum Action {
     },
     /// The snippet was put into a composer: it lists first.
     UseSnippet(SnippetId),
+    /// Change a snippet's name (blank for none; normalised as a session
+    /// name) and text; it keeps its place. Another snippet with that text
+    /// already goes. Blank text, or an unknown snippet, is a no-op.
+    EditSnippet {
+        id: SnippetId,
+        name: String,
+        text: String,
+    },
     DeleteSnippet(SnippetId),
     /// Take back one of this device's messages or session creations that
     /// the server never saw, or dismiss one it refused. Only items shown as

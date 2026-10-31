@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
@@ -51,6 +51,10 @@ class ComposerState extends State<Composer> {
   int? _rev;
   TextEditingValue _sent = TextEditingValue.empty;
 
+  /// The snippets as the hub sent them last, so an open picker follows
+  /// edits and deletions.
+  late final _snippets = ValueNotifier(widget.snippets);
+
   @override
   void initState() {
     super.initState();
@@ -78,11 +82,18 @@ class ComposerState extends State<Composer> {
       _adoptFocus();
     }
     _take(widget.composer);
+    if (!listEquals(oldWidget.snippets, widget.snippets)) {
+      // An open picker is another route: it rebuilds after this frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _snippets.value = widget.snippets;
+      });
+    }
   }
 
   @override
   void dispose() {
     _field.dispose();
+    _snippets.dispose();
     if (_ownsFocus) _focus.dispose();
     super.dispose();
   }
@@ -133,10 +144,10 @@ class ComposerState extends State<Composer> {
   }
 
   /// Opens the snippets; one put in brings the focus back to the field.
-  Future<void> _snippets() => pickSnippet(
+  Future<void> _pickSnippet() => pickSnippet(
     context,
     sessionId: widget.sessionId,
-    snippets: widget.snippets,
+    snippets: _snippets,
     composerBlank: _blank,
     send: widget.send,
     onInserted: _focus.requestFocus,
@@ -232,7 +243,7 @@ class ComposerState extends State<Composer> {
                 children: [
                   IconButton(
                     tooltip: 'Snippets',
-                    onPressed: _snippets,
+                    onPressed: _pickSnippet,
                     icon: const Icon(Icons.bookmark_outline),
                   ),
                   const SizedBox(width: 2),

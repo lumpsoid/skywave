@@ -316,6 +316,8 @@ fn snippet_view(snippet: &Snippet) -> SnippetView {
             .as_deref()
             .map_or_else(|| first.clone(), clean_line),
         detail: snippet.name.is_some().then_some(first),
+        name: snippet.name.clone(),
+        text: snippet.text.clone(),
     }
 }
 

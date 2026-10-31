@@ -229,6 +229,9 @@ pub struct SnippetView {
     pub label: String,
     /// Its text's first line under a name; `None` without one.
     pub detail: Option<String>,
+    /// Its name and whole text as saved, for the editor.
+    pub name: Option<String>,
+    pub text: String,
 }
 
 /// The session agent's permission mode and model: the status line's two

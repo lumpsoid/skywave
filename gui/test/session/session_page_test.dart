@@ -426,35 +426,84 @@ void main() {
     expect(sent.last, const GuiIntentSaveSnippet(key: 's:1', name: 'tests'));
   });
 
-  testWidgets('the snippet button inserts, deletes and saves the message', (
+  testWidgets('the snippet button inserts, edits, deletes and saves', (
     tester,
   ) async {
-    const snippets = [
-      SnippetView(snippetId: 'a', label: 'tests', detail: 'run the tests'),
-      SnippetView(snippetId: 'b', label: 'commit this'),
-    ];
+    const tests = SnippetView(
+      snippetId: 'a',
+      label: 'tests',
+      detail: 'run the tests',
+      name: 'tests',
+      text: 'run the tests',
+    );
+    const commit = SnippetView(
+      snippetId: 'b',
+      label: 'commit this',
+      text: 'commit this',
+    );
     final sent = <GuiIntent>[];
-    await pumpSession(
+    final timeline = holding([]);
+    Future<void> show(List<SnippetView> snippets) => pumpSession(
       tester,
       screen: screenWith(snippets: snippets),
-      timeline: holding([]),
+      timeline: timeline,
       sent: sent,
     );
+    await show([tests, commit]);
     await tester.tap(find.byTooltip('Snippets'));
     await tester.pumpAndSettle();
     expect(find.text('run the tests'), findsOneWidget);
     expect(find.text('Save the message as a snippet'), findsNothing);
+
+    await tester.tap(find.byTooltip('Edit snippet').first);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('snippet-edit-name')), '');
+    await tester.enterText(find.byKey(const Key('snippet-edit-text')), ' ');
+    await tester.pump();
+    expect(
+      tester
+          .widget<FilledButton>(find.widgetWithText(FilledButton, 'Save'))
+          .onPressed,
+      isNull,
+      reason: 'blank text is not saved',
+    );
+    await tester.enterText(
+      find.byKey(const Key('snippet-edit-text')),
+      'run every test',
+    );
+    await tester.pump();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(
+      sent.whereType<GuiIntentAct>().last,
+      const GuiIntentAct(
+        action: ActionIntentEditSnippet(
+          snippetId: 'a',
+          name: '',
+          text: 'run every test',
+        ),
+      ),
+    );
+
     await tester.tap(find.byTooltip('Delete snippet').last);
     await tester.pumpAndSettle();
     expect(
-      sent.last,
+      sent.whereType<GuiIntentAct>().last,
       const GuiIntentAct(action: ActionIntentDeleteSnippet(snippetId: 'b')),
     );
+    // The open sheet follows what the hub sends next.
+    await show([
+      const SnippetView(
+        snippetId: 'a',
+        label: 'run every test',
+        text: 'run every test',
+      ),
+    ]);
     expect(find.text('commit this'), findsNothing);
-    await tester.tap(find.text('tests'));
+    await tester.tap(find.text('run every test'));
     await tester.pumpAndSettle();
     expect(
-      sent.last,
+      sent.whereType<GuiIntentInsertSnippet>().last,
       const GuiIntentInsertSnippet(sessionId: 's1', snippetId: 'a'),
     );
 
@@ -466,7 +515,7 @@ void main() {
     await tester.tap(find.text('Save'));
     await tester.pumpAndSettle();
     expect(
-      sent.last,
+      sent.whereType<GuiIntentSaveComposerSnippet>().last,
       const GuiIntentSaveComposerSnippet(sessionId: 's1', name: ''),
     );
   });
