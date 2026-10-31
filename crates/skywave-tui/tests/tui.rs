@@ -1674,7 +1674,8 @@ fn interrupt_key_and_its_delivery_state() {
         )
         .unwrap();
     h.sync();
-    assert_contains(&h.screen(), "interrupt failed: the agent was not working");
+    // Nothing was working: the agent already does what was asked.
+    assert!(!h.screen().contains("interrupt failed"), "{}", h.screen());
 }
 
 #[test]

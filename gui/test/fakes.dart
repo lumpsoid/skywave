@@ -98,6 +98,8 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
       state: AgentState.idle,
       badgeLabel: 'idle',
       agentLabel: 'agent idle',
+      canInterrupt: false,
+      interruptBusy: false,
       rules: [],
       agent: unknownAgent,
       usage: [],

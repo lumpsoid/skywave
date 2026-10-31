@@ -57,8 +57,12 @@ class _SessionPageState extends State<SessionPage> {
     super.dispose();
   }
 
-  void _interrupt() =>
-      widget.send.act(ActionIntentInterrupt(sessionId: _screen.sessionId));
+  /// Interrupts the agent's turn, if it has one and no interrupt from
+  /// here is already on its way.
+  void _interrupt() {
+    if (!_screen.canInterrupt || _screen.interruptBusy) return;
+    widget.send.act(ActionIntentInterrupt(sessionId: _screen.sessionId));
+  }
 
   void _openSearch() {
     final search = _search.search;
@@ -148,11 +152,7 @@ class _SessionPageState extends State<SessionPage> {
                   onPressed: _openSearch,
                   icon: const Icon(Icons.search),
                 ),
-                IconButton(
-                  tooltip: screen.interruptLabel ?? 'Interrupt (Ctrl+X)',
-                  onPressed: _interrupt,
-                  icon: const Icon(Icons.pan_tool_outlined),
-                ),
+                _InterruptButton(screen: screen, onPressed: _interrupt),
                 PopupMenuButton<VoidCallback>(
                   tooltip: 'More',
                   onSelected: (action) => action(),
@@ -285,6 +285,40 @@ class _SessionPageState extends State<SessionPage> {
 }
 
 /// The timeline's column width, for what sits under it.
+/// Interrupts the agent's turn: off while there is none, a spinner while
+/// the interrupt is on its way, the error colour with the reason as its
+/// tooltip when it failed and the agent still works.
+class _InterruptButton extends StatelessWidget {
+  const _InterruptButton({required this.screen, required this.onPressed});
+
+  final SessionScreen screen;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    if (screen.interruptBusy) {
+      return const IconButton(
+        tooltip: 'Interrupting…',
+        onPressed: null,
+        icon: SizedBox.square(
+          dimension: 18,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    final refusal = screen.interruptRefusal;
+    return IconButton(
+      tooltip: refusal == null
+          ? 'Interrupt (Ctrl+X)'
+          : 'Interrupt failed: $refusal',
+      onPressed: screen.canInterrupt ? onPressed : null,
+      icon: refusal == null
+          ? const Icon(Icons.pan_tool_outlined)
+          : Icon(Icons.pan_tool, color: Theme.of(context).colorScheme.error),
+    );
+  }
+}
+
 class _Column extends StatelessWidget {
   const _Column({required this.child});
 

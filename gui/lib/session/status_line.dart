@@ -6,11 +6,11 @@ import 'package:skywave_gui/session/agent_pickers.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The session's status under its header: the agent's state, an
-/// interrupt or stop on its way, the agent's mode and model (a tap
-/// switches them; a refusal turns them red), the rules granted here (a
-/// tap lists them), and the usage summary at the end, its fields dropped
-/// from the front when the line is short of room.
+/// The session's status under its header: the agent's state, a stop on
+/// its way, the agent's mode and model (a tap switches them; a refusal
+/// turns them red), the rules granted here (a tap lists them), and the
+/// usage summary at the end, its fields dropped from the front when the
+/// line is short of room.
 class StatusLine extends StatelessWidget {
   const StatusLine({required this.screen, required this.send, super.key});
 
@@ -62,8 +62,6 @@ class StatusLine extends StatelessWidget {
 
     final left = <InlineSpan>[
       TextSpan(text: screen.agentLabel, style: agent),
-      if (screen.interruptLabel case final label?)
-        TextSpan(text: ' · $label', style: muted),
       if (screen.stopLabel case final label?)
         TextSpan(text: ' · $label', style: muted),
     ];
