@@ -6,6 +6,8 @@ Each entry: decision, reason, and what is deferred. MVP scope unless noted.
 `proto`, `skywaved`, `core`, `core-ffi`, `tui` are Rust. The Android head is
 Kotlin and talks to the core through UniFFI.
 **Why:** one implementation of sync, storage, and protocol logic.
+**Superseded by D28:** the Kotlin head is gone; every head is Rust or a
+Flutter head over a Rust hub.
 
 ## D2. Heads only render
 All logic lives in `core`. The TUI is a head like any other and gets no
@@ -122,6 +124,8 @@ Mirrors are plain data. If a head would need logic to render something
 `ViewState`, not into the mirror or Kotlin (D2).
 **Why:** keeps the core free of FFI concerns and its types idiomatic Rust; the
 conversion layer is the one place the boundary is visible.
+**Superseded by D28:** `skywave-core-ffi` is removed. The rules about
+`Instant` and plain-data mirrors still describe how the hub maps for Dart.
 
 ## D17. One core per process, pushed to Kotlin as a `StateFlow`
 - The Android `Application` opens and owns the single `SkywaveCore` for the
@@ -137,6 +141,8 @@ conversion layer is the one place the boundary is visible.
 - The device name is passed at open (`EngineConfig::device_name`):
   `Settings.Global.DEVICE_NAME` if set, else `Build.MODEL`. The core's
   host-name default is meaningless on Android.
+**Superseded by D28** for the Kotlin parts. One core per process still
+holds (D25, D27).
 
 ## D18. Kotlin + Jetpack Compose, Material 3, single Activity
 - Navigation is driven by `ViewState.screen`: the core owns the route, the
@@ -145,6 +151,7 @@ conversion layer is the one place the boundary is visible.
 - Manual dependency injection (the `Application` holds the core and its
   repository). Hilt/Dagger only if a later task shows a clear need.
 **Why:** a second source of navigation truth in the head would violate D2.
+**Superseded by D28.**
 
 ## D19. Android build: minSdk 26, arm64-v8a + x86_64, cargo-ndk from Gradle
 - `minSdk` 26; `compileSdk` / `targetSdk` the current stable SDK.
@@ -154,6 +161,7 @@ conversion layer is the one place the boundary is visible.
   `uniffi-bindgen` binary (version-locked to the crate's `uniffi`), never
   checked in.
 **Deferred:** armeabi-v7a / x86, if a real device needs them.
+**Superseded by D28:** the Flutter head builds through cargokit (D26).
 
 ## D20. QR scanning without Google Play Services
 Pairing scans the `skywaved pair` QR (D9) with `zxing-android-embedded`
@@ -162,6 +170,8 @@ dependency.
 **Why:** works on de-Googled devices and emulators; one small dependency.
 CameraX + ZXing core stays the fallback if the embedded library's camera
 handling proves inadequate.
+**Superseded by D28:** the Flutter head has no QR scanning yet (D24); the
+no-Play-Services constraint still applies when it gets one.
 
 ## D21. Background: suspend on stop, resume on start
 The head calls `suspend()` when the app goes to the background
@@ -185,11 +195,16 @@ service) and the core is suspended once none does.
 - No wakelocks beyond WorkManager's and no polling in Kotlin: the core's
   long-poll is the only traffic. The core still decides which approvals
   are new; the notifier posts one notification per approval.
+**Superseded by D28** for the Kotlin implementation. The hub's
+suspend-on-leave follows the first paragraph; the A15 design above is the
+reference for the Flutter head's deferred background work (D24).
 
 ## D22. Android device key in app-private `filesDir`
 MVP per D9: the core's data dir, including the device key, lives under
 `Context.filesDir`, which only the app can read.
 **Deferred (A19):** Keystore-backed signer via an FFI callback.
+**Superseded by D28:** the Flutter head keeps the key in its application
+support dir, also app-private (D25); A19 still applies to it.
 
 ## D23. Head-side presentation and policies live in `skywave-present`
 What a head decides beyond `ViewState` (timeline sections and which item is
@@ -206,10 +221,8 @@ key hints, geometry, colours).
 - D16's rule ("logic goes into core's `ViewState`, not into the mirror")
   is about the FFI mirror gaining logic, and still holds there. Present is
   a separate crate, so the spirit holds: one Rust owner per rule.
-- The Android head keeps its own Kotlin presentation; moving it onto
-  present would need UniFFI mirrors of present's types.
-**Why:** reimplementing in Dart would make a third copy after the TUI and
-Kotlin, and break "heads only render" (D2). The hub must stay pure mapping,
+**Why:** reimplementing in Dart would make another copy after the TUI, and
+break "heads only render" (D2). The hub must stay pure mapping,
 so it cannot own the logic either. Core's `ViewState` is the wrong home for
 head wording ("press d").
 
@@ -243,7 +256,7 @@ platform name (mobile). On desktop too it never shares the TUI's data.
 **Why:** two processes driving one replica is outside D17 (one core per
 process): two engines would race on the cursor and the outbox. Separate
 devices is what the server already models (D5). On Android the app id is
-`dev.skywave.gui`, so it installs beside the Kotlin head.
+`dev.skywave.gui`.
 
 ## D26. GUI platforms: Linux and Android verified, Apple and Windows scaffolded, no web
 - **Built and run:** Linux desktop and Android.
@@ -267,3 +280,16 @@ runtime's open wait until the old core has closed.
 would race. Reopening costs a cold start from the replica, which is the
 normal path anyway. Within one runtime, `AppReady` asks the hub to resend
 everything, so a rebuilt widget tree starts whole.
+
+## D28. Flutter is the only Android head; the Kotlin head is removed
+`android/` (Kotlin, Compose) and `skywave-core-ffi` (its UniFFI bindings)
+are deleted, with the `release-android` profile and the `uniffi`
+dependency. The Flutter head (`gui/`, `dev.skywave.gui`) is the Android
+app. The acceptance rig in `scripts/android-acceptance/` targets it.
+**Why:** two Android heads meant every head-facing change landed twice, and
+the Kotlin one kept its own presentation outside `skywave-present` (D23).
+One head over the shared hub keeps one owner per rule (D2).
+**Lost until the Flutter head gains them (D24's deferred list):** periodic
+catch-up and "Stay connected" in the background (D21), approval
+notifications while suspended, `skywave://pair` links and QR scanning
+(D20). Git history keeps the Kotlin implementation as a reference.

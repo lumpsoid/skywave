@@ -40,7 +40,7 @@ fn install(filter: EnvFilter) {
         .try_init();
 }
 
-/// A trimmed copy of skywave-core-ffi's logcat writer.
+/// Writes each event to logcat through liblog.
 #[cfg(target_os = "android")]
 mod logcat {
     use std::ffi::{CString, c_char, c_int};
