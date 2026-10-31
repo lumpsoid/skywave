@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/composer.dart';
+import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/status_line.dart';
@@ -391,6 +392,44 @@ void main() {
     await tester.tap(find.text('Copy'));
     await tester.pumpAndSettle();
     expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
+  });
+
+  testWidgets('an empty timeline says how to start, once it is loaded', (
+    tester,
+  ) async {
+    const hint = 'Send a message to start the agent.';
+    // No rows sent yet: not known to be empty.
+    final timeline = TimelineHolder();
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: [],
+    );
+    expect(find.text(hint), findsNothing);
+    // Another session's rows, still shown while this one's are on the way.
+    timeline.apply(const TimelineUpdateSnapshot(sessionId: 's0', items: []));
+    await tester.pump();
+    expect(find.text(hint), findsNothing);
+
+    timeline.apply(const TimelineUpdateSnapshot(sessionId: 's1', items: []));
+    await tester.pump();
+    expect(find.text(hint), findsOneWidget);
+    final context = tester.element(find.text(hint));
+    expect(
+      tester.widget<Text>(find.text(hint)).style?.color,
+      SkyColors.of(context).muted,
+    );
+
+    timeline.apply(
+      TimelineUpdateUpserted(
+        key: 'p:c1',
+        item: anyRow('p:c1', RowKind.pendingMessage, 'hi', own: true),
+        index: 0,
+      ),
+    );
+    await tester.pump();
+    expect(find.text(hint), findsNothing);
   });
 
   group('approval', () {
