@@ -143,53 +143,67 @@ class _SessionPageState extends State<SessionPage> {
           onKeyEvent: _onKey,
           child: Scaffold(
             appBar: AppBar(
-              leading: BackButton(
-                onPressed: () => widget.send.act(const ActionIntentBack()),
-              ),
+              // The header's content keeps to the timeline's column.
+              automaticallyImplyLeading: false,
               titleSpacing: 0,
               toolbarHeight: _Title.heightOf(context),
-              title: _Title(screen: screen),
-              actions: [
-                IconButton(
-                  tooltip: 'Search (Ctrl+F)',
-                  onPressed: _openSearch,
-                  icon: const Icon(Icons.search),
-                ),
-                _InterruptButton(screen: screen, onPressed: _interrupt),
-                PopupMenuButton<VoidCallback>(
-                  tooltip: 'More',
-                  onSelected: (action) => action(),
-                  itemBuilder: (context) => [
-                    PopupMenuItem(
-                      value: () => widget.send(
-                        GuiIntentRenameOpen(sessionId: screen.sessionId),
-                      ),
-                      child: const ListTile(
-                        leading: Icon(Icons.drive_file_rename_outline),
-                        title: Text('Rename'),
-                      ),
+              title: _Column(
+                child: Row(
+                  children: [
+                    const SizedBox(width: 4),
+                    BackButton(
+                      onPressed: () =>
+                          widget.send.act(const ActionIntentBack()),
                     ),
-                    PopupMenuItem(
-                      value: () => widget.send.act(
-                        ActionIntentStopSession(sessionId: screen.sessionId),
-                      ),
-                      child: ListTile(
-                        leading: Icon(
-                          Icons.power_settings_new,
-                          color: theme.colorScheme.error,
+                    const SizedBox(width: 4),
+                    Expanded(child: _Title(screen: screen)),
+                    IconButton(
+                      tooltip: 'Search (Ctrl+F)',
+                      onPressed: _openSearch,
+                      icon: const Icon(Icons.search),
+                    ),
+                    _InterruptButton(screen: screen, onPressed: _interrupt),
+                    PopupMenuButton<VoidCallback>(
+                      tooltip: 'More',
+                      onSelected: (action) => action(),
+                      itemBuilder: (context) => [
+                        PopupMenuItem(
+                          value: () => widget.send(
+                            GuiIntentRenameOpen(sessionId: screen.sessionId),
+                          ),
+                          child: const ListTile(
+                            leading: Icon(Icons.drive_file_rename_outline),
+                            title: Text('Rename'),
+                          ),
                         ),
-                        title: const Text('Stop agent'),
-                        subtitle: screen.stopLabel == null
-                            ? null
-                            : Text(screen.stopLabel!),
-                      ),
+                        PopupMenuItem(
+                          value: () => widget.send.act(
+                            ActionIntentStopSession(
+                              sessionId: screen.sessionId,
+                            ),
+                          ),
+                          child: ListTile(
+                            leading: Icon(
+                              Icons.power_settings_new,
+                              color: theme.colorScheme.error,
+                            ),
+                            title: const Text('Stop agent'),
+                            subtitle: screen.stopLabel == null
+                                ? null
+                                : Text(screen.stopLabel!),
+                          ),
+                        ),
+                      ],
                     ),
+                    const SizedBox(width: 4),
                   ],
                 ),
-              ],
+              ),
               bottom: PreferredSize(
                 preferredSize: Size.fromHeight(StatusLine.heightOf(context)),
-                child: StatusLine(screen: screen, send: widget.send),
+                child: _Column(
+                  child: StatusLine(screen: screen, send: widget.send),
+                ),
               ),
             ),
             body: Column(
@@ -287,7 +301,6 @@ class _SessionPageState extends State<SessionPage> {
   }
 }
 
-/// The timeline's column width, for what sits under it.
 /// Interrupts the agent's turn: off while there is none, a spinner while
 /// the interrupt is on its way, the error colour with the reason as its
 /// tooltip when it failed and the agent still works.
@@ -322,6 +335,7 @@ class _InterruptButton extends StatelessWidget {
   }
 }
 
+/// The timeline's column width, for what sits over and under it.
 class _Column extends StatelessWidget {
   const _Column({required this.child});
 
