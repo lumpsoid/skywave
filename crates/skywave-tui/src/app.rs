@@ -12,8 +12,8 @@ use skywave_core::search::{self, BlobLine, BlobText, Found, HEAD_BYTES, Hit};
 use skywave_core::{
     Action, ApprovalId, ApprovalPrompt, BlobId, BlobPolicy, BlobState, Completion,
     CompletionStatus, CoreError, Decision, Delivery, Entry, Link, LinkRejection, ListKind,
-    Outgoing, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId, SessionListView,
-    SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState,
+    Outgoing, PairUri, PairingView, PendingSession, Query, Route, Screen, Seq, SessionId,
+    SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 
 use crate::clipboard::{Clip, CopyError};
@@ -105,8 +105,8 @@ impl PairingForm {
             .extend(text.chars().filter(|c| !c.is_control()));
     }
 
-    /// Fills every field from a pairing URI and focuses the last, so Enter
-    /// submits.
+    /// Fills every field from a pairing URI, already in the core's
+    /// canonical form, and focuses the last, so Enter submits.
     fn fill(&mut self, uri: PairUri) {
         self.address = uri.address;
         self.code = uri.code;
@@ -123,77 +123,13 @@ impl PairingForm {
     }
 }
 
-/// The pairing URI `skywaved pair` prints and encodes as a QR code (spec §6):
-/// `skywave://pair?addr=<percent-encoded host:port>&code=<code>&fp=<hex>`.
-///
-/// Parsing only splits the URI into the three form fields; the fingerprint
-/// is shown colon-separated like `skywaved pair` prints it. Checking and
-/// normalising the values stays with the core.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairUri {
-    pub address: String,
-    pub code: String,
-    pub fingerprint: String,
-}
-
-impl PairUri {
-    const PREFIX: &'static str = "skywave://pair?";
-
-    pub fn parse(text: &str) -> Option<PairUri> {
-        let query = text.trim().strip_prefix(Self::PREFIX)?;
-        let (mut address, mut code, mut fingerprint) = (None, None, None);
-        for pair in query.split('&') {
-            let (key, value) = pair.split_once('=')?;
-            let value = percent_decode(value)?;
-            match key {
-                "addr" => address = Some(value),
-                "code" => code = Some(value),
-                "fp" => fingerprint = Some(value),
-                _ => {}
-            }
-        }
-        let fingerprint = fingerprint?;
-        let fingerprint = if fingerprint.len() == 64 && fingerprint.is_ascii() {
-            fingerprint
-                .as_bytes()
-                .chunks(2)
-                .map(|pair| std::str::from_utf8(pair).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(":")
-        } else {
-            fingerprint
-        };
-        Some(PairUri {
-            address: address?,
-            code: code?,
-            fingerprint,
-        })
-    }
-}
-
-/// Decodes `%XX` escapes (and `+` as a space); `None` on a bad escape.
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
+/// Whether `text` is meant as a pairing URI (spec §6), so a malformed one
+/// is reported rather than typed into a field.
+fn looks_like_pair_uri(text: &str) -> bool {
+    let scheme = "skywave://";
+    text.trim()
+        .get(..scheme.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
 }
 
 /// Rows of completion candidates shown at most.
@@ -1305,7 +1241,8 @@ impl App {
     }
 
     /// Bracketed paste: on the pairing screen a pairing URI fills the whole
-    /// form, anything else goes into the focused field; an open prompt
+    /// form, a malformed one is reported, anything else goes into the
+    /// focused field; an open prompt
     /// (new session, rename) takes it; on a session it goes into the
     /// search prompt while that is open, else into the composer, line
     /// breaks included.
@@ -1338,9 +1275,10 @@ impl App {
         if !self.typing() {
             return;
         }
-        match PairUri::parse(text) {
-            Some(uri) => self.ui.form.fill(uri),
-            None => self.ui.form.insert(text.trim()),
+        match parse_pair_uri(text) {
+            Ok(uri) => self.ui.form.fill(uri),
+            Err(err) if looks_like_pair_uri(text) => self.ui.error = Some(err.to_string()),
+            Err(_) => self.ui.form.insert(text.trim()),
         }
     }
 
@@ -1497,10 +1435,11 @@ impl App {
     fn pairing_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
         let form = &mut self.ui.form;
         // A URI typed or pasted without bracketed paste lands in one field.
-        if key.code == KeyCode::Enter
-            && let Some(uri) = PairUri::parse(form.value(form.focus))
-        {
-            form.fill(uri);
+        if key.code == KeyCode::Enter && looks_like_pair_uri(form.value(form.focus)) {
+            match parse_pair_uri(form.value(form.focus)) {
+                Ok(uri) => form.fill(uri),
+                Err(err) => self.ui.error = Some(err.to_string()),
+            }
             return None;
         }
         match key.code {

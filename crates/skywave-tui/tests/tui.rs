@@ -23,7 +23,7 @@ use skywave_proto::{
     ToolResult, TurnUsage,
 };
 use skywave_tui::App;
-use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, PairUri, READ_MARK_EVERY};
+use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
 use skywave_tui::clipboard::{self, Clip};
 use skywave_tui::timeline::{ItemKey, delivery, find};
 use skywave_tui::ui;
@@ -374,22 +374,16 @@ fn pairing_failure_shows_the_reason_and_keeps_the_form() {
 #[test]
 fn a_pasted_pairing_uri_fills_the_form() {
     let uri = format!(
-        "skywave://pair?addr=%5Bfd00::7%5D:7443&code=ABCDE12345&fp={}",
+        "skywave://pair?addr=%5Bfd00::7%5D:7443&code=abcde-12345&fp={}",
         "0123456789abcdef".repeat(4)
     );
-    let parsed = PairUri::parse(&uri).unwrap();
-    assert_eq!(parsed.address, "[fd00::7]:7443");
-    assert_eq!(parsed.code, "ABCDE12345");
-    assert!(parsed.fingerprint.starts_with("01:23:45:67:89:ab:cd:ef:01"));
-    assert_eq!(parsed.fingerprint.len(), 64 + 31);
-    assert_eq!(PairUri::parse("skywave://pair?addr=x&code=y"), None);
-    assert_eq!(PairUri::parse("srv:7443"), None);
-
     let mut h = Harness::new();
     h.app.on_paste(&uri);
     let form = &h.app.ui().form;
     assert_eq!(form.address, "[fd00::7]:7443");
-    assert_eq!(form.fingerprint, parsed.fingerprint);
+    assert_eq!(form.code, "ABCDE12345");
+    assert!(form.fingerprint.starts_with("01:23:45:67:89:AB:CD:EF:01"));
+    assert_eq!(form.fingerprint.len(), 64 + 31);
     assert!(matches!(h.key(KeyCode::Enter), Some(Action::Pair { .. })));
 
     // Without bracketed paste the URI arrives as keys in one field.
@@ -398,6 +392,28 @@ fn a_pasted_pairing_uri_fills_the_form() {
     assert_eq!(h.key(KeyCode::Enter), None);
     assert_eq!(h.app.ui().form.address, "[fd00::7]:7443");
     assert_eq!(h.app.ui().form.code, "ABCDE12345");
+
+    // Anything that is not a pairing URI is just text.
+    let mut h = Harness::new();
+    h.app.on_paste(" srv:7443\n");
+    assert_eq!(h.app.ui().form.address, "srv:7443");
+}
+
+#[test]
+fn a_malformed_pairing_uri_is_reported_not_typed() {
+    let uri = "skywave://pair?addr=srv:7443&code=ABCDE12345";
+    let mut h = Harness::new();
+    h.app.on_paste(uri);
+    assert_eq!(h.app.ui().form.address, "");
+    assert_contains(&h.screen(), "error: not a pairing link: missing fp");
+
+    // Typed, Enter reports it and keeps the text to fix.
+    let mut h = Harness::new();
+    h.type_text(uri);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(h.app.ui().form.address, uri);
+    assert_eq!(h.app.ui().form.focus, Field::Address);
+    assert_contains(&h.screen(), "error: not a pairing link: missing fp");
 }
 
 #[test]
