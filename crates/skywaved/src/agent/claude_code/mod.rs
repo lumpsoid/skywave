@@ -56,7 +56,7 @@ use uuid::Uuid;
 
 use self::protocol::{Output, Protocol};
 use super::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession, Effort,
     PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
@@ -195,12 +195,22 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
+        // Start-time requests are asked like any other: their lines go to
+        // the CLI and any answer known at once joins the early events.
         let mut wanted = Vec::new();
+        let mut asked = Vec::new();
         if let Some(mode) = spec.mode {
-            wanted.extend(protocol.set_permission_mode(mode).writes);
+            asked.push(protocol.set_permission_mode(mode));
         }
         if let Some(model) = spec.model {
-            wanted.extend(protocol.set_model(model).writes);
+            asked.push(protocol.set_model(model));
+        }
+        if let Some(effort) = spec.effort {
+            asked.push(protocol.set_effort(effort));
+        }
+        for mut out in asked {
+            wanted.append(&mut out.writes);
+            early.append(&mut out.events);
         }
         if let Err(e) = process.write(&wanted).await {
             // The process is gone or going; the driver reports its exit.
@@ -304,6 +314,10 @@ impl AgentSession for ClaudeCodeSession {
         self.request(Request::Model(model))
     }
 
+    async fn set_effort(&mut self, effort: Effort) -> Result<(), AgentError> {
+        self.request(Request::Effort(effort))
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(Request::Shutdown);
@@ -321,6 +335,7 @@ enum Request {
     Interrupt,
     Mode(PermissionMode),
     Model(String),
+    Effort(Effort),
     Shutdown,
 }
 
@@ -460,6 +475,7 @@ impl Driver {
                         Some(Request::Interrupt) => self.protocol.interrupt(),
                         Some(Request::Mode(mode)) => self.protocol.set_permission_mode(mode),
                         Some(Request::Model(model)) => self.protocol.set_model(model),
+                        Some(Request::Effort(effort)) => self.protocol.set_effort(effort),
                         Some(Request::Shutdown) | None => break self.shutdown().await,
                     };
                     if !self.apply(out).await {

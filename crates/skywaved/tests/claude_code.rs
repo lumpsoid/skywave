@@ -13,13 +13,15 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{Decision, SessionId};
-use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
+use skywaved::agent::claude_code::protocol::{
+    self, EFFORT_UNSUPPORTED, INTERRUPT_REASON, PINNED_VERSION, Protocol,
+};
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    BodyFormat, DisplayBody, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
+    RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -224,6 +226,11 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::ModelRefused { model, reason } => {
                 format!("model refused {model}: {}", cut(reason))
             }
+            AdapterEvent::Effort(effort) => format!("effort: {effort:?}"),
+            AdapterEvent::EffortSet(effort) => format!("effort set: {effort:?}"),
+            AdapterEvent::EffortRefused { effort, reason } => {
+                format!("effort refused {effort:?}: {}", cut(reason))
+            }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
         })
         .collect()
@@ -233,7 +240,10 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
 fn observes_settings(event: &AdapterEvent) -> bool {
     matches!(
         event,
-        AdapterEvent::PermissionMode(_) | AdapterEvent::Model(_) | AdapterEvent::ModelsOffered(_)
+        AdapterEvent::PermissionMode(_)
+            | AdapterEvent::Model(_)
+            | AdapterEvent::Effort(_)
+            | AdapterEvent::ModelsOffered(_)
     )
 }
 
@@ -258,6 +268,9 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
                     | AdapterEvent::Model(_)
                     | AdapterEvent::ModelSet(_)
                     | AdapterEvent::ModelRefused { .. }
+                    | AdapterEvent::Effort(_)
+                    | AdapterEvent::EffortSet(_)
+                    | AdapterEvent::EffortRefused { .. }
                     | AdapterEvent::ModelsOffered(_)
             )
         })
@@ -268,6 +281,7 @@ fn settings(events: &[AdapterEvent]) -> Vec<String> {
         .map(|event| match event {
             AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
             AdapterEvent::Model(model) => format!("model: {model}"),
+            AdapterEvent::Effort(effort) => format!("effort: {effort:?}"),
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
             other => describe(std::slice::from_ref(other)).remove(0),
         })
@@ -1318,6 +1332,7 @@ fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
         resume,
         mode: None,
         model: None,
+        effort: None,
     }
 }
 
@@ -1792,6 +1807,60 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
             },
             AdapterEvent::PermissionModeSet(PermissionMode::AcceptEdits),
         ]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next_raw(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[test]
+fn an_effort_is_refused_at_once_without_asking_the_cli() {
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let out = protocol.set_effort(Effort::High);
+    assert_eq!(out.writes, Vec::<serde_json::Value>::new());
+    assert_eq!(
+        out.events,
+        [AdapterEvent::EffortRefused {
+            effort: Effort::High,
+            reason: EFFORT_UNSUPPORTED.to_owned(),
+        }]
+    );
+    // A model, by contrast, is asked of the CLI and answered later.
+    let out = protocol.set_model("sonnet".to_owned());
+    assert_eq!((out.writes.len(), out.events.len()), (1, 0));
+}
+
+#[tokio::test]
+async fn a_session_started_with_an_effort_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = spec(tmp.path(), None);
+    spec.model = Some("sonnet".to_owned());
+    spec.effort = Some(Effort::High);
+    let (mut session, mut events) = adapter().start(spec).await.unwrap();
+    assert!(matches!(
+        next_raw(&mut events).await,
+        AdapterEvent::ResumeHandle(_)
+    ));
+    // Known at once, so it comes before the model's answer from the CLI.
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::EffortRefused {
+                effort: Effort::High,
+                reason: EFFORT_UNSUPPORTED.to_owned(),
+            },
+            AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
+        ]
+    );
+    session.set_effort(Effort::Low).await.unwrap();
+    assert_eq!(
+        next_raw(&mut events).await,
+        AdapterEvent::EffortRefused {
+            effort: Effort::Low,
+            reason: EFFORT_UNSUPPORTED.to_owned(),
+        }
     );
     session.shutdown().await.unwrap();
     assert_eq!(
