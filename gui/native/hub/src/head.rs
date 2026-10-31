@@ -24,7 +24,7 @@ use crate::clip::{COPY_MAX, Copied, copy};
 use crate::dispatcher::{Dispatched, Tag};
 use crate::screen::{CreateUi, Ui, rename_initial, revoked};
 use crate::signals::{
-    ComposerView, CopyWhat, Intent, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
+    ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
     ScreenUpdate, SearchUpdate, TimelineRow, TimelineUpdate,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
@@ -286,10 +286,10 @@ impl Head {
     }
 
     /// A GUI intent.
-    pub fn on_intent(&mut self, intent: Intent, clock: Clock) -> Vec<Out> {
+    pub fn on_intent(&mut self, intent: GuiIntent, clock: Clock) -> Vec<Out> {
         let mut out = Vec::new();
         // A keystroke changes no row: the timeline is not mapped again.
-        let rows = !matches!(intent, Intent::DraftEdited { .. });
+        let rows = !matches!(intent, GuiIntent::DraftEdited { .. });
         if let Err(text) = self.intent(intent, clock, &mut out) {
             out.push(Out::Effect(PlatformEffect::Error { text }));
         }
@@ -375,14 +375,19 @@ impl Head {
         .min()
     }
 
-    fn intent(&mut self, intent: Intent, clock: Clock, out: &mut Vec<Out>) -> Result<(), String> {
+    fn intent(
+        &mut self,
+        intent: GuiIntent,
+        clock: Clock,
+        out: &mut Vec<Out>,
+    ) -> Result<(), String> {
         match intent {
-            Intent::AppReady => self.sent = Sent::default(),
-            Intent::Act { action } => {
+            GuiIntent::AppReady => self.sent = Sent::default(),
+            GuiIntent::Act { action } => {
                 let action = intents::action(action)?;
                 self.dispatch_user(action, Purpose::Plain, clock, out);
             }
-            Intent::DraftEdited {
+            GuiIntent::DraftEdited {
                 session_id,
                 text,
                 cursor_utf16,
@@ -400,7 +405,7 @@ impl Head {
                     session.history.end();
                 }
             }
-            Intent::ComposerSubmit { session_id } => {
+            GuiIntent::ComposerSubmit { session_id } => {
                 let Some(session) = self.open_head(&session_id) else {
                     return Ok(());
                 };
@@ -416,14 +421,14 @@ impl Head {
                     session.sending = Some(tag);
                 }
             }
-            Intent::HistoryOlder => self.recall(true, clock),
-            Intent::HistoryNewer => self.recall(false, clock),
-            Intent::FollowingChanged { following } => {
+            GuiIntent::HistoryOlder => self.recall(true, clock),
+            GuiIntent::HistoryNewer => self.recall(false, clock),
+            GuiIntent::FollowingChanged { following } => {
                 if let Some(session) = &mut self.session {
                     session.following = following;
                 }
             }
-            Intent::ExpandItem { key } => {
+            GuiIntent::ExpandItem { key } => {
                 let Some(seq) = logged(parse_key(&key)?) else {
                     return Ok(());
                 };
@@ -444,12 +449,12 @@ impl Head {
                     self.dispatch_user(fetch, Purpose::Plain, clock, out);
                 }
             }
-            Intent::CollapseItem { key } => {
+            GuiIntent::CollapseItem { key } => {
                 if let (Some(seq), Some(session)) = (logged(parse_key(&key)?), &mut self.session) {
                     session.expanded.remove(&seq);
                 }
             }
-            Intent::DownloadItem { key } => {
+            GuiIntent::DownloadItem { key } => {
                 let fetch = logged(parse_key(&key)?)
                     .and_then(|seq| self.entry(seq))
                     .and_then(wanted_blob)
@@ -458,7 +463,7 @@ impl Head {
                     self.dispatch_user(fetch, Purpose::Plain, clock, out);
                 }
             }
-            Intent::OpenFull { blob_id } => {
+            GuiIntent::OpenFull { blob_id } => {
                 let id = intents::id("blob", &blob_id)?;
                 let state = open_session(&self.view).and_then(|view| {
                     view.timeline.iter().find_map(|item| match item {
@@ -479,7 +484,7 @@ impl Head {
                     },
                 }));
             }
-            Intent::Copy { key, what } => {
+            GuiIntent::Copy { key, what } => {
                 let key = parse_key(&key)?;
                 let content = open_session(&self.view).and_then(|view| {
                     let item = &view.timeline[find(view, key)?];
@@ -511,7 +516,7 @@ impl Head {
                     Copied::Failed(text) => return Err(text),
                 }
             }
-            Intent::SearchTyped { query } => {
+            GuiIntent::SearchTyped { query } => {
                 let Some((view, session)) = open_session(&self.view).zip(self.session.as_mut())
                 else {
                     return Ok(());
@@ -525,7 +530,7 @@ impl Head {
                 search.wrapped = false;
                 search.edit(view, |text| *text = query, BlobText::read);
             }
-            Intent::SearchStep { older, from_key } => {
+            GuiIntent::SearchStep { older, from_key } => {
                 let from = from_key.as_deref().map(parse_key).transpose()?;
                 let Some((view, session)) = open_session(&self.view).zip(self.session.as_mut())
                 else {
@@ -544,19 +549,19 @@ impl Head {
                     session.expanded.insert(seq);
                 }
             }
-            Intent::SearchClose => {
+            GuiIntent::SearchClose => {
                 if let Some(session) = &mut self.session {
                     session.search = None;
                 }
             }
-            Intent::CreateOpen => {
+            GuiIntent::CreateOpen => {
                 if let Some(Screen::SessionList(list)) = self.view.as_ref().map(|v| &v.screen)
                     && list.kind == skywave_core::ListKind::Active
                 {
                     self.create = Some(CreateUi::default());
                 }
             }
-            Intent::CompletionTyped { input } => {
+            GuiIntent::CompletionTyped { input } => {
                 let Some(create) = &mut self.create else {
                     return Ok(());
                 };
@@ -566,7 +571,7 @@ impl Head {
                     self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
-            Intent::CompletionComplete => {
+            GuiIntent::CompletionComplete => {
                 let candidates = self.candidates();
                 let Some(create) = &mut self.create else {
                     return Ok(());
@@ -581,7 +586,7 @@ impl Head {
                     create.rev = self.revs;
                 }
             }
-            Intent::CompletionMove { up } => {
+            GuiIntent::CompletionMove { up } => {
                 let len = self.candidates().len();
                 if let Some(create) = self.create.as_mut().filter(|_| len > 0) {
                     create.settle.input();
@@ -592,7 +597,7 @@ impl Head {
                     }
                 }
             }
-            Intent::CompletionAccept => {
+            GuiIntent::CompletionAccept => {
                 let candidates = self.candidates();
                 let Some(create) = &mut self.create else {
                     return Ok(());
@@ -612,7 +617,7 @@ impl Head {
                     create.rev = self.revs;
                 }
             }
-            Intent::CompletionCancel => {
+            GuiIntent::CompletionCancel => {
                 let completing = matches!(
                     self.view.as_ref().map(|v| &v.screen),
                     Some(Screen::SessionList(list)) if list.completion.is_some()
@@ -631,7 +636,7 @@ impl Head {
                     }
                 }
             }
-            Intent::RenameOpen { session_id } => {
+            GuiIntent::RenameOpen { session_id } => {
                 let id: SessionId = intents::id("session", &session_id)?;
                 let initial = match self.view.as_ref().map(|v| &v.screen) {
                     Some(Screen::SessionList(list)) => list
@@ -649,7 +654,7 @@ impl Head {
                     initial,
                 });
             }
-            Intent::RenameSubmit { name } => {
+            GuiIntent::RenameSubmit { name } => {
                 let Some(rename) = &self.rename else {
                     return Ok(());
                 };
@@ -660,8 +665,8 @@ impl Head {
                 let tag = self.dispatch_user(action, Purpose::Rename, clock, out);
                 self.rename_tag = Some(tag);
             }
-            Intent::RenameCancel => self.rename = None,
-            Intent::PairSubmit {
+            GuiIntent::RenameCancel => self.rename = None,
+            GuiIntent::PairSubmit {
                 address,
                 code,
                 fingerprint,
@@ -683,12 +688,12 @@ impl Head {
                 };
                 self.dispatch_user(action, Purpose::Plain, clock, out);
             }
-            Intent::PairPasted { text } => match parse_pair_uri(&text) {
+            GuiIntent::PairPasted { text } => match parse_pair_uri(&text) {
                 Ok(uri) => self.fill(uri),
                 Err(err) if looks_like_pair_uri(&text) => return Err(err.to_string()),
                 Err(_) => {}
             },
-            Intent::RevokedDismiss => self.revoked_dismissed = true,
+            GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
         }
         Ok(())
     }

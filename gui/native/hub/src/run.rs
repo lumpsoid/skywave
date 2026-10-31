@@ -11,7 +11,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 use crate::boot::{self, Running};
 use crate::dispatcher::Dispatcher;
 use crate::head::{Clock, Head, Out};
-use crate::signals::{Boot, BootFailed, Booted, Intent, ScreenUpdate, ScreenView};
+use crate::signals::{Boot, BootFailed, Booted, GuiIntent, ScreenUpdate, ScreenView};
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
 /// `BootFailed` and waiting for the next `Boot`; then runs the loop. Returns
@@ -20,7 +20,7 @@ pub async fn boot_then_run(mut stop: oneshot::Receiver<()>) {
     // rinf keeps one receiver per signal type: these, handed on to the
     // loop, are the only ones. Intents sent before the loop are queued.
     let boot = Boot::get_dart_signal_receiver();
-    let intents = Intent::get_dart_signal_receiver();
+    let intents = GuiIntent::get_dart_signal_receiver();
     let running = loop {
         tokio::select! {
             _ = &mut stop => return,
@@ -45,7 +45,7 @@ pub async fn boot_then_run(mut stop: oneshot::Receiver<()>) {
 async fn run(
     mut hub: Running,
     boot: SignalReceiver<DartSignalPack<Boot>>,
-    intents: SignalReceiver<DartSignalPack<Intent>>,
+    intents: SignalReceiver<DartSignalPack<GuiIntent>>,
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut head = Head::new();
