@@ -178,6 +178,9 @@ class _SessionPageState extends State<SessionPage> {
     final screen = _screen;
     final theme = Theme.of(context);
     final rename = screen.renamePrompt;
+    // Only a stopped agent surely has no process: an idle one stays warm a
+    // while, an errored one may have failed a turn and still run.
+    final stopped = screen.state == AgentState.stopped;
 
     return Stack(
       children: [
@@ -219,20 +222,27 @@ class _SessionPageState extends State<SessionPage> {
                           ),
                         ),
                         PopupMenuItem(
+                          enabled: !stopped,
                           value: () => widget.send.act(
                             ActionIntentStopSession(
                               sessionId: screen.sessionId,
                             ),
                           ),
                           child: ListTile(
+                            enabled: !stopped,
                             leading: Icon(
                               Icons.power_settings_new,
-                              color: theme.colorScheme.error,
+                              color: stopped ? null : theme.colorScheme.error,
                             ),
                             title: const Text('Stop agent'),
-                            subtitle: screen.stopLabel == null
-                                ? null
-                                : Text(screen.stopLabel!),
+                            subtitle: stopped
+                                ? const Text(
+                                    'Already stopped · a message restarts it',
+                                  )
+                                : switch (screen.stopLabel) {
+                                    final label? => Text(label),
+                                    null => null,
+                                  },
                           ),
                         ),
                       ],
