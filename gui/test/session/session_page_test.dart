@@ -755,6 +755,58 @@ void main() {
     expect(find.byTooltip('bogus refused: unknown model'), findsOneWidget);
   });
 
+  testWidgets('a bar runs under the header only while the agent works', (
+    tester,
+  ) async {
+    Future<void> show(AgentState state, {bool still = false}) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MediaQuery(
+            data: MediaQueryData(disableAnimations: still),
+            child: SessionPage(
+              screen: screenWith(state: state),
+              timeline: holding([row('s:1', 'first row')]),
+              send: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    LinearProgressIndicator bar() =>
+        tester.widget(find.byType(LinearProgressIndicator));
+
+    await show(AgentState.working);
+    expect(bar().value, isNull, reason: 'it runs');
+    final at = tester.getRect(find.byType(LinearProgressIndicator));
+    expect(at.top, tester.getRect(find.byType(AppBar)).bottom);
+    expect(at.height, lessThanOrEqualTo(4));
+    final first = tester.getRect(find.text('first row')).top;
+
+    await show(AgentState.working, still: true);
+    expect(bar().value, 1, reason: 'reduced motion: it holds still');
+
+    for (final state in [
+      AgentState.idle,
+      AgentState.awaitingApproval,
+      AgentState.errored,
+      AgentState.stopped,
+    ]) {
+      await show(state);
+      expect(
+        find.byType(LinearProgressIndicator),
+        findsNothing,
+        reason: '$state',
+      );
+      expect(
+        tester.getRect(find.text('first row')).top,
+        first,
+        reason: 'the timeline does not shift',
+      );
+    }
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -939,7 +991,7 @@ void main() {
         find.textContaining('/home/me/work', findRichText: true),
       );
       final state = tester.getRect(
-        find.textContaining('working', findRichText: true),
+        find.textContaining('idle', findRichText: true),
       );
       final first = tester.getRect(find.text('first row'));
       expect(title.top, greaterThanOrEqualTo(bar.top));
@@ -986,12 +1038,16 @@ void main() {
     testWidgets('the agent state shows once, its full label as a tooltip', (
       tester,
     ) async {
-      await pumpSession(
-        tester,
-        screen: screenWith(),
-        timeline: holding([]),
-        sent: [],
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionPage(
+            screen: screenWith(state: AgentState.working),
+            timeline: holding([]),
+            send: (_) {},
+          ),
+        ),
       );
+      await tester.pump();
       expect(find.textContaining('working', findRichText: true), findsOne);
       expect(find.byTooltip('agent working'), findsOneWidget);
       expect(find.text('/home/me/work'), findsOneWidget);
