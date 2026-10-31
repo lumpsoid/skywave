@@ -3,6 +3,7 @@ import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
+import 'package:skywave_gui/screen/revoked_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
@@ -21,86 +22,72 @@ class ScreenNavigator extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        SafeArea(
-          bottom: false,
-          child: LinkBanner(holder: holders.link, send: send),
-        ),
+        LinkBanner(holder: holders.link, send: send),
         Expanded(
+          // The banner takes the top inset while it shows.
           child: ListenableBuilder(
-            listenable: holders.screen,
-            builder: (context, _) {
-              final update = holders.screen.screen;
-              final kind = holders.screen.kind;
-              if (update == null || kind == null) {
-                return const Scaffold(
-                  body: Center(child: CircularProgressIndicator()),
+            listenable: holders.link,
+            builder: (context, child) => MediaQuery.removePadding(
+              context: context,
+              removeTop: holders.link.link?.label.isNotEmpty ?? false,
+              child: child!,
+            ),
+            child: ListenableBuilder(
+              listenable: holders.screen,
+              builder: (context, _) {
+                final update = holders.screen.screen;
+                final kind = holders.screen.kind;
+                if (update == null || kind == null) {
+                  return const Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  );
+                }
+                return PopScope(
+                  canPop: !update.canGoBack,
+                  onPopInvokedWithResult: (didPop, _) {
+                    if (!didPop) send.act(const ActionIntentBack());
+                  },
+                  child: Navigator(
+                    pages: [
+                      MaterialPage<void>(
+                        key: ValueKey((kind, update.revokedFullScreen)),
+                        child: update.revokedFullScreen
+                            ? RevokedPage(send: send)
+                            : _page(update),
+                      ),
+                    ],
+                    onDidRemovePage: (_) {},
+                  ),
                 );
-              }
-              return PopScope(
-                canPop: !update.canGoBack,
-                onPopInvokedWithResult: (didPop, _) {
-                  if (!didPop) send.act(const ActionIntentBack());
-                },
-                child: Navigator(
-                  pages: [
-                    MaterialPage<void>(
-                      key: ValueKey(kind),
-                      child: update.revokedFullScreen
-                          ? RevokedPage(send: send)
-                          : _page(update.screen),
-                    ),
-                  ],
-                  onDidRemovePage: (_) {},
-                ),
-              );
-            },
+              },
+            ),
           ),
         ),
       ],
     );
   }
 
-  Widget _page(ScreenView screen) => switch (screen) {
-    ScreenViewPairing() => PairingPage(screen: screen, send: send),
-    ScreenViewSessionList() => SessionListPage(screen: screen, send: send),
+  Widget _page(ScreenUpdate update) => switch (update.screen) {
+    final ScreenViewPairing screen => PairingPage(
+      screen: screen,
+      canGoBack: update.canGoBack,
+      send: send,
+    ),
+    final ScreenViewSessionList screen => SessionListPage(
+      screen: screen,
+      canGoBack: update.canGoBack,
+      send: send,
+    ),
     ScreenViewSession(:final session) => SessionPage(
       screen: session,
       timeline: holders.timeline,
       send: send,
     ),
-    ScreenViewSettings() => SettingsPage(screen: screen, send: send),
+    final ScreenViewSettings screen => SettingsPage(
+      screen: screen,
+      canGoBack: update.canGoBack,
+      send: send,
+    ),
     _ => const SizedBox.shrink(),
   };
-}
-
-/// The device was revoked: re-pair, or browse what is here.
-class RevokedPage extends StatelessWidget {
-  const RevokedPage({required this.send, super.key});
-
-  final SendIntent send;
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('This device was revoked.'),
-            const SizedBox(height: 16),
-            FilledButton(
-              onPressed: () => send.act(
-                const ActionIntentNavigate(route: RouteView.pairing),
-              ),
-              child: const Text('Pair again'),
-            ),
-            TextButton(
-              onPressed: () => send(const GuiIntentRevokedDismiss()),
-              child: const Text('Browse local data'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }

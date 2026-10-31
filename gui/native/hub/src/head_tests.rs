@@ -411,3 +411,50 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
             .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
     );
 }
+
+#[test]
+fn a_tapped_candidate_fills_the_create_prompt() {
+    let mut rig = Rig::new();
+    let kind = EventKind::SessionCreated {
+        workdir: "/srv/other".into(),
+    };
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![Event {
+                session_id: SessionId::new(),
+                at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
+                command_id: kind.logged_by_command().then(CommandId::new),
+                kind,
+            }],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/".into(),
+    });
+    rig.intent(GuiIntent::CompletionComplete);
+    rig.results();
+    rig.view();
+    let prompt = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionList { create, .. } => create.clone().unwrap(),
+        other => panic!("not the list: {other:?}"),
+    };
+    let listed = prompt(&rig).popup.expect("the candidates are listed");
+    let paths: Vec<_> = listed.candidates.iter().map(|c| c.path.clone()).collect();
+    assert!(paths.len() >= 2, "both recent workdirs: {paths:?}");
+
+    let outs = rig.intent(GuiIntent::CompletionPick { index: 99 });
+    assert!(outs.is_empty(), "a stale tap does nothing");
+    let before = prompt(&rig).input_rev;
+    rig.intent(GuiIntent::CompletionPick { index: 1 });
+    let after = prompt(&rig);
+    assert_eq!(after.input, format!("{}/", paths[1]));
+    assert!(after.input_rev > before);
+    assert!(after.popup.is_none(), "taking one closes the list");
+}

@@ -617,6 +617,31 @@ impl Head {
                     create.rev = self.revs;
                 }
             }
+            GuiIntent::CompletionPick { index } => {
+                let candidates = self.candidates();
+                let Some(create) = &mut self.create else {
+                    return Ok(());
+                };
+                let Some(index) = usize::try_from(index)
+                    .ok()
+                    .filter(|&index| index < candidates.len())
+                else {
+                    return Ok(());
+                };
+                create.settle.input();
+                // Highlight it, then take it as Enter would.
+                for _ in 0..create.settle.selected() {
+                    create.settle.up();
+                }
+                for _ in 0..index {
+                    create.settle.down(candidates.len());
+                }
+                if let Some(chosen) = create.settle.choose(&candidates) {
+                    self.revs += 1;
+                    create.input = chosen;
+                    create.rev = self.revs;
+                }
+            }
             GuiIntent::CompletionCancel => {
                 let completing = matches!(
                     self.view.as_ref().map(|v| &v.screen),
