@@ -1,7 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <!-- The core talks to the paired server. -->
+    <!-- The core talks to the paired server over plain sockets. Nothing in
+         the GUI watches connectivity, so ACCESS_NETWORK_STATE is not asked. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- The server is usually on the LAN: API 37+ blocks local addresses
+         without it (TCP connects just time out); MainActivity asks on launch
+         until granted. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK"/>
+    <!-- Approval notifications (API 33+); MainActivity asks once. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- open_filex declares these to open shared-storage media. The GUI
          opens only its own blob files, which need none of them. -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove"/>
