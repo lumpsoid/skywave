@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use skywave_core::{
-    AgentSetting, AgentView, BlobState, Decision, Delivery, DeviceRef, FailReason, Outgoing,
-    PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    AgentSetting, AgentView, BlobState, Decision, Delivery, DeviceRef, Effort, FailReason,
+    Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -204,6 +204,18 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
     }
 }
 
+/// A reasoning effort in words: "low", "medium", "high", "extra high",
+/// "max".
+pub fn effort_label(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "extra high",
+        Effort::Max => "max",
+    }
+}
+
 /// What a mode lets the agent do, one line for a picker.
 pub fn mode_detail(mode: PermissionMode) -> &'static str {
     match mode {
@@ -252,6 +264,25 @@ pub fn agent_model_label(agent: &AgentView) -> Option<String> {
     }
 }
 
+/// The effort for a status line: `effort high` in effect, `high → max` with
+/// a switch not yet answered, `unknown → max` before the agent said,
+/// `no effort` when its model takes none (`no effort → high` once one is
+/// asked for), and `None` while neither is known.
+pub fn agent_effort_label(agent: &AgentView) -> Option<String> {
+    let change = agent.effort_change.as_ref().map(|change| change.value);
+    match (agent.effort, change) {
+        (Some(current), Some(change)) if current != Some(change) => Some(format!(
+            "{} → {}",
+            current.map_or("no effort", effort_label),
+            effort_label(change)
+        )),
+        (Some(Some(current)), _) => Some(format!("effort {}", effort_label(current))),
+        (Some(None), _) => Some("no effort".to_owned()),
+        (None, Some(change)) => Some(format!("unknown → {}", effort_label(change))),
+        (None, None) => None,
+    }
+}
+
 /// The agent's newest refusal of a mode, in words: `bypass refused: …`.
 pub fn mode_refusal(agent: &AgentView) -> Option<String> {
     let refused = agent.mode_refused.as_ref()?;
@@ -268,11 +299,23 @@ pub fn model_refusal(agent: &AgentView) -> Option<String> {
     Some(format!("{} refused: {}", refused.value, refused.reason))
 }
 
-/// Both refusals, mode first, for a head that shows them together.
+/// The agent's newest refusal of an effort, in words: `effort max refused: …`.
+pub fn effort_refusal(agent: &AgentView) -> Option<String> {
+    let refused = agent.effort_refused.as_ref()?;
+    Some(format!(
+        "effort {} refused: {}",
+        effort_label(refused.value),
+        refused.reason
+    ))
+}
+
+/// All refusals, mode then model then effort, for a head that shows them
+/// together.
 pub fn agent_refusal(agent: &AgentView) -> Vec<String> {
     mode_refusal(agent)
         .into_iter()
         .chain(model_refusal(agent))
+        .chain(effort_refusal(agent))
         .collect()
 }
 
@@ -283,6 +326,7 @@ pub fn agent_setting_line(setting: &AgentSetting, refused: Option<&str>) -> Stri
     let (what, value) = match setting {
         AgentSetting::Mode(mode) => ("mode", mode_label(*mode).to_owned()),
         AgentSetting::Model(model) => ("model", model.clone()),
+        AgentSetting::Effort(effort) => ("effort", effort.map_or("none", effort_label).to_owned()),
     };
     match refused {
         Some(reason) => format!("{what} {value} refused: {reason}"),
@@ -328,7 +372,7 @@ pub fn scope_label(scope: RuleScope) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use skywave_core::{ModelChoice, SettingChange};
+    use skywave_core::{ModelChoice, Refusal, SettingChange};
 
     use super::*;
 
@@ -371,6 +415,95 @@ mod tests {
         assert_eq!(
             agent_setting_line(&AgentSetting::Mode(PermissionMode::Bypass), Some("no")),
             "mode bypass refused: no"
+        );
+    }
+
+    #[test]
+    fn effort_reads_as_current_then_switch() {
+        let change = |effort| {
+            Some(SettingChange {
+                value: effort,
+                outgoing: None,
+            })
+        };
+        let label = |effort, effort_change| {
+            agent_effort_label(&AgentView {
+                effort,
+                effort_change,
+                ..AgentView::default()
+            })
+        };
+        let words = [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "extra high"),
+            (Effort::Max, "max"),
+        ];
+        for (effort, word) in words {
+            assert_eq!(effort_label(effort), word);
+        }
+        assert_eq!(label(None, None), None);
+        assert_eq!(
+            label(Some(Some(Effort::High)), None).as_deref(),
+            Some("effort high")
+        );
+        assert_eq!(
+            label(Some(Some(Effort::High)), change(Effort::Max)).as_deref(),
+            Some("high → max")
+        );
+        assert_eq!(
+            label(Some(Some(Effort::High)), change(Effort::High)).as_deref(),
+            Some("effort high"),
+            "a switch to what already runs"
+        );
+        assert_eq!(
+            label(None, change(Effort::Max)).as_deref(),
+            Some("unknown → max")
+        );
+        assert_eq!(label(Some(None), None).as_deref(), Some("no effort"));
+        assert_eq!(
+            label(Some(None), change(Effort::High)).as_deref(),
+            Some("no effort → high")
+        );
+    }
+
+    #[test]
+    fn effort_refusals_and_timeline_lines() {
+        let agent = AgentView {
+            effort_refused: Some(Refusal {
+                value: Effort::High,
+                reason: "kept medium".into(),
+            }),
+            model_refused: Some(Refusal {
+                value: "bogus".into(),
+                reason: "no".into(),
+            }),
+            ..AgentView::default()
+        };
+        assert_eq!(
+            effort_refusal(&agent).as_deref(),
+            Some("effort high refused: kept medium")
+        );
+        assert_eq!(effort_refusal(&AgentView::default()), None);
+        assert_eq!(
+            agent_refusal(&agent),
+            ["bogus refused: no", "effort high refused: kept medium"]
+        );
+        assert_eq!(
+            agent_setting_line(&AgentSetting::Effort(Some(Effort::XHigh)), None),
+            "effort → extra high"
+        );
+        assert_eq!(
+            agent_setting_line(&AgentSetting::Effort(None), None),
+            "effort → none"
+        );
+        assert_eq!(
+            agent_setting_line(
+                &AgentSetting::Effort(Some(Effort::High)),
+                Some("kept medium")
+            ),
+            "effort high refused: kept medium"
         );
     }
 

@@ -2,7 +2,7 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CommandId, Decision, PermissionMode, Seq, SessionId, SnippetId,
+    ApprovalId, BlobId, CommandId, Decision, Effort, PermissionMode, Seq, SessionId, SnippetId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +122,13 @@ pub enum Action {
     SetModel {
         session_id: SessionId,
         model: String,
+    },
+    /// Ask the session's agent to run at reasoning effort `effort`, one of
+    /// the view's [`efforts`](crate::AgentView::efforts). A no-op for an
+    /// unknown session. Shown as for a mode.
+    SetEffort {
+        session_id: SessionId,
+        effort: Effort,
     },
     /// Delete an archived session from this device only, to free space and
     /// drop its content here; it stays on the server and other devices.
