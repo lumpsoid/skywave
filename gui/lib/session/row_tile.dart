@@ -8,7 +8,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// One timeline row as Rust sent it: the turn separator or "new" rule
 /// above it, its time, then the item by kind, with its content sections.
 /// A tap selects it and expands or collapses it; a long press or right
-/// click opens its menu (copy, download, edit or discard).
+/// click opens its menu (copy, download, edit or discard). A message's
+/// text selects, with its own menu.
 class RowTile extends StatelessWidget {
   const RowTile({
     required this.row,
@@ -127,6 +128,7 @@ class RowTile extends StatelessWidget {
         hit: hit,
         mark: mark,
         send: send,
+        onTap: row.selectable || row.expandable ? _tap : null,
       ),
       RowKind.tool ||
       RowKind.toolCall ||
@@ -329,12 +331,16 @@ class _Message extends StatelessWidget {
     required this.hit,
     required this.mark,
     required this.send,
+    required this.onTap,
   });
 
   final TimelineRow row;
   final SearchHit? hit;
   final TextStyle mark;
   final SendIntent send;
+
+  /// The row's tap, for a tap on the text.
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -394,10 +400,18 @@ class _Message extends StatelessWidget {
               ),
             ),
           if (row.text.isNotEmpty)
-            Text.rich(
-              TextSpan(
-                style: theme.textTheme.bodyMedium?.copyWith(color: foreground),
-                children: highlighted(row.text, hit?.text ?? const [], mark),
+            _SelectableBody(
+              onTap: onTap,
+              copyMessage: row.selectable
+                  ? () => send(GuiIntentCopy(key: row.key, what: CopyWhat.main))
+                  : null,
+              child: Text.rich(
+                TextSpan(
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: foreground,
+                  ),
+                  children: highlighted(row.text, hit?.text ?? const [], mark),
+                ),
               ),
             ),
         ],
@@ -455,6 +469,72 @@ class _Message extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// A message's text, selectable: a drag (a long press on touch) selects,
+/// and the selection's menu copies it or, with [copyMessage], the whole
+/// message. A tap is still the row's [onTap], or clears a selection.
+///
+/// One area per message, not one over the timeline: the row's tap and
+/// menu stay on the rest of the row, an area over the lazy list would
+/// lose its selection as rows scroll out and are disposed, and a long
+/// press over the whole list would be either the row's menu or a
+/// selection, never both.
+class _SelectableBody extends StatefulWidget {
+  const _SelectableBody({required this.child, this.onTap, this.copyMessage});
+
+  final Widget child;
+  final VoidCallback? onTap;
+  final VoidCallback? copyMessage;
+
+  @override
+  State<_SelectableBody> createState() => _SelectableBodyState();
+}
+
+class _SelectableBodyState extends State<_SelectableBody> {
+  final _area = GlobalKey<SelectionAreaState>();
+  bool _selected = false;
+
+  /// The region takes a plain tap for its own (placing nothing, as text
+  /// here is read-only): this one, nearer, wins it for the row.
+  void _tap() {
+    if (_selected) {
+      _area.currentState?.selectableRegion.clearSelection();
+      ContextMenuController.removeAny();
+      return;
+    }
+    widget.onTap?.call();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SelectionArea(
+      key: _area,
+      onSelectionChanged: (content) {
+        _selected = content != null && content.plainText.isNotEmpty;
+      },
+      contextMenuBuilder: (context, area) {
+        final copy = widget.copyMessage;
+        return AdaptiveTextSelectionToolbar.buttonItems(
+          anchors: area.contextMenuAnchors,
+          buttonItems: [
+            ...area.contextMenuButtonItems,
+            if (copy != null)
+              ContextMenuButtonItem(
+                label: 'Copy message',
+                onPressed: () {
+                  ContextMenuController.removeAny();
+                  copy();
+                },
+              ),
+          ],
+        );
+      },
+      child: widget.onTap == null
+          ? widget.child
+          : GestureDetector(onTap: _tap, child: widget.child),
     );
   }
 }

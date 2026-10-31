@@ -263,6 +263,136 @@ void main() {
     expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.call));
   });
 
+  testWidgets('a message\'s text selects; its menu copies it or the whole '
+      'message; a tap and the row menu still work', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    try {
+      final timeline = holding([
+        anyRow(
+          's:1',
+          RowKind.agentMessage,
+          'hello brave new world',
+          author: 'agent',
+        ),
+      ]);
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: timeline,
+        sent: sent,
+      );
+      final text = find.text('hello brave new world', findRichText: true);
+      expect(
+        find.ancestor(of: text, matching: find.byType(SelectionArea)),
+        findsOneWidget,
+      );
+
+      // A tap on the text is the row's.
+      await tester.tap(text);
+      await tester.pump();
+      expect(timeline.selectedKey, 's:1');
+
+      // A mouse drag selects part of it; Copy takes just that.
+      final box = tester.getRect(text);
+      final drag = await tester.startGesture(
+        box.centerLeft + const Offset(1, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pump();
+      await drag.moveTo(box.center);
+      await tester.pump();
+      await drag.up();
+      await tester.pumpAndSettle();
+      await tester.tapAt(
+        box.centerLeft + const Offset(4, 0),
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Copy message'), findsOneWidget);
+      await tester.tap(find.text('Copy'));
+      await tester.pumpAndSettle();
+      expect(copied, hasLength(1));
+      expect('hello brave new world', startsWith(copied.single));
+      expect(copied.single, isNot('hello brave new world'));
+
+      // Copy message is the whole message, through the hub.
+      await tester.tapAt(
+        box.center,
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      sent.clear();
+      await tester.tap(find.text('Copy message'));
+      await tester.pumpAndSettle();
+      expect(sent, [const GuiIntentCopy(key: 's:1', what: CopyWhat.main)]);
+      expect(find.text('Copy message'), findsNothing);
+
+      // Off the text, the row's menu.
+      await tester.tapAt(
+        tester.getCenter(find.text('agent')),
+        buttons: kSecondaryButton,
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Copy message'), findsNothing);
+      await tester.tap(find.text('Copy'));
+      await tester.pumpAndSettle();
+      expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('on touch a long press on the text selects; off it, the row '
+      'menu', (tester) async {
+    final timeline = holding([
+      anyRow('s:1', RowKind.agentMessage, 'hello world', author: 'agent'),
+    ]);
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: sent,
+    );
+    await tester.longPress(find.text('hello world', findRichText: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsOneWidget);
+    expect(find.text('Edit queued'), findsNothing);
+
+    // A tap clears the selection; it does not also select the row.
+    await tester.tap(find.text('hello world', findRichText: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsNothing);
+    expect(timeline.selectedKey, isNull);
+
+    await tester.longPress(find.text('agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy message'), findsNothing);
+    await tester.tap(find.text('Copy'));
+    await tester.pumpAndSettle();
+    expect(sent.last, const GuiIntentCopy(key: 's:1', what: CopyWhat.main));
+  });
+
   group('approval', () {
     ApprovalPanel panel(List<RuleOption> suggestions) => ApprovalPanel(
       approvalId: 'a1',
