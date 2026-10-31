@@ -12,6 +12,10 @@ publish.workspace = true
 # (terminal, UniFFI, rinf) can use it.
 skywave-core.workspace = true
 
+[dev-dependencies]
+# Timestamps for test timelines.
+chrono.workspace = true
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
