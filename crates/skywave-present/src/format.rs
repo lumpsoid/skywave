@@ -240,7 +240,8 @@ pub fn agent_mode_label(agent: &AgentView) -> String {
 }
 
 /// The model for a status line, as [`agent_mode_label`] does for the mode:
-/// its offered label, else its name.
+/// its offered label, else its name; `unknown → Opus` while one is asked
+/// for before the agent said, and `None` while neither.
 pub fn agent_model_label(agent: &AgentView) -> Option<String> {
     let current = agent.model_label();
     let change = agent.model_change.as_ref().map(|change| {
@@ -250,7 +251,7 @@ pub fn agent_model_label(agent: &AgentView) -> Option<String> {
     });
     match (current, change) {
         (Some(current), Some(change)) if current != change => Some(format!("{current} → {change}")),
-        (None, Some(change)) => Some(format!("? → {change}")),
+        (None, Some(change)) => Some(format!("unknown → {change}")),
         (current, _) => current.map(str::to_owned),
     }
 }
@@ -361,6 +362,15 @@ mod tests {
         assert_eq!(agent_mode_label(&agent), "ask → plan");
         assert_eq!(agent_model_label(&agent).as_deref(), Some("Sonnet → opus"));
         assert_eq!(agent_mode_label(&AgentView::default()), "unknown");
+        assert_eq!(agent_model_label(&AgentView::default()), None);
+        let asked = AgentView {
+            model_change: Some(SettingChange {
+                value: "opus".into(),
+                outgoing: None,
+            }),
+            ..AgentView::default()
+        };
+        assert_eq!(agent_model_label(&asked).as_deref(), Some("unknown → opus"));
         assert_eq!(
             agent_setting_line(&AgentSetting::Mode(PermissionMode::Bypass), Some("no")),
             "mode bypass refused: no"

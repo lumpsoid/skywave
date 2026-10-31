@@ -5533,7 +5533,7 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
     // No list yet: a name is typed, `q` and `?` included.
     assert_eq!(h.key(KeyCode::Char('m')), None);
     let screen = h.screen();
-    assert_contains(&screen, "Model · now ?");
+    assert_contains(&screen, "Model · now unknown");
     assert_contains(&screen, "No list yet");
     assert_contains(&screen, "or type a model name");
     assert!(h.app.typing());
@@ -5552,7 +5552,7 @@ fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
         })
     );
     assert!(!h.app.typing(), "back on the timeline");
-    assert_contains(&status_line(&h, 100), "agent idle · ? → opus");
+    assert_contains(&status_line(&h, 100), "agent idle · model unknown → opus");
     let command = logged_command(
         &mut h,
         id,

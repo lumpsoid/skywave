@@ -149,7 +149,7 @@ class StatusLine extends StatelessWidget {
           ),
           _Chip(
             icon: Icons.memory,
-            label: settings.modelLabel ?? 'model',
+            label: settings.modelLabel,
             refusal: settings.modelRefusal,
             tooltip: 'Model',
             onTap: () => pickModel(context, screen, send),

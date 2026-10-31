@@ -68,6 +68,7 @@ const _composer = ComposerView(text: '', cursorUtf16: 0, rev: 1);
 /// An agent that has not said its mode or model yet.
 const unknownAgent = AgentSettingsView(
   modeLabel: 'mode unknown',
+  modelLabel: 'model unknown',
   modes: [],
   models: [],
 );
