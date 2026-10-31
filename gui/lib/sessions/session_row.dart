@@ -1,16 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/look.dart' hide StateBadge;
 import 'package:skywave_gui/src/bindings/bindings.dart';
-
-/// The colour of an agent state's badge, shared by the list and the
-/// session header.
-Color agentStateColor(AgentState state, ColorScheme colors) => switch (state) {
-  AgentState.idle => colors.outline,
-  AgentState.working => const Color(0xFF0277BD),
-  AgentState.awaitingApproval => const Color(0xFFF57F17),
-  AgentState.errored => colors.error,
-  AgentState.stopped => colors.outlineVariant,
-};
 
 /// An agent state's badge with Rust's label.
 class StateBadge extends StatelessWidget {
@@ -22,7 +13,7 @@ class StateBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final color = agentStateColor(state, theme.colorScheme);
+    final color = SkyColors.of(context).agent(state);
     return Container(
       constraints: const BoxConstraints(minWidth: 72),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -113,10 +104,7 @@ class SessionRow extends StatelessWidget {
                       icon: Icons.notification_important,
                       text: approvals,
                       semanticLabel: _approvalsLabel(approvals),
-                      color: agentStateColor(
-                        AgentState.awaitingApproval,
-                        colors,
-                      ),
+                      color: SkyColors.of(context).warning,
                     ),
                   if (row.error case final error?)
                     _Marker(

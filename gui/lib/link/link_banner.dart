@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
+import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The link banner across the top of every screen: Rust's label on the
@@ -105,41 +106,20 @@ class LinkBanner extends StatelessWidget {
     );
   }
 
-  /// The banner's colours and icon for each state: online green (only
-  /// with something queued or waiting), syncing blue, offline amber,
-  /// refused red.
+  /// The banner's colours (the theme's) and icon for each state.
   static ({Color background, Color foreground, IconData icon}) _look(
     LinkState state,
     BuildContext context,
   ) {
-    final colors = Theme.of(context).colorScheme;
-    return switch (state) {
-      LinkState.online => (
-        background: const Color(0xFF2E7D32),
-        foreground: Colors.white,
-        icon: Icons.cloud_done,
-      ),
-      LinkState.connecting || LinkState.catchingUp => (
-        background: const Color(0xFF0277BD),
-        foreground: Colors.white,
-        icon: Icons.cloud_sync,
-      ),
-      LinkState.reconnecting => (
-        background: const Color(0xFFFFB300),
-        foreground: Colors.black,
-        icon: Icons.cloud_off,
-      ),
-      LinkState.revoked || LinkState.protocolMismatch => (
-        background: colors.error,
-        foreground: colors.onError,
-        icon: Icons.block,
-      ),
-      LinkState.unpaired => (
-        background: colors.surfaceContainerHighest,
-        foreground: colors.onSurface,
-        icon: Icons.link_off,
-      ),
+    final (:background, :foreground) = SkyColors.of(context).link(state);
+    final icon = switch (state) {
+      LinkState.online => Icons.cloud_done,
+      LinkState.connecting || LinkState.catchingUp => Icons.cloud_sync,
+      LinkState.reconnecting => Icons.cloud_off,
+      LinkState.revoked || LinkState.protocolMismatch => Icons.block,
+      LinkState.unpaired => Icons.link_off,
     };
+    return (background: background, foreground: foreground, icon: icon);
   }
 }
 
