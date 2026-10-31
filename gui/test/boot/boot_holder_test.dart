@@ -73,4 +73,34 @@ void main() {
     // Booted asks Rust for the whole state.
     expect(sent, [const GuiIntentAppReady()]);
   });
+
+  testWidgets('leaving and returning to the screen is reported once each', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      SkywaveApp(boot: BootHolder(), holders: fakeHolders(), send: sent.add),
+    );
+
+    // Away: through inactive and hidden to paused.
+    for (final state in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    expect(sent, [const GuiIntentAppBackgrounded()]);
+
+    // Back: the same way up to resumed.
+    sent.clear();
+    for (final state in [
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    expect(sent, [const GuiIntentAppForegrounded()]);
+  });
 }

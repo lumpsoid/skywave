@@ -9,12 +9,15 @@
 //!   mapping, one feature each.
 //! - `run`: the hub task's `select!` loop; `boot`, `dispatcher`: opening
 //!   the core and dispatching to it in order.
+//! - `lifecycle`: what the app leaving and returning to the screen does to
+//!   the core, per platform.
 
 mod boot;
 mod clip;
 pub mod dispatcher;
 mod head;
 mod intents;
+mod lifecycle;
 mod link;
 mod logging;
 mod run;
