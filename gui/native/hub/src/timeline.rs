@@ -170,16 +170,19 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
         outgoing: None,
         delivery_label: delivery(item).map(|(o, d)| delivery_label(&d, &o, wall_ms)),
         discardable: false,
+        command_id: None,
         tool: None,
         sections: Vec::new(),
     };
     let (at, entry) = match item {
         TimelineItem::Pending {
+            command_id,
             text,
             outgoing,
             discardable,
             ..
         } => {
+            row.command_id = Some(command_id.0.to_string());
             row.author = Some("you".to_owned());
             row.own = true;
             row.text = clean_text(text);
@@ -975,6 +978,16 @@ mod tests {
         let mut held = old.rows;
         apply(&mut held, updates);
         assert_eq!(held, new.rows);
+    }
+
+    #[test]
+    fn a_pending_message_carries_the_command_id_discard_takes() {
+        let id = CommandId::new();
+        let pending = rows_of(vec![pending(id, "hi")]);
+        assert_eq!(pending.rows[0].command_id, Some(id.0.to_string()));
+        assert!(pending.rows[0].discardable);
+        let logged = rows_of(vec![logged_message(2, id, "hi")]);
+        assert_eq!(logged.rows[0].command_id, None);
     }
 
     #[test]
