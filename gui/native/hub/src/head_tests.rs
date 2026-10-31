@@ -481,6 +481,36 @@ fn a_pasted_pairing_uri_fills_the_form_and_a_malformed_one_is_reported() {
 }
 
 #[test]
+fn a_scanned_pairing_uri_fills_the_form_and_any_other_code_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open_detached(dir.path()).unwrap();
+    let clock = Clock::read();
+    let mut head = Head::new();
+    head.on_view(core.view(), clock);
+    let form = |head: &Head| match &head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Pairing { form, .. } => form.clone(),
+        other => panic!("not pairing: {other:?}"),
+    };
+    let fp = skywave_core::Fingerprint::of_der(b"ca");
+    let uri = format!(
+        "skywave://pair?addr=host%3A7443&code=ABCDE12345&fp={}",
+        fp.to_hex()
+    );
+    head.on_intent(GuiIntent::PairScanned { text: uri }, clock);
+    let filled = form(&head);
+    assert_eq!(filled.address, "host:7443");
+
+    let outs = head.on_intent(
+        GuiIntent::PairScanned {
+            text: "https://example.com".into(),
+        },
+        clock,
+    );
+    assert_eq!(errors(&outs).len(), 1, "a scan is never a field's text");
+    assert_eq!(form(&head), filled);
+}
+
+#[test]
 fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
     let mut rig = Rig::new();
     let mut view = rig.core.view();
