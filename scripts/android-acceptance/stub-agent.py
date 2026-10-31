@@ -60,6 +60,7 @@ SAFE_PREFIX = os.environ.get("STUB_SAFE_PREFIX", "/tmp/a12/")
 DENY_DEFAULT = "The user denied this action."
 # What set_permission_mode accepts. The stub only acts on acceptEdits and
 # bypassPermissions; the others are remembered and reported.
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
 TOOLS = ["Task", "Bash", "Glob", "Grep", "Read", "Edit", "MultiEdit", "Write",
          "WebFetch", "WebSearch", "TodoWrite"]
@@ -210,6 +211,7 @@ class Stub:
         self.sid = self.opts["session_id"]
         self.cwd = os.getcwd()
         self.mode = self.opts["mode"]
+        self.effort = "medium"
         self.add_dirs = list(self.opts["add_dirs"])
         self.rules = [parse_rule_string(s) for s in self.opts["allowed"] if s]
         self.rules += self.load_settings_rules()
@@ -311,6 +313,10 @@ class Stub:
             emit(self.set_permission_mode(rid, (m.get("request") or {}).get("mode")))
         elif sub == "set_model":
             emit(self.set_model(rid, (m.get("request") or {}).get("model")))
+        elif sub == "apply_flag_settings":
+            emit(self.apply_flag_settings(rid, (m.get("request") or {}).get("settings")))
+        elif sub == "get_settings":
+            emit(self.get_settings(rid))
         else:
             emit({"type": "control_response",
                   "response": {"subtype": "error", "request_id": rid,
@@ -403,6 +409,22 @@ class Stub:
         return {"type": "control_response", "response": {
             "subtype": "success", "request_id": rid, "response": {"model": MODEL}}}
 
+    def apply_flag_settings(self, rid, settings):
+        """The reply to apply_flag_settings (docs/agents/claude-code.md §3.10):
+        an empty success, whatever it set; an unknown effortLevel is ignored."""
+        level = (settings or {}).get("effortLevel")
+        if level in EFFORTS:
+            self.effort = level
+            log("RUL", f"effort set to {level}")
+        return {"type": "control_response", "response": {
+            "subtype": "success", "request_id": rid}}
+
+    def get_settings(self, rid):
+        """The reply to get_settings, cut to what skywaved reads: `applied`."""
+        return {"type": "control_response", "response": {
+            "subtype": "success", "request_id": rid, "response": {
+                "applied": {"model": MODEL, "effort": self.effort}}}}
+
     def initialize_response(self, rid):
         return {"type": "control_response", "response": {
             "subtype": "success", "request_id": rid, "response": {
@@ -410,7 +432,8 @@ class Stub:
                 "available_output_styles": ["default"],
                 "models": [{"value": "default", "displayName": "Stub (default)",
                             "description": "stub-agent, no model",
-                            "resolvedModel": MODEL}],
+                            "resolvedModel": MODEL, "supportsEffort": True,
+                            "supportedEffortLevels": EFFORTS}],
                 "account": {"email": "user@example.com",
                             "organization": "<stub-organization>"},
                 "pid": os.getpid(), "claude_code_version": VERSION,

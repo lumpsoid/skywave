@@ -36,6 +36,17 @@
 //! answer, so such an echo is dropped rather than reported as the mode;
 //! any other status (an approved `ExitPlanMode` returning to the mode before
 //! plan) is reported.
+//!
+//! **Effort** (docs/agents/claude-code.md §3.10). A request is an
+//! `apply_flag_settings` setting `effortLevel`, but its ack proves nothing
+//! (the CLI acks a level it ignores), so the answer is the `get_settings`
+//! written once the ack comes: `applied.effort` is the effort in force, or
+//! `null` when the running model takes none. One such chain runs at a time;
+//! a request asked while one runs waits for it, so each read answers only its
+//! own request. Unasked reads follow the initialize answer and every model
+//! switch, which can change the effort, and report what runs; one answered
+//! while a chain runs or waits is dropped, as the chain's own read is newer.
+//! A chain that ends without a read (an error) writes the dropped one again.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -45,7 +56,7 @@ use uuid::Uuid;
 
 use super::{display, rules, usage};
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, ModelChoice, PermissionMode, ResumeHandle,
+    AdapterEvent, AgentCallId, AgentRequestId, Effort, ModelChoice, PermissionMode, ResumeHandle,
     TurnOutcome,
 };
 
@@ -137,6 +148,27 @@ pub fn set_model_request(request_id: &str, model: &str) -> Value {
     })
 }
 
+/// The request that sets the effort flag; the ack proves nothing.
+pub fn apply_effort_request(request_id: &str, effort: Effort) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "apply_flag_settings",
+            "settings": { "effortLevel": effort_name(effort) },
+        },
+    })
+}
+
+/// The request that reads back the settings in force.
+pub fn get_settings_request(request_id: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "get_settings" },
+    })
+}
+
 /// What the CLI calls `mode`.
 pub fn mode_name(mode: PermissionMode) -> &'static str {
     match mode {
@@ -156,7 +188,26 @@ pub fn parse_mode(name: &str) -> Option<PermissionMode> {
         .find(|mode| mode_name(*mode) == name)
 }
 
-/// The models an initialize answer offers.
+/// What the CLI calls `effort`.
+pub fn effort_name(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
+/// The effort the CLI calls `name`; `None` for one it added since.
+pub fn parse_effort(name: &str) -> Option<Effort> {
+    Effort::ALL
+        .into_iter()
+        .find(|effort| effort_name(*effort) == name)
+}
+
+/// The models an initialize answer offers, each with the effort levels it
+/// takes (`supportedEffortLevels`, when it `supportsEffort`).
 pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
     let Some(models) = models.and_then(Value::as_array) else {
         return Vec::new();
@@ -172,11 +223,26 @@ pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
                     .filter(|t| !t.is_empty())
                     .map(str::to_owned)
             };
+            let efforts = match model.get("supportsEffort").and_then(Value::as_bool) {
+                Some(true) => model
+                    .get("supportedEffortLevels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(parse_effort)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
             Some(ModelChoice {
                 label: text("displayName").unwrap_or_else(|| id.clone()),
                 detail: text("description"),
                 resolved: text("resolvedModel"),
                 id,
+                efforts,
             })
         })
         .collect()
@@ -269,18 +335,33 @@ pub struct Protocol {
     /// tool-use id: a structured result is read by its tool.
     tools: HashMap<String, String>,
     shutting_down: bool,
-    /// Mode and model requests the CLI has not answered, by request id.
+    /// Mode, model and effort requests and effort reads the CLI has not
+    /// answered, by request id.
     settings: HashMap<String, Asked>,
+    /// Effort requests waiting for the chain in flight, oldest first.
+    efforts: VecDeque<Effort>,
+    /// An effort chain (apply, then its read) has not ended.
+    effort_in_flight: bool,
+    /// An unasked read was dropped while a chain ran, and no read has
+    /// answered since: what it saw is not in the log.
+    effort_unread: bool,
     /// Modes switched to on request whose `system/status` echo has not
     /// come yet, oldest first.
     echoes: VecDeque<PermissionMode>,
 }
 
-/// A mode or model request waiting for its `control_response`.
+/// A control request waiting for its `control_response`.
 #[derive(Debug, Clone)]
 enum Asked {
     Mode(PermissionMode),
     Model(String),
+    /// The `apply_flag_settings` that starts an effort chain.
+    EffortApply(Effort),
+    /// A `get_settings`: the answer to the effort `asked`, or, for `None`,
+    /// a look at what runs.
+    EffortRead {
+        asked: Option<Effort>,
+    },
 }
 
 impl Protocol {
@@ -306,6 +387,9 @@ impl Protocol {
             tools: HashMap::new(),
             shutting_down: false,
             settings: HashMap::new(),
+            efforts: VecDeque::new(),
+            effort_in_flight: false,
+            effort_unread: false,
             echoes: VecDeque::new(),
         }
     }
@@ -448,6 +532,16 @@ impl Protocol {
         }
     }
 
+    /// Asks the CLI to run at `effort`; answered by `EffortSet` or
+    /// `EffortRefused` once the `get_settings` after its apply comes back.
+    /// Asked while another effort chain runs, it waits for that one to end.
+    pub fn set_effort(&mut self, effort: Effort) -> Output {
+        self.efforts.push_back(effort);
+        let mut out = Output::default();
+        self.next_effort(&mut out);
+        out
+    }
+
     /// The session is stopping: queued messages are dropped and no new turn
     /// starts.
     pub fn begin_shutdown(&mut self) {
@@ -499,6 +593,46 @@ impl Protocol {
     fn request_id(&mut self) -> String {
         self.next_request += 1;
         format!("skywave_{}", self.next_request)
+    }
+
+    /// Starts the oldest waiting effort chain, unless one is in flight.
+    fn next_effort(&mut self, out: &mut Output) {
+        if self.effort_in_flight {
+            return;
+        }
+        let Some(effort) = self.efforts.pop_front() else {
+            return;
+        };
+        self.effort_in_flight = true;
+        let id = self.request_id();
+        out.writes.push(apply_effort_request(&id, effort));
+        self.settings.insert(id, Asked::EffortApply(effort));
+    }
+
+    /// The effort chain in flight ended: the next one starts. With none
+    /// waiting, a read dropped during the chain that nothing replaced (the
+    /// chain ended without reading) is written again.
+    fn end_effort(&mut self, out: &mut Output) {
+        self.effort_in_flight = false;
+        self.next_effort(out);
+        if self.effort_unread && !self.effort_busy() {
+            self.effort_unread = false;
+            self.read_effort(None, out);
+        }
+    }
+
+    /// An effort chain runs or waits, so a read that is not its own is
+    /// older than the read that will end it.
+    fn effort_busy(&self) -> bool {
+        self.effort_in_flight || !self.efforts.is_empty()
+    }
+
+    /// Writes a `get_settings` answering the effort `asked`, or, for `None`,
+    /// looking at what runs.
+    fn read_effort(&mut self, asked: Option<Effort>, out: &mut Output) {
+        let id = self.request_id();
+        out.writes.push(get_settings_request(&id));
+        self.settings.insert(id, Asked::EffortRead { asked });
     }
 
     fn begin_turn(&mut self, text: &str) -> Output {
@@ -717,7 +851,7 @@ impl Protocol {
         out.events.push(AdapterEvent::PermissionMode(mode));
     }
 
-    /// The answer to a mode or model request.
+    /// The answer to a mode, model or effort request, or to an effort read.
     fn on_setting_response(&mut self, asked: Asked, response: &Value, out: &mut Output) {
         let success = str_field(response, "subtype") == "success";
         let reason = || {
@@ -728,7 +862,7 @@ impl Protocol {
                 .to_owned()
         };
         let body = response.get("response").unwrap_or(&Value::Null);
-        out.events.push(match asked {
+        match asked {
             Asked::Mode(mode) if success => {
                 let mode = body
                     .get("mode")
@@ -736,12 +870,12 @@ impl Protocol {
                     .and_then(parse_mode)
                     .unwrap_or(mode);
                 self.echoes.push_back(mode);
-                AdapterEvent::PermissionModeSet(mode)
+                out.events.push(AdapterEvent::PermissionModeSet(mode));
             }
-            Asked::Mode(mode) => AdapterEvent::PermissionModeRefused {
+            Asked::Mode(mode) => out.events.push(AdapterEvent::PermissionModeRefused {
                 mode,
                 reason: reason(),
-            },
+            }),
             Asked::Model(model) if success => {
                 let resolved = body
                     .get("model")
@@ -749,13 +883,100 @@ impl Protocol {
                     .filter(|m| !m.is_empty())
                     .map_or(model, str::to_owned);
                 self.model = Some(resolved.clone());
-                AdapterEvent::ModelSet(resolved)
+                out.events.push(AdapterEvent::ModelSet(resolved));
+                // Another model may take another effort, or none.
+                self.read_effort(None, out);
             }
-            Asked::Model(model) => AdapterEvent::ModelRefused {
+            Asked::Model(model) => out.events.push(AdapterEvent::ModelRefused {
                 model,
                 reason: reason(),
-            },
-        });
+            }),
+            // Written only now: a read sent with the apply could be answered
+            // before the apply is.
+            Asked::EffortApply(effort) if success => self.read_effort(Some(effort), out),
+            Asked::EffortApply(effort) => {
+                out.events.push(AdapterEvent::EffortRefused {
+                    effort,
+                    reason: reason(),
+                });
+                self.end_effort(out);
+            }
+            Asked::EffortRead { asked } => self.on_effort_read(asked, response, out),
+        }
+    }
+
+    /// The answer to a `get_settings`. The body also holds the merged
+    /// settings (env, hooks, permission rules): never log it.
+    fn on_effort_read(&mut self, asked: Option<Effort>, response: &Value, out: &mut Output) {
+        let success = str_field(response, "subtype") == "success";
+        let applied = response
+            .get("response")
+            .and_then(|body| body.get("applied"));
+        let raw = applied.and_then(|applied| applied.get("effort"));
+        let in_force = if success { applied_effort(raw) } else { None };
+        let raw = match raw {
+            Some(Value::String(name)) => name.clone(),
+            Some(other) => other.to_string(),
+            None => "nothing".to_owned(),
+        };
+        if success && in_force.is_none() {
+            tracing::warn!(effort = %raw, "agent reports an effort the adapter does not know");
+        }
+        let Some(effort) = asked else {
+            match in_force {
+                Some(in_force) if !self.effort_busy() => {
+                    out.events.push(AdapterEvent::Effort(in_force));
+                }
+                Some(_) => self.effort_unread = true,
+                None if !success => {
+                    tracing::warn!(
+                        "cannot read the agent's settings: {}",
+                        str_field(response, "error")
+                    );
+                }
+                None => {}
+            }
+            return;
+        };
+        match in_force {
+            Some(in_force) if in_force == Some(effort) => {
+                out.events.push(AdapterEvent::EffortSet(in_force));
+            }
+            Some(in_force) => {
+                let reason = match in_force {
+                    Some(kept) => format!("kept {}", effort_name(kept)),
+                    None => {
+                        let model = applied
+                            .and_then(|applied| applied.get("model"))
+                            .and_then(Value::as_str)
+                            .or(self.model.as_deref())
+                            .unwrap_or("the model");
+                        format!("{model} takes no effort level")
+                    }
+                };
+                out.events
+                    .push(AdapterEvent::EffortRefused { effort, reason });
+                out.events.push(AdapterEvent::Effort(in_force));
+            }
+            None => {
+                let reason = if success {
+                    format!("agent reports effort {raw}")
+                } else {
+                    response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("refused")
+                        .to_owned()
+                };
+                out.events
+                    .push(AdapterEvent::EffortRefused { effort, reason });
+            }
+        }
+        if success {
+            // This read is newer than any dropped one.
+            self.effort_unread = false;
+        }
+        self.end_effort(out);
     }
 
     fn on_control_response(&mut self, message: &Value, out: &mut Output) {
@@ -786,6 +1007,8 @@ impl Protocol {
                 out.events.push(AdapterEvent::ModelsOffered(models));
             }
             self.ready = true;
+            // Neither this answer nor `system/init` names the effort.
+            self.read_effort(None, out);
         } else {
             let error = response
                 .get("error")
@@ -889,6 +1112,17 @@ fn result_error(message: &Value) -> String {
     match message.get("result").and_then(Value::as_str) {
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => format!("turn failed ({})", str_field(message, "subtype")),
+    }
+}
+
+/// The effort a `get_settings` answer's `applied.effort` names: `Some(None)`
+/// for `null` (the running model takes none), `None` for a level this
+/// adapter does not know or no effort at all.
+fn applied_effort(raw: Option<&Value>) -> Option<Option<Effort>> {
+    match raw? {
+        Value::Null => Some(None),
+        Value::String(name) => parse_effort(name).map(Some),
+        _ => None,
     }
 }
 

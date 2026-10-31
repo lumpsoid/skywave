@@ -414,6 +414,12 @@ impl Model {
                 }
                 self.enqueue(CommandKind::SetModel { session_id, model })
             }
+            Action::SetEffort { session_id, effort } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SetEffort { session_id, effort })
+            }
             Action::DeleteSessionLocally { session_id } => {
                 if !self.summary(session_id).is_some_and(|s| self.deletable(s)) {
                     return Vec::new();
@@ -1281,11 +1287,26 @@ impl Model {
                 outgoing: None,
             }),
         };
+        let effort_change = match local(
+            &|kind| matches!(kind, CommandKind::SetEffort { session_id, .. } if *session_id == id),
+        ) {
+            Some((CommandKind::SetEffort { effort, .. }, outgoing)) => Some(SettingChange {
+                value: effort,
+                outgoing: Some(outgoing),
+            }),
+            _ => agent.effort.requested_effort().map(|r| SettingChange {
+                value: r.value,
+                outgoing: None,
+            }),
+        };
         AgentView {
             mode: agent.mode.current,
             model: agent.model.current.clone(),
             mode_change,
             model_change,
+            effort: agent.effort.current,
+            effort_change,
+            effort_refused: agent.effort.refused_effort(),
             mode_refused: agent.mode.refused.clone(),
             model_refused: agent.model.refused.clone(),
             models: self.models.clone(),
@@ -1481,7 +1502,8 @@ impl Model {
                 }
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
                 EventKind::PermissionModeRequested { by, .. }
-                | EventKind::ModelRequested { by, .. } => {
+                | EventKind::ModelRequested { by, .. }
+                | EventKind::EffortRequested { by, .. } => {
                     if let Some(command) = event.command_id {
                         asked_by.insert(command, *by);
                     }
@@ -1518,6 +1540,20 @@ impl Model {
                 }),
                 // Shown in the header.
                 EventKind::SessionCreated { .. } | EventKind::ModelsOffered { .. } => None,
+                EventKind::EffortChanged { effort, answers } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Effort(*effort),
+                    by: self.asker(&asked_by, *answers),
+                    refused: None,
+                }),
+                EventKind::EffortRefused {
+                    effort,
+                    reason,
+                    answers,
+                } => Some(Entry::AgentSetting {
+                    setting: AgentSetting::Effort(Some(*effort)),
+                    by: self.asker(&asked_by, *answers),
+                    refused: Some(reason.clone()),
+                }),
             };
             if let Some(entry) = entry {
                 items.push(TimelineItem::Logged {
@@ -1749,7 +1785,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::RenameSession { session_id, .. }
         | CommandKind::SetSessionArchived { session_id, .. }
         | CommandKind::SetPermissionMode { session_id, .. }
-        | CommandKind::SetModel { session_id, .. } => Some(*session_id),
+        | CommandKind::SetModel { session_id, .. }
+        | CommandKind::SetEffort { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -1791,7 +1828,7 @@ mod tests {
 
     use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{
-        BlobRef, Decision, RejectReason, RuleScope, ToolDisplay, ToolKind, ToolResult,
+        BlobRef, Decision, Effort, RejectReason, RuleScope, ToolDisplay, ToolKind, ToolResult,
     };
 
     use super::*;
@@ -2661,6 +2698,7 @@ mod tests {
             label: "Sonnet".into(),
             detail: None,
             resolved: Some("model-s".into()),
+            efforts: Vec::new(),
         };
         f.log(
             a,
@@ -2733,6 +2771,168 @@ mod tests {
                 reason: "not found".into(),
             })
         );
+    }
+
+    #[test]
+    fn an_effort_switch_shows_until_answered_and_its_timeline_names_who_asked() {
+        let mut f = Fixture::paired();
+        let (sid, other) = (f.session("/srv/a"), f.session("/srv/b"));
+        assert!(
+            f.dispatch(Action::SetEffort {
+                session_id: SessionId::new(),
+                effort: Effort::High,
+            })
+            .is_empty(),
+            "an unknown session is a no-op"
+        );
+        f.log(
+            sid,
+            vec![EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: None,
+            }],
+        );
+        f.open(sid);
+        assert_eq!(f.session_view().agent.effort, Some(Some(Effort::High)));
+        let command = queued(&f.dispatch(Action::SetEffort {
+            session_id: sid,
+            effort: Effort::Max,
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::SetEffort {
+                session_id: sid,
+                effort: Effort::Max
+            }
+        );
+        // On its way: this device's command, for this session only.
+        assert_eq!(
+            f.session_view().agent.effort_change,
+            Some(SettingChange {
+                value: Effort::Max,
+                outgoing: Some(Outgoing::Queued),
+            })
+        );
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::EffortRequested {
+                    effort: Effort::Max,
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        let agent = f.session_view().agent;
+        assert_eq!(agent.effort, Some(Some(Effort::High)));
+        assert_eq!(
+            agent.effort_change,
+            Some(SettingChange {
+                value: Effort::Max,
+                outgoing: None,
+            })
+        );
+        f.log(
+            sid,
+            vec![EventKind::EffortRefused {
+                effort: Effort::Max,
+                reason: "kept high".into(),
+                answers: Some(command.id),
+            }],
+        );
+        let view = f.session_view();
+        assert_eq!(view.agent.effort_change, None);
+        assert_eq!(
+            view.agent.effort_refused,
+            Some(Refusal {
+                value: Effort::Max,
+                reason: "kept high".into(),
+            })
+        );
+        f.log(
+            sid,
+            vec![EventKind::EffortChanged {
+                effort: None,
+                answers: None,
+            }],
+        );
+        let view = f.session_view();
+        assert_eq!(view.agent.effort, Some(None));
+        let device = Some(DeviceRef {
+            id: me,
+            name: None,
+            me: true,
+        });
+        let settings: Vec<&Entry> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: entry @ Entry::AgentSetting { .. },
+                    ..
+                } => Some(entry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                &Entry::AgentSetting {
+                    setting: AgentSetting::Effort(Some(Effort::High)),
+                    by: None,
+                    refused: None,
+                },
+                &Entry::AgentSetting {
+                    setting: AgentSetting::Effort(Some(Effort::Max)),
+                    by: device,
+                    refused: Some("kept high".into()),
+                },
+                &Entry::AgentSetting {
+                    setting: AgentSetting::Effort(None),
+                    by: None,
+                    refused: None,
+                },
+            ]
+        );
+        // The overlay is per session.
+        f.open(other);
+        assert_eq!(f.session_view().agent.effort_change, None);
+    }
+
+    #[test]
+    fn efforts_follow_the_pending_model_and_fall_back_to_every_level() {
+        let choice = |id: &str, efforts: Vec<Effort>| ModelChoice {
+            id: id.into(),
+            label: id.into(),
+            detail: None,
+            resolved: Some(format!("{id}-full")),
+            efforts,
+        };
+        let change = |model: &str| {
+            Some(SettingChange {
+                value: model.to_owned(),
+                outgoing: None,
+            })
+        };
+        let mut agent = AgentView::default();
+        assert_eq!(agent.efforts(), Effort::ALL, "no list yet");
+        agent.models = vec![
+            choice("sonnet", vec![Effort::Low, Effort::High]),
+            choice("haiku", Vec::new()),
+        ];
+        agent.model = Some("sonnet-full".into());
+        assert_eq!(agent.efforts(), [Effort::Low, Effort::High]);
+        agent.model_change = change("haiku");
+        assert!(agent.efforts().is_empty(), "the pending model takes none");
+        agent.model_change = change("typed-by-hand");
+        assert_eq!(agent.efforts(), Effort::ALL, "a model no choice names");
+        agent.model_change = None;
+        agent.model = Some("other".into());
+        assert_eq!(agent.efforts(), Effort::ALL);
     }
 
     #[test]

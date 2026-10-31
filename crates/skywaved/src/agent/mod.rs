@@ -38,16 +38,17 @@
 //!   that point are reported as [`AdapterEvent::ApprovalCancelled`] (or are
 //!   cancelled by the mapper when the turn ends), followed by
 //!   `TurnEnded(Interrupted)`. The session stays usable for the next turn.
-//! - [`AgentSession::set_permission_mode`] and [`AgentSession::set_model`]
-//!   work at any time, mid-turn and with an approval pending too. Each
-//!   request gets exactly one answer, in the order asked:
-//!   `PermissionModeSet` / `PermissionModeRefused` (`ModelSet` /
-//!   `ModelRefused`), unless the agent exits first. What the agent runs
-//!   with otherwise (at start, at a turn, a change it made on its own) is
-//!   reported as `PermissionMode` / `Model`, as often as the agent says, and
-//!   the models it offers as `ModelsOffered`. [`StartSpec`] names the mode
-//!   and model to start with; the adapter applies them as requests, so each
-//!   is answered the same way.
+//! - [`AgentSession::set_permission_mode`], [`AgentSession::set_model`] and
+//!   [`AgentSession::set_effort`] work at any time, mid-turn and with an
+//!   approval pending too. Each request gets exactly one answer, in the
+//!   order asked: `PermissionModeSet` / `PermissionModeRefused` (`ModelSet`
+//!   / `ModelRefused`, `EffortSet` / `EffortRefused`), unless the agent
+//!   exits first. What the agent runs with otherwise (at start, at a turn, a
+//!   change it made on its own) is reported as `PermissionMode` / `Model` /
+//!   `Effort`, as often as the agent says, and the models it offers as
+//!   `ModelsOffered`. [`StartSpec`] names the mode, model and effort to
+//!   start with; the adapter applies them as requests, so each is answered
+//!   the same way.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -65,7 +66,9 @@ use std::path::PathBuf;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{Decision, SessionId};
-pub use skywave_proto::{ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage};
+pub use skywave_proto::{
+    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage,
+};
 use tokio::sync::mpsc;
 
 use crate::db::Db;
@@ -166,6 +169,8 @@ pub struct StartSpec {
     pub mode: Option<PermissionMode>,
     /// The model to run, asked for like `mode`.
     pub model: Option<String>,
+    /// The reasoning effort to run at, asked for like `mode`.
+    pub effort: Option<Effort>,
 }
 
 /// How a turn ended.
@@ -242,6 +247,15 @@ pub enum AdapterEvent {
     /// The answer to the oldest unanswered model request: the agent refused
     /// `model` (as asked) and keeps the one it had.
     ModelRefused { model: String, reason: String },
+    /// The agent runs at `effort`, as it reported unasked; `None` when its
+    /// model takes no effort level. May repeat.
+    Effort(Option<Effort>),
+    /// The answer to the oldest unanswered effort request: the agent runs at
+    /// `effort` now (`None`: its model takes no effort level).
+    EffortSet(Option<Effort>),
+    /// The answer to the oldest unanswered effort request: the agent refused
+    /// `effort` and keeps the one it had.
+    EffortRefused { effort: Effort, reason: String },
     /// The models the agent offers, uncut.
     ModelsOffered(Vec<ModelChoice>),
     /// The agent stopped; no further events follow. `error` is set when it
@@ -314,6 +328,11 @@ pub trait AgentSession: Send + 'static {
     /// Asks the agent to run `model`; answered by `ModelSet` or
     /// `ModelRefused`.
     fn set_model(&mut self, model: String) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Asks the agent to run at `effort`; answered by `EffortSet` or
+    /// `EffortRefused`.
+    fn set_effort(&mut self, effort: Effort)
+    -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
     /// Interrupt first to stop a running turn cleanly; a turn still running

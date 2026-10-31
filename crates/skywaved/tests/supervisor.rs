@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use serde_json::json;
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind,
-    ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
-    SessionState, ToolResult,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Effort,
+    EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq,
+    SessionId, SessionState, ToolResult,
 };
+use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
     FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, REFUSE_REASON, Step,
@@ -141,6 +142,14 @@ impl Fixture {
         self.command(CommandKind::SetModel {
             session_id: self.session_id,
             model: model.into(),
+        })
+    }
+
+    /// Sends a `SetEffort` and returns its command id.
+    fn set_effort(&mut self, effort: Effort) -> CommandId {
+        self.command(CommandKind::SetEffort {
+            session_id: self.session_id,
+            effort,
         })
     }
 
@@ -791,6 +800,7 @@ async fn agent_that_cannot_start_errors_the_session() {
             resume: None,
             mode: None,
             model: None,
+            effort: None,
         })
         .await
         .unwrap();
@@ -903,10 +913,12 @@ fn is_setting_answer(kind: &EventKind) -> bool {
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. }
     )
 }
 
-/// The answers about mode and model in `kinds`, in order.
+/// The answers about mode, model and effort in `kinds`, in order.
 fn setting_answers(kinds: &[EventKind]) -> Vec<EventKind> {
     kinds
         .iter()
@@ -1102,6 +1114,262 @@ async fn a_setting_accepted_while_down_is_carried_out_on_restart() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// Waits until the session's agent has been shut down `n` times.
+async fn wait_for_shutdowns(agent: &FakeAgent, f: &Fixture, n: usize) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let shutdowns = || {
+        agent
+            .inputs(f.session_id)
+            .iter()
+            .filter(|i| **i == FakeInput::Shutdown)
+            .count()
+    };
+    while shutdowns() < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle agent not shut down"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_effort_starts_an_idle_session_and_requests_are_answered_in_order() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().refuse_effort(Effort::Max));
+    let supervisor = f.start(&agent).await;
+
+    let high = f.set_effort(Effort::High);
+    f.wait_count("first answer", 1, is_setting_answer).await;
+    // Each goes out once the one before it was asked, so each is answered.
+    let low = f.set_effort(Effort::Low);
+    f.wait_count("second answer", 2, is_setting_answer).await;
+    let max = f.set_effort(Effort::Max);
+    let kinds = f.wait_count("third answer", 3, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds),
+        [
+            EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: Some(high),
+            },
+            EventKind::EffortChanged {
+                effort: Some(Effort::Low),
+                answers: Some(low),
+            },
+            EventKind::EffortRefused {
+                effort: Effort::Max,
+                reason: REFUSE_REASON.into(),
+                answers: Some(max),
+            },
+        ]
+    );
+    // Started for it, no turn ran.
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| *k == state(SessionState::AgentWorking))
+    );
+    let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
+    assert_eq!(settings.effort.current, Some(Some(Effort::Low)));
+    assert_eq!(settings.effort.requested, None);
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetEffort(Effort::High),
+            FakeInput::SetEffort(Effort::Low),
+            FakeInput::SetEffort(Effort::Max),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_the_newest_of_queued_efforts_goes_out() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    // Both logged before the supervisor reads either.
+    f.set_effort(Effort::Low);
+    let high = f.set_effort(Effort::High);
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::EffortChanged {
+            effort: Some(Effort::High),
+            answers: Some(high),
+        }]
+    );
+    assert_eq!(
+        agent.inputs(f.session_id)[..2],
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetEffort(Effort::High),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_restart_refuses_an_effort_request_it_had_handed_out() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let lost = f.set_effort(Effort::High);
+    // The daemon handled the request and stopped before the agent answered.
+    let seq = f.log.command_seq(&f.storage.db, lost).unwrap().unwrap();
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+            [i64::try_from(seq.0).unwrap()],
+        )
+        .unwrap();
+
+    let supervisor = f.start(&agent).await;
+    // Settled by the time `start` returns.
+    assert_eq!(
+        setting_answers(&f.kinds()),
+        [EventKind::EffortRefused {
+            effort: Effort::High,
+            reason: DAEMON_RESTARTED.into(),
+            answers: Some(lost),
+        }]
+    );
+    // One the supervisor had not reached yet is carried out as usual.
+    let low = f.set_effort(Effort::Low);
+    let kinds = f.wait_count("answer", 2, is_setting_answer).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        setting_answers(&kinds)[1],
+        EventKind::EffortChanged {
+            effort: Some(Effort::Low),
+            answers: Some(low),
+        }
+    );
+    assert_eq!(
+        agent.inputs(f.session_id)[..2],
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetEffort(Effort::Low),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_agent_is_asked_for_the_effort_the_log_wants() {
+    let mut f = Fixture::new();
+    // The first turn's model takes no effort level.
+    let agent = FakeAgent::new(
+        FakeScript::new().turn([Step::Emit(AdapterEvent::Effort(None)), Step::text("done")]),
+    );
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    // Accepted while down: the start carries the open request out.
+    let high = f.set_effort(Effort::High);
+    let supervisor = f.start_with(&agent, config).await;
+    f.wait_count("answer", 1, is_setting_answer).await;
+    wait_for_shutdowns(&agent, &f, 1).await;
+
+    // Resumed: asked for what it last ran with, which logs nothing new.
+    f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+    wait_for_shutdowns(&agent, &f, 2).await;
+
+    // Resumed after reporting no effort level: asked for none.
+    f.send("two");
+    let kinds = f.wait_count("reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id)[..8],
+        [
+            FakeInput::Started { resumed: false },
+            FakeInput::SetEffort(Effort::High),
+            FakeInput::Shutdown,
+            FakeInput::Started { resumed: true },
+            FakeInput::SetEffort(Effort::High),
+            message("one"),
+            FakeInput::Shutdown,
+            FakeInput::Started { resumed: true },
+        ]
+    );
+    assert_eq!(agent.inputs(f.session_id)[8], message("two"));
+    assert_eq!(
+        setting_answers(&kinds),
+        [
+            EventKind::EffortChanged {
+                effort: Some(Effort::High),
+                answers: Some(high),
+            },
+            EventKind::EffortChanged {
+                effort: None,
+                answers: None,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_claude_session_switches_its_effort_and_settles_each_request() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+    let high = f.set_effort(Effort::High);
+    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    // The start asked for it, so the answer names the command; the look the
+    // handshake wrote came back mid-chain and logged nothing before it.
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::EffortChanged {
+            effort: Some(Effort::High),
+            answers: Some(high),
+        }]
+    );
+    // While it runs, a request goes straight to it.
+    let low = f.set_effort(Effort::Low);
+    let kinds = f.wait_count("answer", 2, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[1],
+        EventKind::EffortChanged {
+            effort: Some(Effort::Low),
+            answers: Some(low),
+        }
+    );
+    // On a model that takes none, the look after the switch is logged
+    // unasked, and an effort is refused.
+    let model = f.set_model("no-effort");
+    let kinds = f.wait_count("answer", 4, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[2..],
+        [
+            EventKind::ModelChanged {
+                model: "resolved-no-effort".into(),
+                answers: Some(model),
+            },
+            EventKind::EffortChanged {
+                effort: None,
+                answers: None,
+            },
+        ]
+    );
+    let max = f.set_effort(Effort::Max);
+    let kinds = f.wait_count("answer", 5, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[4],
+        EventKind::EffortRefused {
+            effort: Effort::Max,
+            reason: "resolved-no-effort takes no effort level".into(),
+            answers: Some(max),
+        }
+    );
+    let pid = fake_cli_pid(&f);
+    supervisor.shutdown().await.unwrap();
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    // What the refusal's read showed was already in the log.
+    assert_eq!(setting_answers(&f.kinds()).len(), 5);
+}
+
 #[tokio::test]
 async fn offered_models_are_logged_only_when_they_change() {
     let mut f = Fixture::new();
@@ -1110,6 +1378,7 @@ async fn offered_models_are_logged_only_when_they_change() {
         label: "Fast".into(),
         detail: None,
         resolved: Some("model-f".into()),
+        efforts: Vec::new(),
     }];
     let agent = FakeAgent::new(FakeScript::new().offer_models(models.clone()));
     let config = SupervisorConfig {

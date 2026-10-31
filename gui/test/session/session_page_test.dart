@@ -1043,10 +1043,12 @@ void main() {
         AgentSettingsView(
           modeLabel: 'ask',
           modelLabel: 'Sonnet',
+          effortLabel: 'effort medium',
           modeRefusal: mode,
           modelRefusal: model,
           modes: askAgent.modes,
           models: askAgent.models,
+          efforts: askAgent.efforts,
         );
     Finder snack(String text) =>
         find.descendant(of: find.byType(SnackBar), matching: find.text(text));
@@ -1270,6 +1272,135 @@ void main() {
       );
     });
 
+    testWidgets('an effort is picked from the list', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: sent,
+      );
+      expect(find.text('effort medium'), findsOneWidget);
+      await tester.tap(find.byTooltip('Effort'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsOneWidget);
+      await tester.tap(find.text('high'));
+      await tester.pumpAndSettle();
+      // No confirmation: the pick is sent at once.
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(
+        sent.last,
+        const GuiIntentAct(
+          action: ActionIntentSetEffort(
+            sessionId: 's1',
+            effort: EffortView.high,
+          ),
+        ),
+      );
+
+      // The level it runs at sends nothing.
+      sent.clear();
+      await tester.tap(find.byTooltip('Effort'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('medium'));
+      await tester.pumpAndSettle();
+      expect(sent, isEmpty);
+    });
+
+    testWidgets('a model that takes no effort says so, with nothing to pick', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'ask',
+            modelLabel: 'Haiku',
+            effortLabel: 'no effort',
+            modes: askAgent.modes,
+            models: askAgent.models,
+            efforts: const [],
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      expect(find.text('no effort'), findsOneWidget);
+      await tester.tap(find.byTooltip('Effort'));
+      await tester.pumpAndSettle();
+      expect(find.text('This model takes no effort level.'), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.byType(ListTile),
+        ),
+        findsNothing,
+      );
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+    });
+
+    testWidgets('an effort refusal shows on its chip and in its picker', (
+      tester,
+    ) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: 'ask',
+            modelLabel: 'Sonnet',
+            effortLabel: 'effort medium',
+            effortRefusal: 'effort max refused: not for this model',
+            modes: askAgent.modes,
+            models: askAgent.models,
+            efforts: askAgent.efforts,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(
+        find.byTooltip('effort max refused: not for this model'),
+        findsOne,
+      );
+      await tester.tap(find.text('effort medium'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('effort max refused: not for this model'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a narrow line folds the effort refusal onto the chip', (
+      tester,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(360, 700)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          agent: AgentSettingsView(
+            modeLabel: "accept edits → don't ask",
+            modelLabel: 'claude-sonnet-5-5-20261001 → claude-opus-5-5',
+            effortLabel: 'effort medium',
+            effortRefusal: 'effort max refused: not for this model',
+            modes: askAgent.modes,
+            models: const [],
+            efforts: askAgent.efforts,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.byTooltip('Effort'), findsNothing, reason: 'folded');
+      expect(
+        find.byTooltip('effort max refused: not for this model'),
+        findsOne,
+      );
+    });
+
     testWidgets('a refusal shows on its chip and in its picker', (
       tester,
     ) async {
@@ -1280,9 +1411,11 @@ void main() {
           agent: AgentSettingsView(
             modeLabel: 'ask',
             modelLabel: 'model unknown',
+            effortLabel: 'effort medium',
             modeRefusal: 'bypass refused: not launched for it',
             modes: askAgent.modes,
             models: const [],
+            efforts: askAgent.efforts,
           ),
         ),
         timeline: holding([]),
@@ -1350,8 +1483,10 @@ void main() {
           agent: AgentSettingsView(
             modeLabel: "accept edits → don't ask",
             modelLabel: 'claude-sonnet-5-5-20261001 → claude-opus-5-5',
+            effortLabel: 'effort medium',
             modes: askAgent.modes,
             models: const [],
+            efforts: askAgent.efforts,
           ),
         ),
         timeline: holding([]),
@@ -1383,8 +1518,10 @@ void main() {
           agent: AgentSettingsView(
             modeLabel: 'mode unknown',
             modelLabel: 'unknown → claude-opus-5-5',
+            effortLabel: 'effort unknown',
             modes: askAgent.modes,
             models: const [],
+            efforts: askAgent.efforts,
           ),
         ),
         timeline: holding([]),
@@ -1392,7 +1529,8 @@ void main() {
       );
       expect(
         find.bySemanticsLabel(
-          'Agent settings: mode unknown · unknown → claude-opus-5-5',
+          'Agent settings: mode unknown · unknown → claude-opus-5-5 · '
+          'effort unknown',
         ),
         findsOneWidget,
       );
@@ -1400,6 +1538,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('mode unknown'), findsOneWidget);
       expect(find.text('unknown → claude-opus-5-5'), findsOneWidget);
+      expect(find.text('effort unknown'), findsOneWidget);
     });
 
     testWidgets('the agent state shows once, its full label as a tooltip', (
@@ -1454,7 +1593,7 @@ void main() {
         timeline: holding([]),
         sent: [],
       );
-      for (final tooltip in ['Permission mode', 'Model']) {
+      for (final tooltip in ['Permission mode', 'Model', 'Effort']) {
         final size = tester.getSize(
           find.descendant(
             of: find.byTooltip(tooltip),
@@ -1475,9 +1614,11 @@ void main() {
           agent: AgentSettingsView(
             modeLabel: 'ask',
             modelLabel: 'Sonnet',
+            effortLabel: 'effort medium',
             modelRefusal: 'no such model',
             modes: askAgent.modes,
             models: askAgent.models,
+            efforts: askAgent.efforts,
           ),
         ),
         timeline: holding([]),
@@ -1497,6 +1638,7 @@ void main() {
         find.bySemanticsLabel('Model: Sonnet, refused: no such model'),
         findsOneWidget,
       );
+      expect(find.bySemanticsLabel('Effort: effort medium'), findsOneWidget);
       semantics.dispose();
     });
 

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Event,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Effort, Event,
     EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState,
 };
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -899,6 +899,64 @@ fn archive_needs_a_known_session_and_dedups_resends() {
     assert_eq!(f.log.head(), seq, "a resend appends nothing");
 }
 
+// --- SetEffort ---------------------------------------------------------------
+
+#[test]
+fn set_effort_needs_a_known_session() {
+    let mut f = Fixture::new();
+    f.create_session();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(CommandKind::SetEffort {
+            session_id: SessionId::new(),
+            effort: Effort::High,
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+}
+
+#[test]
+fn set_effort_logs_one_request_the_agent_answers() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::SetEffort {
+            session_id: session,
+            effort: Effort::XHigh,
+        },
+    };
+    let before = f.log.head();
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, before.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(
+        event.kind,
+        EventKind::EffortRequested {
+            effort: Effort::XHigh,
+            by: device,
+        }
+    );
+    let settings = f.log.agent_settings(&f.storage.db, session).unwrap();
+    let open = settings.effort.requested_effort().unwrap();
+    assert_eq!((open.value, open.command), (Effort::XHigh, command.id));
+
+    // The agent's answer is an agent event, and settles the request.
+    f.agent(
+        session,
+        EventKind::EffortChanged {
+            effort: Some(Effort::XHigh),
+            answers: Some(command.id),
+        },
+    );
+    let settings = f.log.agent_settings(&f.storage.db, session).unwrap();
+    assert_eq!(settings.effort.requested, None);
+    assert_eq!(settings.effort.current, Some(Some(Effort::XHigh)));
+}
+
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
@@ -925,6 +983,10 @@ fn agent_appends_are_checked() {
         },
         EventKind::SessionArchived {
             archived: true,
+            by: DeviceId::new(),
+        },
+        EventKind::EffortRequested {
+            effort: Effort::High,
             by: DeviceId::new(),
         },
     ] {

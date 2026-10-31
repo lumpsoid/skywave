@@ -1,6 +1,6 @@
 //! Maps one session's [`AdapterEvent`]s to log events.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
@@ -9,7 +9,7 @@ use skywave_proto::limits::{
     RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
+    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId, Effort,
     EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState, ToolCall, ToolKind,
     ToolResult,
 };
@@ -43,15 +43,16 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
-/// | `PermissionMode` / `Model` | `PermissionModeChanged` / `ModelChanged` answering nothing, only when it differs from what the log has |
-/// | `PermissionModeSet` / `ModelSet` | `PermissionModeChanged` / `ModelChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
-/// | `PermissionModeRefused` / `ModelRefused` | `PermissionModeRefused` / `ModelRefused` answering the oldest request asked |
+/// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
+/// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
+/// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
-/// | `Exited` | leftover approvals cancelled, leftover mode and model requests refused; `Errored` if a turn was open or the exit was abnormal |
+/// | `Exited` | leftover approvals cancelled, leftover mode, model and effort requests refused; `Errored` if a turn was open or the exit was abnormal |
 ///
-/// **Settings.** The supervisor tells the mapper of every mode or model
-/// request it hands the agent ([`EventMapper::asked_mode`],
-/// [`EventMapper::asked_model`]), with the command asking, if any. The agent
+/// **Settings.** The supervisor tells the mapper of every mode, model or
+/// effort request it hands the agent ([`EventMapper::asked_mode`],
+/// [`EventMapper::asked_model`], [`EventMapper::asked_effort`]), with the
+/// command asking, if any. The agent
 /// answers requests in order, so each answer names the oldest one asked.
 /// What the agent reports unasked is logged only when it changes what the
 /// log has, starting from the [`AgentSettings`] the mapper is made with.
@@ -106,13 +107,15 @@ pub struct EventMapper {
     calls: HashMap<AgentCallId, LoggedCall>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
     turn_open: bool,
-    /// The session's mode and model as the log has them.
+    /// The session's mode, model and effort as the log has them.
     settings: AgentSettings,
     /// Mode requests the agent has not answered, oldest first, with the
     /// command asking.
     asked_modes: VecDeque<(PermissionMode, Option<CommandId>)>,
     /// Model requests likewise.
     asked_models: VecDeque<(String, Option<CommandId>)>,
+    /// Effort requests likewise.
+    asked_efforts: VecDeque<(Effort, Option<CommandId>)>,
 }
 
 /// What the mapper keeps of a logged call to link its result and approval.
@@ -135,6 +138,7 @@ impl EventMapper {
             settings,
             asked_modes: VecDeque::new(),
             asked_models: VecDeque::new(),
+            asked_efforts: VecDeque::new(),
         }
     }
 
@@ -146,6 +150,11 @@ impl EventMapper {
     /// The agent was asked to run `model`, for `command` if one asked.
     pub fn asked_model(&mut self, model: String, command: Option<CommandId>) {
         self.asked_models.push_back((model, command));
+    }
+
+    /// The agent was asked to run at `effort`, for `command` if one asked.
+    pub fn asked_effort(&mut self, effort: Effort, command: Option<CommandId>) {
+        self.asked_efforts.push_back((effort, command));
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -350,6 +359,30 @@ impl EventMapper {
                 };
                 seqs.push(self.append(log, storage, kind)?);
             }
+            AdapterEvent::Effort(effort) => {
+                if self.settings.effort.current != Some(effort) {
+                    let kind = EventKind::EffortChanged {
+                        effort,
+                        answers: None,
+                    };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::EffortSet(effort) => {
+                let answers = self.answer_effort();
+                if answers.is_some() || self.settings.effort.current != Some(effort) {
+                    let kind = EventKind::EffortChanged { effort, answers };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+            }
+            AdapterEvent::EffortRefused { effort, reason } => {
+                let kind = EventKind::EffortRefused {
+                    effort,
+                    reason: cut_line(&reason, REFUSAL_MAX_CHARS).0,
+                    answers: self.answer_effort(),
+                };
+                seqs.push(self.append(log, storage, kind)?);
+            }
             AdapterEvent::ModelsOffered(_) => {
                 tracing::debug!("models offered reach the log through the supervisor");
             }
@@ -400,7 +433,17 @@ impl EventMapper {
         asked.and_then(|(_, command)| command)
     }
 
-    /// Refuses every mode and model request the agent left unanswered.
+    /// The command of the oldest effort request, now answered.
+    fn answer_effort(&mut self) -> Option<CommandId> {
+        let asked = self.asked_efforts.pop_front();
+        if asked.is_none() {
+            tracing::debug!("agent answered an effort request nobody asked");
+        }
+        asked.and_then(|(_, command)| command)
+    }
+
+    /// Refuses every mode, model and effort request the agent left
+    /// unanswered.
     fn refuse_asked(
         &mut self,
         log: &EventLog,
@@ -418,6 +461,14 @@ impl EventMapper {
         for (model, answers) in std::mem::take(&mut self.asked_models) {
             let kind = EventKind::ModelRefused {
                 model,
+                reason: AGENT_EXITED.to_owned(),
+                answers,
+            };
+            seqs.push(self.append(log, storage, kind)?);
+        }
+        for (effort, answers) in std::mem::take(&mut self.asked_efforts) {
+            let kind = EventKind::EffortRefused {
+                effort,
                 reason: AGENT_EXITED.to_owned(),
                 answers,
             };
@@ -622,8 +673,9 @@ fn bounded_suggestions(mut suggestions: Vec<proto::RuleSuggestion>) -> Vec<proto
     suggestions
 }
 
-/// The first [`MODELS_MAX`] models, each field cut to one line of its cap;
-/// a model with a blank id is dropped.
+/// The first [`MODELS_MAX`] models, each field cut to one line of its cap
+/// and each effort level kept once, first place wins; a model with a blank
+/// id is dropped.
 pub(crate) fn bounded_models(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
     models
         .into_iter()
@@ -638,11 +690,15 @@ pub(crate) fn bounded_models(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
                 .resolved
                 .map(|resolved| cut_line(&resolved, MODEL_MAX_CHARS).0)
                 .filter(|resolved| !resolved.is_empty());
+            let mut efforts = model.efforts;
+            let mut seen = HashSet::new();
+            efforts.retain(|effort| seen.insert(*effort));
             (!id.is_empty()).then(|| ModelChoice {
                 label: if label.is_empty() { id.clone() } else { label },
                 id,
                 detail,
                 resolved,
+                efforts,
             })
         })
         .take(MODELS_MAX)
@@ -732,5 +788,32 @@ mod tests {
         );
         assert_eq!(generic_text(&json!("echo")), ("echo".to_owned(), true));
         assert_eq!(generic_text(&Value::Null), (String::new(), true));
+    }
+
+    #[test]
+    fn bounded_models_keep_each_effort_once_in_order() {
+        use skywave_proto::Effort;
+        let choice = |id: &str, efforts| ModelChoice {
+            id: id.into(),
+            label: id.into(),
+            detail: None,
+            resolved: None,
+            efforts,
+        };
+        let models = bounded_models(vec![
+            choice(
+                "a",
+                vec![
+                    Effort::High,
+                    Effort::Low,
+                    Effort::High,
+                    Effort::Max,
+                    Effort::Low,
+                ],
+            ),
+            choice("b", Vec::new()),
+        ]);
+        assert_eq!(models[0].efforts, [Effort::High, Effort::Low, Effort::Max]);
+        assert_eq!(models[1].efforts, []);
     }
 }

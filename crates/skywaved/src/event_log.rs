@@ -15,7 +15,7 @@
 //!   new commands from the log itself: every accepted command is an event
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
 //!   `SessionRenamed`, `SessionArchived`, `SessionCreated`,
-//!   `PermissionModeRequested`, `ModelRequested`),
+//!   `PermissionModeRequested`, `ModelRequested`, `EffortRequested`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -150,9 +150,10 @@ impl EventLog {
     /// Accepts the kinds the agent supervisor owns: `AgentMessage`,
     /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id),
     /// `SessionStateChanged`, `TurnUsage`, the agent's answers about its
-    /// mode and model and `ModelsOffered`. Kinds that only commands produce, and
-    /// `ApprovalCancelled` (use [`EventLog::cancel_approval`]), are refused
-    /// with [`Error::InvalidAppend`], as is an unknown session.
+    /// mode, model and effort, and `ModelsOffered`. Kinds that only
+    /// commands produce, and `ApprovalCancelled` (use
+    /// [`EventLog::cancel_approval`]), are refused with
+    /// [`Error::InvalidAppend`], as is an unknown session.
     pub fn append(&self, db: &mut Db, session_id: SessionId, kind: EventKind) -> Result<Seq> {
         match &kind {
             EventKind::AgentMessage { .. }
@@ -165,7 +166,9 @@ impl EventLog {
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
-            | EventKind::ModelsOffered { .. } => {}
+            | EventKind::ModelsOffered { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -175,7 +178,8 @@ impl EventLog {
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionArchived { .. }
             | EventKind::PermissionModeRequested { .. }
-            | EventKind::ModelRequested { .. } => {
+            | EventKind::ModelRequested { .. }
+            | EventKind::EffortRequested { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -399,7 +403,10 @@ pub(crate) fn append_in(
         | EventKind::PermissionModeRefused { .. }
         | EventKind::ModelRequested { .. }
         | EventKind::ModelChanged { .. }
-        | EventKind::ModelRefused { .. } => {
+        | EventKind::ModelRefused { .. }
+        | EventKind::EffortRequested { .. }
+        | EventKind::EffortChanged { .. }
+        | EventKind::EffortRefused { .. } => {
             let mut settings = agent_settings_in(conn, session_id)?;
             settings.apply(command, kind);
             conn.execute(
@@ -526,6 +533,9 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ModelChanged { .. } => "ModelChanged",
         EventKind::ModelRefused { .. } => "ModelRefused",
         EventKind::ModelsOffered { .. } => "ModelsOffered",
+        EventKind::EffortRequested { .. } => "EffortRequested",
+        EventKind::EffortChanged { .. } => "EffortChanged",
+        EventKind::EffortRefused { .. } => "EffortRefused",
     }
 }
 

@@ -1831,6 +1831,7 @@ fn agent_settings_and_offered_models_are_kept() {
         label: "Sonnet".into(),
         detail: None,
         resolved: None,
+        efforts: Vec::new(),
     }];
     let mut store = Store::open(&dir).unwrap();
     let event = |session_id, kind| Event {
@@ -1877,4 +1878,35 @@ fn agent_settings_and_offered_models_are_kept() {
     // A mode is not activity.
     assert_eq!(summary.last_seq, Seq(1));
     assert_eq!(store.load().unwrap().models, models);
+}
+
+#[test]
+fn an_agents_effort_is_kept() {
+    use skywave_proto::Effort;
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let mut store = Store::open(&dir).unwrap();
+    let event = |kind| Event {
+        session_id: id,
+        at: chrono::Utc::now(),
+        command_id: None,
+        kind,
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+            }),
+            event(EventKind::EffortChanged {
+                effort: Some(Effort::XHigh),
+                answers: None,
+            }),
+        ],
+    };
+    store.apply_batch(&batch, chrono::Utc::now()).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let summary = store.session(id).unwrap().unwrap();
+    assert_eq!(summary.agent.effort.current, Some(Some(Effort::XHigh)));
 }

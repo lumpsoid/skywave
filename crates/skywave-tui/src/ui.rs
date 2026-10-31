@@ -631,8 +631,12 @@ fn footer_keys(app: &App) -> &'static str {
                     "y switch · any other key back to the list · ? help"
                 }
                 Some(Picker::Mode { .. }) => "↑↓ choose · Enter switch · Esc cancel · ? help",
+                Some(Picker::Agent { .. }) => {
+                    "↑↓ choose · Enter open · m model · e effort · Esc cancel · ? help"
+                }
+                Some(Picker::Effort { .. }) => "↑↓ choose · Enter switch · Esc back · ? help",
                 _ => {
-                    "↑↓ choose · type a name instead · Enter switch · Ctrl-U clear · Esc cancel · F1 help"
+                    "↑↓ choose · type a name instead · Enter switch · Ctrl-U clear · Esc back · F1 help"
                 }
             },
             // A pending message only takes these keys while the core says it
@@ -652,13 +656,13 @@ fn footer_keys(app: &App) -> &'static str {
                     .as_ref()
                     .is_some_and(|p| !p.suggestions.is_empty()) =>
                 {
-                    "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
-                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
+                    "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model · R rename · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model/effort · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
             _ => {
@@ -793,7 +797,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("S", "stop the agent; a message restarts it"),
                     key("p", "switch the agent's permission mode"),
                     key("", "(bypass lets every tool run: y confirms it)"),
-                    key("m", "switch the agent's model: pick one, or type its name"),
+                    key("m", "switch the agent's model or effort: m or e"),
                     key("R", "rename the session"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),

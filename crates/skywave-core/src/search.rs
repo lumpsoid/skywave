@@ -12,7 +12,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::blobs::read_head;
-use crate::view::{AgentSetting, BlobId, BlobState, BlobView, Entry, TimelineItem, ToolOutcome};
+use crate::view::{
+    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, TimelineItem, ToolOutcome,
+};
 
 /// Most of a downloaded blob a search reads: the head of a longer one.
 pub const HEAD_BYTES: u64 = 1024 * 1024;
@@ -266,6 +268,15 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         } => {
             let mut out: Vec<&str> = match setting {
                 AgentSetting::Model(model) => vec![model],
+                // The wire names, as the agent spells them.
+                AgentSetting::Effort(effort) => match effort {
+                    None => vec!["none"],
+                    Some(Effort::Low) => vec!["low"],
+                    Some(Effort::Medium) => vec!["medium"],
+                    Some(Effort::High) => vec!["high"],
+                    Some(Effort::XHigh) => vec!["xhigh"],
+                    Some(Effort::Max) => vec!["max"],
+                },
                 AgentSetting::Mode(_) => Vec::new(),
             };
             out.extend(refused.as_deref());
@@ -441,6 +452,27 @@ mod tests {
         assert_eq!(hit("interrupted"), Vec::<usize>::new());
         assert_eq!(hit("queued"), [8]);
         assert_eq!(hit("e"), [0, 1, 2, 3, 4, 5, 6, 8]);
+    }
+
+    #[test]
+    fn an_effort_entry_is_found_by_its_level() {
+        let timeline = vec![
+            logged(Entry::AgentSetting {
+                setting: AgentSetting::Effort(Some(Effort::XHigh)),
+                by: None,
+                refused: None,
+            }),
+            logged(Entry::AgentSetting {
+                setting: AgentSetting::Effort(Some(Effort::Low)),
+                by: None,
+                refused: Some("kept medium".into()),
+            }),
+        ];
+        let hit = |q: &str| indices(&timeline, &Query::new(q));
+        assert_eq!(hit("xhigh"), [0]);
+        assert_eq!(hit("low"), [1]);
+        assert_eq!(hit("kept"), [1]);
+        assert!(hit("max").is_empty());
     }
 
     #[test]
