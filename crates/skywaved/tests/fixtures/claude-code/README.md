@@ -37,6 +37,7 @@ not recorded yet; the runbook is in `docs/agents/claude-code.md` §3.5.
 - `pid` became `12345`.
 - The home directory path became `$HOME`.
 - Every thinking-block `signature` (an opaque base64 string) became `<scrubbed-signature>`.
+- Every `get_settings` answer keeps only `response.applied`: its `effective` and `sources` hold the merged settings layers (a real user's `env`, hooks and permission rules).
 
 Nothing else was changed. Session ids, message ids and request ids are the real values.
 
@@ -52,4 +53,5 @@ Nothing else was changed. Session ids, message ids and request ids are the real 
 | `permission_modes_plan.ndjson` | 2026-10-31, same driver. `default` → `plan`, then one Write: the approved `ExitPlanMode` returns to `default`, so the Write and the next turn's Write are both asked. |
 | `permission_mode_errors.ndjson` | 2026-10-31, control requests only, no user message. `set_permission_mode` `plan` succeeds, then `bypassPermissions` (`bypass_not_launched`) and `bogus` (`invalid_mode`) are rejected; an `initialize` after each reads `current_permission_mode` back. |
 | `model_switch.ndjson` | 2026-10-31, task 34f66d, a Python driver, control requests only, no user message. `set_model` `sonnet` and `claude-opus-4-7` succeed with the resolved model, `bogus-model` is rejected (`not_found`), `default` and a request with no `model` both switch to the account default; an `initialize` between some steps shows it does not report the current model. |
+| `effort_switch.ndjson` | 2026-10-31, a Python driver, control requests only, no user message, `step:` notes. It writes exactly what the adapter writes, in its order: each `get_settings` goes out only when the answer it follows comes. (1) `initialize`, then an unasked `get_settings` (`medium`). (2, 3) `apply_flag_settings` `high`, `max`, each acked with an empty success and read back. (4) `low` and `medium` as two queued requests: `medium`'s apply waits for `low`'s read. (5) `set_model claude-haiku-4-5-20251001` reads `effort: null`; `high` is acked and still reads `null`. (6) `set_model sonnet` reads `high`: the level outlasted the model that took none. (7) A start: `set_model opus` and the apply `xhigh` pipelined, a read after each answer; both read `xhigh` on opus. |
 | `resume.ndjson` | A new process with `--resume <session id from basic.ndjson>`. The model quotes the first prompt from `basic`, and every message carries the **same** session id. |

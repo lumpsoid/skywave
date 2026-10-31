@@ -1312,34 +1312,62 @@ async fn a_restarted_agent_is_asked_for_the_effort_the_log_wants() {
 }
 
 #[tokio::test]
-async fn a_claude_session_refuses_an_effort_until_it_can_switch_one() {
+async fn a_claude_session_switches_its_effort_and_settles_each_request() {
     let mut f = Fixture::new();
     let supervisor = start_claude(&f).await;
     let high = f.set_effort(Effort::High);
     let kinds = f.wait_count("answer", 1, is_setting_answer).await;
-    // The start asked for it, so the refusal names the command.
+    // The start asked for it, so the answer names the command; the look the
+    // handshake wrote came back mid-chain and logged nothing before it.
     assert_eq!(
         setting_answers(&kinds),
-        [EventKind::EffortRefused {
-            effort: Effort::High,
-            reason: "this agent cannot switch effort yet".into(),
+        [EventKind::EffortChanged {
+            effort: Some(Effort::High),
             answers: Some(high),
         }]
     );
-    // While it runs, a request goes straight to it and is refused the same.
+    // While it runs, a request goes straight to it.
     let low = f.set_effort(Effort::Low);
     let kinds = f.wait_count("answer", 2, is_setting_answer).await;
     assert_eq!(
         setting_answers(&kinds)[1],
-        EventKind::EffortRefused {
-            effort: Effort::Low,
-            reason: "this agent cannot switch effort yet".into(),
+        EventKind::EffortChanged {
+            effort: Some(Effort::Low),
             answers: Some(low),
+        }
+    );
+    // On a model that takes none, the look after the switch is logged
+    // unasked, and an effort is refused.
+    let model = f.set_model("no-effort");
+    let kinds = f.wait_count("answer", 4, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[2..],
+        [
+            EventKind::ModelChanged {
+                model: "resolved-no-effort".into(),
+                answers: Some(model),
+            },
+            EventKind::EffortChanged {
+                effort: None,
+                answers: None,
+            },
+        ]
+    );
+    let max = f.set_effort(Effort::Max);
+    let kinds = f.wait_count("answer", 5, is_setting_answer).await;
+    assert_eq!(
+        setting_answers(&kinds)[4],
+        EventKind::EffortRefused {
+            effort: Effort::Max,
+            reason: "resolved-no-effort takes no effort level".into(),
+            answers: Some(max),
         }
     );
     let pid = fake_cli_pid(&f);
     supervisor.shutdown().await.unwrap();
     assert!(!process_exists(pid), "agent process {pid} still exists");
+    // What the refusal's read showed was already in the log.
+    assert_eq!(setting_answers(&f.kinds()).len(), 5);
 }
 
 #[tokio::test]

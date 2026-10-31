@@ -16,10 +16,12 @@
 //! process are added to the handle as `"rules"` and passed to the resumed
 //! process as flags ([`rules::cli_args`]), so they survive a restart. [`AgentAdapter::start`] returns after the CLI answers the
 //! initialize handshake; a CLI that fails before that is a start error, or a
-//! resume error when it does not know the session. The mode and model the
-//! [`StartSpec`] names are then asked for with control requests, like any
-//! later change (docs/agents/claude-code.md §3.7), so each gets the CLI's
-//! own answer.
+//! resume error when it does not know the session. The mode, model and
+//! effort the [`StartSpec`] names are then asked for, in that order, with
+//! control requests, like any later change (docs/agents/claude-code.md §3.7,
+//! §3.10), so each gets the CLI's own answer. The CLI handles stdin in order,
+//! so the effort is applied after the model switch; the level is a flag that
+//! outlasts model switches anyway.
 //!
 //! The protocol translation lives in [`protocol::Protocol`], which does no
 //! I/O; this module runs the process around it. Requests return once queued
