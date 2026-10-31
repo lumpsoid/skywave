@@ -38,12 +38,12 @@ use axum::routing::post;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
-use skywave_proto::{DeviceId, PairRequest, PairResponse, path};
+use skywave_proto::{DeviceId, Fingerprint, PairRequest, PairResponse, path};
 
 use crate::db::Db;
 use crate::devices;
 use crate::error::{Error, Result};
-use crate::identity::{Fingerprint, ServerIdentity};
+use crate::identity::ServerIdentity;
 
 /// `skywaved pair` default code lifetime (spec §5).
 pub const DEFAULT_TTL: Duration = Duration::minutes(10);

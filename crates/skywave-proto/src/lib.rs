@@ -8,6 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod fingerprint;
+
+pub use fingerprint::{Fingerprint, InvalidFingerprint};
+
 /// Wire protocol version. Bump on any incompatible change to these types.
 ///
 /// v2: tool calls carry a [`CallId`] and a bounded [`ToolDisplay`] instead of

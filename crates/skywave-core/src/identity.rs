@@ -10,10 +10,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use skywave_proto::DeviceId;
+use skywave_proto::{DeviceId, Fingerprint};
 use uuid::Uuid;
 
-use crate::tls::{self, Fingerprint};
+use crate::tls;
 
 /// A paired device's credentials.
 pub trait Identity: Send + Sync {
