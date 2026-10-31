@@ -5,6 +5,7 @@ import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/app.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
 import 'package:skywave_gui/effects/effects.dart';
+import 'package:skywave_gui/effects/notifications.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -16,7 +17,12 @@ Future<void> main() async {
   await initializeRust(assignRustSignal);
 
   final messenger = GlobalKey<ScaffoldMessengerState>();
-  final holders = Holders(effects: AppEffectSink(messenger))..connect();
+  final notifications = SystemNotifications(sendToRust);
+  // Not awaited: on iOS and macOS it waits for the permission prompt.
+  unawaited(notifications.init());
+  final holders = Holders(
+    effects: AppEffectSink(messenger, notifications),
+  )..connect();
   final boot = BootHolder();
   unawaited(boot.connect());
 

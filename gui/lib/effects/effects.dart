@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:rinf/rinf.dart';
+import 'package:skywave_gui/effects/notifications.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Carries out platform effects; one method per [PlatformEffect] variant.
@@ -50,27 +52,42 @@ class EffectsListener {
   void dispose() => unawaited(_subscription?.cancel());
 }
 
-/// The app's sink: the clipboard, and snackbars through [messenger].
-/// System notifications and opening files come with their plugins (G7);
-/// until then they show as snackbars too.
+/// The app's sink: system notifications, the clipboard, the platform's
+/// file opener, and snackbars through [messenger].
 class AppEffectSink implements EffectSink {
-  AppEffectSink(this.messenger);
+  AppEffectSink(this.messenger, this.notifications);
 
   final GlobalKey<ScaffoldMessengerState> messenger;
+  final SystemNotifications notifications;
 
   @override
   void notify({
     required String title,
     required String body,
     String? sessionId,
-  }) => _show(body);
+  }) => unawaited(
+    notifications.show(title: title, body: body, sessionId: sessionId),
+  );
 
   @override
   void copy(String text) =>
       unawaited(Clipboard.setData(ClipboardData(text: text)));
 
+  /// Opens a downloaded blob with the platform's default handler. Blobs are
+  /// text files without an extension, so Android and iOS are told so.
   @override
-  void openFile(String path) => _show(path);
+  void openFile(String path) => unawaited(_open(path));
+
+  Future<void> _open(String path) async {
+    final result = await OpenFilex.open(
+      path,
+      type: 'text/plain',
+      uti: 'public.plain-text',
+    );
+    if (result.type != ResultType.done) {
+      _show('Cannot open the file: ${result.message}', error: true);
+    }
+  }
 
   @override
   void notice(String text) => _show(text);
