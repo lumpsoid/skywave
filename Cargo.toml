@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "gui/native/hub"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +33,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 qrcode = { version = "0.14.1", default-features = false }
 ratatui = "0.29.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+rinf = "8.11.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
