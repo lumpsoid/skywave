@@ -85,7 +85,8 @@ class StatusLine extends StatelessWidget {
         final usage = fitTail(
           screen.usage,
           (text) => width(TextSpan(text: text, style: muted)),
-          constraints.maxWidth - leftWidth - 24,
+          // Less the line's padding (32), the gaps, and a margin.
+          constraints.maxWidth - leftWidth - 64,
         );
 
         return Padding(

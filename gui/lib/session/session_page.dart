@@ -4,7 +4,7 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/look.dart';
-import 'package:skywave_gui/session/rename_dialog.dart';
+import 'package:skywave_gui/sessions/rename_dialog.dart';
 import 'package:skywave_gui/session/search_bar.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/status_line.dart';
@@ -273,7 +273,7 @@ class _SessionPageState extends State<SessionPage> {
         ),
         if (rename != null)
           Positioned.fill(
-            child: RenameOverlay(
+            child: RenameDialog(
               key: ValueKey(rename.sessionId),
               prompt: rename,
               send: widget.send,
