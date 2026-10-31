@@ -900,6 +900,37 @@ void main() {
         sent: [],
       );
       expect(tester.takeException(), isNull);
+      // Too narrow for both labels: one chip lists them in full.
+      expect(find.byTooltip('Permission mode'), findsNothing);
+      await tester.tap(find.byTooltip('Agent settings'));
+      await tester.pumpAndSettle();
+      expect(find.text("accept edits → don't ask"), findsOneWidget);
+      expect(
+        find.text('claude-sonnet-5-5-20261001 → claude-opus-5-5'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Permission mode'));
+      await tester.pumpAndSettle();
+      expect(find.text('accept edits detail'), findsOneWidget);
+    });
+
+    testWidgets('the chips take taps over 48 dp', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: [],
+      );
+      for (final tooltip in ['Permission mode', 'Model']) {
+        final size = tester.getSize(
+          find.descendant(
+            of: find.byTooltip(tooltip),
+            matching: find.byType(InkWell),
+          ),
+        );
+        expect(size.width, greaterThanOrEqualTo(48), reason: tooltip);
+        expect(size.height, greaterThanOrEqualTo(48), reason: tooltip);
+      }
     });
   });
 }
