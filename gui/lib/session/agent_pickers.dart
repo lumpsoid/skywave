@@ -86,6 +86,56 @@ Future<bool> _confirm(BuildContext context, ModeOption option) async {
   return confirmed ?? false;
 }
 
+/// Lists the effort levels the running model takes; a pick switches the
+/// session's agent to it. A model that takes none says so.
+Future<void> pickEffort(
+  BuildContext context,
+  SessionScreen screen,
+  SendIntent send,
+) async {
+  final agent = screen.agent;
+  final picked = await showDialog<EffortOption>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Effort'),
+      contentPadding: const EdgeInsets.fromLTRB(0, 16, 0, 0),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (agent.effortRefusal case final refusal?)
+              _Refusal(text: refusal),
+            if (agent.efforts.isEmpty)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(24, 0, 24, 16),
+                child: Text('This model takes no effort level.'),
+              ),
+            for (final option in agent.efforts)
+              _Choice(
+                label: option.label,
+                detail: null,
+                current: option.current,
+                pending: option.pending,
+                onTap: () => Navigator.of(context).pop(option),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
+  if (picked == null || picked.current || !context.mounted) return;
+  send.act(
+    ActionIntentSetEffort(sessionId: screen.sessionId, effort: picked.effort),
+  );
+}
+
 /// Lists the models the agents offer, and takes a model's name typed in:
 /// the only way while none is offered. A pick switches the session's
 /// agent to it.

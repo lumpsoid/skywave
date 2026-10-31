@@ -154,6 +154,13 @@ class StatusLine extends StatelessWidget {
             tooltip: 'Model',
             onTap: () => pickModel(context, screen, send),
           ),
+          _Chip(
+            icon: Icons.psychology_outlined,
+            label: settings.effortLabel,
+            refusal: settings.effortRefusal,
+            tooltip: 'Effort',
+            onTap: () => pickEffort(context, screen, send),
+          ),
           if (rules != null)
             _Chip(
               icon: Icons.verified_outlined,
@@ -178,7 +185,10 @@ class StatusLine extends StatelessWidget {
             _Chip(
               icon: Icons.tune,
               label: all.map((chip) => chip.label).join(' · '),
-              refusal: settings.modeRefusal ?? settings.modelRefusal,
+              refusal:
+                  settings.modeRefusal ??
+                  settings.modelRefusal ??
+                  settings.effortRefusal,
               tooltip: 'Agent settings',
               onTap: () => _showSettings(context, all),
             ),

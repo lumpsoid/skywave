@@ -828,3 +828,127 @@ fn a_model_asked_for_before_the_agent_names_one_reads_unknown() {
     assert_eq!(rig.agent().model_label, "unknown → opus");
     assert_eq!(rig.agent().mode_label, "mode unknown");
 }
+
+#[test]
+fn an_effort_reads_unknown_then_its_level_and_its_switch_as_waiting() {
+    use skywave_proto::{Effort, ModelChoice};
+    let mut rig = Rig::new();
+    assert_eq!(rig.agent().effort_label, "effort unknown", "not said yet");
+    rig.log(vec![
+        EventKind::ModelsOffered {
+            models: vec![ModelChoice {
+                id: "sonnet".into(),
+                label: "Sonnet".into(),
+                detail: None,
+                resolved: Some("model-s".into()),
+                efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+            }],
+        },
+        EventKind::ModelChanged {
+            model: "model-s".into(),
+            answers: None,
+        },
+        EventKind::EffortChanged {
+            effort: Some(Effort::High),
+            answers: None,
+        },
+    ]);
+    let agent = rig.agent();
+    assert_eq!(agent.effort_label, "effort high");
+    let flags = |a: &crate::signals::AgentSettingsView| {
+        a.efforts
+            .iter()
+            .map(|o| (o.label.clone(), o.current, o.pending))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        flags(&agent),
+        [
+            ("low".to_owned(), false, false),
+            ("medium".to_owned(), false, false),
+            ("high".to_owned(), true, false),
+        ]
+    );
+
+    rig.log(vec![EventKind::EffortRefused {
+        effort: Effort::Max,
+        reason: "not for this model".into(),
+        answers: None,
+    }]);
+    assert_eq!(
+        rig.agent().effort_refusal.as_deref(),
+        Some("effort max refused: not for this model")
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetEffort {
+            session_id: rig.session.0.to_string(),
+            effort: crate::signals::EffortView::Low,
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SetEffort {
+            session_id: rig.session,
+            effort: Effort::Low,
+        }]
+    );
+    rig.results();
+    rig.view();
+    let agent = rig.agent();
+    assert_eq!(agent.effort_label, "high → low");
+    assert_eq!(
+        flags(&agent),
+        [
+            ("low".to_owned(), false, true),
+            ("medium".to_owned(), false, false),
+            ("high".to_owned(), true, false),
+        ]
+    );
+
+    // The server never took it: the switch stops waiting and says why.
+    let entry = rig
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.command.kind, CommandKind::SetEffort { .. }))
+        .unwrap();
+    rig.seam.command_undeliverable(entry.command.id).unwrap();
+    rig.view();
+    let agent = rig.agent();
+    assert_eq!(agent.effort_label, "effort high");
+    assert_eq!(
+        agent.effort_refusal.as_deref(),
+        Some("low failed: the server could not take it")
+    );
+    assert!(agent.efforts.iter().all(|o| !o.pending));
+}
+
+#[test]
+fn a_model_that_takes_no_effort_reads_no_effort_with_nothing_to_pick() {
+    use skywave_proto::ModelChoice;
+    let mut rig = Rig::new();
+    rig.log(vec![
+        EventKind::ModelsOffered {
+            models: vec![ModelChoice {
+                id: "haiku".into(),
+                label: "Haiku".into(),
+                detail: None,
+                resolved: Some("model-h".into()),
+                efforts: Vec::new(),
+            }],
+        },
+        EventKind::ModelChanged {
+            model: "model-h".into(),
+            answers: None,
+        },
+        EventKind::EffortChanged {
+            effort: None,
+            answers: None,
+        },
+    ]);
+    let agent = rig.agent();
+    assert_eq!(agent.effort_label, "no effort");
+    assert!(agent.efforts.is_empty());
+}
