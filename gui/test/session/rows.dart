@@ -123,6 +123,7 @@ const _badges = {
 /// runs, so a test showing one pumps rather than settles.
 SessionScreen screenWith({
   ComposerView composer = composerAt1,
+  List<SnippetView> snippets = const [],
   ApprovalPanel? approval,
   List<String> usage = const [],
   RenamePrompt? renamePrompt,
@@ -146,6 +147,7 @@ SessionScreen screenWith({
   agent: agent ?? askAgent,
   usage: usage,
   composer: composer,
+  snippets: snippets,
   approval: approval,
   renamePrompt: renamePrompt,
   archivedLabel: archivedLabel,

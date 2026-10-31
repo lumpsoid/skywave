@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_proto::Fingerprint;
+use uuid::Uuid;
 
 pub use skywave_proto::{
     ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, ModelChoice,
@@ -37,6 +38,8 @@ pub struct ViewState {
     /// When false, back leaves the app (or does whatever a head does at
     /// its root); heads show an up arrow only when true.
     pub can_go_back: bool,
+    /// This device's saved prompts, the most recently used or saved first.
+    pub snippets: Vec<Snippet>,
 }
 
 /// Approvals some agent is blocked on (D8), so a head can point at them
@@ -565,6 +568,42 @@ pub struct Draft {
     /// Position in `text`, counted in Unicode scalar values (`char`s), so it
     /// means the same on both sides of the FFI.
     pub cursor: usize,
+}
+
+/// Identifies a [`Snippet`]; made on this device and never sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SnippetId(pub Uuid);
+
+impl SnippetId {
+    /// A fresh, time-ordered (UUIDv7) id.
+    pub fn new() -> SnippetId {
+        SnippetId(Uuid::now_v7())
+    }
+}
+
+impl Default for SnippetId {
+    fn default() -> SnippetId {
+        SnippetId::new()
+    }
+}
+
+impl From<Uuid> for SnippetId {
+    fn from(uuid: Uuid) -> SnippetId {
+        SnippetId(uuid)
+    }
+}
+
+/// A prompt saved on this device to use again in any session, kept in the
+/// local store and never synced (D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snippet {
+    pub id: SnippetId,
+    /// What the user called it; `None` shows its text's first line.
+    pub name: Option<String>,
+    pub text: String,
+    /// Orders snippets by when they were last saved or used: higher is
+    /// later.
+    pub used: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -6,7 +6,7 @@ use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView,
     PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView, SessionRow,
-    SessionState, SessionUsage, SessionView, SettingsView, TimelineItem, ViewState,
+    SessionState, SessionUsage, SessionView, SettingsView, Snippet, TimelineItem, ViewState,
 };
 use skywave_present::format::{
     agent_mode_label, agent_model_label, answer_words, blob_size, bytes, delivery_label, dollars,
@@ -21,7 +21,7 @@ use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerView, CreatePrompt, CreatingView, ListKindView, ModeOption, ModelOption, PairForm,
     PairingState, PermissionModeView, RenamePrompt, RuleOption, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, ToolKindView,
+    SessionRowView, SessionScreen, SnippetView, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -55,7 +55,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Pairing(pairing) => pairing_view(pairing, ui.form),
         Screen::SessionList(list) => list_view(list, &view.link, ui),
         Screen::Session(session) => ScreenView::Session {
-            session: session_view(session, &view.link, ui),
+            session: session_view(session, view, ui),
         },
         Screen::Settings(settings) => settings_view(settings),
     };
@@ -240,7 +240,7 @@ fn create_prompt(create: &CreateUi, completion: Option<&Completion>, link: &Link
     }
 }
 
-fn session_view(session: &SessionView, link: &Link, ui: Ui) -> SessionScreen {
+fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScreen {
     SessionScreen {
         session_id: session.id.0.to_string(),
         title: clean_line(&session.title),
@@ -298,12 +298,27 @@ fn session_view(session: &SessionView, link: &Link, ui: Ui) -> SessionScreen {
             history_label: None,
             offline_label: None,
         }),
+        snippets: view.snippets.iter().map(snippet_view).collect(),
         rename_prompt: ui
             .rename
             .filter(|r| r.session_id == session.id.0.to_string())
             .cloned(),
     }
-    .with_offline(link)
+    .with_offline(&view.link)
+}
+
+fn snippet_view(snippet: &Snippet) -> SnippetView {
+    let first = clean_line(snippet.text.trim_start());
+    SnippetView {
+        snippet_id: snippet.id.0.to_string(),
+        label: snippet
+            .name
+            .as_deref()
+            .map_or_else(|| first.clone(), clean_line),
+        detail: snippet.name.is_some().then_some(first),
+        name: snippet.name.clone(),
+        text: snippet.text.clone(),
+    }
 }
 
 impl SessionScreen {

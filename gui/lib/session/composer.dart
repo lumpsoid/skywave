@@ -1,8 +1,9 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' hide listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
+import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Whether Enter sends (a hardware keyboard is the norm) or makes a new
@@ -24,6 +25,7 @@ class Composer extends StatefulWidget {
     required this.sessionId,
     required this.composer,
     required this.send,
+    this.snippets = const [],
     this.focusNode,
     super.key,
   });
@@ -31,6 +33,9 @@ class Composer extends StatefulWidget {
   final String sessionId;
   final ComposerView composer;
   final SendIntent send;
+
+  /// What the snippet button offers to put in.
+  final List<SnippetView> snippets;
 
   /// The field's focus, owned by the caller.
   final FocusNode? focusNode;
@@ -45,6 +50,10 @@ class ComposerState extends State<Composer> {
   bool _ownsFocus = false;
   int? _rev;
   TextEditingValue _sent = TextEditingValue.empty;
+
+  /// The snippets as the hub sent them last, so an open picker follows
+  /// edits and deletions.
+  late final _snippets = ValueNotifier(widget.snippets);
 
   @override
   void initState() {
@@ -73,11 +82,18 @@ class ComposerState extends State<Composer> {
       _adoptFocus();
     }
     _take(widget.composer);
+    if (!listEquals(oldWidget.snippets, widget.snippets)) {
+      // An open picker is another route: it rebuilds after this frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _snippets.value = widget.snippets;
+      });
+    }
   }
 
   @override
   void dispose() {
     _field.dispose();
+    _snippets.dispose();
     if (_ownsFocus) _focus.dispose();
     super.dispose();
   }
@@ -126,6 +142,16 @@ class ComposerState extends State<Composer> {
     if (_blank) return;
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
+
+  /// Opens the snippets; one put in brings the focus back to the field.
+  Future<void> _pickSnippet() => pickSnippet(
+    context,
+    sessionId: widget.sessionId,
+    snippets: _snippets,
+    composerBlank: _blank,
+    send: widget.send,
+    onInserted: _focus.requestFocus,
+  );
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -179,7 +205,7 @@ class ComposerState extends State<Composer> {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+          padding: const EdgeInsets.fromLTRB(4, 8, 8, 8),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -215,6 +241,12 @@ class ComposerState extends State<Composer> {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
+                  IconButton(
+                    tooltip: 'Snippets',
+                    onPressed: _pickSnippet,
+                    icon: const Icon(Icons.bookmark_outline),
+                  ),
+                  const SizedBox(width: 2),
                   Expanded(
                     child: TextField(
                       controller: _field,
