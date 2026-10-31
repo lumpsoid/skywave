@@ -58,6 +58,9 @@ VERSION = "2.1.310"
 MODEL = "claude-stub-1"
 SAFE_PREFIX = os.environ.get("STUB_SAFE_PREFIX", "/tmp/a12/")
 DENY_DEFAULT = "The user denied this action."
+# What set_permission_mode accepts. The stub only acts on acceptEdits and
+# bypassPermissions; the others are remembered and reported.
+PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
 TOOLS = ["Task", "Bash", "Glob", "Grep", "Read", "Edit", "MultiEdit", "Write",
          "WebFetch", "WebSearch", "TodoWrite"]
 
@@ -305,9 +308,7 @@ class Stub:
                 emit(ack(rid))
             return True
         elif sub == "set_permission_mode":
-            self.mode = (m.get("request") or {}).get("mode", self.mode)
-            emit({"type": "control_response",
-                  "response": {"subtype": "success", "request_id": rid, "response": {}}})
+            emit(self.set_permission_mode(rid, (m.get("request") or {}).get("mode")))
         else:
             emit({"type": "control_response",
                   "response": {"subtype": "error", "request_id": rid,
@@ -367,6 +368,27 @@ class Stub:
                 self.queued.append(m)
 
     # -- message builders -----------------------------------------------------
+
+    def set_permission_mode(self, rid, mode):
+        """The reply to set_permission_mode (docs/agents/claude-code.md §3.7);
+        on success also emits the system/status line that follows it."""
+        if mode not in PERMISSION_MODES:
+            return {"type": "control_response", "response": {
+                "subtype": "error", "request_id": rid, "error_code": "invalid_mode",
+                "error": "Cannot set permission mode: must be one of "
+                         + ", ".join(sorted(PERMISSION_MODES))}}
+        if mode == "bypassPermissions" and "--dangerously-skip-permissions" not in self.argv:
+            return {"type": "control_response", "response": {
+                "subtype": "error", "request_id": rid, "error_code": "bypass_not_launched",
+                "error": "Cannot set permission mode to bypassPermissions because the "
+                         "session was not launched with --dangerously-skip-permissions"}}
+        self.mode = mode
+        log("RUL", f"permission mode set to {mode}")
+        emit({"type": "control_response", "response": {
+            "subtype": "success", "request_id": rid, "response": {"mode": mode}}})
+        return {"type": "system", "subtype": "status", "status": None,
+                "permissionMode": mode, "uuid": str(uuid.uuid4()),
+                "session_id": self.sid}
 
     def initialize_response(self, rid):
         return {"type": "control_response", "response": {
