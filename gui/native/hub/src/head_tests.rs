@@ -640,3 +640,76 @@ fn an_expanded_section_says_its_blob_state_once() {
         "requested · waiting for a slot · 70 B"
     );
 }
+
+impl Rig {
+    /// The agent settings as the head last told Dart.
+    fn agent(&self) -> crate::signals::AgentSettingsView {
+        match &self.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Session { session } => session.agent.clone(),
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
+    use skywave_proto::{ModelChoice, PermissionMode};
+    let mut rig = Rig::new();
+    rig.log(vec![
+        EventKind::PermissionModeChanged {
+            mode: PermissionMode::Ask,
+            answers: None,
+        },
+        EventKind::ModelsOffered {
+            models: vec![ModelChoice {
+                id: "sonnet".into(),
+                label: "Sonnet".into(),
+                detail: Some("fast".into()),
+                resolved: Some("model-s".into()),
+            }],
+        },
+        EventKind::ModelChanged {
+            model: "model-s".into(),
+            answers: None,
+        },
+    ]);
+    let agent = rig.agent();
+    assert_eq!(agent.mode_label, "ask");
+    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(agent.modes.len(), 6);
+    assert!(agent.modes[0].current);
+    assert!(agent.modes[5].needs_confirmation);
+    assert!(agent.models[0].current);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetPermissionMode {
+            session_id: rig.session.0.to_string(),
+            mode: crate::signals::PermissionModeView::Plan,
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SetPermissionMode {
+            session_id: rig.session,
+            mode: PermissionMode::Plan,
+        }]
+    );
+    rig.results();
+    rig.view();
+    let agent = rig.agent();
+    assert_eq!(agent.mode_label, "ask → plan");
+    assert!(agent.modes[2].pending && !agent.modes[0].pending);
+
+    rig.log(vec![EventKind::ModelRefused {
+        model: "big".into(),
+        reason: "no model named".into(),
+        answers: None,
+    }]);
+    let agent = rig.agent();
+    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(
+        agent.model_refusal.as_deref(),
+        Some("big refused: no model named")
+    );
+    assert_eq!(agent.mode_refusal, None);
+}

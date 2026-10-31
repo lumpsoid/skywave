@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall, ToolResult,
-    TurnUsage,
+    AgentSettings, ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall,
+    ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -45,6 +45,9 @@ pub struct SessionSummary {
     /// What the session's turns took, as their agent reported it; `None`
     /// until a turn reports anything.
     pub usage: Option<SessionUsage>,
+    /// The agent's permission mode and model, folded with
+    /// [`AgentSettings::apply`].
+    pub agent: AgentSettings,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -113,6 +116,7 @@ impl SessionSummary {
             first_prompt: None,
             archived: false,
             usage: None,
+            agent: AgentSettings::default(),
         };
         summary.apply(seq, event);
         summary
@@ -120,20 +124,26 @@ impl SessionSummary {
 
     /// Folds one event of this session into the summary.
     ///
-    /// A rename only sets the name and an archive only the archived flag:
-    /// neither is activity, so they move neither `last_seq` nor
-    /// `last_activity` and the session keeps its place in the list.
+    /// A rename only sets the name, an archive only the archived flag, a
+    /// mode or model event only the agent settings, and the models an agent
+    /// offers nothing here: none is activity, so they move neither
+    /// `last_seq` nor `last_activity` and the session keeps its place in
+    /// the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
             self.archived = archived;
+        }
+        if AgentSettings::folds(&event.kind) {
+            self.agent.apply(event.command_id, &event.kind);
+            return;
         }
         match &event.kind {
             EventKind::SessionRenamed { name, .. } => {
                 self.name = name.clone();
                 return;
             }
-            EventKind::SessionArchived { .. } => return,
+            EventKind::SessionArchived { .. } | EventKind::ModelsOffered { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -169,7 +179,14 @@ impl SessionSummary {
             | EventKind::ToolResult { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionRenamed { .. }
-            | EventKind::SessionArchived { .. } => {}
+            | EventKind::SessionArchived { .. }
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelRequested { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. } => {}
         }
     }
 
@@ -233,7 +250,14 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
-        | EventKind::TurnUsage(_) => false,
+        | EventKind::TurnUsage(_)
+        | EventKind::PermissionModeRequested { .. }
+        | EventKind::PermissionModeChanged { .. }
+        | EventKind::PermissionModeRefused { .. }
+        | EventKind::ModelRequested { .. }
+        | EventKind::ModelChanged { .. }
+        | EventKind::ModelRefused { .. }
+        | EventKind::ModelsOffered { .. } => false,
     }
 }
 
@@ -257,7 +281,14 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::SessionStateChanged(_)
-        | EventKind::TurnUsage(_) => (None, None),
+        | EventKind::TurnUsage(_)
+        | EventKind::PermissionModeRequested { .. }
+        | EventKind::PermissionModeChanged { .. }
+        | EventKind::PermissionModeRefused { .. }
+        | EventKind::ModelRequested { .. }
+        | EventKind::ModelChanged { .. }
+        | EventKind::ModelRefused { .. }
+        | EventKind::ModelsOffered { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }

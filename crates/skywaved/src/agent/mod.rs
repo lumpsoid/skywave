@@ -38,6 +38,16 @@
 //!   that point are reported as [`AdapterEvent::ApprovalCancelled`] (or are
 //!   cancelled by the mapper when the turn ends), followed by
 //!   `TurnEnded(Interrupted)`. The session stays usable for the next turn.
+//! - [`AgentSession::set_permission_mode`] and [`AgentSession::set_model`]
+//!   work at any time, mid-turn and with an approval pending too. Each
+//!   request gets exactly one answer, in the order asked:
+//!   `PermissionModeSet` / `PermissionModeRefused` (`ModelSet` /
+//!   `ModelRefused`), unless the agent exits first. What the agent runs
+//!   with otherwise (at start, at a turn, a change it made on its own) is
+//!   reported as `PermissionMode` / `Model`, as often as the agent says, and
+//!   the models it offers as `ModelsOffered`. [`StartSpec`] names the mode
+//!   and model to start with; the adapter applies them as requests, so each
+//!   is answered the same way.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -55,13 +65,14 @@ use std::path::PathBuf;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{Decision, SessionId};
-pub use skywave_proto::{RuleScope, RuleSuggestion, TurnUsage};
+pub use skywave_proto::{ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage};
 use tokio::sync::mpsc;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
 
 pub use mapper::EventMapper;
+pub(crate) use mapper::bounded_models;
 pub use skywave_proto::{BodyFormat, ToolKind};
 
 /// The agent's own id for one approval request (e.g. a control request id).
@@ -150,6 +161,11 @@ pub struct StartSpec {
     pub workdir: PathBuf,
     /// The handle stored for this session, to resume it; `None` starts fresh.
     pub resume: Option<ResumeHandle>,
+    /// The mode to run in, asked for once the agent is up; `None` leaves
+    /// the agent's own.
+    pub mode: Option<PermissionMode>,
+    /// The model to run, asked for like `mode`.
+    pub model: Option<String>,
 }
 
 /// How a turn ended.
@@ -207,6 +223,27 @@ pub enum AdapterEvent {
     TurnEnded(TurnOutcome),
     /// The handle to persist for resuming this session; replaces any earlier.
     ResumeHandle(ResumeHandle),
+    /// The agent runs in `mode`, as it reported unasked (at start, at a
+    /// turn, or a change of its own). May repeat what it said before.
+    PermissionMode(PermissionMode),
+    /// The answer to the oldest unanswered mode request: the agent switched.
+    PermissionModeSet(PermissionMode),
+    /// The answer to the oldest unanswered mode request: the agent refused
+    /// `mode` and keeps the one it had.
+    PermissionModeRefused {
+        mode: PermissionMode,
+        reason: String,
+    },
+    /// The agent runs `model`, as it reported unasked; may repeat.
+    Model(String),
+    /// The answer to the oldest unanswered model request: the agent runs
+    /// `model` now, as it names it.
+    ModelSet(String),
+    /// The answer to the oldest unanswered model request: the agent refused
+    /// `model` (as asked) and keeps the one it had.
+    ModelRefused { model: String, reason: String },
+    /// The models the agent offers, uncut.
+    ModelsOffered(Vec<ModelChoice>),
     /// The agent stopped; no further events follow. `error` is set when it
     /// stopped abnormally (crash, startup failure).
     Exited { error: Option<String> },
@@ -266,6 +303,17 @@ pub trait AgentSession: Send + 'static {
 
     /// Stops the current turn, if any; a no-op when idle.
     fn interrupt(&mut self) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Asks the agent to run in `mode`; answered by `PermissionModeSet` or
+    /// `PermissionModeRefused`.
+    fn set_permission_mode(
+        &mut self,
+        mode: PermissionMode,
+    ) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Asks the agent to run `model`; answered by `ModelSet` or
+    /// `ModelRefused`.
+    fn set_model(&mut self, model: String) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
     /// Interrupt first to stop a running turn cleanly; a turn still running

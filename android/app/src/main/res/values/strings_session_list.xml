@@ -65,6 +65,7 @@
     <string name="fail_approval_cancelled">the approval was cancelled first</string>
     <string name="fail_no_active_turn">nothing is running</string>
     <string name="fail_unknown_rule">the rule is unknown to the server</string>
+    <string name="fail_unknown_model">the agent offers no such model</string>
     <string name="fail_undeliverable">the server could not take it</string>
 
     <!-- New-session dialog -->

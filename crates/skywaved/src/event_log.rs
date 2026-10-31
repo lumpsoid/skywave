@@ -14,7 +14,8 @@
 //!   [`EventLog::append`] and [`EventLog::cancel_approval`]. It learns about
 //!   new commands from the log itself: every accepted command is an event
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
-//!   `SessionRenamed`, `SessionArchived`, `SessionCreated`),
+//!   `SessionRenamed`, `SessionArchived`, `SessionCreated`,
+//!   `PermissionModeRequested`, `ModelRequested`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -28,7 +29,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    ApprovalId, CommandId, Event, EventBatch, EventKind, Seq, SessionId, SessionState,
+    AgentSettings, ApprovalId, CommandId, Event, EventBatch, EventKind, ModelChoice, Seq,
+    SessionId, SessionState,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -147,7 +149,8 @@ impl EventLog {
     ///
     /// Accepts the kinds the agent supervisor owns: `AgentMessage`,
     /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id),
-    /// `SessionStateChanged` and `TurnUsage`. Kinds that only commands produce, and
+    /// `SessionStateChanged`, `TurnUsage`, the agent's answers about its
+    /// mode and model and `ModelsOffered`. Kinds that only commands produce, and
     /// `ApprovalCancelled` (use [`EventLog::cancel_approval`]), are refused
     /// with [`Error::InvalidAppend`], as is an unknown session.
     pub fn append(&self, db: &mut Db, session_id: SessionId, kind: EventKind) -> Result<Seq> {
@@ -157,7 +160,12 @@ impl EventLog {
             | EventKind::ToolResult { .. }
             | EventKind::ApprovalRequested { .. }
             | EventKind::SessionStateChanged(_)
-            | EventKind::TurnUsage(_) => {}
+            | EventKind::TurnUsage(_)
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -165,7 +173,9 @@ impl EventLog {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
-            | EventKind::SessionArchived { .. } => {
+            | EventKind::SessionArchived { .. }
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::ModelRequested { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -263,6 +273,38 @@ impl EventLog {
         .collect()
     }
 
+    /// Session `id`'s permission mode and model as its log has them; the
+    /// default when it has none or is unknown.
+    pub fn agent_settings(&self, db: &Db, id: SessionId) -> Result<AgentSettings> {
+        agent_settings_in(db.conn(), id)
+    }
+
+    /// Seq of the event command `id` logged, if it was accepted.
+    pub fn command_seq(&self, db: &Db, id: CommandId) -> Result<Option<Seq>> {
+        let seq: Option<i64> = db
+            .conn()
+            .prepare_cached("SELECT seq FROM events WHERE command_id = ?1")?
+            .query_row([id.0.to_string()], |r| r.get(0))
+            .optional()?;
+        seq.map(seq_from_sql).transpose()
+    }
+
+    /// The models of the newest `ModelsOffered` in any session, if any.
+    pub fn offered_models(&self, db: &Db) -> Result<Option<Vec<ModelChoice>>> {
+        let kind: Option<String> = db
+            .conn()
+            .prepare_cached(
+                "SELECT kind FROM events WHERE json_extract(kind, '$.type') = 'models_offered' \
+                 ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row([], |r| r.get(0))
+            .optional()?;
+        match kind.as_deref().map(serde_json::from_str).transpose()? {
+            Some(EventKind::ModelsOffered { models }) => Ok(Some(models)),
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn roots(&self) -> &[PathBuf] {
         &self.inner.roots
     }
@@ -352,6 +394,19 @@ pub(crate) fn append_in(
                 params![id.0.to_string(), sql_seq],
             )?;
         }
+        EventKind::PermissionModeRequested { .. }
+        | EventKind::PermissionModeChanged { .. }
+        | EventKind::PermissionModeRefused { .. }
+        | EventKind::ModelRequested { .. }
+        | EventKind::ModelChanged { .. }
+        | EventKind::ModelRefused { .. } => {
+            let mut settings = agent_settings_in(conn, session_id)?;
+            settings.apply(command, kind);
+            conn.execute(
+                "UPDATE sessions SET agent_settings = ?2 WHERE id = ?1",
+                params![session, serde_json::to_string(&settings)?],
+            )?;
+        }
         // A stopped turn ends with the state change the agent reports. No
         // archived flag is kept: nothing on the server reads it, clients
         // fold `EventKind::archived_effect` themselves.
@@ -362,9 +417,23 @@ pub(crate) fn append_in(
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
-        | EventKind::TurnUsage(_) => {}
+        | EventKind::TurnUsage(_)
+        | EventKind::ModelsOffered { .. } => {}
     }
     Ok(seq)
+}
+
+fn agent_settings_in(conn: &Connection, id: SessionId) -> Result<AgentSettings> {
+    let json: Option<Option<String>> = conn
+        .prepare_cached("SELECT agent_settings FROM sessions WHERE id = ?1")?
+        .query_row([id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    Ok(json
+        .flatten()
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default())
 }
 
 /// Seq of the newest event in `conn`'s view of the log.
@@ -450,6 +519,13 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::SessionArchived { .. } => "SessionArchived",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
         EventKind::TurnUsage(_) => "TurnUsage",
+        EventKind::PermissionModeRequested { .. } => "PermissionModeRequested",
+        EventKind::PermissionModeChanged { .. } => "PermissionModeChanged",
+        EventKind::PermissionModeRefused { .. } => "PermissionModeRefused",
+        EventKind::ModelRequested { .. } => "ModelRequested",
+        EventKind::ModelChanged { .. } => "ModelChanged",
+        EventKind::ModelRefused { .. } => "ModelRefused",
+        EventKind::ModelsOffered { .. } => "ModelsOffered",
     }
 }
 

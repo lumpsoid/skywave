@@ -36,7 +36,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// names they paired with; `command_id` on [`Event`], the command that
 /// logged it, so a pulled event settles its command when the reply was lost
 /// (it moves there from `EventKind::UserMessage`).
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7: `CommandKind::SetPermissionMode` and `CommandKind::SetModel`; their
+/// `…Requested` events, the agent's `…Changed` and `…Refused` answers, and
+/// `EventKind::ModelsOffered`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -214,6 +218,55 @@ pub enum EventKind {
     /// just before the turn's closing `SessionStateChanged`, at most once a
     /// turn. Not notable.
     TurnUsage(TurnUsage),
+    /// A `SetPermissionMode` command asked the agent for `mode`. Answered
+    /// by a `PermissionModeChanged` or `PermissionModeRefused` naming the
+    /// command; see [`AgentSettings`].
+    PermissionModeRequested {
+        mode: PermissionMode,
+        by: DeviceId,
+    },
+    /// The agent runs in `mode` from here on. `answers` names the
+    /// `SetPermissionMode` command it carries out; `None` when the agent
+    /// changed on its own (e.g. leaving plan mode once a plan is approved)
+    /// or reported the mode it started in.
+    PermissionModeChanged {
+        mode: PermissionMode,
+        answers: Option<CommandId>,
+    },
+    /// The agent refused to switch to `mode` and keeps the mode it had.
+    /// `answers` names the command refused; `None` when a mode reapplied on
+    /// a restart was refused.
+    PermissionModeRefused {
+        mode: PermissionMode,
+        reason: String,
+        answers: Option<CommandId>,
+    },
+    /// A `SetModel` command asked the agent for `model`, one of the ids
+    /// [`ModelsOffered`](EventKind::ModelsOffered) lists or a free name.
+    ModelRequested {
+        model: String,
+        by: DeviceId,
+    },
+    /// The agent runs `model` from here on, as it names the model (which
+    /// may differ from the id asked for, e.g. an alias resolved). `answers`
+    /// as for `PermissionModeChanged`.
+    ModelChanged {
+        model: String,
+        answers: Option<CommandId>,
+    },
+    /// The agent refused to run `model` (the id asked for) and keeps the
+    /// model it had. `answers` as for `PermissionModeRefused`.
+    ModelRefused {
+        model: String,
+        reason: String,
+        answers: Option<CommandId>,
+    },
+    /// The models the agent offers, logged when they differ from the last
+    /// list logged in any session: heads offer the newest list for every
+    /// session. At most [`limits::MODELS_MAX`].
+    ModelsOffered {
+        models: Vec<ModelChoice>,
+    },
 }
 
 impl EventKind {
@@ -223,7 +276,9 @@ impl EventKind {
             EventKind::UserMessage { device_id, .. } => Some(*device_id),
             EventKind::ApprovalResolved { by, .. }
             | EventKind::SessionRenamed { by, .. }
-            | EventKind::SessionArchived { by, .. } => Some(*by),
+            | EventKind::SessionArchived { by, .. }
+            | EventKind::PermissionModeRequested { by, .. }
+            | EventKind::ModelRequested { by, .. } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -233,7 +288,12 @@ impl EventKind {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionStateChanged(_)
-            | EventKind::TurnUsage(_) => None,
+            | EventKind::TurnUsage(_)
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. } => None,
         }
     }
 
@@ -248,14 +308,21 @@ impl EventKind {
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
-            | EventKind::SessionArchived { .. } => true,
+            | EventKind::SessionArchived { .. }
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::ModelRequested { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalCancelled { .. }
             | EventKind::SessionStateChanged(_)
-            | EventKind::TurnUsage(_) => false,
+            | EventKind::TurnUsage(_)
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. } => false,
         }
     }
 
@@ -278,7 +345,14 @@ impl EventKind {
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
             | EventKind::SessionStateChanged(_)
-            | EventKind::TurnUsage(_) => None,
+            | EventKind::TurnUsage(_)
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelRequested { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. } => None,
         }
     }
 }
@@ -305,6 +379,197 @@ pub mod limits {
     pub const RULE_LABEL_MAX_CHARS: usize = 120;
     /// Most [`RuleSuggestion`](crate::RuleSuggestion)s on one approval.
     pub const RULE_SUGGESTIONS_MAX: usize = 8;
+    /// Most [`ModelChoice`](crate::ModelChoice)s in one `ModelsOffered`.
+    pub const MODELS_MAX: usize = 32;
+    /// Longest model id or name (`SetModel`, `ModelChoice::id`,
+    /// `ModelChoice::resolved`, the model events), in chars.
+    pub const MODEL_MAX_CHARS: usize = 80;
+    /// Longest [`ModelChoice::label`](crate::ModelChoice::label), in chars.
+    pub const MODEL_LABEL_MAX_CHARS: usize = 60;
+    /// Longest [`ModelChoice::detail`](crate::ModelChoice::detail), in
+    /// chars.
+    pub const MODEL_DETAIL_MAX_CHARS: usize = 120;
+    /// Longest refusal reason (`PermissionModeRefused`, `ModelRefused`), in
+    /// chars.
+    pub const REFUSAL_MAX_CHARS: usize = 200;
+}
+
+/// How freely the agent acts without asking. Agent-agnostic (D3): the
+/// adapter maps each onto what its agent calls it, and an agent may refuse
+/// one it cannot run in (`PermissionModeRefused`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Asks before any tool no rule allows.
+    Ask,
+    /// File edits in the workdir run without asking.
+    AcceptEdits,
+    /// Plans only; the agent asks to leave plan mode with its plan.
+    Plan,
+    /// The agent decides what to ask about.
+    Auto,
+    /// Never asks: what no rule allows is denied.
+    DontAsk,
+    /// Never asks: everything runs.
+    Bypass,
+}
+
+impl PermissionMode {
+    /// Every mode, from the most asking to the least.
+    pub const ALL: [PermissionMode; 6] = [
+        PermissionMode::Ask,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Plan,
+        PermissionMode::Auto,
+        PermissionMode::DontAsk,
+        PermissionMode::Bypass,
+    ];
+}
+
+/// A model the agent offers. Agent-agnostic (D3): clients show `label`
+/// and `detail` and send `id` back in `SetModel`; they never parse them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelChoice {
+    /// What `SetModel` sends, at most [`limits::MODEL_MAX_CHARS`].
+    pub id: String,
+    /// One line, at most [`limits::MODEL_LABEL_MAX_CHARS`].
+    pub label: String,
+    /// Optional second line, at most [`limits::MODEL_DETAIL_MAX_CHARS`].
+    pub detail: Option<String>,
+    /// The model `ModelChanged` names once this choice runs, when the agent
+    /// says; several choices may resolve to one model.
+    pub resolved: Option<String>,
+}
+
+/// A session's permission mode and model as its log has them: the one rule
+/// the server and every client fold (see [`AgentSettings::apply`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct AgentSettings {
+    pub mode: Setting<PermissionMode>,
+    pub model: Setting<String>,
+}
+
+/// One setting of a session's agent, folded from the log.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct Setting<T> {
+    /// What the agent last said it runs with; `None` until it says.
+    pub current: Option<T>,
+    /// The newest request no answer has named yet, by its command.
+    pub requested: Option<Requested<T>>,
+    /// The newest refusal, until the next request or change.
+    pub refused: Option<Refusal<T>>,
+}
+
+impl<T> Default for Setting<T> {
+    fn default() -> Self {
+        Setting {
+            current: None,
+            requested: None,
+            refused: None,
+        }
+    }
+}
+
+/// A request for a setting, waiting for the agent's answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Requested<T> {
+    pub value: T,
+    pub command: CommandId,
+    pub by: DeviceId,
+}
+
+/// The agent refused `value` with `reason`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Refusal<T> {
+    pub value: T,
+    pub reason: String,
+}
+
+impl<T: Clone> Setting<T> {
+    /// What the agent should run with: the open request, else the current
+    /// value. What a restarted agent is given.
+    pub fn wanted(&self) -> Option<&T> {
+        self.requested
+            .as_ref()
+            .map(|r| &r.value)
+            .or(self.current.as_ref())
+    }
+
+    fn request(&mut self, value: &T, command: Option<CommandId>, by: DeviceId) {
+        self.refused = None;
+        self.requested = command.map(|command| Requested {
+            value: value.clone(),
+            command,
+            by,
+        });
+    }
+
+    fn change(&mut self, value: &T, answers: Option<CommandId>) {
+        self.current = Some(value.clone());
+        self.refused = None;
+        self.settle(answers);
+    }
+
+    fn refuse(&mut self, value: &T, reason: &str, answers: Option<CommandId>) {
+        self.refused = Some(Refusal {
+            value: value.clone(),
+            reason: reason.to_owned(),
+        });
+        self.settle(answers);
+    }
+
+    /// An answer naming the open request settles it; any other leaves it.
+    fn settle(&mut self, answers: Option<CommandId>) {
+        if answers.is_some() && self.requested.as_ref().map(|r| r.command) == answers {
+            self.requested = None;
+        }
+    }
+}
+
+impl AgentSettings {
+    /// Folds one event of the session, logged by command `command_id`.
+    ///
+    /// A request is open until an answer names its command: a change or a
+    /// refusal of an older request, or one the agent made on its own,
+    /// leaves it open. A newer request replaces it. A change sets the
+    /// current value whatever it answers. A refusal keeps the current value
+    /// and is shown until the next request or change.
+    pub fn apply(&mut self, command_id: Option<CommandId>, kind: &EventKind) {
+        match kind {
+            EventKind::PermissionModeRequested { mode, by } => {
+                self.mode.request(mode, command_id, *by);
+            }
+            EventKind::PermissionModeChanged { mode, answers } => self.mode.change(mode, *answers),
+            EventKind::PermissionModeRefused {
+                mode,
+                reason,
+                answers,
+            } => self.mode.refuse(mode, reason, *answers),
+            EventKind::ModelRequested { model, by } => self.model.request(model, command_id, *by),
+            EventKind::ModelChanged { model, answers } => self.model.change(model, *answers),
+            EventKind::ModelRefused {
+                model,
+                reason,
+                answers,
+            } => self.model.refuse(model, reason, *answers),
+            _ => {}
+        }
+    }
+
+    /// Whether `kind` is one [`apply`](Self::apply) folds.
+    pub fn folds(kind: &EventKind) -> bool {
+        matches!(
+            kind,
+            EventKind::PermissionModeRequested { .. }
+                | EventKind::PermissionModeChanged { .. }
+                | EventKind::PermissionModeRefused { .. }
+                | EventKind::ModelRequested { .. }
+                | EventKind::ModelChanged { .. }
+                | EventKind::ModelRefused { .. }
+        )
+    }
 }
 
 /// A lasting permission rule an agent offers to grant along with an
@@ -636,6 +901,23 @@ pub enum CommandKind {
         session_id: SessionId,
         archived: bool,
     },
+    /// Ask the session's agent to run in `mode`, starting the agent if it
+    /// is not running. Accepted for any known session; the agent's answer
+    /// comes as a `PermissionModeChanged` or `PermissionModeRefused` naming
+    /// this command.
+    SetPermissionMode {
+        session_id: SessionId,
+        mode: PermissionMode,
+    },
+    /// Ask the session's agent to run `model`, as [`SetPermissionMode`]
+    /// does for a mode. `model` is cut to [`limits::MODEL_MAX_CHARS`]; an
+    /// empty one is `UnknownModel`.
+    ///
+    /// [`SetPermissionMode`]: CommandKind::SetPermissionMode
+    SetModel {
+        session_id: SessionId,
+        model: String,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -652,6 +934,16 @@ pub fn normalise_session_name(name: &str) -> Option<String> {
     // The cut may end on whitespace.
     let name = name.trim_end();
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// A model id as `ModelRequested` carries it: control characters stripped,
+/// trimmed and cut on a char boundary to [`limits::MODEL_MAX_CHARS`].
+/// `None` when nothing is left.
+pub fn normalise_model(model: &str) -> Option<String> {
+    let clean: String = model.chars().filter(|c| !c.is_control()).collect();
+    let model: String = clean.trim().chars().take(limits::MODEL_MAX_CHARS).collect();
+    let model = model.trim_end();
+    (!model.is_empty()).then(|| model.to_owned())
 }
 
 /// Response to `POST /v1/commands`. Resending a [`CommandId`] returns the
@@ -686,6 +978,8 @@ pub enum RejectReason {
     /// `ResolveApproval.rule` came with a denial, or names no suggestion of
     /// the approval.
     UnknownRule,
+    /// `SetModel.model` is blank.
+    UnknownModel,
 }
 
 impl RejectReason {
@@ -840,5 +1134,78 @@ mod tests {
         ] {
             assert_eq!(kind.archived_effect(), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_request_stays_open_until_an_answer_names_it() {
+        let by = DeviceId::new();
+        let (first, second) = (CommandId::new(), CommandId::new());
+        let mut settings = AgentSettings::default();
+        let request = |mode| EventKind::PermissionModeRequested { mode, by };
+        let changed = |mode, answers| EventKind::PermissionModeChanged { mode, answers };
+
+        settings.apply(None, &changed(PermissionMode::Ask, None));
+        settings.apply(Some(first), &request(PermissionMode::Plan));
+        settings.apply(Some(second), &request(PermissionMode::AcceptEdits));
+        assert_eq!(settings.mode.wanted(), Some(&PermissionMode::AcceptEdits));
+        // The older request's answer changes the mode but leaves the newer open.
+        settings.apply(None, &changed(PermissionMode::Plan, Some(first)));
+        assert_eq!(settings.mode.current, Some(PermissionMode::Plan));
+        assert_eq!(
+            settings.mode.requested.as_ref().map(|r| r.command),
+            Some(second)
+        );
+        // So does a change the agent made on its own.
+        settings.apply(None, &changed(PermissionMode::Ask, None));
+        assert!(settings.mode.requested.is_some());
+        settings.apply(None, &changed(PermissionMode::AcceptEdits, Some(second)));
+        assert_eq!(settings.mode.requested, None);
+        assert_eq!(settings.mode.wanted(), Some(&PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_current_value_until_the_next_request() {
+        let by = DeviceId::new();
+        let command = CommandId::new();
+        let mut settings = AgentSettings::default();
+        settings.apply(
+            None,
+            &EventKind::ModelChanged {
+                model: "m-1".into(),
+                answers: None,
+            },
+        );
+        let request = EventKind::ModelRequested {
+            model: "bogus".into(),
+            by,
+        };
+        settings.apply(Some(command), &request);
+        settings.apply(
+            None,
+            &EventKind::ModelRefused {
+                model: "bogus".into(),
+                reason: "not found".into(),
+                answers: Some(command),
+            },
+        );
+        assert_eq!(settings.model.current.as_deref(), Some("m-1"));
+        assert_eq!(settings.model.wanted().map(String::as_str), Some("m-1"));
+        assert_eq!(
+            settings.model.refused.as_ref().map(|r| r.reason.as_str()),
+            Some("not found")
+        );
+        settings.apply(Some(CommandId::new()), &request);
+        assert_eq!(settings.model.refused, None);
+    }
+
+    #[test]
+    fn a_model_is_normalised_like_a_name() {
+        assert_eq!(normalise_model("  sonnet\n"), Some("sonnet".to_owned()));
+        assert_eq!(normalise_model(" \t "), None);
+        let long = "m".repeat(200);
+        assert_eq!(
+            normalise_model(&long).map(|m| m.chars().count()),
+            Some(limits::MODEL_MAX_CHARS)
+        );
     }
 }

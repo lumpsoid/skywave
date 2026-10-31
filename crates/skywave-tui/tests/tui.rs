@@ -20,8 +20,8 @@ use skywave_core::{
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ToolCall,
-    ToolDisplay, ToolKind, ToolResult, TurnUsage,
+    EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -5384,4 +5384,252 @@ fn each_turn_ends_with_its_time_and_cost_and_the_list_shows_the_session_cost() {
     let other = SessionId::new();
     pull(&mut h, vec![created(other, 4, "/srv/free")]);
     assert!(!line_with(&h.screen(), "/srv/free").contains('$'));
+}
+
+/// Accepts this device's newest command and logs `kind` for it, as the
+/// server does; returns the command.
+fn logged_command(h: &mut Harness, id: SessionId, minute: u32, kind: EventKind) -> CommandId {
+    let command = last_command(h);
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(1) })
+        .unwrap();
+    pull(
+        h,
+        vec![Event {
+            command_id: Some(command),
+            ..event(id, minute, kind)
+        }],
+    );
+    command
+}
+
+#[test]
+fn the_mode_list_switches_and_bypass_asks_once_more() {
+    let (mut h, id, me) = open_session();
+    // A `p` in the composer is text, not the mode list.
+    assert_eq!(h.key(KeyCode::Char('p')), None);
+    assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
+    h.key_with(ctrl('u'));
+    h.key(KeyCode::Esc);
+    assert_contains(&text(&h.frame(200, 24, at(3))), "p mode · m model");
+
+    // Esc closes the list and sends nothing.
+    assert_eq!(h.key(KeyCode::Char('p')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Permission mode · now ?");
+    assert_contains(&screen, "never asks; everything runs");
+    assert_contains(&screen, "Enter switch · Esc cancel");
+    assert!(!h.app.typing(), "the mode list takes no text");
+    assert_eq!(h.key(KeyCode::Char('q')), None);
+    assert!(!h.app.ui().quit, "the list takes every key");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+
+    h.key(KeyCode::Char('p'));
+    h.key(KeyCode::Down);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetPermissionMode {
+            session_id: id,
+            mode: PermissionMode::AcceptEdits,
+        })
+    );
+    assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
+    assert_contains(&status_line(&h, 100), "agent idle · mode ? → accept edits");
+    let command = logged_command(
+        &mut h,
+        id,
+        1,
+        EventKind::PermissionModeRequested {
+            mode: PermissionMode::AcceptEdits,
+            by: me,
+        },
+    );
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            2,
+            EventKind::PermissionModeChanged {
+                mode: PermissionMode::AcceptEdits,
+                answers: Some(command),
+            },
+        )],
+    );
+    let screen = h.screen();
+    assert_contains(&status_line(&h, 100), "agent idle · mode accept edits");
+    assert_contains(&screen, "mode → accept edits by this device");
+
+    // Bypass waits for `y`; any other key goes back to the list.
+    h.key(KeyCode::Char('p'));
+    assert_contains(
+        &h.screen(),
+        "accept edits  file edits run without asking · now",
+    );
+    for _ in 0..5 {
+        h.key(KeyCode::Char('j'));
+    }
+    assert_eq!(h.key(KeyCode::Enter), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Switch to bypass?");
+    assert_contains(&screen, "Never asks; everything runs.");
+    assert_contains(&screen, "y switch · any other key back");
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert!(!h.screen().contains("Switch to bypass?"));
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::SetPermissionMode {
+            session_id: id,
+            mode: PermissionMode::Bypass,
+        })
+    );
+    assert_contains(&status_line(&h, 100), "mode accept edits → bypass");
+
+    // Refused: the old mode stays, and the status line says why until the
+    // next switch.
+    let command = logged_command(
+        &mut h,
+        id,
+        3,
+        EventKind::PermissionModeRequested {
+            mode: PermissionMode::Bypass,
+            by: me,
+        },
+    );
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            4,
+            EventKind::PermissionModeRefused {
+                mode: PermissionMode::Bypass,
+                reason: "not launched for it".into(),
+                answers: Some(command),
+            },
+        )],
+    );
+    let status = status_line(&h, 120);
+    assert_contains(
+        &status,
+        "mode accept edits · bypass refused: not launched for it",
+    );
+    assert_contains(
+        &h.screen(),
+        "mode bypass refused: not launched for it by this device",
+    );
+}
+
+#[test]
+fn the_model_list_offers_the_agents_models_or_takes_a_typed_name() {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+
+    // No list yet: a name is typed, `q` and `?` included.
+    assert_eq!(h.key(KeyCode::Char('m')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Model · now ?");
+    assert_contains(&screen, "No list yet");
+    assert_contains(&screen, "or type a model name");
+    assert!(h.app.typing());
+    // Nothing typed, nothing listed: Enter has nothing to send.
+    assert_eq!(h.key(KeyCode::Enter), None);
+    h.type_text("opus?q");
+    assert!(!h.app.ui().quit && !h.app.ui().help);
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Backspace);
+    assert_contains(&h.screen(), "> opus");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetModel {
+            session_id: id,
+            model: "opus".into(),
+        })
+    );
+    assert!(!h.app.typing(), "back on the timeline");
+    assert_contains(&status_line(&h, 100), "agent idle · ? → opus");
+    let command = logged_command(
+        &mut h,
+        id,
+        1,
+        EventKind::ModelRequested {
+            model: "opus".into(),
+            by: me,
+        },
+    );
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                2,
+                EventKind::ModelsOffered {
+                    models: vec![
+                        ModelChoice {
+                            id: "opus".into(),
+                            label: "Opus".into(),
+                            detail: Some("most capable".into()),
+                            resolved: Some("claude-opus-9".into()),
+                        },
+                        ModelChoice {
+                            id: "haiku".into(),
+                            label: "Haiku".into(),
+                            detail: None,
+                            resolved: None,
+                        },
+                    ],
+                },
+            ),
+            event(
+                id,
+                3,
+                EventKind::ModelChanged {
+                    model: "claude-opus-9".into(),
+                    answers: Some(command),
+                },
+            ),
+        ],
+    );
+    assert_contains(&status_line(&h, 100), "agent idle · Opus");
+    assert_contains(&h.screen(), "model → claude-opus-9 by this device");
+
+    // The list opens on the running model, marked; ↓ Enter sends the
+    // highlighted one's id.
+    h.key(KeyCode::Char('m'));
+    let screen = h.screen();
+    assert_contains(&screen, "Model · now Opus");
+    assert_contains(&screen, "› Opus  most capable · now");
+    assert_contains(&screen, "  Haiku");
+    h.key(KeyCode::Down);
+    assert_contains(&h.screen(), "› Haiku");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetModel {
+            session_id: id,
+            model: "haiku".into(),
+        })
+    );
+
+    // A typed name wins over the highlighted model; Ctrl-U clears it.
+    h.key(KeyCode::Char('m'));
+    h.type_text("x");
+    h.key_with(ctrl('u'));
+    h.app.on_paste("  sonnet-5\n");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetModel {
+            session_id: id,
+            model: "sonnet-5".into(),
+        })
+    );
+}
+
+#[test]
+fn agent_setting_keys_are_in_help() {
+    let (mut h, _, _) = open_session();
+    h.key(KeyCode::Tab);
+    let help = read_help(&mut h);
+    assert_keys(&help, &["p", "m"]);
+    assert_contains(&help.join("\n"), "bypass lets every tool run");
 }

@@ -5,6 +5,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.tooling.preview.Preview
 import dev.skywave.android.ui.ShellChrome
 import dev.skywave.android.ui.SkywaveTheme
+import dev.skywave.core.AgentSetting
+import dev.skywave.core.AgentView
 import dev.skywave.core.ApprovalPrompt
 import dev.skywave.core.Attention
 import dev.skywave.core.ApprovalStatus
@@ -18,7 +20,9 @@ import dev.skywave.core.DeviceRef
 import dev.skywave.core.Draft
 import dev.skywave.core.Entry
 import dev.skywave.core.FailReason
+import dev.skywave.core.ModelChoice
 import dev.skywave.core.Outgoing
+import dev.skywave.core.PermissionMode
 import dev.skywave.core.SessionState
 import dev.skywave.core.SessionUsage
 import dev.skywave.core.SessionView
@@ -76,6 +80,17 @@ internal object SessionSamples {
 
     val usage = TurnUsage(durationMs = 4100u, tokensIn = 12_300u, tokensOut = 840u, costUsd = 0.0123, model = "sonnet")
 
+    val agent = AgentView(
+        mode = PermissionMode.PLAN,
+        model = "claude-sonnet-4-5",
+        modelLabel = "Sonnet",
+        modeChange = null,
+        modelChange = null,
+        modeRefused = null,
+        modelRefused = null,
+        models = listOf(ModelChoice("sonnet", "Sonnet", "Fast and capable", "claude-sonnet-4-5")),
+    )
+
     /** Every kind of entry once, in a plausible order. */
     val everything: List<TimelineItem> = listOf(
         message(1, "Fix the failing sync test"),
@@ -112,6 +127,9 @@ internal object SessionSamples {
         logged(19, Entry.Archived(true, otherDevice)),
         logged(20, Entry.TurnUsage(usage)),
         message(21, "And from my laptop", own = false),
+        logged(22, Entry.AgentSetting(AgentSetting.Mode(PermissionMode.PLAN), meDevice, null)),
+        logged(23, Entry.AgentSetting(AgentSetting.Model("claude-sonnet-4-5"), null, null)),
+        logged(24, Entry.AgentSetting(AgentSetting.Mode(PermissionMode.BYPASS), otherDevice, "not allowed here")),
     )
 
     fun view(
@@ -137,6 +155,7 @@ internal object SessionSamples {
         pendingApproval = pendingApproval,
         rules = emptyList(),
         usage = SessionUsage(usage, usage),
+        agent = agent,
         interrupt = interrupt,
         stop = null,
         draft = draft,

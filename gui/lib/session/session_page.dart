@@ -186,7 +186,7 @@ class _SessionPageState extends State<SessionPage> {
               ],
               bottom: PreferredSize(
                 preferredSize: const Size.fromHeight(26),
-                child: StatusLine(screen: screen),
+                child: StatusLine(screen: screen, send: widget.send),
               ),
             ),
             body: Column(

@@ -1,10 +1,10 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
-use skywave_core::{Action, BlobPolicy, Decision, Route};
+use skywave_core::{Action, BlobPolicy, Decision, PermissionMode, Route};
 use uuid::Uuid;
 
-use crate::signals::{ActionIntent, BlobPolicyChoice, DecisionView, RouteView};
+use crate::signals::{ActionIntent, BlobPolicyChoice, DecisionView, PermissionModeView, RouteView};
 
 /// `intent` as a core action, or why it is not one.
 pub fn action(intent: ActionIntent) -> Result<Action, String> {
@@ -30,6 +30,14 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         },
         ActionIntent::StopSession { session_id } => Action::StopSession {
             session_id: id("session", &session_id)?,
+        },
+        ActionIntent::SetPermissionMode { session_id, mode } => Action::SetPermissionMode {
+            session_id: id("session", &session_id)?,
+            mode: permission_mode(mode),
+        },
+        ActionIntent::SetModel { session_id, model } => Action::SetModel {
+            session_id: id("session", &session_id)?,
+            model,
         },
         ActionIntent::SetSessionArchived {
             session_id,
@@ -61,6 +69,17 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
     })
 }
 
+fn permission_mode(mode: PermissionModeView) -> PermissionMode {
+    match mode {
+        PermissionModeView::Ask => PermissionMode::Ask,
+        PermissionModeView::AcceptEdits => PermissionMode::AcceptEdits,
+        PermissionModeView::Plan => PermissionMode::Plan,
+        PermissionModeView::Auto => PermissionMode::Auto,
+        PermissionModeView::DontAsk => PermissionMode::DontAsk,
+        PermissionModeView::Bypass => PermissionMode::Bypass,
+    }
+}
+
 /// A UUID id of the kind `what`, as core's id types take it.
 pub fn id<T: From<Uuid>>(what: &str, text: &str) -> Result<T, String> {
     Uuid::parse_str(text)
@@ -89,6 +108,26 @@ mod tests {
                 session_id: "nope".into(),
             }),
             Err("not a session id: \"nope\"".to_owned())
+        );
+        assert_eq!(
+            action(ActionIntent::SetPermissionMode {
+                session_id: session.0.to_string(),
+                mode: PermissionModeView::DontAsk,
+            }),
+            Ok(Action::SetPermissionMode {
+                session_id: session,
+                mode: PermissionMode::DontAsk,
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::SetModel {
+                session_id: session.0.to_string(),
+                model: "opus".into(),
+            }),
+            Ok(Action::SetModel {
+                session_id: session,
+                model: "opus".into(),
+            })
         );
         assert!(
             action(ActionIntent::ResolveApproval {

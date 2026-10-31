@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.skywave.android.R
+import dev.skywave.core.AgentSetting
 import dev.skywave.core.ApprovalStatus
 import dev.skywave.core.BodyFormat
 import dev.skywave.core.Decision
@@ -52,6 +53,7 @@ import dev.skywave.core.Delivery
 import dev.skywave.core.DeviceRef
 import dev.skywave.core.Entry
 import dev.skywave.core.Outgoing
+import dev.skywave.core.PermissionMode
 import dev.skywave.core.TimelineItem
 import dev.skywave.core.ToolKind
 import dev.skywave.core.ToolOutcome
@@ -238,6 +240,7 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
                 byText(e.by),
             ).joinToString(" "),
         )
+        is Entry.AgentSetting -> SystemLine(agentSettingText(e))
         is Entry.AgentErrored -> Surface(
             color = MaterialTheme.colorScheme.errorContainer,
             shape = RoundedCornerShape(8.dp),
@@ -258,6 +261,39 @@ private fun LoggedEntry(item: TimelineItem.Logged, expanded: Boolean, gated: Gat
         }
     }
 }
+
+/**
+ * A mode or model switch on one line: "Mode → plan by you", or "Mode bypass
+ * refused: why (asked by laptop)". `by` is left out when the agent switched
+ * on its own.
+ */
+@Composable
+private fun agentSettingText(e: Entry.AgentSetting): AnnotatedString {
+    val model = (e.setting as? AgentSetting.Model)?.model
+    val (value, set, refused) = when (val s = e.setting) {
+        is AgentSetting.Mode -> Triple(modeName(s.mode), R.string.sv_mode_set, R.string.sv_mode_refused)
+        is AgentSetting.Model -> Triple(s.model, R.string.sv_model_set, R.string.sv_model_refused)
+    }
+    val line = e.refused?.let { stringResource(refused, value, it) } ?: stringResource(set, value)
+    val by = e.by?.let { if (e.refused == null) byText(it) else askedByText(it) }
+    return markedParts(listOfNotNull(line, by).joinToString(" "), model, e.refused)
+}
+
+@Composable
+private fun modeName(mode: PermissionMode) = stringResource(
+    when (mode) {
+        PermissionMode.ASK -> R.string.mode_ask
+        PermissionMode.ACCEPT_EDITS -> R.string.mode_accept_edits
+        PermissionMode.PLAN -> R.string.mode_plan
+        PermissionMode.AUTO -> R.string.mode_auto
+        PermissionMode.DONT_ASK -> R.string.mode_dont_ask
+        PermissionMode.BYPASS -> R.string.mode_bypass
+    },
+)
+
+@Composable
+private fun askedByText(by: DeviceRef) =
+    if (by.me) stringResource(R.string.sv_asked_by_you) else stringResource(R.string.sv_asked_by_device, by.label)
 
 @Composable
 private fun byText(by: DeviceRef) = if (by.me) stringResource(R.string.sv_by_you) else stringResource(R.string.sv_by_device, by.label)

@@ -1,7 +1,7 @@
 //! User intents a head hands to [`Core::dispatch`](crate::Core::dispatch).
 
 use crate::store::BlobPolicy;
-use crate::view::{ApprovalId, BlobId, CommandId, Decision, Seq, SessionId};
+use crate::view::{ApprovalId, BlobId, CommandId, Decision, PermissionMode, Seq, SessionId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -79,6 +79,23 @@ pub enum Action {
     SetSessionArchived {
         session_id: SessionId,
         archived: bool,
+    },
+    /// Ask the session's agent to run in `mode`. The agent is started for
+    /// it if it is not running; the session view's
+    /// [`agent`](crate::SessionView::agent) shows the switch until the
+    /// agent answers, then the mode it runs in or its refusal.
+    SetPermissionMode {
+        session_id: SessionId,
+        mode: PermissionMode,
+    },
+    /// Ask the session's agent to run `model`: the
+    /// [`id`](crate::ModelChoice::id) of one the view's
+    /// [`models`](crate::AgentView::models) offers, or a name. Normalised as
+    /// the server will (control characters stripped, trimmed, cut to 80
+    /// chars); a blank one is a no-op. Shown as for a mode.
+    SetModel {
+        session_id: SessionId,
+        model: String,
     },
     /// Delete an archived session from this device only, to free space and
     /// drop its content here; it stays on the server and other devices.

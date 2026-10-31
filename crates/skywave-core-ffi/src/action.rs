@@ -11,7 +11,7 @@ use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 use uuid::Uuid;
 
 use crate::error::SkywaveError;
-use crate::view::{BlobPolicy, Decision, id};
+use crate::view::{BlobPolicy, Decision, PermissionMode, id};
 
 /// A user intent for the core.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -78,6 +78,18 @@ pub enum Action {
     SetSessionArchived {
         session_id: String,
         archived: bool,
+    },
+    /// Ask the session's agent to run in `mode`; the session view's `agent`
+    /// shows the switch until the agent answers.
+    SetPermissionMode {
+        session_id: String,
+        mode: PermissionMode,
+    },
+    /// Ask the session's agent to run `model`: the `id` of one the view's
+    /// `agent.models` offers, or a name. A blank one is a no-op.
+    SetModel {
+        session_id: String,
+        model: String,
     },
     /// Delete a `deletable` session from this device only.
     DeleteSessionLocally {
@@ -185,6 +197,14 @@ impl TryFrom<Action> for sc::Action {
                 session_id: parse("session_id", session_id)?,
                 archived,
             },
+            Action::SetPermissionMode { session_id, mode } => sc::Action::SetPermissionMode {
+                session_id: parse("session_id", session_id)?,
+                mode: mode.into(),
+            },
+            Action::SetModel { session_id, model } => sc::Action::SetModel {
+                session_id: parse("session_id", session_id)?,
+                model,
+            },
             Action::DeleteSessionLocally { session_id } => sc::Action::DeleteSessionLocally {
                 session_id: parse("session_id", session_id)?,
             },
@@ -269,6 +289,14 @@ impl From<sc::Action> for Action {
             } => Action::SetSessionArchived {
                 session_id: id(session_id.0),
                 archived,
+            },
+            sc::Action::SetPermissionMode { session_id, mode } => Action::SetPermissionMode {
+                session_id: id(session_id.0),
+                mode: mode.into(),
+            },
+            sc::Action::SetModel { session_id, model } => Action::SetModel {
+                session_id: id(session_id.0),
+                model,
             },
             sc::Action::DeleteSessionLocally { session_id } => Action::DeleteSessionLocally {
                 session_id: id(session_id.0),
@@ -363,6 +391,14 @@ mod tests {
             sc::Action::SetSessionArchived {
                 session_id,
                 archived: true,
+            },
+            sc::Action::SetPermissionMode {
+                session_id,
+                mode: sc::PermissionMode::Plan,
+            },
+            sc::Action::SetModel {
+                session_id,
+                model: "opus".into(),
             },
             sc::Action::DeleteSessionLocally { session_id },
             sc::Action::OpenSession(session_id),

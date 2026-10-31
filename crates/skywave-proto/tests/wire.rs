@@ -206,6 +206,44 @@ fn all_event_kinds() -> Vec<EventKind> {
             duration_ms: Some(2_590),
             ..TurnUsage::default()
         }),
+        EventKind::PermissionModeRequested {
+            mode: PermissionMode::Plan,
+            by: device(),
+        },
+        EventKind::PermissionModeChanged {
+            mode: PermissionMode::Plan,
+            answers: Some(command()),
+        },
+        EventKind::PermissionModeChanged {
+            mode: PermissionMode::Ask,
+            answers: None,
+        },
+        EventKind::PermissionModeRefused {
+            mode: PermissionMode::Bypass,
+            reason: "not launched for it".into(),
+            answers: Some(command()),
+        },
+        EventKind::ModelRequested {
+            model: "sonnet".into(),
+            by: device(),
+        },
+        EventKind::ModelChanged {
+            model: "model-b".into(),
+            answers: Some(command()),
+        },
+        EventKind::ModelRefused {
+            model: "bogus".into(),
+            reason: "not found".into(),
+            answers: None,
+        },
+        EventKind::ModelsOffered {
+            models: vec![ModelChoice {
+                id: "sonnet".into(),
+                label: "Sonnet".into(),
+                detail: Some("Efficient".into()),
+                resolved: Some("model-b".into()),
+            }],
+        },
     ]
 }
 
@@ -255,6 +293,14 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             archived: false,
         },
+        CommandKind::SetPermissionMode {
+            session_id: session(),
+            mode: PermissionMode::AcceptEdits,
+        },
+        CommandKind::SetModel {
+            session_id: session(),
+            model: "sonnet".into(),
+        },
     ]
 }
 
@@ -270,6 +316,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ApprovalCancelled,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
+            RejectReason::UnknownModel,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );

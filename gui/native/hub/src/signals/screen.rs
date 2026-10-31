@@ -1,5 +1,5 @@
 use rinf::{RustSignal, SignalPiece};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::timeline::{OutgoingView, SectionView, ToolKindView};
 
@@ -200,14 +200,80 @@ pub struct SessionScreen {
     pub rules: Vec<String>,
     /// `2 rules`; `None` for none.
     pub rules_label: Option<String>,
+    /// The agent's mode and model, and what switches them.
+    pub agent: AgentSettingsView,
     /// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `session $1.27`,
-    /// `<model>`: drop from the front when short of room.
+    /// `<model>` until the agent names its model in `agent`: drop from
+    /// the front when short of room.
     pub usage: Vec<String>,
     /// The approval the agent is blocked on.
     pub approval: Option<ApprovalPanel>,
     pub composer: ComposerView,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+}
+
+/// The session agent's permission mode and model: the status line's two
+/// chips and their pickers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct AgentSettingsView {
+    /// `ask`, `ask → plan` while a switch waits for the agent, `?` until
+    /// it says.
+    pub mode_label: String,
+    /// `Sonnet`, `Sonnet → Opus`; `None` until the agent names one and
+    /// none was asked for.
+    pub model_label: Option<String>,
+    /// The model as the agent names it, for the picker's name field.
+    pub model_name: Option<String>,
+    /// `bypass refused: <why>`, `plan failed: <why>`: the newest refusal
+    /// of a mode, until the next switch.
+    pub mode_refusal: Option<String>,
+    /// Likewise for a model.
+    pub model_refusal: Option<String>,
+    /// Every mode, from the most asking to the least.
+    pub modes: Vec<ModeOption>,
+    /// The models the agents offer; empty until one has, when only a name
+    /// typed in switches.
+    pub models: Vec<ModelOption>,
+}
+
+/// A mode the picker lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ModeOption {
+    pub mode: PermissionModeView,
+    /// `accept edits`.
+    pub label: String,
+    /// `file edits run without asking`.
+    pub detail: String,
+    /// It lets every tool run unasked: ask once more before switching.
+    pub needs_confirmation: bool,
+    /// The agent runs in it.
+    pub current: bool,
+    /// A switch to it waits for the agent.
+    pub pending: bool,
+}
+
+/// A model the picker lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ModelOption {
+    /// What `SetModel` sends back.
+    pub id: String,
+    pub label: String,
+    pub detail: Option<String>,
+    /// The agent runs it.
+    pub current: bool,
+    /// A switch to it waits for the agent.
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum PermissionModeView {
+    Ask,
+    AcceptEdits,
+    Plan,
+    Auto,
+    DontAsk,
+    Bypass,
 }
 
 /// The pending approval's panel.
