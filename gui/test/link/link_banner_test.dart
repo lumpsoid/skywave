@@ -14,6 +14,7 @@ LinkUpdate link(
 }) => LinkUpdate(
   state: state,
   label: label,
+  connectionLabel: '',
   canRetryNow: canRetryNow,
   rejected: state == LinkState.revoked || state == LinkState.protocolMismatch,
   queued: 0,

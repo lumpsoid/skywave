@@ -37,6 +37,7 @@ void main() {
         const LinkUpdate(
           state: LinkState.online,
           label: 'online · 2 queued',
+          connectionLabel: 'Connected · 12 ms',
           canRetryNow: false,
           rejected: false,
           queued: 2,
