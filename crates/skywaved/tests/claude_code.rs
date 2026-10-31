@@ -624,6 +624,266 @@ fn replay_granted_rules_are_applied_by_the_cli() {
     assert_eq!(kinds, ["addDirectories", "addRules", "setMode acceptEdits"]);
 }
 
+/// One recorded turn of a `permission_modes*` fixture, from its `step:` note
+/// to the next: the mode its `system/init` reported, the tools the CLI asked
+/// for, every tool the model called, the modes of the `system/status` lines
+/// sent between its `system/init` and its `result`, and whether each tool
+/// result was an error. A status that answers a `set_permission_mode`
+/// between turns can land on either side of the next `system/init`, so
+/// only those inside the turn are counted.
+#[derive(Debug, PartialEq)]
+struct ModeStep {
+    name: String,
+    mode: String,
+    asked: Vec<String>,
+    called: Vec<String>,
+    statuses: Vec<String>,
+    errors: Vec<bool>,
+}
+
+fn mode_steps(records: &[Value]) -> Vec<ModeStep> {
+    let mut steps: Vec<ModeStep> = Vec::new();
+    let mut in_turn = false;
+    for record in records {
+        if let Some(name) = record["text"]
+            .as_str()
+            .and_then(|t| t.strip_prefix("step: "))
+        {
+            steps.push(ModeStep {
+                name: name.to_owned(),
+                mode: String::new(),
+                asked: vec![],
+                called: vec![],
+                statuses: vec![],
+                errors: vec![],
+            });
+            continue;
+        }
+        let (Some(step), "out") = (steps.last_mut(), record["dir"].as_str().unwrap_or("")) else {
+            continue;
+        };
+        let msg = &record["msg"];
+        match (msg["type"].as_str().unwrap(), msg["subtype"].as_str()) {
+            ("system", Some("init")) => {
+                step.mode = msg["permissionMode"].as_str().unwrap().into();
+                in_turn = true;
+            }
+            ("result", _) => in_turn = false,
+            ("system", Some("status")) if in_turn => step
+                .statuses
+                .push(msg["permissionMode"].as_str().unwrap().into()),
+            ("control_request", _) if msg["request"]["subtype"] == "can_use_tool" => step
+                .asked
+                .push(msg["request"]["tool_name"].as_str().unwrap().into()),
+            ("assistant", _) => step.called.extend(
+                msg["message"]["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c["type"] == "tool_use")
+                    .map(|c| c["name"].as_str().unwrap().to_owned()),
+            ),
+            ("user", _) => step.errors.extend(
+                msg["message"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| c["type"] == "tool_result")
+                    .map(|c| c["is_error"] == true),
+            ),
+            _ => {}
+        }
+    }
+    steps
+}
+
+/// Every `set_permission_mode` in fixture `name`, in order: the mode asked
+/// for, the CLI's `control_response.response`, and the mode of the first
+/// `system/status` line after that response, if any.
+fn mode_changes(records: &[Value]) -> Vec<(String, Value, Option<String>)> {
+    let mut changes: Vec<(String, Value, Option<String>)> = Vec::new();
+    let mut pending: HashMap<&str, String> = HashMap::new();
+    for record in records {
+        let msg = &record["msg"];
+        match record["dir"].as_str().unwrap_or("") {
+            "in" if msg["request"]["subtype"] == "set_permission_mode" => {
+                pending.insert(
+                    msg["request_id"].as_str().unwrap(),
+                    msg["request"]["mode"].as_str().unwrap().into(),
+                );
+            }
+            "out" if msg["type"] == "control_response" => {
+                if let Some(mode) = pending.remove(msg["response"]["request_id"].as_str().unwrap())
+                {
+                    changes.push((mode, msg["response"].clone(), None));
+                }
+            }
+            // Later status lines come from elsewhere (an approved
+            // ExitPlanMode); `mode_steps` reports those.
+            "out" if msg["type"] == "system" && msg["subtype"] == "status" => {
+                if let Some(last @ (_, _, None)) = changes.last_mut() {
+                    last.2 = Some(msg["permissionMode"].as_str().unwrap().into());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(pending.is_empty(), "unanswered mode changes {pending:?}");
+    changes
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// The CLI side of a mode change (docs/agents/claude-code.md §3.7): a
+/// `set_permission_mode` is answered with `{"mode"}` and a `system/status`
+/// line, takes effect from the next tool call in the same process, and
+/// leaves an approval that is already pending waiting for its answer.
+#[test]
+fn recorded_permission_modes_change_what_the_cli_asks() {
+    let records = fixture("permission_modes");
+    for (mode, response, status) in mode_changes(&records) {
+        assert_eq!(response["subtype"], "success", "{mode}");
+        assert_eq!(response["response"], json!({ "mode": mode }));
+        assert_eq!(status.as_deref(), Some(mode.as_str()));
+    }
+
+    let step =
+        |name: &str, mode: &str, asked: &[&str], called: &[&str], statuses: &[&str]| ModeStep {
+            name: name.into(),
+            mode: mode.into(),
+            asked: strings(asked),
+            called: strings(called),
+            statuses: strings(statuses),
+            errors: vec![false; called.len()],
+        };
+    let mut expected = vec![
+        step("default: Write", "default", &["Write"], &["Write"], &[]),
+        step("acceptEdits: Write", "acceptEdits", &[], &["Write"], &[]),
+        step("acceptEdits: Bash rm", "acceptEdits", &[], &["Bash"], &[]),
+        // Plan writes its plan file unasked, then asks to leave plan mode;
+        // approving it returns to the mode before plan.
+        step(
+            "plan: Write",
+            "plan",
+            &["ExitPlanMode"],
+            &["Write", "ToolSearch", "ExitPlanMode", "Write"],
+            &["acceptEdits"],
+        ),
+        step("auto: Write", "auto", &[], &["Write"], &[]),
+        step("auto: Bash rm", "auto", &[], &["Bash"], &[]),
+        step("dontAsk: Write", "dontAsk", &[], &["Write"], &[]),
+        step(
+            "default again: Write",
+            "default",
+            &["Write"],
+            &["Write"],
+            &[],
+        ),
+        // The switch to acceptEdits does not settle the pending Write: the
+        // CLI sends no cancel and waits for the answer.
+        step(
+            "pending + switch to acceptEdits",
+            "default",
+            &["Write"],
+            &["Write"],
+            &["acceptEdits"],
+        ),
+    ];
+    // dontAsk refuses instead of asking.
+    expected[6].errors = vec![true];
+    assert_eq!(mode_steps(&records), expected);
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["msg"]["type"] == "control_cancel_request")
+    );
+}
+
+/// Approving `ExitPlanMode` returns to the mode the session was in before
+/// plan: `default` here, `acceptEdits` in `permission_modes`.
+#[test]
+fn recorded_plan_approval_returns_to_the_previous_mode() {
+    let records = fixture("permission_modes_plan");
+    // The only set_permission_mode; the switch back comes from the approval.
+    let [(mode, response, status)] = &mode_changes(&records)[..] else {
+        panic!("expected one mode change");
+    };
+    assert_eq!(
+        (mode.as_str(), &response["response"], status.as_deref()),
+        ("plan", &json!({"mode": "plan"}), Some("plan"))
+    );
+
+    let exit_plan = records
+        .iter()
+        .find(|r| r["dir"] == "out" && r["msg"]["request"]["tool_name"] == "ExitPlanMode")
+        .map(|r| &r["msg"]["request"])
+        .unwrap();
+    assert_eq!(exit_plan["permission_suggestions"], Value::Null);
+    assert!(exit_plan["input"]["plan"].as_str().is_some());
+
+    let steps = mode_steps(&records);
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.name.as_str(), s.mode.as_str(), &s.asked, &s.statuses))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "plan (from default): Write",
+                "plan",
+                &strings(&["ExitPlanMode", "Write"]),
+                &strings(&["default"])
+            ),
+            (
+                "after plan: Write",
+                "default",
+                &strings(&["Write"]),
+                &vec![]
+            ),
+        ]
+    );
+}
+
+/// A mode the CLI rejects is answered with an error `control_response`
+/// carrying an `error_code`, and the mode stays as it was.
+#[test]
+fn recorded_rejected_permission_modes_keep_the_mode() {
+    let records = fixture("permission_mode_errors");
+    let changes: Vec<(String, Value, Option<String>)> = mode_changes(&records);
+    let summary: Vec<(&str, &str, Option<&str>, Option<&str>)> = changes
+        .iter()
+        .map(|(mode, response, status)| {
+            (
+                mode.as_str(),
+                response["subtype"].as_str().unwrap(),
+                response["error_code"].as_str(),
+                status.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("plan", "success", None, Some("plan")),
+            (
+                "bypassPermissions",
+                "error",
+                Some("bypass_not_launched"),
+                None
+            ),
+            ("bogus", "error", Some("invalid_mode"), None),
+        ]
+    );
+    // `initialize` reads the mode back: still plan after both rejections.
+    let current: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["msg"]["response"]["response"]["current_permission_mode"].as_str())
+        .collect();
+    assert_eq!(current, ["default", "plan", "plan", "plan"]);
+}
+
 #[test]
 fn replay_interrupt_while_streaming_and_while_idle() {
     // This run had no --session-id: the CLI's own id is adopted.

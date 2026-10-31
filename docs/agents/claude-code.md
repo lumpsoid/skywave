@@ -434,6 +434,74 @@ session-scoped one is kept in the resume handle and comes back as
 A middle way is to offer it only with an extra confirmation in the client.
 That changes the protocol and the UI, so it is not part of d29758.
 
+### 3.7 Changing the permission mode mid-session [C]
+
+Recorded with 2.1.310 on 2026-10-31 (`permission_modes.ndjson`,
+`permission_modes_plan.ndjson`, `permission_mode_errors.ndjson`). This is
+what the interactive CLI cycles with shift+tab. skywaved does not send it
+yet.
+
+**Request (stdin → CLI)**, at any time, also before the first user message
+and while an approval is pending:
+
+```json
+{"type":"control_request","request_id":"<uuid>","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}}
+```
+
+`mode` is one of `default` (the UI's "manual"), `acceptEdits`, `plan`,
+`auto`, `dontAsk`, `bypassPermissions`.
+
+**Success (CLI → stdout)**: a `control_response` that echoes the mode, then
+a status line:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"mode":"plan"}}}
+{"type":"system","subtype":"status","status":null,"permissionMode":"plan","uuid":"…","session_id":"…"}
+```
+
+The `control_response` is the ack. The status line can come later, in
+some runs only after the next stdin line, so don't wait for it. From the next
+turn on, `system/init.permissionMode` and `initialize`'s
+`current_permission_mode` both report the new mode. The change holds in
+the running process; across `--resume` it is lost like any session state
+(§3.2).
+
+**Rejection**: an error `control_response` with an `error_code`; the mode
+stays as it was.
+
+| `mode` | `error_code` | `error` |
+|--------|--------------|---------|
+| `bypassPermissions` | `bypass_not_launched` | `Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions` |
+| anything unknown | `invalid_mode` | `Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan` |
+
+**Effect**, one tool call per turn, the next turn after the switch:
+
+| mode | Write in workdir | Bash `rm <file in workdir>` |
+|------|------------------|-----------------------------|
+| `default` | `can_use_tool` | (asks, §3.1) |
+| `acceptEdits` | runs, not asked | runs, not asked |
+| `plan` | not run; see below | — |
+| `auto` | runs, not asked | runs, not asked |
+| `dontAsk` | not asked; error `tool_result` "Permission to use Write has been denied because Claude Code is running in don't ask mode…", and a `system/permission_denied` line | — |
+
+`auto` decides on its own, so it may still ask for riskier calls than these;
+only these two were recorded.
+
+**Plan mode.** The model writes its plan to `~/.claude/plans/<slug>.md`
+without being asked, then calls `ExitPlanMode`. That comes as a normal
+`can_use_tool` with `input.plan` (the plan as markdown) and
+`permission_suggestions: null`. Allowing it sends a `system/status` that
+returns to **the mode before plan**: `default` when plan was entered from
+`default`, `acceptEdits` when entered from `acceptEdits`. The model then does
+the work under that mode. So approving a plan is an ordinary approval with a
+mode change as a side effect, and a client must take the mode from the
+status line, not assume one.
+
+**A pending approval is not settled by a mode change.** Switching to
+`acceptEdits` while a Write's `can_use_tool` waited sent no
+`control_cancel_request`. The CLI went on waiting until it got the answer
+(10 s here). The client still has to answer every approval it shows.
+
 ## 4. Interrupt
 
 Request **[C]**:
@@ -624,7 +692,7 @@ output when a field is missing.
 - removing rules granted with "always allow" (they live in the CLI's
   settings, out of Skywave's sight)
 - hooks over the control channel
-- `set_permission_mode`
+- sending `set_permission_mode` from skywaved (the CLI side is in §3.7)
 - MCP over stdio
 - `--replay-user-messages`
 - sending a second user message while a turn runs (`still_queued` suggests the
