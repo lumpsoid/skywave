@@ -1,12 +1,27 @@
 //! The rinf bridge between the skywave core and the Flutter GUI: turns Dart
 //! signals into core actions and core snapshots into Rust signals. It holds
-//! no business logic. Entry point of the Rust side of the app.
+//! no business logic: what the head decides is skywave-present's, driven
+//! the way the TUI drives it. Entry point of the Rust side of the app.
+//!
+//! - [`signals`]: the Dart contract.
+//! - `head`: snapshots, intents and results in; signals and actions out.
+//! - `link`, `screen`, `timeline`, `search`, `clip`, `intents`: the
+//!   mapping, one feature each.
+//! - `run`: the hub task's `select!` loop; `boot`, `dispatcher`: opening
+//!   the core and dispatching to it in order.
 
 mod boot;
+mod clip;
 pub mod dispatcher;
+mod head;
+mod intents;
+mod link;
 mod logging;
 mod run;
+mod screen;
+mod search;
 mod signals;
+mod timeline;
 
 use rinf::{dart_shutdown, write_interface};
 use tokio::sync::oneshot;
