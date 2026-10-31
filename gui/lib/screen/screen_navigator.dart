@@ -86,6 +86,7 @@ class ScreenNavigator extends StatelessWidget {
     ),
     final ScreenViewSettings screen => SettingsPage(
       screen: screen,
+      link: holders.link,
       canGoBack: update.canGoBack,
       send: send,
     ),

@@ -6,7 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ScreenView};
+use crate::signals::{ActionIntent, ListKindView, RouteView, ScreenView};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -451,6 +451,38 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
 }
 
 #[test]
+fn the_list_title_leaves_the_counts_to_the_toggle() {
+    let mut rig = Rig::new();
+    let list = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::SessionList {
+            kind,
+            title,
+            rows,
+            other_count,
+            ..
+        } => (*kind, title.clone(), rows.len(), *other_count),
+        other => panic!("not the list: {other:?}"),
+    };
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(list(&rig), (ListKindView::Active, "Sessions".into(), 1, 0));
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::ArchivedSessions,
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(
+        list(&rig),
+        (ListKindView::Archived, "Sessions".into(), 0, 1)
+    );
+}
+
+#[test]
 fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {
@@ -655,6 +687,8 @@ impl Rig {
 fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     use skywave_proto::{ModelChoice, PermissionMode};
     let mut rig = Rig::new();
+    assert_eq!(rig.agent().mode_label, "mode unknown", "not said yet");
+    assert_eq!(rig.agent().model_label, "model unknown", "not said yet");
     rig.log(vec![
         EventKind::PermissionModeChanged {
             mode: PermissionMode::Ask,
@@ -675,7 +709,7 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     ]);
     let agent = rig.agent();
     assert_eq!(agent.mode_label, "ask");
-    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(agent.model_label, "Sonnet");
     assert_eq!(agent.modes.len(), 6);
     assert!(agent.modes[0].current);
     assert!(agent.modes[5].needs_confirmation);
@@ -706,10 +740,25 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
         answers: None,
     }]);
     let agent = rig.agent();
-    assert_eq!(agent.model_label.as_deref(), Some("Sonnet"));
+    assert_eq!(agent.model_label, "Sonnet");
     assert_eq!(
         agent.model_refusal.as_deref(),
         Some("big refused: no model named")
     );
     assert_eq!(agent.mode_refusal, None);
+}
+
+#[test]
+fn a_model_asked_for_before_the_agent_names_one_reads_unknown() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SetModel {
+            session_id: rig.session.0.to_string(),
+            model: "opus".into(),
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(rig.agent().model_label, "unknown → opus");
+    assert_eq!(rig.agent().mode_label, "mode unknown");
 }

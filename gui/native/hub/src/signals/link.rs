@@ -6,11 +6,17 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub struct LinkUpdate {
     pub state: LinkState,
-    /// The banner's text, e.g. `online · 12 ms · 2 queued`, `offline · 2
-    /// queued · retry in 07s (attempt 3)`, `device revoked · re-pair to
-    /// reconnect`. Empty while unpaired: the pairing screen says what to
-    /// do. No key hints.
+    /// The banner's text, e.g. `online · 2 queued`, `offline · 2 queued ·
+    /// retry in 07s (attempt 3)`, `device revoked · re-pair to reconnect`.
+    /// Empty when there is nothing to say, and the banner hides: while
+    /// unpaired (the pairing screen says what to do), and while online
+    /// with nothing queued and no approvals elsewhere. No key hints.
     pub label: String,
+    /// The link for Settings, always said: `Connected · 12 ms`,
+    /// `Connecting…`, `Syncing · 4/9`, `Offline · retry in 07s`, `Device
+    /// revoked`, `Not paired`. Carries the round trip while online, so it
+    /// changes on every ping: only the tile showing it should rebuild.
+    pub connection_label: String,
     /// While reconnecting: whole seconds until the next attempt, rounded
     /// up; 0 once it is due. `None` in every other state.
     pub retry_in_s: Option<u32>,

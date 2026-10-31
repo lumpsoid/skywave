@@ -1,16 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/look.dart' hide StateBadge;
 import 'package:skywave_gui/src/bindings/bindings.dart';
-
-/// The colour of an agent state's badge, shared by the list and the
-/// session header.
-Color agentStateColor(AgentState state, ColorScheme colors) => switch (state) {
-  AgentState.idle => colors.outline,
-  AgentState.working => const Color(0xFF0277BD),
-  AgentState.awaitingApproval => const Color(0xFFF57F17),
-  AgentState.errored => colors.error,
-  AgentState.stopped => colors.outlineVariant,
-};
 
 /// An agent state's badge with Rust's label.
 class StateBadge extends StatelessWidget {
@@ -22,7 +13,7 @@ class StateBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final color = agentStateColor(state, theme.colorScheme);
+    final color = SkyColors.of(context).agent(state);
     return Container(
       constraints: const BoxConstraints(minWidth: 72),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -55,86 +46,131 @@ class SessionRow extends StatelessWidget {
       color: colors.onSurfaceVariant,
     );
     final renameFailed = row.rename?.state == OutgoingState.failed;
-    return ListTile(
-      leading: StateBadge(state: row.state, label: row.badgeLabel),
-      title: Text.rich(
-        TextSpan(
-          children: [
-            TextSpan(
-              text: row.title,
-              style: const TextStyle(fontWeight: FontWeight.w600),
-            ),
-            if (row.renameLabel case final rename?)
-              TextSpan(
-                text: '  $rename',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: renameFailed ? colors.error : colors.primary,
-                ),
-              ),
-          ],
+    // A screen reader reads the row as one sentence, title first; the
+    // parts it is drawn from stay out of it. The menu keeps its own node.
+    return Semantics(
+      label: rowSemanticsLabel(row),
+      child: ListTile(
+        leading: ExcludeSemantics(
+          child: StateBadge(state: row.state, label: row.badgeLabel),
         ),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-      ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (row.workdir case final workdir?)
-            Text(
-              workdir,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: muted?.copyWith(fontFamily: 'monospace'),
+        title: ExcludeSemantics(
+          child: Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(
+                  text: row.title,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                if (row.renameLabel case final rename?)
+                  TextSpan(
+                    text: '  $rename',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: renameFailed ? colors.error : colors.primary,
+                    ),
+                  ),
+              ],
             ),
-          Wrap(
-            spacing: 12,
-            crossAxisAlignment: WrapCrossAlignment.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        subtitle: ExcludeSemantics(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (row.unread > 0)
-                _Marker(
-                  key: const Key('row-unread'),
-                  icon: Icons.circle,
-                  text: '${row.unread}',
-                  color: colors.tertiary,
-                  tooltip: 'Unread',
+              if (row.workdir case final workdir?)
+                Text(
+                  workdir,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: muted?.copyWith(fontFamily: 'monospace'),
                 ),
-              if (row.approvalsLabel case final approvals?)
-                _Marker(
-                  icon: Icons.notification_important,
-                  text: approvals,
-                  color: agentStateColor(AgentState.awaitingApproval, colors),
-                ),
-              if (row.error case final error?)
-                _Marker(
-                  icon: Icons.error_outline,
-                  text: error,
-                  color: colors.error,
-                ),
-              if (row.hasDraft)
-                _Marker(
-                  icon: Icons.edit_note,
-                  text: 'draft',
-                  color: colors.onSurfaceVariant,
-                ),
-              Text(
-                [?row.costLabel, row.lastActivityLabel].join(' · '),
-                style: muted,
+              Wrap(
+                spacing: 12,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  if (row.unread > 0)
+                    _Marker(
+                      key: const Key('row-unread'),
+                      icon: Icons.circle,
+                      text: '${row.unread}',
+                      semanticLabel: _unreadLabel(row.unread),
+                      color: colors.tertiary,
+                      tooltip: 'Unread',
+                    ),
+                  if (row.approvalsLabel case final approvals?)
+                    _Marker(
+                      icon: Icons.notification_important,
+                      text: approvals,
+                      semanticLabel: _approvalsLabel(approvals),
+                      color: SkyColors.of(context).warning,
+                    ),
+                  if (row.error case final error?)
+                    _Marker(
+                      icon: Icons.error_outline,
+                      text: error,
+                      semanticLabel: _errorLabel(error),
+                      color: colors.error,
+                    ),
+                  if (row.hasDraft)
+                    _Marker(
+                      icon: Icons.edit_note,
+                      text: 'draft',
+                      semanticLabel: _draftLabel,
+                      color: colors.onSurfaceVariant,
+                    ),
+                  Text(
+                    [?row.costLabel, row.lastActivityLabel].join(' · '),
+                    style: muted,
+                  ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
+        isThreeLine: row.workdir != null,
+        trailing: _RowMenu(row: row, send: send),
+        onTap: () =>
+            send.act(ActionIntentOpenSession(sessionId: row.sessionId)),
       ),
-      isThreeLine: row.workdir != null,
-      trailing: _RowMenu(row: row, send: send),
-      onTap: () => send.act(ActionIntentOpenSession(sessionId: row.sessionId)),
     );
   }
+}
+
+String _unreadLabel(int unread) => '$unread unread';
+String _approvalsLabel(String approvals) => 'needs approval, $approvals';
+String _errorLabel(String error) => 'agent error: $error';
+const _draftLabel = 'draft saved';
+
+/// What a screen reader says for [row]: its title, a rename on its way,
+/// its state (unless a marker says it), the markers, where it works, and
+/// its cost and last activity.
+String rowSemanticsLabel(SessionRowView row) {
+  final rename = row.renameLabel;
+  final saysState =
+      !(row.state == AgentState.awaitingApproval &&
+          row.approvalsLabel != null) &&
+      !(row.state == AgentState.errored && row.error != null);
+  return [
+    row.title,
+    if (rename != null) rename.startsWith('rename') ? rename : 'rename $rename',
+    if (saysState) row.badgeLabel,
+    if (row.unread > 0) _unreadLabel(row.unread),
+    if (row.approvalsLabel case final approvals?) _approvalsLabel(approvals),
+    if (row.error case final error?) _errorLabel(error),
+    if (row.hasDraft) _draftLabel,
+    ?row.workdir,
+    ?row.costLabel,
+    'last active ${row.lastActivityLabel}',
+  ].join(', ');
 }
 
 class _Marker extends StatelessWidget {
   const _Marker({
     required this.icon,
     required this.text,
+    required this.semanticLabel,
     required this.color,
     this.tooltip,
     super.key,
@@ -142,6 +178,9 @@ class _Marker extends StatelessWidget {
 
   final IconData icon;
   final String text;
+
+  /// What a screen reader says for it, in place of its icon and text.
+  final String semanticLabel;
   final Color color;
   final String? tooltip;
 
@@ -163,7 +202,13 @@ class _Marker extends StatelessWidget {
         ),
       ],
     );
-    return tooltip == null ? marker : Tooltip(message: tooltip, child: marker);
+    return Semantics(
+      label: semanticLabel,
+      excludeSemantics: true,
+      child: tooltip == null
+          ? marker
+          : Tooltip(message: tooltip, child: marker),
+    );
   }
 }
 

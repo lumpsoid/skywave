@@ -270,4 +270,74 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+  testWidgets('a row reads as one sentence, its markers named', (tester) async {
+    final semantics = tester.ensureSemantics();
+    await pump(tester, list(rows: [sessionRow('a')]));
+    expect(
+      tester.getSemantics(find.byType(ListTile)),
+      matchesSemantics(
+        label:
+            r'title a, rename queued, 3 unread, needs approval, '
+            r'1 approval pending, draft saved, /srv/a, $1.27, '
+            'last active 2026-10-31 14:02 UTC',
+        isButton: true,
+        isFocusable: true,
+        hasEnabledState: true,
+        isEnabled: true,
+        hasSelectedState: true,
+        hasTapAction: true,
+        hasFocusAction: true,
+        // The menu keeps its own node, with its name.
+        children: [
+          matchesSemantics(
+            tooltip: 'Session actions',
+            isButton: true,
+            isFocusable: true,
+            hasEnabledState: true,
+            isEnabled: true,
+            hasExpandedState: true,
+            hasTapAction: true,
+            hasFocusAction: true,
+          ),
+        ],
+      ),
+    );
+    // No fragment is read on its own: not the bare count, not the badge.
+    expect(find.bySemanticsLabel('3'), findsNothing);
+    expect(find.bySemanticsLabel('approval'), findsNothing);
+    semantics.dispose();
+  });
+
+  testWidgets('an errored row says the agent errored and why', (tester) async {
+    final semantics = tester.ensureSemantics();
+    final row = sessionRow('a');
+    await pump(
+      tester,
+      list(
+        rows: [
+          SessionRowView(
+            sessionId: 'e',
+            title: 'broken',
+            state: AgentState.errored,
+            badgeLabel: 'error',
+            unread: 0,
+            approvals: 0,
+            error: 'crashed',
+            hasDraft: false,
+            lastActivityLabel: row.lastActivityLabel,
+            lastActivityMs: 0,
+            deletable: false,
+            archived: false,
+          ),
+        ],
+      ),
+    );
+    expect(
+      find.bySemanticsLabel(
+        'broken, agent error: crashed, last active 2026-10-31 14:02 UTC',
+      ),
+      findsOneWidget,
+    );
+    semantics.dispose();
+  });
 }

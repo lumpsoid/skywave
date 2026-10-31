@@ -111,6 +111,16 @@ final askAgent = AgentSettingsView(
   ],
 );
 
+const _badges = {
+  AgentState.idle: 'idle',
+  AgentState.working: 'working',
+  AgentState.awaitingApproval: 'approval',
+  AgentState.errored: 'error',
+  AgentState.stopped: 'stopped',
+};
+
+/// A session screen, idle unless told otherwise: a working agent's bar
+/// runs, so a test showing one pumps rather than settles.
 SessionScreen screenWith({
   ComposerView composer = composerAt1,
   ApprovalPanel? approval,
@@ -118,6 +128,7 @@ SessionScreen screenWith({
   RenamePrompt? renamePrompt,
   String? archivedLabel,
   AgentSettingsView? agent,
+  AgentState state = AgentState.idle,
   bool canInterrupt = true,
   bool interruptBusy = false,
   String? interruptRefusal,
@@ -125,9 +136,9 @@ SessionScreen screenWith({
   sessionId: 's1',
   title: 'work',
   workdir: '/home/me/work',
-  state: AgentState.working,
-  badgeLabel: 'working',
-  agentLabel: 'agent working',
+  state: state,
+  badgeLabel: _badges[state]!,
+  agentLabel: 'agent ${_badges[state]}',
   canInterrupt: canInterrupt,
   interruptBusy: interruptBusy,
   interruptRefusal: interruptRefusal,
