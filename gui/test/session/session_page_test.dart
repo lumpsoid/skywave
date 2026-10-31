@@ -691,6 +691,70 @@ void main() {
     );
   });
 
+  testWidgets('a refusal that arrives is said once in a snack bar', (
+    tester,
+  ) async {
+    Future<void> show(SessionScreen screen) => pumpSession(
+      tester,
+      screen: screen,
+      timeline: holding([]),
+      sent: [],
+    );
+    AgentSettingsView refusing({String? mode, String? model}) =>
+        AgentSettingsView(
+          modeLabel: 'ask',
+          modelLabel: 'Sonnet',
+          modeRefusal: mode,
+          modelRefusal: model,
+          modes: askAgent.modes,
+          models: askAgent.models,
+        );
+    Finder snack(String text) =>
+        find.descendant(of: find.byType(SnackBar), matching: find.text(text));
+    Future<void> dismiss() async {
+      await tester.tap(find.byIcon(Icons.close));
+      await tester.pumpAndSettle();
+    }
+
+    // Already refused when the page opened: not news.
+    await show(screenWith(interruptRefusal: 'old news'));
+    expect(find.byType(SnackBar), findsNothing);
+
+    await show(screenWith(interruptRefusal: 'the server could not take it'));
+    expect(
+      snack('Interrupt failed: the server could not take it'),
+      findsOneWidget,
+    );
+    await dismiss();
+    // The same refusal again, as on any rebuild: said once.
+    await show(screenWith(interruptRefusal: 'the server could not take it'));
+    expect(find.byType(SnackBar), findsNothing);
+    // It stays on the button.
+    expect(
+      find.byTooltip('Interrupt failed: the server could not take it'),
+      findsOneWidget,
+    );
+
+    await show(screenWith());
+    await show(
+      screenWith(agent: refusing(mode: 'bypass refused: not launched for it')),
+    );
+    expect(snack('bypass refused: not launched for it'), findsOneWidget);
+    await dismiss();
+    await show(
+      screenWith(
+        agent: refusing(
+          mode: 'bypass refused: not launched for it',
+          model: 'bogus refused: unknown model',
+        ),
+      ),
+    );
+    expect(snack('bogus refused: unknown model'), findsOneWidget);
+    expect(snack('bypass refused: not launched for it'), findsNothing);
+    await dismiss();
+    expect(find.byTooltip('bogus refused: unknown model'), findsOneWidget);
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(
