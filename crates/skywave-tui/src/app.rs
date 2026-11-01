@@ -367,6 +367,10 @@ pub enum Picker {
     Agent { selected: usize },
     /// The levels the model takes, [`AgentView::efforts`] in order.
     Effort { selected: usize },
+    /// The menu `C` opens: row 0 is "New context" (inert while the core
+    /// does not offer it), the rows after it [`SessionView::contexts`] as
+    /// the core lists them.
+    Contexts { selected: usize },
 }
 
 /// The rows of [`Picker::Agent`].
@@ -399,6 +403,14 @@ impl Picker {
         Picker::Model {
             selected,
             name: String::new(),
+        }
+    }
+
+    /// The contexts menu, on the current context.
+    fn contexts(view: &SessionView) -> Picker {
+        let current = view.contexts.iter().position(|c| c.current);
+        Picker::Contexts {
+            selected: current.map_or(0, |i| i + 1),
         }
     }
 
@@ -524,6 +536,49 @@ impl Picker {
                 }
                 _ => (false, None),
             },
+            Picker::Contexts { selected } => {
+                // Row 0 is "New context"; the contexts follow.
+                let last = view.contexts.len();
+                *selected = (*selected).min(last);
+                let context = selected.checked_sub(1).and_then(|i| view.contexts.get(i));
+                match key.code {
+                    KeyCode::Esc => (true, None),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                        (false, None)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(last);
+                        (false, None)
+                    }
+                    // Only what the core offers; otherwise the row is inert.
+                    KeyCode::Enter => match context {
+                        None if view.can_clear => (true, Some(Action::ClearContext { session_id })),
+                        None => (false, None),
+                        // Already current: nothing to switch, just close.
+                        Some(c) if c.current => (true, None),
+                        Some(c) => (
+                            true,
+                            Some(Action::SwitchContext {
+                                session_id,
+                                context: c.id,
+                            }),
+                        ),
+                    },
+                    // The current context stands for the whole timeline.
+                    KeyCode::Char('v') => match context {
+                        None => (false, None),
+                        Some(c) => (
+                            true,
+                            Some(Action::ViewContext {
+                                session_id,
+                                context: (!c.current).then_some(c.id),
+                            }),
+                        ),
+                    },
+                    _ => (false, None),
+                }
+            }
             Picker::Effort { selected } => {
                 let efforts = view.agent.efforts();
                 let last = efforts.len().saturating_sub(1);
@@ -1758,6 +1813,10 @@ impl App {
                 }
                 KeyCode::Char('m') => {
                     session.picker = Some(Picker::agent());
+                    None
+                }
+                KeyCode::Char('C') => {
+                    session.picker = Some(Picker::contexts(view));
                     None
                 }
                 KeyCode::Char('R') => {
