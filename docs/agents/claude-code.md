@@ -22,7 +22,7 @@ text, and not seen.
 | 1 | Long-lived stream-json process: send user messages, read text, tool_use, tool_result and result | **[C]** |
 | 2 | Permission prompt over stdio (`can_use_tool`), allow and deny replies, a long wait | **[C]** (waits ≥150 s seen; a wait with no limit at all is [U], see §3.4) |
 | 3 | Interrupt over stdin, while streaming and while an approval is pending; the process stays usable | **[C]** |
-| 4 | Session id (`--session-id` and `system/init`), `--resume` in a new process | **[C]** |
+| 4 | Session id (`--session-id` and `system/init`), `--resume` in a new process, `--resume --fork-session` with a chosen id | **[C]** |
 | 5 | initialize handshake, exit when stdin closes, stderr | **[C]**, with one caveat: stdin EOF does not end the current turn (§6) |
 
 The spec needs no change.
@@ -710,7 +710,20 @@ same process, with the same session id.
   `system/init.session_id` and is repeated on every message. **[C]**
 - `--resume <uuid>` in a **new** process restores the history (`resume.ndjson`
   quotes the first prompt of `basic`) and keeps the **same** session id.
-  **[C]** `--fork-session` would create a new id instead. **[U]** Not needed.
+  **[C]**
+- `--resume <A> --fork-session --session-id <B>` in a new process copies A's
+  history into a new transcript under the id **B we chose**: `system/init`
+  and every message carry B. **[C]** (`fork.ndjson`, 2026-11-01). Without
+  `--session-id` the CLI picks the new id (seen in a probe, not recorded).
+  A is untouched: a later `--resume <A>` does not know the fork's turns, and
+  `--resume <B>` restores A's history plus the fork's. **[C]** Nothing in the
+  fork's stream names A, so the parent is known only from what skywaved
+  stored. Like a resume, the fork carries A's spend: B's first
+  `total_cost_usd` and `modelUsage` include A's, while
+  `model_usage_since_last_result` holds only B's turn, so the adapter's
+  per-turn cost (§2.5) needs no change. Resuming or forking from a different
+  cwd is still **[U]**. Moving a context to a new session (planned)
+  starts the new session's first context this way.
 - Reusing an existing id with `--session-id` fails:
   `Error: Session ID <id> is already in use.`, exit 1. **[C]** So the first
   start uses `--session-id`, and every restart uses `--resume`.
