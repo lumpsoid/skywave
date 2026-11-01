@@ -875,6 +875,117 @@ fn context_intents_map_to_actions_and_the_screen_lists_the_contexts() {
 }
 
 #[test]
+fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() {
+    let mut rig = Rig::new();
+    let start = skywave_proto::ContextId::first_of(rig.session);
+    rig.log(vec![EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "fix it".into(),
+    }]);
+    let row = rig.open_session().contexts[0].clone();
+    assert!(!row.can_move, "negative control: no turn answered yet");
+    assert!(
+        row.move_refusal
+            .as_deref()
+            .unwrap()
+            .starts_with("can't move yet"),
+        "{row:?}"
+    );
+    assert_eq!((row.moved_label, row.discard_move), (None, None));
+
+    rig.log(vec![
+        EventKind::SessionStateChanged(skywave_proto::SessionState::AgentWorking),
+        EventKind::AgentMessage {
+            text: "done".into(),
+        },
+    ]);
+    let row = rig.open_session().contexts[0].clone();
+    assert!(row.can_move, "positive control: {row:?}");
+    assert_eq!(row.move_refusal, None);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::MoveContext {
+            session_id: rig.session.0.to_string(),
+            context_id: start.0.to_string(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::MoveContext {
+            session_id: rig.session,
+            context: start
+        }]
+    );
+    rig.actions.clear();
+    rig.results();
+    rig.view();
+    let row = rig
+        .open_session()
+        .contexts
+        .iter()
+        .find(|c| c.context_id == start.0.to_string())
+        .unwrap()
+        .clone();
+    let command = row.discard_move.clone().expect("the queued move");
+    assert!(!row.can_move, "{row:?}");
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Discard {
+            command_id: command.clone(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::Discard(
+            crate::intents::id("command", &command).unwrap()
+        )]
+    );
+}
+
+#[test]
+fn a_moved_context_row_names_where_it_went() {
+    let mut rig = Rig::new();
+    let me = rig.seam.identity().unwrap().device_id();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let new = SessionId::new();
+    let start = skywave_proto::ContextId::first_of(rig.session);
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                Event {
+                    session_id: new,
+                    at,
+                    command_id: None,
+                    context: skywave_proto::ContextId::first_of(new),
+                    kind: EventKind::SessionCreated {
+                        workdir: "/srv/forked".into(),
+                        context_name: "start".into(),
+                        from: Some(skywave_proto::ContextRef {
+                            session: rig.session,
+                            context: start,
+                        }),
+                    },
+                },
+                Event {
+                    session_id: rig.session,
+                    at,
+                    command_id: Some(CommandId::new()),
+                    context: start,
+                    kind: EventKind::ContextMoved { to: new, by: me },
+                },
+            ],
+        })
+        .unwrap();
+    rig.view();
+    let row = rig.open_session().contexts[0].clone();
+    assert_eq!(row.moved_to_session_id, Some(new.0.to_string()));
+    assert_eq!(row.moved_label.as_deref(), Some("moved → “forked”"));
+    assert!(!row.can_move);
+    assert_eq!(row.move_refusal, None, "moved says so in its label");
+}
+
+#[test]
 fn a_malformed_context_id_is_an_error_not_an_action() {
     let mut rig = Rig::new();
     let outs = rig.intent(GuiIntent::Act {

@@ -108,7 +108,14 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
       canInterrupt: false,
       interruptBusy: false,
       canClear: false,
-      contexts: [ContextRow(contextId: 'c1', label: 'start', current: true)],
+      contexts: [
+        ContextRow(
+          contextId: 'c1',
+          label: 'start',
+          current: true,
+          canMove: false,
+        ),
+      ],
       contextId: 'c1',
       rules: [],
       agent: unknownAgent,

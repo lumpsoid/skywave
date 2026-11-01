@@ -11,9 +11,9 @@ use skywave_core::{
 };
 use skywave_present::format::{
     agent_effort_label, agent_mode_label, agent_model_label, answer_words, blob_size, bytes,
-    context_row, delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail,
-    mode_label, mode_needs_confirmation, mode_refusal, model_refusal, outgoing_label, scope_label,
-    tokens, turn_time, viewing_hint,
+    context_moved_label, context_row, delivery_label, dollars, effort_label, effort_refusal,
+    fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal,
+    move_refusal, outgoing_label, scope_label, tokens, turn_time, viewing_hint,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -294,6 +294,12 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
                 label: clean_line(&context_row(c)),
                 current: c.current,
                 outgoing_label: c.outgoing.as_ref().map(outgoing_label),
+                moved_to_session_id: c.moved_to.as_ref().map(|to| to.id.0.to_string()),
+                moved_label: context_moved_label(c).map(|l| clean_line(&l)),
+                can_move: c.can_move,
+                move_refusal: (!c.can_move && c.moved_to.is_none())
+                    .then(|| move_refusal(c).to_owned()),
+                discard_move: c.discard_move.map(|id| id.0.to_string()),
             })
             .collect(),
         context_id: session.context.0.to_string(),

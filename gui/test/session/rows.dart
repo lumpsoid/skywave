@@ -156,7 +156,7 @@ SessionScreen screenWith({
   String? interruptRefusal,
   bool canClear = false,
   List<ContextRow> contexts = const [
-    ContextRow(contextId: 'c1', label: 'start', current: true),
+    ContextRow(contextId: 'c1', label: 'start', current: true, canMove: false),
   ],
   String contextId = 'c1',
   String? viewingId,

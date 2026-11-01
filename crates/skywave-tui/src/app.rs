@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, ContextView,
-    CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView,
-    PermissionMode, Route, Screen, Seq, SessionId, SessionListView, SessionRow, SessionView,
-    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
+    Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
+    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome,
+    ViewState, parse_pair_uri,
 };
-use skywave_present::format::{bytes, mode_needs_confirmation};
+use skywave_present::format::{bytes, mode_needs_confirmation, move_refusal};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
     looks_like_pair_uri, unanswered,
@@ -377,19 +377,6 @@ pub enum Picker {
         moving: Option<ContextId>,
         note: Option<String>,
     },
-}
-
-/// Why `M` does nothing on a row the core does not offer to move. The core
-/// says only yes or no, so a context the agent never answered in and one a
-/// message of this device is still on its way to share the general words.
-pub fn move_refusal(context: &ContextView) -> &'static str {
-    if context.moved_to.is_some() {
-        "already moved to another session"
-    } else if context.outgoing.is_some() {
-        "a move or message of yours to it is on its way"
-    } else {
-        "can't move yet: it needs an answered turn and no message of yours on its way"
-    }
 }
 
 /// The rows of [`Picker::Agent`].
