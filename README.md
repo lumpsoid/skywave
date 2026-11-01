@@ -114,6 +114,8 @@ skywaved serve
 ```
 
 The first run creates the CA, the server certificate and the database.
+In a container, run it under an init (`docker run --init`, or `tini`):
+`skywaved` reaps its own agents but not the orphans reparented to PID 1.
 
 ### 2. Pair a device
 

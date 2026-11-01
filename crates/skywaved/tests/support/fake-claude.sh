@@ -7,7 +7,13 @@
 # It writes its argv to ./argv.txt and its pid to ./pid.txt (the session
 # workdir). A user message containing "approve" asks for a Write permission;
 # one containing "hang" streams until interrupted; one containing "crash"
-# exits 3 with a stderr line; any other message gets the text "echo".
+# exits 3 with a stderr line; one containing "deaf" gets the text "deaf",
+# then the CLI stops reading stdin (a wedged CLI); any other message gets the text "echo". One containing
+# "orphan" also starts a background `sleep`, its pid in ./child.txt, before
+# it is handled as above; with "stubborn" too, the `sleep` ignores SIGTERM.
+# One containing "run" starts the Write call and runs it until interrupted.
+# A SIGTERM makes the CLI write ./term.txt and exit, reporting a running
+# call as killed first, as the real CLI does (§6).
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id,
 # with `--fork-session` too (the parent is unknown; §5). A fork otherwise
 # runs as its `--session-id`, as the real CLI does.
@@ -21,6 +27,8 @@
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
+running=""
+trap 'echo term > term.txt; if [ -n "$running" ]; then tool_result "Exit code 137" true; fi; exit 143' TERM
 
 sid=""
 mode="default"
@@ -112,6 +120,16 @@ while IFS= read -r line; do
         printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310","permissionMode":"%s"}\n' "$PWD" "$sid" "$mode"
       fi
       case "$line" in
+        *stubborn*)
+          (trap '' TERM; exec sleep 300) </dev/null >/dev/null 2>&1 &
+          echo $! > child.txt
+          ;;
+        *orphan*)
+          sleep 300 </dev/null >/dev/null 2>&1 &
+          echo $! > child.txt
+          ;;
+      esac
+      case "$line" in
         *approve*)
           printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"a.txt","content":"hi"}}]},"session_id":"%s"}\n' "$sid"
           printf '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt","content":"hi"},"tool_use_id":"toolu_1"}}\n'
@@ -142,6 +160,20 @@ while IFS= read -r line; do
         *crash*)
           echo "boom: the agent fell over" >&2
           exit 3
+          ;;
+        *run*)
+          running=1
+          printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"a.txt","content":"hi"}}]},"session_id":"%s"}\n' "$sid"
+          IFS= read -r req
+          running=""
+          ack "$req"
+          tool_result "rejected" true
+          result_aborted aborted_tools
+          ;;
+        *deaf*)
+          text "deaf"
+          result_ok
+          sleep 300
           ;;
         *hang*)
           text "working"
