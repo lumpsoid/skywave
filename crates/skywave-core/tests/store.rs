@@ -9,9 +9,9 @@ use skywave_core::{
     Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Decision,
-    DeviceId, DeviceInfo, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, SessionState,
-    ToolResult, TurnUsage,
+    ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContextId,
+    Decision, DeviceId, DeviceInfo, Event, EventBatch, EventKind, RejectReason, Seq, SessionId,
+    SessionState, ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -19,6 +19,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         session_id,
         at: Utc.with_ymd_and_hms(2026, 10, 29, 9, minute, 0).unwrap(),
         command_id: kind.logged_by_command().then(CommandId::new),
+        context: ContextId::first_of(session_id),
         kind,
     }
 }
@@ -46,6 +47,7 @@ impl Log {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -58,6 +60,7 @@ impl Log {
                 2,
                 EventKind::SessionCreated {
                     workdir: "/srv/b".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -340,6 +343,7 @@ fn send(session_id: SessionId, text: &str) -> Command {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id,
+            context: ContextId::first_of(session_id),
             text: text.into(),
         },
     }
@@ -534,6 +538,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_drafts(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 2);
 
@@ -616,6 +621,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
+                    context_name: "start".into(),
                 },
             ),
             turn(
@@ -665,6 +671,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_usage(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
@@ -681,6 +688,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -729,6 +737,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_archived(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
@@ -746,6 +755,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -810,6 +820,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_titles(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
@@ -830,6 +841,7 @@ fn notable_count_is_projected_and_backfilled() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -902,6 +914,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_unread(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
@@ -1022,6 +1035,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -1069,6 +1083,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_drafts(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
@@ -1596,6 +1611,7 @@ fn created(session_id: SessionId, minute: u32) -> Event {
         minute,
         EventKind::SessionCreated {
             workdir: "/srv/x".into(),
+            context_name: "start".into(),
         },
     )
 }
@@ -1734,6 +1750,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop_alerted(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
@@ -1749,6 +1766,108 @@ fn drop_devices(dir: &Path) {
 fn drop_snippets(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE snippets;").unwrap();
+}
+
+/// A replica from protocol v8 holds events without a context, a first
+/// session event without its context's name, and messages queued without
+/// the context they were written in. The migration rewrites each to the v9
+/// shape: the session's first context, named "start".
+#[test]
+fn a_v8_replica_moves_into_first_contexts() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let other = SessionId::new();
+    let (queued, finished) = (send(session, "one"), send(other, "two"));
+    let rename = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RenameSession {
+            session_id: session,
+            name: Some("x".into()),
+        },
+    };
+    {
+        let mut store = Store::open(&dir).unwrap();
+        let created = |id| {
+            event(
+                id,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv".into(),
+                    context_name: "start".into(),
+                },
+            )
+        };
+        let batch = EventBatch {
+            from: Seq(1),
+            events: vec![
+                created(session),
+                created(other),
+                event(session, 1, EventKind::AgentMessage { text: "hi".into() }),
+            ],
+        };
+        store.apply_batch(&batch, Utc::now()).unwrap();
+        for command in [&queued, &finished, &rename] {
+            store.enqueue(command).unwrap();
+        }
+        store
+            .record_result(finished.id, &CommandResult::Accepted { seq: Seq(4) }, at(1))
+            .unwrap();
+    }
+    // Back to the v8 shapes and the schema before the column.
+    {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute_batch(
+            "UPDATE events SET event = json_remove(event, '$.context', '$.kind.context_name');
+             UPDATE outbox SET command = json_remove(command, '$.kind.context');",
+        )
+        .unwrap();
+        let v8: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE json_extract(event, '$.context') IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v8, 3);
+    }
+    drop_contexts(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let store = Store::open(&dir).unwrap();
+    let events = store.session_events(session).unwrap();
+    assert_eq!(events.len(), 2);
+    for (_, event) in &events {
+        assert_eq!(event.context, ContextId::first_of(session));
+    }
+    assert!(matches!(
+        &events[0].1.kind,
+        EventKind::SessionCreated { context_name, .. } if context_name == "start"
+    ));
+    assert_eq!(
+        store.session_events(other).unwrap()[0].1.context,
+        ContextId::first_of(other)
+    );
+    // Both messages decode, queued and finished, in their sessions' first
+    // context; other commands are left as they were.
+    let outbox = store.outbox().unwrap();
+    let commands: Vec<&Command> = outbox.iter().map(|e| &e.command).collect();
+    assert_eq!(commands, [&queued, &finished, &rename]);
+    assert_eq!(outbox[0].status, OutboxStatus::Queued);
+    assert_ne!(outbox[1].status, OutboxStatus::Queued);
+    for id in [session, other] {
+        assert_eq!(
+            store.session(id).unwrap().unwrap().context,
+            ContextId::first_of(id)
+        );
+    }
+}
+
+/// Undoes the session contexts migration's schema change; the events it
+/// rewrote keep their v9 shape, which a rerun leaves as it is.
+fn drop_contexts(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN context;")
+        .unwrap();
 }
 
 /// Undoes the agent settings migration.
@@ -1838,6 +1957,7 @@ fn agent_settings_and_offered_models_are_kept() {
         session_id,
         at: chrono::Utc::now(),
         command_id: None,
+        context: ContextId::first_of(session_id),
         kind,
     };
     let batch = EventBatch {
@@ -1847,6 +1967,7 @@ fn agent_settings_and_offered_models_are_kept() {
                 id,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -1860,6 +1981,7 @@ fn agent_settings_and_offered_models_are_kept() {
                 other,
                 EventKind::SessionCreated {
                     workdir: "/srv/b".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -1890,6 +2012,7 @@ fn an_agents_effort_is_kept() {
         session_id: id,
         at: chrono::Utc::now(),
         command_id: None,
+        context: ContextId::first_of(id),
         kind,
     };
     let batch = EventBatch {
@@ -1897,6 +2020,7 @@ fn an_agents_effort_is_kept() {
         events: vec![
             event(EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             }),
             event(EventKind::EffortChanged {
                 effort: Some(Effort::XHigh),

@@ -11,8 +11,8 @@ use skywave_core::{
     Request, Screen, Transport, TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, DirsResult, EventKind, EventsQuery,
-    HelloResponse, PROTOCOL_VERSION, Seq,
+    BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DirsResult, EventKind,
+    EventsQuery, HelloResponse, PROTOCOL_VERSION, Seq,
 };
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing::{self, IssuedCode};
@@ -224,6 +224,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id,
+            context: ContextId::first_of(session_id),
             text: "hi".into(),
         },
     };

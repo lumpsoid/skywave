@@ -186,6 +186,13 @@ class RowTile extends StatelessWidget {
         hit: hit,
         mark: mark,
       ),
+      RowKind.contextDivider => _Notice(
+        row: row,
+        icon: Icons.alt_route,
+        color: colors.muted,
+        hit: hit,
+        mark: mark,
+      ),
       RowKind.turnUsage => _Notice(
         row: row,
         icon: Icons.timer_outlined,

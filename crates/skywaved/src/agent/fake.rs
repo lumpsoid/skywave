@@ -20,10 +20,23 @@
 //! next one.
 //!
 //! The fake persists nothing itself but keeps per-session progress in the
-//! [`FakeAgent`] (clones share it): resuming a session with its
-//! [`ResumeHandle`] continues with the next scripted turn, and starting a
-//! session fresh a second time fails, as with a real agent. Every request a
-//! session receives is recorded and readable with [`FakeAgent::inputs`].
+//! [`FakeAgent`] (clones share it): the scripted turns run in order across
+//! every start of a Skywave session, whatever its context, and every
+//! request is recorded and readable with [`FakeAgent::inputs`], each start
+//! as [`FakeInput::Started`] naming its context and the grants it got.
+//!
+//! **Grants.** The fake keeps no grants of its own: a script reports them
+//! with [`Step::grants`] (the whole set, as the real adapter does when an
+//! approval grants a rule), and the supervisor hands what it stored back in
+//! the next start's [`StartSpec::grants`].
+//!
+//! **Conversations.** Each session context is its own conversation, which,
+//! like a real agent's, exists only once it got a message: the fake reports
+//! the context's [`ResumeHandle`] ([`FakeAgent::resume_handle`]) as it takes
+//! the first message of a fresh start, not at the start itself. Starting a
+//! context fresh after it got a message fails ("already exists; resume
+//! it"); starting one that never got a message fresh again is fine. A
+//! handle for another context is refused.
 //!
 //! ```
 //! use skywaved::agent::fake::{FakeAgent, FakeScript, Step};
@@ -51,18 +64,18 @@
 //! asks for it the same way, after reporting the models the script offers
 //! ([`FakeScript::offer_models`]), if any.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{Value, json};
-use skywave_proto::{Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSession, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
+    RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -225,6 +238,11 @@ impl Step {
         }
     }
 
+    /// Reports `grants` as the session's whole set of grants.
+    pub fn grants(grants: Value) -> Step {
+        Step::Emit(AdapterEvent::Grants(Grants(grants)))
+    }
+
     /// Offers a lasting rule with an approval step. No effect on other
     /// steps.
     pub fn suggest(mut self, label: &str, scope: RuleScope) -> Step {
@@ -293,6 +311,9 @@ impl Default for Gate {
 pub enum FakeInput {
     Started {
         resumed: bool,
+        context: ContextId,
+        /// The session's grants the start was given.
+        grants: Option<Grants>,
     },
     Message(String),
     /// An answer and the rule it grants, if any.
@@ -316,6 +337,9 @@ struct Progress {
     /// Index of the next scripted turn.
     next_turn: usize,
     inputs: Vec<FakeInput>,
+    /// The session's contexts whose conversation exists: they got a
+    /// message.
+    conversations: HashSet<ContextId>,
 }
 
 impl FakeAgent {
@@ -334,9 +358,9 @@ impl FakeAgent {
             .unwrap_or_default()
     }
 
-    /// The resume handle the fake reports for `session_id`.
-    pub fn resume_handle(session_id: SessionId) -> ResumeHandle {
-        ResumeHandle(json!({ "fake_session": session_id.0 }))
+    /// The resume handle the fake reports for session context `context`.
+    pub fn resume_handle(context: ContextId) -> ResumeHandle {
+        ResumeHandle(json!({ "fake_context": context.0 }))
     }
 }
 
@@ -348,40 +372,35 @@ impl AgentAdapter for FakeAgent {
         if let Some(handle) = &spec.resume {
             let named = handle
                 .0
-                .get("fake_session")
+                .get("fake_context")
                 .and_then(Value::as_str)
                 .and_then(|id| Uuid::parse_str(id).ok());
-            if named != Some(spec.session_id.0) {
+            if named != Some(spec.context.0) {
                 return Err(AgentError::Resume(format!(
-                    "handle {} is not for session {}",
-                    handle.0, spec.session_id.0
+                    "handle {} is not for context {}",
+                    handle.0, spec.context.0
                 )));
             }
         }
         {
             let mut shared = lock(&self.shared);
-            if !resumed && shared.contains_key(&spec.session_id) {
+            let progress = shared.entry(spec.session_id).or_default();
+            if !resumed && progress.conversations.contains(&spec.context) {
                 return Err(AgentError::Start(format!(
-                    "session {} already exists; resume it",
-                    spec.session_id.0
+                    "context {} already exists; resume it",
+                    spec.context.0
                 )));
             }
-            shared
-                .entry(spec.session_id)
-                .or_default()
-                .inputs
-                .push(FakeInput::Started { resumed });
+            progress.inputs.push(FakeInput::Started {
+                resumed,
+                context: spec.context,
+                grants: spec.grants.clone(),
+            });
         }
 
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
         let mut early = Vec::new();
-        if !resumed {
-            // Known up front, like an agent session id chosen by the adapter.
-            early.push(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(
-                spec.session_id,
-            )));
-        }
         if !self.script.models.is_empty() {
             early.push(AdapterEvent::ModelsOffered(self.script.models.clone()));
         }
@@ -407,6 +426,9 @@ impl AgentAdapter for FakeAgent {
         let answers = events.clone();
         let runner = Runner {
             session_id: spec.session_id,
+            context: spec.context,
+            // A resumed conversation exists and its handle is stored.
+            handle_reported: resumed,
             script: Arc::clone(&self.script),
             shared: Arc::clone(&self.shared),
             commands: commands_rx,
@@ -536,6 +558,10 @@ impl Stop {
 
 struct Runner {
     session_id: SessionId,
+    context: ContextId,
+    /// The context's handle has been reported: it was resumed, or this
+    /// start took its first message.
+    handle_reported: bool,
     script: Arc<FakeScript>,
     shared: Arc<Mutex<HashMap<SessionId, Progress>>>,
     commands: mpsc::UnboundedReceiver<FakeInput>,
@@ -565,6 +591,19 @@ impl Runner {
                     Some(FakeInput::Shutdown) | None => break None,
                 },
             };
+            if !self.handle_reported {
+                // The conversation exists from its first message on.
+                self.handle_reported = true;
+                lock(&self.shared)
+                    .entry(self.session_id)
+                    .or_default()
+                    .conversations
+                    .insert(self.context);
+                let handle = FakeAgent::resume_handle(self.context);
+                if !self.emit(AdapterEvent::ResumeHandle(handle)).await {
+                    return;
+                }
+            }
             let steps = self.next_turn(&text);
             if !self.emit(AdapterEvent::TurnStarted).await {
                 return;

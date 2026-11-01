@@ -247,10 +247,14 @@ Result: the tool runs, `tool_result` follows, and
 
 A granted update with destination `session` or `cliArg` lives in the CLI
 process only: `--resume` restores the conversation, not the permission
-mode or rules. The adapter therefore adds each one it grants to its resume
-handle (`{"session_id":…, "rules":[<update>, …]}`; a later `setMode`
-replaces an earlier one) and starts a resumed process with them as flags,
-before `--resume`:
+mode or rules. The rule was granted for the Skywave session, though, which
+outlives the process and spans its contexts. The adapter therefore adds
+each one it grants to the session's grants (`{"rules":[<update>, …]}`; a
+later `setMode` replaces an earlier one), reports the whole set anew, and
+the daemon stores it per Skywave session in `sessions.agent_grants`, apart
+from each context's resume handle. Every later process of the session,
+fresh (`--session-id`) or resumed (`--resume`), in whichever context, is
+started with them as flags, before the session flag:
 
 | update | flags |
 |--------|-------|
@@ -417,8 +421,8 @@ before changing `protocol::allow_always_response`.
 `setMode` `bypassPermissions` suggestion, labelled `every tool`, only when
 the CLI itself puts it in a request's `permission_suggestions`. Skywave
 never makes one up. None of the recorded requests had one. Once granted, a
-session-scoped one is kept in the resume handle and comes back as
-`--permission-mode bypassPermissions` after a restart. That is **[U]**
+session-scoped one is kept in the session's grants and comes back as
+`--permission-mode bypassPermissions` on every later start. That is **[U]**
 (§3.2).
 
 **Trade-off, for the user to decide:**
@@ -691,7 +695,17 @@ same process, with the same session id.
 
 - `--session-id <uuid>` sets the session id. Every `session_id` field and the
   transcript file use it. **[C]** T09 can therefore generate the id up front
-  and store it as the opaque `agent_state` before the first turn finishes.
+  and store it before the first turn finishes, as the context's opaque
+  resume handle `{"session_id":"<uuid>"}` in `contexts.agent_state`. It
+  reports that handle with the first `TurnStarted`, not at start: the CLI
+  keeps no conversation for a session that never got a message, so
+  `--resume` of one fails with `No conversation found` (confirmed by the
+  user, 2026-11-01). A process stopped before any message (one started for
+  a setting, then shut down idle) reports no handle, and the context's next
+  start is fresh with a new id. The handle holds no rules: granted session
+  rules are the session's grants (§3.2), stored per Skywave session. A
+  handle stored when it still carried `rules` resumes all the same; those
+  rules are ignored, not granted.
 - Without `--session-id`, the CLI picks a UUID. It is first visible in
   `system/init.session_id` and is repeated on every message. **[C]**
 - `--resume <uuid>` in a **new** process restores the history (`resume.ndjson`

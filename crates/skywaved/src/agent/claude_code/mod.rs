@@ -10,13 +10,19 @@
 //!   (--session-id <uuid> | --resume <uuid>) <agent.args...>
 //! ```
 //!
-//! A fresh session gets a new UUID as `--session-id`, reported at once as the
-//! [`ResumeHandle`] `{"session_id": "<uuid>"}`; a restart passes it back with
-//! `--resume`. Rules granted for the session that the CLI keeps only in its
-//! process are added to the handle as `"rules"` and passed to the resumed
-//! process as flags ([`rules::cli_args`]), so they survive a restart. [`AgentAdapter::start`] returns after the CLI answers the
-//! initialize handshake; a CLI that fails before that is a start error, or a
-//! resume error when it does not know the session. The mode, model and
+//! A fresh context gets a new UUID as `--session-id`, reported with the first
+//! turn as the context's [`ResumeHandle`](super::ResumeHandle)
+//! `{"session_id": "<uuid>"}` (a process stopped before any message reports
+//! none, as the CLI keeps no conversation for it); a restart passes it back
+//! with `--resume`. Rules granted for the Skywave session that the CLI keeps
+//! only in its process are the session's [`Grants`](super::Grants)
+//! `{"rules": [...]}`, reported apart from the handle and passed to every
+//! later process of the session, fresh or resumed, as flags
+//! ([`rules::cli_args`]), so they survive a restart and a new context.
+//!
+//! [`AgentAdapter::start`] returns after the CLI answers the initialize
+//! handshake; a CLI that fails before that is a start error, or a resume
+//! error when it does not know the session. The mode, model and
 //! effort the [`StartSpec`] names are then asked for, in that order, with
 //! control requests, like any later change (docs/agents/claude-code.md §3.7,
 //! §3.10), so each gets the CLI's own answer. The CLI handles stdin in order,
@@ -165,13 +171,16 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &self,
         spec: StartSpec,
     ) -> Result<(ClaudeCodeSession, AdapterEvents), AgentError> {
-        let (agent_session, session_rules, resumed) = match &spec.resume {
-            Some(handle) => {
-                let (id, rules) =
-                    protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?;
-                (id, rules, true)
-            }
-            None => (Uuid::new_v4(), Vec::new(), false),
+        let (agent_session, resumed) = match &spec.resume {
+            Some(handle) => (
+                protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?,
+                true,
+            ),
+            None => (Uuid::new_v4(), false),
+        };
+        let session_rules = match &spec.grants {
+            Some(grants) => rules::parse_grants(grants).map_err(AgentError::Start)?,
+            None => Vec::new(),
         };
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
         let child = self.spawn(&spec.workdir, agent_session, resumed, &session_rules)?;

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Effort,
-    EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq,
-    SessionId, SessionState, ToolResult,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId,
+    Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    Seq, SessionId, SessionState, ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
@@ -87,14 +87,76 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Sends `text` in the session's current context.
     fn send(&mut self, text: &str) -> Seq {
+        let context = self.current();
         accepted(self.handle(
             DeviceId::new(),
             CommandKind::SendMessage {
                 session_id: self.session_id,
+                context,
                 text: text.into(),
             },
         ))
+    }
+
+    /// The session's current context.
+    fn current(&self) -> ContextId {
+        self.log
+            .session(&self.storage.db, self.session_id)
+            .unwrap()
+            .unwrap()
+            .context
+    }
+
+    /// Clears the session into a new context `context`; the marker's seq.
+    fn clear(&mut self, context: ContextId) -> Seq {
+        accepted(self.handle(
+            DeviceId::new(),
+            CommandKind::ClearContext {
+                session_id: self.session_id,
+                context,
+                name: "next".into(),
+            },
+        ))
+    }
+
+    /// Switches the session to its context `context`; the marker's seq.
+    fn switch(&mut self, context: ContextId) -> Seq {
+        accepted(self.handle(
+            DeviceId::new(),
+            CommandKind::SwitchContext {
+                session_id: self.session_id,
+                context,
+            },
+        ))
+    }
+
+    /// The session's events after `seq`, with their seqs.
+    fn events_after(&self, seq: Seq) -> Vec<(Seq, Event)> {
+        let batch = self.log.read(&self.storage.db, seq, 5000).unwrap();
+        (batch.from.0..)
+            .map(Seq)
+            .zip(batch.events)
+            .filter(|(_, e)| e.session_id == self.session_id)
+            .collect()
+    }
+
+    /// The session's events after `seq`, each kind with its stamp.
+    fn stamped_after(&self, seq: Seq) -> Vec<(EventKind, ContextId)> {
+        self.events_after(seq)
+            .into_iter()
+            .map(|(_, e)| (e.kind, e.context))
+            .collect()
+    }
+
+    fn turn_context(&self) -> (bool, Option<ContextId>) {
+        let info = self
+            .log
+            .session(&self.storage.db, self.session_id)
+            .unwrap()
+            .unwrap();
+        (info.turn_active, info.turn_context)
     }
 
     fn resolve(&mut self, device: DeviceId, id: ApprovalId, decision: Decision) -> CommandResult {
@@ -207,6 +269,37 @@ impl Fixture {
             .await
     }
 
+    /// Creates another session, with a workdir of its own; its id.
+    fn create_session(&mut self) -> SessionId {
+        let workdir = self.root.join("other");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let seq = accepted(self.handle(
+            DeviceId::new(),
+            CommandKind::CreateSession {
+                workdir: workdir.to_str().unwrap().to_owned(),
+            },
+        ));
+        self.log
+            .read(&self.storage.db, Seq(seq.0 - 1), 1)
+            .unwrap()
+            .events[0]
+            .session_id
+    }
+
+    /// The session's first context, the one it was created with.
+    fn first(&self) -> ContextId {
+        ContextId::first_of(self.session_id)
+    }
+
+    /// The fake's record of a start in the session's first context.
+    fn started(&self, resumed: bool) -> FakeInput {
+        FakeInput::Started {
+            resumed,
+            context: self.first(),
+            grants: None,
+        }
+    }
+
     fn approval_id(&self) -> ApprovalId {
         self.kinds()
             .iter()
@@ -216,6 +309,15 @@ impl Fixture {
                 _ => None,
             })
             .expect("an approval was requested")
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let violations = self.storage.db.context_stamp_violations().unwrap();
+            assert!(violations.is_empty(), "context stamps: {violations:#?}");
+        }
     }
 }
 
@@ -300,15 +402,16 @@ async fn full_turn_through_commands() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("write notes"),
             FakeInput::Answer("req-1".into(), Decision::Approve, None),
         ]
     );
     // The resume handle was stored for later restarts.
     assert_eq!(
-        skywaved::agent::load_resume_handle(&f.storage.db, f.session_id).unwrap(),
-        Some(FakeAgent::resume_handle(f.session_id))
+        skywaved::agent::load_resume_handle(&f.storage.db, ContextId::first_of(f.session_id))
+            .unwrap(),
+        Some(FakeAgent::resume_handle(f.first()))
     );
     supervisor.shutdown().await.unwrap();
 }
@@ -468,7 +571,7 @@ async fn interrupt_with_pending_approval_returns_to_idle() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("write notes"),
             FakeInput::Interrupt,
             message("again"),
@@ -502,9 +605,9 @@ async fn crash_mid_turn_then_next_message_resumes() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("first"),
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("second"),
         ]
     );
@@ -523,11 +626,7 @@ async fn failed_turn_keeps_the_agent_running() {
     f.wait_count("idle", 1, is_idle).await;
     assert_eq!(
         agent.inputs(f.session_id),
-        [
-            FakeInput::Started { resumed: false },
-            message("first"),
-            message("second"),
-        ]
+        [f.started(false), message("first"), message("second"),]
     );
     supervisor.shutdown().await.unwrap();
 }
@@ -584,10 +683,10 @@ async fn daemon_restart_cancels_pending_approvals_and_resumes() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("write notes"),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("again"),
         ]
     );
@@ -624,13 +723,13 @@ async fn daemon_restart_delivers_pending_messages_once() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("one"),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("two"),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("three"),
             FakeInput::Shutdown,
         ]
@@ -693,10 +792,10 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("one"),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("two"),
             FakeInput::Shutdown,
         ]
@@ -739,11 +838,11 @@ async fn stop_mid_turn_interrupts_shuts_down_and_resumes() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             message("write notes"),
             FakeInput::Interrupt,
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
             message("again"),
             FakeInput::Shutdown,
         ]
@@ -762,11 +861,7 @@ async fn stop_without_a_running_agent_does_nothing() {
     supervisor.shutdown().await.unwrap();
     assert_eq!(
         agent.inputs(f.session_id),
-        [
-            FakeInput::Started { resumed: false },
-            message("one"),
-            FakeInput::Shutdown,
-        ]
+        [f.started(false), message("one"), FakeInput::Shutdown,]
     );
     assert_eq!(
         f.handle(
@@ -781,29 +876,42 @@ async fn stop_without_a_running_agent_does_nothing() {
     );
 }
 
-#[tokio::test]
-async fn agent_that_cannot_start_errors_the_session() {
-    let mut f = Fixture::new();
-    let agent = FakeAgent::new(FakeScript::new());
-    // A session the fake already knows cannot be started fresh again.
-    use skywaved::agent::{AgentAdapter, StartSpec};
+/// Has `agent` hold a conversation for `context` that the log knows
+/// nothing of: started outside the supervisor and given a message, so no
+/// handle is stored and the supervisor's fresh start of `context` fails.
+async fn converse_elsewhere(agent: &FakeAgent, f: &Fixture, context: ContextId) {
+    use skywaved::agent::{AgentAdapter, AgentSession, StartSpec};
     let workdir = f
         .log
         .session(&f.storage.db, f.session_id)
         .unwrap()
         .unwrap()
         .workdir;
-    let _ = agent
+    let (mut elsewhere, mut events) = agent
         .start(StartSpec {
             session_id: f.session_id,
+            context,
             workdir: workdir.into(),
             resume: None,
+            grants: None,
             mode: None,
             model: None,
             effort: None,
         })
         .await
         .unwrap();
+    elsewhere.send_message("elsewhere".into()).await.unwrap();
+    while !matches!(events.recv().await, Some(AdapterEvent::ResumeHandle(_))) {}
+    elsewhere.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_that_cannot_start_errors_the_session() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    // A context whose conversation the fake already has, with no handle
+    // stored, cannot be started fresh again.
+    converse_elsewhere(&agent, &f, f.first()).await;
     let supervisor = f.start(&agent).await;
 
     f.send("hello");
@@ -972,7 +1080,7 @@ async fn a_setting_starts_an_idle_session_and_logs_the_answer() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             FakeInput::SetPermissionMode(PermissionMode::Plan),
             FakeInput::SetModel("model-b".into()),
             message("hello"),
@@ -1047,7 +1155,7 @@ async fn only_the_newest_of_queued_requests_goes_out() {
     assert_eq!(
         agent.inputs(f.session_id)[..3],
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
             message("hello"),
         ]
@@ -1079,14 +1187,17 @@ async fn a_resumed_agent_gets_its_mode_and_model_back() {
     let kinds = f.wait_count("reply", 1, is_idle).await;
     supervisor.shutdown().await.unwrap();
     let inputs = agent.inputs(f.session_id);
-    let resumed = inputs
+    // The first agent got no message, so it left no conversation to resume:
+    // the restart is fresh, and still gets the settings back.
+    let restarted = inputs
         .iter()
-        .position(|i| *i == FakeInput::Started { resumed: true })
-        .expect("resumed");
+        .rposition(|i| matches!(i, FakeInput::Started { .. }))
+        .expect("restarted");
+    assert_ne!(restarted, 0, "started twice");
     assert_eq!(
-        inputs[resumed..resumed + 4],
+        inputs[restarted..restarted + 4],
         [
-            FakeInput::Started { resumed: true },
+            f.started(false),
             FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
             FakeInput::SetModel("model-b".into()),
             message("again"),
@@ -1176,7 +1287,7 @@ async fn an_effort_starts_an_idle_session_and_requests_are_answered_in_order() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             FakeInput::SetEffort(Effort::High),
             FakeInput::SetEffort(Effort::Low),
             FakeInput::SetEffort(Effort::Max),
@@ -1204,10 +1315,7 @@ async fn only_the_newest_of_queued_efforts_goes_out() {
     );
     assert_eq!(
         agent.inputs(f.session_id)[..2],
-        [
-            FakeInput::Started { resumed: false },
-            FakeInput::SetEffort(Effort::High),
-        ]
+        [f.started(false), FakeInput::SetEffort(Effort::High),]
     );
 }
 
@@ -1250,10 +1358,7 @@ async fn a_restart_refuses_an_effort_request_it_had_handed_out() {
     );
     assert_eq!(
         agent.inputs(f.session_id)[..2],
-        [
-            FakeInput::Started { resumed: false },
-            FakeInput::SetEffort(Effort::Low),
-        ]
+        [f.started(false), FakeInput::SetEffort(Effort::Low),]
     );
 }
 
@@ -1273,7 +1378,9 @@ async fn a_restarted_agent_is_asked_for_the_effort_the_log_wants() {
     f.wait_count("answer", 1, is_setting_answer).await;
     wait_for_shutdowns(&agent, &f, 1).await;
 
-    // Resumed: asked for what it last ran with, which logs nothing new.
+    // Restarted (fresh: the first agent got no message, so there is no
+    // conversation to resume): asked for what it last ran with, which logs
+    // nothing new.
     f.send("one");
     f.wait_count("reply", 1, is_idle).await;
     wait_for_shutdowns(&agent, &f, 2).await;
@@ -1285,14 +1392,14 @@ async fn a_restarted_agent_is_asked_for_the_effort_the_log_wants() {
     assert_eq!(
         agent.inputs(f.session_id)[..8],
         [
-            FakeInput::Started { resumed: false },
+            f.started(false),
             FakeInput::SetEffort(Effort::High),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(false),
             FakeInput::SetEffort(Effort::High),
             message("one"),
             FakeInput::Shutdown,
-            FakeInput::Started { resumed: true },
+            f.started(true),
         ]
     );
     assert_eq!(agent.inputs(f.session_id)[8], message("two"));
@@ -1445,4 +1552,536 @@ async fn a_blank_model_is_refused() {
             reason: RejectReason::UnknownSession
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session contexts: one context's agent at a time
+
+fn started_in(context: ContextId, resumed: bool) -> FakeInput {
+    FakeInput::Started {
+        resumed,
+        context,
+        grants: None,
+    }
+}
+
+/// Every start the fake recorded for the session, in order.
+fn starts(agent: &FakeAgent, f: &Fixture) -> Vec<FakeInput> {
+    agent
+        .inputs(f.session_id)
+        .into_iter()
+        .filter(|i| matches!(i, FakeInput::Started { .. }))
+        .collect()
+}
+
+fn handle_of(f: &Fixture, context: ContextId) -> Option<skywaved::agent::ResumeHandle> {
+    skywaved::agent::load_resume_handle(&f.storage.db, context).unwrap()
+}
+
+fn reply(text: &str) -> EventKind {
+    EventKind::AgentMessage {
+        text: format!("echo: {text}"),
+    }
+}
+
+#[tokio::test]
+async fn a_message_then_a_switch_logged_before_the_supervisor_runs_stay_in_their_context() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("partial"), Step::Hang]));
+    // Both contexts exist and A is current; the supervisor is not running.
+    f.clear(b);
+    f.switch(a);
+    let sent = f.send("for a");
+    let marker = f.switch(b);
+    assert_eq!(
+        marker,
+        sent.next(),
+        "both logged before the supervisor runs"
+    );
+
+    let supervisor = f.start(&agent).await;
+    f.wait_count("A's turn ended", 1, is_idle).await;
+    wait_for_shutdowns(&agent, &f, 1).await;
+    // The message went to A's agent, which was then interrupted and stopped.
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            started_in(a, false),
+            message("for a"),
+            FakeInput::Interrupt,
+            FakeInput::Shutdown,
+        ]
+    );
+    // What A reported after the switch is A's. (The fake sees the
+    // interrupt before its first step, so its turn has no text.)
+    assert_eq!(
+        f.stamped_after(marker),
+        [
+            (state(SessionState::AgentWorking), a),
+            (state(SessionState::Idle), a),
+        ]
+    );
+    assert_eq!(f.turn_context(), (false, None));
+    assert_eq!(handle_of(&f, a), Some(FakeAgent::resume_handle(a)));
+    assert_eq!(handle_of(&f, b), None);
+    assert_eq!(
+        starts(&agent, &f),
+        [started_in(a, false)],
+        "B did not start"
+    );
+
+    // Positive control: B starts once it gets a message, fresh.
+    let to_b = f.send("for b");
+    f.wait_count("B's reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [started_in(a, false), started_in(b, false)]
+    );
+    assert_eq!(
+        f.stamped_after(to_b),
+        [
+            (state(SessionState::AgentWorking), b),
+            (reply("for b"), b),
+            (state(SessionState::Idle), b),
+        ]
+    );
+    assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+}
+
+#[tokio::test]
+async fn a_switch_while_idle_stops_the_agent_and_one_to_the_current_context_keeps_it() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+
+    // A switch to the context already running keeps its agent.
+    f.switch(a);
+    f.send("two");
+    f.wait_count("reply", 2, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [started_in(a, false), message("one"), message("two")]
+    );
+
+    // A clear stops the idle agent, without an interrupt, and logs nothing.
+    let b = ContextId::new();
+    let marker = f.clear(b);
+    wait_for_shutdowns(&agent, &f, 1).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            started_in(a, false),
+            message("one"),
+            message("two"),
+            FakeInput::Shutdown,
+        ]
+    );
+    assert_eq!(f.stamped_after(marker), []);
+    // Positive control: the same query sees the marker itself.
+    let around = f.stamped_after(Seq(marker.0 - 1));
+    assert!(matches!(
+        around.as_slice(),
+        [(EventKind::ContextStarted { .. }, context)] if *context == b
+    ));
+}
+
+#[tokio::test]
+async fn contexts_start_fresh_and_resume_their_own_conversation() {
+    // End to end through commands: create, send, clear, send, switch back,
+    // send.
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    let one = f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+    f.clear(b);
+    let two = f.send("two");
+    f.wait_count("reply", 2, is_idle).await;
+    f.switch(a);
+    let three = f.send("three");
+    f.wait_count("reply", 3, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            started_in(a, false),
+            message("one"),
+            FakeInput::Shutdown,
+            started_in(b, false),
+            message("two"),
+            FakeInput::Shutdown,
+            started_in(a, true),
+            message("three"),
+            FakeInput::Shutdown,
+        ]
+    );
+    assert_eq!(handle_of(&f, a), Some(FakeAgent::resume_handle(a)));
+    assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+    for (sent, text, context) in [(one, "one", a), (two, "two", b), (three, "three", a)] {
+        let after = f.stamped_after(sent);
+        assert_eq!(
+            after[..3],
+            [
+                (state(SessionState::AgentWorking), context),
+                (reply(text), context),
+                (state(SessionState::Idle), context),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn mode_model_and_effort_asked_in_one_context_are_asked_again_in_the_next() {
+    let mut f = Fixture::new();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    f.set_mode(PermissionMode::AcceptEdits);
+    f.set_model("model-b");
+    f.set_effort(Effort::High);
+    f.wait_count("answers", 3, is_setting_answer).await;
+    f.send("in a");
+    f.wait_count("reply", 1, is_idle).await;
+
+    f.clear(b);
+    f.send("in b");
+    let kinds = f.wait_count("reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    let inputs = agent.inputs(f.session_id);
+    let in_b = inputs
+        .iter()
+        .position(|i| *i == started_in(b, false))
+        .expect("B started");
+    assert_eq!(
+        inputs[in_b..],
+        [
+            started_in(b, false),
+            FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
+            FakeInput::SetModel("model-b".into()),
+            FakeInput::SetEffort(Effort::High),
+            message("in b"),
+            FakeInput::Shutdown,
+        ]
+    );
+    // Restoring what the log already has logs nothing new.
+    assert_eq!(setting_answers(&kinds).len(), 3);
+}
+
+#[tokio::test]
+async fn an_approval_pending_at_a_clear_is_cancelled_in_its_own_context() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let agent = FakeAgent::new(approval_script());
+    let supervisor = f.start(&agent).await;
+    f.send("write notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    let id = f.approval_id();
+
+    let marker = f.clear(ContextId::new());
+    f.wait_count("A's turn ended", 1, is_idle).await;
+    wait_for_shutdowns(&agent, &f, 1).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        f.stamped_after(marker),
+        [
+            (
+                EventKind::ApprovalCancelled {
+                    id,
+                    reason: INTERRUPT_REASON.into(),
+                },
+                a,
+            ),
+            (state(SessionState::Idle), a),
+        ]
+    );
+    assert_eq!(f.turn_context(), (false, None));
+    assert_eq!(
+        agent.inputs(f.session_id)[2..],
+        [FakeInput::Interrupt, FakeInput::Shutdown]
+    );
+}
+
+#[tokio::test]
+async fn a_turn_lost_with_the_daemon_after_a_clear_is_settled_in_its_own_context() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    f.send("hang");
+    f.wait_count("turn", 1, |k| *k == state(SessionState::AgentWorking))
+        .await;
+    supervisor.shutdown().await.unwrap();
+
+    // Accepted while the daemon is down, with A's turn still open.
+    let marker = f.clear(b);
+    assert_eq!(f.turn_context(), (true, Some(a)));
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    assert_eq!(
+        f.stamped_after(marker),
+        [(
+            state(SessionState::Errored {
+                message: TURN_LOST.into()
+            }),
+            a
+        )]
+    );
+    assert_eq!(f.turn_context(), (false, None));
+
+    // The next message starts B, fresh.
+    let to_b = f.send("in b");
+    f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [started_in(a, false), started_in(b, false)]
+    );
+    assert_eq!(
+        f.stamped_after(to_b),
+        [
+            (state(SessionState::AgentWorking), b),
+            (reply("in b"), b),
+            (state(SessionState::Idle), b),
+        ]
+    );
+}
+
+/// What a supervisor appends with no agent process for a message or a
+/// setting request whose agent did not start: `[(kind, context)]` of an
+/// `Errored` then a `PermissionModeRefused`, checked against `context`.
+fn assert_start_failures(after: &[(EventKind, ContextId)], context: ContextId) {
+    assert!(
+        matches!(
+            after,
+            [
+                (EventKind::SessionStateChanged(SessionState::Errored { message }), errored),
+                (EventKind::PermissionModeRefused { reason, .. }, refused),
+            ] if message.starts_with("cannot start agent")
+                && reason.starts_with("agent did not start")
+                && *errored == context
+                && *refused == context
+        ),
+        "{after:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_context_whose_agent_cannot_start_answers_in_that_context() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    converse_elsewhere(&agent, &f, a).await;
+    converse_elsewhere(&agent, &f, b).await;
+    // A message and a request in A, then a clear to B, all before the
+    // supervisor runs: the answers are A's though B is current by then.
+    f.send("in a");
+    f.set_mode(PermissionMode::Plan);
+    let marker = f.clear(b);
+    let supervisor = f.start(&agent).await;
+    f.wait_count("refusal", 1, is_setting_answer).await;
+    assert_start_failures(&f.stamped_after(marker), a);
+
+    // The same in B, now current.
+    let head = f.log.head();
+    f.send("in b");
+    let edits = f.set_mode(PermissionMode::AcceptEdits);
+    let kinds = f.wait_count("refusal", 2, is_setting_answer).await;
+    supervisor.shutdown().await.unwrap();
+    let after: Vec<_> = f
+        .stamped_after(head)
+        .into_iter()
+        .filter(|(kind, _)| {
+            !matches!(
+                kind,
+                EventKind::UserMessage { .. } | EventKind::PermissionModeRequested { .. }
+            )
+        })
+        .collect();
+    assert_start_failures(&after, b);
+    assert!(matches!(
+        setting_answers(&kinds).last(),
+        Some(EventKind::PermissionModeRefused { answers, .. }) if *answers == Some(edits)
+    ));
+}
+
+#[tokio::test]
+async fn a_context_started_for_a_setting_leaves_no_handle_and_starts_fresh_for_its_message() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+    f.send("in a");
+    f.wait_count("reply", 1, is_idle).await;
+    wait_for_shutdowns(&agent, &f, 1).await;
+
+    let marker = f.clear(b);
+    let edits = f.set_mode(PermissionMode::AcceptEdits);
+    f.wait_count("answer", 1, is_setting_answer).await;
+    wait_for_shutdowns(&agent, &f, 2).await;
+    assert_eq!(
+        f.stamped_after(marker)[1..],
+        [(
+            EventKind::PermissionModeChanged {
+                mode: PermissionMode::AcceptEdits,
+                answers: Some(edits),
+            },
+            b
+        )]
+    );
+    assert_eq!(handle_of(&f, b), None, "no handle before B's first message");
+
+    let to_b = f.send("in b");
+    f.wait_count("reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_in(a, false),
+            started_in(b, false),
+            started_in(b, false)
+        ]
+    );
+    assert_eq!(
+        f.stamped_after(to_b)[..3],
+        [
+            (state(SessionState::AgentWorking), b),
+            (reply("in b"), b),
+            (state(SessionState::Idle), b),
+        ]
+    );
+    assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+}
+
+// ---------------------------------------------------------------------------
+// Grants: per session, across its contexts
+
+fn grants(rules: serde_json::Value) -> skywaved::agent::Grants {
+    skywaved::agent::Grants(json!({ "rules": rules }))
+}
+
+fn grants_of(f: &Fixture, session: SessionId) -> Option<skywaved::agent::Grants> {
+    skywaved::agent::load_grants(&f.storage.db, session).unwrap()
+}
+
+fn started_with(
+    context: ContextId,
+    resumed: bool,
+    grants: Option<skywaved::agent::Grants>,
+) -> FakeInput {
+    FakeInput::Started {
+        resumed,
+        context,
+        grants,
+    }
+}
+
+#[tokio::test]
+async fn grants_reported_in_one_context_go_to_every_later_start_of_the_session() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let c = ContextId::new();
+    let granted = grants(json!(["edits", "Bash(cargo test)"]));
+    // The second turn, which runs in B, reports a first set and then the
+    // whole new one, which replaces it.
+    let script = FakeScript::new().turn([Step::text("in a")]).turn([
+        Step::grants(json!({ "rules": ["edits"] })),
+        Step::grants(granted.0.clone()),
+        Step::text("in b"),
+    ]);
+    let agent = FakeAgent::new(script);
+    let supervisor = f.start(&agent).await;
+
+    f.send("one");
+    f.wait_count("A's reply", 1, is_idle).await;
+    f.clear(b);
+    f.send("two");
+    f.wait_count("B's reply", 2, is_idle).await;
+    assert_eq!(grants_of(&f, f.session_id), Some(granted.clone()));
+
+    // Switching back to A resumes it with what B was granted.
+    f.switch(a);
+    f.send("three");
+    f.wait_count("A's second reply", 3, is_idle).await;
+    // The next message after a clear starts fresh, with them too.
+    f.clear(c);
+    f.send("four");
+    f.wait_count("C's reply", 4, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_with(a, false, None),
+            started_with(b, false, None),
+            started_with(a, true, Some(granted.clone())),
+            started_with(c, false, Some(granted.clone())),
+        ]
+    );
+    // Stored for the session, not for the context that reported them.
+    assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+    assert_eq!(grants_of(&f, f.session_id), Some(granted));
+}
+
+#[tokio::test]
+async fn grants_never_cross_sessions() {
+    let mut f = Fixture::new();
+    let first = f.session_id;
+    let granted = grants(json!(["edits"]));
+    // Each session's turns run in order: only a session's second turn
+    // reports grants.
+    let script = FakeScript::new()
+        .turn([Step::text("first turn")])
+        .turn([Step::grants(granted.0.clone())]);
+    let agent = FakeAgent::new(script);
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.send("two");
+    f.wait_count("both replies", 2, is_idle).await;
+    assert_eq!(grants_of(&f, first), Some(granted.clone()));
+
+    // Another session starts without them.
+    let second = f.create_session();
+    f.session_id = second;
+    f.send("elsewhere");
+    f.wait_count("the other session's reply", 1, is_idle).await;
+    assert_eq!(
+        starts(&agent, &f),
+        [started_with(ContextId::first_of(second), false, None)]
+    );
+    assert_eq!(grants_of(&f, second), None);
+
+    // Positive control: the first session's next start gets them.
+    f.session_id = first;
+    let next = ContextId::new();
+    f.clear(next);
+    f.send("three");
+    f.wait_count("the first session's third reply", 3, is_idle)
+        .await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_with(ContextId::first_of(first), false, None),
+            started_with(next, false, Some(granted.clone())),
+        ]
+    );
+    assert_eq!(grants_of(&f, first), Some(granted));
+    assert_eq!(grants_of(&f, second), None);
 }

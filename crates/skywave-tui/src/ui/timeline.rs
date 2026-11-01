@@ -22,8 +22,9 @@ use skywave_core::{
     Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
-    agent_setting_line, answer_words, asked_by, blob_size, bytes, decision_label, delivery_label,
-    dollars, fail_reason, outgoing_label, percent, seconds, took_label, turn_time,
+    agent_setting_line, answer_words, asked_by, blob_size, bytes, context_started_line,
+    context_switched_line, decision_label, delivery_label, dollars, fail_reason, outgoing_label,
+    percent, seconds, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -291,6 +292,12 @@ impl Layout<'_> {
                     Span::raw("stopped · the agent was shut down, a message restarts it").yellow(),
                 );
                 return vec![Line::from(spans)];
+            }
+            Entry::ContextStarted { name, by } => {
+                return context_divider(lead, &context_started_line(name, by));
+            }
+            Entry::ContextSwitched { name, by } => {
+                return context_divider(lead, &context_switched_line(name, by));
             }
             Entry::Renamed { name, by } => {
                 let who = if by.me {
@@ -1164,6 +1171,12 @@ fn group(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
 }
 
 /// Another device, by its name or the end of its id, safe for the grid.
+/// A context divider: what follows went to another context.
+fn context_divider(mut lead: Vec<Span<'static>>, what: &str) -> Vec<Line<'static>> {
+    lead.push(Span::raw(format!("── {} ──", clean(what))).cyan());
+    vec![Line::from(lead)]
+}
+
 pub(super) fn device_label(device: &DeviceRef) -> String {
     clean(&device.label())
 }

@@ -18,8 +18,8 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo,
-    Event, EventBatch, EventKind, ModelChoice, Seq, SessionId,
+    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
+    DeviceInfo, Event, EventBatch, EventKind, ModelChoice, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -196,6 +196,23 @@ CREATE TABLE snippets (
     text TEXT NOT NULL,
     used INTEGER NOT NULL
 );
+"#,
+    r#"
+-- Session contexts (protocol v9). `SessionSummary::context`: a replica from
+-- before this holds no context events, so every session is in its first
+-- context, which has the session's id. Stored events and queued commands
+-- are rewritten to the v9 shapes (no serde defaults): every event belongs
+-- to its session's first context, which the server's own migration names
+-- "start", and a queued message was written in it. The server's migration
+-- makes that context current, so such a message is still accepted.
+ALTER TABLE sessions ADD COLUMN context TEXT NOT NULL DEFAULT '';
+UPDATE sessions SET context = id;
+UPDATE events SET event = json_set(event, '$.context', session_id);
+UPDATE events SET event = json_set(event, '$.kind.context_name', 'start')
+    WHERE json_extract(event, '$.kind.type') = 'session_created';
+UPDATE outbox SET command = json_set(command, '$.kind.context',
+        json_extract(command, '$.kind.session_id'))
+    WHERE json_extract(command, '$.kind.type') = 'send_message';
 "#,
 ];
 
@@ -1192,7 +1209,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage, agent";
+    stopped, notable, name, first_prompt, archived, usage, agent, context";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -1207,7 +1224,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         ),
         params![
             summary.id.0.to_string(),
@@ -1223,6 +1240,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.archived,
             summary.usage.as_ref().map(to_json).transpose()?,
             to_json(&summary.agent)?,
+            summary.context.0.to_string(),
         ],
     )?;
     Ok(())
@@ -1247,6 +1265,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         archived: row.get(10)?,
         usage: opt_json_col(row, 11)?,
         agent: opt_json_col(row, 12)?.unwrap_or_default(),
+        context: ContextId(uuid_col(row, 13)?),
     })
 }
 

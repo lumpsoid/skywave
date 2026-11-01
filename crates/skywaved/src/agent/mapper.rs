@@ -9,14 +9,14 @@ use skywave_proto::limits::{
     RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId, Effort,
-    EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState, ToolCall, ToolKind,
-    ToolResult,
+    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
+    ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
+    ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
     AdapterEvent, AgentCallId, AgentRequestId, DisplayBody, ResultDisplay, ToolDisplay,
-    TurnOutcome, store_resume_handle,
+    TurnOutcome, store_grants, store_resume_handle,
 };
 use crate::error::Result;
 use crate::{EventLog, Storage};
@@ -29,7 +29,9 @@ const AGENT_EXITED: &str = "agent exited";
 /// Turns one session's adapter events into log events.
 ///
 /// The supervisor owns one mapper per running agent session and feeds it
-/// every [`AdapterEvent`] in order:
+/// every [`AdapterEvent`] in order. Every event it logs is stamped with the
+/// mapper's context, the one the agent process was started for, even when
+/// it arrives after the session switched to another context:
 ///
 /// | adapter event | log |
 /// |---------------|-----|
@@ -42,7 +44,8 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
-/// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
+/// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
+/// | `Grants` | stored in `sessions.agent_grants` for the mapper's session (whichever context), no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
@@ -100,6 +103,9 @@ const AGENT_EXITED: &str = "agent exited";
 #[derive(Debug)]
 pub struct EventMapper {
     session_id: SessionId,
+    /// The session context the agent runs in, whose resume handle it
+    /// stores.
+    context: ContextId,
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
     approvals: Vec<(AgentRequestId, ApprovalId)>,
@@ -128,10 +134,12 @@ struct LoggedCall {
 }
 
 impl EventMapper {
-    /// A mapper for `session_id`, whose log holds `settings`.
-    pub fn new(session_id: SessionId, settings: AgentSettings) -> EventMapper {
+    /// A mapper for `session_id`, whose log holds `settings`, running its
+    /// agent in session context `context`.
+    pub fn new(session_id: SessionId, context: ContextId, settings: AgentSettings) -> EventMapper {
         EventMapper {
             session_id,
+            context,
             approvals: Vec::new(),
             calls: HashMap::new(),
             turn_open: false,
@@ -159,6 +167,12 @@ impl EventMapper {
 
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// The session context the agent runs in. Everything the mapper logs
+    /// is stamped with it.
+    pub fn context(&self) -> ContextId {
+        self.context
     }
 
     /// A turn has started and not yet ended.
@@ -306,7 +320,10 @@ impl EventMapper {
                 seqs.push(self.append(log, storage, EventKind::SessionStateChanged(state))?);
             }
             AdapterEvent::ResumeHandle(handle) => {
-                store_resume_handle(&storage.db, self.session_id, &handle)?;
+                store_resume_handle(&storage.db, self.context, &handle)?;
+            }
+            AdapterEvent::Grants(grants) => {
+                store_grants(&storage.db, self.session_id, &grants)?;
             }
             AdapterEvent::PermissionMode(mode) => {
                 if self.settings.mode.current != Some(mode) {
@@ -412,7 +429,7 @@ impl EventMapper {
         if AgentSettings::folds(&kind) {
             self.settings.apply(None, &kind);
         }
-        log.append(&mut storage.db, self.session_id, kind)
+        log.append(&mut storage.db, self.session_id, self.context, kind)
     }
 
     /// The command of the oldest mode request, now answered.

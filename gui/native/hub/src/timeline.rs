@@ -13,8 +13,9 @@ use skywave_core::{
     read_head,
 };
 use skywave_present::format::{
-    agent_setting_line, answer_words, asked_by, bytes, decision_label, delivery_label, dollars,
-    fail_reason, outgoing_label, percent, seconds, took_label, turn_time,
+    agent_setting_line, answer_words, asked_by, bytes, context_started_line, context_switched_line,
+    decision_label, delivery_label, dollars, fail_reason, outgoing_label, percent, seconds,
+    took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
@@ -226,6 +227,16 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             &mut row,
             RowKind::Stopped,
             "stopped · the agent was shut down, a message restarts it".to_owned(),
+        ),
+        Entry::ContextStarted { name, by } => set(
+            &mut row,
+            RowKind::ContextDivider,
+            clean_line(&context_started_line(name, by)),
+        ),
+        Entry::ContextSwitched { name, by } => set(
+            &mut row,
+            RowKind::ContextDivider,
+            clean_line(&context_switched_line(name, by)),
         ),
         Entry::Renamed { name, by } => set(
             &mut row,
@@ -791,7 +802,8 @@ fn clean(line: &str) -> String {
 mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        AgentSetting, AgentView, CommandId, DeviceId, PermissionMode, SessionId, SessionState,
+        AgentSetting, AgentView, CommandId, ContextId, DeviceId, PermissionMode, SessionId,
+        SessionState,
     };
 
     use super::*;
@@ -810,6 +822,12 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            contexts: Vec::new(),
+            context: ContextId::new(),
+            viewing: None,
+            can_clear: false,
+            clear: None,
+            switch: None,
             interrupt: None,
             stop: None,
             draft: None,
@@ -823,6 +841,7 @@ mod tests {
         TimelineItem::Logged {
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, minute, 0).unwrap(),
+            context: ContextId::new(),
             entry: Entry::AgentMessage { text: text.into() },
         }
     }
@@ -830,6 +849,7 @@ mod tests {
     fn pending(id: CommandId, text: &str) -> TimelineItem {
         TimelineItem::Pending {
             command_id: id,
+            context: ContextId::new(),
             text: text.into(),
             outgoing: Outgoing::Queued,
             discardable: true,
@@ -841,6 +861,7 @@ mod tests {
         TimelineItem::Logged {
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
+            context: ContextId::new(),
             entry: Entry::UserMessage {
                 command_id: id,
                 text: text.into(),
@@ -987,6 +1008,7 @@ mod tests {
         let logged = |seq, setting, by, refused: Option<&str>| TimelineItem::Logged {
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            context: ContextId::new(),
             entry: Entry::AgentSetting {
                 setting,
                 by,

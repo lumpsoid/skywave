@@ -263,6 +263,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         session_id,
         at: at(minute),
         command_id: kind.logged_by_command().then(CommandId::new),
+        context: skywave_proto::ContextId::first_of(session_id),
         kind,
     }
 }
@@ -294,6 +295,7 @@ fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
         minute,
         EventKind::SessionCreated {
             workdir: workdir.into(),
+            context_name: "start".into(),
         },
     )
 }
@@ -1813,6 +1815,198 @@ fn rename_from_the_timeline_titles_the_header() {
 }
 
 #[test]
+fn context_dividers_show_where_the_context_changed() {
+    let (mut h, id, me) = open_session();
+    let walrus = skywave_proto::ContextId::new();
+    let other = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            Event {
+                context: walrus,
+                ..event(
+                    id,
+                    1,
+                    EventKind::ContextStarted {
+                        by: other,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+            Event {
+                context: skywave_proto::ContextId::first_of(id),
+                ..event(id, 2, EventKind::ContextSwitched { by: me })
+            },
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        &format!(
+            "── New context · velvet walrus · by device …{} ──",
+            tail(other)
+        ),
+    );
+    assert_contains(&screen, "── Back to start · by you ──");
+}
+
+/// A session whose first context ("start") holds "alpha question" and
+/// whose current one, "velvet walrus", holds "beta question".
+fn two_contexts() -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    let walrus = skywave_proto::ContextId::new();
+    pull(
+        &mut h,
+        vec![
+            message(id, 1, CommandId::new(), me, "alpha question"),
+            Event {
+                context: walrus,
+                ..event(
+                    id,
+                    2,
+                    EventKind::ContextStarted {
+                        by: me,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+            Event {
+                context: walrus,
+                ..message(id, 3, CommandId::new(), me, "beta question")
+            },
+        ],
+    );
+    (h, id, me)
+}
+
+#[test]
+fn contexts_menu_offers_a_new_context_only_once_there_is_a_message() {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    // An empty context: the entry is shown but inert.
+    assert_eq!(h.key(KeyCode::Char('C')), None);
+    let screen = h.screen();
+    assert_contains(&screen, " Contexts · Enter switches");
+    assert_contains(&screen, "New context (this one is empty)");
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), " Contexts · Enter switches");
+    h.key(KeyCode::Esc);
+    assert!(!h.screen().contains(" Contexts · Enter switches"));
+
+    // Positive control: with a message in it, Enter starts a new one.
+    pull(&mut h, vec![message(id, 1, CommandId::new(), me, "hello")]);
+    h.key(KeyCode::Char('C'));
+    let screen = h.screen();
+    assert_contains(&screen, "New context");
+    assert!(!screen.contains("this one is empty"), "{screen}");
+    assert_contains(&screen, "start · hello");
+    assert_contains(&screen, "current");
+    h.key(KeyCode::Up);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::ClearContext { session_id: id })
+    );
+    assert!(!h.screen().contains(" Contexts · Enter switches"));
+    assert_contains(&status_line(&h, 100), "new context queued");
+}
+
+#[test]
+fn contexts_picker_switches_to_an_earlier_context() {
+    let (mut h, id, _) = two_contexts();
+    h.key(KeyCode::Char('C'));
+    let screen = h.screen();
+    assert_contains(&screen, "start · alpha question");
+    assert_contains(&screen, "› velvet walrus · beta question · current");
+    // Enter on the current one has nothing to switch.
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert!(!h.screen().contains(" Contexts · Enter switches"));
+
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SwitchContext {
+            session_id: id,
+            context: skywave_proto::ContextId::first_of(id),
+        })
+    );
+    assert_contains(&status_line(&h, 100), "switch queued");
+}
+
+#[test]
+fn contexts_picker_views_one_context_and_back() {
+    let (mut h, id, _) = two_contexts();
+    let start = skywave_proto::ContextId::first_of(id);
+    let screen = h.screen();
+    assert_contains(&screen, "alpha question");
+    assert_contains(&screen, "beta question");
+    assert!(!screen.contains("Viewing"), "{screen}");
+
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    assert_eq!(
+        h.key(KeyCode::Char('v')),
+        Some(Action::ViewContext {
+            session_id: id,
+            context: Some(start),
+        })
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "alpha question");
+    assert!(!screen.contains("beta question"), "{screen}");
+    assert_contains(
+        &status_line(&h, 140),
+        "Viewing start — messages go to velvet walrus",
+    );
+
+    // On the current context, `v` shows the whole timeline again.
+    h.key(KeyCode::Char('C'));
+    assert_eq!(
+        h.key(KeyCode::Char('v')),
+        Some(Action::ViewContext {
+            session_id: id,
+            context: None,
+        })
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "alpha question");
+    assert_contains(&screen, "beta question");
+    assert!(!screen.contains("Viewing"), "{screen}");
+}
+
+#[test]
+fn a_message_refused_for_a_changed_context_is_edited_and_resent() {
+    let (mut h, _, _) = open_session();
+    h.type_text("written before");
+    h.key(KeyCode::Enter);
+    let stale = last_command(&h);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.seam
+        .command_result(
+            stale,
+            &CommandResult::Rejected {
+                reason: RejectReason::ContextChanged,
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(
+        &h.screen(),
+        "[failed: the session moved to another context first]: written before",
+    );
+    assert_eq!(h.key(KeyCode::Char('e')), Some(Action::EditQueued(stale)));
+    assert_eq!(h.app.composer().unwrap().text(), "written before");
+    h.key(KeyCode::Enter);
+    let resent = last_command(&h);
+    assert_ne!(resent, stale);
+    assert_contains(&h.screen(), "you [queued]: written before");
+    assert!(!h.screen().contains("failed"));
+}
+
+#[test]
 fn stop_key_and_its_delivery_state() {
     let (mut h, id, _) = open_session();
     // A capital S in the composer is text, not a stop.
@@ -2179,7 +2373,7 @@ fn session_keys_are_in_help_and_footer() {
     let screen = h.screen();
     assert_contains(&screen, "expand it; downloads its blob if needed");
     h.key(KeyCode::Char('G'));
-    assert_contains(&h.screen(), "approve / deny the pending approval");
+    assert_contains(&h.screen(), "new context; switch to or view one");
     h.key(KeyCode::Char('?'));
     h.key(KeyCode::Char('i'));
     assert!(h.app.typing());
@@ -2808,6 +3002,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
         session_id: id,
         at: at_s(minute, second),
         command_id: kind.logged_by_command().then(CommandId::new),
+        context: skywave_proto::ContextId::first_of(id),
         kind,
     };
     let ids: Vec<CallId> = (0..8).map(|_| CallId::new()).collect();
