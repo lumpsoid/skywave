@@ -9,9 +9,9 @@ use skywave_proto::limits::{
     RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId, Effort,
-    EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState, ToolCall, ToolKind,
-    ToolResult,
+    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
+    ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
+    ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
@@ -42,7 +42,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
-/// | `ResumeHandle` | stored in `sessions.agent_state`, no event |
+/// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
@@ -100,6 +100,9 @@ const AGENT_EXITED: &str = "agent exited";
 #[derive(Debug)]
 pub struct EventMapper {
     session_id: SessionId,
+    /// The session context the agent runs in, whose resume handle it
+    /// stores.
+    context: ContextId,
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
     approvals: Vec<(AgentRequestId, ApprovalId)>,
@@ -128,10 +131,12 @@ struct LoggedCall {
 }
 
 impl EventMapper {
-    /// A mapper for `session_id`, whose log holds `settings`.
-    pub fn new(session_id: SessionId, settings: AgentSettings) -> EventMapper {
+    /// A mapper for `session_id`, whose log holds `settings`, running its
+    /// agent in session context `context`.
+    pub fn new(session_id: SessionId, context: ContextId, settings: AgentSettings) -> EventMapper {
         EventMapper {
             session_id,
+            context,
             approvals: Vec::new(),
             calls: HashMap::new(),
             turn_open: false,
@@ -306,7 +311,7 @@ impl EventMapper {
                 seqs.push(self.append(log, storage, EventKind::SessionStateChanged(state))?);
             }
             AdapterEvent::ResumeHandle(handle) => {
-                store_resume_handle(&storage.db, self.session_id, &handle)?;
+                store_resume_handle(&storage.db, self.context, &handle)?;
             }
             AdapterEvent::PermissionMode(mode) => {
                 if self.settings.mode.current != Some(mode) {

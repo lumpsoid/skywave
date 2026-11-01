@@ -295,3 +295,39 @@ One head over the shared hub keeps one owner per rule (D2).
 catch-up and "Stay connected" in the background (D21), approval
 notifications while suspended and `skywave://pair` links. QR scanning
 (D20) is back. Git history keeps the Kotlin implementation as a reference.
+
+## D29. Session contexts: sequential, stamped by the server
+A Skywave session owns an ordered list of contexts, each its own agent
+conversation with its own resume handle. Contexts are sequential: one is
+current and at most one agent process runs. `ClearContext` starts a new,
+empty context; `SwitchContext` makes an earlier one current again; the
+supervisor treats either as a restart of the agent in that context. The
+server stamps every event with the context it belongs to (`Event.context`)
+when it logs it, so clients draw dividers, list contexts and filter the
+timeline from the stamp, never from position. A session's first context has
+the session's id, for new sessions and migrated ones alike. The id of a
+later context is chosen by the client that clears, so an offline device can
+address it (a message queued after the clear names it) before the server
+answers. Names are two random words carried in the log: the server names the
+first context in `SessionCreated`, the clearing client names the rest; a
+blank name is replaced, never refused, because a refusal would cascade into a
+`ContextChanged` refusal of the message the same device queued next.
+"New context" always creates one, even when the current context is empty;
+clients disable it while the current context has no message, and the picker
+hides empty contexts other than the current one.
+Grants (rules the agent was granted) are session-scoped and kept apart from
+the per-context resume handle: rules are documented as granted for the
+Skywave session, and clients list them session-wide.
+**Why:** sequential contexts keep one agent per session and one ordering
+owner (the log); stamping at append time keeps the fold trivial and correct
+across switches (an `Interrupt` accepted after a switch but before the old
+turn ended is stamped with the old turn's context).
+**Lost on upgrade:** rules granted before the upgrade, since an opaque
+handle cannot be split by a migration (alpha stance). Known consequence:
+`SessionView::rules` folds from the log's `ApprovalResolved { rule }`, so
+clients keep listing pre-upgrade rules the agent no longer has until they
+are granted again. Pre-upgrade sessions have one context named "start".
+**Rejected:** server-assigned context numbers (an offline device could not
+address the new context); names derived from the id (locks the word lists
+forever); reusing an empty current context (would need a fake event or a
+cascading rejection).

@@ -263,6 +263,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         session_id,
         at: at(minute),
         command_id: kind.logged_by_command().then(CommandId::new),
+        context: skywave_proto::ContextId::first_of(session_id),
         kind,
     }
 }
@@ -294,6 +295,7 @@ fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
         minute,
         EventKind::SessionCreated {
             workdir: workdir.into(),
+            context_name: "start".into(),
         },
     )
 }
@@ -2808,6 +2810,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
         session_id: id,
         at: at_s(minute, second),
         command_id: kind.logged_by_command().then(CommandId::new),
+        context: skywave_proto::ContextId::first_of(id),
         kind,
     };
     let ids: Vec<CallId> = (0..8).map(|_| CallId::new()).collect();

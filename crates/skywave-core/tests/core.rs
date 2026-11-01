@@ -13,8 +13,8 @@ use skywave_core::{
     SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, Decision, DeviceId, Event, EventBatch,
-    EventKind, Seq, SessionId, ToolResult,
+    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, ContextId, Decision, DeviceId, Event,
+    EventBatch, EventKind, Seq, SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -89,6 +89,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         session_id,
         at: Utc.with_ymd_and_hms(2026, 10, 29, 11, minute, 0).unwrap(),
         command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
+        context: ContextId::first_of(session_id),
         kind,
     }
 }
@@ -232,6 +233,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )],
     })
@@ -257,6 +259,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
         command.kind,
         CommandKind::SendMessage {
             session_id: sid,
+            context: ContextId::first_of(sid),
             text: "fix the build".into()
         }
     );
@@ -374,6 +377,7 @@ fn draft_survives_restart() {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )],
     })
@@ -436,6 +440,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -500,6 +505,7 @@ fn gap_is_refused_and_changes_nothing() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
+                    context_name: "start".into(),
                 },
             )],
         })
@@ -532,6 +538,7 @@ fn blob_progress_is_persisted_and_shown() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -629,6 +636,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             requested(1, news),
@@ -704,6 +712,7 @@ fn deleted_session_stays_gone_after_restart() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )
     };

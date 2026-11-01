@@ -315,10 +315,19 @@ impl Model {
                 Vec::new()
             }
             Action::SendMessage { session_id, text } => {
-                if text.trim().is_empty() || self.summary(session_id).is_none() {
+                let Some(summary) = self.summary(session_id) else {
+                    return Vec::new();
+                };
+                if text.trim().is_empty() {
                     return Vec::new();
                 }
-                let effects = self.enqueue(CommandKind::SendMessage { session_id, text });
+                // The message is written in the context the device shows.
+                let context = summary.context;
+                let effects = self.enqueue(CommandKind::SendMessage {
+                    session_id,
+                    context,
+                    text,
+                });
                 // The store drops the draft with the enqueue.
                 if !effects.is_empty() {
                     self.drafts.remove(&session_id);
@@ -616,7 +625,9 @@ impl Model {
             return Vec::new();
         };
         let draft = match &self.outbox[index].command.kind {
-            CommandKind::SendMessage { session_id, text } if edit => {
+            CommandKind::SendMessage {
+                session_id, text, ..
+            } if edit => {
                 let joined = match self.drafts.get(session_id) {
                     Some(old) => format!("{text}\n\n{}", old.text),
                     None => text.clone(),
@@ -1540,6 +1551,8 @@ impl Model {
                 }),
                 // Shown in the header.
                 EventKind::SessionCreated { .. } | EventKind::ModelsOffered { .. } => None,
+                // Not shown yet.
+                EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => None,
                 EventKind::EffortChanged { effort, answers } => Some(Entry::AgentSetting {
                     setting: AgentSetting::Effort(*effort),
                     by: self.asker(&asked_by, *answers),
@@ -1587,9 +1600,9 @@ impl Model {
         }
 
         items.extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
-            CommandKind::SendMessage { session_id, text }
-                if *session_id == id && !logged.contains(&e.command.id) =>
-            {
+            CommandKind::SendMessage {
+                session_id, text, ..
+            } if *session_id == id && !logged.contains(&e.command.id) => {
                 Some(TimelineItem::Pending {
                     command_id: e.command.id,
                     text: text.clone(),
@@ -1786,7 +1799,9 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetSessionArchived { session_id, .. }
         | CommandKind::SetPermissionMode { session_id, .. }
         | CommandKind::SetModel { session_id, .. }
-        | CommandKind::SetEffort { session_id, .. } => Some(*session_id),
+        | CommandKind::SetEffort { session_id, .. }
+        | CommandKind::ClearContext { session_id, .. }
+        | CommandKind::SwitchContext { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -1887,6 +1902,7 @@ mod tests {
                         session_id,
                         at: Utc.with_ymd_and_hms(2026, 10, 29, 10, minute, 0).unwrap(),
                         command_id,
+                        context: skywave_proto::ContextId::first_of(session_id),
                         kind,
                     };
                     self.events.push(event.clone());
@@ -1902,6 +1918,7 @@ mod tests {
                 id,
                 vec![EventKind::SessionCreated {
                     workdir: workdir.into(),
+                    context_name: "start".into(),
                 }],
             );
             id
@@ -2068,6 +2085,48 @@ mod tests {
     }
 
     #[test]
+    fn a_message_is_written_in_the_current_context() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let send = |f: &mut Fixture| {
+            queued(&f.dispatch(Action::SendMessage {
+                session_id: sid,
+                text: "hello".into(),
+            }))
+            .kind
+        };
+        let in_context = |context| CommandKind::SendMessage {
+            session_id: sid,
+            context,
+            text: "hello".into(),
+        };
+        assert_eq!(
+            send(&mut f),
+            in_context(skywave_proto::ContextId::first_of(sid))
+        );
+
+        // Another device cleared the context: the next message goes there.
+        let fresh = skywave_proto::ContextId::new();
+        let started = Event {
+            session_id: sid,
+            at: Utc::now(),
+            command_id: Some(CommandId::new()),
+            context: fresh,
+            kind: EventKind::ContextStarted {
+                by: skywave_proto::DeviceId::new(),
+                name: "fresh start".into(),
+            },
+        };
+        let from = Seq(f.events.len() as u64 + 1);
+        f.events.push(started.clone());
+        f.model.apply_batch(&EventBatch {
+            from,
+            events: vec![started],
+        });
+        assert_eq!(send(&mut f), in_context(fresh));
+    }
+
+    #[test]
     fn own_message_moves_through_outgoing_states_and_appears_once() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
@@ -2088,6 +2147,7 @@ mod tests {
             command.kind,
             CommandKind::SendMessage {
                 session_id: sid,
+                context: skywave_proto::ContextId::first_of(sid),
                 text: "hello".into()
             }
         );
@@ -3000,6 +3060,7 @@ mod tests {
                 session_id: sid,
                 at: Utc::now(),
                 command_id: Some(CommandId::new()),
+                context: skywave_proto::ContextId::first_of(sid),
                 kind: EventKind::UserMessage {
                     device_id: phone,
                     text: "again".into(),
@@ -3556,6 +3617,7 @@ mod tests {
                 session_id: gone,
                 at: minute(9),
                 command_id: Some(CommandId::new()),
+                context: skywave_proto::ContextId::first_of(gone),
                 kind: message("again"),
             }],
         });
@@ -3943,6 +4005,7 @@ mod tests {
         let new = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
+            context_name: "start".into(),
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));

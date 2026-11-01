@@ -554,7 +554,11 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     "SessionCreated"
                 }
                 (
-                    CommandKind::SendMessage { session_id, text },
+                    CommandKind::SendMessage {
+                        session_id,
+                        context,
+                        text,
+                    },
                     EventKind::UserMessage {
                         device_id,
                         text: logged,
@@ -563,6 +567,7 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     assert_eq!(*device_id, device);
                     assert_eq!(logged, text);
                     assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);
+                    assert_eq!(events[(seq.0 - 1) as usize].context, *context);
                     "UserMessage"
                 }
                 (

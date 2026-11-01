@@ -18,8 +18,8 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo, DirsResult,
-    EventBatch, EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse,
+    BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId, DeviceInfo,
+    DirsResult, EventBatch, EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse,
     RejectReason, Seq, SessionId, path,
 };
 use skywaved::blobs::BlobStore;
@@ -163,10 +163,16 @@ impl Fixture {
     }
 }
 
+/// Every test ends by checking that every row names a context of its own
+/// session.
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
+        }
+        if !std::thread::panicking() {
+            let violations = self.storage.db.context_stamp_violations().unwrap();
+            assert!(violations.is_empty(), "context stamps: {violations:#?}");
         }
     }
 }
@@ -474,6 +480,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id: SessionId::new(),
+            context: ContextId::first_of(SessionId::new()),
             text: "hi".into(),
         },
     };
@@ -493,6 +500,7 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id: session,
+            context: ContextId::first_of(session),
             text: "hello".into(),
         },
     };

@@ -48,6 +48,7 @@ impl Rig {
         let session = SessionId::new();
         let kind = EventKind::SessionCreated {
             workdir: "/srv/work".into(),
+            context_name: "start".into(),
         };
         seam.apply_events(&EventBatch {
             from: Seq(seam.cursor().unwrap().0 + 1),
@@ -55,6 +56,7 @@ impl Rig {
                 session_id: session,
                 at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
                 command_id: kind.logged_by_command().then(CommandId::new),
+                context: skywave_proto::ContextId::first_of(session),
                 kind,
             }],
         })
@@ -582,6 +584,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {
         workdir: "/srv/other".into(),
+        context_name: "start".into(),
     };
     rig.seam
         .apply_events(&EventBatch {
@@ -590,6 +593,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
                 session_id: SessionId::new(),
                 at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
                 command_id: kind.logged_by_command().then(CommandId::new),
+                context: skywave_proto::ContextId::first_of(SessionId::new()),
                 kind,
             }],
         })
@@ -636,6 +640,7 @@ impl Rig {
                 session_id: self.session,
                 at,
                 command_id: None,
+                context: skywave_proto::ContextId::first_of(self.session),
                 kind,
             })
             .collect();

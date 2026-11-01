@@ -15,7 +15,8 @@
 //!   new commands from the log itself: every accepted command is an event
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
 //!   `SessionRenamed`, `SessionArchived`, `SessionCreated`,
-//!   `PermissionModeRequested`, `ModelRequested`, `EffortRequested`),
+//!   `PermissionModeRequested`, `ModelRequested`, `EffortRequested`,
+//!   `ContextStarted`, `ContextSwitched`),
 //!   so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
@@ -29,8 +30,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, ApprovalId, CommandId, Event, EventBatch, EventKind, ModelChoice, Seq,
-    SessionId, SessionState,
+    AgentSettings, ApprovalId, CommandId, ContextId, Event, EventBatch, EventKind, ModelChoice,
+    Seq, SessionId, SessionState,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -65,6 +66,23 @@ pub struct SessionInfo {
     pub workdir: String,
     /// The agent has a running turn that has not been interrupted.
     pub turn_active: bool,
+    /// The context the session runs in now.
+    pub context: ContextId,
+    /// The context of the running turn while `turn_active`; it differs from
+    /// `context` after a switch until the old agent's turn ends.
+    pub turn_context: Option<ContextId>,
+}
+
+impl SessionInfo {
+    /// The context the running turn belongs to, which an `Interrupt` of it
+    /// is stamped with: not the current one after a switch until the old
+    /// agent reports the turn over. A running turn always has its context
+    /// recorded (`SessionStateChanged(AgentWorking)` sets both, the v7
+    /// migration filled it in); were it missing, the current context is the
+    /// best guess.
+    pub fn running_turn_context(&self) -> ContextId {
+        self.turn_context.unwrap_or(self.context)
+    }
 }
 
 /// An approval request no device has answered yet.
@@ -113,7 +131,7 @@ impl EventLog {
     pub fn read(&self, db: &Db, after: Seq, limit: u32) -> Result<EventBatch> {
         let limit = limit.clamp(1, MAX_BATCH_LIMIT);
         let mut stmt = db.conn().prepare_cached(
-            "SELECT seq, session_id, at, command_id, kind FROM events
+            "SELECT seq, session_id, at, command_id, context, kind FROM events
              WHERE seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![seq_to_sql(after), limit], |r| {
@@ -123,12 +141,13 @@ impl EventLog {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         let from = after.next();
         let mut events = Vec::new();
         for row in rows {
-            let (seq, session_id, at, command_id, kind) = row?;
+            let (seq, session_id, at, command_id, context, kind) = row?;
             let expected = from.0 + events.len() as u64;
             if seq_from_sql(seq)? != Seq(expected) {
                 return Err(Error::Corrupt(format!(
@@ -139,6 +158,7 @@ impl EventLog {
                 session_id: parse_id(&session_id)?,
                 at: parse_time(&at)?,
                 command_id: command_id.as_deref().map(parse_id).transpose()?,
+                context: parse_id(&context)?,
                 kind: serde_json::from_str(&kind)?,
             });
         }
@@ -154,6 +174,8 @@ impl EventLog {
     /// commands produce, and `ApprovalCancelled` (use
     /// [`EventLog::cancel_approval`]), are refused with
     /// [`Error::InvalidAppend`], as is an unknown session.
+    ///
+    /// The event is stamped with the session's current context.
     pub fn append(&self, db: &mut Db, session_id: SessionId, kind: EventKind) -> Result<Seq> {
         match &kind {
             EventKind::AgentMessage { .. }
@@ -179,7 +201,9 @@ impl EventLog {
             | EventKind::SessionArchived { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
-            | EventKind::EffortRequested { .. } => {
+            | EventKind::EffortRequested { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -187,12 +211,12 @@ impl EventLog {
             }
         }
         let tx = begin(db)?;
-        if session_in(&tx, session_id)?.is_none() {
+        let Some(session) = session_in(&tx, session_id)? else {
             return Err(Error::InvalidAppend(format!(
                 "unknown session {}",
                 session_id.0
             )));
-        }
+        };
         if let EventKind::ApprovalRequested { id, .. } = &kind
             && approval_in(&tx, *id)?.is_some()
         {
@@ -201,7 +225,7 @@ impl EventLog {
                 id.0
             )));
         }
-        let seq = append_in(&tx, session_id, None, &kind)?;
+        let seq = append_in(&tx, session_id, session.context, None, &kind)?;
         tx.commit()?;
         self.published(seq);
         Ok(seq)
@@ -210,7 +234,8 @@ impl EventLog {
     /// Appends `ApprovalCancelled { id, reason }` if approval `id` is still
     /// pending, and returns its seq. `None` when the approval is unknown or
     /// already resolved or cancelled: an answer that committed first wins
-    /// (D5), so the supervisor treats `None` as "nothing to cancel".
+    /// (D5), so the supervisor treats `None` as "nothing to cancel". The
+    /// event is stamped with the approval's context.
     pub fn cancel_approval(
         &self,
         db: &mut Db,
@@ -220,6 +245,7 @@ impl EventLog {
         let tx = begin(db)?;
         let Some(ApprovalRow {
             session_id,
+            context,
             closed: None,
             ..
         }) = approval_in(&tx, id)?
@@ -230,7 +256,7 @@ impl EventLog {
             id,
             reason: reason.to_owned(),
         };
-        let seq = append_in(&tx, session_id, None, &kind)?;
+        let seq = append_in(&tx, session_id, context, None, &kind)?;
         tx.commit()?;
         self.published(seq);
         Ok(Some(seq))
@@ -260,19 +286,16 @@ impl EventLog {
 
     /// Every session, oldest first.
     pub fn sessions(&self, db: &Db) -> Result<Vec<SessionInfo>> {
-        let mut stmt = db
-            .conn()
-            .prepare_cached("SELECT id, workdir, turn_active FROM sessions ORDER BY rowid")?;
+        let mut stmt = db.conn().prepare_cached(
+            "SELECT id, workdir, turn_active, current_context, turn_context
+             FROM sessions ORDER BY rowid",
+        )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get::<_, bool>(2)?))
+            Ok((r.get::<_, String>(0)?, SessionRow::from_row(r, 1)?))
         })?;
         rows.map(|row| {
-            let (id, workdir, turn_active) = row?;
-            Ok(SessionInfo {
-                id: parse_id(&id)?,
-                workdir,
-                turn_active,
-            })
+            let (id, session) = row?;
+            session.info(parse_id(&id)?)
         })
         .collect()
     }
@@ -337,46 +360,72 @@ pub(crate) fn begin(db: &mut Db) -> Result<rusqlite::Transaction<'_>> {
 
 /// Appends one event at the next seq and updates the projections. Must run
 /// inside a transaction from [`begin`]; preconditions are the caller's.
-/// `command` is the command logging it ([`Event::command_id`]), `None` for
-/// agent and daemon events.
+/// `context` is the context of the session the event belongs to
+/// ([`Event::context`]); `command` is the command logging it
+/// ([`Event::command_id`]), `None` for agent and daemon events.
 pub(crate) fn append_in(
     conn: &Connection,
     session_id: SessionId,
+    context: ContextId,
     command: Option<CommandId>,
     kind: &EventKind,
 ) -> Result<Seq> {
     let seq = head_in(conn)?.next();
     let sql_seq = seq_to_sql(seq);
     let session = session_id.0.to_string();
+    let context = context.0.to_string();
     let at = Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true);
     conn.prepare_cached(
-        "INSERT INTO events (seq, session_id, at, command_id, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO events (seq, session_id, at, command_id, context, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?
     .execute(params![
         sql_seq,
         session,
         at,
         command.map(|id| id.0.to_string()),
+        context,
         serde_json::to_string(kind)?
     ])?;
 
     match kind {
-        EventKind::SessionCreated { workdir } => {
+        // The sessions row first: the contexts row refers to it.
+        EventKind::SessionCreated { workdir, .. } => {
             conn.execute(
-                "INSERT INTO sessions (id, workdir) VALUES (?1, ?2)",
-                params![session, workdir],
+                "INSERT INTO sessions (id, workdir, current_context) VALUES (?1, ?2, ?3)",
+                params![session, workdir, context],
+            )?;
+            conn.execute(
+                "INSERT INTO contexts (id, session_id) VALUES (?1, ?2)",
+                params![context, session],
+            )?;
+        }
+        EventKind::ContextStarted { .. } => {
+            conn.execute(
+                "INSERT INTO contexts (id, session_id) VALUES (?1, ?2)",
+                params![context, session],
+            )?;
+            conn.execute(
+                "UPDATE sessions SET current_context = ?2 WHERE id = ?1",
+                params![session, context],
+            )?;
+        }
+        EventKind::ContextSwitched { .. } => {
+            conn.execute(
+                "UPDATE sessions SET current_context = ?2 WHERE id = ?1",
+                params![session, context],
             )?;
         }
         EventKind::SessionStateChanged(state) => {
             let active = matches!(state, SessionState::AgentWorking);
             conn.execute(
-                "UPDATE sessions SET turn_active = ?2 WHERE id = ?1",
-                params![session, active],
+                "UPDATE sessions SET turn_active = ?2, turn_context = ?3 WHERE id = ?1",
+                params![session, active, active.then_some(&context)],
             )?;
         }
         EventKind::TurnInterrupted => {
             conn.execute(
-                "UPDATE sessions SET turn_active = 0 WHERE id = ?1",
+                "UPDATE sessions SET turn_active = 0, turn_context = NULL WHERE id = ?1",
                 [&session],
             )?;
         }
@@ -384,10 +433,11 @@ pub(crate) fn append_in(
             id, suggestions, ..
         } => {
             conn.execute(
-                "INSERT INTO approvals (id, session_id, rules) VALUES (?1, ?2, ?3)",
+                "INSERT INTO approvals (id, session_id, context, rules) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     id.0.to_string(),
                     session,
+                    context,
                     i64::try_from(suggestions.len()).unwrap_or(i64::MAX)
                 ],
             )?;
@@ -450,25 +500,62 @@ pub(crate) fn head_in(conn: &Connection) -> Result<Seq> {
 }
 
 pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<SessionInfo>> {
-    Ok(conn
-        .query_row(
-            "SELECT workdir, turn_active FROM sessions WHERE id = ?1",
-            [id.0.to_string()],
-            |r| {
-                Ok(SessionInfo {
-                    id,
-                    workdir: r.get(0)?,
-                    turn_active: r.get(1)?,
-                })
-            },
-        )
-        .optional()?)
+    conn.prepare_cached(
+        "SELECT workdir, turn_active, current_context, turn_context FROM sessions WHERE id = ?1",
+    )?
+    .query_row([id.0.to_string()], |r| SessionRow::from_row(r, 0))
+    .optional()?
+    .map(|row| row.info(id))
+    .transpose()
+}
+
+/// A `sessions` row's columns before its ids are parsed.
+struct SessionRow {
+    workdir: String,
+    turn_active: bool,
+    context: String,
+    turn_context: Option<String>,
+}
+
+impl SessionRow {
+    /// Reads `workdir, turn_active, current_context, turn_context` from
+    /// column `first` on.
+    fn from_row(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SessionRow> {
+        Ok(SessionRow {
+            workdir: r.get(first)?,
+            turn_active: r.get(first + 1)?,
+            context: r.get(first + 2)?,
+            turn_context: r.get(first + 3)?,
+        })
+    }
+
+    fn info(self, id: SessionId) -> Result<SessionInfo> {
+        Ok(SessionInfo {
+            id,
+            workdir: self.workdir,
+            turn_active: self.turn_active,
+            context: parse_id(&self.context)?,
+            turn_context: self.turn_context.as_deref().map(parse_id).transpose()?,
+        })
+    }
+}
+
+/// The session context `id` belongs to; `None` if it is no context of any
+/// session.
+pub(crate) fn context_session_in(conn: &Connection, id: ContextId) -> Result<Option<SessionId>> {
+    let session: Option<String> = conn
+        .prepare_cached("SELECT session_id FROM contexts WHERE id = ?1")?
+        .query_row([id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    session.as_deref().map(parse_id).transpose()
 }
 
 /// What the log says of one approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApprovalRow {
     pub session_id: SessionId,
+    /// The context the request was logged in.
+    pub context: ContextId,
     /// How it was closed; `None` while it is pending.
     pub closed: Option<Closed>,
     /// How many rule suggestions the request offers.
@@ -488,18 +575,19 @@ pub(crate) enum Closed {
 pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<ApprovalRow>> {
     // The type tag of the event at `closed_seq` tells an answer from a
     // cancel.
-    let row: Option<(String, Option<String>, i64)> = conn
+    let row: Option<(String, String, Option<String>, i64)> = conn
         .query_row(
-            "SELECT a.session_id, json_extract(e.kind, '$.type'), a.rules
+            "SELECT a.session_id, a.context, json_extract(e.kind, '$.type'), a.rules
              FROM approvals a LEFT JOIN events e ON e.seq = a.closed_seq
              WHERE a.id = ?1",
             [id.0.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    row.map(|(session, closed_by, rules)| {
+    row.map(|(session, context, closed_by, rules)| {
         Ok(ApprovalRow {
             session_id: parse_id(&session)?,
+            context: parse_id(&context)?,
             closed: closed_by.map(|kind| match kind.as_str() {
                 "approval_cancelled" => Closed::Cancelled,
                 _ => Closed::Resolved,
@@ -536,6 +624,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRequested { .. } => "EffortRequested",
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",
+        EventKind::ContextStarted { .. } => "ContextStarted",
+        EventKind::ContextSwitched { .. } => "ContextSwitched",
     }
 }
 

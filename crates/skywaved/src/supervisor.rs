@@ -535,7 +535,10 @@ impl<A: AgentAdapter> Supervisor<A> {
         let Some(info) = self.log.session(&self.storage.db, session_id)? else {
             return Ok(Err(format!("unknown session {}", session_id.0)));
         };
-        let resume = load_resume_handle(&self.storage.db, session_id)?;
+        // Interim until the supervisor follows context changes: the agent
+        // runs in the session's current context.
+        let context = info.context;
+        let resume = load_resume_handle(&self.storage.db, context)?;
         let resumed = resume.is_some();
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
@@ -554,7 +557,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
                 tracing::info!(session = %session_id.0, resumed, "agent started");
-                let mut mapper = EventMapper::new(session_id, settings.clone());
+                let mut mapper = EventMapper::new(session_id, context, settings.clone());
                 let mut asked = HashSet::new();
                 if let Some(mode) = mode {
                     let command = settings.mode.requested.as_ref().map(|r| r.command);

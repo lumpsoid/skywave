@@ -188,6 +188,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",
         RejectReason::UnknownModel => "no model named",
+        RejectReason::ContextExists => "that context already exists",
+        RejectReason::UnknownContext => "the session has no such context",
+        RejectReason::ContextChanged => "the session moved to another context first",
     }
 }
 

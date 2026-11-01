@@ -15,9 +15,9 @@
 //!
 //! Everything agent-specific stays behind this seam: the agent's own
 //! approval request ids are opaque [`AgentRequestId`]s, and its resume state
-//! (for example its own session id) is an opaque [`ResumeHandle`] persisted in
-//! `sessions.agent_state` with [`store_resume_handle`] /
-//! [`load_resume_handle`].
+//! (for example its own session id) is an opaque [`ResumeHandle`] persisted
+//! per session context in `contexts.agent_state` with
+//! [`store_resume_handle`] / [`load_resume_handle`].
 //!
 //! **Protocol between supervisor and session.**
 //! - [`AgentAdapter::start`] with `resume: None` starts a fresh agent session;
@@ -65,7 +65,7 @@ use std::path::PathBuf;
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use skywave_proto::{Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId};
 pub use skywave_proto::{
     Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage,
 };
@@ -150,8 +150,8 @@ pub struct ResultDisplay {
 
 /// Whatever an adapter needs to resume an agent session after a restart.
 ///
-/// Opaque JSON: only the adapter that produced it reads it. Stored in
-/// `sessions.agent_state`.
+/// Opaque JSON: only the adapter that produced it reads it. Stored per
+/// session context, in `contexts.agent_state`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(transparent)]
 pub struct ResumeHandle(pub serde_json::Value);
@@ -341,28 +341,28 @@ pub trait AgentSession: Send + 'static {
     fn shutdown(self) -> impl Future<Output = Result<(), AgentError>> + Send;
 }
 
-/// Persists `handle` as session `session_id`'s resume handle.
-pub fn store_resume_handle(db: &Db, session_id: SessionId, handle: &ResumeHandle) -> Result<()> {
+/// Persists `handle` as session context `context`'s resume handle.
+pub fn store_resume_handle(db: &Db, context: ContextId, handle: &ResumeHandle) -> Result<()> {
     let changed = db
         .conn()
-        .prepare_cached("UPDATE sessions SET agent_state = ?2 WHERE id = ?1")?
-        .execute((session_id.0.to_string(), serde_json::to_string(handle)?))?;
+        .prepare_cached("UPDATE contexts SET agent_state = ?2 WHERE id = ?1")?
+        .execute((context.0.to_string(), serde_json::to_string(handle)?))?;
     if changed == 0 {
-        return Err(Error::UnknownSession(session_id));
+        return Err(Error::UnknownContext(context));
     }
     Ok(())
 }
 
-/// The resume handle stored for session `session_id`; `None` until the agent
-/// has reported one.
-pub fn load_resume_handle(db: &Db, session_id: SessionId) -> Result<Option<ResumeHandle>> {
+/// The resume handle stored for session context `context`; `None` until
+/// the agent has reported one.
+pub fn load_resume_handle(db: &Db, context: ContextId) -> Result<Option<ResumeHandle>> {
     let row: Option<Option<String>> = db
         .conn()
-        .prepare_cached("SELECT agent_state FROM sessions WHERE id = ?1")?
-        .query_row([session_id.0.to_string()], |r| r.get(0))
+        .prepare_cached("SELECT agent_state FROM contexts WHERE id = ?1")?
+        .query_row([context.0.to_string()], |r| r.get(0))
         .optional()?;
     match row {
-        None => Err(Error::UnknownSession(session_id)),
+        None => Err(Error::UnknownContext(context)),
         Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
     }
 }

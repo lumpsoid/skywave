@@ -675,6 +675,7 @@ mod tests {
                 session_id,
                 at: Utc::now(),
                 command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
+                context: skywave_proto::ContextId::first_of(session_id),
                 kind,
             };
             seam.apply_events(&EventBatch {
@@ -682,6 +683,7 @@ mod tests {
                 events: vec![
                     event(EventKind::SessionCreated {
                         workdir: "/srv".into(),
+                        context_name: "start".into(),
                     }),
                     event(EventKind::ToolResult(ToolResult {
                         call: None,
@@ -786,6 +788,7 @@ mod tests {
                 session_id: self.session_id,
                 at: Utc::now(),
                 command_id: None,
+                context: skywave_proto::ContextId::first_of(self.session_id),
                 kind: EventKind::ToolResult(ToolResult {
                     call: None,
                     is_error: false,
@@ -932,6 +935,7 @@ mod tests {
                     session_id: f.session_id,
                     at: Utc::now(),
                     command_id: Some(skywave_proto::CommandId::new()),
+                    context: skywave_proto::ContextId::first_of(f.session_id),
                     kind: EventKind::SessionArchived {
                         archived: true,
                         by: DeviceId::new(),

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Effort,
-    EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId,
+    Effort, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion, Seq,
     SessionId, SessionState, ToolResult,
 };
 use skywaved::agent::AdapterEvent;
@@ -92,6 +92,7 @@ impl Fixture {
             DeviceId::new(),
             CommandKind::SendMessage {
                 session_id: self.session_id,
+                context: ContextId::first_of(self.session_id),
                 text: text.into(),
             },
         ))
@@ -307,7 +308,8 @@ async fn full_turn_through_commands() {
     );
     // The resume handle was stored for later restarts.
     assert_eq!(
-        skywaved::agent::load_resume_handle(&f.storage.db, f.session_id).unwrap(),
+        skywaved::agent::load_resume_handle(&f.storage.db, ContextId::first_of(f.session_id))
+            .unwrap(),
         Some(FakeAgent::resume_handle(f.session_id))
     );
     supervisor.shutdown().await.unwrap();
