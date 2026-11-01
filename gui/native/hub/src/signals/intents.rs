@@ -188,6 +188,12 @@ pub enum ActionIntent {
         session_id: String,
         context_id: String,
     },
+    /// Continue `context_id` (one the session lists as movable) as a new
+    /// session of its own; here it stays as it was.
+    MoveContext {
+        session_id: String,
+        context_id: String,
+    },
     /// Show only `context_id`'s part of the timeline; `None` shows the
     /// whole session. Messages still go to the current context.
     ViewContext {

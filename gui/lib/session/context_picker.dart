@@ -5,7 +5,10 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Lists the session's contexts. Switch makes one the context messages go
 /// to (not offered on the current one); View filters the timeline to it,
-/// and on the current one shows the whole session again.
+/// and on the current one shows the whole session again. Move continues one
+/// as a session of its own, after a confirm; a moved one offers Open on that
+/// session instead of Switch, and a move of this device's that is refused or
+/// untried offers Discard move.
 Future<void> pickContext(
   BuildContext context,
   SessionScreen screen,
@@ -34,6 +37,27 @@ Future<void> pickContext(
                     ),
                   );
                 },
+                onOpen: () {
+                  Navigator.of(context).pop();
+                  send.act(
+                    ActionIntentOpenSession(sessionId: c.movedToSessionId!),
+                  );
+                },
+                onMove: () async {
+                  final ok = await _confirmMove(context, c);
+                  if (ok != true || !context.mounted) return;
+                  Navigator.of(context).pop();
+                  send.act(
+                    ActionIntentMoveContext(
+                      sessionId: screen.sessionId,
+                      contextId: c.contextId,
+                    ),
+                  );
+                },
+                onDiscardMove: () {
+                  Navigator.of(context).pop();
+                  send.act(ActionIntentDiscard(commandId: c.discardMove!));
+                },
                 onView: () {
                   Navigator.of(context).pop();
                   send.act(
@@ -57,18 +81,44 @@ Future<void> pickContext(
   );
 }
 
+Future<bool?> _confirmMove(BuildContext context, ContextRow c) {
+  return showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: Text('Move ${c.label} to a new session?'),
+      content: const Text('It goes on there; here it stays as it was.'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Move'),
+        ),
+      ],
+    ),
+  );
+}
+
 class _ContextTile extends StatelessWidget {
   const _ContextTile({
     required this.context,
     required this.viewing,
     required this.onSwitch,
     required this.onView,
+    required this.onOpen,
+    required this.onMove,
+    required this.onDiscardMove,
   });
 
   final ContextRow context;
   final bool viewing;
   final VoidCallback onSwitch;
   final VoidCallback onView;
+  final VoidCallback onOpen;
+  final VoidCallback onMove;
+  final VoidCallback onDiscardMove;
 
   @override
   Widget build(BuildContext context) {
@@ -80,17 +130,13 @@ class _ContextTile extends StatelessWidget {
       selected: c.current,
       leading: Icon(c.current ? Icons.check_circle : Icons.circle_outlined),
       title: Text(c.label, maxLines: 2, overflow: TextOverflow.ellipsis),
-      subtitle: switch (c.outgoingLabel) {
-        final label? => Text(
-          label,
-          style: theme.textTheme.labelSmall?.copyWith(color: colors.warning),
-        ),
-        null => c.current ? const Text('current') : null,
-      },
+      subtitle: _subtitle(theme, colors),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (!c.current)
+          if (c.movedToSessionId != null)
+            TextButton(onPressed: onOpen, child: const Text('Open'))
+          else if (!c.current)
             TextButton(onPressed: onSwitch, child: const Text('Switch')),
           TextButton(
             onPressed: viewing ? null : onView,
@@ -98,6 +144,37 @@ class _ContextTile extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+
+  Widget? _subtitle(ThemeData theme, SkyColors colors) {
+    final c = context;
+    final warn = theme.textTheme.labelSmall?.copyWith(color: colors.warning);
+    final lines = <Widget>[
+      if (c.outgoingLabel case final label?) Text(label, style: warn),
+      if (c.movedLabel case final label?) Text(label),
+      if (c.outgoingLabel == null && c.movedLabel == null && c.current)
+        const Text('current'),
+    ];
+    final actions = <Widget>[
+      if (c.movedToSessionId == null)
+        Tooltip(
+          message: c.moveRefusal ?? '',
+          child: TextButton(
+            onPressed: c.canMove ? onMove : null,
+            child: const Text('Move to new session'),
+          ),
+        ),
+      if (c.discardMove != null)
+        TextButton(onPressed: onDiscardMove, child: const Text('Discard move')),
+    ];
+    if (lines.isEmpty && actions.isEmpty) return null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ...lines,
+        if (actions.isNotEmpty) Wrap(children: actions),
+      ],
     );
   }
 }

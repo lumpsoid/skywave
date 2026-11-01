@@ -428,6 +428,19 @@ pub fn context_moved_label(context: &ContextView) -> Option<String> {
     Some(format!("moved → {}", session_word(to)))
 }
 
+/// Why a picker does not move a row the core does not offer to move. The core
+/// says only yes or no, so a context the agent never answered in and one a
+/// message of this device is still on its way to share the general words.
+pub fn move_refusal(context: &ContextView) -> &'static str {
+    if context.moved_to.is_some() {
+        "already moved to another session"
+    } else if context.outgoing.is_some() {
+        "a move or message of yours to it is on its way"
+    } else {
+        "can't move yet: it needs an answered turn and no message of yours on its way"
+    }
+}
+
 /// A context as a picker row reads: its name, then its first prompt
 /// (`velvet walrus · fix the flaky test`), or the name alone while it has
 /// no message.
