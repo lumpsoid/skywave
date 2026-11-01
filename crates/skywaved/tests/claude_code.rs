@@ -2182,6 +2182,190 @@ async fn dropping_the_session_stops_the_agent() {
     assert!(!process_exists(pid), "agent process {pid} still exists");
 }
 
+/// The pid of the `sleep` an "orphan" message started, from ./child.txt.
+fn orphan_pid(workdir: &Path) -> u32 {
+    std::fs::read_to_string(workdir.join("child.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Whether process `pid` is gone within [`WAIT`]. A zombie counts as gone:
+/// it has died, and whoever it belongs to reaps it.
+fn gone(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        if stat.trim().is_empty() || stat.trim_start().starts_with('Z') {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[tokio::test]
+async fn a_clean_exit_kills_what_the_agent_left_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("orphan".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
+    let child = orphan_pid(tmp.path());
+    assert!(process_exists(child), "the agent's child {child} never ran");
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(gone(child), "the agent's child {child} outlived it");
+}
+
+#[tokio::test]
+async fn killing_the_agent_kills_what_it_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session
+        .send_message("orphan hang".to_owned())
+        .await
+        .unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    let (pid, child) = (fake_pid(tmp.path()), orphan_pid(tmp.path()));
+    // Abandoning the turn kills the agent, SIGTERM first.
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(
+        tmp.path().join("term.txt").exists(),
+        "no SIGTERM came first"
+    );
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    assert!(gone(child), "the agent's child {child} outlived it");
+}
+
+#[tokio::test]
+async fn what_ignores_sigterm_is_killed_after_the_term_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .with_term_grace(Duration::from_millis(300))
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session
+        .send_message("stubborn hang".to_owned())
+        .await
+        .unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    let child = orphan_pid(tmp.path());
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(
+        tmp.path().join("term.txt").exists(),
+        "no SIGTERM came first"
+    );
+    assert!(gone(child), "the agent's child {child} outlived it");
+}
+
+#[tokio::test]
+async fn an_agent_that_stops_reading_is_killed_and_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .with_write_timeout(Duration::from_millis(500))
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("deaf".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 2).await, [text("deaf"), COMPLETED]);
+    let pid = fake_pid(tmp.path());
+    // More than a pipe holds, to a process that no longer reads.
+    session.send_message("x".repeat(1 << 20)).await.unwrap();
+    assert_eq!(next(&mut events).await, AdapterEvent::TurnStarted);
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited {
+            error: Some("agent stopped reading its input; killed it".to_owned())
+        }
+    );
+    assert!(events.recv().await.is_none());
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    // A stop after the kill still returns.
+    session.shutdown().await.unwrap_or(());
+}
+
+#[tokio::test]
+async fn a_kill_reports_what_the_agent_says_as_it_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("run".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [write_call()]);
+    // Abandoned: on SIGTERM the CLI reports the call it killed, and no
+    // turn end.
+    session.shutdown().await.unwrap();
+    let event = next(&mut events).await;
+    let AdapterEvent::ToolResult { call, result } = &event else {
+        panic!("expected the killed call's result, got {event:?}");
+    };
+    assert_eq!(*call, Some(CALL.into()));
+    assert!(result.is_error);
+    assert_eq!(result.output, "Exit code 137");
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(events.recv().await.is_none());
+}
+
+/// The daemon crashing is the thread that started the agent ending with
+/// nothing stopping it: the agent gets SIGTERM.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_agent_dies_with_the_thread_that_started_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workdir = tmp.path().to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = runtime
+            .block_on(adapter().start(spec(&workdir, Conversation::Fresh)))
+            .unwrap();
+        // Leaked, so no drop stops the agent.
+        std::mem::forget(started);
+        std::mem::forget(runtime);
+    })
+    .join()
+    .unwrap();
+    let pid = fake_pid(tmp.path());
+    assert!(gone(pid), "agent process {pid} outlived its thread");
+    assert!(tmp.path().join("term.txt").exists(), "no SIGTERM came");
+}
+
 #[tokio::test]
 async fn a_session_starts_with_and_switches_its_mode_and_model() {
     let tmp = tempfile::tempdir().unwrap();

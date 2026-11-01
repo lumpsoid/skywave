@@ -37,6 +37,9 @@ tracing-subscriber.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 x509-parser.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
