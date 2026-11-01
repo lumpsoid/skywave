@@ -66,13 +66,13 @@ pub use store::{
 };
 pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
 pub use view::{
-    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
-    BlobState, BlobView, BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId,
-    Completion, CompletionStatus, ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef,
-    Draft, Effort, Entry, ErrorInfo, FailReason, Link, LinkRejection, ListKind, ModelChoice,
-    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession,
-    PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView,
-    TurnUsage, ViewState,
+    AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
+    Attention, BackgroundTask, BlobId, BlobState, BlobView, BodyFormat, BodyView, CallId,
+    Candidate, CandidateSource, CommandId, Completion, CompletionStatus, ContextId, ContextView,
+    Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, Link,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Screen, Seq, SessionId, SessionListView, SessionRef,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet, SnippetId, TaskId,
+    TaskKind, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
 };

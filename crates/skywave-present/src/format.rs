@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use skywave_core::{
-    AgentSetting, AgentView, BlobState, ContextView, Decision, Delivery, DeviceRef, Effort,
-    FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionRef,
-    SessionView,
+    AgentSetting, AgentView, AgentWork, BlobState, ContextView, Decision, Delivery, DeviceRef,
+    Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    SessionRef, SessionView,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -242,6 +242,73 @@ pub fn mode_needs_confirmation(mode: PermissionMode) -> bool {
     mode == PermissionMode::Bypass
 }
 
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The activity in `work`, for where the user looks for it (a menu
+/// subtitle, a picker title): `2 background tasks · 1 loop`. Ambient tasks
+/// are not activity and are not counted. A schedule is always a "loop".
+/// `None` when there is nothing to say.
+pub fn work_summary(work: &AgentWork) -> Option<String> {
+    let tasks = work.tasks.iter().filter(|task| !task.ambient).count();
+    let loops = work.schedules.len();
+    let parts: Vec<String> = [
+        (tasks > 0).then(|| count(tasks, "background task", "background tasks")),
+        (loops > 0).then(|| count(loops, "loop", "loops")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// What stopping the agent (Stop agent, clear, switch, move of the current
+/// context) does to `work`, for the confirmation: background tasks end,
+/// loops are paused and can come back with the next message; Skywave cannot
+/// end a loop, the agent can. A loop saved with the folder says so.
+/// `None` when [`stop_needs_confirmation`](crate::policy::stop_needs_confirmation)
+/// is false.
+pub fn stop_warning(work: &AgentWork) -> Option<String> {
+    if !crate::policy::stop_needs_confirmation(work) {
+        return None;
+    }
+    let tasks = work.tasks.iter().filter(|task| !task.ambient).count();
+    let loops = work.schedules.len();
+    let mut effects = Vec::new();
+    if tasks > 0 {
+        effects.push(format!(
+            "ends {}",
+            count(tasks, "background task", "background tasks")
+        ));
+    }
+    if loops > 0 {
+        effects.push(format!("pauses {}", count(loops, "loop", "loops")));
+    }
+    let mut text = format!("Stopping {}.", effects.join(" and "));
+    if loops > 0 {
+        text.push_str(
+            " A paused loop can come back with your next message; to end it, ask the agent.",
+        );
+    }
+    let durable = work
+        .schedules
+        .iter()
+        .filter(|s| s.outlives_agent == Some(true))
+        .count();
+    if durable > 0 {
+        let (noun, verb) = if durable == 1 {
+            ("loop", "is")
+        } else {
+            ("loops", "are")
+        };
+        text.push_str(&format!(
+            " {durable} {noun} {verb} saved in this folder and can fire in a later agent."
+        ));
+    }
+    Some(text)
+}
+
 /// The mode for a status line: the one in effect, `→` a switch not yet
 /// answered (`ask → plan`), `unknown` while the agent has not said
 /// (`unknown → plan`).
@@ -472,9 +539,97 @@ pub fn viewing_hint(view: &SessionView) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use skywave_core::{ModelChoice, Refusal, SettingChange};
+    use skywave_core::{
+        BackgroundTask, ModelChoice, Refusal, Schedule, ScheduleId, SettingChange, TaskId, TaskKind,
+    };
 
     use super::*;
+
+    fn task(ambient: bool) -> BackgroundTask {
+        BackgroundTask {
+            id: TaskId("t".into()),
+            kind: TaskKind::Shell,
+            title: "t".into(),
+            parent: None,
+            ambient,
+        }
+    }
+
+    fn schedule(outlives_agent: Option<bool>) -> Schedule {
+        Schedule {
+            id: ScheduleId("s".into()),
+            when: "*/5 * * * *".into(),
+            recurring: true,
+            prompt: "check".into(),
+            outlives_agent,
+        }
+    }
+
+    fn work(tasks: Vec<BackgroundTask>, schedules: Vec<Schedule>) -> AgentWork {
+        AgentWork { tasks, schedules }
+    }
+
+    #[test]
+    fn the_work_summary_counts_activity_only() {
+        assert_eq!(work_summary(&work(vec![], vec![])), None);
+        assert_eq!(work_summary(&work(vec![task(true)], vec![])), None);
+        assert_eq!(
+            work_summary(&work(vec![task(false)], vec![])).as_deref(),
+            Some("1 background task")
+        );
+        assert_eq!(
+            work_summary(&work(
+                vec![task(false), task(false), task(true)],
+                vec![schedule(None)]
+            ))
+            .as_deref(),
+            Some("2 background tasks · 1 loop")
+        );
+        assert_eq!(
+            work_summary(&work(vec![], vec![schedule(None), schedule(None)])).as_deref(),
+            Some("2 loops")
+        );
+    }
+
+    #[test]
+    fn the_stop_warning_pauses_loops_and_never_ends_them() {
+        assert_eq!(stop_warning(&work(vec![], vec![])), None);
+        assert_eq!(stop_warning(&work(vec![task(true)], vec![])), None);
+        assert_eq!(
+            stop_warning(&work(vec![task(false)], vec![])).as_deref(),
+            Some("Stopping ends 1 background task.")
+        );
+        let both = stop_warning(&work(
+            vec![task(false), task(false)],
+            vec![schedule(Some(false))],
+        ))
+        .unwrap();
+        assert!(both.starts_with("Stopping ends 2 background tasks and pauses 1 loop."));
+        assert!(both.contains("to end it, ask the agent"));
+        assert!(!both.contains("saved in this folder"));
+        for text in [
+            both,
+            stop_warning(&work(vec![], vec![schedule(None), schedule(None)])).unwrap(),
+        ] {
+            assert!(text.contains("pauses"));
+            assert!(!text.contains("ends 1 loop") && !text.contains("ends 2 loops"));
+            assert!(!text.contains("and ends"));
+        }
+    }
+
+    #[test]
+    fn the_stop_warning_names_durable_loops_only_when_there_are_some() {
+        let one = stop_warning(&work(vec![], vec![schedule(Some(true)), schedule(None)])).unwrap();
+        assert!(one.contains("1 loop is saved in this folder and can fire in a later agent."));
+        let two = stop_warning(&work(
+            vec![],
+            vec![schedule(Some(true)), schedule(Some(true))],
+        ))
+        .unwrap();
+        assert!(two.contains("2 loops are saved in this folder"));
+        let none = stop_warning(&work(vec![], vec![schedule(None)])).unwrap();
+        assert!(!none.contains("saved in this folder"));
+    }
 
     #[test]
     fn agent_settings_read_as_current_then_switch() {
@@ -735,6 +890,8 @@ mod tests {
             agent: AgentView::default(),
             interrupt: None,
             stop: None,
+            work: Default::default(),
+            task_stops: Vec::new(),
             draft: None,
             draft_rev: 0,
             last_seq: skywave_core::Seq(1),

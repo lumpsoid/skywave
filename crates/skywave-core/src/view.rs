@@ -13,9 +13,9 @@ use skywave_proto::Fingerprint;
 use uuid::Uuid;
 
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, ContextId, Decision, DeviceId, Effort,
-    ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
-    ToolKind, TurnUsage,
+    AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, CommandId, ContextId,
+    Decision, DeviceId, Effort, ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 
 pub use crate::projection::SessionUsage;
@@ -485,6 +485,18 @@ pub struct SessionView {
     /// This device's latest stop of the session, until its effect is in the
     /// replica.
     pub stop: Option<Outgoing>,
+    /// What the agent runs outside a turn and has scheduled, as it reported
+    /// it last. Shown where the user looks for it, never as an always-on
+    /// indicator.
+    pub work: AgentWork,
+    /// This device's stops of a background task still on their way: each
+    /// task named by a [`Action::StopTask`](crate::Action::StopTask) of
+    /// this device, with the newest such command's progress. Gone once the
+    /// task leaves [`work`](Self::work) or a refusal answering the command
+    /// is in the log. A stop the server rejected (e.g. the task had ended)
+    /// shows as failed while its task is still listed. Accepted is not
+    /// done: the agent may yet fail to stop the task.
+    pub task_stops: Vec<(TaskId, Outgoing)>,
     /// This device's unsent message, as last saved.
     pub draft: Option<Draft>,
     /// Changes when the core itself rewrites a draft (e.g.
@@ -1062,6 +1074,8 @@ mod tests {
             switch: None,
             interrupt: None,
             stop: None,
+            work: AgentWork::default(),
+            task_stops: Vec::new(),
             draft: None,
             draft_rev: 0,
             last_seq: Seq(6),
