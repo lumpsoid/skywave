@@ -882,6 +882,35 @@ waiting on stays pending.
   stderr into the daemon log.
 - **No CLI timeout while idle [C].** In the interrupt run the process sat idle
   for about 240 s between turns with no output, and then served the next turn.
+- **Signals [C].** Probed 2026-11-01 on 2.1.310 with skywaved's default argv
+  (§1 flags, `--session-id`, no `agent.args`) and its `initialize`; the
+  signal went to the CLI's process group, then the session was resumed.
+  Not kept as fixtures: the runs carry a real user's settings and hooks.
+  - **Bash commands run outside the CLI's process group.** Every Bash
+    command, foreground or `run_in_background`, runs under a shell that is
+    its own session leader (`pgid = sid = ` its pid). A signal to the CLI's
+    group never reaches it.
+  - **SIGTERM: the CLI cleans up and exits** with 143 within about 0.6 s in
+    every case. A running foreground command is killed and reported:
+    `task_notification` (`stopped`), then the call's `tool_result`
+    `"Exit code 137"` (`is_error`), which the CLI also keeps in its
+    conversation. A background task is killed: `task_notification`
+    (`stopped`), `task_updated` (`killed`), `background_tasks_changed` with
+    `[]`. No `result` comes, and nothing else.
+  - **SIGKILL: the CLI's commands keep running**, reparented away from it:
+    foreground and background alike. The conversation ends at the
+    `tool_use` with no result. On resume the CLI reports the background
+    task as `task_notification` `stopped` ("Background shell command didn't
+    finish before the previous session ended") while it in fact still runs.
+  - **A text answer cut off** (signal while it is generated, before its
+    `assistant` line): either signal, nothing more is printed and nothing
+    of the answer is kept. A `thinking` block already printed is not kept
+    either. On resume the CLI answers the unanswered message with the
+    placeholder `No response requested.`; the model sees no answer.
+  - **A pending approval** (`can_use_tool` unanswered) on SIGTERM: nothing
+    is printed, the tool does not run, and the conversation ends at the
+    `tool_use`; on resume the CLI adds an interruption marker as its
+    result.
 
 ## 6a. How T09 implements it
 
@@ -919,6 +948,21 @@ notes above:
   control_response so the CLI does not wait on them.
 - The deny message is `The user denied this action.`; the version check
   warns when `claude_code_version` is not `2.1.310`.
+- **Killing is SIGTERM, then SIGKILL.** Each CLI leads its own process
+  group; a kill sends SIGTERM to the group, then SIGKILL to whatever is
+  left after 5 s (the term grace). The SIGTERM is what stops the CLI's
+  Bash commands (§6, Signals): they are out of the group's reach, so a CLI
+  that outlives the grace leaves them running. The group still takes
+  children that stay in it. On Linux the CLI gets `PR_SET_PDEATHSIG`
+  SIGTERM, so a crashed daemon's CLI stops its commands and exits too.
+- **A kill reads stdout until it ends** (bounded by the term grace) and
+  reports what comes, so the log gets the killed call's `tool_result` and
+  the stopped tasks, as the CLI's conversation does. The CLI reports no
+  `result` and cancels no approval on SIGTERM, so an abandoned turn and
+  its approvals stay open for the next start to settle. stdin is closed
+  after the signal, so the CLI handles the signal rather than an EOF.
+- **A write the CLI does not read within 30 s** kills it, reported as
+  `Exited { error }`: a wedged CLI cannot hold up its session's driver.
 
 ## 6b. Tool displays (Tc)
 

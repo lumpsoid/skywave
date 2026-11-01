@@ -42,13 +42,27 @@
 //!
 //! **Shutdown.** [`AgentSession::shutdown`] with a turn that was interrupted
 //! waits up to the grace period for its `result`. A turn still running
-//! without an interrupt is abandoned: the process is killed at once, so the
-//! CLI cancels nothing and reports nothing more (closing stdin would not stop
-//! the turn, and interrupting it would cancel its approvals). Otherwise
-//! shutdown closes stdin and waits up to the grace period for the process to
-//! exit before killing it. The event stream ends with `Exited`.
+//! without an interrupt is abandoned: the process is killed at once, without
+//! an interrupt (closing stdin would not stop the turn, and interrupting it
+//! would cancel its approvals). Otherwise shutdown closes stdin and waits up
+//! to the grace period for the process to exit before killing it. The event
+//! stream ends with `Exited`.
+//!
+//! **Killing.** A kill is SIGTERM to the CLI's process group, then SIGKILL
+//! for whatever is left after the term grace ([`group`]). The SIGTERM is
+//! what stops the CLI's tools: it runs each Bash command in a session of
+//! its own, out of the group's reach, and on SIGTERM kills its running
+//! command and background tasks and reports them before it exits
+//! (docs/agents/claude-code.md §6). A kill on request reads and reports
+//! stdout until it ends, so the log gets those reports, which the CLI also
+//! keeps in its conversation. On SIGTERM the CLI reports no turn end and
+//! cancels no approvals, so an abandoned turn and its approvals stay open.
+//! A CLI that stops reading stdin for the write timeout is killed and
+//! reported as an `Exited` error, so a wedged process cannot block its
+//! session.
 
 pub mod display;
+mod group;
 pub mod protocol;
 pub mod rules;
 pub mod usage;
@@ -64,10 +78,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::Instrument;
 use uuid::Uuid;
 
+use self::group::Group;
 use self::protocol::{Output, Protocol};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
@@ -91,11 +106,18 @@ pub const REQUIRED_ARGS: [&str; 8] = [
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// How long start waits for the initialize handshake.
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a write may wait for the CLI to read its stdin before the
+/// process counts as wedged and is killed.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a killed process group gets between SIGTERM and SIGKILL.
+pub const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(5);
 
 /// Capacity of a session's event channel.
 const EVENT_CAPACITY: usize = 256;
 /// How long to wait for the rest of stderr once the process has exited.
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
+/// How often a terminated group is checked for what is left in it.
+const GROUP_POLL: Duration = Duration::from_millis(50);
 /// What the CLI says when `--resume` names a session it does not have, with
 /// or without `--fork-session` (docs/agents/claude-code.md §5).
 const UNKNOWN_SESSION: &str = "No conversation found";
@@ -106,6 +128,8 @@ pub struct ClaudeCodeAdapter {
     config: AgentConfig,
     grace_period: Duration,
     startup_timeout: Duration,
+    write_timeout: Duration,
+    term_grace: Duration,
 }
 
 impl ClaudeCodeAdapter {
@@ -114,6 +138,8 @@ impl ClaudeCodeAdapter {
             config,
             grace_period: DEFAULT_GRACE_PERIOD,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            term_grace: DEFAULT_TERM_GRACE,
         }
     }
 
@@ -126,6 +152,19 @@ impl ClaudeCodeAdapter {
     /// Sets how long start waits for the initialize handshake.
     pub fn with_startup_timeout(mut self, startup_timeout: Duration) -> ClaudeCodeAdapter {
         self.startup_timeout = startup_timeout;
+        self
+    }
+
+    /// Sets how long a write waits for the CLI to read before killing it.
+    pub fn with_write_timeout(mut self, write_timeout: Duration) -> ClaudeCodeAdapter {
+        self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Sets how long a killed process group gets between SIGTERM and
+    /// SIGKILL.
+    pub fn with_term_grace(mut self, term_grace: Duration) -> ClaudeCodeAdapter {
+        self.term_grace = term_grace;
         self
     }
 
@@ -146,21 +185,22 @@ impl ClaudeCodeAdapter {
         session: CliSession,
         session_rules: &[Value],
     ) -> Result<Child, AgentError> {
-        Command::new(&self.config.command)
+        let mut command = Command::new(&self.config.command);
+        command
             .args(self.command_args(session, session_rules))
             .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                AgentError::Start(format!(
-                    "cannot run {} in {}: {e}",
-                    self.config.command.display(),
-                    workdir.display()
-                ))
-            })
+            .kill_on_drop(true);
+        group::isolate(&mut command);
+        command.spawn().map_err(|e| {
+            AgentError::Start(format!(
+                "cannot run {} in {}: {e}",
+                self.config.command.display(),
+                workdir.display()
+            ))
+        })
     }
 }
 
@@ -237,7 +277,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         };
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
         let child = self.spawn(&spec.workdir, session, &session_rules)?;
-        let mut process = Process::new(child, &span)?;
+        let mut process = Process::new(child, &span, self.write_timeout, self.term_grace)?;
         let mut protocol =
             Protocol::new(session.id(), session.handle_stored()).with_session_rules(session_rules);
 
@@ -413,6 +453,9 @@ enum Request {
 
 /// The CLI process and its pipes.
 struct Process {
+    // Dropped before `child`, so the group is killed while the CLI that
+    // leads it is not yet reaped.
+    group: Group,
     child: Child,
     /// `None` once closed.
     stdin: Option<ChildStdin>,
@@ -420,10 +463,21 @@ struct Process {
     stderr_task: Option<JoinHandle<()>>,
     /// The last non-blank stderr line.
     stderr_tail: Arc<Mutex<Option<String>>>,
+    write_timeout: Duration,
+    term_grace: Duration,
+    /// When the group was sent SIGTERM.
+    terminated: Option<Instant>,
+    /// The process was killed for not reading its stdin.
+    wedged: bool,
 }
 
 impl Process {
-    fn new(mut child: Child, span: &tracing::Span) -> Result<Process, AgentError> {
+    fn new(
+        mut child: Child,
+        span: &tracing::Span,
+        write_timeout: Duration,
+        term_grace: Duration,
+    ) -> Result<Process, AgentError> {
         let missing = || AgentError::Start("agent pipes not available".to_owned());
         let stdin = child.stdin.take().ok_or_else(missing)?;
         let stdout = child.stdout.take().ok_or_else(missing)?;
@@ -432,19 +486,42 @@ impl Process {
         let stderr_task =
             tokio::spawn(read_stderr(stderr, Arc::clone(&stderr_tail)).instrument(span.clone()));
         Ok(Process {
+            group: Group::of(&child),
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
             stderr_task: Some(stderr_task),
             stderr_tail,
+            write_timeout,
+            term_grace,
+            terminated: None,
+            wedged: false,
         })
     }
 
-    /// Writes `lines` to stdin, one JSON object per line.
+    /// Writes `lines` to stdin, one JSON object per line. A process that
+    /// does not take them within the write timeout is killed: half a line
+    /// may have gone out, and a wedged process would hold up its session.
     async fn write(&mut self, lines: &[Value]) -> std::io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
+        let write_timeout = self.write_timeout;
+        match timeout(write_timeout, self.write_lines(lines)).await {
+            Ok(written) => written,
+            Err(_) => {
+                tracing::warn!("agent did not read its input within {write_timeout:?}; killing it");
+                self.wedged = true;
+                self.kill().await;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "agent stopped reading its input",
+                ))
+            }
+        }
+    }
+
+    async fn write_lines(&mut self, lines: &[Value]) -> std::io::Result<()> {
         let stdin = self
             .stdin
             .as_mut()
@@ -457,16 +534,49 @@ impl Process {
         stdin.flush().await
     }
 
-    /// Waits for the process to exit; `None` if waiting failed.
+    /// Waits for the process to exit, then kills what it left in its group;
+    /// `None` if waiting failed.
     async fn wait_exit(&mut self) -> Option<std::process::ExitStatus> {
         self.stdin = None;
-        self.child.wait().await.ok()
+        let status = self.child.wait().await.ok();
+        self.kill().await;
+        status
     }
 
-    /// Kills the process and reaps it.
-    async fn kill(&mut self) {
+    /// SIGTERMs the group, the CLI included, once, then closes stdin: the
+    /// CLI handles the signal, not an EOF.
+    fn terminate(&mut self) {
+        if self.terminated.is_none() && self.group.terminate() {
+            self.terminated = Some(Instant::now());
+        }
         self.stdin = None;
-        if let Err(e) = self.child.kill().await {
+    }
+
+    /// When whatever is left of a terminated group gets SIGKILL; now if
+    /// it was not terminated (groups are not used).
+    fn kill_deadline(&self) -> Instant {
+        self.terminated
+            .map_or_else(Instant::now, |at| at + self.term_grace)
+    }
+
+    /// Kills the process with its group and reaps it: SIGTERM unless sent
+    /// already, then SIGKILL for whatever is left at the term grace's end.
+    /// The CLI is reaped if it exits in time; until then its group id
+    /// cannot be reused.
+    async fn kill(&mut self) {
+        self.terminate();
+        let _ = timeout_at(self.kill_deadline(), async {
+            let _ = self.child.wait().await;
+            while !self.group.is_empty() {
+                tokio::time::sleep(GROUP_POLL).await;
+            }
+        })
+        .await;
+        self.group.kill();
+        // Still running where groups are not used.
+        if let Ok(None) = self.child.try_wait()
+            && let Err(e) = self.child.kill().await
+        {
             tracing::debug!("cannot kill the agent: {e}");
         }
         self.drain_stderr().await;
@@ -490,6 +600,9 @@ impl Process {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        if self.wedged {
+            return "agent stopped reading its input; killed it".to_owned();
+        }
         protocol
             .exit_error()
             .map(str::to_owned)
@@ -604,7 +717,7 @@ impl Driver {
             // Abandoned: no interrupt, so the CLI cancels nothing and the
             // turn and its approvals stay open in the log.
             tracing::info!("abandoning the running turn; killing the agent");
-            self.process.kill().await;
+            self.kill().await;
             return None;
         }
         if self.protocol.turn_open() {
@@ -622,11 +735,19 @@ impl Driver {
         .await;
         if exited.is_err() {
             tracing::warn!("agent did not exit within {grace_period:?}; killing it");
-            self.process.kill().await;
+            self.kill().await;
         } else {
             self.process.drain_stderr().await;
         }
         None
+    }
+
+    /// Kills the process, reporting what it says until its stdout ends: on
+    /// SIGTERM the CLI reports the tools and tasks it stops.
+    async fn kill(&mut self) {
+        self.process.terminate();
+        let _ = timeout_at(self.process.kill_deadline(), self.pump(false)).await;
+        self.process.kill().await;
     }
 
     /// Reads and reports stdout until it ends or, with `until_idle`, until
