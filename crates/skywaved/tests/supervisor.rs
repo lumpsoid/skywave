@@ -8,15 +8,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
+use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId,
-    Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
-    Seq, SessionId, SessionState, ToolResult,
+    AgentWork, ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision,
+    DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
-    FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, REFUSE_REASON, Step,
+    FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, REFUSE_REASON,
+    Step, task,
 };
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
@@ -820,7 +822,10 @@ async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
     let mut f = Fixture::new();
     let tick = Gate::new();
     let agent = FakeAgent::new(FakeScript::new().turn([
-        Step::wake(Duration::from_millis(50), [Step::Wait(tick.clone()), Step::text("tick")]),
+        Step::wake(
+            Duration::from_millis(50),
+            [Step::Wait(tick.clone()), Step::text("tick")],
+        ),
         Step::text("scheduled"),
     ]));
     let config = SupervisorConfig { idle_timeout: IDLE };
@@ -844,11 +849,251 @@ async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
     supervisor.shutdown().await.unwrap();
     let kinds = f.kinds();
     assert!(!kinds.iter().any(is_errored), "log: {kinds:#?}");
-    assert!(kinds.contains(&EventKind::AgentMessage { text: "tick".into() }));
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        text: "tick".into()
+    }));
     assert_eq!(
         agent.inputs(f.session_id),
         [f.started(false), message("loop"), FakeInput::Shutdown]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks keep the agent
+
+/// The idle timeout of the background-task tests: long enough to tell a
+/// stop at the deadline from none.
+const TASK_IDLE: Duration = Duration::from_millis(600);
+
+fn tasks_changed(f: &Fixture) -> Vec<EventKind> {
+    f.kinds()
+        .into_iter()
+        .filter(|k| matches!(k, EventKind::BackgroundTasksChanged { .. }))
+        .collect()
+}
+
+fn no_tasks() -> EventKind {
+    EventKind::BackgroundTasksChanged { tasks: Vec::new() }
+}
+
+fn assert_running(agent: &FakeAgent, f: &Fixture, why: &str) {
+    assert!(
+        !agent.inputs(f.session_id).contains(&FakeInput::Shutdown),
+        "agent stopped {why}; log: {:#?}",
+        f.kinds()
+    );
+}
+
+/// A background job the agent reports at the end of its turn keeps it past
+/// the idle timeout, and the timeout counts from when the job ends.
+/// `ambient_tasks_do_not_keep_the_agent` is the same script with an ambient
+/// task, stopped at the deadline.
+#[tokio::test]
+async fn a_live_background_task_keeps_the_agent_until_it_ends() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::tasks([task("job", false)]),
+        Step::later(
+            TASK_IDLE * 5 / 2,
+            [AdapterEvent::BackgroundTasks(Vec::new())],
+        ),
+    ]));
+    let config = SupervisorConfig {
+        idle_timeout: TASK_IDLE,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("run it in the background");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    tokio::time::sleep(TASK_IDLE * 3 / 2).await;
+    assert_running(&agent, &f, "with a task live");
+
+    f.wait_for("the job's end", |k| k.last() == Some(&no_tasks()))
+        .await;
+    // The clock starts now, not at the turn's end long ago.
+    tokio::time::sleep(TASK_IDLE / 2).await;
+    assert_running(&agent, &f, "right as its task ended");
+    wait_for_shutdowns(&agent, &f, 1).await;
+    supervisor.shutdown().await.unwrap();
+
+    assert!(!f.kinds().iter().any(is_errored), "log: {:#?}", f.kinds());
+    assert_eq!(tasks_changed(&f).len(), 2, "log: {:#?}", f.kinds());
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("run it in the background"),
+            FakeInput::Shutdown
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ambient_tasks_do_not_keep_the_agent() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::tasks([task("watch", true)]),
+        Step::later(
+            TASK_IDLE * 5 / 2,
+            [AdapterEvent::BackgroundTasks(Vec::new())],
+        ),
+    ]));
+    let config = SupervisorConfig {
+        idle_timeout: TASK_IDLE,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("watch it");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    let idle = tokio::time::Instant::now();
+    wait_for_shutdowns(&agent, &f, 1).await;
+    // Stopped at the deadline, long before the task's end was due.
+    assert!(idle.elapsed() < TASK_IDLE * 2, "{:?}", idle.elapsed());
+    supervisor.shutdown().await.unwrap();
+    // Its exit ended the ambient task in the log.
+    assert_eq!(tasks_changed(&f).last(), Some(&no_tasks()));
+}
+
+/// An idle agent reporting again that it runs nothing keeps its deadline:
+/// the clock started at the turn's end is not restarted.
+#[tokio::test]
+async fn a_repeated_report_of_no_tasks_does_not_push_the_deadline_back() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::later(
+        TASK_IDLE * 2 / 3,
+        [AdapterEvent::BackgroundTasks(Vec::new())],
+    )]));
+    let config = SupervisorConfig {
+        idle_timeout: TASK_IDLE,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("nothing to run");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    let idle = tokio::time::Instant::now();
+    wait_for_shutdowns(&agent, &f, 1).await;
+    // A restarted clock would stop it at 5/3 of the timeout.
+    assert!(idle.elapsed() < TASK_IDLE * 3 / 2, "{:?}", idle.elapsed());
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The log keeps the first `TASKS_MAX` tasks; one past them is still
+/// counted. Here the ones the log keeps are all ambient.
+#[tokio::test]
+async fn a_busy_task_past_the_log_cap_still_keeps_the_agent() {
+    let mut f = Fixture::new();
+    let mut tasks: Vec<_> = (0..TASKS_MAX)
+        .map(|i| task(&format!("watch-{i}"), true))
+        .collect();
+    tasks.push(task("job", false));
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::tasks(tasks)]));
+    let config = SupervisorConfig {
+        idle_timeout: TASK_IDLE,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("run them");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    let work = f.log.agent_work(&f.storage.db, f.session_id).unwrap();
+    assert_eq!(work.tasks.len(), TASKS_MAX);
+    assert!(work.tasks.iter().all(|t| t.ambient));
+    tokio::time::sleep(TASK_IDLE * 3 / 2).await;
+    assert_running(&agent, &f, "with a task past the cap live");
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Tasks and schedules left in the log by a daemon that stopped are ended
+/// on the next start, in the context of the agent that reported them.
+#[tokio::test]
+async fn a_daemon_restart_ends_the_work_its_agent_left() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::tasks([task("job", false)])]));
+    let supervisor = f.start(&agent).await;
+    f.send("run it");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    // While the daemon is down: a schedule of the same agent, then a clear.
+    let schedule = Schedule {
+        id: ScheduleId("s1".into()),
+        when: "*/5 * * * *".into(),
+        recurring: true,
+        prompt: "check the build".into(),
+        outlives_agent: Some(false),
+    };
+    f.log
+        .append(
+            &mut f.storage.db,
+            f.session_id,
+            a,
+            EventKind::SchedulesChanged {
+                schedules: vec![schedule],
+            },
+        )
+        .unwrap();
+    let marker = f.clear(b);
+    let work = f.log.agent_work(&f.storage.db, f.session_id).unwrap();
+    assert_eq!((work.tasks.len(), work.schedules.len()), (1, 1));
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    assert_eq!(
+        f.stamped_after(marker),
+        [
+            (no_tasks(), a),
+            (
+                EventKind::SchedulesChanged {
+                    schedules: Vec::new()
+                },
+                a
+            ),
+        ]
+    );
+    assert_eq!(
+        f.log.agent_work(&f.storage.db, f.session_id).unwrap(),
+        AgentWork::default()
+    );
+    supervisor.shutdown().await.unwrap();
+
+    // Settled once: a second restart finds nothing to end.
+    f.reopen_log();
+    let head = f.log.head();
+    let supervisor = f.start(&agent).await;
+    assert_eq!(f.stamped_after(head), []);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Stopping the agent ends its tasks; the next start reports none and logs
+/// nothing for it.
+#[tokio::test]
+async fn a_stop_ends_the_live_tasks_and_the_next_start_has_none() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([Step::tasks([task("job", false)])])
+            .turn([Step::tasks([]), Step::text("fresh")]),
+    );
+    let supervisor = f.start(&agent).await;
+    f.send("run it");
+    f.wait_count("the turn's end", 1, is_idle).await;
+
+    // The seq of `SessionStopped`; what follows is the agent's exit.
+    let stop = accepted(f.stop());
+    f.wait_for("the tasks' end", |k| k.last() == Some(&no_tasks()))
+        .await;
+    assert_eq!(f.stamped_after(stop), [(no_tasks(), f.first())]);
+
+    f.send("again");
+    f.wait_count("second idle", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert!(f.kinds().contains(&EventKind::AgentMessage {
+        text: "fresh".into()
+    }));
+    // The set, its end at the stop, and nothing for the empty report.
+    assert_eq!(tasks_changed(&f).len(), 2, "log: {:#?}", f.kinds());
+    assert_eq!(tasks_changed(&f).last(), Some(&no_tasks()));
 }
 
 #[tokio::test]

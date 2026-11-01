@@ -15,7 +15,12 @@
 //! [`Step::Wake`] schedules a turn the agent starts on its own, with no
 //! message, like a CLI's scheduled wakeup: it runs once the session is idle
 //! and its time has come, before any queued message, and is lost with the
-//! session.
+//! session. [`Step::Later`] is the same without a turn: its events are
+//! emitted between turns, like a CLI reporting that a background job
+//! ended. A `Later` and a `Wake` due at the same time play in script order,
+//! so `[Step::later(t, [no tasks]), Step::wake(t, ..)]` is a task that ends
+//! and the turn the agent starts to report it. [`task`] makes an
+//! [`AgentTask`] for [`Step::tasks`].
 //!
 //! An interrupt is seen while blocked, or between two steps; the rest of the
 //! turn is dropped, a pending approval is reported `ApprovalCancelled`, and
@@ -80,15 +85,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use skywave_proto::{ContextId, Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId, TaskKind};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, Conversation, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay,
-    ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSession, AgentTask, Conversation, Effort, Grants, ModelChoice, PermissionMode,
+    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -204,6 +209,24 @@ pub enum Step {
     /// Emits nothing; `after` from now the agent starts a turn of `steps`
     /// on its own, with no message, like a scheduled wakeup.
     Wake { after: Duration, steps: Vec<Step> },
+    /// Emits nothing; `after` from now, once the agent is idle, it emits
+    /// `events` outside any turn, like a background job ending.
+    Later {
+        after: Duration,
+        events: Vec<AdapterEvent>,
+    },
+}
+
+/// A shell task `id` for [`Step::tasks`]; `ambient` for one that is not
+/// activity.
+pub fn task(id: &str, ambient: bool) -> AgentTask {
+    AgentTask {
+        id: id.to_owned(),
+        kind: TaskKind::Shell,
+        title: format!("task {id}"),
+        parent: None,
+        ambient,
+    }
 }
 
 impl Step {
@@ -261,6 +284,20 @@ impl Step {
             after,
             steps: steps.into_iter().collect(),
         }
+    }
+
+    /// Emits events the agent reports `after` from now, outside any turn
+    /// ([`Step::Later`]).
+    pub fn later(after: Duration, events: impl IntoIterator<Item = AdapterEvent>) -> Step {
+        Step::Later {
+            after,
+            events: events.into_iter().collect(),
+        }
+    }
+
+    /// Reports `tasks` as the agent's whole set of background tasks.
+    pub fn tasks(tasks: impl IntoIterator<Item = AgentTask>) -> Step {
+        Step::Emit(AdapterEvent::BackgroundTasks(tasks.into_iter().collect()))
     }
 
     /// Reports `grants` as the session's whole set of grants.
@@ -633,14 +670,34 @@ struct Runner {
     events: mpsc::Sender<AdapterEvent>,
     /// Messages received during a turn, each starting a later turn.
     queued: VecDeque<String>,
-    /// Turns scheduled by [`Step::Wake`], with when each is due.
-    wakeups: Vec<(Instant, Vec<Step>)>,
+    /// What [`Step::Wake`] and [`Step::Later`] scheduled, with when each
+    /// is due.
+    wakeups: Vec<(Instant, Wakeup)>,
+}
+
+/// Something the agent does on its own once idle.
+enum Wakeup {
+    /// A turn of these steps ([`Step::Wake`]).
+    Turn(Vec<Step>),
+    /// These events, outside a turn ([`Step::Later`]).
+    Report(Vec<AdapterEvent>),
 }
 
 impl Runner {
     async fn run(mut self) {
         let error = loop {
-            if let Some(steps) = self.take_due_wakeup() {
+            if let Some(wakeup) = self.take_due_wakeup() {
+                let steps = match wakeup {
+                    Wakeup::Turn(steps) => steps,
+                    Wakeup::Report(events) => {
+                        for event in events {
+                            if !self.emit(event).await {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                };
                 if !self.emit(AdapterEvent::TurnStarted).await {
                     return;
                 }
@@ -708,8 +765,9 @@ impl Runner {
         self.emit(AdapterEvent::Exited { error }).await;
     }
 
-    /// Steps of the earliest wakeup that is due, if one is.
-    fn take_due_wakeup(&mut self) -> Option<Vec<Step>> {
+    /// The earliest wakeup that is due, if one is; of those due at once,
+    /// the first scheduled.
+    fn take_due_wakeup(&mut self) -> Option<Wakeup> {
         let now = Instant::now();
         let (index, _) = self
             .wakeups
@@ -795,7 +853,14 @@ impl Runner {
                 }
                 Step::Fail(message) => return Flow::Ended(TurnOutcome::Failed(message)),
                 Step::Exit(error) => return Flow::Exit(error),
-                Step::Wake { after, steps } => self.wakeups.push((Instant::now() + after, steps)),
+                Step::Wake { after, steps } => {
+                    self.wakeups
+                        .push((Instant::now() + after, Wakeup::Turn(steps)));
+                }
+                Step::Later { after, events } => {
+                    self.wakeups
+                        .push((Instant::now() + after, Wakeup::Report(events)));
+                }
             }
         }
         Flow::Ended(TurnOutcome::Completed)
