@@ -1868,6 +1868,10 @@ impl Model {
                     }
                 }
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
+                // Folded into the session summary; nothing in the timeline.
+                EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
+                    None
+                }
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {

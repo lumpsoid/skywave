@@ -58,7 +58,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// with its `EventKind::ContextMoved`, the [`ContextRef`] a moved context
 /// went on from in `EventKind::SessionCreated::from`, and
 /// `RejectReason::{ContextMoved, ContextCurrent, NoConversation}`.
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// v11: background work. `EventKind::BackgroundTasksChanged` and
+/// `EventKind::SchedulesChanged`, each the whole set of the agent's
+/// [`BackgroundTask`]s or [`Schedule`]s, folded into [`AgentWork`].
+pub const PROTOCOL_VERSION: u32 = 11;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -362,6 +366,18 @@ pub enum EventKind {
         reason: String,
         answers: Option<CommandId>,
     },
+    /// The agent's live background tasks after a change, in the agent's
+    /// order: the whole set, replacing the last one logged (see
+    /// [`AgentWork::apply`]). At most [`limits::TASKS_MAX`]. Not notable.
+    BackgroundTasksChanged {
+        tasks: Vec<BackgroundTask>,
+    },
+    /// The agent's scheduled wakeups as it last reported them: the whole
+    /// set, replacing the last one logged. Best effort and information
+    /// only; at most [`limits::SCHEDULES_MAX`]. Not notable.
+    SchedulesChanged {
+        schedules: Vec<Schedule>,
+    },
 }
 
 impl EventKind {
@@ -394,7 +410,9 @@ impl EventKind {
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => None,
+            | EventKind::EffortRefused { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. } => None,
         }
     }
 
@@ -431,7 +449,9 @@ impl EventKind {
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => false,
+            | EventKind::EffortRefused { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. } => false,
         }
     }
 
@@ -467,7 +487,9 @@ impl EventKind {
             | EventKind::EffortRefused { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
-            | EventKind::ContextMoved { .. } => None,
+            | EventKind::ContextMoved { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. } => None,
         }
     }
 }
@@ -510,6 +532,21 @@ pub mod limits {
     /// Longest refusal reason (`PermissionModeRefused`, `ModelRefused`), in
     /// chars.
     pub const REFUSAL_MAX_CHARS: usize = 200;
+    /// Most [`BackgroundTask`](crate::BackgroundTask)s in one
+    /// `BackgroundTasksChanged`; past it the producer keeps the first ones
+    /// in the agent's order and drops the rest.
+    pub const TASKS_MAX: usize = 32;
+    /// Most [`Schedule`](crate::Schedule)s in one `SchedulesChanged`; past
+    /// it the producer keeps the first ones in the agent's order and drops
+    /// the rest.
+    pub const SCHEDULES_MAX: usize = 16;
+    /// Longest [`TaskId`](crate::TaskId) or [`ScheduleId`](crate::ScheduleId),
+    /// in chars. Agents mint short ids (a handful of chars); the producer
+    /// drops a task or schedule whose id is longer rather than cut it, as a
+    /// cut id would no longer name it.
+    pub const TASK_ID_MAX_CHARS: usize = 64;
+    /// Longest [`Schedule::when`](crate::Schedule::when), in chars.
+    pub const SCHEDULE_WHEN_MAX_CHARS: usize = 60;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -757,6 +794,88 @@ impl AgentSettings {
                 | EventKind::EffortRequested { .. }
                 | EventKind::EffortChanged { .. }
                 | EventKind::EffortRefused { .. }
+        )
+    }
+}
+
+/// Identifies one background task of a session's agent: the agent's own
+/// id, opaque to clients, which send it back to name the task. At most
+/// [`limits::TASK_ID_MAX_CHARS`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct TaskId(pub String);
+
+/// What kind of work a [`BackgroundTask`] is. Agent-agnostic (D3).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// A shell command, or a watch on one's output.
+    Shell,
+    /// Another agent working for this one.
+    Subagent,
+    Other,
+}
+
+/// Work the agent runs outside a turn, as it reported it last.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTask {
+    pub id: TaskId,
+    pub kind: TaskKind,
+    /// One line, at most [`limits::TITLE_MAX_CHARS`].
+    pub title: String,
+    /// The subagent task that launched this one, if any.
+    pub parent: Option<TaskId>,
+    /// Not activity: no busy indicator, and it does not keep the agent
+    /// alive on its own.
+    pub ambient: bool,
+}
+
+/// Identifies one scheduled wakeup of a session's agent: the agent's own
+/// id, opaque to clients. At most [`limits::TASK_ID_MAX_CHARS`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct ScheduleId(pub String);
+
+/// A prompt the agent scheduled for itself, as it reported it last.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Schedule {
+    pub id: ScheduleId,
+    /// When it fires, in the agent's own words (e.g. a cron expression);
+    /// clients show it and never parse it. At most
+    /// [`limits::SCHEDULE_WHEN_MAX_CHARS`].
+    pub when: String,
+    pub recurring: bool,
+    /// One line, at most [`limits::TITLE_MAX_CHARS`].
+    pub prompt: String,
+    /// Whether it is saved with the workdir and fires in later agents too;
+    /// `None` when the agent does not say.
+    pub outlives_agent: Option<bool>,
+}
+
+/// A session's agent's background work as its log has it: the one rule the
+/// server and every client fold (see [`AgentWork::apply`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentWork {
+    pub tasks: Vec<BackgroundTask>,
+    pub schedules: Vec<Schedule>,
+}
+
+impl AgentWork {
+    /// Folds one event of the session: each `…Changed` replaces its whole
+    /// set, the last event wins; anything else leaves the work alone.
+    pub fn apply(&mut self, kind: &EventKind) {
+        match kind {
+            EventKind::BackgroundTasksChanged { tasks } => self.tasks = tasks.clone(),
+            EventKind::SchedulesChanged { schedules } => self.schedules = schedules.clone(),
+            _ => {}
+        }
+    }
+
+    /// Whether `kind` is one [`apply`](Self::apply) folds.
+    pub fn folds(kind: &EventKind) -> bool {
+        matches!(
+            kind,
+            EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. }
         )
     }
 }
