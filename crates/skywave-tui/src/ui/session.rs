@@ -16,8 +16,8 @@ use skywave_core::{
 };
 use skywave_present::format::{
     agent_effort_label, agent_mode_label, agent_model_label, agent_refusal, answer_words,
-    blob_size, bytes, delivery_label, dollars, effort_label, mode_detail, mode_label,
-    outgoing_label, tokens, turn_time,
+    blob_size, bytes, context_row, delivery_label, dollars, effort_label, mode_detail, mode_label,
+    outgoing_label, tokens, turn_time, viewing_hint,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -145,6 +145,18 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
     if let Some(stop) = &session.stop {
         spans.push(Span::raw(" · stop ").dark_gray());
         spans.push(Span::styled(outgoing_label(stop), outgoing_badge(stop).1));
+    }
+    for (what, outgoing) in [("new context", &session.clear), ("switch", &session.switch)] {
+        if let Some(outgoing) = outgoing {
+            spans.push(Span::raw(format!(" · {what} ")).dark_gray());
+            spans.push(Span::styled(
+                outgoing_label(outgoing),
+                outgoing_badge(outgoing).1,
+            ));
+        }
+    }
+    if let Some(hint) = viewing_hint(session) {
+        spans.push(Span::raw(format!(" · {}", clean(&hint))).yellow());
     }
     // Read-only: only what was granted here; `?` lists them.
     match session.rules.len() {
@@ -546,6 +558,34 @@ fn render_picker(
             (
                 " Agent ".to_owned(),
                 list_lines(items, *selected, rows),
+                None,
+            )
+        }
+        Picker::Contexts { selected } => {
+            let new = if session.can_clear {
+                Span::raw("New context")
+            } else {
+                Span::raw("New context (this one is empty)").dark_gray()
+            };
+            let mut items = vec![vec![new]];
+            items.extend(session.contexts.iter().map(|context| {
+                let mut spans = vec![Span::raw(clean(&context_row(context)))];
+                if context.current {
+                    spans.push(Span::raw(" · current").green());
+                }
+                if let Some(outgoing) = &context.outgoing {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        outgoing_label(outgoing),
+                        outgoing_badge(outgoing).1,
+                    ));
+                }
+                spans
+            }));
+            let selected = (*selected).min(items.len() - 1);
+            (
+                " Contexts · Enter switches · v views ".to_owned(),
+                list_lines(items, selected, rows),
                 None,
             )
         }
