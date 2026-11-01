@@ -3,7 +3,7 @@
 use crate::store::BlobPolicy;
 use crate::view::{
     ApprovalId, BlobId, CommandId, ContextId, Decision, Effort, PermissionMode, Seq, SessionId,
-    SnippetId,
+    SnippetId, TaskId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +150,15 @@ pub enum Action {
     SetPermissionMode {
         session_id: SessionId,
         mode: PermissionMode,
+    },
+    /// Ask the session's agent to stop its background `task` (one the
+    /// view's [`work`](crate::SessionView::work) lists). The session view's
+    /// [`task_stops`](crate::SessionView::task_stops) shows it until the
+    /// task is gone or the agent refuses. Schedules cannot be stopped this
+    /// way.
+    StopTask {
+        session_id: SessionId,
+        task: TaskId,
     },
     /// Ask the session's agent to run `model`: the
     /// [`id`](crate::ModelChoice::id) of one the view's
