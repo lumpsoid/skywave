@@ -12,12 +12,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use skywave_core::{
     ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, PermissionMode,
-    RuleSuggestion, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
+    RuleSuggestion, SessionState, SessionUsage, SessionView, TaskKind, TimelineItem, ToolView,
 };
 use skywave_present::format::{
     agent_effort_label, agent_mode_label, agent_model_label, agent_refusal, answer_words,
     blob_size, bytes, context_moved_label, context_row, delivery_label, dollars, effort_label,
-    mode_detail, mode_label, outgoing_label, tokens, turn_time, viewing_hint,
+    mode_detail, mode_label, outgoing_label, stop_warning, tokens, turn_time, viewing_hint,
+    work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -26,7 +27,9 @@ use super::timeline::{
     title_spans,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
-use crate::app::{App, Focus, Geometry, Picker, SessionUi};
+use crate::app::{
+    App, BackgroundRow, Focus, Geometry, Picker, SessionUi, StopKind, background_rows,
+};
 
 /// Most composer rows on screen; longer drafts scroll.
 const COMPOSER_ROWS: usize = 6;
@@ -617,6 +620,105 @@ fn render_picker(
                 lines,
                 None,
             )
+        }
+        Picker::Stop(kind) => {
+            let what = match kind {
+                StopKind::Session => "Stop the agent?",
+                StopKind::Clear => "Start a new context?",
+                StopKind::Switch(_) => "Switch context?",
+                StopKind::Move(_) => "Move this context to a new session?",
+            };
+            let mut lines = vec![Line::from(what).bold()];
+            if let Some(warning) = stop_warning(&session.work) {
+                lines.push(Line::from(clean(&warning)).yellow());
+            }
+            lines.push(Line::from("y go on · any other key back").yellow().bold());
+            (" Background work ".to_owned(), lines, None)
+        }
+        Picker::Background {
+            stopping: Some(id), ..
+        } => {
+            let title = session
+                .work
+                .tasks
+                .iter()
+                .find(|t| t.id == *id)
+                .map(|t| clean(&t.title))
+                .unwrap_or_default();
+            let lines = vec![
+                Line::from(format!("Stop {title}?")).bold(),
+                Line::from("y stops it · any other key back")
+                    .yellow()
+                    .bold(),
+            ];
+            (" Background work ".to_owned(), lines, None)
+        }
+        Picker::Background { selected, .. } => {
+            let work_rows = background_rows(&session.work);
+            let mut items: Vec<Vec<Span<'static>>> = Vec::new();
+            for row in &work_rows {
+                items.push(match row {
+                    BackgroundRow::Task(task, depth) => {
+                        let kind = match task.kind {
+                            TaskKind::Shell => "shell",
+                            TaskKind::Subagent => "subagent",
+                            TaskKind::Other => "task",
+                        };
+                        let mut spans = vec![
+                            Span::raw("  ".repeat(*depth)),
+                            Span::raw(format!("{kind:<9}")).dark_gray(),
+                            Span::raw(clean(&task.title)),
+                        ];
+                        if task.ambient {
+                            spans.push(Span::raw(" · watcher").dark_gray());
+                        }
+                        if let Some((_, outgoing)) =
+                            session.task_stops.iter().find(|(id, _)| *id == task.id)
+                        {
+                            spans.push(Span::raw(" stop "));
+                            spans.push(Span::styled(
+                                outgoing_label(outgoing),
+                                outgoing_badge(outgoing).1,
+                            ));
+                        }
+                        spans
+                    }
+                    BackgroundRow::Loop(schedule) => {
+                        let mut spans = vec![
+                            Span::raw(format!("loop {} ", clean(&schedule.when))),
+                            Span::raw(if schedule.recurring {
+                                "repeats"
+                            } else {
+                                "once"
+                            })
+                            .dark_gray(),
+                            Span::raw(format!(" {}", clean(&schedule.prompt))),
+                        ];
+                        if schedule.outlives_agent == Some(true) {
+                            spans.push(Span::raw(" · saved in this folder").dark_gray());
+                        }
+                        spans
+                    }
+                });
+            }
+            let title = format!(
+                " Background work · {} ",
+                work_summary(&session.work).unwrap_or_else(|| "nothing running".to_owned())
+            );
+            let lines = if items.is_empty() {
+                vec![Line::from("Nothing is running in the background.").dark_gray()]
+            } else {
+                let selected = (*selected).min(items.len() - 1);
+                let mut lines = list_lines(items, selected, rows.saturating_sub(1).max(1));
+                if !session.work.schedules.is_empty() {
+                    lines.push(
+                        Line::from("Loops as of the last turn; ask the agent to end one.")
+                            .dark_gray(),
+                    );
+                }
+                lines
+            };
+            (title, lines, None)
         }
         Picker::Effort { selected } => {
             let efforts = agent.efforts();
