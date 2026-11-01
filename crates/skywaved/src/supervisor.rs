@@ -16,7 +16,8 @@
 //!   agent for the message's context first if it is not running (lazily,
 //!   resumed with the context's stored
 //!   [`ResumeHandle`](crate::agent::ResumeHandle) when there is one, fresh
-//!   otherwise). An agent running another context is stopped first, like
+//!   otherwise, and given the session's [`Grants`](crate::agent::Grants)
+//!   either way). An agent running another context is stopped first, like
 //!   on `SessionStopped`; validated commands never get there, since a
 //!   context change already stopped it;
 //! - `ApprovalResolved` → [`EventMapper::take_approval`] and
@@ -128,7 +129,7 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, EventMapper, StartSpec,
-    bounded_models, load_resume_handle,
+    bounded_models, load_grants, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -639,6 +640,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let resume = load_resume_handle(&self.storage.db, context)?;
         let resumed = resume.is_some();
+        let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
@@ -650,6 +652,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             context,
             workdir: info.workdir.into(),
             resume,
+            grants,
             mode,
             model: model.clone(),
             effort,

@@ -16,7 +16,7 @@ use skywave_proto::{
 
 use super::{
     AdapterEvent, AgentCallId, AgentRequestId, DisplayBody, ResultDisplay, ToolDisplay,
-    TurnOutcome, store_resume_handle,
+    TurnOutcome, store_grants, store_resume_handle,
 };
 use crate::error::Result;
 use crate::{EventLog, Storage};
@@ -45,6 +45,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
 /// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
+/// | `Grants` | stored in `sessions.agent_grants` for the mapper's session (whichever context), no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
@@ -320,6 +321,9 @@ impl EventMapper {
             }
             AdapterEvent::ResumeHandle(handle) => {
                 store_resume_handle(&storage.db, self.context, &handle)?;
+            }
+            AdapterEvent::Grants(grants) => {
+                store_grants(&storage.db, self.session_id, &grants)?;
             }
             AdapterEvent::PermissionMode(mode) => {
                 if self.settings.mode.current != Some(mode) {

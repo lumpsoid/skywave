@@ -17,13 +17,21 @@
 //! approval request ids are opaque [`AgentRequestId`]s, and its resume state
 //! (for example its own session id) is an opaque [`ResumeHandle`] persisted
 //! per session context in `contexts.agent_state` with
-//! [`store_resume_handle`] / [`load_resume_handle`].
+//! [`store_resume_handle`] / [`load_resume_handle`]. What the agent was
+//! granted for the whole Skywave session (for example lasting permission
+//! rules) is opaque [`Grants`], persisted per session in
+//! `sessions.agent_grants` with [`store_grants`] / [`load_grants`] and given
+//! to every start of every context of that session.
 //!
 //! **Protocol between supervisor and session.**
 //! - [`AgentAdapter::start`] with `resume: None` starts a fresh agent session;
 //!   with the stored handle it resumes one after a restart. The adapter
-//!   reports the handle to persist as [`AdapterEvent::ResumeHandle`], as early
-//!   as it knows it (before the first turn ends).
+//!   reports the handle to persist as [`AdapterEvent::ResumeHandle`] once
+//!   the context's conversation exists and before the first turn ends; a
+//!   process stopped before any message reports none, so the context's next
+//!   start is fresh too. `spec.grants` are the session's grants; when they
+//!   change the adapter reports the whole new set as
+//!   [`AdapterEvent::Grants`].
 //! - A turn begins with a user message and ends with exactly one
 //!   [`AdapterEvent::TurnEnded`]. A message sent while a turn runs is queued
 //!   by the agent and starts the next turn. What the turn took (time,
@@ -156,6 +164,16 @@ pub struct ResultDisplay {
 #[serde(transparent)]
 pub struct ResumeHandle(pub serde_json::Value);
 
+/// What an agent was granted for the whole Skywave session, across its
+/// contexts (for example lasting permission rules).
+///
+/// Opaque JSON like [`ResumeHandle`]: only the adapter that produced it
+/// reads it. Stored per session, in `sessions.agent_grants`, and never
+/// shared between sessions.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Grants(pub serde_json::Value);
+
 /// How to start an agent session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartSpec {
@@ -168,6 +186,9 @@ pub struct StartSpec {
     pub workdir: PathBuf,
     /// The handle stored for `context`, to resume it; `None` starts fresh.
     pub resume: Option<ResumeHandle>,
+    /// The grants stored for the session, whichever context starts; `None`
+    /// until the agent has reported any.
+    pub grants: Option<Grants>,
     /// The mode to run in, asked for once the agent is up; `None` leaves
     /// the agent's own.
     pub mode: Option<PermissionMode>,
@@ -230,8 +251,11 @@ pub enum AdapterEvent {
     TurnUsage(TurnUsage),
     /// The current turn is over.
     TurnEnded(TurnOutcome),
-    /// The handle to persist for resuming this session; replaces any earlier.
+    /// The handle to persist for resuming this context; replaces any earlier.
     ResumeHandle(ResumeHandle),
+    /// The grants to persist for the session, the whole set; replaces any
+    /// earlier.
+    Grants(Grants),
     /// The agent runs in `mode`, as it reported unasked (at start, at a
     /// turn, or a change of its own). May repeat what it said before.
     PermissionMode(PermissionMode),
@@ -367,6 +391,32 @@ pub fn load_resume_handle(db: &Db, context: ContextId) -> Result<Option<ResumeHa
         .optional()?;
     match row {
         None => Err(Error::UnknownContext(context)),
+        Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
+    }
+}
+
+/// Persists `grants` as session `session`'s grants, replacing any earlier.
+pub fn store_grants(db: &Db, session: SessionId, grants: &Grants) -> Result<()> {
+    let changed = db
+        .conn()
+        .prepare_cached("UPDATE sessions SET agent_grants = ?2 WHERE id = ?1")?
+        .execute((session.0.to_string(), serde_json::to_string(grants)?))?;
+    if changed == 0 {
+        return Err(Error::UnknownSession(session));
+    }
+    Ok(())
+}
+
+/// The grants stored for session `session`; `None` until the agent has
+/// reported any.
+pub fn load_grants(db: &Db, session: SessionId) -> Result<Option<Grants>> {
+    let row: Option<Option<String>> = db
+        .conn()
+        .prepare_cached("SELECT agent_grants FROM sessions WHERE id = ?1")?
+        .query_row([session.0.to_string()], |r| r.get(0))
+        .optional()?;
+    match row {
+        None => Err(Error::UnknownSession(session)),
         Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
     }
 }

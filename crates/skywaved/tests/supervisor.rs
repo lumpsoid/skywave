@@ -269,6 +269,23 @@ impl Fixture {
             .await
     }
 
+    /// Creates another session, with a workdir of its own; its id.
+    fn create_session(&mut self) -> SessionId {
+        let workdir = self.root.join("other");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let seq = accepted(self.handle(
+            DeviceId::new(),
+            CommandKind::CreateSession {
+                workdir: workdir.to_str().unwrap().to_owned(),
+            },
+        ));
+        self.log
+            .read(&self.storage.db, Seq(seq.0 - 1), 1)
+            .unwrap()
+            .events[0]
+            .session_id
+    }
+
     /// The session's first context, the one it was created with.
     fn first(&self) -> ContextId {
         ContextId::first_of(self.session_id)
@@ -279,6 +296,7 @@ impl Fixture {
         FakeInput::Started {
             resumed,
             context: self.first(),
+            grants: None,
         }
     }
 
@@ -875,6 +893,7 @@ async fn converse_elsewhere(agent: &FakeAgent, f: &Fixture, context: ContextId) 
             context,
             workdir: workdir.into(),
             resume: None,
+            grants: None,
             mode: None,
             model: None,
             effort: None,
@@ -1539,7 +1558,11 @@ async fn a_blank_model_is_refused() {
 // Session contexts: one context's agent at a time
 
 fn started_in(context: ContextId, resumed: bool) -> FakeInput {
-    FakeInput::Started { resumed, context }
+    FakeInput::Started {
+        resumed,
+        context,
+        grants: None,
+    }
 }
 
 /// Every start the fake recorded for the session, in order.
@@ -1943,4 +1966,122 @@ async fn a_context_started_for_a_setting_leaves_no_handle_and_starts_fresh_for_i
         ]
     );
     assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+}
+
+// ---------------------------------------------------------------------------
+// Grants: per session, across its contexts
+
+fn grants(rules: serde_json::Value) -> skywaved::agent::Grants {
+    skywaved::agent::Grants(json!({ "rules": rules }))
+}
+
+fn grants_of(f: &Fixture, session: SessionId) -> Option<skywaved::agent::Grants> {
+    skywaved::agent::load_grants(&f.storage.db, session).unwrap()
+}
+
+fn started_with(
+    context: ContextId,
+    resumed: bool,
+    grants: Option<skywaved::agent::Grants>,
+) -> FakeInput {
+    FakeInput::Started {
+        resumed,
+        context,
+        grants,
+    }
+}
+
+#[tokio::test]
+async fn grants_reported_in_one_context_go_to_every_later_start_of_the_session() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let c = ContextId::new();
+    let granted = grants(json!(["edits", "Bash(cargo test)"]));
+    // The second turn, which runs in B, reports a first set and then the
+    // whole new one, which replaces it.
+    let script = FakeScript::new().turn([Step::text("in a")]).turn([
+        Step::grants(json!({ "rules": ["edits"] })),
+        Step::grants(granted.0.clone()),
+        Step::text("in b"),
+    ]);
+    let agent = FakeAgent::new(script);
+    let supervisor = f.start(&agent).await;
+
+    f.send("one");
+    f.wait_count("A's reply", 1, is_idle).await;
+    f.clear(b);
+    f.send("two");
+    f.wait_count("B's reply", 2, is_idle).await;
+    assert_eq!(grants_of(&f, f.session_id), Some(granted.clone()));
+
+    // Switching back to A resumes it with what B was granted.
+    f.switch(a);
+    f.send("three");
+    f.wait_count("A's second reply", 3, is_idle).await;
+    // The next message after a clear starts fresh, with them too.
+    f.clear(c);
+    f.send("four");
+    f.wait_count("C's reply", 4, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_with(a, false, None),
+            started_with(b, false, None),
+            started_with(a, true, Some(granted.clone())),
+            started_with(c, false, Some(granted.clone())),
+        ]
+    );
+    // Stored for the session, not for the context that reported them.
+    assert_eq!(handle_of(&f, b), Some(FakeAgent::resume_handle(b)));
+    assert_eq!(grants_of(&f, f.session_id), Some(granted));
+}
+
+#[tokio::test]
+async fn grants_never_cross_sessions() {
+    let mut f = Fixture::new();
+    let first = f.session_id;
+    let granted = grants(json!(["edits"]));
+    // Each session's turns run in order: only a session's second turn
+    // reports grants.
+    let script = FakeScript::new()
+        .turn([Step::text("first turn")])
+        .turn([Step::grants(granted.0.clone())]);
+    let agent = FakeAgent::new(script);
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.send("two");
+    f.wait_count("both replies", 2, is_idle).await;
+    assert_eq!(grants_of(&f, first), Some(granted.clone()));
+
+    // Another session starts without them.
+    let second = f.create_session();
+    f.session_id = second;
+    f.send("elsewhere");
+    f.wait_count("the other session's reply", 1, is_idle).await;
+    assert_eq!(
+        starts(&agent, &f),
+        [started_with(ContextId::first_of(second), false, None)]
+    );
+    assert_eq!(grants_of(&f, second), None);
+
+    // Positive control: the first session's next start gets them.
+    f.session_id = first;
+    let next = ContextId::new();
+    f.clear(next);
+    f.send("three");
+    f.wait_count("the first session's third reply", 3, is_idle)
+        .await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_with(ContextId::first_of(first), false, None),
+            started_with(next, false, Some(granted.clone())),
+        ]
+    );
+    assert_eq!(grants_of(&f, first), Some(granted));
+    assert_eq!(grants_of(&f, second), None);
 }

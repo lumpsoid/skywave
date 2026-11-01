@@ -22,8 +22,14 @@
 //! ([`rules::offered`]) ride along as rule suggestions; an approval granting
 //! one sends that update back as `updatedPermissions`, so the CLI keeps the
 //! rule where it said it would. One the CLI keeps in its process only is
-//! also added to the resume handle ([`rules::keep`]), reported anew, so a
-//! resumed process is started with it again.
+//! also added to the session's grants ([`rules::keep`]), reported anew as
+//! [`AdapterEvent::Grants`], so every later process of the session is
+//! started with it again.
+//!
+//! **Handle.** The resume handle is `{"session_id"}` alone. A fresh process
+//! reports it with its first `TurnStarted`, once the CLI has a conversation
+//! to resume (it keeps none for a session that never got a message); a
+//! resumed one reports it only if the CLI switches session ids.
 //!
 //! **Mode and model** (docs/agents/claude-code.md §3.7). A request is a
 //! `set_permission_mode` / `set_model` control request; its
@@ -83,32 +89,21 @@ pub struct Output {
     pub events: Vec<AdapterEvent>,
 }
 
-/// The resume handle naming CLI session `session_id` and the granted
-/// permission updates its process keeps (`rules`, left out when empty).
-pub fn resume_handle(session_id: Uuid, rules: &[Value]) -> ResumeHandle {
-    let mut handle = json!({ "session_id": session_id.to_string() });
-    if !rules.is_empty() {
-        handle["rules"] = json!(rules);
-    }
-    ResumeHandle(handle)
+/// The resume handle naming CLI session `session_id`.
+pub fn resume_handle(session_id: Uuid) -> ResumeHandle {
+    ResumeHandle(json!({ "session_id": session_id.to_string() }))
 }
 
-/// The CLI session id and the kept permission updates in a handle made by
-/// [`resume_handle`].
-pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<(Uuid, Vec<Value>), String> {
-    let session_id = handle
+/// The CLI session id in a handle made by [`resume_handle`]. Other keys
+/// are ignored: a handle stored before grants moved out may still carry
+/// `rules`, which are not granted again.
+pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<Uuid, String> {
+    handle
         .0
         .get("session_id")
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
-        .ok_or_else(|| format!("not a resume handle of this adapter: {}", handle.0))?;
-    let rules = handle
-        .0
-        .get("rules")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok((session_id, rules))
+        .ok_or_else(|| format!("not a resume handle of this adapter: {}", handle.0))
 }
 
 /// A user message: starts a turn.
@@ -313,8 +308,12 @@ struct Pending {
 #[derive(Debug)]
 pub struct Protocol {
     session_id: Uuid,
-    resumed: bool,
-    /// Granted permission updates the process keeps only in itself.
+    /// The handle naming `session_id` has been reported, or was stored
+    /// already (a resumed process). A fresh process reports it with its
+    /// first turn.
+    handle_reported: bool,
+    /// Granted permission updates the process keeps only in itself: the
+    /// session's grants.
     session_rules: Vec<Value>,
     next_request: u64,
     initialize_id: Option<String>,
@@ -370,7 +369,7 @@ impl Protocol {
     pub fn new(session_id: Uuid, resumed: bool) -> Protocol {
         Protocol {
             session_id,
-            resumed,
+            handle_reported: resumed,
             session_rules: Vec::new(),
             next_request: 0,
             initialize_id: None,
@@ -394,25 +393,22 @@ impl Protocol {
         }
     }
 
-    /// The process was started with `rules`, the updates kept so far.
+    /// The process was started with `rules`, the session's grants so far.
     pub fn with_session_rules(mut self, rules: Vec<Value>) -> Protocol {
         self.session_rules = rules;
         self
     }
 
-    /// The first step: the initialize handshake and, for a fresh session,
-    /// the resume handle (known up front from `--session-id`).
+    /// The first step: the initialize handshake. A fresh session reports
+    /// its handle with its first turn, not here: the CLI keeps no
+    /// conversation for a session that never got a message.
     pub fn start(&mut self) -> Output {
         let id = self.request_id();
-        let mut out = Output {
+        let out = Output {
             writes: vec![initialize_request(&id)],
             events: Vec::new(),
         };
         self.initialize_id = Some(id);
-        if !self.resumed {
-            out.events
-                .push(AdapterEvent::ResumeHandle(self.resume_handle()));
-        }
         out
     }
 
@@ -484,7 +480,7 @@ impl Protocol {
             (Decision::Approve, Some(update)) => {
                 if rules::keep(&mut self.session_rules, update) {
                     out.events
-                        .push(AdapterEvent::ResumeHandle(self.resume_handle()));
+                        .push(AdapterEvent::Grants(rules::grants(&self.session_rules)));
                 }
                 allow_always_response(&pending.request.0, &pending.input, update)
             }
@@ -586,8 +582,18 @@ impl Protocol {
         out
     }
 
-    fn resume_handle(&self) -> ResumeHandle {
-        resume_handle(self.session_id, &self.session_rules)
+    /// Reports `TurnStarted`, after the resume handle when it is the first
+    /// turn of a fresh process: from that message on the CLI has a
+    /// conversation to resume.
+    fn open_turn(&mut self, out: &mut Output) {
+        self.turn_open = true;
+        self.interrupt_sent = false;
+        if !self.handle_reported {
+            self.handle_reported = true;
+            out.events
+                .push(AdapterEvent::ResumeHandle(resume_handle(self.session_id)));
+        }
+        out.events.push(AdapterEvent::TurnStarted);
     }
 
     fn request_id(&mut self) -> String {
@@ -636,12 +642,12 @@ impl Protocol {
     }
 
     fn begin_turn(&mut self, text: &str) -> Output {
-        self.turn_open = true;
-        self.interrupt_sent = false;
-        Output {
+        let mut out = Output {
             writes: vec![user_message(text)],
-            events: vec![AdapterEvent::TurnStarted],
-        }
+            events: Vec::new(),
+        };
+        self.open_turn(&mut out);
+        out
     }
 
     fn check_version(&mut self, version: Option<&str>) {
@@ -672,23 +678,27 @@ impl Protocol {
         {
             out.events.push(AdapterEvent::PermissionMode(mode));
         }
-        if !self.turn_open {
-            // A turn the CLI started on its own; frame it all the same.
-            self.turn_open = true;
-            self.interrupt_sent = false;
-            out.events.push(AdapterEvent::TurnStarted);
-        }
         let reported = message
             .get("session_id")
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok());
+        // A handle reported with the old id is reported anew; one not
+        // reported yet goes out once, with the new id, as the turn opens.
+        let mut report_again = false;
         if let Some(id) = reported
             && id != self.session_id
         {
             tracing::info!(session_id = %id, "agent runs under another session id; keeping it");
             self.session_id = id;
+            report_again = self.handle_reported;
+        }
+        if !self.turn_open {
+            // A turn the CLI started on its own; frame it all the same.
+            self.open_turn(out);
+        }
+        if report_again {
             out.events
-                .push(AdapterEvent::ResumeHandle(self.resume_handle()));
+                .push(AdapterEvent::ResumeHandle(resume_handle(self.session_id)));
         }
     }
 

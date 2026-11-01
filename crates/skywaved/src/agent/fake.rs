@@ -23,7 +23,12 @@
 //! [`FakeAgent`] (clones share it): the scripted turns run in order across
 //! every start of a Skywave session, whatever its context, and every
 //! request is recorded and readable with [`FakeAgent::inputs`], each start
-//! as [`FakeInput::Started`] naming its context.
+//! as [`FakeInput::Started`] naming its context and the grants it got.
+//!
+//! **Grants.** The fake keeps no grants of its own: a script reports them
+//! with [`Step::grants`] (the whole set, as the real adapter does when an
+//! approval grants a rule), and the supervisor hands what it stored back in
+//! the next start's [`StartSpec::grants`].
 //!
 //! **Conversations.** Each session context is its own conversation, which,
 //! like a real agent's, exists only once it got a message: the fake reports
@@ -69,8 +74,8 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSession, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
+    RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -233,6 +238,11 @@ impl Step {
         }
     }
 
+    /// Reports `grants` as the session's whole set of grants.
+    pub fn grants(grants: Value) -> Step {
+        Step::Emit(AdapterEvent::Grants(Grants(grants)))
+    }
+
     /// Offers a lasting rule with an approval step. No effect on other
     /// steps.
     pub fn suggest(mut self, label: &str, scope: RuleScope) -> Step {
@@ -302,6 +312,8 @@ pub enum FakeInput {
     Started {
         resumed: bool,
         context: ContextId,
+        /// The session's grants the start was given.
+        grants: Option<Grants>,
     },
     Message(String),
     /// An answer and the rule it grants, if any.
@@ -382,6 +394,7 @@ impl AgentAdapter for FakeAgent {
             progress.inputs.push(FakeInput::Started {
                 resumed,
                 context: spec.context,
+                grants: spec.grants.clone(),
             });
         }
 
