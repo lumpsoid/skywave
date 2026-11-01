@@ -51,8 +51,7 @@ class SystemNotifications {
       // denial can be undone in system settings, so show is still tried.
       await _plugin.initialize(
         settings: _settings,
-        onDidReceiveNotificationResponse: (response) =>
-            _open(response.payload),
+        onDidReceiveNotificationResponse: (response) => _open(response.payload),
       );
       _ready = true;
     } on Exception catch (error) {
