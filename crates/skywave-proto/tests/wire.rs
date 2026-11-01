@@ -26,6 +26,9 @@ fn call() -> CallId {
 fn context() -> ContextId {
     Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0008).into()
 }
+fn moved_to() -> SessionId {
+    Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0009).into()
+}
 fn blob() -> BlobRef {
     BlobRef {
         id: blob_id(),
@@ -51,12 +54,25 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::SessionCreated {
             workdir: "/srv/code/skywave".into(),
             context_name: "velvet walrus".into(),
+            from: None,
+        },
+        EventKind::SessionCreated {
+            workdir: "/srv/code/skywave".into(),
+            context_name: "amber otter".into(),
+            from: Some(ContextRef {
+                session: session(),
+                context: context(),
+            }),
         },
         EventKind::ContextStarted {
             by: device(),
             name: "amber otter".into(),
         },
         EventKind::ContextSwitched { by: device() },
+        EventKind::ContextMoved {
+            to: moved_to(),
+            by: device(),
+        },
         EventKind::UserMessage {
             device_id: device(),
             text: "run the tests".into(),
@@ -343,6 +359,11 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             context: context(),
         },
+        CommandKind::MoveContext {
+            session_id: session(),
+            context: context(),
+            name: "amber otter".into(),
+        },
     ]
 }
 
@@ -362,6 +383,9 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ContextExists,
             RejectReason::UnknownContext,
             RejectReason::ContextChanged,
+            RejectReason::ContextMoved,
+            RejectReason::ContextCurrent,
+            RejectReason::NoConversation,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -605,6 +629,37 @@ fn v7_model_choice_decodes_without_efforts() {
     assert_eq!(models[0].efforts, vec![Effort::Low, Effort::XHigh]);
 }
 
+/// A `SessionCreated` stored before v10 has no `from`: it created a session
+/// of its own, logged by its `CreateSession`.
+#[test]
+fn v9_session_created_decodes_without_from() {
+    let kind =
+        decode(r#"{"type":"session_created","workdir":"/w","context_name":"velvet walrus"}"#);
+    assert_eq!(
+        kind,
+        EventKind::SessionCreated {
+            workdir: "/w".into(),
+            context_name: "velvet walrus".into(),
+            from: None,
+        }
+    );
+    assert!(kind.logged_by_command());
+    // Positive control: a `from` on the wire is read, not dropped.
+    let kind = decode(
+        r#"{"type":"session_created","workdir":"/w","context_name":"velvet walrus","from":{"session":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008"}}"#,
+    );
+    let EventKind::SessionCreated { from, .. } = kind else {
+        panic!("not SessionCreated: {kind:?}");
+    };
+    assert_eq!(
+        from,
+        Some(ContextRef {
+            session: session(),
+            context: context(),
+        })
+    );
+}
+
 #[test]
 fn tool_events_without_display_or_summary_are_rejected() {
     for json in [
@@ -617,8 +672,8 @@ fn tool_events_without_display_or_summary_are_rejected() {
 }
 
 #[test]
-fn protocol_is_v9() {
-    assert_eq!(PROTOCOL_VERSION, 9);
+fn protocol_is_v10() {
+    assert_eq!(PROTOCOL_VERSION, 10);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);

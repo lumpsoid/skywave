@@ -331,3 +331,57 @@ are granted again. Pre-upgrade sessions have one context named "start".
 address the new context); names derived from the id (locks the word lists
 forever); reusing an empty current context (would need a fake event or a
 cascading rejection).
+
+## D30. Moving a context: one command, two events, only the last names it
+`MoveContext { session_id, context, name }` continues a context of the
+session that has a conversation and is not current as a new session in the
+source's stored workdir. The server mints the new session's id and logs, in
+one transaction, `SessionCreated { workdir, context_name: name, from:
+Some(ContextRef { session, context }) }` in the new session (stamped with
+its first context, naming no command), then `ContextMoved { to, by }` in the
+source (stamped with the moved context, naming the command, at its
+`Accepted { seq }`). The moved context stays in the source, never current
+or started again (`SwitchContext` to it is `ContextMoved`); the new
+session's first context records it as its `origin` and forks its
+conversation on first start.
+**Why two events:** clients fold each session from its own events only, so
+both sessions need one. **Why only the last names the command:** the
+settling rule is "the event naming the command is at its `Accepted` seq".
+With exactly one such event and it the last the command appends, a device
+that settles from the log already has the earlier `SessionCreated`, since
+batches are contiguous. So "every accepted command logs exactly one event"
+becomes "exactly one event naming it, the last it appends";
+`logged_by_command` is per event (`SessionCreated` with a `from` is the
+daemon's).
+**Rejected:** both events naming the command (a pull split between them
+would settle at the first seq while the source does not yet show the
+move); the command id on `SessionCreated` with `ContextMoved` logged by the
+daemon after (settles before the source shows the move); one event with
+derivation across sessions (clients would fold a session from another's
+events); `CreateSession { workdir, from }` (another command's validation
+and events).
+**Moving the current context** (decided 2026-11-01): the server refuses it
+(`ContextCurrent`). A client sends `ClearContext` then `MoveContext`, so the
+source goes on in a fresh empty context as after "New context"; switching
+back to the previous context instead was rejected.
+**Not carried:** the new session starts with the agent's defaults for
+mode, model and effort (carrying them is deferred), and with no grants
+(D29: grants belong to one session, never shared).
+**Blocked on a client** while that device has unsent or unpulled
+`SendMessage`s to the context: the clear right behind them would interrupt
+the turn they start, and the fork would carry an interrupted answer.
+**Deferred:** copying a context into a new session (it would reuse
+`SessionCreated { from }`, `origin` and the fork, add a sibling
+`ContextCopied { to, by }`, and must fork eagerly or snapshot: a claude
+handle is a session id, not a point in time, so a lazily forked copy would
+include the source's later turns); carrying grants, mode, model or effort;
+showing the origin's history inline in the new session; naming the new
+session after the source; a client-chosen id for the new session, so an
+offline device could open it before the server answers; an agent
+capability that lets clients hide the move for agents that cannot fork
+(today such an adapter fails `start` with `AgentError::Start`); moving
+into an existing session or merging; moving a new session's first context
+again before it has had a turn (`NoConversation`); a different workdir for
+the new session (blocked: resuming from another cwd is untested); and a
+reason in the core for why a context cannot move, so heads can tell "the
+agent never ran in it" from "a message of yours is on its way".

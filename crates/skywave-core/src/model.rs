@@ -32,8 +32,9 @@ use crate::view::{
     BlobState, BlobView, BodyView, CallId, CommandId, ContextId, ContextView, Decision, Delivery,
     DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice,
     Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen,
-    Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
+    SettingChange, SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolOutcome,
+    ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -169,9 +170,9 @@ pub(crate) struct Model {
     alerted_at: HashMap<ApprovalId, u64>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
-    /// A [`Action::CreateSessionLike`] whose session is not in the replica
-    /// yet: its command, and the session it was asked from, still on
-    /// screen. In memory only.
+    /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
+    /// new session is not in the replica yet: its command, and the session
+    /// it was asked from, still on screen. In memory only.
     opening: Option<(CommandId, SessionId)>,
     /// The server's devices by name, as stored.
     devices: HashMap<DeviceId, String>,
@@ -394,23 +395,12 @@ impl Model {
                 }
                 self.enqueue(CommandKind::StopSession { session_id })
             }
-            Action::ClearContext { session_id } => {
-                if self.summary(session_id).is_none() {
-                    return Vec::new();
-                }
-                let used = self.context_names(session_id);
-                let name = fresh_context_name(&used, skywave_proto::context_name::random);
-                self.enqueue(CommandKind::ClearContext {
-                    session_id,
-                    context: ContextId::new(),
-                    name,
-                })
-            }
+            Action::ClearContext { session_id } => self.clear_context(session_id),
             Action::SwitchContext {
                 session_id,
                 context,
             } => {
-                if self.summary(session_id).is_none() {
+                if self.summary(session_id).is_none() || self.moved(session_id, context) {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::SwitchContext {
@@ -418,6 +408,10 @@ impl Model {
                     context,
                 })
             }
+            Action::MoveContext {
+                session_id,
+                context,
+            } => self.move_context(session_id, context),
             Action::ViewContext {
                 session_id,
                 context,
@@ -599,6 +593,70 @@ impl Model {
             Effect::Enqueue(command),
             Effect::Request(Request::OutboxChanged),
         ]
+    }
+
+    /// Queues a clear of the session's context: a fresh id, and a name no
+    /// context of it has as far as this device knows.
+    fn clear_context(&mut self, session_id: SessionId) -> Vec<Effect> {
+        if self.summary(session_id).is_none() {
+            return Vec::new();
+        }
+        let used = self.context_names(session_id);
+        let name = fresh_context_name(&used, skywave_proto::context_name::random);
+        self.enqueue(CommandKind::ClearContext {
+            session_id,
+            context: ContextId::new(),
+            name,
+        })
+    }
+
+    /// Queues the move of a context the open session lists as movable,
+    /// under its own name, behind a clear when messages go to it now: the
+    /// server never moves the current context. The new session opens once
+    /// the move is in the replica ([`Model::apply_batch`]).
+    fn move_context(&mut self, session_id: SessionId, context: ContextId) -> Vec<Effect> {
+        let Some(summary) = self.summary(session_id) else {
+            return Vec::new();
+        };
+        let target = self.target_context(summary);
+        let events = self
+            .open
+            .as_ref()
+            .filter(|open| open.id == session_id)
+            .map_or(&[][..], |open| open.events.as_slice());
+        let Some(name) = self
+            .contexts(session_id, events, target)
+            .into_iter()
+            .find(|c| c.id == context && c.can_move)
+            .map(|c| c.name)
+        else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        if context == target {
+            effects = self.clear_context(session_id);
+            // One wake-up, after the move.
+            effects.retain(|effect| matches!(effect, Effect::Enqueue(_)));
+        }
+        let moved = self.enqueue(CommandKind::MoveContext {
+            session_id,
+            context,
+            name,
+        });
+        if let Some(Effect::Enqueue(command)) = moved.first() {
+            self.opening = Some((command.id, session_id));
+        }
+        effects.extend(moved);
+        effects
+    }
+
+    /// Whether the open session's log has `context` moved away.
+    fn moved(&self, session_id: SessionId, context: ContextId) -> bool {
+        self.open
+            .iter()
+            .filter(|open| open.id == session_id)
+            .flat_map(|open| &open.events)
+            .any(|(_, e)| e.context == context && matches!(e.kind, EventKind::ContextMoved { .. }))
     }
 
     /// Keeps the session's draft; blank text drops it. Nothing to write when
@@ -828,9 +886,16 @@ impl Model {
                 && event.command_id == Some(command)
             {
                 self.opening = None;
+                // A move names its new session from the source's log; that
+                // session's `SessionCreated` came first, in this batch or
+                // an earlier one.
+                let to = match event.kind {
+                    EventKind::ContextMoved { to, .. } => to,
+                    _ => event.session_id,
+                };
                 // Its events come from the store: see `unloaded_session`.
                 if self.place == Place::Session(from) {
-                    self.place = Place::Session(event.session_id);
+                    self.place = Place::Session(to);
                     self.open = None;
                     self.viewing = None;
                 }
@@ -880,6 +945,18 @@ impl Model {
             }
         }
         first
+    }
+
+    /// The session `id` as the views name it: untitled once deleted here
+    /// or before it is pulled.
+    fn session_ref(&self, id: SessionId) -> SessionRef {
+        SessionRef {
+            id,
+            title: self
+                .summary(id)
+                .filter(|_| !self.deleted.contains(&id))
+                .map(|summary| self.title(summary).text),
+        }
     }
 
     /// The device `id` as the views name it.
@@ -1218,7 +1295,11 @@ impl Model {
         if let Some(viewing) = viewing {
             timeline.retain(|item| match item {
                 TimelineItem::Logged {
-                    entry: Entry::ContextStarted { .. } | Entry::ContextSwitched { .. },
+                    entry:
+                        Entry::ContextStarted { .. }
+                        | Entry::ContextSwitched { .. }
+                        | Entry::ContextMoved { .. }
+                        | Entry::MovedFrom { .. },
                     ..
                 } => false,
                 TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
@@ -1471,7 +1552,7 @@ impl Model {
 
     /// The session's contexts in log order, every one of them: those in
     /// `events`, then this device's clears on their way. `current` is where
-    /// messages go now.
+    /// messages go now; a moved one stays listed, never current.
     fn contexts(
         &self,
         id: SessionId,
@@ -1487,19 +1568,30 @@ impl Model {
             last_activity: None,
             current: false,
             outgoing: None,
+            moved_to: None,
+            discard_move: None,
+            can_move: false,
         };
         let mut logged = HashSet::new();
+        // Those its agent worked in: a conversation to fork.
+        let mut worked = HashSet::new();
         for (_, event) in events {
             match &event.kind {
                 EventKind::SessionCreated { context_name, .. } => {
                     contexts.push(new(event.context, context_name));
                 }
                 EventKind::ContextStarted { name, .. } => contexts.push(new(event.context, name)),
+                EventKind::SessionStateChanged(LogState::AgentWorking) => {
+                    worked.insert(event.context);
+                }
                 _ => {}
             }
             let Some(context) = contexts.iter_mut().find(|c| c.id == event.context) else {
                 continue;
             };
+            if let EventKind::ContextMoved { to, .. } = &event.kind {
+                context.moved_to = Some(self.session_ref(*to));
+            }
             context.last_activity = Some(event.at);
             if let EventKind::UserMessage { text, .. } = &event.kind {
                 logged.extend(event.command_id);
@@ -1540,6 +1632,10 @@ impl Model {
                 _ => {}
             }
         }
+        let on_its_way = |e: &OutboxEntry| {
+            let outgoing = Outgoing::from(&e.status);
+            !self.in_replica(outgoing) && !matches!(outgoing, Outgoing::Failed(_))
+        };
         for context in &mut contexts {
             context.current = context.id == current;
             context.outgoing = self.latest_outgoing(|kind| match kind {
@@ -1551,9 +1647,43 @@ impl Model {
                 | CommandKind::SwitchContext {
                     session_id,
                     context: c,
+                }
+                | CommandKind::MoveContext {
+                    session_id,
+                    context: c,
+                    ..
                 } => *session_id == id && *c == context.id,
                 _ => false,
             });
+            let blocked =
+                self.outbox
+                    .iter()
+                    .filter(|e| on_its_way(e))
+                    .any(|e| match &e.command.kind {
+                        CommandKind::MoveContext {
+                            session_id,
+                            context: c,
+                            ..
+                        }
+                        | CommandKind::SendMessage {
+                            session_id,
+                            context: c,
+                            ..
+                        } => *session_id == id && *c == context.id,
+                        _ => false,
+                    });
+            context.can_move =
+                worked.contains(&context.id) && context.moved_to.is_none() && !blocked;
+            context.discard_move = self
+                .outbox
+                .iter()
+                .rev()
+                .find(|e| {
+                    matches!(&e.command.kind, CommandKind::MoveContext { session_id, context: c, .. }
+                        if *session_id == id && *c == context.id)
+                })
+                .filter(|e| e.discardable())
+                .map(|e| e.command.id);
         }
         contexts
     }
@@ -1775,11 +1905,17 @@ impl Model {
                     by: self.asker(&asked_by, *answers),
                     refused: Some(reason.clone()),
                 }),
-                EventKind::SessionCreated { context_name, .. } => {
+                EventKind::SessionCreated {
+                    context_name, from, ..
+                } => {
                     names.insert(event.context, context_name);
                     current = Some(event.context);
-                    // Shown in the header.
-                    None
+                    // Shown in the header, but for where a moved context
+                    // came from.
+                    from.map(|from| Entry::MovedFrom {
+                        from: self.session_ref(from.session),
+                        name: context_name.clone(),
+                    })
                 }
                 EventKind::ContextStarted { by, name } => {
                     names.insert(event.context, name);
@@ -1804,6 +1940,15 @@ impl Model {
                 }
                 // Shown in the header.
                 EventKind::ModelsOffered { .. } => None,
+                EventKind::ContextMoved { to, by } => Some(Entry::ContextMoved {
+                    name: names
+                        .get(&event.context)
+                        .copied()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    to: self.session_ref(*to),
+                    by: self.device_ref(*by),
+                }),
                 EventKind::EffortChanged { effort, answers } => Some(Entry::AgentSetting {
                     setting: AgentSetting::Effort(*effort),
                     by: self.asker(&asked_by, *answers),
@@ -2082,7 +2227,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
-        | CommandKind::SwitchContext { session_id, .. } => Some(*session_id),
+        | CommandKind::SwitchContext { session_id, .. }
+        | CommandKind::MoveContext { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -2224,6 +2370,7 @@ mod tests {
                 vec![EventKind::SessionCreated {
                     workdir: workdir.into(),
                     context_name: "start".into(),
+                    from: None,
                 }],
             );
             id
@@ -4314,6 +4461,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
+            from: None,
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
@@ -6123,5 +6271,355 @@ mod tests {
         );
         assert!(pending(&f).is_empty());
         assert_eq!(context_of(&send(&mut f, sid, "written before")), fresh);
+    }
+
+    // ---- moving a context ---------------------------------------------
+
+    fn working() -> EventKind {
+        EventKind::SessionStateChanged(LogState::AgentWorking)
+    }
+
+    /// The open session's context `id`, as its picker lists it.
+    fn context_row(f: &Fixture, id: ContextId) -> ContextView {
+        f.session_view()
+            .contexts
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("listed")
+    }
+
+    fn move_context(session_id: SessionId, context: ContextId) -> Action {
+        Action::MoveContext {
+            session_id,
+            context,
+        }
+    }
+
+    /// The new session's `SessionCreated` as the daemon logs it for a move
+    /// of `context` out of `from`.
+    fn moved_in(f: &mut Fixture, new: SessionId, from: SessionId, context: ContextId) {
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/a".into(),
+            context_name: "start".into(),
+            from: Some(skywave_proto::ContextRef {
+                session: from,
+                context,
+            }),
+        };
+        assert!(!created.logged_by_command());
+        f.log_stamped(new, vec![(None, ContextId::first_of(new), created)]);
+    }
+
+    #[test]
+    fn moving_the_current_context_clears_it_first_and_opens_the_new_session() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let start = ContextId::first_of(sid);
+        f.log(sid, vec![message("fix it"), working(), agent("done")]);
+        f.open(sid);
+        f.dispatch(mark_read(sid, 4));
+        assert!(context_row(&f, start).can_move);
+
+        let effects = f.dispatch(move_context(sid, start));
+        let [
+            Effect::Enqueue(clear),
+            Effect::Enqueue(moved),
+            Effect::Request(Request::OutboxChanged),
+        ] = &effects[..]
+        else {
+            panic!("expected a clear, then a move, then one wake-up: {effects:?}");
+        };
+        let CommandKind::ClearContext {
+            session_id,
+            context: fresh,
+            name: fresh_name,
+        } = clear.kind.clone()
+        else {
+            panic!("expected a clear first, got {clear:?}");
+        };
+        assert_eq!(session_id, sid);
+        assert_ne!(fresh_name, "start");
+        assert_eq!(
+            moved.kind,
+            CommandKind::MoveContext {
+                session_id: sid,
+                context: start,
+                name: "start".into()
+            },
+            "under the moved context's own name"
+        );
+        assert_eq!(
+            f.model.opening,
+            Some((moved.id, sid)),
+            "the move's id, not the clear's"
+        );
+        let view = f.session_view();
+        assert_eq!(view.context, fresh, "the session goes on in a fresh one");
+        let row = context_row(&f, start);
+        assert_eq!(
+            (row.outgoing, row.can_move, row.moved_to, row.current),
+            (Some(Outgoing::Queued), false, None, false)
+        );
+        assert!(
+            f.dispatch(move_context(sid, start)).is_empty(),
+            "its move is on its way"
+        );
+
+        // The server logs the clear, the new session, then the move; this
+        // pull splits between the last two.
+        let new = SessionId::new();
+        let at = f.events.len() as u64 + 1;
+        for (command, seq) in [(clear.id, at), (moved.id, at + 2)] {
+            f.model.command_sending(command, Utc::now());
+            f.model.command_result(
+                command,
+                CommandResult::Accepted { seq: Seq(seq) },
+                Utc::now(),
+            );
+        }
+        f.log_stamped(
+            sid,
+            vec![(Some(clear.id), fresh, started(&fresh_name, f.me))],
+        );
+        moved_in(&mut f, new, sid, start);
+        assert_eq!(f.model.open_session(), Some(sid), "the move is not in yet");
+        f.log_stamped(
+            sid,
+            vec![(
+                Some(moved.id),
+                start,
+                EventKind::ContextMoved { to: new, by: f.me },
+            )],
+        );
+        assert_eq!(f.model.open_session(), Some(new), "follows the move's `to`");
+        assert_eq!(f.model.unloaded_session(), Some(new));
+        assert_eq!(f.model.opening, None);
+
+        // Neither the clear nor the move is activity or news in the source;
+        // the new session sorts first.
+        let list = f.list_view_after_back();
+        let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [new, sid]);
+        assert_eq!(unread(&f, sid), 0);
+        f.log(sid, vec![agent("later")]);
+        assert_eq!(unread(&f, sid), 1, "news still counts");
+
+        f.open(new);
+        let a = SessionRef {
+            id: new,
+            title: Some("a".into()),
+        };
+        assert_eq!(
+            entries(&f).first(),
+            Some(&Entry::MovedFrom {
+                from: SessionRef {
+                    id: sid,
+                    title: Some("fix it".into())
+                },
+                name: "start".into()
+            })
+        );
+        f.open(sid);
+        let row = context_row(&f, start);
+        assert_eq!(
+            (row.moved_to, row.can_move, row.outgoing, row.messages),
+            (Some(a.clone()), false, None, 1),
+            "a moved context stays listed"
+        );
+        let me = f.model.device_ref(f.me);
+        let dividers: Vec<Entry> = entries(&f)
+            .into_iter()
+            .filter(|e| !matches!(e, Entry::UserMessage { .. } | Entry::AgentMessage { .. }))
+            .collect();
+        assert_eq!(
+            dividers,
+            [
+                Entry::ContextStarted {
+                    name: fresh_name.clone(),
+                    by: me.clone()
+                },
+                Entry::ContextMoved {
+                    name: "start".into(),
+                    to: a,
+                    by: me
+                }
+            ],
+            "the clear's divider, then the move's"
+        );
+        let find = |f: &Fixture, q: &str| {
+            crate::search::find(
+                &f.session_view().timeline,
+                &crate::search::Query::new(q),
+                &mut |_| None,
+            )
+            .hits
+            .len()
+        };
+        assert_eq!(find(&f, "start"), 1, "the move's divider, by name");
+
+        // Never current again here; another context still switches.
+        assert!(
+            f.dispatch(Action::SwitchContext {
+                session_id: sid,
+                context: start
+            })
+            .is_empty()
+        );
+        queued(&f.dispatch(Action::SwitchContext {
+            session_id: sid,
+            context: fresh,
+        }));
+
+        // Viewing it: its history, no dividers.
+        f.dispatch(Action::ViewContext {
+            session_id: sid,
+            context: Some(start),
+        });
+        let texts: Vec<Entry> = entries(&f);
+        assert!(
+            texts
+                .iter()
+                .all(|e| matches!(e, Entry::UserMessage { .. } | Entry::AgentMessage { .. })),
+            "{texts:?}"
+        );
+        assert_eq!(texts.len(), 3, "fix it, done, later");
+    }
+
+    #[test]
+    fn a_context_not_current_moves_alone_and_only_opens_from_its_session() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let list = f.session("/srv/b");
+        let start = ContextId::first_of(sid);
+        f.log(sid, vec![message("fix it"), working()]);
+        f.log_in(sid, ContextId::new(), vec![started("velvet walrus", f.me)]);
+        f.open(sid);
+        let moved = queued(&f.dispatch(move_context(sid, start)));
+        assert_eq!(
+            moved.kind,
+            CommandKind::MoveContext {
+                session_id: sid,
+                context: start,
+                name: "start".into()
+            }
+        );
+        // Gone elsewhere meanwhile: stays there.
+        f.open(list);
+        let new = SessionId::new();
+        moved_in(&mut f, new, sid, start);
+        f.log_stamped(
+            sid,
+            vec![(
+                Some(moved.id),
+                start,
+                EventKind::ContextMoved { to: new, by: f.me },
+            )],
+        );
+        assert_eq!(f.model.open_session(), Some(list));
+    }
+
+    #[test]
+    fn a_context_moves_once_its_agent_worked_and_this_devices_messages_are_in() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let start = ContextId::first_of(sid);
+        f.log(sid, vec![message("fix it")]);
+        f.open(sid);
+        let row = context_row(&f, start);
+        assert_eq!((row.messages, row.can_move), (1, false), "no agent ran");
+        assert!(f.dispatch(move_context(sid, start)).is_empty());
+        f.log(sid, vec![working()]);
+        assert!(context_row(&f, start).can_move);
+
+        // A message of this device on its way, accepted but not pulled
+        // included, would go out before the clear: no move meanwhile.
+        let hello = send(&mut f, sid, "hello");
+        assert!(!context_row(&f, start).can_move, "queued");
+        assert!(f.dispatch(move_context(sid, start)).is_empty());
+        f.model.command_sending(hello.id, Utc::now());
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(hello.id, CommandResult::Accepted { seq }, Utc::now());
+        assert!(!context_row(&f, start).can_move, "accepted, not pulled");
+        f.log_commands(
+            sid,
+            vec![(
+                Some(hello.id),
+                EventKind::UserMessage {
+                    device_id: f.me,
+                    text: "hello".into(),
+                },
+            )],
+        );
+        assert!(context_row(&f, start).can_move, "in the replica");
+
+        // A refused one goes nowhere: it does not hold the move up.
+        let refused = send(&mut f, sid, "refused");
+        f.model.command_sending(refused.id, Utc::now());
+        f.model.command_result(
+            refused.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextChanged,
+            },
+            Utc::now(),
+        );
+        assert!(context_row(&f, start).can_move);
+        // Nor does one to another context.
+        let walrus = ContextId::new();
+        f.log_in(sid, walrus, vec![started("velvet walrus", f.me)]);
+        send(&mut f, sid, "to walrus");
+        assert!(context_row(&f, start).can_move);
+    }
+
+    #[test]
+    fn a_move_refused_for_the_current_context_shows_failed_and_can_go() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let start = ContextId::first_of(sid);
+        f.log(sid, vec![message("fix it"), working()]);
+        f.open(sid);
+        let effects = f.dispatch(move_context(sid, start));
+        let [Effect::Enqueue(clear), Effect::Enqueue(moved), _] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        let fresh = context_of(clear);
+        f.model.command_sending(clear.id, Utc::now());
+        let seq = Seq(f.events.len() as u64 + 1);
+        f.model
+            .command_result(clear.id, CommandResult::Accepted { seq }, Utc::now());
+        f.log_stamped(sid, vec![(Some(clear.id), fresh, started("x", f.me))]);
+        // Another device switched back before the move arrived.
+        f.log(
+            sid,
+            vec![EventKind::ContextSwitched {
+                by: DeviceId::new(),
+            }],
+        );
+        let refused = Outgoing::Failed(FailReason::Rejected(RejectReason::ContextCurrent));
+        f.model.command_sending(moved.id, Utc::now());
+        f.model.command_result(
+            moved.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextCurrent,
+            },
+            Utc::now(),
+        );
+        assert_eq!(f.model.summary(sid).unwrap().context, start);
+        assert_eq!(f.session_view().context, start, "the replica's");
+        let row = context_row(&f, start);
+        assert_eq!(
+            (row.outgoing, row.discard_move, row.moved_to),
+            (Some(refused), Some(moved.id), None)
+        );
+        assert!(row.can_move, "a refused move can be asked again");
+        assert_eq!(
+            f.dispatch(Action::Discard(moved.id)),
+            [Effect::Withdraw {
+                id: moved.id,
+                draft: None
+            }]
+        );
+        let row = context_row(&f, start);
+        assert_eq!((row.outgoing, row.discard_move), (None, None));
     }
 }

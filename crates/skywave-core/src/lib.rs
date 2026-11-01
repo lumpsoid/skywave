@@ -72,6 +72,7 @@ pub use view::{
     Draft, Effort, Entry, ErrorInfo, FailReason, Link, LinkRejection, ListKind, ModelChoice,
     Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession,
     PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Screen, Seq, SessionId,
-    SessionListView, SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet,
-    SnippetId, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView,
+    TurnUsage, ViewState,
 };

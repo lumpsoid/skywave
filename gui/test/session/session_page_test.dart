@@ -1159,8 +1159,14 @@ void main() {
         contextId: 'c1',
         label: 'start · fix the test',
         current: false,
+        canMove: false,
       ),
-      ContextRow(contextId: 'c2', label: 'velvet walrus', current: true),
+      ContextRow(
+        contextId: 'c2',
+        label: 'velvet walrus',
+        current: true,
+        canMove: false,
+      ),
     ];
 
     Future<void> openMore(
@@ -1213,6 +1219,137 @@ void main() {
           action: ActionIntentSwitchContext(sessionId: 's1', contextId: 'c1'),
         ),
       ]);
+    });
+
+    const movable = [
+      ContextRow(
+        contextId: 'c1',
+        label: 'start · fix the test',
+        current: false,
+        canMove: true,
+      ),
+      ContextRow(
+        contextId: 'c2',
+        label: 'velvet walrus',
+        current: true,
+        canMove: false,
+        moveRefusal: 'can\'t move yet: it needs an answered turn',
+      ),
+    ];
+
+    testWidgets('moving asks first; cancelling sends nothing, confirming '
+        'sends the intent; a row that cannot move has no enabled action', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await openMore(
+        tester,
+        screenWith(contexts: movable, contextId: 'c2'),
+        sent,
+      );
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      final buttons = find.widgetWithText(TextButton, 'Move to new session');
+      expect(buttons, findsNWidgets(2));
+      expect(tester.widget<TextButton>(buttons.last).onPressed, isNull);
+      expect(tester.widget<TextButton>(buttons.first).onPressed, isNotNull);
+
+      await tester.tap(buttons.first);
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Move start · fix the test to a new session?'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Move to new session').first,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Move'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(
+          action: ActionIntentMoveContext(sessionId: 's1', contextId: 'c1'),
+        ),
+      ]);
+    });
+
+    testWidgets('a moved row names where it went and Open opens that '
+        'session; Switch is not offered', (tester) async {
+      final sent = <GuiIntent>[];
+      await openMore(
+        tester,
+        screenWith(
+          contexts: const [
+            ContextRow(
+              contextId: 'c1',
+              label: 'start',
+              current: false,
+              canMove: false,
+              movedToSessionId: 's2',
+              movedLabel: 'moved → “forked”',
+            ),
+            ContextRow(
+              contextId: 'c2',
+              label: 'velvet walrus',
+              current: true,
+              canMove: false,
+            ),
+          ],
+          contextId: 'c2',
+        ),
+        sent,
+      );
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      expect(find.text('moved → “forked”'), findsOneWidget);
+      expect(find.text('Switch'), findsNothing);
+      expect(find.text('Move to new session'), findsOneWidget, reason: 'c2');
+      await tester.tap(find.text('Open'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentOpenSession(sessionId: 's2')),
+      ]);
+    });
+
+    testWidgets('Discard move sends Discard with the command, only on a row '
+        'that has one', (tester) async {
+      final sent = <GuiIntent>[];
+      await openMore(
+        tester,
+        screenWith(
+          contexts: const [
+            ContextRow(
+              contextId: 'c1',
+              label: 'start',
+              current: true,
+              canMove: false,
+              discardMove: 'cmd-1',
+            ),
+          ],
+        ),
+        sent,
+      );
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      expect(find.text('Discard move'), findsOneWidget);
+      await tester.tap(find.text('Discard move'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentDiscard(commandId: 'cmd-1')),
+      ]);
+    });
+
+    testWidgets('a row without a queued move offers no Discard move', (
+      tester,
+    ) async {
+      await openMore(tester, screenWith(contexts: two, contextId: 'c2'), []);
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      expect(find.text('Discard move'), findsNothing);
     });
 
     testWidgets('viewing another context sends it, the current one shows '

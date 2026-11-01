@@ -165,6 +165,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE approvals ADD COLUMN context TEXT NOT NULL DEFAULT '';
     UPDATE approvals SET context = session_id;
     "#,
+    // v8: moving a context into a new session (protocol v10). Both columns
+    // are NULL for every context that exists before it.
+    r#"
+    -- The context this one continues (SessionCreated.from): its conversation
+    -- is forked on the context's first start, until it has a handle of its own.
+    ALTER TABLE contexts ADD COLUMN origin TEXT REFERENCES contexts (id);
+    -- The session a ContextMoved sent the context to; set, it is never current
+    -- or started again.
+    ALTER TABLE contexts ADD COLUMN moved_to TEXT REFERENCES sessions (id);
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -475,6 +485,62 @@ mod tests {
                 )],
             ]
         );
+        assert_eq!(db.context_stamp_violations().unwrap(), Vec::<String>::new());
+    }
+
+    /// A v7 database, from before moving contexts, gains `contexts.origin`
+    /// and `contexts.moved_to`, NULL for every context it has.
+    #[test]
+    fn v8_adds_origin_and_moved_to_to_every_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let (a, c) = (
+            "01920000-0000-7000-8000-00000000000a",
+            "01920000-0000-7000-8000-00000000000c",
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..7] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7).unwrap();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO sessions (id, workdir, current_context) VALUES ('{a}', '/w/a', '{c}');
+                INSERT INTO contexts (id, session_id, agent_state)
+                    VALUES ('{a}', '{a}', '{{"session":"agent-a"}}'), ('{c}', '{a}', NULL);
+                "#
+            ))
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT id, session_id, agent_state, origin, moved_to FROM contexts ORDER BY rowid",
+            )
+            .unwrap();
+        let rows: Vec<[Option<String>; 5]> = stmt
+            .query_map([], |r| {
+                Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?])
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            rows,
+            [
+                [s(a), s(a), s(r#"{"session":"agent-a"}"#), None, None],
+                [s(c), s(a), None, None, None],
+            ]
+        );
+        let current: String = db
+            .conn()
+            .query_row("SELECT current_context FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(current, c);
         assert_eq!(db.context_stamp_violations().unwrap(), Vec::<String>::new());
     }
 

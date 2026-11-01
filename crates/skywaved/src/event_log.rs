@@ -16,8 +16,9 @@
 //!   (`UserMessage`, `ApprovalResolved`, `TurnInterrupted`, `SessionStopped`,
 //!   `SessionRenamed`, `SessionArchived`, `SessionCreated`,
 //!   `PermissionModeRequested`, `ModelRequested`, `EffortRequested`,
-//!   `ContextStarted`, `ContextSwitched`),
-//!   so it follows the log with [`EventLog::subscribe`] and
+//!   `ContextStarted`, `ContextSwitched`, `ContextMoved`; a `MoveContext`
+//!   also logs the new session's `SessionCreated` right before its own
+//!   event), so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
 //! The wake-up notifier is in-process: only writers holding this
@@ -212,7 +213,8 @@ impl EventLog {
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::ContextStarted { .. }
-            | EventKind::ContextSwitched { .. } => {
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -404,15 +406,23 @@ pub(crate) fn append_in(
     ])?;
 
     match kind {
-        // The sessions row first: the contexts row refers to it.
-        EventKind::SessionCreated { workdir, .. } => {
+        // The sessions row first: the contexts row refers to it. A moved
+        // context's new session continues the context it came from.
+        EventKind::SessionCreated { workdir, from, .. } => {
             conn.execute(
                 "INSERT INTO sessions (id, workdir, current_context) VALUES (?1, ?2, ?3)",
                 params![session, workdir, context],
             )?;
             conn.execute(
-                "INSERT INTO contexts (id, session_id) VALUES (?1, ?2)",
-                params![context, session],
+                "INSERT INTO contexts (id, session_id, origin) VALUES (?1, ?2, ?3)",
+                params![context, session, from.map(|r| r.context.0.to_string())],
+            )?;
+        }
+        // Logged after the new session's `SessionCreated`, so its row exists.
+        EventKind::ContextMoved { to, .. } => {
+            conn.execute(
+                "UPDATE contexts SET moved_to = ?2 WHERE id = ?1",
+                params![context, to.0.to_string()],
             )?;
         }
         EventKind::ContextStarted { .. } => {
@@ -565,6 +575,45 @@ pub(crate) fn context_session_in(conn: &Connection, id: ContextId) -> Result<Opt
     session.as_deref().map(parse_id).transpose()
 }
 
+/// What the server knows about one session context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextRow {
+    pub session_id: SessionId,
+    /// The context this one continues (`SessionCreated::from`), of another
+    /// session; `None` for a context that started afresh.
+    pub origin: Option<ContextId>,
+    /// The session a `ContextMoved` sent it on as; set, it is never current
+    /// or started here again.
+    pub moved_to: Option<SessionId>,
+    /// The agent stored a resume handle for it, so it has a conversation to
+    /// continue. Every context the log shows with a turn has one: the
+    /// adapters store the handle before `AgentWorking` is logged.
+    pub has_handle: bool,
+}
+
+/// Context `id` as the server has it; `None` if it is no context of any
+/// session.
+pub(crate) fn context_in(conn: &Connection, id: ContextId) -> Result<Option<ContextRow>> {
+    let row: Option<(String, Option<String>, Option<String>, bool)> = conn
+        .prepare_cached(
+            "SELECT session_id, origin, moved_to, agent_state IS NOT NULL
+             FROM contexts WHERE id = ?1",
+        )?
+        .query_row([id.0.to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    row.map(|(session, origin, moved_to, has_handle)| {
+        Ok(ContextRow {
+            session_id: parse_id(&session)?,
+            origin: origin.as_deref().map(parse_id).transpose()?,
+            moved_to: moved_to.as_deref().map(parse_id).transpose()?,
+            has_handle,
+        })
+    })
+    .transpose()
+}
+
 /// What the log says of one approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ApprovalRow {
@@ -641,6 +690,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortRefused { .. } => "EffortRefused",
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
+        EventKind::ContextMoved { .. } => "ContextMoved",
     }
 }
 

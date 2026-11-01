@@ -33,9 +33,14 @@ The spec needs no change.
 claude -p \
   --input-format stream-json --output-format stream-json --verbose \
   --permission-prompt-tool stdio \
-  [--session-id <uuid> | --resume <uuid>] \
+  [--session-id <uuid> | --resume <uuid> |
+   --resume <parent> --fork-session --session-id <uuid>] \
   [--include-partial-messages] [--model <m>]
 ```
+
+skywaved starts a fresh context with `--session-id`, a restart with
+`--resume`, and a context forked from another's conversation with
+`--resume <parent> --fork-session --session-id <new uuid>` (§5).
 
 - `--verbose` is **required**. Without it the CLI exits 1 with
   `Error: When using --print, --output-format=stream-json requires --verbose`. **[C]**
@@ -722,8 +727,21 @@ same process, with the same session id.
   `total_cost_usd` and `modelUsage` include A's, while
   `model_usage_since_last_result` holds only B's turn, so the adapter's
   per-turn cost (§2.5) needs no change. Resuming or forking from a different
-  cwd is still **[U]**. Moving a context to a new session (planned)
-  starts the new session's first context this way.
+  cwd is still **[U]**. Moving a context to a new session starts the new
+  session's first context this way: the adapter mints B as for a fresh
+  start and reports `{"session_id":"B"}` with the first turn, so a fork
+  stopped before any message reports no handle and its next start forks
+  again under another new id.
+- Forking an unknown parent fails like resuming one. **[C]** (probe,
+  CLI 2.1.310, 2026-11-01: `--resume 00000000-0000-0000-0000-000000000000
+  --fork-session --session-id <B>`, stdin closed, in an empty scratch dir.)
+  stderr is `No conversation found with session ID:
+  00000000-0000-0000-0000-000000000000` (the parent's id), stdout one
+  `result` with `subtype:"error_during_execution"`, `num_turns:0`,
+  `total_cost_usd:0`, `errors:["No conversation found with session ID:
+  00000000-…"]` and `session_id` **B**, exit 1, before any model call. No
+  `~/.claude/projects/` directory was created for the scratch cwd, so a
+  failed fork leaves no B transcript behind.
 - Reusing an existing id with `--session-id` fails:
   `Error: Session ID <id> is already in use.`, exit 1. **[C]** So the first
   start uses `--session-id`, and every restart uses `--resume`.
@@ -776,8 +794,9 @@ notes above:
   message is written only after the turn's `result`. So each written message
   is exactly one turn, and the [U] CLI-side queueing (§7) is never relied on.
 - **`start` waits for the initialize reply.** A CLI that exits or reports an
-  error `result` before it is a start error; with `--resume` and
-  `No conversation found` in the error text, a resume error (§5). If a CLI
+  error `result` before it is a start error; with `--resume` (a restart
+  or a fork) and `No conversation found` in the error text, a resume
+  error (§5). If a CLI
   ever reports the unknown id only after the handshake, it surfaces as
   `Exited { error }` instead, which still marks the session errored.
 - **An error `tool_result` for a call whose approval is pending** (stdin

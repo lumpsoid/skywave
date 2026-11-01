@@ -16,7 +16,7 @@ use skywave_proto::{
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
-    FakeAgent, FakeInput, FakeScript, INTERRUPT_REASON, REFUSE_REASON, Step,
+    FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, REFUSE_REASON, Step,
 };
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
@@ -294,7 +294,7 @@ impl Fixture {
     /// The fake's record of a start in the session's first context.
     fn started(&self, resumed: bool) -> FakeInput {
         FakeInput::Started {
-            resumed,
+            conversation: fake_conversation(resumed),
             context: self.first(),
             grants: None,
         }
@@ -345,6 +345,15 @@ fn is_errored(kind: &EventKind) -> bool {
         kind,
         EventKind::SessionStateChanged(SessionState::Errored { .. })
     )
+}
+
+/// What the fake records for a start resumed or (`false`) fresh.
+fn fake_conversation(resumed: bool) -> FakeConversation {
+    if resumed {
+        FakeConversation::Resume
+    } else {
+        FakeConversation::Fresh
+    }
 }
 
 fn approval_script() -> FakeScript {
@@ -880,7 +889,7 @@ async fn stop_without_a_running_agent_does_nothing() {
 /// nothing of: started outside the supervisor and given a message, so no
 /// handle is stored and the supervisor's fresh start of `context` fails.
 async fn converse_elsewhere(agent: &FakeAgent, f: &Fixture, context: ContextId) {
-    use skywaved::agent::{AgentAdapter, AgentSession, StartSpec};
+    use skywaved::agent::{AgentAdapter, AgentSession, Conversation, StartSpec};
     let workdir = f
         .log
         .session(&f.storage.db, f.session_id)
@@ -892,7 +901,7 @@ async fn converse_elsewhere(agent: &FakeAgent, f: &Fixture, context: ContextId) 
             session_id: f.session_id,
             context,
             workdir: workdir.into(),
-            resume: None,
+            conversation: Conversation::Fresh,
             grants: None,
             mode: None,
             model: None,
@@ -1559,7 +1568,7 @@ async fn a_blank_model_is_refused() {
 
 fn started_in(context: ContextId, resumed: bool) -> FakeInput {
     FakeInput::Started {
-        resumed,
+        conversation: fake_conversation(resumed),
         context,
         grants: None,
     }
@@ -1969,6 +1978,302 @@ async fn a_context_started_for_a_setting_leaves_no_handle_and_starts_fresh_for_i
 }
 
 // ---------------------------------------------------------------------------
+// Moved contexts: the new session forks the moved context's conversation
+
+/// Moves the session's `context` into a new session; the `ContextMoved`'s
+/// seq and the new session.
+fn move_context(f: &mut Fixture, context: ContextId) -> (Seq, SessionId) {
+    let seq = accepted(f.handle(
+        DeviceId::new(),
+        CommandKind::MoveContext {
+            session_id: f.session_id,
+            context,
+            name: "moved".into(),
+        },
+    ));
+    let event = f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0].clone();
+    match event.kind {
+        EventKind::ContextMoved { to, .. } => (seq, to),
+        other => panic!("expected ContextMoved, got {other:?}"),
+    }
+}
+
+/// Sends `text` in session `session`'s first context.
+fn send_in(f: &mut Fixture, session: SessionId, text: &str) -> Seq {
+    accepted(f.handle(
+        DeviceId::new(),
+        CommandKind::SendMessage {
+            session_id: session,
+            context: ContextId::first_of(session),
+            text: text.into(),
+        },
+    ))
+}
+
+/// Session `session`'s whole log, with seqs.
+fn events_in(f: &Fixture, session: SessionId) -> Vec<(Seq, Event)> {
+    let batch = f.log.read(&f.storage.db, Seq::ZERO, 5000).unwrap();
+    (batch.from.0..)
+        .map(Seq)
+        .zip(batch.events)
+        .filter(|(_, e)| e.session_id == session)
+        .collect()
+}
+
+/// Waits until session `session` has `n` `Idle`s.
+async fn wait_idle_in(f: &Fixture, session: SessionId, n: usize) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let head = f.log.head();
+        let events = events_in(f, session);
+        if events.iter().filter(|(_, e)| is_idle(&e.kind)).count() >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {n} idle in {session:?}; log: {events:#?}"
+        );
+        f.log.wait_after(head, WAIT).await;
+    }
+}
+
+/// Every start the fake recorded for session `session`, in order.
+fn starts_in(agent: &FakeAgent, session: SessionId) -> Vec<FakeInput> {
+    agent
+        .inputs(session)
+        .into_iter()
+        .filter(|i| matches!(i, FakeInput::Started { .. }))
+        .collect()
+}
+
+/// The fake's record of a start of `context` in `conversation`.
+fn started_as(context: ContextId, conversation: FakeConversation) -> FakeInput {
+    FakeInput::Started {
+        conversation,
+        context,
+        grants: None,
+    }
+}
+
+#[tokio::test]
+async fn a_context_moved_mid_turn_is_stopped_and_forked_by_its_new_session() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let gate = Gate::new();
+    // Turns run per session: each session's first message gets the first.
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([Step::text("first")])
+            .turn([Step::Wait(gate.clone())]),
+    );
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("A's reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    // Logged before the supervisor runs again, so it reaches the clear with
+    // A's turn owed and the move already logged: the stopped agent's
+    // events come after the move. The new session's message is logged too,
+    // so the supervisor alone orders its start after the source's stop.
+    f.send("two");
+    let marker = f.clear(b);
+    let (moved, new) = move_context(&mut f, a);
+    let forked = ContextId::first_of(new);
+    let to_new = send_in(&mut f, new, "in new");
+    assert_eq!(to_new, moved.next(), "nothing ran in between");
+    let supervisor = f.start(&agent).await;
+    wait_idle_in(&f, new, 1).await;
+
+    // A's agent was resumed for its message, interrupted and stopped.
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("one"),
+            FakeInput::Shutdown,
+            f.started(true),
+            message("two"),
+            FakeInput::Interrupt,
+            FakeInput::Shutdown,
+        ]
+    );
+    // Its late turn events land in the source after the move, stamped with
+    // the moved context, and leave the source idle.
+    let after = f.stamped_after(marker);
+    assert!(
+        matches!(
+            &after[..],
+            [
+                (EventKind::ContextMoved { to, .. }, at_move),
+                (EventKind::SessionStateChanged(SessionState::AgentWorking), working),
+                (EventKind::SessionStateChanged(SessionState::Idle), idle),
+            ] if *to == new && [*at_move, *working, *idle] == [a, a, a]
+        ),
+        "{after:#?}"
+    );
+    assert_eq!(f.turn_context(), (false, None));
+
+    // The new session forked A's conversation, and only after A's agent had
+    // stopped: its first agent event comes after A's last.
+    assert_eq!(
+        agent.inputs(new),
+        [
+            started_as(forked, FakeConversation::Fork(a)),
+            message("in new")
+        ]
+    );
+    let source_idle = f.events_after(marker).last().unwrap().0;
+    let new_events = events_in(&f, new);
+    let kinds: Vec<_> = new_events
+        .iter()
+        .map(|(_, e)| (e.kind.clone(), e.context))
+        .collect();
+    assert!(
+        matches!(
+            &kinds[..],
+            [
+                (EventKind::SessionCreated { from: Some(from), .. }, _),
+                (EventKind::UserMessage { .. }, _),
+                (EventKind::SessionStateChanged(SessionState::AgentWorking), _),
+                (EventKind::AgentMessage { text }, _),
+                (EventKind::SessionStateChanged(SessionState::Idle), _),
+            ] if from.session == f.session_id && from.context == a && text == "first"
+        ),
+        "{kinds:#?}"
+    );
+    assert!(kinds.iter().all(|(_, context)| *context == forked));
+    assert!(
+        source_idle < new_events[2].0,
+        "A stopped before the fork ran"
+    );
+    // The copy is the new context's own conversation.
+    assert_eq!(
+        handle_of(&f, forked),
+        Some(FakeAgent::resume_handle(forked))
+    );
+    assert_eq!(handle_of(&f, a), Some(FakeAgent::resume_handle(a)));
+
+    // A restart of the new session resumes its own conversation, not the
+    // origin's again.
+    supervisor.shutdown().await.unwrap();
+    gate.open();
+    let supervisor = f.start(&agent).await;
+    send_in(&mut f, new, "again");
+    wait_idle_in(&f, new, 2).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts_in(&agent, new),
+        [
+            started_as(forked, FakeConversation::Fork(a)),
+            started_as(forked, FakeConversation::Resume),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_new_session_started_for_a_setting_forks_again_for_its_message() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new());
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+    f.send("one");
+    f.wait_count("A's reply", 1, is_idle).await;
+    f.clear(ContextId::new());
+    let (_, new) = move_context(&mut f, a);
+    let forked = ContextId::first_of(new);
+
+    // A setting request starts the new session with no message; the idle
+    // agent is stopped at once, before its copy has a handle.
+    f.command(CommandKind::SetPermissionMode {
+        session_id: new,
+        mode: PermissionMode::Plan,
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !agent.inputs(new).contains(&FakeInput::Shutdown) {
+        assert!(tokio::time::Instant::now() < deadline, "not shut down");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(handle_of(&f, forked), None, "no handle before a message");
+
+    send_in(&mut f, new, "in new");
+    wait_idle_in(&f, new, 1).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts_in(&agent, new),
+        [
+            started_as(forked, FakeConversation::Fork(a)),
+            started_as(forked, FakeConversation::Fork(a)),
+        ]
+    );
+    assert_eq!(
+        handle_of(&f, forked),
+        Some(FakeAgent::resume_handle(forked))
+    );
+}
+
+#[tokio::test]
+async fn a_new_session_whose_origin_lost_its_handle_does_not_start_fresh() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("A's reply", 1, is_idle).await;
+    f.clear(ContextId::new());
+    let (_, new) = move_context(&mut f, a);
+    let forked = ContextId::first_of(new);
+    // Validation moves only a context with a handle; force it away.
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE contexts SET agent_state = NULL WHERE id = ?1",
+            [a.0.to_string()],
+        )
+        .unwrap();
+
+    let sent = send_in(&mut f, new, "in new");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let errored = loop {
+        let head = f.log.head();
+        let after: Vec<_> = events_in(&f, new)
+            .into_iter()
+            .filter(|(seq, _)| *seq > sent)
+            .collect();
+        if let Some((_, event)) = after.first() {
+            break event.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no answer");
+        f.log.wait_after(head, WAIT).await;
+    };
+    assert!(
+        matches!(
+            &errored.kind,
+            EventKind::SessionStateChanged(SessionState::Errored { message })
+                if message.contains("no conversation to continue")
+        ),
+        "{errored:#?}"
+    );
+    assert_eq!(errored.context, forked);
+    assert_eq!(agent.inputs(new), [], "no start at all, fresh or not");
+
+    // Positive control: with the origin's handle back, the same message
+    // forks it.
+    skywaved::agent::store_resume_handle(&f.storage.db, a, &FakeAgent::resume_handle(a)).unwrap();
+    send_in(&mut f, new, "again");
+    wait_idle_in(&f, new, 1).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts_in(&agent, new),
+        [started_as(forked, FakeConversation::Fork(a))]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Grants: per session, across its contexts
 
 fn grants(rules: serde_json::Value) -> skywaved::agent::Grants {
@@ -1985,7 +2290,7 @@ fn started_with(
     grants: Option<skywaved::agent::Grants>,
 ) -> FakeInput {
     FakeInput::Started {
-        resumed,
+        conversation: fake_conversation(resumed),
         context,
         grants,
     }
