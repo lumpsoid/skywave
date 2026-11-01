@@ -247,6 +247,17 @@ pub struct ContextRow {
     /// `queued`, `sending`, ...: this device's clear or switch making it
     /// current, while on its way.
     pub outgoing_label: Option<String>,
+    /// The session it was moved to, when it was.
+    pub moved_to_session_id: Option<String>,
+    /// `moved → “fix the flaky test”`; `None` for one not moved.
+    pub moved_label: Option<String>,
+    /// Offer "Move to new session".
+    pub can_move: bool,
+    /// Why it cannot move; `None` while it can, or once moved.
+    pub move_refusal: Option<String>,
+    /// The command to discard to drop this device's refused or untried move
+    /// of it.
+    pub discard_move: Option<String>,
 }
 
 /// A saved prompt, as the composer's picker lists it.

@@ -14,10 +14,8 @@
 //! reacts to
 //! - `UserMessage` → [`AgentSession::send_message`], starting the session's
 //!   agent for the message's context first if it is not running (lazily,
-//!   resumed with the context's stored
-//!   [`ResumeHandle`](crate::agent::ResumeHandle) when there is one, fresh
-//!   otherwise, and given the session's [`Grants`](crate::agent::Grants)
-//!   either way). An agent running another context is stopped first, like
+//!   and given the session's [`Grants`](crate::agent::Grants); for which
+//!   conversation, see **Conversations** below). An agent running another context is stopped first, like
 //!   on `SessionStopped`; validated commands never get there, since a
 //!   context change already stopped it;
 //! - `ApprovalResolved` → [`EventMapper::take_approval`] and
@@ -39,6 +37,12 @@
 //!   another context; nothing when it runs that context or none runs. The
 //!   new context is never started here: its next message or setting request
 //!   starts it, resumed with its handle or fresh.
+//! - `ContextMoved` (stamped with the moved context, in the session it
+//!   leaves) → what `SessionStopped` does, if the agent still runs the
+//!   moved context. It cannot: a context is moved only when not current,
+//!   and the change away from it already stopped its agent. The new
+//!   session's `SessionCreated { from }` needs nothing either; the new
+//!   session starts lazily like any other.
 //! - `PermissionModeRequested` / `ModelRequested` / `EffortRequested` →
 //!   [`AgentSession::set_permission_mode`] / [`AgentSession::set_model`] /
 //!   [`AgentSession::set_effort`], noted with the mapper so the agent's answer names the command. A
@@ -49,6 +53,20 @@
 //!   replaced before the supervisor reached it is skipped, so requests
 //!   never land out of order, and one the agent's start already asked for
 //!   is not asked again.
+//!
+//! **Conversations.** A context starts in its own conversation, resumed
+//! with its stored [`ResumeHandle`](crate::agent::ResumeHandle), once it has
+//! one. Before that, the first context of a session a context was moved
+//! into forks its origin's conversation ([`Conversation::Fork`] with the
+//! origin's handle) until its own copy reports a handle, so a start stopped
+//! before any message forks again; any other context starts fresh. An
+//! origin with no handle refuses the start, logged like any failed start,
+//! rather than starting fresh. The fork reads a finished conversation: the
+//! clear or switch before the move stopped the source's agent and waited
+//! for its exit (`stop_session` drains to `Exited`), and the supervisor
+//! handles one log event at a time, so that agent is gone before any event
+//! of the new session is handled. Its late events (the interrupted turn's
+//! `Idle`, its exit) stay in the source, stamped with the moved context.
 //!
 //! **Mode, model and effort.** Every agent starts with the mode, model and
 //! effort the session's log wants
@@ -128,8 +146,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, EventMapper, StartSpec,
-    bounded_models, load_grants, load_resume_handle,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, Conversation, EventMapper, StartSpec,
+    bounded_models, load_grants, load_origin, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -449,6 +467,20 @@ impl<A: AgentAdapter> Supervisor<A> {
                     self.stop_on_request(session_id).await?;
                 }
             }
+            EventKind::ContextMoved { .. } => {
+                // Stamped with the moved context, which is never current
+                // when it moves: the switch away from it already stopped
+                // its agent. If one still runs it, stop it rather than let
+                // it run a conversation the new session now continues.
+                if self
+                    .running
+                    .get(&session_id)
+                    .is_some_and(|running| running.context() == event.context)
+                {
+                    tracing::warn!(session = %session_id.0, "agent runs a moved context; stopping it");
+                    self.stop_on_request(session_id).await?;
+                }
+            }
             EventKind::PermissionModeRequested { mode, .. } => {
                 let setting = Setting::Mode(mode);
                 self.set(session_id, event.context, event.command_id, setting)
@@ -623,9 +655,9 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Starts the session's agent for `context`, resumed with the
-    /// context's handle when it has one, fresh otherwise. `Err` carries why
-    /// the agent could not start, for the log.
+    /// Starts the session's agent for `context`, in its [`Conversation`]
+    /// (see `conversation`). `Err` carries why the agent could not start, for
+    /// the log.
     ///
     /// `context` is the stamp of the event the start is for, not the
     /// session's current context: a switch logged after that event, and not
@@ -638,8 +670,18 @@ impl<A: AgentAdapter> Supervisor<A> {
         let Some(info) = self.log.session(&self.storage.db, session_id)? else {
             return Ok(Err(format!("unknown session {}", session_id.0)));
         };
-        let resume = load_resume_handle(&self.storage.db, context)?;
-        let resumed = resume.is_some();
+        let conversation = match conversation(&self.storage.db, context)? {
+            Ok(conversation) => conversation,
+            Err(message) => {
+                tracing::warn!(session = %session_id.0, %message, "agent not started");
+                return Ok(Err(message));
+            }
+        };
+        let how = match &conversation {
+            Conversation::Fresh => "fresh",
+            Conversation::Resume(_) => "resumed",
+            Conversation::Fork(_) => "forked",
+        };
         let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
@@ -651,7 +693,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             session_id,
             context,
             workdir: info.workdir.into(),
-            resume,
+            conversation,
             grants,
             mode,
             model: model.clone(),
@@ -659,7 +701,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
-                tracing::info!(session = %session_id.0, context = %context.0, resumed, "agent started");
+                tracing::info!(session = %session_id.0, context = %context.0, conversation = how, "agent started");
                 let mut mapper = EventMapper::new(session_id, context, settings.clone());
                 let mut asked = HashSet::new();
                 if let Some(mode) = mode {
@@ -868,6 +910,29 @@ fn run_thread<A: AgentAdapter>(
         }
     };
     runtime.block_on(supervisor.run(stop))
+}
+
+/// The conversation session context `context` starts in: its own, resumed
+/// with its handle; else, for the first context of a session a context was
+/// moved into, a fork of its origin's; else a fresh one. An origin without
+/// a handle is refused (`Err`, for the log) rather than started fresh,
+/// which would silently drop the conversation the context continues;
+/// command validation moves only a context with a handle, so this is a
+/// guard.
+fn conversation(db: &Db, context: ContextId) -> Result<Result<Conversation, String>> {
+    if let Some(handle) = load_resume_handle(db, context)? {
+        return Ok(Ok(Conversation::Resume(handle)));
+    }
+    let Some(origin) = load_origin(db, context)? else {
+        return Ok(Ok(Conversation::Fresh));
+    };
+    Ok(match load_resume_handle(db, origin)? {
+        Some(handle) => Ok(Conversation::Fork(handle)),
+        None => Err(format!(
+            "context {} has no conversation to continue",
+            origin.0
+        )),
+    })
 }
 
 /// A setting a device asked a session's agent for.

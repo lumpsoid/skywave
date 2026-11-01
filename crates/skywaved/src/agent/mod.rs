@@ -17,19 +17,23 @@
 //! approval request ids are opaque [`AgentRequestId`]s, and its resume state
 //! (for example its own session id) is an opaque [`ResumeHandle`] persisted
 //! per session context in `contexts.agent_state` with
-//! [`store_resume_handle`] / [`load_resume_handle`]. What the agent was
+//! [`store_resume_handle`] / [`load_resume_handle`]. A context moved into
+//! a new session leaves that session's first context its origin
+//! ([`load_origin`]), whose conversation the new one continues as a fork.
+//! What the agent was
 //! granted for the whole Skywave session (for example lasting permission
 //! rules) is opaque [`Grants`], persisted per session in
 //! `sessions.agent_grants` with [`store_grants`] / [`load_grants`] and given
 //! to every start of every context of that session.
 //!
 //! **Protocol between supervisor and session.**
-//! - [`AgentAdapter::start`] with `resume: None` starts a fresh agent session;
-//!   with the stored handle it resumes one after a restart. The adapter
-//!   reports the handle to persist as [`AdapterEvent::ResumeHandle`] once
-//!   the context's conversation exists and before the first turn ends; a
-//!   process stopped before any message reports none, so the context's next
-//!   start is fresh too. `spec.grants` are the session's grants; when they
+//! - [`AgentAdapter::start`] runs the [`Conversation`] in `spec`: a fresh
+//!   one, the context's own resumed with its stored handle, or a fork of
+//!   the origin's. The adapter reports the handle to persist as
+//!   [`AdapterEvent::ResumeHandle`] once the context's conversation exists
+//!   and before the first turn ends (for a fork, the copy's handle, as for
+//!   a fresh start); a process stopped before any message reports none, so
+//!   the context's next start is fresh (or a fork) again. `spec.grants` are the session's grants; when they
 //!   change the adapter reports the whole new set as
 //!   [`AdapterEvent::Grants`].
 //! - A turn begins with a user message and ends with exactly one
@@ -81,6 +85,7 @@ use tokio::sync::mpsc;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::event_log::parse_id;
 
 pub use mapper::EventMapper;
 pub(crate) use mapper::bounded_models;
@@ -174,18 +179,31 @@ pub struct ResumeHandle(pub serde_json::Value);
 #[serde(transparent)]
 pub struct Grants(pub serde_json::Value);
 
+/// Which conversation a starting agent runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Conversation {
+    /// A new, empty conversation.
+    Fresh,
+    /// The context's own conversation, from its handle.
+    Resume(ResumeHandle),
+    /// A copy of another conversation (the handle of the context this one
+    /// continues), which becomes this context's own: the adapter reports
+    /// the new conversation's handle as for a fresh start.
+    Fork(ResumeHandle),
+}
+
 /// How to start an agent session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartSpec {
     pub session_id: SessionId,
     /// The session context the agent runs in. For logging and the fake's
     /// keying only: adapters must not interpret it (the context's
-    /// conversation is `resume`).
+    /// conversation is `conversation`).
     pub context: ContextId,
     /// Canonical working directory of the session (D14); the agent runs here.
     pub workdir: PathBuf,
-    /// The handle stored for `context`, to resume it; `None` starts fresh.
-    pub resume: Option<ResumeHandle>,
+    /// The conversation to run in `context`.
+    pub conversation: Conversation,
     /// The grants stored for the session, whichever context starts; `None`
     /// until the agent has reported any.
     pub grants: Option<Grants>,
@@ -314,8 +332,11 @@ pub enum AgentError {
 pub trait AgentAdapter: Send + Sync + 'static {
     type Session: AgentSession;
 
-    /// Starts (or, with `spec.resume`, resumes) the agent for one session and
-    /// returns the session with its event stream.
+    /// Starts the agent for one session in `spec.conversation` (fresh,
+    /// resumed or forked) and returns the session with its event stream.
+    /// An unusable handle to resume or fork fails with
+    /// [`AgentError::Resume`]; an adapter that cannot fork fails a fork
+    /// with [`AgentError::Start`].
     fn start(
         &self,
         spec: StartSpec,
@@ -392,6 +413,21 @@ pub fn load_resume_handle(db: &Db, context: ContextId) -> Result<Option<ResumeHa
     match row {
         None => Err(Error::UnknownContext(context)),
         Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
+    }
+}
+
+/// The context of another session that session context `context`
+/// continues, its origin: set on the first context of a session a context
+/// was moved into, `None` for any other.
+pub fn load_origin(db: &Db, context: ContextId) -> Result<Option<ContextId>> {
+    let row: Option<Option<String>> = db
+        .conn()
+        .prepare_cached("SELECT origin FROM contexts WHERE id = ?1")?
+        .query_row([context.0.to_string()], |r| r.get(0))
+        .optional()?;
+    match row {
+        None => Err(Error::UnknownContext(context)),
+        Some(id) => Ok(id.as_deref().map(parse_id).transpose()?),
     }
 }
 

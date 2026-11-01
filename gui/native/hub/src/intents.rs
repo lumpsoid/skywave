@@ -46,6 +46,13 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             session_id: id("session", &session_id)?,
             context: id("context", &context_id)?,
         },
+        ActionIntent::MoveContext {
+            session_id,
+            context_id,
+        } => Action::MoveContext {
+            session_id: id("session", &session_id)?,
+            context: id("context", &context_id)?,
+        },
         ActionIntent::ViewContext {
             session_id,
             context_id,

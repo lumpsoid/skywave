@@ -18,9 +18,9 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay,
-    ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome,
-    TurnUsage,
+    BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice, PermissionMode,
+    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind,
+    TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -95,6 +95,18 @@ fn replay_any_version(
     dropped: &[usize],
     strict: bool,
 ) -> (Vec<AdapterEvent>, Option<String>) {
+    replay_records(name, fixture(name), session_id, resumed, dropped, strict)
+}
+
+/// [`replay_any_version`] of `records`, taken from fixture `name`.
+fn replay_records(
+    name: &str,
+    records: Vec<Value>,
+    session_id: Uuid,
+    resumed: bool,
+    dropped: &[usize],
+    strict: bool,
+) -> (Vec<AdapterEvent>, Option<String>) {
     let mut protocol = Protocol::new(session_id, resumed);
     let start = protocol.start();
     let mut events = start.events;
@@ -104,7 +116,7 @@ fn replay_any_version(
     let mut offers: HashMap<String, Value> = HashMap::new();
     // The id of each of our control requests, by the recorded one.
     let mut our_ids: HashMap<String, String> = HashMap::new();
-    for record in fixture(name) {
+    for record in records {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
             "in" => {
@@ -482,6 +494,82 @@ fn replay_usage_is_per_turn_across_turns_and_a_resume() {
     let (resume, costs) = usages(&replay("resume", uuid(BASIC_SESSION), true, &[]));
     assert_eq!(resume, [haiku_turn(1471, 2 + 19_310 + 90, 14)]);
     assert_costs(&costs, &[third]);
+}
+
+/// The argv and records of each CLI process in fixture `name`, in order:
+/// each starts at an `argv: ` note.
+fn processes(name: &str) -> Vec<(String, Vec<Value>)> {
+    let mut processes: Vec<(String, Vec<Value>)> = Vec::new();
+    for record in fixture(name) {
+        match record["text"]
+            .as_str()
+            .and_then(|t| t.strip_prefix("argv: "))
+        {
+            Some(argv) => processes.push((argv.to_owned(), Vec::new())),
+            None => processes
+                .last_mut()
+                .unwrap_or_else(|| panic!("{name}: a record before any argv"))
+                .1
+                .push(record),
+        }
+    }
+    processes
+}
+
+/// The id after `flag` in the recorded `argv`.
+fn flag_id(argv: &str, flag: &str) -> Uuid {
+    uuid(
+        argv.split(' ')
+            .skip_while(|a| *a != flag)
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {flag} in {argv}")),
+    )
+}
+
+#[test]
+fn replay_a_fork_runs_as_its_new_session_id_and_reports_it() {
+    const NAME: &str = "fork";
+    let processes = processes(NAME);
+    let (parent_argv, _) = &processes[0];
+    let (argv, records) = processes[1].clone();
+    assert!(argv.contains(" --fork-session "), "{argv}");
+    let (parent, fork) = (flag_id(&argv, "--resume"), flag_id(&argv, "--session-id"));
+    assert_eq!(flag_id(parent_argv, "--session-id"), parent);
+    assert_ne!(parent, fork);
+
+    // The CLI runs as the fork's id, never naming the parent.
+    let inits: Vec<&str> = records
+        .iter()
+        .filter(|r| r["msg"]["type"] == "system" && r["msg"]["subtype"] == "init")
+        .map(|r| r["msg"]["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(inits, [fork.to_string()]);
+
+    // So a process started as for a fresh session `fork` reports that
+    // handle once, with the first turn.
+    let totals: Vec<f64> = records
+        .iter()
+        .filter(|r| r["dir"] == "out" && r["msg"]["type"] == "result")
+        .map(|r| r["msg"]["total_cost_usd"].as_f64().unwrap())
+        .collect();
+    let (events, version) = replay_records(NAME, records, fork, false, &[], false);
+    assert_eq!(version.as_deref(), Some(PINNED_VERSION));
+    assert_eq!(
+        describe(&events),
+        [
+            format!("resume handle: {fork}"),
+            "turn started".to_owned(),
+            "text: PELICAN. OTTER is noted.".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+        ]
+    );
+
+    // The CLI's total carries the parent's spend; the turn's cost is the
+    // fork's own.
+    assert_costs(&[totals.first().copied()], &[0.0022982]);
+    let (_, costs) = usages(&events);
+    assert_costs(&costs, &[0.00086901]);
 }
 
 #[test]
@@ -1420,13 +1508,13 @@ fn adapter() -> ClaudeCodeAdapter {
     .with_grace_period(Duration::from_secs(5))
 }
 
-fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
+fn spec(workdir: &Path, conversation: Conversation) -> StartSpec {
     let session_id = SessionId::new();
     StartSpec {
         session_id,
         context: ContextId::first_of(session_id),
         workdir: workdir.to_owned(),
-        resume,
+        conversation,
         grants: None,
         mode: None,
         model: None,
@@ -1565,7 +1653,10 @@ const INTERRUPTED: AdapterEvent = AdapterEvent::TurnEnded(TurnOutcome::Interrupt
 #[tokio::test]
 async fn a_session_runs_turns_approvals_and_interrupts() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
 
     // The handle comes with the first turn, and names the --session-id.
     session.send_message("hello".to_owned()).await.unwrap();
@@ -1703,7 +1794,10 @@ async fn a_restart_resumes_with_the_handle_and_the_sessions_grants() {
     let (grants, flags) = session_rules();
     let spec = StartSpec {
         grants: Some(grants),
-        ..spec(tmp.path(), Some(protocol::resume_handle(id)))
+        ..spec(
+            tmp.path(),
+            Conversation::Resume(protocol::resume_handle(id)),
+        )
     };
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
@@ -1733,7 +1827,7 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
     let (grants, flags) = session_rules();
     let spec = StartSpec {
         grants: Some(grants),
-        ..spec(tmp.path(), None)
+        ..spec(tmp.path(), Conversation::Fresh)
     };
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
     session.send_message("hello".to_owned()).await.unwrap();
@@ -1759,7 +1853,10 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
 #[tokio::test]
 async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
     let tmp = tempfile::tempdir().unwrap();
-    let (session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     let first = session_id_arg(tmp.path());
     session.shutdown().await.unwrap();
     // Nothing between the start and the exit: the CLI holds no
@@ -1772,7 +1869,10 @@ async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
 
     // So the context's next start is fresh again, with a new id; with a
     // message, that one does report its handle.
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     let second = session_id_arg(tmp.path());
     assert_ne!(first, second);
     session.send_message("hello".to_owned()).await.unwrap();
@@ -1794,7 +1894,7 @@ async fn an_old_handle_with_rules_still_resumes_without_granting_them() {
     let required: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
 
     let (session, _events) = adapter()
-        .start(spec(tmp.path(), Some(old.clone())))
+        .start(spec(tmp.path(), Conversation::Resume(old.clone())))
         .await
         .unwrap();
     assert_eq!(
@@ -1806,7 +1906,7 @@ async fn an_old_handle_with_rules_still_resumes_without_granting_them() {
     // Control: the same rules given as the session's grants are granted.
     let spec = StartSpec {
         grants: Some(grants),
-        ..spec(tmp.path(), Some(old))
+        ..spec(tmp.path(), Conversation::Resume(old))
     };
     let (session, _events) = adapter().start(spec).await.unwrap();
     let flags: Vec<String> = flags.map(str::to_owned).into();
@@ -1819,7 +1919,7 @@ async fn foreign_grants_are_a_start_error() {
     let tmp = tempfile::tempdir().unwrap();
     let spec = StartSpec {
         grants: Some(Grants(json!({ "fake": 1 }))),
-        ..spec(tmp.path(), None)
+        ..spec(tmp.path(), Conversation::Fresh)
     };
     let error = adapter().start(spec).await.unwrap_err();
     assert!(matches!(error, AgentError::Start(_)), "{error:?}");
@@ -1830,9 +1930,65 @@ async fn resuming_an_unknown_session_is_a_resume_error() {
     let tmp = tempfile::tempdir().unwrap();
     let handle = protocol::resume_handle(Uuid::nil());
     let error = adapter()
-        .start(spec(tmp.path(), Some(handle)))
+        .start(spec(tmp.path(), Conversation::Resume(handle)))
         .await
         .unwrap_err();
+    match error {
+        AgentError::Resume(message) => {
+            assert!(message.contains("No conversation found"), "{message}")
+        }
+        other => panic!("expected a resume error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_fork_resumes_its_parent_under_a_new_session_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = Uuid::new_v4();
+    let (mut session, mut events) = adapter()
+        .start(spec(
+            tmp.path(),
+            Conversation::Fork(protocol::resume_handle(parent)),
+        ))
+        .await
+        .unwrap();
+    let fork = session_id_arg(tmp.path());
+    assert_ne!(fork, parent);
+    let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+    expected.extend(
+        [
+            "--resume",
+            &parent.to_string(),
+            "--fork-session",
+            "--session-id",
+            &fork.to_string(),
+            "--model",
+            "haiku",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(argv(tmp.path()), expected);
+
+    // The fork's handle comes with its first turn, as a fresh one's does.
+    session.send_message("hello".to_owned()).await.unwrap();
+    assert_eq!(handle_then_turn(&mut events).await, fork);
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[tokio::test]
+async fn forking_an_unknown_parent_is_a_resume_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let handle = protocol::resume_handle(Uuid::nil());
+    let error = adapter()
+        .start(spec(tmp.path(), Conversation::Fork(handle)))
+        .await
+        .unwrap_err();
+    assert!(argv(tmp.path()).contains(&"--fork-session".to_owned()));
     match error {
         AgentError::Resume(message) => {
             assert!(message.contains("No conversation found"), "{message}")
@@ -1846,7 +2002,7 @@ async fn a_foreign_resume_handle_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let handle = ResumeHandle(json!({ "fake_session": "x" }));
     let error = adapter()
-        .start(spec(tmp.path(), Some(handle)))
+        .start(spec(tmp.path(), Conversation::Resume(handle)))
         .await
         .unwrap_err();
     assert!(matches!(error, AgentError::Resume(_)), "{error:?}");
@@ -1859,14 +2015,20 @@ async fn a_missing_command_is_a_start_error() {
         command: tmp.path().join("no-such-agent"),
         args: Vec::new(),
     });
-    let error = adapter.start(spec(tmp.path(), None)).await.unwrap_err();
+    let error = adapter
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap_err();
     assert!(matches!(error, AgentError::Start(_)), "{error:?}");
 }
 
 #[tokio::test]
 async fn shutdown_after_an_interrupt_waits_for_the_result() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     session.send_message("hang".to_owned()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
@@ -1884,7 +2046,10 @@ async fn shutdown_after_an_interrupt_waits_for_the_result() {
 #[tokio::test]
 async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     session.send_message("approve".to_owned()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 2).await, [write_call(), write_approval()]);
@@ -1902,7 +2067,10 @@ async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
 #[tokio::test]
 async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     session.send_message("crash".to_owned()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(
@@ -1921,7 +2089,10 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
 #[tokio::test]
 async fn dropping_the_session_stops_the_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
     session.send_message("hang".to_owned()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
@@ -1938,7 +2109,7 @@ async fn dropping_the_session_stops_the_agent() {
 #[tokio::test]
 async fn a_session_starts_with_and_switches_its_mode_and_model() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut spec = spec(tmp.path(), None);
+    let mut spec = spec(tmp.path(), Conversation::Fresh);
     spec.mode = Some(PermissionMode::Plan);
     spec.model = Some("sonnet".to_owned());
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
@@ -2444,7 +2615,7 @@ fn a_strict_replay_fails_on_a_read_the_recording_lacks() {
 #[tokio::test]
 async fn a_session_starts_with_and_switches_its_effort() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut spec = spec(tmp.path(), None);
+    let mut spec = spec(tmp.path(), Conversation::Fresh);
     spec.model = Some("sonnet".to_owned());
     spec.effort = Some(Effort::High);
     let (mut session, mut events) = adapter().start(spec).await.unwrap();

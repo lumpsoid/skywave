@@ -21,7 +21,9 @@ use skywave_core::{
     ListKind, OutboxEntry, OutboxStatus, Screen, Seam, SessionRow, SessionView, TimelineItem,
     TransportConfig, ViewState,
 };
-use skywave_proto::{CommandId, CommandKind, CommandResult, Event, EventKind, Seq, SessionId};
+use skywave_proto::{
+    CommandId, CommandKind, CommandResult, ContextRef, Event, EventKind, Seq, SessionId,
+};
 use skywaved::agent::fake::FakeAgent;
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing;
@@ -520,7 +522,8 @@ pub fn assert_same_log(server: &[Event], local: &[(Seq, Event)]) {
 
 /// Ground truth for D7 across `clients`: the server stored exactly one
 /// result per command made, the one each device recorded; every accepted
-/// command's seq names its own event; nothing else reached the log.
+/// command's seq names its own event; nothing else reached the log but the
+/// new session's `SessionCreated` right before each move's `ContextMoved`.
 pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     let events = daemon.events();
     let results = daemon.command_results();
@@ -612,6 +615,33 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     assert_eq!(events[(seq.0 - 1) as usize].context, *context);
                     "ContextSwitched"
                 }
+                (
+                    CommandKind::MoveContext {
+                        session_id,
+                        context,
+                        ..
+                    },
+                    EventKind::ContextMoved { to, by },
+                ) => {
+                    assert_eq!(by, &device);
+                    assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);
+                    assert_eq!(events[(seq.0 - 1) as usize].context, *context);
+                    // The new session comes right before, naming no command.
+                    let created = &events[(seq.0 - 2) as usize];
+                    assert_eq!(created.session_id, *to);
+                    assert_eq!(created.command_id, None);
+                    let from = ContextRef {
+                        session: *session_id,
+                        context: *context,
+                    };
+                    assert!(
+                        matches!(&created.kind, EventKind::SessionCreated { from: Some(r), .. } if *r == from),
+                        "seq {} holds {created:?}, not the moved context's session",
+                        seq.0 - 1
+                    );
+                    *accepted.entry("MovedSessionCreated").or_default() += 1;
+                    "ContextMoved"
+                }
                 (command, event) => panic!("seq {seq:?} holds {event:?}, not {command:?}"),
             };
             *accepted.entry(name).or_default() += 1;
@@ -621,12 +651,14 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     let logged = |name: &str| {
         count(&events, |k| {
             name == match k {
-                EventKind::SessionCreated { .. } => "SessionCreated",
+                EventKind::SessionCreated { from: None, .. } => "SessionCreated",
+                EventKind::SessionCreated { from: Some(_), .. } => "MovedSessionCreated",
                 EventKind::UserMessage { .. } => "UserMessage",
                 EventKind::ApprovalResolved { .. } => "ApprovalResolved",
                 EventKind::TurnInterrupted => "TurnInterrupted",
                 EventKind::ContextStarted { .. } => "ContextStarted",
                 EventKind::ContextSwitched { .. } => "ContextSwitched",
+                EventKind::ContextMoved { .. } => "ContextMoved",
                 _ => "",
             }
         })
@@ -638,6 +670,8 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
         "TurnInterrupted",
         "ContextStarted",
         "ContextSwitched",
+        "ContextMoved",
+        "MovedSessionCreated",
     ] {
         assert_eq!(
             logged(name),

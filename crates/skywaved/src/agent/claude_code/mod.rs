@@ -7,25 +7,31 @@
 //! ```text
 //! <agent.command> -p --input-format stream-json --output-format stream-json \
 //!   --verbose --permission-prompt-tool stdio [<session rules>] \
-//!   (--session-id <uuid> | --resume <uuid>) <agent.args...>
+//!   (--session-id <uuid> | --resume <uuid> |
+//!    --resume <parent> --fork-session --session-id <uuid>) <agent.args...>
 //! ```
 //!
 //! A fresh context gets a new UUID as `--session-id`, reported with the first
 //! turn as the context's [`ResumeHandle`](super::ResumeHandle)
 //! `{"session_id": "<uuid>"}` (a process stopped before any message reports
 //! none, as the CLI keeps no conversation for it); a restart passes it back
-//! with `--resume`. Rules granted for the Skywave session that the CLI keeps
-//! only in its process are the session's [`Grants`](super::Grants)
-//! `{"rules": [...]}`, reported apart from the handle and passed to every
-//! later process of the session, fresh or resumed, as flags
+//! with `--resume`. A context forked from another's conversation resumes the
+//! parent with `--fork-session` under a new UUID: the CLI runs the fork as
+//! that id, reported like a fresh context's; one stopped before any message
+//! reports none, so its next start forks again. Rules granted for the
+//! Skywave session that the CLI keeps only in its process are the session's
+//! [`Grants`](super::Grants) `{"rules": [...]}`, reported apart from the
+//! handle and passed to every later process of the session, fresh or
+//! resumed, as flags
 //! ([`rules::cli_args`]), so they survive a restart and a new context.
 //!
 //! [`AgentAdapter::start`] returns after the CLI answers the initialize
 //! handshake; a CLI that fails before that is a start error, or a resume
-//! error when it does not know the session. The mode, model and
-//! effort the [`StartSpec`] names are then asked for, in that order, with
-//! control requests, like any later change (docs/agents/claude-code.md §3.7,
-//! §3.10), so each gets the CLI's own answer. The CLI handles stdin in order,
+//! error when it does not know the session resumed or forked. The mode,
+//! model and effort the [`StartSpec`] names are then asked for, in that
+//! order, with control requests, like any later change
+//! (docs/agents/claude-code.md §3.7, §3.10), so each gets the CLI's own
+//! answer. The CLI handles stdin in order,
 //! so the effort is applied after the model switch; the level is a flag that
 //! outlasts model switches anyway.
 //!
@@ -64,8 +70,8 @@ use uuid::Uuid;
 
 use self::protocol::{Output, Protocol};
 use super::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession, Effort,
-    PermissionMode, StartSpec,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
+    Conversation, Effort, PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
 
@@ -90,7 +96,8 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const EVENT_CAPACITY: usize = 256;
 /// How long to wait for the rest of stderr once the process has exited.
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
-/// What the CLI says when `--resume` names a session it does not have.
+/// What the CLI says when `--resume` names a session it does not have, with
+/// or without `--fork-session` (docs/agents/claude-code.md §5).
 const UNKNOWN_SESSION: &str = "No conversation found";
 
 /// Starts Claude Code CLI sessions with the configured command.
@@ -122,19 +129,13 @@ impl ClaudeCodeAdapter {
         self
     }
 
-    /// The CLI arguments for session `session_id`: the required flags, the
-    /// flags granting `session_rules`, `--session-id` (or `--resume` when
-    /// `resumed`), then `agent.args`.
-    pub fn command_args(
-        &self,
-        session_id: Uuid,
-        resumed: bool,
-        session_rules: &[Value],
-    ) -> Vec<String> {
+    /// The CLI arguments for a process taking up `session`: the required
+    /// flags, the flags granting `session_rules`, the session's flags
+    /// ([`CliSession::args`]), then `agent.args`.
+    pub fn command_args(&self, session: CliSession, session_rules: &[Value]) -> Vec<String> {
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
         args.extend(rules::cli_args(session_rules));
-        args.push(if resumed { "--resume" } else { "--session-id" }.to_owned());
-        args.push(session_id.to_string());
+        args.extend(session.args());
         args.extend(self.config.args.iter().cloned());
         args
     }
@@ -142,12 +143,11 @@ impl ClaudeCodeAdapter {
     fn spawn(
         &self,
         workdir: &Path,
-        session_id: Uuid,
-        resumed: bool,
+        session: CliSession,
         session_rules: &[Value],
     ) -> Result<Child, AgentError> {
         Command::new(&self.config.command)
-            .args(self.command_args(session_id, resumed, session_rules))
+            .args(self.command_args(session, session_rules))
             .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -164,6 +164,54 @@ impl ClaudeCodeAdapter {
     }
 }
 
+/// The CLI session a process takes up, from the start's [`Conversation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliSession {
+    /// A new conversation under `id`.
+    New(Uuid),
+    /// The conversation under `id`.
+    Resume(Uuid),
+    /// A copy of the conversation `parent`, run under the new `id`.
+    Fork { parent: Uuid, id: Uuid },
+}
+
+impl CliSession {
+    /// The session id the CLI runs as.
+    pub fn id(self) -> Uuid {
+        match self {
+            CliSession::New(id) | CliSession::Resume(id) | CliSession::Fork { id, .. } => id,
+        }
+    }
+
+    /// The flags naming the session: `--session-id <id>`, `--resume <id>`,
+    /// or `--resume <parent> --fork-session --session-id <id>`.
+    pub fn args(self) -> Vec<String> {
+        match self {
+            CliSession::New(id) => vec!["--session-id".to_owned(), id.to_string()],
+            CliSession::Resume(id) => vec!["--resume".to_owned(), id.to_string()],
+            CliSession::Fork { parent, id } => vec![
+                "--resume".to_owned(),
+                parent.to_string(),
+                "--fork-session".to_owned(),
+                "--session-id".to_owned(),
+                id.to_string(),
+            ],
+        }
+    }
+
+    /// The handle naming [`Self::id`] is stored already: only a resumed
+    /// process runs as a conversation the context had.
+    fn handle_stored(self) -> bool {
+        matches!(self, CliSession::Resume(_))
+    }
+
+    /// The process takes up a conversation that must exist, so the CLI not
+    /// knowing it is a resume error.
+    fn has_parent(self) -> bool {
+        matches!(self, CliSession::Resume(_) | CliSession::Fork { .. })
+    }
+}
+
 impl AgentAdapter for ClaudeCodeAdapter {
     type Session = ClaudeCodeSession;
 
@@ -171,21 +219,27 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &self,
         spec: StartSpec,
     ) -> Result<(ClaudeCodeSession, AdapterEvents), AgentError> {
-        let (agent_session, resumed) = match &spec.resume {
-            Some(handle) => (
+        // A fork gets a new id as a fresh start does: its first turn reports
+        // it, and a fork stopped before any message forks again.
+        let session = match &spec.conversation {
+            Conversation::Fresh => CliSession::New(Uuid::new_v4()),
+            Conversation::Resume(handle) => CliSession::Resume(
                 protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?,
-                true,
             ),
-            None => (Uuid::new_v4(), false),
+            Conversation::Fork(parent) => CliSession::Fork {
+                parent: protocol::parse_resume_handle(parent).map_err(AgentError::Resume)?,
+                id: Uuid::new_v4(),
+            },
         };
         let session_rules = match &spec.grants {
             Some(grants) => rules::parse_grants(grants).map_err(AgentError::Start)?,
             None => Vec::new(),
         };
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
-        let child = self.spawn(&spec.workdir, agent_session, resumed, &session_rules)?;
+        let child = self.spawn(&spec.workdir, session, &session_rules)?;
         let mut process = Process::new(child, &span)?;
-        let mut protocol = Protocol::new(agent_session, resumed).with_session_rules(session_rules);
+        let mut protocol =
+            Protocol::new(session.id(), session.handle_stored()).with_session_rules(session_rules);
 
         let mut early = Vec::new();
         let handshake = handshake(&mut process, &mut protocol, &mut early).instrument(span.clone());
@@ -199,11 +253,13 @@ impl AgentAdapter for ClaudeCodeAdapter {
         };
         if let Some(message) = failure {
             process.kill().await;
-            return Err(if resumed && message.contains(UNKNOWN_SESSION) {
-                AgentError::Resume(message)
-            } else {
-                AgentError::Start(message)
-            });
+            return Err(
+                if session.has_parent() && message.contains(UNKNOWN_SESSION) {
+                    AgentError::Resume(message)
+                } else {
+                    AgentError::Start(message)
+                },
+            );
         }
 
         // Start-time requests are asked like any other: their lines go to

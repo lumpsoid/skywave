@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, CoreError, Decision, Entry,
-    Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route, Screen, Seq,
-    SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome, ViewState,
-    parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
+    Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
+    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome,
+    ViewState, parse_pair_uri,
 };
-use skywave_present::format::{bytes, mode_needs_confirmation};
+use skywave_present::format::{bytes, mode_needs_confirmation, move_refusal};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
     looks_like_pair_uri, unanswered,
@@ -369,8 +369,14 @@ pub enum Picker {
     Effort { selected: usize },
     /// The menu `C` opens: row 0 is "New context" (inert while the core
     /// does not offer it), the rows after it [`SessionView::contexts`] as
-    /// the core lists them.
-    Contexts { selected: usize },
+    /// the core lists them. `moving` is the context `M` asked to move into
+    /// a session of its own, until `y` sends it; `note` why `M` was refused
+    /// on a row, until the next key.
+    Contexts {
+        selected: usize,
+        moving: Option<ContextId>,
+        note: Option<String>,
+    },
 }
 
 /// The rows of [`Picker::Agent`].
@@ -411,6 +417,8 @@ impl Picker {
         let current = view.contexts.iter().position(|c| c.current);
         Picker::Contexts {
             selected: current.map_or(0, |i| i + 1),
+            moving: None,
+            note: None,
         }
     }
 
@@ -536,7 +544,26 @@ impl Picker {
                 }
                 _ => (false, None),
             },
-            Picker::Contexts { selected } => {
+            // y/N, as the mode picker asks: only `y` moves.
+            Picker::Contexts {
+                moving: moving @ Some(_),
+                ..
+            } => match (key.code, moving.take()) {
+                (KeyCode::Char('y') | KeyCode::Char('Y'), Some(context)) => (
+                    true,
+                    Some(Action::MoveContext {
+                        session_id,
+                        context,
+                    }),
+                ),
+                _ => (false, None),
+            },
+            Picker::Contexts {
+                selected,
+                moving,
+                note,
+            } => {
+                *note = None;
                 // Row 0 is "New context"; the contexts follow.
                 let last = view.contexts.len();
                 *selected = (*selected).min(last);
@@ -555,6 +582,11 @@ impl Picker {
                     KeyCode::Enter => match context {
                         None if view.can_clear => (true, Some(Action::ClearContext { session_id })),
                         None => (false, None),
+                        // Moved on: the context lives in another session now.
+                        Some(c) if c.moved_to.is_some() => {
+                            let to = c.moved_to.as_ref().map(|to| to.id);
+                            (true, to.map(Action::OpenSession))
+                        }
                         // Already current: nothing to switch, just close.
                         Some(c) if c.current => (true, None),
                         Some(c) => (
@@ -576,6 +608,22 @@ impl Picker {
                             }),
                         ),
                     },
+                    // Only what the core offers; otherwise say why not.
+                    KeyCode::Char('M') => {
+                        if let Some(c) = context {
+                            if c.can_move {
+                                *moving = Some(c.id);
+                            } else {
+                                *note = Some(move_refusal(c).to_owned());
+                            }
+                        }
+                        (false, None)
+                    }
+                    // Drops this device's refused (or untried) move of it.
+                    KeyCode::Char('x') => (
+                        false,
+                        context.and_then(|c| c.discard_move).map(Action::Discard),
+                    ),
                     _ => (false, None),
                 }
             }

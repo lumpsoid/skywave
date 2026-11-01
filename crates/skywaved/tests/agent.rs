@@ -16,10 +16,12 @@ use skywave_proto::{
     ContextId, Decision, DeviceId, EventKind, RejectReason, Seq, SessionId, SessionState, ToolCall,
     ToolDisplay, ToolKind, ToolResult,
 };
-use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step};
+use skywaved::agent::fake::{
+    FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
+};
 use skywaved::agent::{
-    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, DisplayBody,
-    EventMapper, ResultDisplay, StartSpec, TurnOutcome, load_resume_handle,
+    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation,
+    DisplayBody, EventMapper, ResultDisplay, StartSpec, TurnOutcome, load_resume_handle,
 };
 use skywaved::{EventLog, Storage};
 use tempfile::TempDir;
@@ -73,8 +75,15 @@ impl Fixture {
             session_id: self.session_id,
             context: ContextId::first_of(self.session_id),
             workdir: self.workdir.clone(),
-            resume: load_resume_handle(&self.storage.db, ContextId::first_of(self.session_id))
-                .unwrap(),
+            conversation: match load_resume_handle(
+                &self.storage.db,
+                ContextId::first_of(self.session_id),
+            )
+            .unwrap()
+            {
+                Some(handle) => Conversation::Resume(handle),
+                None => Conversation::Fresh,
+            },
             grants: None,
             mode: None,
             model: None,
@@ -348,7 +357,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         agent.inputs(f.session_id),
         [
             FakeInput::Started {
-                resumed: false,
+                conversation: FakeConversation::Fresh,
                 context: ContextId::first_of(f.session_id),
                 grants: None,
             },
@@ -561,7 +570,7 @@ async fn restart_resumes_with_the_stored_handle() {
             .turn([Step::text("one")])
             .turn([Step::text("two")]),
     );
-    assert_eq!(f.spec().resume, None);
+    assert_eq!(f.spec().conversation, Conversation::Fresh);
     // A start that got no message leaves no conversation and no handle, so
     // starting fresh again is fine.
     let (session, mut events) = agent.start(f.spec()).await.unwrap();
@@ -573,7 +582,7 @@ async fn restart_resumes_with_the_stored_handle() {
     session.shutdown().await.unwrap();
     let rest = f.pump(&mut events, &mut mapper, |_| true).await;
     assert_eq!(rest, [AdapterEvent::Exited { error: None }]);
-    assert_eq!(f.spec().resume, None);
+    assert_eq!(f.spec().conversation, Conversation::Fresh);
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -595,8 +604,8 @@ async fn restart_resumes_with_the_stored_handle() {
     // The restart finds the handle in contexts.agent_state.
     let spec = f.spec();
     assert_eq!(
-        spec.resume,
-        Some(FakeAgent::resume_handle(ContextId::first_of(f.session_id)))
+        spec.conversation,
+        Conversation::Resume(FakeAgent::resume_handle(ContextId::first_of(f.session_id)))
     );
     let (mut session, mut events) = agent.start(spec).await.unwrap();
     let mut mapper = EventMapper::new(
@@ -614,7 +623,7 @@ async fn restart_resumes_with_the_stored_handle() {
 
     // A handle for another context is refused.
     let mut wrong = f.spec();
-    wrong.resume = Some(FakeAgent::resume_handle(ContextId::new()));
+    wrong.conversation = Conversation::Resume(FakeAgent::resume_handle(ContextId::new()));
     assert!(matches!(
         agent.start(wrong).await,
         Err(AgentError::Resume(_))
@@ -624,11 +633,95 @@ async fn restart_resumes_with_the_stored_handle() {
 /// Starting a session fresh again fails, like a reused agent session id.
 async fn fresh_start_error(agent: &FakeAgent, f: &Fixture) -> AgentError {
     let mut fresh = f.spec();
-    fresh.resume = None;
+    fresh.conversation = Conversation::Fresh;
     match agent.start(fresh).await {
         Err(error) => error,
         Ok(_) => panic!("a second fresh start must fail"),
     }
+}
+
+/// A start of `context`, in session `session_id`, forking the conversation
+/// `handle` names.
+fn fork_spec(
+    f: &Fixture,
+    session_id: SessionId,
+    context: ContextId,
+    handle: agent::ResumeHandle,
+) -> StartSpec {
+    StartSpec {
+        session_id,
+        context,
+        conversation: Conversation::Fork(handle),
+        ..f.spec()
+    }
+}
+
+#[tokio::test]
+async fn a_fork_copies_a_conversation_of_another_session() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("origin")]));
+    let origin = ContextId::first_of(f.session_id);
+    let other = SessionId::new();
+    let forked = ContextId::first_of(other);
+    let origin_handle = FakeAgent::resume_handle(origin);
+
+    // No conversation to copy yet: the origin never got a message.
+    let refused = agent
+        .start(fork_spec(&f, other, forked, origin_handle.clone()))
+        .await;
+    assert!(matches!(refused, Err(AgentError::Resume(_))));
+    assert_eq!(agent.inputs(other), []);
+
+    let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(f.session_id, origin, AgentSettings::default());
+    session.send_message("a".into()).await.unwrap();
+    f.pump(&mut events, &mut mapper, turn_ended).await;
+    session.shutdown().await.unwrap();
+
+    // Progress is kept per session, yet the fork finds the origin's
+    // conversation in the other session.
+    let (mut session, mut events) = agent
+        .start(fork_spec(&f, other, forked, origin_handle.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.inputs(other),
+        [FakeInput::Started {
+            conversation: FakeConversation::Fork(origin),
+            context: forked,
+            grants: None,
+        }]
+    );
+    // The copy is the forked context's own conversation: its handle comes
+    // with its first message, as for a fresh start, never the origin's.
+    session.send_message("b".into()).await.unwrap();
+    assert_eq!(
+        events.recv().await,
+        Some(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(forked)))
+    );
+    assert_eq!(events.recv().await, Some(AdapterEvent::TurnStarted));
+    // Scripted turns run per session: the new session starts at the first.
+    assert_eq!(
+        events.recv().await,
+        Some(AdapterEvent::Text("origin".into()))
+    );
+    session.shutdown().await.unwrap();
+
+    // Once it has its own conversation, forking into it again is refused.
+    let again = agent
+        .start(fork_spec(&f, other, forked, origin_handle))
+        .await;
+    assert!(matches!(again, Err(AgentError::Start(_))));
+    // A handle naming no conversation is refused too.
+    let unknown = agent
+        .start(fork_spec(
+            &f,
+            other,
+            forked,
+            FakeAgent::resume_handle(ContextId::new()),
+        ))
+        .await;
+    assert!(matches!(unknown, Err(AgentError::Resume(_))));
 }
 
 #[tokio::test]
