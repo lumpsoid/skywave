@@ -6,7 +6,8 @@
 //! tool names, titles, details, statuses and the bounded previews. So is
 //! the content of the blobs behind the timeline that are already
 //! downloaded, as far as the head reads them ([`BlobText`]); a search
-//! never downloads one, and says how many it could not search.
+//! never downloads one, and says how many it could not search. A timeline
+//! narrowed to one context is searched as shown.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -263,6 +264,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::ToolResult { summary, .. } => vec![summary],
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
         Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
+        Entry::ContextStarted { name, .. } | Entry::ContextSwitched { name, .. } => vec![name],
         Entry::AgentSetting {
             setting, refused, ..
         } => {
@@ -296,8 +298,8 @@ mod tests {
 
     use super::*;
     use crate::view::{
-        BodyFormat, BodyView, CallId, CommandId, DeviceId, DeviceRef, Outgoing, Seq, ToolKind,
-        ToolView,
+        BodyFormat, BodyView, CallId, CommandId, ContextId, DeviceId, DeviceRef, Outgoing, Seq,
+        ToolKind, ToolView,
     };
 
     /// The matching items' indices, no blob downloaded.
@@ -313,6 +315,7 @@ mod tests {
         TimelineItem::Logged {
             seq: Seq(1),
             at: DateTime::UNIX_EPOCH,
+            context: ContextId::first_of(crate::view::SessionId::new()),
             entry,
         }
     }
@@ -424,6 +427,7 @@ mod tests {
             logged(Entry::Interrupted),
             TimelineItem::Pending {
                 command_id: CommandId::new(),
+                context: ContextId::new(),
                 text: "queued question".into(),
                 outgoing: Outgoing::Queued,
                 discardable: true,

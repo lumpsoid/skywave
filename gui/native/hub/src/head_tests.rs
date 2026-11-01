@@ -6,7 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ListKindView, RouteView, ScreenView};
+use crate::signals::{ActionIntent, ListKindView, RouteView, RowKind, ScreenView};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -654,6 +654,62 @@ impl Rig {
     fn rows(&self) -> &[TimelineRow] {
         &self.head.sent.timeline.as_ref().unwrap().1
     }
+}
+
+#[test]
+fn a_context_cleared_or_switched_is_a_divider_row() {
+    let mut rig = Rig::new();
+    let walrus = skywave_proto::ContextId::new();
+    let me = rig.seam.identity().unwrap().device_id();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let event = |context, kind| Event {
+        session_id: rig.session,
+        at,
+        command_id: Some(CommandId::new()),
+        context,
+        kind,
+    };
+    let events = vec![
+        event(
+            walrus,
+            EventKind::ContextStarted {
+                by: DeviceId::new(),
+                name: "velvet walrus".into(),
+            },
+        ),
+        event(
+            skywave_proto::ContextId::first_of(rig.session),
+            EventKind::ContextSwitched { by: me },
+        ),
+    ];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone(), row.selectable))
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, RowKind::ContextDivider);
+    assert!(
+        rows[0]
+            .1
+            .starts_with("New context · velvet walrus · by device …"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[1],
+        (
+            RowKind::ContextDivider,
+            "Back to start · by you".to_owned(),
+            false
+        )
+    );
 }
 
 /// An edit's call and result as skywaved logs them for the stub agent:

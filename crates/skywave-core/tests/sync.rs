@@ -804,3 +804,182 @@ async fn an_approval_pulled_while_offline_alerts_once_after_a_cold_start() {
     assert_eq!(view.attention.alerts, 0, "alerted before");
     assert_eq!(view.attention.approvals.len(), 1, "still waiting");
 }
+
+/// A context cleared offline leads the message queued after it: the
+/// message names the new context, and once the link is back both go out in
+/// order and are accepted, the message landing in the new context.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_cleared_offline_takes_the_message_queued_after_it() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&daemon).await;
+    client
+        .open_session(session, |s| !s.contexts.is_empty())
+        .await;
+
+    proxy.down();
+    client
+        .wait("the link to drop", |_, view| is_reconnecting(&view.link))
+        .await;
+    client.dispatch(Action::ClearContext {
+        session_id: session,
+    });
+    client.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "afresh".into(),
+    });
+    let outbox = client.outbox();
+    let (clear, cleared, name) = match &outbox[1].command.kind {
+        CommandKind::ClearContext { context, name, .. } => {
+            (outbox[1].command.id, *context, name.clone())
+        }
+        other => panic!("expected the clear, got {other:?}"),
+    };
+    let message = match &outbox[2].command.kind {
+        CommandKind::SendMessage { context, .. } => {
+            assert_eq!(*context, cleared, "written for the new context");
+            outbox[2].command.id
+        }
+        other => panic!("expected the message, got {other:?}"),
+    };
+    let view = client
+        .open_session(session, |s| s.timeline.len() == 1)
+        .await;
+    assert_eq!(view.context, cleared);
+    assert_eq!(view.clear, Some(Outgoing::Queued));
+
+    proxy.up();
+    let view = client
+        .wait("both accepted and pulled", |c, view| {
+            let events = daemon.events();
+            view.queued == 0
+                && c.cursor() == Seq(events.len() as u64)
+                && count(&events, |k| matches!(k, EventKind::AgentMessage { .. })) == 1
+        })
+        .await;
+    let Screen::Session(view) = view.screen else {
+        panic!("the session stays open");
+    };
+    let seq_of = |id: CommandId| match client
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == id)
+        .map(|e| e.status)
+    {
+        Some(OutboxStatus::Done(CommandResult::Accepted { seq })) => seq,
+        other => panic!("expected accepted, got {other:?}"),
+    };
+    assert!(seq_of(clear) < seq_of(message), "in the order queued");
+    let events = daemon.events();
+    let logged = &events[(seq_of(message).0 - 1) as usize];
+    assert_eq!(logged.context, cleared);
+    assert_eq!(
+        events[(seq_of(clear).0 - 1) as usize].kind,
+        EventKind::ContextStarted {
+            by: client.device(),
+            name: name.clone(),
+        }
+    );
+    support::assert_exactly_once(&daemon, &[&client]);
+
+    assert_eq!((view.context, view.clear), (cleared, None));
+    // The first context had no message: only the new one is offered.
+    assert_eq!(
+        view.contexts
+            .iter()
+            .map(|c| (c.name.as_str(), c.messages, c.current))
+            .collect::<Vec<_>>(),
+        [(name.as_str(), 1, true)]
+    );
+    assert!(matches!(
+        &view.timeline[0],
+        TimelineItem::Logged {
+            entry: Entry::ContextStarted { name: shown, by },
+            context,
+            ..
+        } if *shown == name && by.me && *context == cleared
+    ));
+}
+
+/// A message written while another device cleared the context is refused
+/// for it: shown failed and discardable, it goes back to the draft, and
+/// sent again it reaches the context now current.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_refused_for_a_changed_context_is_edited_and_resent() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let session = a.create_session(&daemon).await;
+    daemon.settle(&[&a, &b], SOON).await;
+    a.open_session(session, |s| !s.contexts.is_empty()).await;
+
+    proxy_a.down();
+    a.wait("a offline", |_, view| is_reconnecting(&view.link))
+        .await;
+    a.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "written before".into(),
+    });
+    let stale = a.outbox()[1].command.id;
+    b.dispatch(Action::ClearContext {
+        session_id: session,
+    });
+    let started = |events: &[Event]| {
+        events.iter().find_map(|e| match e.kind {
+            EventKind::ContextStarted { .. } => Some(e.context),
+            _ => None,
+        })
+    };
+    daemon
+        .wait_log("b's clear", |events| started(events).is_some())
+        .await;
+    let fresh = started(&daemon.events()).unwrap();
+
+    proxy_a.up();
+    let refused = Outgoing::Failed(FailReason::Rejected(RejectReason::ContextChanged));
+    let view = a
+        .open_session(session, |s| {
+            s.context == fresh
+                && s.timeline.iter().any(|item| {
+                    matches!(item, TimelineItem::Pending { command_id, outgoing, .. }
+                        if *command_id == stale && *outgoing == refused)
+                })
+        })
+        .await;
+    assert!(view.timeline.iter().any(|item| matches!(
+        item,
+        TimelineItem::Pending { command_id, discardable: true, .. } if *command_id == stale
+    )));
+
+    a.dispatch(Action::EditQueued(stale));
+    let view = a.open_session(session, |s| s.draft.is_some()).await;
+    let text = view.draft.unwrap().text;
+    assert_eq!(text, "written before");
+    a.dispatch(Action::SendMessage {
+        session_id: session,
+        text,
+    });
+    let resent = a.outbox().last().unwrap().command.id;
+    daemon
+        .wait_log("the resend", |events| {
+            events.iter().any(|e| e.command_id == Some(resent))
+        })
+        .await;
+    let events = daemon.events();
+    let logged = events
+        .iter()
+        .find(|e| e.command_id == Some(resent))
+        .unwrap();
+    assert_eq!(logged.context, fresh);
+    assert!(matches!(logged.kind, EventKind::UserMessage { .. }));
+    assert!(
+        !events.iter().any(|e| e.command_id == Some(stale)),
+        "the refused one never logged"
+    );
+}

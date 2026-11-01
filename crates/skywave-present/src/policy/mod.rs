@@ -62,8 +62,8 @@ pub fn looks_like_pair_uri(text: &str) -> bool {
 pub(crate) mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        CommandId, DeviceId, DeviceRef, Entry, Seq, SessionId, SessionState, SessionView,
-        TimelineItem,
+        CommandId, ContextId, DeviceId, DeviceRef, Entry, Seq, SessionId, SessionState,
+        SessionView, TimelineItem,
     };
 
     use super::*;
@@ -90,6 +90,12 @@ pub(crate) mod tests {
             rules: Vec::new(),
             usage: None,
             agent: Default::default(),
+            contexts: Vec::new(),
+            context: ContextId::new(),
+            viewing: None,
+            can_clear: false,
+            clear: None,
+            switch: None,
             interrupt: None,
             stop: None,
             draft: None,
@@ -103,6 +109,7 @@ pub(crate) mod tests {
         TimelineItem::Logged {
             seq: Seq(seq),
             at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            context: ContextId::new(),
             entry,
         }
     }

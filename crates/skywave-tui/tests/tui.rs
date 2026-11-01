@@ -1815,6 +1815,42 @@ fn rename_from_the_timeline_titles_the_header() {
 }
 
 #[test]
+fn context_dividers_show_where_the_context_changed() {
+    let (mut h, id, me) = open_session();
+    let walrus = skywave_proto::ContextId::new();
+    let other = DeviceId::new();
+    pull(
+        &mut h,
+        vec![
+            Event {
+                context: walrus,
+                ..event(
+                    id,
+                    1,
+                    EventKind::ContextStarted {
+                        by: other,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+            Event {
+                context: skywave_proto::ContextId::first_of(id),
+                ..event(id, 2, EventKind::ContextSwitched { by: me })
+            },
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        &format!(
+            "── New context · velvet walrus · by device …{} ──",
+            tail(other)
+        ),
+    );
+    assert_contains(&screen, "── Back to start · by you ──");
+}
+
+#[test]
 fn stop_key_and_its_delivery_state() {
     let (mut h, id, _) = open_session();
     // A capital S in the composer is text, not a stop.

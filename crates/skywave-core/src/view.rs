@@ -13,9 +13,9 @@ use skywave_proto::Fingerprint;
 use uuid::Uuid;
 
 pub use skywave_proto::{
-    ApprovalId, BlobId, BodyFormat, CallId, CommandId, Decision, DeviceId, Effort, ModelChoice,
-    PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, ToolKind,
-    TurnUsage,
+    ApprovalId, BlobId, BodyFormat, CallId, CommandId, ContextId, Decision, DeviceId, Effort,
+    ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
+    ToolKind, TurnUsage,
 };
 
 pub use crate::projection::SessionUsage;
@@ -445,7 +445,29 @@ pub struct SessionView {
     pub workdir: Option<String>,
     pub state: SessionState,
     /// Log order; this device's messages not yet in the log come last.
+    /// While [`viewing`](Self::viewing) a context, only that context's
+    /// items, with no context dividers.
     pub timeline: Vec<TimelineItem>,
+    /// The contexts a picker offers, in log order: each one with a message
+    /// (logged, or this device's on its way) and the current one, this
+    /// device's clear on its way included. Empty until the session's
+    /// events are loaded.
+    pub contexts: Vec<ContextView>,
+    /// The context a message sent now goes to: the session's current one,
+    /// or the one this device's clear or switch on its way makes current.
+    pub context: ContextId,
+    /// The context [`Action::ViewContext`](crate::Action::ViewContext)
+    /// narrowed the timeline to; `None` shows the whole session.
+    pub viewing: Option<ContextId>,
+    /// [`Action::ClearContext`](crate::Action::ClearContext) is worth
+    /// offering: the current context has a message, logged or on its way.
+    pub can_clear: bool,
+    /// This device's latest clear of the session's context, until its
+    /// effect is in the replica.
+    pub clear: Option<Outgoing>,
+    /// This device's latest switch of the session's context, until its
+    /// effect is in the replica.
+    pub switch: Option<Outgoing>,
     /// The approval the agent is blocked on, if any.
     pub pending_approval: Option<ApprovalPrompt>,
     /// The lasting rules granted with approvals in this session, by any
@@ -484,6 +506,8 @@ impl SessionView {
     /// The messages sent into the session, newest first, for a head to
     /// recall into its composer: every device's logged messages, then this
     /// device's not yet logged, a message repeated back to back listed once.
+    /// Taken from the timeline as shown: one context's while
+    /// [`viewing`](Self::viewing) it.
     pub fn prompts(&self) -> Vec<&str> {
         let mut prompts: Vec<&str> = Vec::new();
         for item in self.timeline.iter().rev() {
@@ -501,6 +525,29 @@ impl SessionView {
         }
         prompts
     }
+}
+
+/// One of a session's contexts as a picker lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextView {
+    pub id: ContextId,
+    /// As the log names it (a session's first context from before contexts
+    /// existed reads "start").
+    pub name: String,
+    /// First line of the context's first message, logged or else this
+    /// device's on its way.
+    pub first_prompt: Option<String>,
+    /// Its messages: every device's logged ones, plus this device's on
+    /// their way (not refused).
+    pub messages: usize,
+    /// Time of the context's newest logged event; `None` for a context
+    /// this device's clear has not logged yet.
+    pub last_activity: Option<DateTime<Utc>>,
+    /// Messages sent now go here ([`SessionView::context`]).
+    pub current: bool,
+    /// This device's latest clear or switch making it current, until its
+    /// effect is in the replica.
+    pub outgoing: Option<Outgoing>,
 }
 
 /// A session's agent settings as the session view shows them.
@@ -641,11 +688,17 @@ pub enum TimelineItem {
     Logged {
         seq: Seq,
         at: DateTime<Utc>,
+        /// The context the event belongs to; a context divider has the
+        /// context it makes current.
+        context: ContextId,
         entry: Entry,
     },
     /// A message from this device that is not in the log yet.
     Pending {
         command_id: CommandId,
+        /// The context it was written in, which must still be current
+        /// when it reaches the server.
+        context: ContextId,
         text: String,
         outgoing: Outgoing,
         /// [`Action::Discard`](crate::Action::Discard) and
@@ -729,6 +782,18 @@ pub enum Entry {
     Interrupted,
     /// The session's agent was shut down on request.
     Stopped,
+    /// A device cleared the session's context: the context `name` started
+    /// afresh and became current.
+    ContextStarted {
+        name: String,
+        by: DeviceRef,
+    },
+    /// A device made the earlier context `name` current again. A switch to
+    /// the context already current has no entry.
+    ContextSwitched {
+        name: String,
+        by: DeviceRef,
+    },
     /// The session was renamed; `None` restored its default title.
     Renamed {
         name: Option<String>,
@@ -897,6 +962,7 @@ mod tests {
         TimelineItem::Logged {
             seq: Seq(seq),
             at: DateTime::UNIX_EPOCH,
+            context: ContextId::new(),
             entry,
         }
     }
@@ -921,6 +987,7 @@ mod tests {
     fn pending(text: &str) -> TimelineItem {
         TimelineItem::Pending {
             command_id: CommandId::new(),
+            context: ContextId::new(),
             text: text.into(),
             outgoing: Outgoing::Queued,
             discardable: true,
@@ -952,6 +1019,12 @@ mod tests {
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
+            contexts: Vec::new(),
+            context: ContextId::new(),
+            viewing: None,
+            can_clear: false,
+            clear: None,
+            switch: None,
             interrupt: None,
             stop: None,
             draft: None,

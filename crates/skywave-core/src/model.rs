@@ -17,7 +17,9 @@ use skywave_proto::{
 use crate::action::{Action, Route};
 use crate::completion::Completer;
 use crate::identity::Identity;
-use crate::projection::{SessionSummary, blob_refs, is_notable};
+use crate::projection::{
+    FIRST_PROMPT_MAX_CHARS, SessionSummary, blob_refs, first_line, is_notable,
+};
 use crate::seam::Request;
 use crate::snippets::Snippets;
 use crate::store::{
@@ -27,11 +29,11 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
-    BlobState, BlobView, BodyView, CallId, CommandId, Decision, Delivery, DeviceId, DeviceRef,
-    Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice, Outgoing, PairedInfo,
-    PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen, Seq, SessionId,
-    SessionListView, SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet,
-    SnippetId, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    BlobState, BlobView, BodyView, CallId, CommandId, ContextId, ContextView, Decision, Delivery,
+    DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice,
+    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen,
+    Seq, SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -152,6 +154,9 @@ pub(crate) struct Model {
     deleted: HashSet<SessionId>,
     /// Events of the session on screen, loaded from the replica.
     open: Option<OpenSession>,
+    /// The context [`Action::ViewContext`] narrowed the session on screen
+    /// to; gone once another screen shows. In memory only.
+    viewing: Option<(SessionId, ContextId)>,
     /// Pending approvals the user was alerted to, or that needed no alert
     /// (answered here), in this process or an earlier one: as stored, plus
     /// what [`Model::apply_batch`] and [`Model::set_link`] hand out to
@@ -203,6 +208,7 @@ impl Model {
             snippets: Snippets::default(),
             deleted: HashSet::new(),
             open: None,
+            viewing: None,
             alerted: HashSet::new(),
             alerts: 0,
             alerted_at: HashMap::new(),
@@ -321,8 +327,9 @@ impl Model {
                 if text.trim().is_empty() {
                     return Vec::new();
                 }
-                // The message is written in the context the device shows.
-                let context = summary.context;
+                // The message goes where this device's own clear or switch
+                // on its way leads, so it is not refused for that.
+                let context = self.target_context(summary);
                 let effects = self.enqueue(CommandKind::SendMessage {
                     session_id,
                     context,
@@ -387,6 +394,39 @@ impl Model {
                 }
                 self.enqueue(CommandKind::StopSession { session_id })
             }
+            Action::ClearContext { session_id } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                let used = self.context_names(session_id);
+                let name = fresh_context_name(&used, skywave_proto::context_name::random);
+                self.enqueue(CommandKind::ClearContext {
+                    session_id,
+                    context: ContextId::new(),
+                    name,
+                })
+            }
+            Action::SwitchContext {
+                session_id,
+                context,
+            } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::SwitchContext {
+                    session_id,
+                    context,
+                })
+            }
+            Action::ViewContext {
+                session_id,
+                context,
+            } => {
+                if self.place == Place::Session(session_id) {
+                    self.viewing = context.map(|context| (session_id, context));
+                }
+                Vec::new()
+            }
             Action::RenameSession { session_id, name } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
@@ -441,6 +481,7 @@ impl Model {
                 }
                 self.place = Place::Session(id);
                 self.open = None;
+                self.viewing = None;
                 self.completer.end();
                 vec![Effect::LoadSession(id)]
             }
@@ -480,6 +521,7 @@ impl Model {
             Action::Navigate(route) => {
                 self.place = route.into();
                 self.open = None;
+                self.viewing = None;
                 self.completer.end();
                 Vec::new()
             }
@@ -513,6 +555,7 @@ impl Model {
             return Vec::new();
         }
         self.place = Place::Pairing;
+        self.viewing = None;
         let (address, code, fingerprint) = (
             address.trim().to_owned(),
             code.trim().to_owned(),
@@ -789,6 +832,7 @@ impl Model {
                 if self.place == Place::Session(from) {
                     self.place = Place::Session(event.session_id);
                     self.open = None;
+                    self.viewing = None;
                 }
             }
         }
@@ -889,6 +933,7 @@ impl Model {
         if self.place == Place::Session(id) {
             self.place = Place::Archived;
             self.open = None;
+            self.viewing = None;
         }
     }
 
@@ -956,6 +1001,7 @@ impl Model {
         self.pairing = PairingStatus::Idle;
         self.place = Place::SessionList;
         self.open = None;
+        self.viewing = None;
         self.link = Link::Connecting;
     }
 
@@ -1156,8 +1202,36 @@ impl Model {
         let stop = self.latest_outgoing(
             |kind| matches!(kind, CommandKind::StopSession { session_id } if *session_id == id),
         );
+        let clear = self.latest_outgoing(
+            |kind| matches!(kind, CommandKind::ClearContext { session_id, .. } if *session_id == id),
+        );
+        let switch = self.latest_outgoing(
+            |kind| matches!(kind, CommandKind::SwitchContext { session_id, .. } if *session_id == id),
+        );
+        let context = self.target_context(summary);
+        let viewing = self
+            .viewing
+            .filter(|(session, _)| *session == id)
+            .map(|(_, context)| context);
         let title = self.title(summary);
-        let (timeline, rules) = self.timeline(id, events);
+        let (mut timeline, rules) = self.timeline(id, events);
+        if let Some(viewing) = viewing {
+            timeline.retain(|item| match item {
+                TimelineItem::Logged {
+                    entry: Entry::ContextStarted { .. } | Entry::ContextSwitched { .. },
+                    ..
+                } => false,
+                TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
+                    *context == viewing
+                }
+            });
+        }
+        let contexts = self.contexts(id, events, context);
+        let can_clear = contexts.iter().any(|c| c.current && c.messages > 0);
+        let contexts = contexts
+            .into_iter()
+            .filter(|c| c.current || c.messages > 0)
+            .collect();
         Some(SessionView {
             id,
             title: title.text,
@@ -1171,6 +1245,12 @@ impl Model {
             rules,
             usage: summary.usage.clone(),
             agent: self.agent_view(summary),
+            contexts,
+            context,
+            viewing,
+            can_clear,
+            clear,
+            switch,
             interrupt,
             stop,
             draft: self.drafts.get(&id).cloned(),
@@ -1335,6 +1415,149 @@ impl Model {
             .filter(|outgoing| !self.in_replica(*outgoing))
     }
 
+    /// Where a message sent to the session now goes: the context this
+    /// device's newest clear or switch of it makes current while that is on
+    /// its way (accepted but not yet pulled included), else the replica's.
+    /// A failed one changed nothing; once the newest standing one is in the
+    /// replica, the replica says what is current, other devices' later
+    /// switches included.
+    fn target_context(&self, summary: &SessionSummary) -> ContextId {
+        for e in self.outbox.iter().rev() {
+            let context = match &e.command.kind {
+                CommandKind::ClearContext {
+                    session_id,
+                    context,
+                    ..
+                }
+                | CommandKind::SwitchContext {
+                    session_id,
+                    context,
+                } if *session_id == summary.id => *context,
+                _ => continue,
+            };
+            let outgoing = Outgoing::from(&e.status);
+            if matches!(outgoing, Outgoing::Failed(_)) {
+                continue;
+            }
+            if self.in_replica(outgoing) {
+                break;
+            }
+            return context;
+        }
+        summary.context
+    }
+
+    /// The names of the session's contexts as far as this device knows: the
+    /// open session's logged ones and every clear of it in the outbox.
+    fn context_names(&self, id: SessionId) -> HashSet<String> {
+        let logged = self
+            .open
+            .iter()
+            .filter(|open| open.id == id)
+            .flat_map(|open| &open.events)
+            .filter_map(|(_, event)| match &event.kind {
+                EventKind::SessionCreated { context_name, .. } => Some(context_name),
+                EventKind::ContextStarted { name, .. } => Some(name),
+                _ => None,
+            });
+        let cleared = self.outbox.iter().filter_map(|e| match &e.command.kind {
+            CommandKind::ClearContext {
+                session_id, name, ..
+            } if *session_id == id => Some(name),
+            _ => None,
+        });
+        logged.chain(cleared).cloned().collect()
+    }
+
+    /// The session's contexts in log order, every one of them: those in
+    /// `events`, then this device's clears on their way. `current` is where
+    /// messages go now.
+    fn contexts(
+        &self,
+        id: SessionId,
+        events: &[(Seq, Event)],
+        current: ContextId,
+    ) -> Vec<ContextView> {
+        let mut contexts: Vec<ContextView> = Vec::new();
+        let new = |id, name: &str| ContextView {
+            id,
+            name: name.to_owned(),
+            first_prompt: None,
+            messages: 0,
+            last_activity: None,
+            current: false,
+            outgoing: None,
+        };
+        let mut logged = HashSet::new();
+        for (_, event) in events {
+            match &event.kind {
+                EventKind::SessionCreated { context_name, .. } => {
+                    contexts.push(new(event.context, context_name));
+                }
+                EventKind::ContextStarted { name, .. } => contexts.push(new(event.context, name)),
+                _ => {}
+            }
+            let Some(context) = contexts.iter_mut().find(|c| c.id == event.context) else {
+                continue;
+            };
+            context.last_activity = Some(event.at);
+            if let EventKind::UserMessage { text, .. } = &event.kind {
+                logged.extend(event.command_id);
+                context.messages += 1;
+                if context.first_prompt.is_none() {
+                    context.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
+                }
+            }
+        }
+        for e in &self.outbox {
+            let outgoing = Outgoing::from(&e.status);
+            if matches!(outgoing, Outgoing::Failed(_)) {
+                continue;
+            }
+            match &e.command.kind {
+                CommandKind::ClearContext {
+                    session_id,
+                    context,
+                    name,
+                } if *session_id == id
+                    && !self.in_replica(outgoing)
+                    && !contexts.iter().any(|c| c.id == *context) =>
+                {
+                    contexts.push(new(*context, name));
+                }
+                CommandKind::SendMessage {
+                    session_id,
+                    context,
+                    text,
+                } if *session_id == id && !logged.contains(&e.command.id) => {
+                    if let Some(context) = contexts.iter_mut().find(|c| c.id == *context) {
+                        context.messages += 1;
+                        if context.first_prompt.is_none() {
+                            context.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for context in &mut contexts {
+            context.current = context.id == current;
+            context.outgoing = self.latest_outgoing(|kind| match kind {
+                CommandKind::ClearContext {
+                    session_id,
+                    context: c,
+                    ..
+                }
+                | CommandKind::SwitchContext {
+                    session_id,
+                    context: c,
+                } => *session_id == id && *c == context.id,
+                _ => false,
+            });
+        }
+        contexts
+    }
+
     /// The session's timeline and the rules granted in it, in log order.
     fn timeline(
         &self,
@@ -1348,6 +1571,9 @@ impl Model {
         let mut tools = ToolIndex::default();
         // The device behind each mode or model request, by its command.
         let mut asked_by: HashMap<CommandId, DeviceId> = HashMap::new();
+        // Each context's name, and the context current at this point.
+        let mut names: HashMap<ContextId, &str> = HashMap::new();
+        let mut current = None;
         for (seq, event) in events {
             let entry = match &event.kind {
                 // The server logs every message with its command id, the
@@ -1549,10 +1775,35 @@ impl Model {
                     by: self.asker(&asked_by, *answers),
                     refused: Some(reason.clone()),
                 }),
+                EventKind::SessionCreated { context_name, .. } => {
+                    names.insert(event.context, context_name);
+                    current = Some(event.context);
+                    // Shown in the header.
+                    None
+                }
+                EventKind::ContextStarted { by, name } => {
+                    names.insert(event.context, name);
+                    current = Some(event.context);
+                    Some(Entry::ContextStarted {
+                        name: name.clone(),
+                        by: self.device_ref(*by),
+                    })
+                }
+                // Back to where the session already was: nothing changed.
+                EventKind::ContextSwitched { .. } if current == Some(event.context) => None,
+                EventKind::ContextSwitched { by } => {
+                    current = Some(event.context);
+                    Some(Entry::ContextSwitched {
+                        name: names
+                            .get(&event.context)
+                            .copied()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        by: self.device_ref(*by),
+                    })
+                }
                 // Shown in the header.
-                EventKind::SessionCreated { .. } | EventKind::ModelsOffered { .. } => None,
-                // Not shown yet.
-                EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => None,
+                EventKind::ModelsOffered { .. } => None,
                 EventKind::EffortChanged { effort, answers } => Some(Entry::AgentSetting {
                     setting: AgentSetting::Effort(*effort),
                     by: self.asker(&asked_by, *answers),
@@ -1572,6 +1823,7 @@ impl Model {
                 items.push(TimelineItem::Logged {
                     seq: *seq,
                     at: event.at,
+                    context: event.context,
                     entry,
                 });
             }
@@ -1601,10 +1853,13 @@ impl Model {
 
         items.extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
             CommandKind::SendMessage {
-                session_id, text, ..
+                session_id,
+                context,
+                text,
             } if *session_id == id && !logged.contains(&e.command.id) => {
                 Some(TimelineItem::Pending {
                     command_id: e.command.id,
+                    context: *context,
                     text: text.clone(),
                     outgoing: Outgoing::from(&e.status),
                     discardable: e.discardable(),
@@ -1788,6 +2043,32 @@ fn tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
     }
 }
 
+/// How many names [`fresh_context_name`] draws before it numbers one.
+const CONTEXT_NAME_ROLLS: usize = 64;
+
+/// A context name not in `used`: the first `roll` draws that is not, else
+/// the last draw numbered (" 2", " 3", …) within
+/// [`CONTEXT_NAME_MAX_CHARS`](skywave_proto::limits::CONTEXT_NAME_MAX_CHARS).
+fn fresh_context_name(used: &HashSet<String>, mut roll: impl FnMut() -> String) -> String {
+    let mut name = roll();
+    for _ in 1..CONTEXT_NAME_ROLLS {
+        if !used.contains(&name) {
+            return name;
+        }
+        name = roll();
+    }
+    let mut n = 1;
+    let mut fresh = name.clone();
+    while used.contains(&fresh) {
+        n += 1;
+        let suffix = format!(" {n}");
+        let room = skywave_proto::limits::CONTEXT_NAME_MAX_CHARS - suffix.chars().count();
+        let base: String = name.chars().take(room).collect();
+        fresh = format!("{}{suffix}", base.trim_end());
+    }
+    fresh
+}
+
 /// The session a command names, if it names one. An answer names its
 /// approval only; its session is pending that approval meanwhile.
 fn command_session(kind: &CommandKind) -> Option<SessionId> {
@@ -1893,16 +2174,40 @@ mod tests {
             session_id: SessionId,
             kinds: Vec<(Option<CommandId>, EventKind)>,
         ) {
+            let first = ContextId::first_of(session_id);
+            let events = kinds
+                .into_iter()
+                .map(|(command_id, kind)| (command_id, first, kind))
+                .collect();
+            self.log_stamped(session_id, events);
+        }
+
+        /// Appends events of `context`, as [`Fixture::log`] does.
+        fn log_in(&mut self, session_id: SessionId, context: ContextId, kinds: Vec<EventKind>) {
+            let events = kinds
+                .into_iter()
+                .map(|kind| (kind.logged_by_command().then(CommandId::new), context, kind))
+                .collect();
+            self.log_stamped(session_id, events);
+        }
+
+        /// Appends events, each logged by the command and in the context
+        /// named with it, and delivers them as one batch.
+        fn log_stamped(
+            &mut self,
+            session_id: SessionId,
+            kinds: Vec<(Option<CommandId>, ContextId, EventKind)>,
+        ) {
             let from = Seq(self.events.len() as u64 + 1);
             let events: Vec<Event> = kinds
                 .into_iter()
-                .map(|(command_id, kind)| {
+                .map(|(command_id, context, kind)| {
                     let minute = (self.events.len() % 60) as u32;
                     let event = Event {
                         session_id,
                         at: Utc.with_ymd_and_hms(2026, 10, 29, 10, minute, 0).unwrap(),
                         command_id,
-                        context: skywave_proto::ContextId::first_of(session_id),
+                        context,
                         kind,
                     };
                     self.events.push(event.clone());
@@ -2166,6 +2471,7 @@ mod tests {
         let pending = |outgoing, delivery| {
             vec![TimelineItem::Pending {
                 command_id: command.id,
+                context: skywave_proto::ContextId::first_of(sid),
                 text: "hello".into(),
                 outgoing,
                 discardable: outgoing == Outgoing::Queued,
@@ -2317,6 +2623,7 @@ mod tests {
             TimelineItem::Pending {
                 command_id,
                 text,
+                context: _,
                 outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::UnknownSession)),
                 discardable: true,
                 delivery: Some(Delivery {
@@ -2441,6 +2748,7 @@ mod tests {
         assert!(view.timeline.contains(&TimelineItem::Logged {
             seq: Seq(3),
             at: f.events[2].at,
+            context: skywave_proto::ContextId::first_of(sid),
             entry: Entry::Approval {
                 id: approval,
                 tool: "bash".into(),
@@ -5395,5 +5703,425 @@ mod tests {
         let view = f.model.view();
         assert_eq!(shown(&view), "active list");
         assert!(!view.can_go_back);
+    }
+
+    // ---- contexts -------------------------------------------------------
+
+    fn started(name: &str, by: DeviceId) -> EventKind {
+        EventKind::ContextStarted {
+            by,
+            name: name.into(),
+        }
+    }
+
+    fn context_of(command: &Command) -> ContextId {
+        match &command.kind {
+            CommandKind::SendMessage { context, .. }
+            | CommandKind::ClearContext { context, .. }
+            | CommandKind::SwitchContext { context, .. } => *context,
+            other => panic!("no context in {other:?}"),
+        }
+    }
+
+    /// The open session's contexts as (name, messages, current).
+    fn contexts(f: &Fixture) -> Vec<(String, usize, bool)> {
+        f.session_view()
+            .contexts
+            .into_iter()
+            .map(|c| (c.name, c.messages, c.current))
+            .collect()
+    }
+
+    #[test]
+    fn a_cleared_context_is_where_messages_go_at_once() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let first = ContextId::first_of(sid);
+        assert!(!f.session_view().can_clear, "nothing to clear yet");
+        assert_eq!(contexts(&f), [("start".to_owned(), 0, true)]);
+        let hello = send(&mut f, sid, "hello");
+        assert_eq!(context_of(&hello), first);
+        assert!(f.session_view().can_clear, "a message on its way counts");
+
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        let CommandKind::ClearContext {
+            session_id,
+            context,
+            name,
+        } = clear.kind.clone()
+        else {
+            panic!("expected a clear, got {clear:?}");
+        };
+        assert_eq!(session_id, sid);
+        assert_ne!(context, first);
+        assert_ne!(name, "start");
+        assert_eq!(
+            skywave_proto::normalise_context_name(&name).as_deref(),
+            Some(name.as_str()),
+            "named as the server will log it"
+        );
+        let view = f.session_view();
+        assert_eq!(view.context, context);
+        assert_eq!(view.clear, Some(Outgoing::Queued));
+        assert!(!view.can_clear, "the new context has no message yet");
+        assert_eq!(
+            view.contexts
+                .iter()
+                .map(|c| (c.id, c.messages, c.current, c.outgoing))
+                .collect::<Vec<_>>(),
+            [
+                (first, 1, false, None),
+                (context, 0, true, Some(Outgoing::Queued))
+            ]
+        );
+        assert_eq!(view.contexts[1].name, name);
+        assert_eq!(view.contexts[1].last_activity, None);
+
+        let fresh = send(&mut f, sid, "fresh");
+        assert_eq!(context_of(&fresh), context);
+        let view = f.session_view();
+        assert!(view.can_clear);
+        let pending: Vec<_> = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Pending { context, text, .. } => Some((text.as_str(), *context)),
+                TimelineItem::Logged { .. } => None,
+            })
+            .collect();
+        assert_eq!(pending, [("hello", first), ("fresh", context)]);
+        assert!(
+            f.dispatch(Action::ClearContext {
+                session_id: SessionId::new()
+            })
+            .is_empty(),
+            "unknown here"
+        );
+    }
+
+    #[test]
+    fn a_failed_clear_leaves_messages_where_they_went() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let first = ContextId::first_of(sid);
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        // Queued after the clear, so written for its context.
+        let stale = send(&mut f, sid, "after the clear");
+        assert_eq!(context_of(&stale), context_of(&clear));
+        f.model.command_result(
+            clear.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextExists,
+            },
+            Utc::now(),
+        );
+        let view = f.session_view();
+        assert_eq!(view.context, first, "a failed clear changed nothing");
+        assert_eq!(
+            view.clear,
+            Some(Outgoing::Failed(FailReason::Rejected(
+                RejectReason::ContextExists
+            )))
+        );
+        assert_eq!(contexts(&f), [("start".to_owned(), 0, true)]);
+        assert_eq!(context_of(&send(&mut f, sid, "next")), first);
+    }
+
+    #[test]
+    fn an_accepted_switch_leads_until_it_is_pulled() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = ContextId::first_of(sid);
+        let later = ContextId::new();
+        f.log_in(sid, later, vec![started("velvet walrus", DeviceId::new())]);
+        f.open(sid);
+        assert_eq!(f.session_view().context, later);
+        let switch = queued(&f.dispatch(Action::SwitchContext {
+            session_id: sid,
+            context: first,
+        }));
+        assert_eq!(f.session_view().switch, Some(Outgoing::Queued));
+        f.model.command_sending(switch.id, Utc::now());
+        f.model.command_result(
+            switch.id,
+            CommandResult::Accepted { seq: Seq(3) },
+            Utc::now(),
+        );
+        assert_eq!(f.model.cursor, Seq(2), "not pulled yet");
+        let view = f.session_view();
+        assert_eq!(
+            (view.context, view.switch),
+            (first, Some(Outgoing::Accepted(Seq(3))))
+        );
+        assert_eq!(context_of(&send(&mut f, sid, "in the window")), first);
+        f.log_stamped(
+            sid,
+            vec![(
+                Some(switch.id),
+                first,
+                EventKind::ContextSwitched { by: f.me },
+            )],
+        );
+        let view = f.session_view();
+        assert_eq!((view.context, view.switch), (first, None));
+        // Now the replica leads: another device's later switch wins.
+        f.log_in(
+            sid,
+            later,
+            vec![EventKind::ContextSwitched {
+                by: DeviceId::new(),
+            }],
+        );
+        assert_eq!(context_of(&send(&mut f, sid, "after")), later);
+    }
+
+    #[test]
+    fn the_context_list_reads_the_log() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = ContextId::first_of(sid);
+        let (empty, second) = (ContextId::new(), ContextId::new());
+        let other = DeviceId::new();
+        f.log(sid, vec![message("fix the test\nwith detail"), agent("ok")]);
+        f.log_in(sid, empty, vec![started("velvet walrus", other)]);
+        f.log_in(
+            sid,
+            second,
+            vec![
+                started("calm owl", other),
+                message("second"),
+                message("more"),
+            ],
+        );
+        f.log(sid, vec![EventKind::ContextSwitched { by: other }]);
+        f.open(sid);
+        send(&mut f, sid, "queued here");
+        let view = f.session_view();
+        assert_eq!(view.context, first);
+        assert!(view.can_clear);
+        // Log order; the empty context that is not current is not offered.
+        assert_eq!(
+            contexts(&f),
+            [
+                ("start".to_owned(), 2, true),
+                ("calm owl".to_owned(), 2, false)
+            ]
+        );
+        assert_eq!(
+            view.contexts
+                .iter()
+                .map(|c| (c.id, c.first_prompt.as_deref()))
+                .collect::<Vec<_>>(),
+            [(first, Some("fix the test")), (second, Some("second"))]
+        );
+        assert_eq!(view.contexts[1].last_activity, Some(f.events[6].at));
+        assert_eq!(view.contexts[0].last_activity, Some(f.events[7].at));
+
+        // Back in the empty one: it is offered, as current, and nothing
+        // there to clear.
+        f.log_in(sid, empty, vec![EventKind::ContextSwitched { by: other }]);
+        assert_eq!(
+            contexts(&f),
+            [
+                ("start".to_owned(), 2, false),
+                ("velvet walrus".to_owned(), 0, true),
+                ("calm owl".to_owned(), 2, false)
+            ]
+        );
+        assert!(!f.session_view().can_clear);
+    }
+
+    #[test]
+    fn a_cleared_name_is_none_the_session_has() {
+        let used: HashSet<String> = ["amber fox", "calm owl"].map(str::to_owned).into();
+        let mut rolls = ["amber fox", "calm owl", "amber fox", "dusky elk"].into_iter();
+        assert_eq!(
+            fresh_context_name(&used, || rolls.next().unwrap().to_owned()),
+            "dusky elk",
+            "used names are drawn again"
+        );
+        // A generator that only ever repeats: the name is numbered.
+        assert_eq!(
+            fresh_context_name(&used, || "amber fox".to_owned()),
+            "amber fox 2"
+        );
+        let mut more = used.clone();
+        more.insert("amber fox 2".into());
+        assert_eq!(
+            fresh_context_name(&more, || "amber fox".to_owned()),
+            "amber fox 3"
+        );
+        let long = "x".repeat(skywave_proto::limits::CONTEXT_NAME_MAX_CHARS);
+        let used: HashSet<String> = [long.clone()].into();
+        let numbered = fresh_context_name(&used, || long.clone());
+        assert_eq!(
+            numbered.chars().count(),
+            skywave_proto::limits::CONTEXT_NAME_MAX_CHARS
+        );
+        assert!(numbered.ends_with(" 2"));
+
+        // What a clear avoids: the names logged and those of clears queued.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.log_in(sid, ContextId::new(), vec![started("velvet walrus", f.me)]);
+        f.open(sid);
+        let clear = queued(&f.dispatch(Action::ClearContext { session_id: sid }));
+        let CommandKind::ClearContext { name, .. } = clear.kind else {
+            unreachable!()
+        };
+        assert!(!["start", "velvet walrus"].contains(&name.as_str()));
+        assert_eq!(
+            f.model.context_names(sid),
+            ["start".to_owned(), "velvet walrus".to_owned(), name].into()
+        );
+    }
+
+    #[test]
+    fn dividers_mark_where_the_context_changed_and_viewing_one_narrows_the_timeline() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (a, b) = (ContextId::first_of(sid), ContextId::new());
+        let laptop = DeviceId::new();
+        f.log(sid, vec![message("a1")]);
+        f.log_in(
+            sid,
+            b,
+            vec![started("velvet walrus", laptop), message("b1")],
+        );
+        f.log(sid, vec![EventKind::ContextSwitched { by: f.me }]);
+        // B's agent, stopped by the switch, ends its turn after it.
+        f.log_in(sid, b, vec![EventKind::TurnInterrupted]);
+        f.log(
+            sid,
+            vec![message("a2"), EventKind::ContextSwitched { by: laptop }],
+        );
+        f.open(sid);
+        send(&mut f, sid, "a3");
+        let texts = |f: &Fixture| -> Vec<String> {
+            f.session_view()
+                .timeline
+                .iter()
+                .map(|item| match item {
+                    TimelineItem::Logged { entry, .. } => match entry {
+                        Entry::UserMessage { text, .. } => text.clone(),
+                        Entry::ContextStarted { name, by } => {
+                            format!("started {name} by {}", if by.me { "me" } else { "laptop" })
+                        }
+                        Entry::ContextSwitched { name, by } => {
+                            format!("back to {name} by {}", if by.me { "me" } else { "laptop" })
+                        }
+                        Entry::Interrupted => "interrupted".to_owned(),
+                        other => format!("{other:?}"),
+                    },
+                    TimelineItem::Pending { text, .. } => format!("pending {text}"),
+                })
+                .collect()
+        };
+        // The second switch, to the context already current, has no entry.
+        assert_eq!(
+            texts(&f),
+            [
+                "a1",
+                "started velvet walrus by laptop",
+                "b1",
+                "back to start by me",
+                "interrupted",
+                "a2",
+                "pending a3"
+            ]
+        );
+        let stamps: Vec<ContextId> =
+            f.session_view()
+                .timeline
+                .iter()
+                .map(|item| match item {
+                    TimelineItem::Logged { context, .. }
+                    | TimelineItem::Pending { context, .. } => *context,
+                })
+                .collect();
+        assert_eq!(stamps, [a, b, b, a, b, a, a]);
+
+        let view = |f: &mut Fixture, context| {
+            f.dispatch(Action::ViewContext {
+                session_id: sid,
+                context,
+            })
+        };
+        assert!(view(&mut f, Some(b)).is_empty());
+        assert_eq!(f.session_view().viewing, Some(b));
+        assert_eq!(f.session_view().context, a, "viewing moves no message");
+        assert_eq!(texts(&f), ["b1", "interrupted"], "B's late end is B's");
+        let find = |f: &Fixture, q: &str| {
+            crate::search::find(
+                &f.session_view().timeline,
+                &crate::search::Query::new(q),
+                &mut |_| None,
+            )
+            .hits
+            .len()
+        };
+        assert_eq!(
+            (find(&f, "b1"), find(&f, "a1"), find(&f, "walrus")),
+            (1, 0, 0)
+        );
+        view(&mut f, Some(a));
+        assert_eq!(texts(&f), ["a1", "a2", "pending a3"], "not B's end");
+        assert_eq!((find(&f, "b1"), find(&f, "a1")), (0, 1));
+        view(&mut f, None);
+        assert_eq!(texts(&f).len(), 7);
+        assert_eq!(find(&f, "walrus"), 1, "the whole session's dividers");
+
+        // Kept only while the session stays open.
+        view(&mut f, Some(b));
+        f.dispatch(Action::Back);
+        f.open(sid);
+        assert_eq!(f.session_view().viewing, None);
+        assert!(view(&mut f, Some(b)).is_empty());
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert!(
+            view(&mut f, Some(b)).is_empty(),
+            "only the session on screen"
+        );
+        f.open(sid);
+        assert_eq!(f.session_view().viewing, None);
+    }
+
+    #[test]
+    fn a_message_refused_for_a_changed_context_goes_back_to_the_draft() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        f.open(sid);
+        let stale = send(&mut f, sid, "written before");
+        assert_eq!(context_of(&stale), ContextId::first_of(sid));
+        // Another device cleared meanwhile, so the server refuses it.
+        let fresh = ContextId::new();
+        f.log_in(sid, fresh, vec![started("velvet walrus", DeviceId::new())]);
+        f.model.command_sending(stale.id, Utc::now());
+        f.model.command_result(
+            stale.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ContextChanged,
+            },
+            Utc::now(),
+        );
+        let refused = Outgoing::Failed(FailReason::Rejected(RejectReason::ContextChanged));
+        assert!(f.session_view().timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Pending { command_id, outgoing, discardable: true, .. }
+                if *command_id == stale.id && *outgoing == refused
+        )));
+        let effects = f.dispatch(Action::EditQueued(stale.id));
+        assert!(
+            matches!(&effects[..], [Effect::Withdraw { id, draft: Some(_) }] if *id == stale.id)
+        );
+        let view = f.session_view();
+        assert_eq!(
+            view.draft.map(|d| d.text).as_deref(),
+            Some("written before")
+        );
+        assert!(pending(&f).is_empty());
+        assert_eq!(context_of(&send(&mut f, sid, "written before")), fresh);
     }
 }
