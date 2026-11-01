@@ -1,7 +1,7 @@
 {
-  "protocol_version": 9,
+  "protocol_version": 10,
   "hello": {
-    "protocol_version": 9,
+    "protocol_version": 10,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -38,7 +38,23 @@
         "kind": {
           "type": "session_created",
           "workdir": "/srv/code/skywave",
-          "context_name": "velvet walrus"
+          "context_name": "velvet walrus",
+          "from": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "session_created",
+          "workdir": "/srv/code/skywave",
+          "context_name": "amber otter",
+          "from": {
+            "session": "01920000-0000-7000-8000-000000000001",
+            "context": "01920000-0000-7000-8000-000000000008"
+          }
         }
       },
       {
@@ -59,6 +75,17 @@
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
           "type": "context_switched",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "context_moved",
+          "to": "01920000-0000-7000-8000-000000000009",
           "by": "01920000-0000-7000-8000-000000000003"
         }
       },
@@ -696,6 +723,15 @@
         "session_id": "01920000-0000-7000-8000-000000000001",
         "context": "01920000-0000-7000-8000-000000000008"
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "move_context",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "name": "amber otter"
+      }
     }
   ],
   "command_results": [
@@ -750,6 +786,18 @@
     {
       "result": "rejected",
       "reason": "context_changed"
+    },
+    {
+      "result": "rejected",
+      "reason": "context_moved"
+    },
+    {
+      "result": "rejected",
+      "reason": "context_current"
+    },
+    {
+      "result": "rejected",
+      "reason": "no_conversation"
     }
   ]
 }

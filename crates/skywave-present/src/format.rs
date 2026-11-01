@@ -191,6 +191,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ContextExists => "that context already exists",
         RejectReason::UnknownContext => "the session has no such context",
         RejectReason::ContextChanged => "the session moved to another context first",
+        RejectReason::ContextMoved => "that context was moved to a session of its own",
+        RejectReason::ContextCurrent => "that context is the current one",
+        RejectReason::NoConversation => "the agent never ran in that context",
     }
 }
 

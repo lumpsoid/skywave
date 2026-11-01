@@ -15,14 +15,18 @@
 //! - `SetModel` → `ModelRequested` with the normalised model;
 //! - `SetEffort` → `EffortRequested`;
 //! - `ClearContext` → `ContextStarted` with the normalised name;
-//! - `SwitchContext` → `ContextSwitched`.
+//! - `SwitchContext` → `ContextSwitched`;
+//! - `MoveContext` → `SessionCreated { from }` for the new session, naming
+//!   no command, then `ContextMoved` in the source.
 //!
-//! Each appends exactly that one event and nothing else, carrying the
-//! command's id ([`Event::command_id`](skywave_proto::Event::command_id)),
-//! so the log acknowledges an accepted command as its `Accepted` does: a
-//! device whose reply was lost settles the command when it pulls the
-//! event. A rejected command appends nothing; only its stored result
-//! answers it.
+//! Each appends exactly one event naming the command
+//! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
+//! appends, and nothing else but the new session's `SessionCreated` a
+//! `MoveContext` logs before it. So the log acknowledges an accepted
+//! command as its `Accepted` does: a device whose reply was lost settles
+//! the command when it pulls that event, and batches are contiguous, so it
+//! has whatever the command appended before it too. A rejected command
+//! appends nothing; only its stored result answers it.
 //!
 //! **Context stamps.** The server stamps each event with the context it
 //! belongs to ([`Event::context`](skywave_proto::Event::context)):
@@ -30,8 +34,9 @@
 //! session's id; `ContextStarted` and `ContextSwitched` with the context
 //! they make current; `ApprovalResolved` with the approval's context;
 //! `TurnInterrupted` with the context of the running turn, which after a
-//! switch is the old context until its agent reports the turn over; every
-//! other event with the session's current context.
+//! switch is the old context until its agent reports the turn over;
+//! `ContextMoved` with the context it moves; every other event with the
+//! session's current context.
 //!
 //! **SendMessage.** `ContextChanged` when its `context` is no longer the
 //! session's current one: the message was written for a conversation the
@@ -47,7 +52,21 @@
 //!
 //! **SwitchContext.** Absolute: switching to the current context is
 //! accepted and logged. A context of another session, or none, is
-//! `UnknownContext`.
+//! `UnknownContext`; a moved one is `ContextMoved`.
+//!
+//! **MoveContext.** Refused, in this order: `UnknownSession`;
+//! `UnknownContext` for a context not of the session; `ContextMoved` for
+//! one already moved; `ContextCurrent` for the session's current context
+//! (a client clears first to move it, D30); `NoConversation` for one with
+//! no resume handle (the adapters store it before `AgentWorking` is
+//! logged, so every context that had a turn has one); then the source's
+//! stored workdir must still canonicalise under a root
+//! (`WorkdirNotAllowed`, `WorkdirNotFound`) and to itself, else
+//! `WorkdirNotFound`: the new session runs in that path verbatim, where
+//! the agent finds the conversation it forks. The new session's id is the
+//! server's; its first context is named as `ClearContext` names one. A
+//! moved context is never current again, so no `SendMessage` can reach
+//! it.
 //!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
@@ -95,8 +114,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind,
-    RejectReason, Seq, SessionId, context_name, normalise_context_name,
+    Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
+    EventKind, RejectReason, Seq, SessionId, context_name, normalise_context_name,
 };
 
 use crate::db::Db;
@@ -148,8 +167,8 @@ impl EventLog {
         Ok(result)
     }
 
-    /// Validates `command` and appends its event, returning the event's seq
-    /// or why the command is refused.
+    /// Validates `command` and appends its events, returning the seq of the
+    /// one naming it, the last, or why the command is refused.
     fn apply(
         &self,
         tx: &Connection,
@@ -165,6 +184,7 @@ impl EventLog {
                         let kind = EventKind::SessionCreated {
                             workdir,
                             context_name: context_name::random(),
+                            from: None,
                         };
                         (session, ContextId::first_of(session), kind)
                     }
@@ -249,13 +269,78 @@ impl EventLog {
                 if known(*session_id)?.is_none() {
                     return Ok(Err(RejectReason::UnknownSession));
                 }
-                if event_log::context_session_in(tx, *context)? != Some(*session_id) {
+                let Some(row) = event_log::context_in(tx, *context)?
+                    .filter(|row| row.session_id == *session_id)
+                else {
                     return Ok(Err(RejectReason::UnknownContext));
+                };
+                if row.moved_to.is_some() {
+                    return Ok(Err(RejectReason::ContextMoved));
                 }
                 (
                     *session_id,
                     *context,
                     EventKind::ContextSwitched { by: device },
+                )
+            }
+            CommandKind::MoveContext {
+                session_id,
+                context,
+                name,
+            } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                let Some(row) = event_log::context_in(tx, *context)?
+                    .filter(|row| row.session_id == *session_id)
+                else {
+                    return Ok(Err(RejectReason::UnknownContext));
+                };
+                if row.moved_to.is_some() {
+                    return Ok(Err(RejectReason::ContextMoved));
+                }
+                if session.context == *context {
+                    return Ok(Err(RejectReason::ContextCurrent));
+                }
+                if !row.has_handle {
+                    return Ok(Err(RejectReason::NoConversation));
+                }
+                // The agent finds the conversation it forks by the workdir it
+                // ran in, so the new session runs in that very path: one that
+                // canonicalises elsewhere now (a symlink on it changed) is no
+                // longer the directory the source's conversation lives in.
+                match dirs::canonical_under_roots(self.roots(), &session.workdir) {
+                    Ok(canonical) if canonical == session.workdir => {}
+                    Ok(_) => return Ok(Err(RejectReason::WorkdirNotFound)),
+                    Err(reason) => return Ok(Err(reason)),
+                }
+                // The new session's event first, naming no command: the
+                // command names itself on the source's `ContextMoved`, the
+                // last event it appends, so a device that settles it from
+                // the log already has the new session too.
+                let moved_to = SessionId::new();
+                event_log::append_in(
+                    tx,
+                    moved_to,
+                    ContextId::first_of(moved_to),
+                    None,
+                    &EventKind::SessionCreated {
+                        workdir: session.workdir,
+                        context_name: normalise_context_name(name)
+                            .unwrap_or_else(context_name::random),
+                        from: Some(ContextRef {
+                            session: *session_id,
+                            context: *context,
+                        }),
+                    },
+                )?;
+                (
+                    *session_id,
+                    *context,
+                    EventKind::ContextMoved {
+                        to: moved_to,
+                        by: device,
+                    },
                 )
             }
             CommandKind::StopSession { session_id } => {

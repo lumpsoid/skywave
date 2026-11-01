@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId,
-    Effort, Event, EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
+    DeviceId, Effort, Event, EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
     SessionState,
 };
+use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
 use skywaved::{Error, EventLog, Storage};
 use tempfile::TempDir;
@@ -142,6 +143,23 @@ fn rejected(reason: RejectReason) -> CommandResult {
     CommandResult::Rejected { reason }
 }
 
+/// A `ClearContext` of `session` into a fresh context.
+fn clear_kind(session: SessionId, name: &str) -> CommandKind {
+    CommandKind::ClearContext {
+        session_id: session,
+        context: ContextId::new(),
+        name: name.into(),
+    }
+}
+
+fn move_kind(session: SessionId, context: ContextId, name: &str) -> CommandKind {
+    CommandKind::MoveContext {
+        session_id: session,
+        context,
+        name: name.into(),
+    }
+}
+
 fn workdir(path: &Path) -> String {
     path.to_str().unwrap().to_owned()
 }
@@ -244,9 +262,11 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
     );
 }
 
-/// Every command logs exactly one event, carrying the command's id at the
-/// seq its `Accepted` names, so the log alone acknowledges it; agent and
-/// daemon events carry none, and a rejected command logs nothing.
+/// Every command logs exactly one event naming it, carrying the command's
+/// id at the seq its `Accepted` names, so the log alone acknowledges it;
+/// agent and daemon events carry none (the new session's `SessionCreated`
+/// a move logs before its own event included), and a rejected command logs
+/// nothing.
 #[test]
 fn each_accepted_command_logs_one_event_naming_it() {
     let mut f = Fixture::new();
@@ -301,6 +321,21 @@ fn each_accepted_command_logs_one_event_naming_it() {
         assert_eq!(seq, before.next(), "one event, nothing else");
         logged.push((id, seq));
     }
+    // A move: its first context had a turn and is no longer current.
+    let first = ContextId::first_of(session);
+    f.converse(first);
+    let (id, result, before) = send(&mut f, clear_kind(session, "second"));
+    let seq = accepted(result);
+    assert_eq!(seq, before.next(), "one event, nothing else");
+    logged.push((id, seq));
+    let (id, result, before) = send(&mut f, move_kind(session, first, "moved"));
+    let seq = accepted(result);
+    assert_eq!(
+        seq,
+        before.next().next(),
+        "the new session's SessionCreated, then the move's own event"
+    );
+    logged.push((id, seq));
     let head = f.log.head();
     let (_, refused, _) = send(
         &mut f,
@@ -491,6 +526,7 @@ fn create_session_records_the_canonical_workdir() {
     let EventKind::SessionCreated {
         workdir: logged,
         context_name,
+        from: None,
     } = &batch.events[0].kind
     else {
         panic!("not SessionCreated: {:?}", batch.events[0].kind);
@@ -1028,6 +1064,7 @@ fn agent_appends_are_checked() {
         EventKind::SessionCreated {
             workdir: "/".into(),
             context_name: "start".into(),
+            from: None,
         },
         EventKind::ContextStarted {
             by: DeviceId::new(),
@@ -1035,6 +1072,15 @@ fn agent_appends_are_checked() {
         },
         EventKind::ContextSwitched {
             by: DeviceId::new(),
+        },
+        EventKind::ContextMoved {
+            to: other,
+            by: DeviceId::new(),
+        },
+        EventKind::SessionCreated {
+            workdir: "/".into(),
+            context_name: "moved".into(),
+            from: Some(ContextRef { session, context }),
         },
         EventKind::ApprovalCancelled {
             id: ApprovalId::new(),
@@ -1105,6 +1151,26 @@ impl Fixture {
             context,
             name: name.into(),
         })
+    }
+
+    /// Gives `context` a conversation: stores a resume handle for it, as
+    /// the agent does before its first turn is logged.
+    fn converse(&self, context: ContextId) {
+        let handle = ResumeHandle(serde_json::json!({ "session": context.0.to_string() }));
+        store_resume_handle(&self.storage.db, context, &handle).unwrap();
+    }
+
+    /// `contexts.origin` and `contexts.moved_to` of `context`.
+    fn moves(&self, context: ContextId) -> (Option<String>, Option<String>) {
+        self.storage
+            .db
+            .conn()
+            .query_row(
+                "SELECT origin, moved_to FROM contexts WHERE id = ?1",
+                [context.0.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
     }
 }
 
@@ -1467,4 +1533,259 @@ async fn rejected_commands_do_not_wake_waiters() {
 fn log_is_shareable_across_threads() {
     fn assert_send_sync<T: Send + Sync + Clone>() {}
     assert_send_sync::<EventLog>();
+}
+
+// --- MoveContext -------------------------------------------------------------
+
+impl Fixture {
+    /// A session in `dir` whose first context had a turn and is no longer
+    /// current: the context a move takes.
+    fn movable_in(&mut self, dir: &Path) -> (SessionId, ContextId) {
+        let seq = accepted(self.handle(CommandKind::CreateSession {
+            workdir: workdir(dir),
+        }));
+        let session = self.all_events()[(seq.0 - 1) as usize].session_id;
+        let first = ContextId::first_of(session);
+        self.converse(first);
+        accepted(self.handle(clear_kind(session, "next")));
+        (session, first)
+    }
+
+    fn movable(&mut self) -> (SessionId, ContextId) {
+        let project = self.root.join("project");
+        self.movable_in(&project)
+    }
+
+    fn workdir_of(&self, session: SessionId) -> String {
+        self.log
+            .session(&self.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .workdir
+    }
+}
+
+#[test]
+fn a_move_logs_the_new_session_then_the_move_naming_the_command() {
+    let mut f = Fixture::new();
+    let (session, first) = f.movable();
+    let current = f.current_context(session);
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: move_kind(session, first, "  amber\n otter "),
+    };
+    let before = f.log.head();
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, Seq(before.0 + 2), "exactly two new events");
+    assert_eq!(f.log.head(), seq);
+
+    let events = f.all_events();
+    let created = &events[(seq.0 - 2) as usize];
+    let moved = &events[(seq.0 - 1) as usize];
+    let to = created.session_id;
+    assert_ne!(to, session);
+    // The new session first, naming no command, in its first context.
+    assert_eq!(created.command_id, None);
+    assert_eq!(created.context, ContextId::first_of(to));
+    assert_eq!(
+        created.kind,
+        EventKind::SessionCreated {
+            workdir: f.workdir_of(session),
+            context_name: "amber otter".into(),
+            from: Some(ContextRef {
+                session,
+                context: first,
+            }),
+        }
+    );
+    // Then the move itself, at the command's seq, stamped with the moved
+    // context.
+    assert_eq!(moved.session_id, session);
+    assert_eq!(moved.command_id, Some(command.id));
+    assert_eq!(moved.context, first);
+    assert_eq!(moved.kind, EventKind::ContextMoved { to, by: device });
+
+    // Projections: the new session runs in the source's stored workdir, in
+    // its first context, which continues the moved one.
+    assert_eq!(f.workdir_of(to), f.workdir_of(session));
+    assert_eq!(f.current_context(to), ContextId::first_of(to));
+    assert_eq!(f.current_context(session), current, "the source goes on");
+    let id = |context: ContextId| Some(context.0.to_string());
+    let to_id = Some(to.0.to_string());
+    assert_eq!(f.moves(first), (None, to_id));
+    assert_eq!(f.moves(ContextId::first_of(to)), (id(first), None));
+    assert_eq!(f.moves(current), (None, None));
+    assert_eq!(
+        f.storage.db.context_stamp_violations().unwrap(),
+        Vec::<String>::new()
+    );
+
+    // A name blank once normalised is generated, as for `ClearContext`.
+    f.converse(current);
+    accepted(f.handle(clear_kind(session, "third")));
+    let seq = accepted(f.handle(move_kind(session, current, " \n ")));
+    let EventKind::SessionCreated { context_name, .. } = &f.all_events()[(seq.0 - 2) as usize].kind
+    else {
+        panic!("no SessionCreated before the move");
+    };
+    let (adjective, noun) = context_name.split_once(' ').unwrap();
+    assert!(skywave_proto::context_name::ADJECTIVES.contains(&adjective));
+    assert!(skywave_proto::context_name::NOUNS.contains(&noun));
+}
+
+#[test]
+fn a_refused_move_appends_nothing() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let other = f.create_session();
+    f.converse(ContextId::first_of(other));
+    // first: had a turn; second: never did; third: current, never did.
+    let first = ContextId::first_of(session);
+    f.converse(first);
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "second"));
+    let third = ContextId::new();
+    accepted(f.clear(session, third, "third"));
+
+    let head = f.log.head();
+    let mut refuse = |session: SessionId, context: ContextId, reason: RejectReason| {
+        assert_eq!(
+            f.handle(move_kind(session, context, "x")),
+            rejected(reason),
+            "{context:?}"
+        );
+        assert_eq!(f.log.head(), head, "a refused move logs nothing");
+    };
+    refuse(SessionId::new(), first, RejectReason::UnknownSession);
+    refuse(session, ContextId::new(), RejectReason::UnknownContext);
+    refuse(
+        session,
+        ContextId::first_of(other),
+        RejectReason::UnknownContext,
+    );
+    // Current is checked before the conversation.
+    refuse(session, third, RejectReason::ContextCurrent);
+    refuse(session, second, RejectReason::NoConversation);
+
+    // Positive control: the context that had a turn moves, once.
+    let seq = accepted(f.handle(move_kind(session, first, "x")));
+    assert_eq!(seq, Seq(head.0 + 2));
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(move_kind(session, first, "again")),
+        rejected(RejectReason::ContextMoved)
+    );
+    assert_eq!(f.log.head(), head);
+}
+
+#[test]
+fn a_move_needs_the_workdir_as_the_source_stored_it() {
+    let mut f = Fixture::new();
+    // Removed after the session was created.
+    let gone = f.root.join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let (removed, removed_context) = f.movable_in(&gone);
+    std::fs::remove_dir(&gone).unwrap();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(move_kind(removed, removed_context, "x")),
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    assert_eq!(f.log.head(), head);
+
+    // Its root dropped from the config.
+    let (session, first) = f.movable();
+    let elsewhere = f.tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let configured = std::mem::replace(
+        &mut f.log,
+        EventLog::open(&f.storage.db, vec![elsewhere]).unwrap(),
+    );
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(move_kind(session, first, "x")),
+        rejected(RejectReason::WorkdirNotAllowed)
+    );
+    assert_eq!(f.log.head(), head);
+    // Positive control: with the root back the same move is accepted.
+    f.log = configured;
+    accepted(f.handle(move_kind(session, first, "x")));
+}
+
+/// The new session runs in the source's stored path verbatim, where the
+/// agent finds the conversation it forks: one that canonicalises elsewhere
+/// now (a directory on it became a symlink) is not that directory.
+#[cfg(unix)]
+#[test]
+fn a_move_refuses_a_workdir_that_now_resolves_elsewhere() {
+    let mut f = Fixture::new();
+    let parent = f.root.join("p");
+    std::fs::create_dir_all(parent.join("w")).unwrap();
+    std::fs::create_dir_all(f.root.join("q").join("w")).unwrap();
+    let (session, first) = f.movable_in(&parent.join("w"));
+    assert_eq!(f.workdir_of(session), workdir(&parent.join("w")));
+
+    let aside = f.root.join("p-aside");
+    std::fs::rename(&parent, &aside).unwrap();
+    std::os::unix::fs::symlink(f.root.join("q"), &parent).unwrap();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(move_kind(session, first, "x")),
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    assert_eq!(f.log.head(), head);
+
+    // Positive control: with the directory back, the same move goes ahead.
+    std::fs::remove_file(&parent).unwrap();
+    std::fs::rename(&aside, &parent).unwrap();
+    accepted(f.handle(move_kind(session, first, "x")));
+}
+
+#[test]
+fn a_resent_move_gets_the_same_answer_and_one_new_session() {
+    let mut f = Fixture::new();
+    let (session, first) = f.movable();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: move_kind(session, first, "moved"),
+    };
+    let result = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+    let seq = accepted(result.clone());
+    let mut other = f.connection();
+    for _ in 0..3 {
+        assert_eq!(
+            f.log.handle(&mut other.db, device, &command).unwrap(),
+            result
+        );
+    }
+    assert_eq!(f.log.head(), seq);
+    let moved_sessions = f
+        .all_kinds()
+        .into_iter()
+        .filter(|kind| matches!(kind, EventKind::SessionCreated { from: Some(_), .. }))
+        .count();
+    assert_eq!(moved_sessions, 1);
+}
+
+#[test]
+fn switching_to_a_moved_context_is_refused() {
+    let mut f = Fixture::new();
+    let (session, first) = f.movable();
+    let current = f.current_context(session);
+    accepted(f.handle(move_kind(session, first, "moved")));
+    let switch = |context| CommandKind::SwitchContext {
+        session_id: session,
+        context,
+    };
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(switch(first)),
+        rejected(RejectReason::ContextMoved)
+    );
+    assert_eq!(f.log.head(), head);
+    assert_eq!(f.current_context(session), current);
+    // Positive control: a context that stayed is switched to as before.
+    accepted(f.handle(switch(current)));
 }

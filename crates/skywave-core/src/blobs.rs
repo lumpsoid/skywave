@@ -684,6 +684,7 @@ mod tests {
                     event(EventKind::SessionCreated {
                         workdir: "/srv".into(),
                         context_name: "start".into(),
+                        from: None,
                     }),
                     event(EventKind::ToolResult(ToolResult {
                         call: None,

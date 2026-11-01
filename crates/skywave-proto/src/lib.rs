@@ -53,7 +53,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `EventKind::SessionCreated::context_name`; the context a
 /// `CommandKind::SendMessage` was written in; and
 /// `RejectReason::{ContextExists, UnknownContext, ContextChanged}`.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// v10: moving a context into a new session. `CommandKind::MoveContext`
+/// with its `EventKind::ContextMoved`, the [`ContextRef`] a moved context
+/// went on from in `EventKind::SessionCreated::from`, and
+/// `RejectReason::{ContextMoved, ContextCurrent, NoConversation}`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -129,6 +134,14 @@ impl ContextId {
     }
 }
 
+/// One context of one session, named across sessions: the context a moved
+/// context went on from (`EventKind::SessionCreated::from`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContextRef {
+    pub session: SessionId,
+    pub context: ContextId,
+}
+
 /// Position in the server's global event log (D12).
 ///
 /// One log spans every session. Seqs are contiguous: the first event is
@@ -164,9 +177,12 @@ pub struct Event {
     pub session_id: SessionId,
     pub at: DateTime<Utc>,
     /// The command that logged the event; `None` for the events the agent
-    /// and the daemon produce. Every accepted command logs exactly one
-    /// event, so it is that command's `Accepted { seq }` too: a device whose
-    /// reply was lost settles the command from the log.
+    /// and the daemon produce. Every accepted command logs exactly one event
+    /// naming it, the last it appends, so it is that command's
+    /// `Accepted { seq }` too: a device whose reply was lost settles the
+    /// command from the log, and already has whatever else the command
+    /// appended. `MoveContext` also logs the new session's `SessionCreated`
+    /// before it.
     pub command_id: Option<CommandId>,
     /// The context of its session the event belongs to, decided by the
     /// server when it logs the event; never derived from the event's
@@ -182,9 +198,15 @@ pub enum EventKind {
     /// A session was created in `workdir`, a directory on the server (D14).
     /// Its first context, which has the session's id, is named
     /// `context_name` by the server.
+    ///
+    /// `from` is set when the session continues a context another session
+    /// moved here: the daemon logs it for a `MoveContext`, never a command
+    /// of its own (the command's event is the source's `ContextMoved`).
+    /// Events stored before v10 have no `from` and decode as `None`.
     SessionCreated {
         workdir: String,
         context_name: String,
+        from: Option<ContextRef>,
     },
     /// A `ClearContext` command started a new, empty context named `name`
     /// and made it current; the event is stamped with the new context. The
@@ -196,6 +218,13 @@ pub enum EventKind {
     /// A `SwitchContext` command made the context the event is stamped with
     /// current again; the agent resumes that context's conversation.
     ContextSwitched {
+        by: DeviceId,
+    },
+    /// A `MoveContext` command sent the context the event is stamped with
+    /// on as session `to`, whose `SessionCreated` comes right before it: it
+    /// is never current here again.
+    ContextMoved {
+        to: SessionId,
         by: DeviceId,
     },
     UserMessage {
@@ -347,7 +376,8 @@ impl EventKind {
             | EventKind::ModelRequested { by, .. }
             | EventKind::EffortRequested { by, .. }
             | EventKind::ContextStarted { by, .. }
-            | EventKind::ContextSwitched { by } => Some(*by),
+            | EventKind::ContextSwitched { by }
+            | EventKind::ContextMoved { by, .. } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -368,13 +398,15 @@ impl EventKind {
         }
     }
 
-    /// Whether only a command logs this kind, so an event of it carries
-    /// the [`Event::command_id`] of the command that did. The agent and the
-    /// daemon log the rest, `ApprovalCancelled` included.
+    /// Whether only a command logs this event, so it carries the
+    /// [`Event::command_id`] of the command that did. The agent and the
+    /// daemon log the rest, `ApprovalCancelled` included, and so the
+    /// `SessionCreated` of a moved context: its `MoveContext` names itself
+    /// on the `ContextMoved` that follows.
     pub fn logged_by_command(&self) -> bool {
         match self {
-            EventKind::SessionCreated { .. }
-            | EventKind::UserMessage { .. }
+            EventKind::SessionCreated { from, .. } => from.is_none(),
+            EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
@@ -384,7 +416,8 @@ impl EventKind {
             | EventKind::ModelRequested { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::ContextStarted { .. }
-            | EventKind::ContextSwitched { .. } => true,
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -433,7 +466,8 @@ impl EventKind {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::ContextStarted { .. }
-            | EventKind::ContextSwitched { .. } => None,
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. } => None,
         }
     }
 }
@@ -1097,6 +1131,21 @@ pub enum CommandKind {
         session_id: SessionId,
         context: ContextId,
     },
+    /// Continue `context`, a context of the session with a conversation
+    /// that is not its current one, as a new session in the session's
+    /// workdir. The new session's first context is named `name`, as
+    /// [`ClearContext`] names one, and continues the conversation;
+    /// `context` stays in the source, moved, never current again. The
+    /// server logs the new session's `SessionCreated` (naming no command),
+    /// then the source's `ContextMoved`, which names this command and is
+    /// its `Accepted { seq }`.
+    ///
+    /// [`ClearContext`]: CommandKind::ClearContext
+    MoveContext {
+        session_id: SessionId,
+        context: ContextId,
+        name: String,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1177,11 +1226,20 @@ pub enum RejectReason {
     /// `ClearContext.context` is already a context, of this session or
     /// another.
     ContextExists,
-    /// `SwitchContext.context` is not a context of the session.
+    /// `SwitchContext.context` or `MoveContext.context` is not a context of
+    /// the session.
     UnknownContext,
     /// `SendMessage.context` is no longer the session's current context: a
     /// device cleared or switched contexts after the message was written.
     ContextChanged,
+    /// `SwitchContext.context` or `MoveContext.context` was already moved
+    /// to a session of its own.
+    ContextMoved,
+    /// `MoveContext.context` is the session's current context.
+    ContextCurrent,
+    /// `MoveContext.context` has no conversation to continue: the agent
+    /// never ran in it.
+    NoConversation,
 }
 
 impl RejectReason {
@@ -1489,6 +1547,10 @@ mod tests {
                 name: "velvet walrus".into(),
             },
             EventKind::ContextSwitched { by },
+            EventKind::ContextMoved {
+                to: SessionId::new(),
+                by,
+            },
         ] {
             assert_eq!(kind.device(), Some(by), "{kind:?}");
             assert!(kind.logged_by_command(), "{kind:?}");
@@ -1498,9 +1560,30 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/w".into(),
             context_name: "start".into(),
+            from: None,
         };
         assert_eq!(created.device(), None);
+        assert!(created.logged_by_command());
         assert!(!EventKind::AgentMessage { text: "x".into() }.logged_by_command());
+    }
+
+    #[test]
+    fn a_moved_contexts_session_created_is_logged_by_the_daemon() {
+        // The `MoveContext` names itself on the source's `ContextMoved`, the
+        // last event it appends; the new session's `SessionCreated` before it
+        // names no command.
+        let session = SessionId::new();
+        let moved = EventKind::SessionCreated {
+            workdir: "/w".into(),
+            context_name: "fork".into(),
+            from: Some(ContextRef {
+                session,
+                context: ContextId::new(),
+            }),
+        };
+        assert!(!moved.logged_by_command());
+        assert_eq!(moved.device(), None);
+        assert_eq!(moved.archived_effect(), None);
     }
 
     #[test]

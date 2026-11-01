@@ -131,7 +131,7 @@ impl SessionSummary {
     /// A rename only sets the name, an archive only the archived flag, a
     /// mode or model event only the agent settings, a context cleared or
     /// switched only the current context, and the models an agent offers
-    /// nothing here: none is activity, so they move neither `last_seq` nor
+    /// or a context moved away nothing here: none is activity, so they move neither `last_seq` nor
     /// `last_activity` and the session keeps its place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
@@ -151,7 +151,9 @@ impl SessionSummary {
                 self.context = event.context;
                 return;
             }
-            EventKind::SessionArchived { .. } | EventKind::ModelsOffered { .. } => return,
+            EventKind::SessionArchived { .. }
+            | EventKind::ModelsOffered { .. }
+            | EventKind::ContextMoved { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -202,7 +204,8 @@ impl SessionSummary {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::ContextStarted { .. }
-            | EventKind::ContextSwitched { .. } => {}
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. } => {}
         }
     }
 
@@ -278,7 +281,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::EffortChanged { .. }
         | EventKind::EffortRefused { .. }
         | EventKind::ContextStarted { .. }
-        | EventKind::ContextSwitched { .. } => false,
+        | EventKind::ContextSwitched { .. }
+        | EventKind::ContextMoved { .. } => false,
     }
 }
 
@@ -314,7 +318,8 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::EffortChanged { .. }
         | EventKind::EffortRefused { .. }
         | EventKind::ContextStarted { .. }
-        | EventKind::ContextSwitched { .. } => (None, None),
+        | EventKind::ContextSwitched { .. }
+        | EventKind::ContextMoved { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -347,6 +352,7 @@ mod tests {
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
         );
@@ -391,6 +397,7 @@ mod tests {
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
+                from: None,
             },
         );
         let mut summary = SessionSummary::new(Seq(1), &created);
@@ -466,6 +473,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
+            from: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.title(), "app");
@@ -511,6 +519,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
+            from: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let renamed = EventKind::SessionRenamed {
@@ -534,6 +543,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
+            from: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let first = ContextId::first_of(sid);
@@ -582,6 +592,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
+            from: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert!(!summary.archived);
@@ -614,6 +625,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
             context_name: "start".into(),
+            from: None,
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.usage, None);
