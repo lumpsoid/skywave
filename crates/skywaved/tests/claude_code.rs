@@ -2950,7 +2950,7 @@ fn replay_loop_reports_no_task() {
 // Schedules
 
 #[test]
-fn initialize_registers_the_stop_hook_alone() {
+fn initialize_registers_the_stop_hook_and_the_per_task_stop() {
     assert_eq!(
         protocol::initialize_request("r1"),
         json!({
@@ -2959,8 +2959,59 @@ fn initialize_registers_the_stop_hook_alone() {
             "request": {
                 "subtype": "initialize",
                 "hooks": { "Stop": [{ "hookCallbackIds": ["skywave-stop"] }] },
+                "perTaskStopAffordance": true,
             },
         })
+    );
+}
+
+/// The task ids of each reported set, and `"interrupted"` where a turn ended
+/// as [`TurnOutcome::Interrupted`].
+fn task_sets_and_interrupts(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                Some(format!("tasks: [{}]", ids.join(", ")))
+            }
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted) => Some("interrupted".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn replay_an_interrupt_spares_the_background_agent() {
+    let events = replay("interrupt_spares_tasks", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        task_sets_and_interrupts(&events),
+        [
+            "tasks: []",
+            "tasks: [a2384c814f3a1cabf]",
+            // The interrupt ends the turn; the agent stays in the set.
+            "interrupted",
+            // It leaves only when it completes.
+            "tasks: []",
+        ]
+    );
+}
+
+#[test]
+fn replay_an_interrupt_without_the_flag_kills_the_background_agent() {
+    // The contrast: a CLI not told of a per-task stop kills the task at the
+    // interrupt. (The harness ignores `initialize`'s content; the recording
+    // documents the CLI.)
+    let events = replay("interrupt_kills_tasks", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        task_sets_and_interrupts(&events),
+        [
+            "tasks: []",
+            "tasks: [ade77bae3441b384c]",
+            // The task is gone before the interrupt's turn ends.
+            "tasks: []",
+            "interrupted",
+        ]
     );
 }
 
