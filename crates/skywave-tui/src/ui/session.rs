@@ -16,8 +16,8 @@ use skywave_core::{
 };
 use skywave_present::format::{
     agent_effort_label, agent_mode_label, agent_model_label, agent_refusal, answer_words,
-    blob_size, bytes, context_row, delivery_label, dollars, effort_label, mode_detail, mode_label,
-    outgoing_label, tokens, turn_time, viewing_hint,
+    blob_size, bytes, context_moved_label, context_row, delivery_label, dollars, effort_label,
+    mode_detail, mode_label, outgoing_label, tokens, turn_time, viewing_hint,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -561,7 +561,23 @@ fn render_picker(
                 None,
             )
         }
-        Picker::Contexts { selected } => {
+        Picker::Contexts {
+            moving: Some(id), ..
+        } => {
+            let name = session
+                .contexts
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| clean(&context_row(c)))
+                .unwrap_or_default();
+            let lines = vec![
+                Line::from(format!("Move {name} to a new session?")).bold(),
+                Line::from("It goes on there; here it stays as it was.").yellow(),
+                Line::from("y move · any other key back").yellow().bold(),
+            ];
+            (" Contexts ".to_owned(), lines, None)
+        }
+        Picker::Contexts { selected, note, .. } => {
             let new = if session.can_clear {
                 Span::raw("New context")
             } else {
@@ -580,12 +596,25 @@ fn render_picker(
                         outgoing_badge(outgoing).1,
                     ));
                 }
+                if let Some(moved) = context_moved_label(context) {
+                    spans.push(Span::raw(format!(" · {}", clean(&moved))).dark_gray());
+                }
                 spans
             }));
             let selected = (*selected).min(items.len() - 1);
+            // The reason `M` was refused takes the last row.
+            let rows = if note.is_some() {
+                rows.saturating_sub(1)
+            } else {
+                rows
+            };
+            let mut lines = list_lines(items, selected, rows.max(1));
+            if let Some(note) = note {
+                lines.push(Line::from(clean(note)).yellow());
+            }
             (
-                " Contexts · Enter switches · v views ".to_owned(),
-                list_lines(items, selected, rows),
+                " Contexts · Enter switches · v views · M moves ".to_owned(),
+                lines,
                 None,
             )
         }

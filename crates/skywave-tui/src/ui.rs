@@ -634,8 +634,11 @@ fn footer_keys(app: &App) -> &'static str {
                 Some(Picker::Agent { .. }) => {
                     "↑↓ choose · Enter open · m model · e effort · Esc cancel · ? help"
                 }
+                Some(Picker::Contexts {
+                    moving: Some(_), ..
+                }) => "y move to a new session · any other key back to the list · ? help",
                 Some(Picker::Contexts { .. }) => {
-                    "↑↓ choose · Enter switch / new · v view · Esc cancel · ? help"
+                    "↑↓ choose · Enter switch / new · v view · M move · x drop a refused move · Esc cancel · ? help"
                 }
                 Some(Picker::Effort { .. }) => "↑↓ choose · Enter switch · Esc back · ? help",
                 _ => {
@@ -803,6 +806,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("m", "switch the agent's model or effort: m or e"),
                     key("C", "new context; switch to or view one"),
                     key("", "(Enter switches, v views; on this one: all)"),
+                    key("", "(M moves it to a new session, y confirms;"),
+                    key("", "x drops a refused move; Enter on a moved one opens it)"),
                     key("R", "rename the session"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),

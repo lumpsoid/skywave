@@ -1996,6 +1996,171 @@ fn contexts_picker_switches_to_an_earlier_context() {
     assert_contains(&status_line(&h, 100), "switch queued");
 }
 
+/// A session whose first context ("start") the agent answered in, and
+/// whose current one, "velvet walrus", is just begun: the first is movable.
+fn movable_context() -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    let walrus = skywave_proto::ContextId::new();
+    pull(
+        &mut h,
+        vec![
+            message(id, 1, CommandId::new(), me, "alpha question"),
+            event(
+                id,
+                2,
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+            ),
+            event(
+                id,
+                3,
+                EventKind::AgentMessage {
+                    text: "alpha answer".into(),
+                },
+            ),
+            Event {
+                context: walrus,
+                ..event(
+                    id,
+                    4,
+                    EventKind::ContextStarted {
+                        by: me,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+            Event {
+                context: walrus,
+                ..message(id, 5, CommandId::new(), me, "beta question")
+            },
+        ],
+    );
+    (h, id, me)
+}
+
+#[test]
+fn moving_a_context_asks_first_and_only_y_sends_it() {
+    let (mut h, id, _) = movable_context();
+    let start = skywave_proto::ContextId::first_of(id);
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Char('M')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Move start · alpha question to a new session?");
+    assert_contains(&screen, "y move · any other key back");
+
+    // Anything but `y` goes back to the list, and nothing is sent.
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    let screen = h.screen();
+    assert_contains(&screen, " Contexts · Enter switches");
+    assert!(!screen.contains("to a new session?"), "{screen}");
+    // The confirmation does not survive: `y` on the list is nothing.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+
+    // Positive control: asked again, `y` sends it.
+    h.key(KeyCode::Char('M'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::MoveContext {
+            session_id: id,
+            context: start,
+        })
+    );
+    assert!(!h.screen().contains(" Contexts · Enter switches"));
+}
+
+#[test]
+fn moving_a_context_the_core_does_not_offer_says_why_and_sends_nothing() {
+    let (mut h, _, _) = two_contexts();
+    // No agent answered in either context.
+    h.key(KeyCode::Char('C'));
+    assert_eq!(h.key(KeyCode::Char('M')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "can't move yet: it needs an answered turn");
+    assert!(!screen.contains("to a new session?"), "{screen}");
+    // The reason goes with the next key, and `y` does not move it.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert!(!h.screen().contains("can't move yet"));
+    assert_contains(&h.screen(), " Contexts · Enter switches");
+}
+
+#[test]
+fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
+    use skywave_proto::{ContextId, ContextRef};
+    let (mut h, id, me) = movable_context();
+    let new = SessionId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                new,
+                6,
+                EventKind::SessionCreated {
+                    workdir: "/srv/work".into(),
+                    context_name: "start".into(),
+                    from: Some(ContextRef {
+                        session: id,
+                        context: ContextId::first_of(id),
+                    }),
+                },
+            ),
+            event(
+                new,
+                7,
+                EventKind::SessionRenamed {
+                    name: Some("forked".into()),
+                    by: me,
+                },
+            ),
+            event(id, 8, EventKind::ContextMoved { to: new, by: me }),
+        ],
+    );
+    h.key(KeyCode::Char('C'));
+    let screen = h.screen();
+    assert_contains(
+        &line_with(&screen, "start · alpha question"),
+        "moved → “forked”",
+    );
+    assert!(
+        !line_with(&screen, "velvet walrus · beta").contains("moved"),
+        "{screen}"
+    );
+    // A moved context cannot move again, and says so.
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Char('M')), None);
+    assert_contains(&h.screen(), "already moved to another session");
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
+}
+
+#[test]
+fn x_drops_a_refused_move_from_the_contexts_picker() {
+    let (mut h, _, _) = movable_context();
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Char('M'));
+    let Some(Action::MoveContext { .. }) = h.key(KeyCode::Char('y')) else {
+        panic!("not sent");
+    };
+    let moved = last_command(&h);
+
+    h.seam.command_sending(moved).unwrap();
+    h.seam
+        .command_result(
+            moved,
+            &CommandResult::Rejected {
+                reason: RejectReason::WorkdirNotAllowed,
+            },
+        )
+        .unwrap();
+    h.sync();
+    h.key(KeyCode::Char('C'));
+    // Another row (the current context) has no move to drop.
+    assert_eq!(h.key(KeyCode::Char('x')), None);
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Char('x')), Some(Action::Discard(moved)));
+    assert!(h.seam.pending_outbox().unwrap().is_empty());
+}
+
 #[test]
 fn contexts_picker_views_one_context_and_back() {
     let (mut h, id, _) = two_contexts();
