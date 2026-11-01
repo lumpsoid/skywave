@@ -282,15 +282,26 @@ impl Model {
                 code,
                 fingerprint,
             } => self.pair(address, code, fingerprint),
-            Action::CreateSession { workdir } => {
+            Action::CreateSession {
+                workdir,
+                conversation,
+            } => {
                 let workdir = workdir.trim();
                 if workdir.is_empty() {
                     return Vec::new();
                 }
                 self.completer.end();
+                // No local id check: dispatch has no failure channel, and a
+                // silent drop would lose what the user typed. The server's
+                // `BadConversation` shows as a failed pending session.
+                let conversation = conversation
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned);
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
-                    conversation: None,
+                    conversation,
                 })
             }
             Action::CreateSessionLike(from) => {
@@ -1310,7 +1321,8 @@ impl Model {
                         Entry::ContextStarted { .. }
                         | Entry::ContextSwitched { .. }
                         | Entry::ContextMoved { .. }
-                        | Entry::MovedFrom { .. },
+                        | Entry::MovedFrom { .. }
+                        | Entry::Adopted { .. },
                     ..
                 } => false,
                 TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
@@ -1970,7 +1982,10 @@ impl Model {
                             from: self.session_ref(from.session),
                             name: context_name.clone(),
                         }),
-                        Some(SessionOrigin::Agent { .. }) | None => None,
+                        Some(SessionOrigin::Agent { conversation }) => Some(Entry::Adopted {
+                            conversation: conversation.clone(),
+                        }),
+                        None => None,
                     }
                 }
                 EventKind::ContextStarted { by, name } => {
@@ -2520,6 +2535,7 @@ mod tests {
         assert!(
             model
                 .dispatch(Action::CreateSession {
+                    conversation: None,
                     workdir: "/srv/x".into()
                 })
                 .is_empty()
@@ -4555,11 +4571,13 @@ mod tests {
         let old = f.session("/srv/old");
         assert!(
             f.dispatch(Action::CreateSession {
+                conversation: None,
                 workdir: "   ".into()
             })
             .is_empty()
         );
         let command = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: " /srv/new ".into(),
         }));
         let creating = |f: &Fixture| f.list_view().creating;
@@ -4753,12 +4771,101 @@ mod tests {
     }
 
     #[test]
+    fn a_created_session_sends_its_trimmed_conversation_unchecked() {
+        let mut f = Fixture::paired();
+        let create = |f: &mut Fixture, conversation: Option<&str>| {
+            queued(&f.dispatch(Action::CreateSession {
+                workdir: "/srv/a".into(),
+                conversation: conversation.map(str::to_owned),
+            }))
+            .kind
+        };
+        let kind = |conversation: Option<&str>| CommandKind::CreateSession {
+            workdir: "/srv/a".into(),
+            conversation: conversation.map(str::to_owned),
+        };
+        assert_eq!(create(&mut f, Some(" id ")), kind(Some("id")));
+        assert_eq!(create(&mut f, Some("  ")), kind(None));
+        assert_eq!(create(&mut f, None), kind(None));
+        // Not an id the agent could have: still sent, the server decides.
+        assert_eq!(create(&mut f, Some("../x y")), kind(Some("../x y")));
+    }
+
+    #[test]
+    fn a_refused_conversation_is_a_discardable_failed_creation() {
+        let mut f = Fixture::paired();
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/a".into(),
+            conversation: Some("nope".into()),
+        }));
+        f.model.command_sending(command.id, Utc::now());
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::BadConversation,
+            },
+            Utc::now(),
+        );
+        let creating = f.list_view().creating;
+        assert_eq!(creating.len(), 1);
+        assert_eq!(creating[0].workdir, "/srv/a");
+        assert!(creating[0].discardable);
+        assert!(matches!(creating[0].outgoing, Outgoing::Failed(_)));
+        assert_eq!(
+            f.dispatch(Action::Discard(command.id)),
+            vec![Effect::Withdraw {
+                id: command.id,
+                draft: None,
+            }]
+        );
+        assert!(f.list_view().creating.is_empty());
+    }
+
+    #[test]
+    fn an_adopted_session_starts_with_the_adopted_entry() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/a".into(),
+            context_name: "start".into(),
+            from: Some(SessionOrigin::Agent {
+                conversation: "conv-1".into(),
+            }),
+        };
+        f.log_stamped(adopted, vec![(None, ContextId::first_of(adopted), created)]);
+        f.log(adopted, vec![message("go on")]);
+        f.open(adopted);
+        let shown = entries(&f);
+        assert_eq!(
+            shown.first(),
+            Some(&Entry::Adopted {
+                conversation: "conv-1".into()
+            })
+        );
+        assert!(
+            matches!(shown.get(1), Some(Entry::UserMessage { .. })),
+            "{shown:?}"
+        );
+        // Positive control: a plain session has no such first item.
+        let plain = f.session("/srv/b");
+        f.log(plain, vec![message("hi")]);
+        f.open(plain);
+        assert!(
+            !entries(&f)
+                .iter()
+                .any(|e| matches!(e, Entry::Adopted { .. } | Entry::MovedFrom { .. }))
+        );
+    }
+
+    #[test]
     fn discard_refused_creation_hides_row() {
         let mut f = Fixture::paired();
         let refused = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/etc".into(),
         }));
         let waiting = queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/new".into(),
         }));
         f.model.command_sending(refused.id, Utc::now());
@@ -5927,6 +6034,7 @@ mod tests {
         assert!(complete(&mut f, "/srv/").is_some());
         // Creating the session ends the completion.
         queued(&f.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/x".into(),
         }));
         assert_eq!(f.list_view().completion, None);

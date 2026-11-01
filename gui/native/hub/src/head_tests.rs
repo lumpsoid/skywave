@@ -24,6 +24,53 @@ struct Rig {
     done: Vec<Dispatched>,
 }
 
+#[test]
+fn an_adopted_session_starts_with_a_divider_row() {
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let new = SessionId::new();
+    let events = vec![Event {
+        session_id: new,
+        at,
+        command_id: None,
+        context: skywave_proto::ContextId::first_of(new),
+        kind: EventKind::SessionCreated {
+            workdir: "/srv/adopted".into(),
+            context_name: "start".into(),
+            from: Some(skywave_proto::SessionOrigin::Agent {
+                conversation: "3f2a-91bc".into(),
+            }),
+        },
+    }];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSession {
+            session_id: new.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone(), row.selectable))
+        .collect();
+    assert_eq!(
+        rows,
+        [(
+            RowKind::ContextDivider,
+            "Continues agent conversation 3f2a-91bc from outside Skywave; its earlier history is not shown here"
+                .to_owned(),
+            false
+        )]
+    );
+}
+
 impl Rig {
     fn new() -> Rig {
         let dir = tempfile::tempdir().unwrap();

@@ -841,6 +841,12 @@ pub enum Entry {
         from: SessionRef,
         name: String,
     },
+    /// The session's first item when it was made by adopting the agent's
+    /// outside conversation `conversation`; its earlier history is not
+    /// shown here.
+    Adopted {
+        conversation: String,
+    },
     /// The session was renamed; `None` restored its default title.
     Renamed {
         name: Option<String>,

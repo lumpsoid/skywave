@@ -360,6 +360,7 @@ impl Client {
     /// command has its result.
     pub async fn create_session(&self, daemon: &Daemon) -> SessionId {
         self.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         });
         let command = self.outbox().last().unwrap().command.id;
