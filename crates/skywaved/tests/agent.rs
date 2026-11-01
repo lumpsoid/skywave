@@ -4,6 +4,7 @@
 //! `EventLog::handle`, the agent is told directly, and every adapter event is
 //! fed to the mapper.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -837,6 +838,7 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
             tool: "write".into(),
             input: json!("short"),
             suggestions,
+            task: None,
         },
     ] {
         mapper.apply(&f.log, &mut f.storage, event).unwrap();
@@ -915,6 +917,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
             tool: "write".into(),
             input: json!("short"),
             suggestions: Vec::new(),
+            task: None,
         },
         AdapterEvent::ToolResult {
             call: None,
@@ -1026,6 +1029,7 @@ fn large_content_gives_small_events_and_blobs() {
                 tool: "shell".into(),
                 input: input.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1290,6 +1294,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 tool: "write".into(),
                 input: write.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ApprovalRequested {
                 request: "q2".into(),
@@ -1297,6 +1302,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 tool: "write".into(),
                 input: edited.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1897,4 +1903,89 @@ fn schedules_are_cut_to_the_limits() {
         schedules.last().unwrap().id.0,
         format!("s{}", SCHEDULES_MAX - 2)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Background approvals
+
+fn asked(request: &str, task: Option<&str>) -> AdapterEvent {
+    AdapterEvent::ApprovalRequested {
+        request: request.into(),
+        call: None,
+        tool: "write".into(),
+        input: json!(request),
+        suggestions: Vec::new(),
+        task: task.map(str::to_owned),
+    }
+}
+
+/// The ids of the approvals logged, by their summary (the request's input).
+fn approval_ids(f: &Fixture) -> HashMap<String, ApprovalId> {
+    f.kinds()
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::ApprovalRequested { id, summary, .. } => Some((summary, id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cancelled_ids(f: &Fixture) -> Vec<(ApprovalId, String)> {
+    f.kinds()
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::ApprovalCancelled { id, reason } => Some((id, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_tasks_approval_outlives_the_turn_and_exit_cancels_every_approval() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            asked("task", Some("sub")),
+            asked("turn", None),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ],
+    );
+    let ids = approval_ids(&f);
+    // The turn's end cancels the turn's own leftover only.
+    assert_eq!(cancelled_ids(&f), [(ids["turn"], "turn ended".to_owned())]);
+    assert_eq!(
+        mapper.pending_approvals().collect::<Vec<_>>(),
+        [ids["task"]]
+    );
+    // A later turn's end leaves it too.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
+            AdapterEvent::TurnStarted,
+            asked("next", None),
+        ],
+    );
+    assert_eq!(cancelled_ids(&f).len(), 1);
+    // Exit cancels both, the task's and the open turn's.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    let ids = approval_ids(&f);
+    assert_eq!(
+        cancelled_ids(&f)[1..],
+        [
+            (ids["task"], "agent exited".to_owned()),
+            (ids["next"], "agent exited".to_owned()),
+        ]
+    );
+    assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
 }

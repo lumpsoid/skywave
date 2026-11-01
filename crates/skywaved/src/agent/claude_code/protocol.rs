@@ -17,7 +17,10 @@
 //! and stays pending, with no timeout (D8), until it is answered, the CLI
 //! withdraws it (`control_cancel_request`, or an error `tool_result` for its
 //! tool call), or the turn ends; the last two are reported as
-//! `ApprovalCancelled`. An answer to a request that is no longer pending
+//! `ApprovalCancelled`. A background subagent's request (its `agent_id` is a
+//! live task's id) is that task's, not the turn's: it may come outside any
+//! turn, and instead of the turn's end, the task leaving the set
+//! (`background_tasks_changed`) cancels it. An answer to a request that is no longer pending
 //! writes nothing. The request's `permission_suggestions` worth offering
 //! ([`rules::offered`]) ride along as rule suggestions; an approval granting
 //! one sends that update back as `updatedPermissions`, so the CLI keeps the
@@ -73,7 +76,7 @@
 //! Whether a job outlives the process is read from its `CronCreate`
 //! result's structured `durable`, kept by job id for the whole process.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 use skywave_proto::Decision;
@@ -98,6 +101,9 @@ pub const INTERRUPT_REASON: &str = "interrupted";
 pub const WITHDRAWN_REASON: &str = "withdrawn by the agent";
 /// Reason for approvals still pending when their turn ended.
 pub const TURN_ENDED_REASON: &str = "turn ended";
+/// Reason for a background task's approvals still pending when the task
+/// left the set.
+pub const TASK_ENDED_REASON: &str = "task ended";
 
 /// What one protocol step produces, in order.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -343,6 +349,9 @@ struct Pending {
     input: Value,
     /// The permission update behind each suggestion offered, by index.
     updates: Vec<Value>,
+    /// The live background task asking (its `agent_id`), or `None` for
+    /// the turn's own.
+    task: Option<String>,
 }
 
 /// The protocol state of one CLI process.
@@ -378,6 +387,8 @@ pub struct Protocol {
     /// job id, as its `CronCreate` result said. Kept across turns: a job
     /// is listed long after the turn that made it.
     durable: HashMap<String, bool>,
+    /// The ids of the live background tasks, as last reported.
+    tasks: HashSet<String>,
     shutting_down: bool,
     /// Mode, model and effort requests, effort reads and task stops the
     /// CLI has not answered, by request id.
@@ -432,6 +443,7 @@ impl Protocol {
             pending: Vec::new(),
             tools: HashMap::new(),
             durable: HashMap::new(),
+            tasks: HashSet::new(),
             shutting_down: false,
             settings: HashMap::new(),
             efforts: VecDeque::new(),
@@ -769,9 +781,10 @@ impl Protocol {
     }
 
     /// `system/background_tasks_changed`: every live task, replacing the
-    /// last report.
+    /// last report. The approvals of a task no longer in it are cancelled
+    /// first.
     fn on_background_tasks(&mut self, message: &Value, out: &mut Output) {
-        let tasks = message
+        let tasks: Vec<AgentTask> = message
             .get("tasks")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
@@ -799,6 +812,13 @@ impl Protocol {
                 })
             })
             .collect();
+        let live: HashSet<String> = tasks.iter().map(|task| task.id.clone()).collect();
+        self.cancel_pending(
+            |p| p.task.as_ref().is_some_and(|task| !live.contains(task)),
+            TASK_ENDED_REASON,
+            out,
+        );
+        self.tasks = live;
         out.events.push(AdapterEvent::BackgroundTasks(tasks));
     }
 
@@ -922,6 +942,13 @@ impl Protocol {
         let (suggestions, updates) = rules::offered(request.get("permission_suggestions"))
             .into_iter()
             .unzip();
+        // A background subagent asks under its task id; one not live (a
+        // foreground subagent) works for the turn, so is the turn's.
+        let task = request
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .filter(|id| self.tasks.contains(*id))
+            .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
         self.pending.push(Pending {
@@ -929,6 +956,7 @@ impl Protocol {
             tool_use_id,
             input: input.clone(),
             updates,
+            task: task.clone(),
         });
         out.events.push(AdapterEvent::ApprovalRequested {
             request,
@@ -936,6 +964,7 @@ impl Protocol {
             tool,
             input,
             suggestions,
+            task,
         });
     }
 
@@ -995,6 +1024,20 @@ impl Protocol {
             request: pending.request,
             reason: reason.to_owned(),
         });
+    }
+
+    /// Cancels the pending approvals `which` picks, oldest first.
+    fn cancel_pending(&mut self, which: impl Fn(&Pending) -> bool, reason: &str, out: &mut Output) {
+        let (cancelled, kept) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(which);
+        self.pending = kept;
+        for pending in cancelled {
+            out.events.push(AdapterEvent::ApprovalCancelled {
+                request: pending.request,
+                reason: reason.to_owned(),
+            });
+        }
     }
 
     /// A `system/status`: the mode now, unless it echoes a switch the
@@ -1223,12 +1266,8 @@ impl Protocol {
         } else {
             TURN_ENDED_REASON
         };
-        for pending in self.pending.drain(..) {
-            out.events.push(AdapterEvent::ApprovalCancelled {
-                request: pending.request,
-                reason: reason.to_owned(),
-            });
-        }
+        // A background task's approvals outlive the turn.
+        self.cancel_pending(|p| p.task.is_none(), reason, out);
         let usage = usage::turn_usage(message, self.model.as_deref());
         if !usage.is_empty() {
             out.events.push(AdapterEvent::TurnUsage(usage));

@@ -877,6 +877,7 @@ impl Runner {
                         tool,
                         input,
                         suggestions,
+                        task: None,
                     };
                     if !self.emit(asked).await {
                         return Flow::Exit(None);
