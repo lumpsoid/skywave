@@ -234,6 +234,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )],
     })
@@ -380,6 +381,7 @@ fn draft_survives_restart() {
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )],
     })
@@ -443,6 +445,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -508,6 +511,7 @@ fn gap_is_refused_and_changes_nothing() {
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             )],
         })
@@ -541,6 +545,7 @@ fn blob_progress_is_persisted_and_shown() {
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             event(
@@ -639,6 +644,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             requested(1, news),
@@ -715,6 +721,7 @@ fn deleted_session_stays_gone_after_restart() {
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -898,6 +905,7 @@ fn a_message_after_an_acked_switch_not_yet_pulled_goes_to_the_switch_context() {
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             Event {

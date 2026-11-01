@@ -49,6 +49,7 @@ impl Rig {
         let kind = EventKind::SessionCreated {
             workdir: "/srv/work".into(),
             context_name: "start".into(),
+            from: None,
         };
         seam.apply_events(&EventBatch {
             from: Seq(seam.cursor().unwrap().0 + 1),
@@ -585,6 +586,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
     let kind = EventKind::SessionCreated {
         workdir: "/srv/other".into(),
         context_name: "start".into(),
+        from: None,
     };
     rig.seam
         .apply_events(&EventBatch {

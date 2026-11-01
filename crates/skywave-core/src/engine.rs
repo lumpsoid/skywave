@@ -885,6 +885,7 @@ mod tests {
                 kind: skywave_proto::EventKind::SessionCreated {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             }],
         };
@@ -1581,6 +1582,7 @@ mod tests {
                     kind: skywave_proto::EventKind::SessionCreated {
                         workdir: "/srv".into(),
                         context_name: "start".into(),
+                        from: None,
                     },
                 }]),
                 grew: Notify::new(),

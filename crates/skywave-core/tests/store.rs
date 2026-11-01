@@ -48,6 +48,7 @@ impl Log {
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             event(
@@ -61,6 +62,7 @@ impl Log {
                 EventKind::SessionCreated {
                     workdir: "/srv/b".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             event(
@@ -622,6 +624,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             turn(
@@ -689,6 +692,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -756,6 +760,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -842,6 +847,7 @@ fn notable_count_is_projected_and_backfilled() {
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -1036,6 +1042,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
                 context_name: "start".into(),
+                from: None,
             },
         )
     };
@@ -1612,6 +1619,7 @@ fn created(session_id: SessionId, minute: u32) -> Event {
         EventKind::SessionCreated {
             workdir: "/srv/x".into(),
             context_name: "start".into(),
+            from: None,
         },
     )
 }
@@ -1794,6 +1802,7 @@ fn a_v8_replica_moves_into_first_contexts() {
                 EventKind::SessionCreated {
                     workdir: "/srv".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             )
         };
@@ -1968,6 +1977,7 @@ fn agent_settings_and_offered_models_are_kept() {
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             event(
@@ -1982,6 +1992,7 @@ fn agent_settings_and_offered_models_are_kept() {
                 EventKind::SessionCreated {
                     workdir: "/srv/b".into(),
                     context_name: "start".into(),
+                    from: None,
                 },
             ),
             event(
@@ -2021,6 +2032,7 @@ fn an_agents_effort_is_kept() {
             event(EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
                 context_name: "start".into(),
+                from: None,
             }),
             event(EventKind::EffortChanged {
                 effort: Some(Effort::XHigh),

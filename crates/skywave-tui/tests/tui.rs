@@ -296,6 +296,7 @@ fn created(session_id: SessionId, minute: u32, workdir: &str) -> Event {
         EventKind::SessionCreated {
             workdir: workdir.into(),
             context_name: "start".into(),
+            from: None,
         },
     )
 }

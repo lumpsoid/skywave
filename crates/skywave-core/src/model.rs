@@ -1804,6 +1804,8 @@ impl Model {
                 }
                 // Shown in the header.
                 EventKind::ModelsOffered { .. } => None,
+                // Not shown yet.
+                EventKind::ContextMoved { .. } => None,
                 EventKind::EffortChanged { effort, answers } => Some(Entry::AgentSetting {
                     setting: AgentSetting::Effort(*effort),
                     by: self.asker(&asked_by, *answers),
@@ -2082,7 +2084,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetModel { session_id, .. }
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
-        | CommandKind::SwitchContext { session_id, .. } => Some(*session_id),
+        | CommandKind::SwitchContext { session_id, .. }
+        | CommandKind::MoveContext { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -2224,6 +2227,7 @@ mod tests {
                 vec![EventKind::SessionCreated {
                     workdir: workdir.into(),
                     context_name: "start".into(),
+                    from: None,
                 }],
             );
             id
@@ -4314,6 +4318,7 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
+            from: None,
         };
         f.log_commands(new, vec![(Some(command.id), created.clone())]);
         assert_eq!(f.model.open_session(), Some(new));
