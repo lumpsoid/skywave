@@ -60,9 +60,20 @@ impl Fixture {
         batch.events[0].session_id
     }
 
+    /// Appends `kind` as the agent of the session's current context.
     fn agent(&mut self, session: SessionId, kind: EventKind) -> Seq {
+        let context = self
+            .log
+            .session(&self.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .context;
+        self.agent_in(session, context, kind)
+    }
+
+    fn agent_in(&mut self, session: SessionId, context: ContextId, kind: EventKind) -> Seq {
         self.log
-            .append(&mut self.storage.db, session, kind)
+            .append(&mut self.storage.db, session, context, kind)
             .unwrap()
     }
 
@@ -430,8 +441,14 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
                         };
                         accepted(log.handle(&mut conn.db, device, &command).unwrap())
                     } else {
-                        log.append(&mut conn.db, session, EventKind::AgentMessage { text })
-                            .unwrap()
+                        let context = ContextId::first_of(session);
+                        log.append(
+                            &mut conn.db,
+                            session,
+                            context,
+                            EventKind::AgentMessage { text },
+                        )
+                        .unwrap()
                     };
                     assert!(seq > last, "a writer's own events are ordered");
                     last = seq;
@@ -984,14 +1001,28 @@ fn set_effort_logs_one_request_the_agent_answers() {
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
+    let nobody = SessionId::new();
     let unknown = f.log.append(
         &mut f.storage.db,
-        SessionId::new(),
+        nobody,
+        ContextId::first_of(nobody),
         EventKind::AgentMessage { text: "x".into() },
     );
     assert!(matches!(unknown, Err(Error::InvalidAppend(_))));
 
     let session = f.create_session();
+    let context = ContextId::first_of(session);
+    // A context that is not the session's: unknown, or another session's.
+    let other = f.create_session();
+    for wrong in [ContextId::new(), ContextId::first_of(other)] {
+        let appended = f.log.append(
+            &mut f.storage.db,
+            session,
+            wrong,
+            EventKind::AgentMessage { text: "x".into() },
+        );
+        assert!(matches!(appended, Err(Error::InvalidAppend(_))));
+    }
     for kind in [
         EventKind::TurnInterrupted,
         EventKind::SessionCreated {
@@ -1023,7 +1054,7 @@ fn agent_appends_are_checked() {
         },
     ] {
         assert!(matches!(
-            f.log.append(&mut f.storage.db, session, kind),
+            f.log.append(&mut f.storage.db, session, context, kind),
             Err(Error::InvalidAppend(_))
         ));
     }
@@ -1031,6 +1062,7 @@ fn agent_appends_are_checked() {
     let duplicate = f.log.append(
         &mut f.storage.db,
         session,
+        context,
         EventKind::ApprovalRequested {
             id: approval,
             call: None,
@@ -1041,7 +1073,14 @@ fn agent_appends_are_checked() {
         },
     );
     assert!(matches!(duplicate, Err(Error::InvalidAppend(_))));
-    assert_eq!(f.log.head(), Seq(2), "refused appends leave no trace");
+    assert_eq!(f.log.head(), Seq(3), "refused appends leave no trace");
+    // Positive control: the session's own context is accepted.
+    f.agent_in(
+        session,
+        context,
+        EventKind::AgentMessage { text: "x".into() },
+    );
+    assert_eq!(f.log.head(), Seq(4));
 }
 
 // --- contexts ----------------------------------------------------------------
@@ -1275,8 +1314,16 @@ fn session_wide_events_are_stamped_with_the_current_context() {
         accepted(f.handle(kind));
         assert_eq!(f.last_event().context, second);
     }
-    // So, for now, is whatever the agent logs.
-    f.agent(session, EventKind::AgentMessage { text: "x".into() });
+    // What the agent logs carries the context it is given, the context of
+    // the process that produced it, current or not.
+    let first = ContextId::first_of(session);
+    f.agent_in(session, first, EventKind::AgentMessage { text: "x".into() });
+    assert_eq!(f.last_event().context, first);
+    f.agent_in(
+        session,
+        second,
+        EventKind::AgentMessage { text: "y".into() },
+    );
     assert_eq!(f.last_event().context, second);
 }
 
