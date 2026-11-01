@@ -1445,7 +1445,7 @@ mod tests {
             command: &'a Command,
         ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
             Box::pin(async move {
-                let CommandKind::CreateSession { workdir } = &command.kind else {
+                let CommandKind::CreateSession { workdir, .. } = &command.kind else {
                     panic!("only creations are sent here");
                 };
                 let mut seen = self.seen.lock().unwrap();

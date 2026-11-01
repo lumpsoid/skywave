@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId, DeviceInfo,
     DirsResult, EventBatch, EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse,
-    RejectReason, Seq, SessionId, path,
+    RejectReason, Seq, SessionId, SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -138,6 +138,7 @@ impl Fixture {
             id: CommandId::new(),
             kind: CommandKind::CreateSession {
                 workdir: self.root.join("project").display().to_string(),
+                conversation: None,
             },
         }
     }
@@ -522,6 +523,49 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
     assert_eq!(f.log.head(), Seq(2));
+}
+
+/// Adopting an outside conversation over the wire: the trimmed id comes
+/// back in the `SessionCreated` naming the command; a bad id is a result,
+/// not an error, and stays one on resend.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_session_adopts_a_conversation_by_its_id() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let adopt = |conversation: &str| Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: f.root.join("project").display().to_string(),
+            conversation: Some(conversation.to_owned()),
+        },
+    };
+
+    let bad = adopt("not an id");
+    let rejected = CommandResult::Rejected {
+        reason: RejectReason::BadConversation,
+    };
+    assert_eq!(device.command(&bad).await, rejected);
+    assert_eq!(device.command(&bad).await, rejected);
+    assert_eq!(f.log.head(), Seq::ZERO);
+
+    let good = adopt(" 9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8 ");
+    let accepted = device.command(&good).await;
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+    assert_eq!(device.command(&good).await, accepted);
+    let batch = device.events(Seq::ZERO, 0).await;
+    assert_eq!(batch.events.len(), 1);
+    let event = &batch.events[0];
+    assert_eq!(event.command_id, Some(good.id));
+    let EventKind::SessionCreated { from, .. } = &event.kind else {
+        panic!("{batch:?}");
+    };
+    assert_eq!(
+        from,
+        &Some(SessionOrigin::Agent {
+            conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

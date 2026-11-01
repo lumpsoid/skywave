@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionState as LogState, TaskId,
-    ToolCall,
+    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionOrigin, SessionState as LogState,
+    TaskId, ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -290,6 +290,7 @@ impl Model {
                 self.completer.end();
                 self.enqueue(CommandKind::CreateSession {
                     workdir: workdir.to_owned(),
+                    conversation: None,
                 })
             }
             Action::CreateSessionLike(from) => {
@@ -300,7 +301,10 @@ impl Model {
                 else {
                     return Vec::new();
                 };
-                let effects = self.enqueue(CommandKind::CreateSession { workdir });
+                let effects = self.enqueue(CommandKind::CreateSession {
+                    workdir,
+                    conversation: None,
+                });
                 if let Some(Effect::Enqueue(command)) = effects.first() {
                     self.opening = Some((command.id, from));
                 }
@@ -1228,7 +1232,7 @@ impl Model {
             .outbox
             .iter()
             .filter_map(|e| match &e.command.kind {
-                CommandKind::CreateSession { workdir } => {
+                CommandKind::CreateSession { workdir, .. } => {
                     let outgoing = Outgoing::from(&e.status);
                     (!self.in_replica(outgoing)).then(|| PendingSession {
                         command_id: e.command.id,
@@ -1961,10 +1965,13 @@ impl Model {
                     current = Some(event.context);
                     // Shown in the header, but for where a moved context
                     // came from.
-                    from.map(|from| Entry::MovedFrom {
-                        from: self.session_ref(from.session),
-                        name: context_name.clone(),
-                    })
+                    match from {
+                        Some(SessionOrigin::Context(from)) => Some(Entry::MovedFrom {
+                            from: self.session_ref(from.session),
+                            name: context_name.clone(),
+                        }),
+                        Some(SessionOrigin::Agent { .. }) | None => None,
+                    }
                 }
                 EventKind::ContextStarted { by, name } => {
                     names.insert(event.context, name);
@@ -4594,7 +4601,8 @@ mod tests {
         assert_eq!(
             command.kind,
             CommandKind::CreateSession {
-                workdir: "/srv/a".into()
+                workdir: "/srv/a".into(),
+                conversation: None,
             }
         );
         assert_eq!(f.model.unloaded_session(), None);
@@ -6447,10 +6455,10 @@ mod tests {
         let created = EventKind::SessionCreated {
             workdir: "/srv/a".into(),
             context_name: "start".into(),
-            from: Some(skywave_proto::ContextRef {
+            from: Some(SessionOrigin::Context(skywave_proto::ContextRef {
                 session: from,
                 context,
-            }),
+            })),
         };
         assert!(!created.logged_by_command());
         f.log_stamped(new, vec![(None, ContextId::first_of(new), created)]);

@@ -1853,7 +1853,7 @@ fn context_dividers_show_where_the_context_changed() {
 
 #[test]
 fn a_moved_context_is_a_divider_in_both_sessions() {
-    use skywave_proto::{ContextId, ContextRef};
+    use skywave_proto::{ContextId, ContextRef, SessionOrigin};
     let (mut h, id, me) = open_session();
     let (walrus, new) = (ContextId::new(), SessionId::new());
     // As the server logs moving the current context: the clear, then the
@@ -1878,10 +1878,10 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
                 EventKind::SessionCreated {
                     workdir: "/srv/work".into(),
                     context_name: "start".into(),
-                    from: Some(ContextRef {
+                    from: Some(SessionOrigin::Context(ContextRef {
                         session: id,
                         context: ContextId::first_of(id),
-                    }),
+                    })),
                 },
             ),
             event(
@@ -2086,7 +2086,7 @@ fn moving_a_context_the_core_does_not_offer_says_why_and_sends_nothing() {
 
 #[test]
 fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
-    use skywave_proto::{ContextId, ContextRef};
+    use skywave_proto::{ContextId, ContextRef, SessionOrigin};
     let (mut h, id, me) = movable_context();
     let new = SessionId::new();
     pull(
@@ -2098,10 +2098,10 @@ fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
                 EventKind::SessionCreated {
                     workdir: "/srv/work".into(),
                     context_name: "start".into(),
-                    from: Some(ContextRef {
+                    from: Some(SessionOrigin::Context(ContextRef {
                         session: id,
                         context: ContextId::first_of(id),
-                    }),
+                    })),
                 },
             ),
             event(

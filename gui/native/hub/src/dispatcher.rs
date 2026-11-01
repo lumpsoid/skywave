@@ -127,7 +127,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|entry| match entry.command.kind {
-                CommandKind::CreateSession { workdir } => Some(workdir),
+                CommandKind::CreateSession { workdir, .. } => Some(workdir),
                 _ => None,
             })
             .collect();

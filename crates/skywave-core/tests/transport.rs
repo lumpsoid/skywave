@@ -184,6 +184,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
             workdir: fx.workdir(),
+            conversation: None,
         },
     };
     let accepted = transport.send_command(&create).await.unwrap();
