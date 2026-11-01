@@ -732,10 +732,12 @@ fn a_moved_context_is_a_divider_row() {
             kind: EventKind::SessionCreated {
                 workdir: "/srv/forked".into(),
                 context_name: "start".into(),
-                from: Some(skywave_proto::ContextRef {
-                    session: rig.session,
-                    context: start,
-                }),
+                from: Some(skywave_proto::SessionOrigin::Context(
+                    skywave_proto::ContextRef {
+                        session: rig.session,
+                        context: start,
+                    },
+                )),
             },
         },
         Event {
@@ -961,10 +963,12 @@ fn a_moved_context_row_names_where_it_went() {
                     kind: EventKind::SessionCreated {
                         workdir: "/srv/forked".into(),
                         context_name: "start".into(),
-                        from: Some(skywave_proto::ContextRef {
-                            session: rig.session,
-                            context: start,
-                        }),
+                        from: Some(skywave_proto::SessionOrigin::Context(
+                            skywave_proto::ContextRef {
+                                session: rig.session,
+                                context: start,
+                            },
+                        )),
                     },
                 },
                 Event {

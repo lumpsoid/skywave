@@ -195,6 +195,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ContextMoved => "that context was moved to a session of its own",
         RejectReason::ContextCurrent => "that context is the current one",
         RejectReason::NoConversation => "the agent never ran in that context",
+        RejectReason::BadConversation => "not an agent conversation id",
         RejectReason::UnknownTask => "that background task already ended",
     }
 }
@@ -1044,6 +1045,14 @@ mod tests {
         assert_eq!(
             viewing_hint(&view).as_deref(),
             Some("Viewing start — messages go to velvet walrus")
+        );
+    }
+
+    #[test]
+    fn a_bad_conversation_id_is_named() {
+        assert_eq!(
+            reject_reason(RejectReason::BadConversation),
+            "not an agent conversation id"
         );
     }
 }

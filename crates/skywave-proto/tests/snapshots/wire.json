@@ -1,7 +1,7 @@
 {
-  "protocol_version": 11,
+  "protocol_version": 12,
   "hello": {
-    "protocol_version": 11,
+    "protocol_version": 12,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -52,8 +52,24 @@
           "workdir": "/srv/code/skywave",
           "context_name": "amber otter",
           "from": {
+            "kind": "context",
             "session": "01920000-0000-7000-8000-000000000001",
             "context": "01920000-0000-7000-8000-000000000008"
+          }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "session_created",
+          "workdir": "/srv/code/skywave",
+          "context_name": "copper heron",
+          "from": {
+            "kind": "agent",
+            "conversation": "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8"
           }
         }
       },
@@ -688,7 +704,16 @@
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
         "type": "create_session",
-        "workdir": "/srv/code/skywave"
+        "workdir": "/srv/code/skywave",
+        "conversation": null
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "create_session",
+        "workdir": "/srv/code/skywave",
+        "conversation": "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8"
       }
     },
     {
@@ -896,6 +921,10 @@
     {
       "result": "rejected",
       "reason": "no_conversation"
+    },
+    {
+      "result": "rejected",
+      "reason": "bad_conversation"
     },
     {
       "result": "rejected",

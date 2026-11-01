@@ -32,7 +32,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, CommandId, ContextId, Event, EventBatch, EventKind,
-    ModelChoice, Seq, SessionId, SessionState,
+    ModelChoice, Seq, SessionId, SessionOrigin, SessionState,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -417,15 +417,22 @@ pub(crate) fn append_in(
 
     match kind {
         // The sessions row first: the contexts row refers to it. A moved
-        // context's new session continues the context it came from.
+        // context's new session continues the context it came from
+        // (`origin`); an adopting one, the agent's outside conversation
+        // (`adopted`). At most one of the two is set.
         EventKind::SessionCreated { workdir, from, .. } => {
             conn.execute(
                 "INSERT INTO sessions (id, workdir, current_context) VALUES (?1, ?2, ?3)",
                 params![session, workdir, context],
             )?;
+            let (origin, adopted) = match from {
+                None => (None, None),
+                Some(SessionOrigin::Context(r)) => (Some(r.context.0.to_string()), None),
+                Some(SessionOrigin::Agent { conversation }) => (None, Some(conversation.as_str())),
+            };
             conn.execute(
-                "INSERT INTO contexts (id, session_id, origin) VALUES (?1, ?2, ?3)",
-                params![context, session, from.map(|r| r.context.0.to_string())],
+                "INSERT INTO contexts (id, session_id, origin, adopted) VALUES (?1, ?2, ?3, ?4)",
+                params![context, session, origin, adopted],
             )?;
         }
         // Logged after the new session's `SessionCreated`, so its row exists.
@@ -612,8 +619,9 @@ pub(crate) fn context_session_in(conn: &Connection, id: ContextId) -> Result<Opt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextRow {
     pub session_id: SessionId,
-    /// The context this one continues (`SessionCreated::from`), of another
-    /// session; `None` for a context that started afresh.
+    /// The context this one continues (`SessionOrigin::Context` in
+    /// `SessionCreated::from`), of another session; `None` for any other
+    /// context.
     pub origin: Option<ContextId>,
     /// The session a `ContextMoved` sent it on as; set, it is never current
     /// or started here again.

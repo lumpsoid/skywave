@@ -12,7 +12,8 @@ use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision,
     DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolResult,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
+    ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
@@ -58,6 +59,7 @@ impl Fixture {
             DeviceId::new(),
             CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
+                conversation: None,
             },
         ));
         f.session_id = f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0].session_id;
@@ -279,6 +281,7 @@ impl Fixture {
             DeviceId::new(),
             CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
+                conversation: None,
             },
         ));
         self.log
@@ -2584,7 +2587,7 @@ async fn a_context_moved_mid_turn_is_stopped_and_forked_by_its_new_session() {
         matches!(
             &kinds[..],
             [
-                (EventKind::SessionCreated { from: Some(from), .. }, _),
+                (EventKind::SessionCreated { from: Some(SessionOrigin::Context(from)), .. }, _),
                 (EventKind::UserMessage { .. }, _),
                 (EventKind::SessionStateChanged(SessionState::AgentWorking), _),
                 (EventKind::AgentMessage { text }, _),

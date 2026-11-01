@@ -64,7 +64,13 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`BackgroundTask`]s or [`Schedule`]s, folded into [`AgentWork`];
 /// `CommandKind::StopTask` with its `EventKind::{TaskStopRequested,
 /// TaskStopRefused}` and `RejectReason::UnknownTask`.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// v12: adopting a conversation the agent had outside Skywave.
+/// `CommandKind::CreateSession::conversation`, the agent's own id for it;
+/// [`SessionOrigin`] in `EventKind::SessionCreated::from`, which now names
+/// either a moved context or such a conversation; and
+/// `RejectReason::BadConversation`.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -141,11 +147,23 @@ impl ContextId {
 }
 
 /// One context of one session, named across sessions: the context a moved
-/// context went on from (`EventKind::SessionCreated::from`).
+/// context went on from ([`SessionOrigin::Context`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContextRef {
     pub session: SessionId,
     pub context: ContextId,
+}
+
+/// What a new session's first context continues
+/// (`EventKind::SessionCreated::from`). A session continues at most one
+/// thing, so this is one choice rather than two optional fields.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionOrigin {
+    /// A context another session moved here (`MoveContext`, D30).
+    Context(ContextRef),
+    /// A conversation the agent had outside Skywave, by the agent's own id.
+    Agent { conversation: String },
 }
 
 /// Position in the server's global event log (D12).
@@ -205,14 +223,18 @@ pub enum EventKind {
     /// Its first context, which has the session's id, is named
     /// `context_name` by the server.
     ///
-    /// `from` is set when the session continues a context another session
-    /// moved here: the daemon logs it for a `MoveContext`, never a command
+    /// `from` is what the first context continues, `None` for a fresh
+    /// conversation. [`SessionOrigin::Context`]: a context another session
+    /// moved here; the daemon logs it for a `MoveContext`, never a command
     /// of its own (the command's event is the source's `ContextMoved`).
-    /// Events stored before v10 have no `from` and decode as `None`.
+    /// [`SessionOrigin::Agent`]: a conversation the agent had outside
+    /// Skywave, adopted by the `CreateSession` that logs it. Events stored
+    /// before v12 carry a bare [`ContextRef`] in `from` and no longer
+    /// decode; such databases are deleted, not migrated.
     SessionCreated {
         workdir: String,
         context_name: String,
-        from: Option<ContextRef>,
+        from: Option<SessionOrigin>,
     },
     /// A `ClearContext` command started a new, empty context named `name`
     /// and made it current; the event is stamped with the new context. The
@@ -438,11 +460,15 @@ impl EventKind {
     /// Whether only a command logs this event, so it carries the
     /// [`Event::command_id`] of the command that did. The agent and the
     /// daemon log the rest, `ApprovalCancelled` included, and so the
-    /// `SessionCreated` of a moved context: its `MoveContext` names itself
-    /// on the `ContextMoved` that follows.
+    /// `SessionCreated` of a moved context ([`SessionOrigin::Context`]): its
+    /// `MoveContext` names itself on the `ContextMoved` that follows. A
+    /// fresh or adopting `SessionCreated` is its `CreateSession`'s own event.
     pub fn logged_by_command(&self) -> bool {
         match self {
-            EventKind::SessionCreated { from, .. } => from.is_none(),
+            EventKind::SessionCreated { from, .. } => match from {
+                None | Some(SessionOrigin::Agent { .. }) => true,
+                Some(SessionOrigin::Context(_)) => false,
+            },
             EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::TurnInterrupted
@@ -570,6 +596,12 @@ pub mod limits {
     pub const TASK_ID_MAX_CHARS: usize = 64;
     /// Longest [`Schedule::when`](crate::Schedule::when), in chars.
     pub const SCHEDULE_WHEN_MAX_CHARS: usize = 60;
+    /// Longest agent conversation id (`CreateSession::conversation`,
+    /// [`SessionOrigin::Agent`](crate::SessionOrigin::Agent)), in chars.
+    /// Agents mint short ids (a Claude Code session id is a 36-char UUID);
+    /// the server refuses a longer one rather than cut it, as a cut id
+    /// would name a different conversation.
+    pub const CONVERSATION_ID_MAX_CHARS: usize = 128;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -1191,7 +1223,13 @@ pub struct Command {
 pub enum CommandKind {
     /// Start a session in `workdir`, which must lie under one of the
     /// server's configured roots (D14).
-    CreateSession { workdir: String },
+    CreateSession {
+        workdir: String,
+        /// The agent's own id for a conversation it had outside Skywave, in
+        /// `workdir`; the session's first context continues a copy of it.
+        /// `None`: a fresh conversation.
+        conversation: Option<String>,
+    },
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`
     /// when that is no longer the current one.
@@ -1337,6 +1375,20 @@ pub fn normalise_model(model: &str) -> Option<String> {
     (!model.is_empty()).then(|| model.to_owned())
 }
 
+/// An agent conversation id as [`SessionOrigin::Agent`] carries it: trimmed,
+/// and otherwise exactly as sent. `None` when it is blank, longer than
+/// [`limits::CONVERSATION_ID_MAX_CHARS`], or holds whitespace or a control
+/// character; the server refuses it as `BadConversation`. Unlike
+/// [`normalise_model`], nothing is cut or stripped: a changed id would name
+/// a different conversation.
+pub fn check_conversation_id(id: &str) -> Option<&str> {
+    let id = id.trim();
+    let fits = !id.is_empty()
+        && id.chars().count() <= limits::CONVERSATION_ID_MAX_CHARS
+        && !id.chars().any(|c| c.is_whitespace() || c.is_control());
+    fits.then_some(id)
+}
+
 /// Response to `POST /v1/commands`. Resending a [`CommandId`] returns the
 /// original result, so it is stable across retries.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1388,6 +1440,11 @@ pub enum RejectReason {
     /// `MoveContext.context` has no conversation to continue: the agent
     /// never ran in it.
     NoConversation,
+    /// `CreateSession.conversation` is blank after trimming, longer than
+    /// [`limits::CONVERSATION_ID_MAX_CHARS`], or contains whitespace or
+    /// control characters. Whether the conversation exists is not checked:
+    /// the agent settles that when the session first starts.
+    BadConversation,
     /// `StopTask.task` is not among the session's live background tasks:
     /// it already ended, or never ran.
     UnknownTask,
@@ -1727,14 +1784,30 @@ mod tests {
         let moved = EventKind::SessionCreated {
             workdir: "/w".into(),
             context_name: "fork".into(),
-            from: Some(ContextRef {
+            from: Some(SessionOrigin::Context(ContextRef {
                 session,
                 context: ContextId::new(),
-            }),
+            })),
         };
         assert!(!moved.logged_by_command());
         assert_eq!(moved.device(), None);
         assert_eq!(moved.archived_effect(), None);
+    }
+
+    #[test]
+    fn an_adopting_session_created_is_logged_by_its_command() {
+        // An adoption is one `CreateSession`, whose own event this is: a
+        // device whose reply was lost settles the command from it.
+        let adopted = EventKind::SessionCreated {
+            workdir: "/w".into(),
+            context_name: "start".into(),
+            from: Some(SessionOrigin::Agent {
+                conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
+            }),
+        };
+        assert!(adopted.logged_by_command());
+        assert_eq!(adopted.device(), None);
+        assert_eq!(adopted.archived_effect(), None);
     }
 
     #[test]

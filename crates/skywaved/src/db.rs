@@ -182,6 +182,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN
         agent_work TEXT CHECK (agent_work IS NULL OR json_valid(agent_work));
     "#,
+    // v10: adopting an outside agent conversation (protocol v12). NULL for
+    // every context that exists before it.
+    r#"
+    -- The agent's own id of an outside conversation this context continues
+    -- (SessionCreated.from = Agent): it is forked on the context's first start,
+    -- until the context has a handle of its own. NULL for every other context.
+    -- Not a reference to anything here, and not a ResumeHandle: only the
+    -- adapter knows a handle's shape (D3).
+    ALTER TABLE contexts ADD COLUMN adopted TEXT;
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -591,6 +601,55 @@ mod tests {
         };
         assert!(set(r#"{"tasks":[],"schedules":[]}"#).is_ok());
         assert!(set("not json").is_err());
+    }
+
+    /// A v9 database, from before adopting outside conversations, gains
+    /// `contexts.adopted`, NULL for every context it has; what the rows had
+    /// is kept.
+    #[test]
+    fn v10_adds_adopted_to_every_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let (a, b) = (
+            "01920000-0000-7000-8000-00000000000a",
+            "01920000-0000-7000-8000-00000000000b",
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..9] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO sessions (id, workdir, current_context)
+                    VALUES ('{a}', '/w/a', '{a}'), ('{b}', '/w/a', '{b}');
+                INSERT INTO contexts (id, session_id, agent_state, origin)
+                    VALUES ('{a}', '{a}', '{{"session":"agent-a"}}', NULL),
+                           ('{b}', '{b}', NULL, '{a}');
+                "#
+            ))
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT id, agent_state, origin, adopted FROM contexts ORDER BY rowid")
+            .unwrap();
+        let rows: Vec<[Option<String>; 4]> = stmt
+            .query_map([], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            rows,
+            [
+                [s(a), s(r#"{"session":"agent-a"}"#), None, None],
+                [s(b), None, s(a), None],
+            ]
+        );
     }
 
     #[test]
