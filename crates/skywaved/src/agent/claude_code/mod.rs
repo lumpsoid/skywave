@@ -64,8 +64,8 @@ use uuid::Uuid;
 
 use self::protocol::{Output, Protocol};
 use super::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession, Effort,
-    PermissionMode, StartSpec,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
+    Conversation, Effort, PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
 
@@ -171,12 +171,17 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &self,
         spec: StartSpec,
     ) -> Result<(ClaudeCodeSession, AdapterEvents), AgentError> {
-        let (agent_session, resumed) = match &spec.resume {
-            Some(handle) => (
+        let (agent_session, resumed) = match &spec.conversation {
+            Conversation::Resume(handle) => (
                 protocol::parse_resume_handle(handle).map_err(AgentError::Resume)?,
                 true,
             ),
-            None => (Uuid::new_v4(), false),
+            Conversation::Fresh => (Uuid::new_v4(), false),
+            Conversation::Fork(_) => {
+                return Err(AgentError::Start(
+                    "this adapter cannot fork a conversation yet".to_owned(),
+                ));
+            }
         };
         let session_rules = match &spec.grants {
             Some(grants) => rules::parse_grants(grants).map_err(AgentError::Start)?,
