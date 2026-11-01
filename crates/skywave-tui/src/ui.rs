@@ -640,6 +640,13 @@ fn footer_keys(app: &App) -> &'static str {
                 Some(Picker::Contexts { .. }) => {
                     "↑↓ choose · Enter switch / new · v view · M move · x drop a refused move · Esc cancel · ? help"
                 }
+                Some(Picker::Stop(_)) => "y go on · any other key back · ? help",
+                Some(Picker::Background {
+                    stopping: Some(_), ..
+                }) => "y stops the task · any other key back · ? help",
+                Some(Picker::Background { .. }) => {
+                    "↑↓ choose · Enter on a task stops it · Esc close · ? help"
+                }
                 Some(Picker::Effort { .. }) => "↑↓ choose · Enter switch · Esc back · ? help",
                 _ => {
                     "↑↓ choose · type a name instead · Enter switch · Ctrl-U clear · Esc back · F1 help"
@@ -801,6 +808,8 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("", "(several: ↑↓ Enter pick one, Esc back to a / x)"),
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
+                    key("", "(with background work, y confirms)"),
+                    key("B", "list background work; Enter on a task stops it"),
                     key("p", "switch the agent's permission mode"),
                     key("", "(bypass lets every tool run: y confirms it)"),
                     key("m", "switch the agent's model or effort: m or e"),

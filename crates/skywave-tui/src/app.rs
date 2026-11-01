@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
-    Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
-    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TimelineItem, ToolOutcome,
-    ViewState, parse_pair_uri,
+    Action, AgentView, AgentWork, ApprovalId, BackgroundTask, BlobPolicy, BlobState, Completion,
+    ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView,
+    PermissionMode, Route, Schedule, Screen, Seq, SessionId, SessionListView, SessionRow,
+    SessionView, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{bytes, mode_needs_confirmation, move_refusal};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
-    looks_like_pair_uri, unanswered,
+    looks_like_pair_uri, stop_needs_confirmation, unanswered,
 };
 use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
@@ -377,6 +377,83 @@ pub enum Picker {
         moving: Option<ContextId>,
         note: Option<String>,
     },
+    /// The agent's background work, opened by `B`: the tasks (a child under
+    /// its parent), then the loops, which only inform. `stopping` is the
+    /// task Enter asked to stop, until `y` sends it.
+    Background {
+        selected: usize,
+        stopping: Option<TaskId>,
+    },
+    /// An action that stops the agent while it has work, waiting for `y`.
+    Stop(StopKind),
+}
+
+/// What waits for `y` in [`Picker::Stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    /// Stop agent.
+    Session,
+    /// A new context.
+    Clear,
+    /// Switch to this context.
+    Switch(ContextId),
+    /// Move this context, the current one, to a session of its own.
+    Move(ContextId),
+}
+
+impl StopKind {
+    fn action(self, session_id: SessionId) -> Action {
+        match self {
+            StopKind::Session => Action::StopSession { session_id },
+            StopKind::Clear => Action::ClearContext { session_id },
+            StopKind::Switch(context) => Action::SwitchContext {
+                session_id,
+                context,
+            },
+            StopKind::Move(context) => Action::MoveContext {
+                session_id,
+                context,
+            },
+        }
+    }
+}
+
+/// A row of [`Picker::Background`].
+pub enum BackgroundRow<'a> {
+    /// A task, `depth` levels under a task that started it.
+    Task(&'a BackgroundTask, usize),
+    /// A loop.
+    Loop(&'a Schedule),
+}
+
+/// The rows of the background picker: each task followed by the tasks it
+/// started, then the loops.
+pub fn background_rows(work: &AgentWork) -> Vec<BackgroundRow<'_>> {
+    fn add<'a>(
+        work: &'a AgentWork,
+        parent: Option<&TaskId>,
+        depth: usize,
+        rows: &mut Vec<BackgroundRow<'a>>,
+    ) {
+        for task in &work.tasks {
+            let top = depth == 0
+                && task
+                    .parent
+                    .as_ref()
+                    .is_none_or(|p| !work.tasks.iter().any(|t| t.id == *p));
+            if top || (depth > 0 && task.parent.as_ref() == parent) {
+                rows.push(BackgroundRow::Task(task, depth));
+                // Bounded: a cycle would otherwise never end.
+                if depth < work.tasks.len() {
+                    add(work, Some(&task.id), depth + 1, rows);
+                }
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    add(work, None, 0, &mut rows);
+    rows.extend(work.schedules.iter().map(BackgroundRow::Loop));
+    rows
 }
 
 /// The rows of [`Picker::Agent`].
@@ -419,6 +496,24 @@ impl Picker {
             selected: current.map_or(0, |i| i + 1),
             moving: None,
             note: None,
+        }
+    }
+
+    /// The background work, on its first row.
+    fn background() -> Picker {
+        Picker::Background {
+            selected: 0,
+            stopping: None,
+        }
+    }
+
+    /// `kind` as it asks: at once, or after `y` when it would end work.
+    fn stop(&mut self, kind: StopKind, view: &SessionView) -> (bool, Option<Action>) {
+        if stop_needs_confirmation(&view.work) {
+            *self = Picker::Stop(kind);
+            (false, None)
+        } else {
+            (true, Some(kind.action(view.id)))
         }
     }
 
@@ -544,6 +639,44 @@ impl Picker {
                 }
                 _ => (false, None),
             },
+            // y/N, as the mode picker asks: only `y` stops.
+            Picker::Stop(kind) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => (true, Some(kind.action(session_id))),
+                _ => (true, None),
+            },
+            Picker::Background {
+                stopping: stopping @ Some(_),
+                ..
+            } => match (key.code, stopping.take()) {
+                (KeyCode::Char('y') | KeyCode::Char('Y'), Some(task)) => {
+                    (true, Some(Action::StopTask { session_id, task }))
+                }
+                _ => (false, None),
+            },
+            Picker::Background { selected, stopping } => {
+                let rows = background_rows(&view.work);
+                let last = rows.len().saturating_sub(1);
+                *selected = (*selected).min(last);
+                match key.code {
+                    KeyCode::Esc => (true, None),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                        (false, None)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(last);
+                        (false, None)
+                    }
+                    // A loop only informs; the agent ends it when asked.
+                    KeyCode::Enter => {
+                        if let Some(BackgroundRow::Task(task, _)) = rows.get(*selected) {
+                            *stopping = Some(task.id.clone());
+                        }
+                        (false, None)
+                    }
+                    _ => (false, None),
+                }
+            }
             // y/N, as the mode picker asks: only `y` moves.
             Picker::Contexts {
                 moving: moving @ Some(_),
@@ -580,7 +713,7 @@ impl Picker {
                     }
                     // Only what the core offers; otherwise the row is inert.
                     KeyCode::Enter => match context {
-                        None if view.can_clear => (true, Some(Action::ClearContext { session_id })),
+                        None if view.can_clear => self.stop(StopKind::Clear, view),
                         None => (false, None),
                         // Moved on: the context lives in another session now.
                         Some(c) if c.moved_to.is_some() => {
@@ -589,13 +722,7 @@ impl Picker {
                         }
                         // Already current: nothing to switch, just close.
                         Some(c) if c.current => (true, None),
-                        Some(c) => (
-                            true,
-                            Some(Action::SwitchContext {
-                                session_id,
-                                context: c.id,
-                            }),
-                        ),
+                        Some(c) => self.stop(StopKind::Switch(c.id), view),
                     },
                     // The current context stands for the whole timeline.
                     KeyCode::Char('v') => match context {
@@ -611,7 +738,11 @@ impl Picker {
                     // Only what the core offers; otherwise say why not.
                     KeyCode::Char('M') => {
                         if let Some(c) = context {
-                            if c.can_move {
+                            if c.can_move && c.current && stop_needs_confirmation(&view.work) {
+                                // Moving the current one stops the agent.
+                                *self = Picker::Stop(StopKind::Move(c.id));
+                                return (false, None);
+                            } else if c.can_move {
                                 *moving = Some(c.id);
                             } else {
                                 *note = Some(move_refusal(c).to_owned());
@@ -1852,9 +1983,20 @@ impl App {
                     None
                 }
                 // Shifted, so a stray key does not end the agent's run.
-                KeyCode::Char('S') => Some(Action::StopSession {
-                    session_id: view.id,
-                }),
+                KeyCode::Char('S') => {
+                    if stop_needs_confirmation(&view.work) {
+                        session.picker = Some(Picker::Stop(StopKind::Session));
+                        None
+                    } else {
+                        Some(Action::StopSession {
+                            session_id: view.id,
+                        })
+                    }
+                }
+                KeyCode::Char('B') => {
+                    session.picker = Some(Picker::background());
+                    None
+                }
                 KeyCode::Char('p') => {
                     session.picker = Some(Picker::mode(&view.agent));
                     None
