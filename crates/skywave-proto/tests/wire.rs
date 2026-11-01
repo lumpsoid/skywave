@@ -23,6 +23,9 @@ fn server() -> ServerId {
 fn call() -> CallId {
     Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0007).into()
 }
+fn context() -> ContextId {
+    Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0008).into()
+}
 fn blob() -> BlobRef {
     BlobRef {
         id: blob_id(),
@@ -38,6 +41,7 @@ fn event(kind: EventKind) -> Event {
         session_id: session(),
         at: at(),
         command_id: kind.logged_by_command().then(command),
+        context: context(),
         kind,
     }
 }
@@ -46,7 +50,13 @@ fn all_event_kinds() -> Vec<EventKind> {
     vec![
         EventKind::SessionCreated {
             workdir: "/srv/code/skywave".into(),
+            context_name: "velvet walrus".into(),
         },
+        EventKind::ContextStarted {
+            by: device(),
+            name: "amber otter".into(),
+        },
+        EventKind::ContextSwitched { by: device() },
         EventKind::UserMessage {
             device_id: device(),
             text: "run the tests".into(),
@@ -272,6 +282,7 @@ fn all_command_kinds() -> Vec<CommandKind> {
         },
         CommandKind::SendMessage {
             session_id: session(),
+            context: context(),
             text: "hello".into(),
         },
         CommandKind::ResolveApproval {
@@ -323,6 +334,15 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             effort: Effort::High,
         },
+        CommandKind::ClearContext {
+            session_id: session(),
+            context: context(),
+            name: "amber otter".into(),
+        },
+        CommandKind::SwitchContext {
+            session_id: session(),
+            context: context(),
+        },
     ]
 }
 
@@ -339,6 +359,9 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
             RejectReason::UnknownModel,
+            RejectReason::ContextExists,
+            RejectReason::UnknownContext,
+            RejectReason::ContextChanged,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -591,6 +614,23 @@ fn tool_events_without_display_or_summary_are_rejected() {
     ] {
         assert!(serde_json::from_str::<EventKind>(json).is_err(), "{json}");
     }
+}
+
+#[test]
+fn protocol_is_v9() {
+    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
+    // A session's first context has the session's own id.
+    assert_eq!(ContextId::first_of(session()).0, session().0);
+}
+
+/// Events must carry their context: no default for a v8 shape.
+#[test]
+fn an_event_without_a_context_is_rejected() {
+    let mut json = serde_json::to_value(event(EventKind::TurnInterrupted)).unwrap();
+    assert!(serde_json::from_value::<Event>(json.clone()).is_ok());
+    json.as_object_mut().unwrap().remove("context");
+    assert!(serde_json::from_value::<Event>(json).is_err());
 }
 
 #[test]

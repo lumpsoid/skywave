@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use skywave_core::{
-    AgentSetting, AgentView, BlobState, Decision, Delivery, DeviceRef, Effort, FailReason,
-    Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    AgentSetting, AgentView, BlobState, ContextView, Decision, Delivery, DeviceRef, Effort,
+    FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionView,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -188,6 +188,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::NoActiveTurn => "the agent was not working",
         RejectReason::UnknownRule => "the agent did not offer that rule",
         RejectReason::UnknownModel => "no model named",
+        RejectReason::ContextExists => "that context already exists",
+        RejectReason::UnknownContext => "the session has no such context",
+        RejectReason::ContextChanged => "the session moved to another context first",
     }
 }
 
@@ -370,6 +373,52 @@ pub fn scope_label(scope: RuleScope) -> &'static str {
     }
 }
 
+/// Who did something the timeline notes: "you" for this device, else its
+/// [label](DeviceRef::label).
+pub fn device_word(by: &DeviceRef) -> String {
+    if by.me { "you".to_owned() } else { by.label() }
+}
+
+/// The divider where a context was cleared: `New context · velvet walrus ·
+/// by laptop`.
+pub fn context_started_line(name: &str, by: &DeviceRef) -> String {
+    format!("New context · {name} · by {}", device_word(by))
+}
+
+/// The divider where an earlier context was made current again: `Back to
+/// start · by you`.
+pub fn context_switched_line(name: &str, by: &DeviceRef) -> String {
+    format!("Back to {name} · by {}", device_word(by))
+}
+
+/// A context as a picker row reads: its name, then its first prompt
+/// (`velvet walrus · fix the flaky test`), or the name alone while it has
+/// no message.
+pub fn context_row(context: &ContextView) -> String {
+    match &context.first_prompt {
+        Some(prompt) => format!("{} · {prompt}", context.name),
+        None => context.name.clone(),
+    }
+}
+
+/// The hint while the timeline shows a context other than the one messages
+/// go to: `Viewing start — messages go to velvet walrus`. `None` while the
+/// whole session or the current context shows.
+pub fn viewing_hint(view: &SessionView) -> Option<String> {
+    let viewing = view.viewing.filter(|viewing| *viewing != view.context)?;
+    let name = |id| {
+        view.contexts
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.as_str())
+    };
+    let target = name(view.context)?;
+    Some(match name(viewing) {
+        Some(shown) => format!("Viewing {shown} — messages go to {target}"),
+        None => format!("Viewing an earlier context — messages go to {target}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use skywave_core::{ModelChoice, Refusal, SettingChange};
@@ -536,5 +585,81 @@ mod tests {
         ] {
             assert_eq!(dollars(usd), text, "{usd}");
         }
+    }
+
+    #[test]
+    fn context_dividers_rows_and_the_viewing_hint() {
+        use skywave_core::{ContextId, DeviceId, SessionId, SessionState};
+
+        let laptop = DeviceRef {
+            id: DeviceId::new(),
+            name: Some("laptop".into()),
+            me: false,
+        };
+        let me = DeviceRef {
+            me: true,
+            ..laptop.clone()
+        };
+        assert_eq!(
+            context_started_line("velvet walrus", &laptop),
+            "New context · velvet walrus · by laptop"
+        );
+        assert_eq!(
+            context_switched_line("start", &me),
+            "Back to start · by you"
+        );
+
+        let sid = SessionId::new();
+        let (start, walrus) = (ContextId::first_of(sid), ContextId::new());
+        let context = |id, name: &str, prompt: Option<&str>, current| ContextView {
+            id,
+            name: name.into(),
+            first_prompt: prompt.map(str::to_owned),
+            messages: usize::from(prompt.is_some()),
+            last_activity: None,
+            current,
+            outgoing: None,
+        };
+        let contexts = vec![
+            context(start, "start", Some("fix the flaky test"), false),
+            context(walrus, "velvet walrus", None, true),
+        ];
+        assert_eq!(context_row(&contexts[0]), "start · fix the flaky test");
+        assert_eq!(context_row(&contexts[1]), "velvet walrus");
+
+        let mut view = SessionView {
+            id: sid,
+            title: "x".into(),
+            named: false,
+            rename: None,
+            archived: false,
+            workdir: None,
+            state: SessionState::Idle,
+            timeline: Vec::new(),
+            contexts,
+            context: walrus,
+            viewing: None,
+            can_clear: false,
+            clear: None,
+            switch: None,
+            pending_approval: None,
+            rules: Vec::new(),
+            usage: None,
+            agent: AgentView::default(),
+            interrupt: None,
+            stop: None,
+            draft: None,
+            draft_rev: 0,
+            last_seq: skywave_core::Seq(1),
+            unread_from: None,
+        };
+        assert_eq!(viewing_hint(&view), None, "the whole session");
+        view.viewing = Some(walrus);
+        assert_eq!(viewing_hint(&view), None, "the current context");
+        view.viewing = Some(start);
+        assert_eq!(
+            viewing_hint(&view).as_deref(),
+            Some("Viewing start — messages go to velvet walrus")
+        );
     }
 }

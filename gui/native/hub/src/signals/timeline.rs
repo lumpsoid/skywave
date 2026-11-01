@@ -101,6 +101,9 @@ pub enum RowKind {
     Stopped,
     Renamed,
     Archived,
+    /// A context was cleared or an earlier one made current again: what
+    /// follows went to that context.
+    ContextDivider,
     AgentError,
     TurnUsage,
     /// The agent switched its mode or model.

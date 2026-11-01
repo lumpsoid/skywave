@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall,
-    ToolResult, TurnUsage,
+    AgentSettings, ApprovalId, BlobRef, ContextId, Event, EventKind, Seq, SessionId, SessionState,
+    ToolCall, ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -48,6 +48,9 @@ pub struct SessionSummary {
     /// The agent's permission mode and model, folded with
     /// [`AgentSettings::apply`].
     pub agent: AgentSettings,
+    /// The session's current context: its first (which has the session's
+    /// id) until a `ContextStarted` or `ContextSwitched` names another.
+    pub context: ContextId,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -117,6 +120,7 @@ impl SessionSummary {
             archived: false,
             usage: None,
             agent: AgentSettings::default(),
+            context: ContextId::first_of(event.session_id),
         };
         summary.apply(seq, event);
         summary
@@ -125,10 +129,10 @@ impl SessionSummary {
     /// Folds one event of this session into the summary.
     ///
     /// A rename only sets the name, an archive only the archived flag, a
-    /// mode or model event only the agent settings, and the models an agent
-    /// offers nothing here: none is activity, so they move neither
-    /// `last_seq` nor `last_activity` and the session keeps its place in
-    /// the list.
+    /// mode or model event only the agent settings, a context cleared or
+    /// switched only the current context, and the models an agent offers
+    /// nothing here: none is activity, so they move neither `last_seq` nor
+    /// `last_activity` and the session keeps its place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
@@ -143,6 +147,10 @@ impl SessionSummary {
                 self.name = name.clone();
                 return;
             }
+            EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
+                self.context = event.context;
+                return;
+            }
             EventKind::SessionArchived { .. } | EventKind::ModelsOffered { .. } => return,
             _ => {}
         }
@@ -152,7 +160,10 @@ impl SessionSummary {
             self.notable += 1;
         }
         match &event.kind {
-            EventKind::SessionCreated { workdir } => self.workdir = Some(workdir.clone()),
+            EventKind::SessionCreated { workdir, .. } => {
+                self.workdir = Some(workdir.clone());
+                self.context = event.context;
+            }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } => {
                 if !self.pending_approvals.contains(id) {
@@ -189,7 +200,9 @@ impl SessionSummary {
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => {}
+            | EventKind::EffortRefused { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. } => {}
         }
     }
 
@@ -231,7 +244,7 @@ impl SessionSummary {
 
 /// The first line of `text` with leading blank lines skipped, trimmed and
 /// cut to `max` chars; `None` if `text` is blank.
-fn first_line(text: &str, max: usize) -> Option<String> {
+pub(crate) fn first_line(text: &str, max: usize) -> Option<String> {
     let line = text.trim_start().lines().next()?.trim_end();
     Some(line.chars().take(max).collect())
 }
@@ -263,7 +276,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ModelsOffered { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
-        | EventKind::EffortRefused { .. } => false,
+        | EventKind::EffortRefused { .. }
+        | EventKind::ContextStarted { .. }
+        | EventKind::ContextSwitched { .. } => false,
     }
 }
 
@@ -297,7 +312,9 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ModelsOffered { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
-        | EventKind::EffortRefused { .. } => (None, None),
+        | EventKind::EffortRefused { .. }
+        | EventKind::ContextStarted { .. }
+        | EventKind::ContextSwitched { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -313,8 +330,55 @@ mod tests {
             session_id,
             at: Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap(),
             command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
+            context: ContextId::first_of(session_id),
             kind,
         }
+    }
+
+    #[test]
+    fn the_current_context_follows_starts_and_switches() {
+        let sid = SessionId::new();
+        let first = ContextId::first_of(sid);
+        let mut summary = SessionSummary::new(
+            Seq(1),
+            &event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/x".into(),
+                    context_name: "start".into(),
+                },
+            ),
+        );
+        assert_eq!(summary.context, first);
+        let by = DeviceId::new();
+        let fresh = ContextId::new();
+        let in_context = |context, kind| Event {
+            context,
+            ..event(sid, 1, kind)
+        };
+        summary.apply(
+            Seq(2),
+            &in_context(
+                fresh,
+                EventKind::ContextStarted {
+                    by,
+                    name: "fresh".into(),
+                },
+            ),
+        );
+        assert_eq!(summary.context, fresh);
+        // Other events leave it, whatever their stamp.
+        summary.apply(
+            Seq(3),
+            &in_context(first, EventKind::AgentMessage { text: "x".into() }),
+        );
+        assert_eq!(summary.context, fresh);
+        summary.apply(
+            Seq(4),
+            &in_context(first, EventKind::ContextSwitched { by }),
+        );
+        assert_eq!(summary.context, first);
     }
 
     #[test]
@@ -326,6 +390,7 @@ mod tests {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         );
         let mut summary = SessionSummary::new(Seq(1), &created);
@@ -400,6 +465,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.title(), "app");
@@ -444,6 +510,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let renamed = EventKind::SessionRenamed {
@@ -462,10 +529,59 @@ mod tests {
     }
 
     #[test]
+    fn a_context_cleared_or_switched_is_not_activity() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let first = ContextId::first_of(sid);
+        assert_eq!(summary.context, first);
+        let by = DeviceId::new();
+        let cleared = ContextId::new();
+        let started = EventKind::ContextStarted {
+            by,
+            name: "velvet walrus".into(),
+        };
+        assert!(!is_notable(&started));
+        summary.apply(
+            Seq(5),
+            &Event {
+                context: cleared,
+                ..event(sid, 20, started)
+            },
+        );
+        assert_eq!(summary.context, cleared);
+        summary.apply(
+            Seq(9),
+            &Event {
+                context: first,
+                ..event(sid, 30, EventKind::ContextSwitched { by })
+            },
+        );
+        assert_eq!(summary.context, first);
+        assert_eq!(summary.last_seq, Seq(1));
+        assert_eq!(
+            summary.last_activity,
+            event(sid, 0, EventKind::TurnInterrupted).at
+        );
+        assert_eq!(summary.notable, 0);
+        // A positive control: a message is activity.
+        let message = EventKind::UserMessage {
+            device_id: by,
+            text: "hi".into(),
+        };
+        summary.apply(Seq(10), &event(sid, 40, message));
+        assert_eq!(summary.last_seq, Seq(10));
+    }
+
+    #[test]
     fn archiving_is_not_activity_and_a_message_brings_it_back() {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert!(!summary.archived);
@@ -497,6 +613,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.usage, None);

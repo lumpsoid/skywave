@@ -6,7 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ListKindView, RouteView, ScreenView};
+use crate::signals::{ActionIntent, ListKindView, RouteView, RowKind, ScreenView};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -48,6 +48,7 @@ impl Rig {
         let session = SessionId::new();
         let kind = EventKind::SessionCreated {
             workdir: "/srv/work".into(),
+            context_name: "start".into(),
         };
         seam.apply_events(&EventBatch {
             from: Seq(seam.cursor().unwrap().0 + 1),
@@ -55,6 +56,7 @@ impl Rig {
                 session_id: session,
                 at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
                 command_id: kind.logged_by_command().then(CommandId::new),
+                context: skywave_proto::ContextId::first_of(session),
                 kind,
             }],
         })
@@ -582,6 +584,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {
         workdir: "/srv/other".into(),
+        context_name: "start".into(),
     };
     rig.seam
         .apply_events(&EventBatch {
@@ -590,6 +593,7 @@ fn a_tapped_candidate_fills_the_create_prompt() {
                 session_id: SessionId::new(),
                 at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
                 command_id: kind.logged_by_command().then(CommandId::new),
+                context: skywave_proto::ContextId::first_of(SessionId::new()),
                 kind,
             }],
         })
@@ -636,6 +640,7 @@ impl Rig {
                 session_id: self.session,
                 at,
                 command_id: None,
+                context: skywave_proto::ContextId::first_of(self.session),
                 kind,
             })
             .collect();
@@ -649,6 +654,164 @@ impl Rig {
     fn rows(&self) -> &[TimelineRow] {
         &self.head.sent.timeline.as_ref().unwrap().1
     }
+}
+
+#[test]
+fn a_context_cleared_or_switched_is_a_divider_row() {
+    let mut rig = Rig::new();
+    let walrus = skywave_proto::ContextId::new();
+    let me = rig.seam.identity().unwrap().device_id();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let event = |context, kind| Event {
+        session_id: rig.session,
+        at,
+        command_id: Some(CommandId::new()),
+        context,
+        kind,
+    };
+    let events = vec![
+        event(
+            walrus,
+            EventKind::ContextStarted {
+                by: DeviceId::new(),
+                name: "velvet walrus".into(),
+            },
+        ),
+        event(
+            skywave_proto::ContextId::first_of(rig.session),
+            EventKind::ContextSwitched { by: me },
+        ),
+    ];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| (row.kind, row.text.clone(), row.selectable))
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, RowKind::ContextDivider);
+    assert!(
+        rows[0]
+            .1
+            .starts_with("New context · velvet walrus · by device …"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[1],
+        (
+            RowKind::ContextDivider,
+            "Back to start · by you".to_owned(),
+            false
+        )
+    );
+}
+
+impl Rig {
+    fn open_session(&self) -> crate::signals::SessionScreen {
+        match &self.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Session { session } => session.clone(),
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn context_intents_map_to_actions_and_the_screen_lists_the_contexts() {
+    let mut rig = Rig::new();
+    let first = skywave_proto::ContextId::first_of(rig.session);
+    let before = rig.open_session();
+    assert!(!before.can_clear, "nothing to clear in an empty context");
+    assert_eq!(before.contexts.len(), 1, "{:?}", before.contexts);
+    assert!(before.contexts[0].current);
+    assert_eq!(before.context_id, first.0.to_string());
+    assert_eq!(before.viewing_hint, None);
+
+    rig.log(vec![EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "fix the flaky test\nplease".into(),
+    }]);
+    let session = rig.open_session();
+    assert!(session.can_clear, "positive control");
+    assert_eq!(session.contexts[0].label, "start · fix the flaky test");
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ClearContext {
+            session_id: rig.session.0.to_string(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::ClearContext {
+            session_id: rig.session
+        }]
+    );
+    rig.actions.clear();
+    rig.results();
+    rig.view();
+    let session = rig.open_session();
+    assert_eq!(session.clear_label.as_deref(), Some("new context queued"));
+    assert_eq!(session.contexts.len(), 2, "{:?}", session.contexts);
+    let (old, new) = (&session.contexts[0], &session.contexts[1]);
+    assert!(!old.current && new.current);
+    assert_eq!(new.outgoing_label.as_deref(), Some("queued"));
+    assert_eq!(session.context_id, new.context_id);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ViewContext {
+            session_id: rig.session.0.to_string(),
+            context_id: Some(old.context_id.clone()),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::ViewContext {
+            session_id: rig.session,
+            context: Some(first)
+        }]
+    );
+    rig.actions.clear();
+    rig.results();
+    rig.view();
+    let session = rig.open_session();
+    assert_eq!(session.viewing_id, Some(first.0.to_string()));
+    let hint = session.viewing_hint.expect("viewing an earlier context");
+    assert!(
+        hint.starts_with("Viewing start — messages go to "),
+        "{hint}"
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SwitchContext {
+            session_id: rig.session.0.to_string(),
+            context_id: first.0.to_string(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SwitchContext {
+            session_id: rig.session,
+            context: first
+        }]
+    );
+}
+
+#[test]
+fn a_malformed_context_id_is_an_error_not_an_action() {
+    let mut rig = Rig::new();
+    let outs = rig.intent(GuiIntent::Act {
+        action: ActionIntent::SwitchContext {
+            session_id: rig.session.0.to_string(),
+            context_id: "not-an-id".into(),
+        },
+    });
+    assert!(rig.actions.is_empty());
+    assert_eq!(errors(&outs), ["not a context id: \"not-an-id\""]);
 }
 
 /// An edit's call and result as skywaved logs them for the stub agent:

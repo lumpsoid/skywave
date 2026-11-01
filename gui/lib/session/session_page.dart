@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/composer.dart';
+import 'package:skywave_gui/session/context_picker.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/sessions/rename_dialog.dart';
 import 'package:skywave_gui/session/search_bar.dart';
@@ -236,6 +237,37 @@ class _SessionPageState extends State<SessionPage> {
                           ),
                         ),
                         PopupMenuItem(
+                          enabled: screen.canClear,
+                          value: () => widget.send.act(
+                            ActionIntentClearContext(
+                              sessionId: screen.sessionId,
+                            ),
+                          ),
+                          child: ListTile(
+                            enabled: screen.canClear,
+                            leading: const Icon(Icons.alt_route),
+                            title: const Text('New context'),
+                            subtitle: Text(
+                              screen.clearLabel ??
+                                  (screen.canClear
+                                      ? "Clear the agent's context"
+                                      : 'This context is empty'),
+                            ),
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: () =>
+                              pickContext(this.context, screen, widget.send),
+                          child: ListTile(
+                            leading: const Icon(Icons.account_tree_outlined),
+                            title: const Text('Contexts…'),
+                            subtitle: switch (screen.switchLabel) {
+                              final label? => Text('switch $label'),
+                              null => null,
+                            },
+                          ),
+                        ),
+                        PopupMenuItem(
                           enabled: !stopped,
                           value: () => widget.send.act(
                             ActionIntentStopSession(
@@ -297,6 +329,42 @@ class _SessionPageState extends State<SessionPage> {
                                 color: theme.colorScheme.onSecondaryContainer,
                               ),
                             ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                if (screen.viewingHint case final hint?)
+                  Material(
+                    color: theme.colorScheme.tertiaryContainer,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 2,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.visibility_outlined,
+                            size: 16,
+                            color: theme.colorScheme.onTertiaryContainer,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              hint,
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                color: theme.colorScheme.onTertiaryContainer,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () => widget.send.act(
+                              ActionIntentViewContext(
+                                sessionId: screen.sessionId,
+                              ),
+                            ),
+                            child: const Text('Show all'),
                           ),
                         ],
                       ),

@@ -1,12 +1,25 @@
 //! The agent supervisor (spec §5): runs one agent session per Skywave
 //! session that has work, generic over the [`AgentAdapter`].
 //!
+//! **Contexts.** A Skywave session holds an ordered list of contexts, each
+//! its own agent conversation with its own resume handle. At most one agent
+//! process runs per session, for one context: the one stamped on the event
+//! it was started for ([`Event::context`]), not the session's current
+//! context, which a switch logged after that event may already have moved.
+//! Everything the process reports is stamped with its context, also what it
+//! reports after a switch (its interrupted turn's end, its exit).
+//!
 //! **Following the log.** The supervisor learns about commands from the log
 //! itself, like any other reader: it reads every event after its cursor and
 //! reacts to
 //! - `UserMessage` → [`AgentSession::send_message`], starting the session's
-//!   agent first if it is not running (lazily, resumed with the stored
-//!   [`ResumeHandle`](crate::agent::ResumeHandle) when there is one);
+//!   agent for the message's context first if it is not running (lazily,
+//!   resumed with the context's stored
+//!   [`ResumeHandle`](crate::agent::ResumeHandle) when there is one, fresh
+//!   otherwise, and given the session's [`Grants`](crate::agent::Grants)
+//!   either way). An agent running another context is stopped first, like
+//!   on `SessionStopped`; validated commands never get there, since a
+//!   context change already stopped it;
 //! - `ApprovalResolved` → [`EventMapper::take_approval`] and
 //!   [`AgentSession::answer_approval`]. Command handling already lets only the
 //!   first answer in (D5), so the agent hears exactly one answer per request;
@@ -21,10 +34,16 @@
 //!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
 //!   session whose agent is not running is left alone. Like an idle
 //!   shutdown, the next `UserMessage` resumes the agent.
+//! - `ContextStarted` / `ContextSwitched` (stamped with the context they
+//!   make current) → exactly what `SessionStopped` does, when the agent runs
+//!   another context; nothing when it runs that context or none runs. The
+//!   new context is never started here: its next message or setting request
+//!   starts it, resumed with its handle or fresh.
 //! - `PermissionModeRequested` / `ModelRequested` / `EffortRequested` →
 //!   [`AgentSession::set_permission_mode`] / [`AgentSession::set_model`] /
 //!   [`AgentSession::set_effort`], noted with the mapper so the agent's answer names the command. A
-//!   session whose agent is not running is started for it (no message is
+//!   session whose agent is not running is started for it, in the request's
+//!   context, as for a message (no message is
 //!   sent, so no turn runs) and kept like any idle session. Only the
 //!   session's open request goes out, once per agent: one a newer request
 //!   replaced before the supervisor reached it is skipped, so requests
@@ -38,7 +57,8 @@
 //! not asked for). So a restarted or resumed agent keeps all three, and a start made for a request carries that
 //! request out; each is asked for under the open request's command, if
 //! any, so its answer settles that request. An agent start that fails
-//! refuses the request it was made for. The models an agent offers are
+//! refuses the request it was made for, and a message whose agent did not
+//! start gets `Errored`, both stamped with the trigger's context. The models an agent offers are
 //! logged as `ModelsOffered` only when they differ from the newest list in
 //! the whole log.
 //!
@@ -72,9 +92,12 @@
 //!   ([`TURN_LOST`]);
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
+//!   Both are stamped with the context of the state event they settle;
 //! - a mode, model or effort request still open whose event the supervisor had
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
-//!   handed to is gone. One after the cursor is handled as usual.
+//!   handed to is gone. One after the cursor is handled as usual. Settings
+//!   belong to the session, so the refusal is stamped with the current
+//!   context.
 //!
 //! [`SupervisorHandle::shutdown`] stops the agents without interrupting them
 //! ([`AgentSession::shutdown`] abandons a running turn, so the agent cancels
@@ -98,17 +121,19 @@ use std::time::Duration;
 
 use rusqlite::OptionalExtension;
 use skywave_proto::{
-    CommandId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
+    CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
+    SessionState,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, EventMapper, StartSpec,
-    bounded_models, load_resume_handle,
+    bounded_models, load_grants, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::event_log::parse_id;
 use crate::{EventLog, Storage};
 
 /// Reason of the `ApprovalCancelled` appended on daemon start (spec §5).
@@ -174,7 +199,8 @@ pub struct Supervisor<A: AgentAdapter> {
     models: Option<Vec<ModelChoice>>,
 }
 
-/// One running agent session.
+/// One running agent session: at most one per Skywave session, for one of
+/// its contexts ([`Running::context`]).
 struct Running<S> {
     session: S,
     events: AdapterEvents,
@@ -191,6 +217,12 @@ struct Running<S> {
 }
 
 impl<S> Running<S> {
+    /// The session context the agent was started for. Everything it logs
+    /// is stamped with it, also after the session moved to another context.
+    fn context(&self) -> ContextId {
+        self.mapper.context()
+    }
+
     fn idle_deadline(&self, timeout: Duration) -> Option<Instant> {
         self.idle_since.map(|since| since + timeout)
     }
@@ -249,18 +281,27 @@ impl<A: AgentAdapter> Supervisor<A> {
                 .cancel_approval(db, approval.id, DAEMON_RESTARTED)?;
         }
         for session in self.log.sessions(db)? {
-            let settle = match last_state_event(db, session.id)? {
-                Some(EventKind::SessionStateChanged(SessionState::AgentWorking)) => {
+            // Settled in the context of the turn it settles, which a switch
+            // logged after it does not change.
+            let Some((kind, context)) = last_state_event(db, session.id)? else {
+                continue;
+            };
+            let settle = match kind {
+                EventKind::SessionStateChanged(SessionState::AgentWorking) => {
                     SessionState::Errored {
                         message: TURN_LOST.to_owned(),
                     }
                 }
-                Some(EventKind::TurnInterrupted) => SessionState::Idle,
+                EventKind::TurnInterrupted => SessionState::Idle,
                 _ => continue,
             };
             tracing::info!(session = %session.id.0, ?settle, "settling session after restart");
-            self.log
-                .append(db, session.id, EventKind::SessionStateChanged(settle))?;
+            self.log.append(
+                db,
+                session.id,
+                context,
+                EventKind::SessionStateChanged(settle),
+            )?;
         }
         self.cursor = load_cursor(db)?;
         self.stored_cursor = self.cursor;
@@ -302,7 +343,8 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
             for kind in lost {
                 tracing::info!(session = %session.id.0, ?kind, "refusing a request lost with the daemon");
-                self.log.append(db, session.id, kind)?;
+                // Settings belong to the session, not to a context.
+                self.log.append(db, session.id, session.context, kind)?;
             }
         }
         self.models = self.log.offered_models(db)?;
@@ -359,7 +401,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                 // agent gets it.
                 self.cursor = seq;
                 self.store_cursor()?;
-                self.deliver(session_id, text).await?;
+                self.deliver(session_id, event.context, text).await?;
             }
             EventKind::ApprovalResolved {
                 id, decision, rule, ..
@@ -391,30 +433,35 @@ impl<A: AgentAdapter> Supervisor<A> {
                 }
             }
             EventKind::SessionStopped => {
-                let Some(running) = self.running.get_mut(&session_id) else {
-                    return Ok(());
-                };
-                // Shutting down mid-turn would abandon the turn and log it as
-                // lost; end it as interrupted instead. A delivered message
-                // counts too: its turn may have begun before we heard.
-                if (running.turn_started.is_some() || running.owed_turns > 0)
-                    && let Err(error) = running.session.interrupt().await
-                {
-                    tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
-                }
                 tracing::info!(session = %session_id.0, "stopping agent on request");
-                self.stop_session(session_id, true).await?;
+                self.stop_on_request(session_id).await?;
+            }
+            EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
+                // The event is stamped with the context it makes current.
+                // That context starts lazily, on its next message or
+                // setting request; never here.
+                if self
+                    .running
+                    .get(&session_id)
+                    .is_some_and(|running| running.context() != event.context)
+                {
+                    tracing::info!(session = %session_id.0, "stopping agent: context changed");
+                    self.stop_on_request(session_id).await?;
+                }
             }
             EventKind::PermissionModeRequested { mode, .. } => {
-                self.set(session_id, event.command_id, Setting::Mode(mode))
+                let setting = Setting::Mode(mode);
+                self.set(session_id, event.context, event.command_id, setting)
                     .await?;
             }
             EventKind::ModelRequested { model, .. } => {
-                self.set(session_id, event.command_id, Setting::Model(model))
+                let setting = Setting::Model(model);
+                self.set(session_id, event.context, event.command_id, setting)
                     .await?;
             }
             EventKind::EffortRequested { effort, .. } => {
-                self.set(session_id, event.command_id, Setting::Effort(effort))
+                let setting = Setting::Effort(effort);
+                self.set(session_id, event.context, event.command_id, setting)
                     .await?;
             }
             _ => {}
@@ -422,17 +469,55 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Asks the session's agent for `setting` on behalf of `command`. An
-    /// agent that is not running is started, and the start asks for what
-    /// the log wants, this request included.
+    /// Stops the session's agent, if one runs, ending its turn first.
+    async fn stop_on_request(&mut self, session_id: SessionId) -> Result<()> {
+        let Some(running) = self.running.get_mut(&session_id) else {
+            return Ok(());
+        };
+        // Shutting down mid-turn would abandon the turn and log it as
+        // lost; end it as interrupted instead. A delivered message counts
+        // too: its turn may have begun before we heard.
+        if (running.turn_started.is_some() || running.owed_turns > 0)
+            && let Err(error) = running.session.interrupt().await
+        {
+            tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
+        }
+        self.stop_session(session_id, true).await
+    }
+
+    /// Stops the session's agent if it runs for another context than
+    /// `context`, the stamp of the event being handled. Cannot happen while
+    /// command handling validates stamps and a context change stops the
+    /// agent (both before the supervisor reaches the event); if it does, the
+    /// event goes to its own context's agent, not silently to another's.
+    async fn leave_other_context(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+    ) -> Result<()> {
+        if let Some(running) = self.running.get(&session_id)
+            && running.context() != context
+        {
+            tracing::warn!(session = %session_id.0, "agent runs another context; stopping it");
+            self.stop_on_request(session_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Asks the session's agent for `setting` on behalf of `command`, made
+    /// in `context`. An agent that is not running is started for
+    /// `context`, and the start asks for what the log wants, this request
+    /// included.
     async fn set(
         &mut self,
         session_id: SessionId,
+        context: ContextId,
         command: Option<CommandId>,
         setting: Setting,
     ) -> Result<()> {
+        self.leave_other_context(session_id, context).await?;
         if !self.running.contains_key(&session_id) {
-            if let Err(message) = self.start_session(session_id).await? {
+            if let Err(message) = self.start_session(session_id, context).await? {
                 tracing::warn!(session = %session_id.0, %message, "agent did not start for a setting");
                 let reason = format!("agent did not start: {message}");
                 let kind = match setting {
@@ -452,7 +537,8 @@ impl<A: AgentAdapter> Supervisor<A> {
                         answers: command,
                     },
                 };
-                self.log.append(&mut self.storage.db, session_id, kind)?;
+                self.log
+                    .append(&mut self.storage.db, session_id, context, kind)?;
             }
             return Ok(());
         }
@@ -493,13 +579,20 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Gives `text` to the session's agent, starting it if needed. A session
-    /// found closed is reaped and restarted once.
-    async fn deliver(&mut self, session_id: SessionId, text: String) -> Result<()> {
+    /// Gives `text`, a message sent in `context`, to the session's agent,
+    /// starting it for `context` if needed. A session found closed is
+    /// reaped and restarted once.
+    async fn deliver(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+        text: String,
+    ) -> Result<()> {
+        self.leave_other_context(session_id, context).await?;
         let mut failure = String::new();
         for _ in 0..2 {
             if !self.running.contains_key(&session_id)
-                && let Err(message) = self.start_session(session_id).await?
+                && let Err(message) = self.start_session(session_id, context).await?
             {
                 failure = message;
                 break;
@@ -524,19 +617,30 @@ impl<A: AgentAdapter> Supervisor<A> {
         self.log.append(
             &mut self.storage.db,
             session_id,
+            context,
             EventKind::SessionStateChanged(SessionState::Errored { message: failure }),
         )?;
         Ok(())
     }
 
-    /// Starts or resumes the session's agent. `Err` carries why the agent
-    /// could not start, for the log.
-    async fn start_session(&mut self, session_id: SessionId) -> Result<Result<(), String>> {
+    /// Starts the session's agent for `context`, resumed with the
+    /// context's handle when it has one, fresh otherwise. `Err` carries why
+    /// the agent could not start, for the log.
+    ///
+    /// `context` is the stamp of the event the start is for, not the
+    /// session's current context: a switch logged after that event, and not
+    /// handled yet, must not hand the event to the new context.
+    async fn start_session(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+    ) -> Result<Result<(), String>> {
         let Some(info) = self.log.session(&self.storage.db, session_id)? else {
             return Ok(Err(format!("unknown session {}", session_id.0)));
         };
-        let resume = load_resume_handle(&self.storage.db, session_id)?;
+        let resume = load_resume_handle(&self.storage.db, context)?;
         let resumed = resume.is_some();
+        let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
@@ -545,16 +649,18 @@ impl<A: AgentAdapter> Supervisor<A> {
         let effort = settings.effort.wanted().copied().flatten();
         let spec = StartSpec {
             session_id,
+            context,
             workdir: info.workdir.into(),
             resume,
+            grants,
             mode,
             model: model.clone(),
             effort,
         };
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
-                tracing::info!(session = %session_id.0, resumed, "agent started");
-                let mut mapper = EventMapper::new(session_id, settings.clone());
+                tracing::info!(session = %session_id.0, context = %context.0, resumed, "agent started");
+                let mut mapper = EventMapper::new(session_id, context, settings.clone());
                 let mut asked = HashSet::new();
                 if let Some(mode) = mode {
                     let command = settings.mode.requested.as_ref().map(|r| r.command);
@@ -619,7 +725,15 @@ impl<A: AgentAdapter> Supervisor<A> {
             AdapterEvent::TurnEnded(_) | AdapterEvent::Exited { .. }
         );
         if let AdapterEvent::ModelsOffered(models) = event {
-            return offer_models(&self.log, &mut self.storage, &mut self.models, id, models);
+            let context = running.context();
+            return offer_models(
+                &self.log,
+                &mut self.storage,
+                &mut self.models,
+                id,
+                context,
+                models,
+            );
         }
         let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
         if started && let Some(&seq) = seqs.first() {
@@ -668,7 +782,15 @@ impl<A: AgentAdapter> Supervisor<A> {
         let mut mapper = running.mapper;
         for event in events {
             if let AdapterEvent::ModelsOffered(models) = event {
-                offer_models(&self.log, &mut self.storage, &mut self.models, id, models)?;
+                let context = mapper.context();
+                offer_models(
+                    &self.log,
+                    &mut self.storage,
+                    &mut self.models,
+                    id,
+                    context,
+                    models,
+                )?;
             } else {
                 mapper.apply(&self.log, &mut self.storage, event)?;
             }
@@ -755,13 +877,15 @@ enum Setting {
     Effort(Effort),
 }
 
-/// Logs `models`, offered by session `id`'s agent, as `ModelsOffered` when
-/// they differ from `known`, the newest list in the log, and makes them so.
+/// Logs `models`, offered by session `id`'s agent running in `context`, as
+/// `ModelsOffered` when they differ from `known`, the newest list in the
+/// log, and makes them so.
 fn offer_models(
     log: &EventLog,
     storage: &mut Storage,
     known: &mut Option<Vec<ModelChoice>>,
     id: SessionId,
+    context: ContextId,
     models: Vec<ModelChoice>,
 ) -> Result<()> {
     let models = bounded_models(models);
@@ -771,6 +895,7 @@ fn offer_models(
     log.append(
         &mut storage.db,
         id,
+        context,
         EventKind::ModelsOffered {
             models: models.clone(),
         },
@@ -801,18 +926,22 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-/// The session's newest `SessionStateChanged` or `TurnInterrupted`.
-fn last_state_event(db: &Db, session_id: SessionId) -> Result<Option<EventKind>> {
-    let kind: Option<String> = db
+/// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
+/// the context it is stamped with.
+fn last_state_event(db: &Db, session_id: SessionId) -> Result<Option<(EventKind, ContextId)>> {
+    let row: Option<(String, String)> = db
         .conn()
         .prepare_cached(
-            "SELECT kind FROM events WHERE session_id = ?1 \
+            "SELECT kind, context FROM events WHERE session_id = ?1 \
              AND json_extract(kind, '$.type') IN ('session_state_changed', 'turn_interrupted') \
              ORDER BY seq DESC LIMIT 1",
         )?
-        .query_row([session_id.0.to_string()], |r| r.get(0))
+        .query_row([session_id.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    Ok(kind.as_deref().map(serde_json::from_str).transpose()?)
+    let Some((kind, context)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((serde_json::from_str(&kind)?, parse_id(&context)?)))
 }
 
 fn load_cursor(db: &Db) -> Result<Seq> {

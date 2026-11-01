@@ -13,8 +13,8 @@ use skywave_core::{
     SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, Decision, DeviceId, Event, EventBatch,
-    EventKind, Seq, SessionId, ToolResult,
+    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, ContextId, Decision, DeviceId, Event,
+    EventBatch, EventKind, Seq, SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -89,6 +89,7 @@ fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         session_id,
         at: Utc.with_ymd_and_hms(2026, 10, 29, 11, minute, 0).unwrap(),
         command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
+        context: ContextId::first_of(session_id),
         kind,
     }
 }
@@ -232,6 +233,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )],
     })
@@ -257,6 +259,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
         command.kind,
         CommandKind::SendMessage {
             session_id: sid,
+            context: ContextId::first_of(sid),
             text: "fix the build".into()
         }
     );
@@ -269,6 +272,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
         *timeline,
         vec![TimelineItem::Pending {
             command_id: command.id,
+            context: ContextId::first_of(sid),
             text: "fix the build".into(),
             outgoing: Outgoing::Queued,
             discardable: true,
@@ -320,6 +324,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
         vec![TimelineItem::Logged {
             seq: Seq(2),
             at: event(sid, 1, EventKind::TurnInterrupted).at,
+            context: ContextId::first_of(sid),
             entry: Entry::UserMessage {
                 command_id: command.id,
                 text: "fix the build".into(),
@@ -374,6 +379,7 @@ fn draft_survives_restart() {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )],
     })
@@ -436,6 +442,7 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -500,6 +507,7 @@ fn gap_is_refused_and_changes_nothing() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/x".into(),
+                    context_name: "start".into(),
                 },
             )],
         })
@@ -532,6 +540,7 @@ fn blob_progress_is_persisted_and_shown() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             event(
@@ -629,6 +638,7 @@ fn an_approval_no_core_alerted_on_alerts_once_after_a_restart() {
                 0,
                 EventKind::SessionCreated {
                     workdir: "/srv/a".into(),
+                    context_name: "start".into(),
                 },
             ),
             requested(1, news),
@@ -704,6 +714,7 @@ fn deleted_session_stays_gone_after_restart() {
             minute,
             EventKind::SessionCreated {
                 workdir: "/srv/a".into(),
+                context_name: "start".into(),
             },
         )
     };
@@ -864,4 +875,112 @@ fn a_snapshot_published_during_unsubscribe_still_reaches_the_others() {
 
     assert_eq!(core.view().link, Link::Online { latency_ms: 7 });
     assert_eq!(watching.last(), core.view());
+}
+
+/// Between the ack of this device's switch and the pull of its event, the
+/// replica still names the old context: a message sent then goes to the
+/// switch's context all the same, or the server would refuse it.
+#[test]
+fn a_message_after_an_acked_switch_not_yet_pulled_goes_to_the_switch_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, me) = paired_core(dir.path());
+    let views = Views::subscribe(&core);
+    let sid = SessionId::new();
+    let first = ContextId::first_of(sid);
+    let later = ContextId::new();
+    let elsewhere = DeviceId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                    context_name: "start".into(),
+                },
+            ),
+            Event {
+                context: later,
+                ..event(
+                    sid,
+                    1,
+                    EventKind::ContextStarted {
+                        by: elsewhere,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+        ],
+    })
+    .unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    let sent_to = |text: &str| {
+        core.dispatch(Action::SendMessage {
+            session_id: sid,
+            text: text.into(),
+        })
+        .unwrap();
+        let outbox = seam.pending_outbox().unwrap();
+        match &outbox.last().unwrap().command.kind {
+            CommandKind::SendMessage {
+                context, text: t, ..
+            } if t == text => *context,
+            other => panic!("expected the message, got {other:?}"),
+        }
+    };
+    // The control: before the switch, messages go to the newer context.
+    assert_eq!(session_view(&views.last()).context, later);
+    assert_eq!(sent_to("before"), later);
+
+    core.dispatch(Action::SwitchContext {
+        session_id: sid,
+        context: first,
+    })
+    .unwrap();
+    let switch = seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.command.kind, CommandKind::SwitchContext { .. }))
+        .unwrap()
+        .command
+        .id;
+    assert!(seam.command_sending(switch).unwrap());
+    seam.command_result(switch, &CommandResult::Accepted { seq: Seq(4) })
+        .unwrap();
+    // Acked at seq 4, the replica at seq 2: the window.
+    assert_eq!(seam.cursor().unwrap(), Seq(2));
+    let view = session_view(&views.last()).clone();
+    assert_eq!(view.context, first);
+    assert_eq!(view.switch, Some(Outgoing::Accepted(Seq(4))));
+    assert_eq!(sent_to("in the window"), first);
+
+    // Pulled: the replica says the same, and the switch is settled.
+    seam.apply_events(&EventBatch {
+        from: Seq(3),
+        events: vec![
+            Event {
+                command_id: Some(skywave_proto::CommandId::new()),
+                context: later,
+                ..event(
+                    sid,
+                    2,
+                    EventKind::UserMessage {
+                        device_id: elsewhere,
+                        text: "x".into(),
+                    },
+                )
+            },
+            Event {
+                command_id: Some(switch),
+                context: first,
+                ..event(sid, 3, EventKind::ContextSwitched { by: me })
+            },
+        ],
+    })
+    .unwrap();
+    let view = session_view(&views.last()).clone();
+    assert_eq!((view.context, view.switch), (first, None));
+    assert_eq!(sent_to("after"), first);
 }

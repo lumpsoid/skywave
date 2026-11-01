@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod context_name;
 mod fingerprint;
 
 pub use fingerprint::{Fingerprint, InvalidFingerprint};
@@ -44,7 +45,15 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v8: `CommandKind::SetEffort` with its `EffortRequested`, `EffortChanged`
 /// and `EffortRefused` events, and the levels each model takes in
 /// [`ModelChoice::efforts`].
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// v9: session contexts. [`Event::context`] stamps every event with the
+/// [`ContextId`] it belongs to; `CommandKind::ClearContext` and
+/// `CommandKind::SwitchContext` with their `EventKind::ContextStarted` and
+/// `EventKind::ContextSwitched`; the first context's name in
+/// `EventKind::SessionCreated::context_name`; the context a
+/// `CommandKind::SendMessage` was written in; and
+/// `RejectReason::{ContextExists, UnknownContext, ContextChanged}`.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -104,6 +113,21 @@ uuid_id!(
     /// Identifies a blob of large content fetched separately from events.
     BlobId
 );
+uuid_id!(
+    /// Identifies one context of a session: a span of its log with its own
+    /// agent conversation. A session has one current context at a time; its
+    /// first context has the session's own id ([`ContextId::first_of`]).
+    /// Users see a context's name, never its id. A cleared context's id is
+    /// chosen by the client that clears (`CommandKind::ClearContext`).
+    ContextId
+);
+
+impl ContextId {
+    /// The first context of `session`, which has the session's own id.
+    pub fn first_of(session: SessionId) -> ContextId {
+        ContextId(session.0)
+    }
+}
 
 /// Position in the server's global event log (D12).
 ///
@@ -144,6 +168,11 @@ pub struct Event {
     /// event, so it is that command's `Accepted { seq }` too: a device whose
     /// reply was lost settles the command from the log.
     pub command_id: Option<CommandId>,
+    /// The context of its session the event belongs to, decided by the
+    /// server when it logs the event; never derived from the event's
+    /// position. Session-level state (name, archived, settings) folds per
+    /// session regardless.
+    pub context: ContextId,
     pub kind: EventKind,
 }
 
@@ -151,8 +180,23 @@ pub struct Event {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     /// A session was created in `workdir`, a directory on the server (D14).
+    /// Its first context, which has the session's id, is named
+    /// `context_name` by the server.
     SessionCreated {
         workdir: String,
+        context_name: String,
+    },
+    /// A `ClearContext` command started a new, empty context named `name`
+    /// and made it current; the event is stamped with the new context. The
+    /// agent starts afresh in it.
+    ContextStarted {
+        by: DeviceId,
+        name: String,
+    },
+    /// A `SwitchContext` command made the context the event is stamped with
+    /// current again; the agent resumes that context's conversation.
+    ContextSwitched {
+        by: DeviceId,
     },
     UserMessage {
         device_id: DeviceId,
@@ -301,7 +345,9 @@ impl EventKind {
             | EventKind::SessionArchived { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
             | EventKind::ModelRequested { by, .. }
-            | EventKind::EffortRequested { by, .. } => Some(*by),
+            | EventKind::EffortRequested { by, .. }
+            | EventKind::ContextStarted { by, .. }
+            | EventKind::ContextSwitched { by } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -336,7 +382,9 @@ impl EventKind {
             | EventKind::SessionArchived { .. }
             | EventKind::PermissionModeRequested { .. }
             | EventKind::ModelRequested { .. }
-            | EventKind::EffortRequested { .. } => true,
+            | EventKind::EffortRequested { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -383,7 +431,9 @@ impl EventKind {
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => None,
+            | EventKind::EffortRefused { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. } => None,
         }
     }
 }
@@ -405,6 +455,9 @@ pub mod limits {
     pub const PREVIEW_MAX_BYTES: usize = 512;
     /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
     pub const SESSION_NAME_MAX_CHARS: usize = 80;
+    /// Longest context name (`SessionCreated::context_name`,
+    /// `ClearContext`, `ContextStarted`), in chars.
+    pub const CONTEXT_NAME_MAX_CHARS: usize = 40;
     /// Longest [`RuleSuggestion::label`](crate::RuleSuggestion::label), in
     /// chars.
     pub const RULE_LABEL_MAX_CHARS: usize = 120;
@@ -962,11 +1015,13 @@ pub struct Command {
 pub enum CommandKind {
     /// Start a session in `workdir`, which must lie under one of the
     /// server's configured roots (D14).
-    CreateSession {
-        workdir: String,
-    },
+    CreateSession { workdir: String },
+    /// Send `text` to the agent. `context` is the session's context the
+    /// message was written in; the server refuses it as `ContextChanged`
+    /// when that is no longer the current one.
     SendMessage {
         session_id: SessionId,
+        context: ContextId,
         text: String,
     },
     /// Answer an approval. `rule` grants the request's suggestion with
@@ -979,15 +1034,11 @@ pub enum CommandKind {
         rule: Option<u8>,
     },
     /// Stop the agent's current turn in this session.
-    Interrupt {
-        session_id: SessionId,
-    },
+    Interrupt { session_id: SessionId },
     /// Shut down the session's agent, interrupting its turn if one runs.
     /// Accepted whether or not the agent is running; the next message starts
     /// it again.
-    StopSession {
-        session_id: SessionId,
-    },
+    StopSession { session_id: SessionId },
     /// Name the session; `None` (or a name that is empty once normalised)
     /// restores the default title. The server logs the name as
     /// [`normalise_session_name`] leaves it. Accepted for any known session,
@@ -1029,6 +1080,23 @@ pub enum CommandKind {
         session_id: SessionId,
         effort: Effort,
     },
+    /// Start a new, empty context `context` (an id the client chose) named
+    /// `name` and make it current: the agent starts afresh. The server logs
+    /// the name as [`normalise_context_name`] leaves it, or a generated one
+    /// ([`context_name::random`]) when nothing is left. `ContextExists` if
+    /// `context` is already a context of any session.
+    ClearContext {
+        session_id: SessionId,
+        context: ContextId,
+        name: String,
+    },
+    /// Make `context`, one of the session's contexts, current again: the
+    /// agent resumes it. Absolute: accepted even when it is already
+    /// current. `UnknownContext` if the session has no such context.
+    SwitchContext {
+        session_id: SessionId,
+        context: ContextId,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1043,6 +1111,21 @@ pub fn normalise_session_name(name: &str) -> Option<String> {
         .take(limits::SESSION_NAME_MAX_CHARS)
         .collect();
     // The cut may end on whitespace.
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// A context name as `ContextStarted` carries it: control characters
+/// stripped, trimmed, and cut on a char boundary to
+/// [`limits::CONTEXT_NAME_MAX_CHARS`]. `None` when nothing is left; the
+/// server then names the context itself rather than refuse the command.
+pub fn normalise_context_name(name: &str) -> Option<String> {
+    let clean: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name: String = clean
+        .trim()
+        .chars()
+        .take(limits::CONTEXT_NAME_MAX_CHARS)
+        .collect();
     let name = name.trim_end();
     (!name.is_empty()).then(|| name.to_owned())
 }
@@ -1091,6 +1174,14 @@ pub enum RejectReason {
     UnknownRule,
     /// `SetModel.model` is blank.
     UnknownModel,
+    /// `ClearContext.context` is already a context, of this session or
+    /// another.
+    ContextExists,
+    /// `SwitchContext.context` is not a context of the session.
+    UnknownContext,
+    /// `SendMessage.context` is no longer the session's current context: a
+    /// device cleared or switched contexts after the message was written.
+    ContextChanged,
 }
 
 impl RejectReason {
@@ -1387,6 +1478,46 @@ mod tests {
         settings.apply(None, &kind);
         assert_eq!(settings.effort.current, Some(None));
         assert_eq!(settings.effort.wanted(), Some(&None));
+    }
+
+    #[test]
+    fn context_events_name_their_device_and_are_logged_by_command() {
+        let by = DeviceId::new();
+        for kind in [
+            EventKind::ContextStarted {
+                by,
+                name: "velvet walrus".into(),
+            },
+            EventKind::ContextSwitched { by },
+        ] {
+            assert_eq!(kind.device(), Some(by), "{kind:?}");
+            assert!(kind.logged_by_command(), "{kind:?}");
+            assert_eq!(kind.archived_effect(), None, "{kind:?}");
+        }
+        // Positive control: the classifiers do tell kinds apart.
+        let created = EventKind::SessionCreated {
+            workdir: "/w".into(),
+            context_name: "start".into(),
+        };
+        assert_eq!(created.device(), None);
+        assert!(!EventKind::AgentMessage { text: "x".into() }.logged_by_command());
+    }
+
+    #[test]
+    fn a_context_name_is_normalised_like_a_session_name() {
+        assert_eq!(
+            normalise_context_name("  velvet\nwalrus \t"),
+            Some("velvetwalrus".to_owned())
+        );
+        assert_eq!(normalise_context_name(" \n "), None);
+        let long = format!("{} tail", "n".repeat(39));
+        // Cut at the cap, then the trailing space the cut left is trimmed.
+        assert_eq!(normalise_context_name(&long), Some("n".repeat(39)));
+        let long = "n".repeat(100);
+        assert_eq!(
+            normalise_context_name(&long).map(|n| n.chars().count()),
+            Some(limits::CONTEXT_NAME_MAX_CHARS)
+        );
     }
 
     #[test]

@@ -874,14 +874,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seam = paired_seam(dir.path());
         let (bound, _) = seam.bind().unwrap();
+        let session_id = SessionId::new();
         let batch = |from| EventBatch {
             from: Seq(from),
             events: vec![skywave_proto::Event {
-                session_id: SessionId::new(),
+                session_id,
                 at: chrono::Utc::now(),
                 command_id: Some(CommandId::new()),
+                context: skywave_proto::ContextId::first_of(session_id),
                 kind: skywave_proto::EventKind::SessionCreated {
                     workdir: "/srv".into(),
+                    context_name: "start".into(),
                 },
             }],
         };
@@ -1357,6 +1360,7 @@ mod tests {
             id: CommandId::new(),
             kind: CommandKind::SendMessage {
                 session_id: SessionId::new(),
+                context: skywave_proto::ContextId::first_of(SessionId::new()),
                 text: text.into(),
             },
         };
@@ -1573,8 +1577,10 @@ mod tests {
                     session_id,
                     at: Utc::now(),
                     command_id: Some(CommandId::new()),
+                    context: skywave_proto::ContextId::first_of(session_id),
                     kind: skywave_proto::EventKind::SessionCreated {
                         workdir: "/srv".into(),
+                        context_name: "start".into(),
                     },
                 }]),
                 grew: Notify::new(),
@@ -1631,6 +1637,7 @@ mod tests {
                             session_id: self.session_id,
                             at: Utc::now(),
                             command_id: Some(command.id),
+                            context: skywave_proto::ContextId::first_of(self.session_id),
                             kind: skywave_proto::EventKind::UserMessage {
                                 device_id: self.device,
                                 text: text.clone(),

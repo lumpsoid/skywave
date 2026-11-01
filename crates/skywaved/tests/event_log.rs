@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, Effort, Event,
-    EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId, SessionState,
+    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId,
+    Effort, Event, EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
+    SessionState,
 };
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
 use skywaved::{Error, EventLog, Storage};
@@ -59,9 +60,20 @@ impl Fixture {
         batch.events[0].session_id
     }
 
+    /// Appends `kind` as the agent of the session's current context.
     fn agent(&mut self, session: SessionId, kind: EventKind) -> Seq {
+        let context = self
+            .log
+            .session(&self.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .context;
+        self.agent_in(session, context, kind)
+    }
+
+    fn agent_in(&mut self, session: SessionId, context: ContextId, kind: EventKind) -> Seq {
         self.log
-            .append(&mut self.storage.db, session, kind)
+            .append(&mut self.storage.db, session, context, kind)
             .unwrap()
     }
 
@@ -105,6 +117,17 @@ impl Fixture {
             .read(&self.storage.db, Seq::ZERO, 5000)
             .unwrap()
             .events
+    }
+}
+
+/// Every test ends by checking that every row names a context of its own
+/// session.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let violations = self.storage.db.context_stamp_violations().unwrap();
+            assert!(violations.is_empty(), "context stamps: {violations:#?}");
+        }
     }
 }
 
@@ -195,6 +218,7 @@ fn resending_a_command_returns_the_stored_result_without_appending() {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id: session,
+            context: ContextId::first_of(session),
             text: "hello".into(),
         },
     };
@@ -248,6 +272,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
     let commands = [
         CommandKind::SendMessage {
             session_id: session,
+            context: ContextId::first_of(session),
             text: "hi".into(),
         },
         CommandKind::ResolveApproval {
@@ -311,6 +336,7 @@ fn rejected_results_are_stored_and_stay_stable() {
         id: CommandId::new(),
         kind: CommandKind::SendMessage {
             session_id: missing,
+            context: ContextId::first_of(missing),
             text: "x".into(),
         },
     };
@@ -409,13 +435,20 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
                             id: CommandId::new(),
                             kind: CommandKind::SendMessage {
                                 session_id: session,
+                                context: ContextId::first_of(session),
                                 text,
                             },
                         };
                         accepted(log.handle(&mut conn.db, device, &command).unwrap())
                     } else {
-                        log.append(&mut conn.db, session, EventKind::AgentMessage { text })
-                            .unwrap()
+                        let context = ContextId::first_of(session);
+                        log.append(
+                            &mut conn.db,
+                            session,
+                            context,
+                            EventKind::AgentMessage { text },
+                        )
+                        .unwrap()
                     };
                     assert!(seq > last, "a writer's own events are ordered");
                     last = seq;
@@ -455,11 +488,18 @@ fn create_session_records_the_canonical_workdir() {
     }));
     let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let canonical = workdir(&std::fs::canonicalize(f.root.join("project")).unwrap());
+    let EventKind::SessionCreated {
+        workdir: logged,
+        context_name,
+    } = &batch.events[0].kind
+    else {
+        panic!("not SessionCreated: {:?}", batch.events[0].kind);
+    };
+    assert_eq!(logged, &canonical);
+    // The server names the first context.
     assert_eq!(
-        batch.events[0].kind,
-        EventKind::SessionCreated {
-            workdir: canonical.clone()
-        }
+        skywave_proto::normalise_context_name(context_name).as_ref(),
+        Some(context_name)
     );
     assert_eq!(batch.last(), Some(seq));
     let info = f
@@ -859,6 +899,7 @@ fn archive_logs_the_absolute_value_and_a_message_brings_it_back() {
     // A message from any device brings it back, by the shared rule.
     accepted(f.handle(CommandKind::SendMessage {
         session_id: session,
+        context: ContextId::first_of(session),
         text: "again".into(),
     }));
     assert!(!archived(&f));
@@ -960,18 +1001,40 @@ fn set_effort_logs_one_request_the_agent_answers() {
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
+    let nobody = SessionId::new();
     let unknown = f.log.append(
         &mut f.storage.db,
-        SessionId::new(),
+        nobody,
+        ContextId::first_of(nobody),
         EventKind::AgentMessage { text: "x".into() },
     );
     assert!(matches!(unknown, Err(Error::InvalidAppend(_))));
 
     let session = f.create_session();
+    let context = ContextId::first_of(session);
+    // A context that is not the session's: unknown, or another session's.
+    let other = f.create_session();
+    for wrong in [ContextId::new(), ContextId::first_of(other)] {
+        let appended = f.log.append(
+            &mut f.storage.db,
+            session,
+            wrong,
+            EventKind::AgentMessage { text: "x".into() },
+        );
+        assert!(matches!(appended, Err(Error::InvalidAppend(_))));
+    }
     for kind in [
         EventKind::TurnInterrupted,
         EventKind::SessionCreated {
             workdir: "/".into(),
+            context_name: "start".into(),
+        },
+        EventKind::ContextStarted {
+            by: DeviceId::new(),
+            name: "x".into(),
+        },
+        EventKind::ContextSwitched {
+            by: DeviceId::new(),
         },
         EventKind::ApprovalCancelled {
             id: ApprovalId::new(),
@@ -991,7 +1054,7 @@ fn agent_appends_are_checked() {
         },
     ] {
         assert!(matches!(
-            f.log.append(&mut f.storage.db, session, kind),
+            f.log.append(&mut f.storage.db, session, context, kind),
             Err(Error::InvalidAppend(_))
         ));
     }
@@ -999,6 +1062,7 @@ fn agent_appends_are_checked() {
     let duplicate = f.log.append(
         &mut f.storage.db,
         session,
+        context,
         EventKind::ApprovalRequested {
             id: approval,
             call: None,
@@ -1009,7 +1073,329 @@ fn agent_appends_are_checked() {
         },
     );
     assert!(matches!(duplicate, Err(Error::InvalidAppend(_))));
-    assert_eq!(f.log.head(), Seq(2), "refused appends leave no trace");
+    assert_eq!(f.log.head(), Seq(3), "refused appends leave no trace");
+    // Positive control: the session's own context is accepted.
+    f.agent_in(
+        session,
+        context,
+        EventKind::AgentMessage { text: "x".into() },
+    );
+    assert_eq!(f.log.head(), Seq(4));
+}
+
+// --- contexts ----------------------------------------------------------------
+
+impl Fixture {
+    /// The session's newest event.
+    fn last_event(&self) -> Event {
+        self.all_events().pop().unwrap()
+    }
+
+    fn current_context(&self, session: SessionId) -> ContextId {
+        self.log
+            .session(&self.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .context
+    }
+
+    fn clear(&mut self, session: SessionId, context: ContextId, name: &str) -> CommandResult {
+        self.handle(CommandKind::ClearContext {
+            session_id: session,
+            context,
+            name: name.into(),
+        })
+    }
+}
+
+#[test]
+fn a_new_session_opens_its_first_context_with_its_own_id() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let first = ContextId::first_of(session);
+    assert_eq!(first.0, session.0);
+    assert_eq!(f.current_context(session), first);
+    let created = f.last_event();
+    assert!(matches!(created.kind, EventKind::SessionCreated { .. }));
+    assert_eq!(created.context, first);
+    // Its own name, from the shared word lists.
+    let EventKind::SessionCreated { context_name, .. } = created.kind else {
+        unreachable!()
+    };
+    let (adjective, noun) = context_name.split_once(' ').unwrap();
+    assert!(skywave_proto::context_name::ADJECTIVES.contains(&adjective));
+    assert!(skywave_proto::context_name::NOUNS.contains(&noun));
+}
+
+#[test]
+fn clear_context_starts_the_given_context_and_makes_it_current() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let fresh = ContextId::new();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::ClearContext {
+            session_id: session,
+            context: fresh,
+            name: "  fresh start ".into(),
+        },
+    };
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    let started = f.last_event();
+    assert_eq!(
+        started.kind,
+        EventKind::ContextStarted {
+            by: device,
+            name: "fresh start".into()
+        }
+    );
+    assert_eq!(started.context, fresh);
+    assert_eq!(started.command_id, Some(command.id));
+    assert_eq!(f.current_context(session), fresh);
+
+    // A resend is the same command: same seq, nothing logged.
+    let head = f.log.head();
+    let again = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+    assert_eq!(again, CommandResult::Accepted { seq });
+    assert_eq!(f.log.head(), head);
+
+    // Another command naming an existing context is refused, whichever
+    // session it belongs to, and logs nothing.
+    let other = f.create_session();
+    let head = f.log.head();
+    assert_eq!(
+        f.clear(session, fresh, "x"),
+        rejected(RejectReason::ContextExists)
+    );
+    assert_eq!(
+        f.clear(other, fresh, "x"),
+        rejected(RejectReason::ContextExists)
+    );
+    assert_eq!(
+        f.clear(session, ContextId::first_of(other), "x"),
+        rejected(RejectReason::ContextExists)
+    );
+    assert_eq!(
+        f.clear(SessionId::new(), ContextId::new(), "x"),
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(f.log.head(), head);
+    assert_eq!(f.current_context(other), ContextId::first_of(other));
+}
+
+#[test]
+fn a_blank_context_name_is_replaced_and_a_long_one_cut() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    accepted(f.clear(session, ContextId::new(), " \n\t "));
+    let EventKind::ContextStarted { name, .. } = f.last_event().kind else {
+        panic!("not ContextStarted");
+    };
+    let (adjective, noun) = name.split_once(' ').expect("a generated name");
+    assert!(skywave_proto::context_name::ADJECTIVES.contains(&adjective));
+    assert!(skywave_proto::context_name::NOUNS.contains(&noun));
+
+    accepted(f.clear(session, ContextId::new(), &"long ".repeat(30)));
+    let EventKind::ContextStarted { name, .. } = f.last_event().kind else {
+        panic!("not ContextStarted");
+    };
+    assert!(name.starts_with("long long"), "{name:?}");
+    assert!(name.chars().count() <= skywave_proto::limits::CONTEXT_NAME_MAX_CHARS);
+    assert!(!name.ends_with(' '));
+}
+
+#[test]
+fn switch_context_accepts_only_a_context_of_the_session() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let other = f.create_session();
+    let first = ContextId::first_of(session);
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "second"));
+    let switch = |context| CommandKind::SwitchContext {
+        session_id: session,
+        context,
+    };
+
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(switch(ContextId::new())),
+        rejected(RejectReason::UnknownContext)
+    );
+    assert_eq!(
+        f.handle(switch(ContextId::first_of(other))),
+        rejected(RejectReason::UnknownContext)
+    );
+    assert_eq!(
+        f.handle(CommandKind::SwitchContext {
+            session_id: SessionId::new(),
+            context: first,
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(f.log.head(), head);
+
+    // Switching to the current context is accepted and logged once.
+    let seq = accepted(f.handle(switch(second)));
+    assert_eq!(seq, head.next());
+    assert_eq!(f.log.head(), seq);
+    let switched = f.last_event();
+    assert!(matches!(switched.kind, EventKind::ContextSwitched { .. }));
+    assert_eq!(switched.context, second);
+    assert_eq!(f.current_context(session), second);
+
+    // Back to the first.
+    accepted(f.handle(switch(first)));
+    assert_eq!(f.last_event().context, first);
+    assert_eq!(f.current_context(session), first);
+}
+
+#[test]
+fn a_message_for_a_context_left_behind_is_refused() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let first = ContextId::first_of(session);
+    let second = ContextId::new();
+    let send = |context| CommandKind::SendMessage {
+        session_id: session,
+        context,
+        text: "hi".into(),
+    };
+    accepted(f.handle(send(first)));
+    assert_eq!(f.last_event().context, first);
+
+    accepted(f.clear(session, second, "second"));
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(send(first)),
+        rejected(RejectReason::ContextChanged)
+    );
+    assert_eq!(f.log.head(), head);
+    // Unknown session is checked first.
+    assert_eq!(
+        f.handle(CommandKind::SendMessage {
+            session_id: SessionId::new(),
+            context: second,
+            text: "x".into(),
+        }),
+        rejected(RejectReason::UnknownSession)
+    );
+
+    accepted(f.handle(send(second)));
+    let message = f.last_event();
+    assert!(matches!(message.kind, EventKind::UserMessage { .. }));
+    assert_eq!(message.context, second);
+}
+
+#[test]
+fn session_wide_events_are_stamped_with_the_current_context() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "second"));
+    for kind in [
+        CommandKind::RenameSession {
+            session_id: session,
+            name: Some("x".into()),
+        },
+        CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+        CommandKind::SetEffort {
+            session_id: session,
+            effort: Effort::High,
+        },
+        CommandKind::StopSession {
+            session_id: session,
+        },
+    ] {
+        accepted(f.handle(kind));
+        assert_eq!(f.last_event().context, second);
+    }
+    // What the agent logs carries the context it is given, the context of
+    // the process that produced it, current or not.
+    let first = ContextId::first_of(session);
+    f.agent_in(session, first, EventKind::AgentMessage { text: "x".into() });
+    assert_eq!(f.last_event().context, first);
+    f.agent_in(
+        session,
+        second,
+        EventKind::AgentMessage { text: "y".into() },
+    );
+    assert_eq!(f.last_event().context, second);
+}
+
+#[test]
+fn an_answer_is_stamped_with_the_context_its_approval_was_asked_in() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let first = ContextId::first_of(session);
+    f.start_turn(session);
+    let answered = f.request_approval(session);
+    let cancelled = f.request_approval(session);
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "second"));
+
+    accepted(f.handle(CommandKind::ResolveApproval {
+        id: answered,
+        decision: Decision::Approve,
+        rule: None,
+    }));
+    let resolved = f.last_event();
+    assert!(matches!(resolved.kind, EventKind::ApprovalResolved { .. }));
+    assert_eq!(resolved.context, first);
+
+    f.log
+        .cancel_approval(&mut f.storage.db, cancelled, "gone")
+        .unwrap()
+        .unwrap();
+    let cancel = f.last_event();
+    assert!(matches!(cancel.kind, EventKind::ApprovalCancelled { .. }));
+    assert_eq!(cancel.context, first);
+
+    // Positive control: an approval asked after the clear is the new one's.
+    let later = f.request_approval(session);
+    accepted(f.handle(CommandKind::ResolveApproval {
+        id: later,
+        decision: Decision::Deny,
+        rule: None,
+    }));
+    assert_eq!(f.last_event().context, second);
+}
+
+#[test]
+fn an_interrupt_is_stamped_with_the_context_of_the_running_turn() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let first = ContextId::first_of(session);
+    f.start_turn(session);
+    let info = f.log.session(&f.storage.db, session).unwrap().unwrap();
+    assert_eq!(info.turn_context, Some(first));
+    let second = ContextId::new();
+    accepted(f.clear(session, second, "second"));
+    // The old turn still runs until its agent says otherwise.
+    let interrupt = CommandKind::Interrupt {
+        session_id: session,
+    };
+    accepted(f.handle(interrupt.clone()));
+    let interrupted = f.last_event();
+    assert_eq!(interrupted.kind, EventKind::TurnInterrupted);
+    assert_eq!(interrupted.context, first);
+    let info = f.log.session(&f.storage.db, session).unwrap().unwrap();
+    assert_eq!((info.turn_active, info.turn_context), (false, None));
+
+    // A turn started in the new context is that context's.
+    f.start_turn(session);
+    accepted(f.handle(interrupt.clone()));
+    assert_eq!(f.last_event().context, second);
+
+    // An ending turn clears its context with it.
+    f.start_turn(session);
+    f.agent(session, EventKind::SessionStateChanged(SessionState::Idle));
+    let info = f.log.session(&f.storage.db, session).unwrap().unwrap();
+    assert_eq!((info.turn_active, info.turn_context), (false, None));
 }
 
 // --- wake-up ---------------------------------------------------------------
@@ -1071,6 +1457,7 @@ async fn rejected_commands_do_not_wake_waiters() {
     let rx = f.log.subscribe();
     f.handle(CommandKind::SendMessage {
         session_id: SessionId::new(),
+        context: ContextId::first_of(SessionId::new()),
         text: "x".into(),
     });
     assert!(!rx.has_changed().unwrap());
