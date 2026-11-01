@@ -370,3 +370,18 @@ mode, model and effort (carrying them is deferred), and with no grants
 **Blocked on a client** while that device has unsent or unpulled
 `SendMessage`s to the context: the clear right behind them would interrupt
 the turn they start, and the fork would carry an interrupted answer.
+**Deferred:** copying a context into a new session (it would reuse
+`SessionCreated { from }`, `origin` and the fork, add a sibling
+`ContextCopied { to, by }`, and must fork eagerly or snapshot: a claude
+handle is a session id, not a point in time, so a lazily forked copy would
+include the source's later turns); carrying grants, mode, model or effort;
+showing the origin's history inline in the new session; naming the new
+session after the source; a client-chosen id for the new session, so an
+offline device could open it before the server answers; an agent
+capability that lets clients hide the move for agents that cannot fork
+(today such an adapter fails `start` with `AgentError::Start`); moving
+into an existing session or merging; moving a new session's first context
+again before it has had a turn (`NoConversation`); a different workdir for
+the new session (blocked: resuming from another cwd is untested); and a
+reason in the core for why a context cannot move, so heads can tell "the
+agent never ran in it" from "a message of yours is on its way".
