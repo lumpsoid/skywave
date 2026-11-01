@@ -79,6 +79,12 @@
 //! [`FakeScript::refuse_effort`]). A start naming a mode, model or effort
 //! asks for it the same way, after reporting the models the script offers
 //! ([`FakeScript::offer_models`]), if any.
+//!
+//! **Stopping a task.** A stop is answered at once, idle or mid-turn, like
+//! the CLI's ack: `TaskStopAnswered`, then, between turns, the last task
+//! set the fake reported without that task (nothing when it was not in
+//! the set, as the CLI acks an unknown id). [`FakeScript::refuse_stops`]
+//! makes it answer every stop `TaskStopRefused` instead.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -101,7 +107,7 @@ const EVENT_CAPACITY: usize = 64;
 
 /// The reason a fake reports for an approval it drops on interrupt.
 pub const INTERRUPT_REASON: &str = "interrupted";
-/// The reason a fake refuses a mode, model or effort with.
+/// The reason a fake refuses a mode, model, effort or task stop with.
 pub const REFUSE_REASON: &str = "refused by the script";
 
 /// Turns a [`FakeAgent`] plays, in order, for every session.
@@ -112,6 +118,7 @@ pub struct FakeScript {
     refused_models: Vec<String>,
     refused_efforts: Vec<Effort>,
     models: Vec<ModelChoice>,
+    refuse_stops: bool,
 }
 
 impl FakeScript {
@@ -134,6 +141,12 @@ impl FakeScript {
     /// Refuses requests for `effort`.
     pub fn refuse_effort(mut self, effort: Effort) -> FakeScript {
         self.refused_efforts.push(effort);
+        self
+    }
+
+    /// Refuses every task stop.
+    pub fn refuse_stops(mut self) -> FakeScript {
+        self.refuse_stops = true;
         self
     }
 
@@ -411,6 +424,7 @@ pub enum FakeInput {
     SetPermissionMode(PermissionMode),
     SetModel(String),
     SetEffort(Effort),
+    StopTask(String),
     Shutdown,
 }
 
@@ -552,6 +566,7 @@ impl AgentAdapter for FakeAgent {
             events,
             queued: VecDeque::new(),
             wakeups: Vec::new(),
+            tasks: Vec::new(),
         };
         let task = tokio::spawn(runner.run());
         let session = FakeSession {
@@ -642,6 +657,20 @@ impl AgentSession for FakeSession {
         self.answer(FakeInput::SetEffort(effort), answer).await
     }
 
+    async fn stop_task(&mut self, task: String) -> Result<(), AgentError> {
+        let input = FakeInput::StopTask(task.clone());
+        if self.script.refuse_stops {
+            let reason = REFUSE_REASON.to_owned();
+            return self
+                .answer(input, AdapterEvent::TaskStopRefused { task, reason })
+                .await;
+        }
+        let answer = AdapterEvent::TaskStopAnswered { task };
+        self.answer(input.clone(), answer).await?;
+        // The runner reports the shrunk set between turns.
+        self.commands.send(input).map_err(|_| AgentError::Closed)
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(FakeInput::Shutdown);
@@ -686,9 +715,11 @@ struct Runner {
     events: mpsc::Sender<AdapterEvent>,
     /// Messages received during a turn, each starting a later turn.
     queued: VecDeque<String>,
-    /// What [`Step::Wake`] and [`Step::Later`] scheduled, with when each
-    /// is due.
+    /// What [`Step::Wake`] and [`Step::Later`] scheduled, and stopped
+    /// tasks to report, with when each is due.
     wakeups: Vec<(Instant, Wakeup)>,
+    /// The last task set emitted, which a stop shrinks.
+    tasks: Vec<AgentTask>,
 }
 
 /// Something the agent does on its own once idle.
@@ -697,6 +728,8 @@ enum Wakeup {
     Turn(Vec<Step>),
     /// These events, outside a turn ([`Step::Later`]).
     Report(Vec<AdapterEvent>),
+    /// The task set without this stopped task, outside a turn.
+    Stopped(String),
 }
 
 impl Runner {
@@ -708,6 +741,16 @@ impl Runner {
                     Wakeup::Report(events) => {
                         for event in events {
                             if !self.emit(event).await {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Wakeup::Stopped(task) => {
+                        if self.tasks.iter().any(|live| live.id == task) {
+                            let mut tasks = self.tasks.clone();
+                            tasks.retain(|live| live.id != task);
+                            if !self.emit(AdapterEvent::BackgroundTasks(tasks)).await {
                                 return;
                             }
                         }
@@ -737,6 +780,10 @@ impl Runner {
                     };
                     match input {
                         Some(FakeInput::Message(text)) => text,
+                        Some(FakeInput::StopTask(task)) => {
+                            self.stopped(task);
+                            continue;
+                        }
                         // Idle: nothing to interrupt or answer.
                         Some(
                             FakeInput::Interrupt
@@ -936,6 +983,10 @@ impl Runner {
                 self.queued.push_back(text);
                 Ok(())
             }
+            Some(FakeInput::StopTask(task)) => {
+                self.stopped(task);
+                Ok(())
+            }
             Some(
                 FakeInput::Answer(..)
                 | FakeInput::Started { .. }
@@ -946,8 +997,16 @@ impl Runner {
         }
     }
 
+    /// Reports the set without stopped `task` as soon as the agent is idle.
+    fn stopped(&mut self, task: String) {
+        self.wakeups.push((Instant::now(), Wakeup::Stopped(task)));
+    }
+
     /// Sends `event`; false when the receiver is gone and the session over.
-    async fn emit(&self, event: AdapterEvent) -> bool {
+    async fn emit(&mut self, event: AdapterEvent) -> bool {
+        if let AdapterEvent::BackgroundTasks(tasks) = &event {
+            self.tasks.clone_from(tasks);
+        }
         self.events.send(event).await.is_ok()
     }
 }

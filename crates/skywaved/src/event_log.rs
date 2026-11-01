@@ -202,7 +202,8 @@ impl EventLog {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
-            | EventKind::SchedulesChanged { .. } => {}
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRefused { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -216,7 +217,8 @@ impl EventLog {
             | EventKind::EffortRequested { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
-            | EventKind::ContextMoved { .. } => {
+            | EventKind::ContextMoved { .. }
+            | EventKind::TaskStopRequested { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -516,7 +518,9 @@ pub(crate) fn append_in(
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::TurnUsage(_)
-        | EventKind::ModelsOffered { .. } => {}
+        | EventKind::ModelsOffered { .. }
+        | EventKind::TaskStopRequested { .. }
+        | EventKind::TaskStopRefused { .. } => {}
     }
     Ok(seq)
 }
@@ -534,7 +538,7 @@ fn agent_settings_in(conn: &Connection, id: SessionId) -> Result<AgentSettings> 
         .unwrap_or_default())
 }
 
-fn agent_work_in(conn: &Connection, id: SessionId) -> Result<AgentWork> {
+pub(crate) fn agent_work_in(conn: &Connection, id: SessionId) -> Result<AgentWork> {
     let json: Option<Option<String>> = conn
         .prepare_cached("SELECT agent_work FROM sessions WHERE id = ?1")?
         .query_row([id.0.to_string()], |r| r.get(0))
@@ -722,6 +726,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ContextMoved { .. } => "ContextMoved",
         EventKind::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
         EventKind::SchedulesChanged { .. } => "SchedulesChanged",
+        EventKind::TaskStopRequested { .. } => "TaskStopRequested",
+        EventKind::TaskStopRefused { .. } => "TaskStopRefused",
     }
 }
 

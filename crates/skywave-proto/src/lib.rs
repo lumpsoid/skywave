@@ -61,7 +61,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v11: background work. `EventKind::BackgroundTasksChanged` and
 /// `EventKind::SchedulesChanged`, each the whole set of the agent's
-/// [`BackgroundTask`]s or [`Schedule`]s, folded into [`AgentWork`].
+/// [`BackgroundTask`]s or [`Schedule`]s, folded into [`AgentWork`];
+/// `CommandKind::StopTask` with its `EventKind::{TaskStopRequested,
+/// TaskStopRefused}` and `RejectReason::UnknownTask`.
 pub const PROTOCOL_VERSION: u32 = 11;
 
 macro_rules! uuid_id {
@@ -378,6 +380,21 @@ pub enum EventKind {
     SchedulesChanged {
         schedules: Vec<Schedule>,
     },
+    /// A `StopTask` command asked the agent to stop its background `task`.
+    /// Success shows as the task leaving the next `BackgroundTasksChanged`;
+    /// a `TaskStopRefused` naming the command answers otherwise. Not
+    /// notable.
+    TaskStopRequested {
+        task: TaskId,
+        by: DeviceId,
+    },
+    /// The agent did not stop `task`, or no agent ran to stop it. `answers`
+    /// names the `StopTask` command refused. Not notable.
+    TaskStopRefused {
+        task: TaskId,
+        reason: String,
+        answers: Option<CommandId>,
+    },
 }
 
 impl EventKind {
@@ -393,7 +410,8 @@ impl EventKind {
             | EventKind::EffortRequested { by, .. }
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
-            | EventKind::ContextMoved { by, .. } => Some(*by),
+            | EventKind::ContextMoved { by, .. }
+            | EventKind::TaskStopRequested { by, .. } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -412,7 +430,8 @@ impl EventKind {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
-            | EventKind::SchedulesChanged { .. } => None,
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRefused { .. } => None,
         }
     }
 
@@ -435,7 +454,8 @@ impl EventKind {
             | EventKind::EffortRequested { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
-            | EventKind::ContextMoved { .. } => true,
+            | EventKind::ContextMoved { .. }
+            | EventKind::TaskStopRequested { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -451,7 +471,8 @@ impl EventKind {
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
-            | EventKind::SchedulesChanged { .. } => false,
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRefused { .. } => false,
         }
     }
 
@@ -489,7 +510,9 @@ impl EventKind {
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
             | EventKind::BackgroundTasksChanged { .. }
-            | EventKind::SchedulesChanged { .. } => None,
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRequested { .. }
+            | EventKind::TaskStopRefused { .. } => None,
         }
     }
 }
@@ -529,8 +552,8 @@ pub mod limits {
     /// Longest [`ModelChoice::detail`](crate::ModelChoice::detail), in
     /// chars.
     pub const MODEL_DETAIL_MAX_CHARS: usize = 120;
-    /// Longest refusal reason (`PermissionModeRefused`, `ModelRefused`), in
-    /// chars.
+    /// Longest refusal reason (`PermissionModeRefused`, `ModelRefused`,
+    /// `TaskStopRefused`), in chars.
     pub const REFUSAL_MAX_CHARS: usize = 200;
     /// Most [`BackgroundTask`](crate::BackgroundTask)s in one
     /// `BackgroundTasksChanged`; past it the producer keeps the first ones
@@ -1265,6 +1288,12 @@ pub enum CommandKind {
         context: ContextId,
         name: String,
     },
+    /// Ask the session's agent to stop its background `task`, one the
+    /// server last logged in a `BackgroundTasksChanged` (`UnknownTask`
+    /// otherwise). Never starts the agent. Logged as a `TaskStopRequested`;
+    /// success shows as the task leaving the set, a refusal as a
+    /// `TaskStopRefused` naming this command.
+    StopTask { session_id: SessionId, task: TaskId },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1359,6 +1388,9 @@ pub enum RejectReason {
     /// `MoveContext.context` has no conversation to continue: the agent
     /// never ran in it.
     NoConversation,
+    /// `StopTask.task` is not among the session's live background tasks:
+    /// it already ended, or never ran.
+    UnknownTask,
 }
 
 impl RejectReason {

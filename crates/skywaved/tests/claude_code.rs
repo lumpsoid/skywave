@@ -152,6 +152,12 @@ fn replay_records(
                         .and_then(protocol::parse_effort)
                         .map(|effort| protocol.set_effort(effort))
                         .unwrap_or_default(),
+                    // An id that is not a string the adapter can never
+                    // send: the test lists it as dropped.
+                    ("control_request", Some("stop_task")) => msg["request"]["task_id"]
+                        .as_str()
+                        .map(|task| protocol.stop_task(task.to_owned()))
+                        .unwrap_or_default(),
                     // Written by the protocol on the answer it follows.
                     ("control_request", Some("get_settings")) => Default::default(),
                     ("user", _) => protocol
@@ -305,6 +311,10 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             // Filtered out above: [`timeline`] lists the task sets.
             AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
             AdapterEvent::Schedules(schedules) => format!("schedules: {}", schedules.len()),
+            AdapterEvent::TaskStopAnswered { task } => format!("stop answered: {task}"),
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                format!("stop refused {task}: {}", cut(reason))
+            }
         })
         .collect()
 }
@@ -2766,6 +2776,94 @@ fn replay_background_bash_reports_the_shell_and_its_end() {
             "turn ended",
         ]
     );
+}
+
+/// The `stop_task` recording's first CLI process; a second process with a
+/// fresh `initialize` follows it in the same file.
+fn stop_task_first_process() -> Vec<Value> {
+    let records = fixture("stop_task");
+    let second = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["dir"] == "in" && r["msg"]["request"]["subtype"] == "initialize")
+        .map(|(n, _)| n)
+        .nth(1)
+        .expect("a second process");
+    records[..second].to_vec()
+}
+
+#[test]
+fn replay_stop_task_answers_each_stop_after_the_task_leaves() {
+    let (events, _) = replay_records(
+        "stop_task",
+        stop_task_first_process(),
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
+    );
+    let lines: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::TaskStopAnswered { task } => Some(format!("stop answered: {task}")),
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                Some(format!("stop refused {task}: {reason}"))
+            }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                Some(format!("tasks: [{}]", ids.join(", ")))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "tasks: []",
+            "tasks: [b1wyh3vwb]",
+            "tasks: [b1wyh3vwb, ad1d67e1d863e85eb]",
+            // The CLI drops the task from its set before it acks the stop.
+            "tasks: [ad1d67e1d863e85eb]",
+            "stop answered: b1wyh3vwb",
+            "tasks: []",
+            "stop answered: ad1d67e1d863e85eb",
+            // An unknown id, and one already stopped, are acked as success.
+            "stop answered: bnosuchtask",
+            "stop answered: b1wyh3vwb",
+        ]
+    );
+}
+
+#[test]
+fn stop_task_error_answer_is_a_refusal_with_the_cli_text() {
+    // The recorded error, from the recording's second process: the CLI's
+    // only `stop_task` error, for an id that is not a string, which the
+    // adapter never sends.
+    let recorded = fixture("stop_task")
+        .into_iter()
+        .find(|r| r["dir"] == "out" && r["msg"]["response"]["subtype"] == "error")
+        .expect("a recorded stop_task error")["msg"]
+        .clone();
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    protocol.start();
+    let out = protocol.stop_task("b1wyh3vwb".to_owned());
+    assert_eq!(out.writes.len(), 1);
+    assert_eq!(
+        out.writes[0]["request"],
+        json!({ "subtype": "stop_task", "task_id": "b1wyh3vwb" })
+    );
+    let mut answer = recorded;
+    answer["response"]["request_id"] = out.writes[0]["request_id"].clone();
+    let out = protocol.on_line(&answer.to_string());
+    assert_eq!(
+        out.events,
+        [AdapterEvent::TaskStopRefused {
+            task: "b1wyh3vwb".to_owned(),
+            reason: "stop_task: task_id must be a string".to_owned(),
+        }]
+    );
+    // A second answer to the same request finds nothing asked.
+    assert_eq!(protocol.on_line(&answer.to_string()).events, []);
 }
 
 #[test]
