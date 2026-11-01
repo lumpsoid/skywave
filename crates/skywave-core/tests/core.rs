@@ -992,3 +992,132 @@ fn a_message_after_an_acked_switch_not_yet_pulled_goes_to_the_switch_context() {
     assert_eq!((view.context, view.switch), (first, None));
     assert_eq!(sent_to("after"), first);
 }
+
+/// Moving the current context through the core: the clear and the move go
+/// out in that order, and the new session opens, loaded from the store,
+/// only once the move's own event is pulled, the pull split between the
+/// new session and the move.
+#[test]
+fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, me) = paired_core(dir.path());
+    let views = Views::subscribe(&core);
+    let sid = SessionId::new();
+    let start = ContextId::first_of(sid);
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                    context_name: "start".into(),
+                    from: None,
+                },
+            ),
+            event(
+                sid,
+                1,
+                EventKind::UserMessage {
+                    device_id: DeviceId::new(),
+                    text: "fix it".into(),
+                },
+            ),
+            event(
+                sid,
+                2,
+                EventKind::SessionStateChanged(skywave_proto::SessionState::AgentWorking),
+            ),
+        ],
+    })
+    .unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    core.dispatch(Action::MoveContext {
+        session_id: sid,
+        context: start,
+    })
+    .unwrap();
+    let outbox = seam.pending_outbox().unwrap();
+    let [clear, moved] = &outbox[..] else {
+        panic!("expected a clear and a move: {outbox:?}");
+    };
+    let CommandKind::ClearContext {
+        context: fresh,
+        name,
+        ..
+    } = clear.command.kind.clone()
+    else {
+        panic!("expected the clear first, got {clear:?}");
+    };
+    assert_eq!(
+        moved.command.kind,
+        CommandKind::MoveContext {
+            session_id: sid,
+            context: start,
+            name: "start".into(),
+        }
+    );
+    let (clear, moved) = (clear.command.id, moved.command.id);
+    for (command, seq) in [(clear, Seq(4)), (moved, Seq(6))] {
+        assert!(seam.command_sending(command).unwrap());
+        seam.command_result(command, &CommandResult::Accepted { seq })
+            .unwrap();
+    }
+
+    let new = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(4),
+        events: vec![
+            Event {
+                command_id: Some(clear),
+                context: fresh,
+                ..event(sid, 3, EventKind::ContextStarted { by: me, name })
+            },
+            Event {
+                command_id: None,
+                ..event(
+                    new,
+                    4,
+                    EventKind::SessionCreated {
+                        workdir: "/srv/a".into(),
+                        context_name: "start".into(),
+                        from: Some(skywave_proto::ContextRef {
+                            session: sid,
+                            context: start,
+                        }),
+                    },
+                )
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(
+        session_view(&views.last()).id,
+        sid,
+        "the move is not in yet"
+    );
+
+    seam.apply_events(&EventBatch {
+        from: Seq(6),
+        events: vec![Event {
+            command_id: Some(moved),
+            context: start,
+            ..event(sid, 5, EventKind::ContextMoved { to: new, by: me })
+        }],
+    })
+    .unwrap();
+    let view = session_view(&views.last()).clone();
+    assert_eq!(view.id, new);
+    assert!(
+        matches!(
+            view.timeline.first(),
+            Some(TimelineItem::Logged {
+                entry: Entry::MovedFrom { from, name },
+                ..
+            }) if from.id == sid && from.title.as_deref() == Some("fix it") && name == "start"
+        ),
+        "{:?}",
+        view.timeline
+    );
+}

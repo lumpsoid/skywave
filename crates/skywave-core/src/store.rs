@@ -323,13 +323,15 @@ pub struct OutboxEntry {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message or session creation the server never saw (`tries == 0`) or
-    /// refused. A command that may have reached the server and has no
+    /// message, session creation or context move the server never saw
+    /// (`tries == 0`) or refused. A command that may have reached the server and has no
     /// answer never is: withdrawing it could not stop it.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
-            CommandKind::SendMessage { .. } | CommandKind::CreateSession { .. }
+            CommandKind::SendMessage { .. }
+                | CommandKind::CreateSession { .. }
+                | CommandKind::MoveContext { .. }
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),

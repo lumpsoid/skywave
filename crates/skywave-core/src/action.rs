@@ -108,6 +108,18 @@ pub enum Action {
         session_id: SessionId,
         context: ContextId,
     },
+    /// Move one of the open session's contexts into a new session of its
+    /// own, where its agent goes on from its conversation; here it is never
+    /// current again. A no-op unless the session view lists it as
+    /// [`can_move`](crate::ContextView::can_move). The context messages go
+    /// to now is cleared first (as [`Action::ClearContext`]), so the
+    /// session goes on in a fresh one. The new session's first context
+    /// keeps the moved one's name, and it opens once it is in the replica
+    /// if this session is still on screen.
+    MoveContext {
+        session_id: SessionId,
+        context: ContextId,
+    },
     /// Narrow the open session's timeline to one context (`None`: the whole
     /// session). This device only, kept until the session closes; where
     /// messages go does not change.

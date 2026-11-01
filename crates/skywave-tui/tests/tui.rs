@@ -1851,6 +1851,66 @@ fn context_dividers_show_where_the_context_changed() {
     assert_contains(&screen, "── Back to start · by you ──");
 }
 
+#[test]
+fn a_moved_context_is_a_divider_in_both_sessions() {
+    use skywave_proto::{ContextId, ContextRef};
+    let (mut h, id, me) = open_session();
+    let (walrus, new) = (ContextId::new(), SessionId::new());
+    // As the server logs moving the current context: the clear, then the
+    // new session, then the move in the source.
+    pull(
+        &mut h,
+        vec![
+            Event {
+                context: walrus,
+                ..event(
+                    id,
+                    1,
+                    EventKind::ContextStarted {
+                        by: me,
+                        name: "velvet walrus".into(),
+                    },
+                )
+            },
+            event(
+                new,
+                2,
+                EventKind::SessionCreated {
+                    workdir: "/srv/work".into(),
+                    context_name: "start".into(),
+                    from: Some(ContextRef {
+                        session: id,
+                        context: ContextId::first_of(id),
+                    }),
+                },
+            ),
+            event(
+                new,
+                3,
+                EventKind::SessionRenamed {
+                    name: Some("forked".into()),
+                    by: me,
+                },
+            ),
+            event(id, 4, EventKind::ContextMoved { to: new, by: me }),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "── New context · velvet walrus · by you ──");
+    assert_contains(&screen, "── start went on in “forked” · by you ──");
+
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Esc);
+    let Screen::SessionList(list) = &h.app.view().screen else {
+        panic!("not on the session list");
+    };
+    let ids: Vec<SessionId> = list.sessions.iter().map(|s| s.id).collect();
+    assert_eq!(ids, [new, id], "the new session sorts first");
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
+    assert_contains(&h.screen(), "── Continues start from “work” ──");
+}
+
 /// A session whose first context ("start") holds "alpha question" and
 /// whose current one, "velvet walrus", holds "beta question".
 fn two_contexts() -> (Harness, SessionId, DeviceId) {

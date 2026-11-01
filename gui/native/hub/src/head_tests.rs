@@ -714,6 +714,77 @@ fn a_context_cleared_or_switched_is_a_divider_row() {
     );
 }
 
+#[test]
+fn a_moved_context_is_a_divider_row() {
+    let mut rig = Rig::new();
+    let me = rig.seam.identity().unwrap().device_id();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let new = SessionId::new();
+    let start = skywave_proto::ContextId::first_of(rig.session);
+    // As the server logs a move: the new session first, then the move in
+    // the source.
+    let events = vec![
+        Event {
+            session_id: new,
+            at,
+            command_id: None,
+            context: skywave_proto::ContextId::first_of(new),
+            kind: EventKind::SessionCreated {
+                workdir: "/srv/forked".into(),
+                context_name: "start".into(),
+                from: Some(skywave_proto::ContextRef {
+                    session: rig.session,
+                    context: start,
+                }),
+            },
+        },
+        Event {
+            session_id: rig.session,
+            at,
+            command_id: Some(CommandId::new()),
+            context: start,
+            kind: EventKind::ContextMoved { to: new, by: me },
+        },
+    ];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.view();
+    let rows = |rig: &Rig| -> Vec<_> {
+        rig.rows()
+            .iter()
+            .map(|row| (row.kind, row.text.clone(), row.selectable))
+            .collect()
+    };
+    assert_eq!(
+        rows(&rig),
+        [(
+            RowKind::ContextDivider,
+            "start went on in “forked” · by you".to_owned(),
+            false
+        )]
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSession {
+            session_id: new.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(
+        rows(&rig),
+        [(
+            RowKind::ContextDivider,
+            "Continues start from “work”".to_owned(),
+            false
+        )]
+    );
+}
+
 impl Rig {
     fn open_session(&self) -> crate::signals::SessionScreen {
         match &self.head.sent.screen.as_ref().unwrap().screen {

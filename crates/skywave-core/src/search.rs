@@ -264,7 +264,10 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         Entry::ToolResult { summary, .. } => vec![summary],
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
         Entry::Renamed { name, .. } => name.as_deref().into_iter().collect(),
-        Entry::ContextStarted { name, .. } | Entry::ContextSwitched { name, .. } => vec![name],
+        Entry::ContextStarted { name, .. }
+        | Entry::ContextSwitched { name, .. }
+        | Entry::ContextMoved { name, .. }
+        | Entry::MovedFrom { name, .. } => vec![name],
         Entry::AgentSetting {
             setting, refused, ..
         } => {
