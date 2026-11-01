@@ -803,7 +803,13 @@ notes above:
   closed, or a future CLI-side timeout, §3.4) reports `ApprovalCancelled`
   with the result's first line as the reason.
 - **Approvals still pending at `result`** are cancelled (`interrupted` or
-  `turn ended`) before `TurnEnded`.
+  `turn ended`) before `TurnEnded`, except a background subagent's: a
+  `can_use_tool` whose `agent_id` is a live task's id (from
+  `background_tasks_changed`; `subagent_approval.ndjson`) can come outside
+  any turn and is that task's. It stays pending across main turns and is
+  cancelled (`task ended`) when a `background_tasks_changed` no longer lists
+  the task, or withdrawn by the CLI's own cancel. An `agent_id` no task set
+  listed (a foreground subagent) is the turn's.
 - **The turn's usage** (§2.5) is reported as `TurnUsage` just before
   `TurnEnded`, per-turn figures only; nothing is carried between turns or
   processes, so a restart needs no reset. Core sums them per session.

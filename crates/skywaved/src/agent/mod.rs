@@ -293,12 +293,20 @@ pub enum AdapterEvent {
     /// `request` (D8). `call` is the tool call the approval gates, if known.
     /// `suggestions` are the lasting rules the agent offers to grant with an
     /// approval, labelled uncut; an answer names one by its index.
+    ///
+    /// `task` is the background task asking, by its [`AgentTask::id`], or
+    /// `None` for the current turn's own. A task's approval is not the
+    /// turn's: it may come outside any turn and outlives the turn's end. The
+    /// adapter cancels it when the task leaves the set, or the agent
+    /// withdraws it; a turn's leftover approvals the adapter cancels before
+    /// `TurnEnded`.
     ApprovalRequested {
         request: AgentRequestId,
         call: Option<AgentCallId>,
         tool: String,
         input: serde_json::Value,
         suggestions: Vec<RuleSuggestion>,
+        task: Option<String>,
     },
     /// The agent withdrew `request`; an answer to it is no longer read.
     ApprovalCancelled {

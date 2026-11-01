@@ -1719,6 +1719,7 @@ fn write_approval() -> AdapterEvent {
         tool: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
         suggestions: Vec::new(),
+        task: None,
     }
 }
 
@@ -3086,5 +3087,199 @@ fn replay_loop_keeps_whether_its_job_outlives_the_agent() {
             // Not made in this process: unknown.
             elsewhere,
         ]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Background approvals
+
+const SUBAGENT_APPROVAL: &str = "d8debad5-cc3b-4785-835c-f163b612eacc";
+
+/// The `subagent_approval` recording with a main turn run while the
+/// subagent's approval waits: a user message, then the CLI's `init` and
+/// `result` for it (copies of the recording's second turn), just before the
+/// held answer.
+fn subagent_approval_with_a_turn_between() -> Vec<Value> {
+    let records = fixture("subagent_approval");
+    let answer = records
+        .iter()
+        .position(|r| r["dir"] == "in" && r["msg"]["response"]["request_id"] == SUBAGENT_APPROVAL)
+        .expect("the held answer");
+    let out_of = |kind: &str| {
+        records
+            .iter()
+            .rfind(|r| r["dir"] == "out" && r["msg"]["type"] == kind)
+            .unwrap()
+            .clone()
+    };
+    let turn = [
+        json!({ "dir": "in", "msg": protocol::user_message("meanwhile") }),
+        records
+            .iter()
+            .rfind(|r| r["msg"]["subtype"] == "init")
+            .unwrap()
+            .clone(),
+        out_of("result"),
+    ];
+    let mut records = records;
+    records.splice(answer..answer, turn);
+    records
+}
+
+#[test]
+fn replay_a_subagent_approval_outlives_the_main_turns() {
+    let (events, _) = replay_records(
+        "subagent_approval",
+        subagent_approval_with_a_turn_between(),
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
+    );
+    // The replay checked that the held allow was written: an answer to an
+    // approval no longer pending writes nothing.
+    let asked = events
+        .iter()
+        .position(|e| {
+            matches!(e, AdapterEvent::ApprovalRequested { request, task: Some(task), .. }
+                if request.0 == SUBAGENT_APPROVAL && task == "add5b3d5dc618eaff")
+        })
+        .expect("the subagent's approval, as its task's");
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, AdapterEvent::TurnEnded(_)))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(ends.len(), 3, "{:?}", describe(&events));
+    // Asked outside any turn, and still pending at the next turn's end.
+    assert!(ends[0] < asked && asked < ends[1]);
+    assert!(!events[ends[0]..asked].contains(&AdapterEvent::TurnStarted));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ApprovalCancelled { .. })),
+        "{:?}",
+        describe(&events)
+    );
+}
+
+fn subagent_tasks(ids: &[&str]) -> String {
+    let tasks: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({ "task_id": id, "task_type": "local_agent", "description": "sub" }))
+        .collect();
+    json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": tasks }).to_string()
+}
+
+fn can_use_tool(request_id: &str, agent: Option<&str>) -> String {
+    let mut request = json!({
+        "subtype": "can_use_tool",
+        "tool_name": "Write",
+        "input": { "file_path": "a.txt", "content": "hi" },
+        "tool_use_id": format!("call-{request_id}"),
+    });
+    if let Some(agent) = agent {
+        request["agent_id"] = json!(agent);
+    }
+    json!({ "type": "control_request", "request_id": request_id, "request": request }).to_string()
+}
+
+const RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+
+fn cancelled(request: &str, reason: &str) -> AdapterEvent {
+    AdapterEvent::ApprovalCancelled {
+        request: request.into(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn running_protocol() -> Protocol {
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    protocol.start();
+    protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
+    assert!(protocol.ready());
+    protocol
+}
+
+#[test]
+fn a_subagent_approval_outlives_main_turns_until_its_task_leaves() {
+    let mut protocol = running_protocol();
+    protocol.send_message("one".to_owned());
+    protocol.on_line(&subagent_tasks(&["sub1"]));
+    protocol.on_line(RESULT_OK);
+    let asked = protocol.on_line(&can_use_tool("p1", Some("sub1")));
+    assert!(matches!(
+        &asked.events[..],
+        [AdapterEvent::ApprovalRequested { task: Some(task), .. }] if task == "sub1"
+    ));
+    // A second turn's result cancels that turn's own approval only.
+    protocol.send_message("two".to_owned());
+    let main = protocol.on_line(&can_use_tool("p2", None));
+    assert!(matches!(
+        &main.events[..],
+        [AdapterEvent::ApprovalRequested { task: None, .. }]
+    ));
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [
+            cancelled("p2", protocol::TURN_ENDED_REASON),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
+    );
+    // An interrupted turn leaves it too.
+    protocol.send_message("three".to_owned());
+    protocol.interrupt();
+    let end = protocol.on_line(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools"}"#,
+    );
+    assert_eq!(
+        end.events,
+        [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]
+    );
+    // A set still holding the task keeps it; one without cancels it.
+    let kept = protocol.on_line(&subagent_tasks(&["sub1", "sub2"]));
+    assert!(matches!(
+        &kept.events[..],
+        [AdapterEvent::BackgroundTasks(_)]
+    ));
+    let left = protocol.on_line(&subagent_tasks(&["sub2"]));
+    assert!(matches!(
+        &left.events[..],
+        [cancel, AdapterEvent::BackgroundTasks(_)]
+            if *cancel == cancelled("p1", protocol::TASK_ENDED_REASON)
+    ));
+    // No longer pending: the answer writes nothing.
+    let answer = protocol.answer(&"p1".into(), Decision::Approve, None);
+    assert_eq!(answer, Default::default());
+}
+
+#[test]
+fn a_subagent_approval_is_withdrawn_by_the_cli_outside_a_turn() {
+    let mut protocol = running_protocol();
+    protocol.on_line(&subagent_tasks(&["sub1"]));
+    protocol.on_line(&can_use_tool("p1", Some("sub1")));
+    let out = protocol.on_line(r#"{"type":"control_cancel_request","request_id":"p1"}"#);
+    assert_eq!(out.events, [cancelled("p1", protocol::WITHDRAWN_REASON)]);
+}
+
+#[test]
+fn an_approval_from_no_live_task_is_the_turns() {
+    let mut protocol = running_protocol();
+    protocol.send_message("go".to_owned());
+    // A foreground subagent asks under an id no task set listed.
+    let asked = protocol.on_line(&can_use_tool("p1", Some("foreground")));
+    assert!(matches!(
+        &asked.events[..],
+        [AdapterEvent::ApprovalRequested { task: None, .. }]
+    ));
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [
+            cancelled("p1", protocol::TURN_ENDED_REASON),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
     );
 }

@@ -40,11 +40,11 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `Text` | `AgentMessage` |
 /// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display |
 /// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
-/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call |
+/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call; a task's (`task` set) is kept apart from the turn's |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
-/// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
-/// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
+/// | `TurnEnded(Completed \| Interrupted)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Idle)` |
+/// | `TurnEnded(Failed)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
 /// | `Grants` | stored in `sessions.agent_grants` for the mapper's session (whichever context), no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
@@ -53,7 +53,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
 /// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
 /// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
-/// | `Exited` | leftover approvals cancelled, leftover mode, model and effort requests refused, leftover stops dropped; `Errored` if a turn was open or the exit was abnormal |
+/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped; `Errored` if a turn was open or the exit was abnormal |
 ///
 /// **Settings.** The supervisor tells the mapper of every mode, model or
 /// effort request it hands the agent ([`EventMapper::asked_mode`],
@@ -109,6 +109,12 @@ const AGENT_EXITED: &str = "agent exited";
 /// supervisor calls [`EventMapper::take_approval`] for the agent's id and
 /// answers the agent.
 ///
+/// What a turn's end cancels is the adapter's rule: it cancels the turn's
+/// own leftover approvals before `TurnEnded`, and a background task's when
+/// the task leaves the set, so a task's approval can sit pending in an idle
+/// session. The `TurnEnded` cancel is only a backstop for the turn's own
+/// approvals an adapter left; it never touches a task's.
+///
 /// Blocking: it runs SQLite and blob writes.
 #[derive(Debug)]
 pub struct EventMapper {
@@ -118,7 +124,7 @@ pub struct EventMapper {
     context: ContextId,
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
-    approvals: Vec<(AgentRequestId, ApprovalId)>,
+    approvals: Vec<LoggedApproval>,
     /// Calls logged in the current turn, by the agent's id.
     calls: HashMap<AgentCallId, LoggedCall>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
@@ -137,6 +143,15 @@ pub struct EventMapper {
     /// Task stops the agent has not answered, oldest first, with the
     /// command asking.
     asked_stops: VecDeque<(TaskId, Option<CommandId>)>,
+}
+
+/// An approval the mapper logged that no answer has taken yet.
+#[derive(Debug)]
+struct LoggedApproval {
+    request: AgentRequestId,
+    id: ApprovalId,
+    /// A background task asked, not the turn: the turn's end leaves it.
+    of_task: bool,
 }
 
 /// What the mapper keeps of a logged call to link its result and approval.
@@ -209,15 +224,15 @@ impl EventMapper {
 
     /// Approvals logged by this mapper that are still waiting for an answer.
     pub fn pending_approvals(&self) -> impl Iterator<Item = ApprovalId> + '_ {
-        self.approvals.iter().map(|(_, id)| *id)
+        self.approvals.iter().map(|a| a.id)
     }
 
     /// The agent's id for approval `id`, forgetting it: call once when the
     /// log shows `id` resolved, then answer the agent. `None` if `id` is not
     /// this mapper's or was already taken or cancelled.
     pub fn take_approval(&mut self, id: ApprovalId) -> Option<AgentRequestId> {
-        let index = self.approvals.iter().position(|(_, a)| *a == id)?;
-        Some(self.approvals.remove(index).0)
+        let index = self.approvals.iter().position(|a| a.id == id)?;
+        Some(self.approvals.remove(index).request)
     }
 
     /// Records `event` in the log and returns the seqs it appended, in order.
@@ -282,6 +297,7 @@ impl EventMapper {
                 tool,
                 input,
                 suggestions,
+                task,
             } => {
                 let (call, summary, input) = match self.linked(call.as_ref()) {
                     Some(logged) => {
@@ -315,12 +331,16 @@ impl EventMapper {
                         suggestions: bounded_suggestions(suggestions),
                     },
                 )?);
-                self.approvals.push((request, id));
+                self.approvals.push(LoggedApproval {
+                    request,
+                    id,
+                    of_task: task.is_some(),
+                });
             }
             AdapterEvent::ApprovalCancelled { request, reason } => {
-                match self.approvals.iter().position(|(r, _)| *r == request) {
+                match self.approvals.iter().position(|a| a.request == request) {
                     Some(index) => {
-                        let (_, id) = self.approvals.remove(index);
+                        let id = self.approvals.remove(index).id;
                         seqs.extend(log.cancel_approval(&mut storage.db, id, &reason)?);
                     }
                     None => {
@@ -343,7 +363,8 @@ impl EventMapper {
                     TurnOutcome::Interrupted => (TURN_INTERRUPTED, SessionState::Idle),
                     TurnOutcome::Failed(message) => (TURN_ENDED, SessionState::Errored { message }),
                 };
-                self.cancel_pending(log, storage, reason, &mut seqs)?;
+                // A backstop: the adapter cancels the turn's own first.
+                self.cancel_pending(log, storage, reason, |a| !a.of_task, &mut seqs)?;
                 seqs.push(self.append(log, storage, EventKind::SessionStateChanged(state))?);
             }
             AdapterEvent::ResumeHandle(handle) => {
@@ -471,7 +492,7 @@ impl EventMapper {
                 seqs.push(self.append(log, storage, kind)?);
             }
             AdapterEvent::Exited { error } => {
-                self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
+                self.cancel_pending(log, storage, AGENT_EXITED, |_| true, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
                 // The empty set logged below settles them.
                 self.asked_stops.clear();
@@ -592,17 +613,22 @@ impl EventMapper {
         logged
     }
 
-    /// Cancels every approval still pending, oldest first. One already
-    /// answered in the log stays answered (D5).
+    /// Cancels every approval still pending that `which` picks, oldest
+    /// first. One already answered in the log stays answered (D5).
     fn cancel_pending(
         &mut self,
         log: &EventLog,
         storage: &mut Storage,
         reason: &str,
+        which: impl Fn(&LoggedApproval) -> bool,
         seqs: &mut Vec<Seq>,
     ) -> Result<()> {
-        for (_, id) in std::mem::take(&mut self.approvals) {
-            seqs.extend(log.cancel_approval(&mut storage.db, id, reason)?);
+        let (cancelled, kept) = std::mem::take(&mut self.approvals)
+            .into_iter()
+            .partition(which);
+        self.approvals = kept;
+        for approval in cancelled {
+            seqs.extend(log.cancel_approval(&mut storage.db, approval.id, reason)?);
         }
         Ok(())
     }
