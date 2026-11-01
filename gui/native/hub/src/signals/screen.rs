@@ -207,6 +207,21 @@ pub struct SessionScreen {
     pub switch_label: Option<String>,
     /// Offer "New context"; false in a context with no message yet.
     pub can_clear: bool,
+    /// `2 background tasks · 1 loop`; `None` while there is nothing to say.
+    pub work_label: Option<String>,
+    /// What stopping the agent does to its work; `None` when nothing is
+    /// lost, and no confirmation is needed.
+    pub stop_warning: Option<String>,
+    /// The questions the stop confirmations ask.
+    pub stop_headings: StopHeadings,
+    /// The agent's background tasks, a child under its parent.
+    pub tasks: Vec<TaskRow>,
+    /// The agent's loops: information only, Skywave cannot end one.
+    pub schedules: Vec<ScheduleRow>,
+    /// Beneath the loops; `None` without any.
+    pub loops_note: Option<String>,
+    /// For the list when it has no rows.
+    pub work_empty_label: String,
     /// The contexts the picker lists, in order.
     pub contexts: Vec<ContextRow>,
     /// The context messages go to.
@@ -234,6 +249,44 @@ pub struct SessionScreen {
     pub snippets: Vec<SnippetView>,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+}
+
+/// The questions the stop confirmations ask, one per action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct StopHeadings {
+    pub stop_agent: String,
+    pub new_context: String,
+    pub switch_context: String,
+    pub move_context: String,
+}
+
+/// One background task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct TaskRow {
+    pub task_id: String,
+    /// Levels under the task that started it; 0 for a top task.
+    pub depth: u32,
+    /// `shell`, `subagent`, `task`.
+    pub kind_label: String,
+    pub title: String,
+    /// `watcher` for an ambient task; `None` otherwise.
+    pub ambient_label: Option<String>,
+    /// `queued`, `sending`, `failed: <why>`: this device's stop of it, while
+    /// on its way.
+    pub stop_label: Option<String>,
+}
+
+/// One loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ScheduleRow {
+    pub schedule_id: String,
+    /// When it fires, as the agent said.
+    pub when: String,
+    /// `repeats`, `once`.
+    pub repeat_label: String,
+    pub prompt: String,
+    /// `saved in this folder`, when known to outlive the agent.
+    pub saved_label: Option<String>,
 }
 
 /// One context in the picker.

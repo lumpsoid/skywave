@@ -1959,4 +1959,210 @@ void main() {
       semantics.dispose();
     });
   });
+  group('background work', () {
+    const warning = 'Stopping ends 1 background task.';
+    const task = TaskRow(
+      taskId: 't1',
+      depth: 0,
+      kindLabel: 'shell',
+      title: 'npm run dev',
+    );
+    const child = TaskRow(
+      taskId: 't2',
+      depth: 1,
+      kindLabel: 'subagent',
+      title: 'review the diff',
+      stopLabel: 'queued',
+    );
+    const loop = ScheduleRow(
+      scheduleId: 's1',
+      when: '*/5 * * * *',
+      repeatLabel: 'repeats',
+      prompt: 'check the build',
+      savedLabel: 'saved in this folder',
+    );
+
+    Future<List<GuiIntent>> openMore(
+      WidgetTester tester,
+      SessionScreen screen,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screen,
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      return sent;
+    }
+
+    testWidgets('Stop agent and New context ask first while there is work', (
+      tester,
+    ) async {
+      final sent = await openMore(
+        tester,
+        screenWith(
+          canClear: true,
+          workLabel: '1 background task',
+          stopWarning: warning,
+          tasks: [task],
+        ),
+      );
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      expect(find.text('Stop the agent?'), findsOneWidget);
+      expect(find.text(warning), findsOneWidget);
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Stop agent'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentStopSession(sessionId: 's1')),
+      ]);
+
+      sent.clear();
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('New context'));
+      await tester.pumpAndSettle();
+      expect(find.text('Start a new context?'), findsOneWidget);
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+      await tester.tap(find.widgetWithText(FilledButton, 'New context'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentClearContext(sessionId: 's1')),
+      ]);
+    });
+
+    testWidgets('without work they send at once', (tester) async {
+      final sent = await openMore(tester, screenWith(canClear: true));
+      expect(find.text('nothing running'), findsOneWidget);
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentStopSession(sessionId: 's1')),
+      ]);
+    });
+
+    testWidgets('the sheet lists tasks and loops and stops a task after a '
+        'confirm; a loop has no stop', (tester) async {
+      final sent = await openMore(
+        tester,
+        screenWith(
+          workLabel: '2 background tasks · 1 loop',
+          stopWarning: warning,
+          tasks: [task, child],
+          schedules: [loop],
+        ),
+      );
+      expect(find.text('2 background tasks · 1 loop'), findsOneWidget);
+      await tester.tap(find.text('Background work'));
+      await tester.pumpAndSettle();
+      expect(find.text('npm run dev'), findsOneWidget);
+      expect(find.text('shell'), findsOneWidget);
+      expect(find.text('subagent · stop queued'), findsOneWidget);
+      expect(find.text('check the build'), findsOneWidget);
+      expect(
+        find.text('loop */5 * * * * · repeats · saved in this folder'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Loops as of the last turn; ask the agent to end one.'),
+        findsOneWidget,
+      );
+      // The child sits deeper than its parent; only tasks have a Stop.
+      expect(
+        tester.getTopLeft(find.text('review the diff')).dx,
+        greaterThan(tester.getTopLeft(find.text('npm run dev')).dx),
+      );
+      expect(find.widgetWithText(TextButton, 'Stop'), findsNWidgets(2));
+
+      await tester.tap(find.widgetWithText(TextButton, 'Stop').first);
+      await tester.pumpAndSettle();
+      expect(find.text('Stop npm run dev?'), findsOneWidget);
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+      await tester.tap(find.widgetWithText(FilledButton, 'Stop'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(
+          action: ActionIntentStopTask(sessionId: 's1', taskId: 't1'),
+        ),
+      ]);
+    });
+
+    testWidgets('an empty sheet says nothing runs', (tester) async {
+      await openMore(tester, screenWith());
+      await tester.tap(find.text('Background work'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Nothing is running in the background.'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('switching and moving the current context warn', (
+      tester,
+    ) async {
+      const contexts = [
+        ContextRow(
+          contextId: 'c1',
+          label: 'start',
+          current: false,
+          canMove: false,
+        ),
+        ContextRow(
+          contextId: 'c2',
+          label: 'walrus',
+          current: true,
+          canMove: true,
+        ),
+      ];
+      final sent = await openMore(
+        tester,
+        screenWith(
+          contexts: contexts,
+          contextId: 'c2',
+          stopWarning: warning,
+          tasks: [task],
+        ),
+      );
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Switch'));
+      await tester.pumpAndSettle();
+      expect(find.text('Switch context?'), findsOneWidget);
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+      await tester.tap(find.widgetWithText(FilledButton, 'Switch'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(
+          action: ActionIntentSwitchContext(sessionId: 's1', contextId: 'c1'),
+        ),
+      ]);
+
+      sent.clear();
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Move to new session').last,
+      );
+      await tester.pumpAndSettle();
+      // One dialog, the warning in its body.
+      expect(find.byType(AlertDialog), findsNWidgets(2));
+      expect(find.textContaining(warning), findsOneWidget);
+    });
+  });
 }
