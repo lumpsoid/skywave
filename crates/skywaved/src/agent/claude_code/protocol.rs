@@ -54,6 +54,15 @@
 //! while a chain runs or waits is dropped, as the chain's own read is newer.
 //! A chain that ends without a read (an error) writes the dropped one again.
 //!
+//! **Stopping a background task.** A `stop_task` control request naming
+//! the task id; its `control_response` is the answer, `TaskStopAnswered`
+//! on success, `TaskStopRefused` with the CLI's error otherwise. The CLI
+//! acks an id it does not know, or one already ended, with success too;
+//! its only error is for a `task_id` that is not a string. The stop
+//! itself shows in the task lines before the ack (the task leaves the
+//! set); stopping a subagent stops the shells it owns, and the CLI may
+//! then start a turn on its own.
+//!
 //! **Schedules** (`/loop`, `CronCreate`). The CLI lists its scheduled
 //! wakeups only in the input of a Stop hook, which the initialize request
 //! registers as [`STOP_HOOK_ID`]. The hook is called once at the end of
@@ -260,6 +269,15 @@ pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
         .collect()
 }
 
+/// The request that stops background task `task_id`.
+pub fn stop_task_request(request_id: &str, task_id: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "stop_task", "task_id": task_id },
+    })
+}
+
 /// The request that stops the current turn.
 pub fn interrupt_request(request_id: &str) -> Value {
     json!({
@@ -361,8 +379,8 @@ pub struct Protocol {
     /// is listed long after the turn that made it.
     durable: HashMap<String, bool>,
     shutting_down: bool,
-    /// Mode, model and effort requests and effort reads the CLI has not
-    /// answered, by request id.
+    /// Mode, model and effort requests, effort reads and task stops the
+    /// CLI has not answered, by request id.
     settings: HashMap<String, Asked>,
     /// Effort requests waiting for the chain in flight, oldest first.
     efforts: VecDeque<Effort>,
@@ -388,6 +406,8 @@ enum Asked {
     EffortRead {
         asked: Option<Effort>,
     },
+    /// A `stop_task` for the task with this id.
+    StopTask(String),
 }
 
 impl Protocol {
@@ -538,6 +558,19 @@ impl Protocol {
         let id = self.request_id();
         let write = set_permission_mode_request(&id, mode);
         self.settings.insert(id, Asked::Mode(mode));
+        Output {
+            writes: vec![write],
+            events: Vec::new(),
+        }
+    }
+
+    /// Asks the CLI to stop background task `task`; answered by
+    /// `TaskStopAnswered` or `TaskStopRefused` when its `control_response`
+    /// comes.
+    pub fn stop_task(&mut self, task: String) -> Output {
+        let id = self.request_id();
+        let write = stop_task_request(&id, &task);
+        self.settings.insert(id, Asked::StopTask(task));
         Output {
             writes: vec![write],
             events: Vec::new(),
@@ -982,7 +1015,8 @@ impl Protocol {
         out.events.push(AdapterEvent::PermissionMode(mode));
     }
 
-    /// The answer to a mode, model or effort request, or to an effort read.
+    /// The answer to a mode, model or effort request, an effort read or a
+    /// task stop.
     fn on_setting_response(&mut self, asked: Asked, response: &Value, out: &mut Output) {
         let success = str_field(response, "subtype") == "success";
         let reason = || {
@@ -1033,6 +1067,13 @@ impl Protocol {
                 self.end_effort(out);
             }
             Asked::EffortRead { asked } => self.on_effort_read(asked, response, out),
+            Asked::StopTask(task) if success => {
+                out.events.push(AdapterEvent::TaskStopAnswered { task });
+            }
+            Asked::StopTask(task) => out.events.push(AdapterEvent::TaskStopRefused {
+                task,
+                reason: reason(),
+            }),
         }
     }
 

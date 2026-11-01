@@ -163,7 +163,9 @@ impl SessionSummary {
             }
             EventKind::SessionArchived { .. }
             | EventKind::ModelsOffered { .. }
-            | EventKind::ContextMoved { .. } => return,
+            | EventKind::ContextMoved { .. }
+            | EventKind::TaskStopRequested { .. }
+            | EventKind::TaskStopRefused { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -217,7 +219,9 @@ impl SessionSummary {
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
             | EventKind::BackgroundTasksChanged { .. }
-            | EventKind::SchedulesChanged { .. } => {}
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRequested { .. }
+            | EventKind::TaskStopRefused { .. } => {}
         }
     }
 
@@ -296,7 +300,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ContextSwitched { .. }
         | EventKind::ContextMoved { .. }
         | EventKind::BackgroundTasksChanged { .. }
-        | EventKind::SchedulesChanged { .. } => false,
+        | EventKind::SchedulesChanged { .. }
+        | EventKind::TaskStopRequested { .. }
+        | EventKind::TaskStopRefused { .. } => false,
     }
 }
 
@@ -335,7 +341,9 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ContextSwitched { .. }
         | EventKind::ContextMoved { .. }
         | EventKind::BackgroundTasksChanged { .. }
-        | EventKind::SchedulesChanged { .. } => (None, None),
+        | EventKind::SchedulesChanged { .. }
+        | EventKind::TaskStopRequested { .. }
+        | EventKind::TaskStopRefused { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }

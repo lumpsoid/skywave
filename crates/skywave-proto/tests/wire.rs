@@ -332,6 +332,15 @@ fn all_event_kinds() -> Vec<EventKind> {
                 },
             ],
         },
+        EventKind::TaskStopRequested {
+            task: TaskId("a1b2c3".into()),
+            by: device(),
+        },
+        EventKind::TaskStopRefused {
+            task: TaskId("a1b2c3".into()),
+            reason: "agent not running".into(),
+            answers: Some(command()),
+        },
     ]
 }
 
@@ -408,6 +417,10 @@ fn all_command_kinds() -> Vec<CommandKind> {
             context: context(),
             name: "amber otter".into(),
         },
+        CommandKind::StopTask {
+            session_id: session(),
+            task: TaskId("a1b2c3".into()),
+        },
     ]
 }
 
@@ -430,6 +443,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ContextMoved,
             RejectReason::ContextCurrent,
             RejectReason::NoConversation,
+            RejectReason::UnknownTask,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );

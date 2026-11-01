@@ -1872,6 +1872,9 @@ impl Model {
                 EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
                     None
                 }
+                // A stop shows as its task leaving the set; nothing in the
+                // timeline.
+                EventKind::TaskStopRequested { .. } | EventKind::TaskStopRefused { .. } => None,
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
@@ -2232,7 +2235,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
-        | CommandKind::MoveContext { session_id, .. } => Some(*session_id),
+        | CommandKind::MoveContext { session_id, .. }
+        | CommandKind::StopTask { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }

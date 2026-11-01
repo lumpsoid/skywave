@@ -12,7 +12,7 @@ use skywave_proto::limits::{
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, BlobRef, Body, BodyFormat,
     CallId, CommandId, ContextId, Effort, EventKind, ModelChoice, PermissionMode, Schedule, Seq,
-    SessionId, SessionState, ToolCall, ToolKind, ToolResult,
+    SessionId, SessionState, TaskId, ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
@@ -51,7 +51,9 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
-/// | `Exited` | leftover approvals cancelled, leftover mode, model and effort requests refused; `Errored` if a turn was open or the exit was abnormal |
+/// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
+/// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
+/// | `Exited` | leftover approvals cancelled, leftover mode, model and effort requests refused, leftover stops dropped; `Errored` if a turn was open or the exit was abnormal |
 ///
 /// **Settings.** The supervisor tells the mapper of every mode, model or
 /// effort request it hands the agent ([`EventMapper::asked_mode`],
@@ -60,6 +62,13 @@ const AGENT_EXITED: &str = "agent exited";
 /// answers requests in order, so each answer names the oldest one asked.
 /// What the agent reports unasked is logged only when it changes what the
 /// log has, starting from the [`AgentSettings`] the mapper is made with.
+///
+/// **Stops.** Likewise the supervisor tells the mapper of every task stop
+/// it hands the agent ([`EventMapper::asked_stop`]). Both answers retire
+/// the oldest stop asked, the success too though it logs nothing: with two
+/// stops in flight, a success that kept its place would hand the next
+/// refusal the wrong command. Stops left on `Exited` are dropped, not
+/// refused: the empty task set logged on exit settles them.
 ///
 /// **Calls.** Every `ToolCall` gets a fresh [`CallId`]. The mapper remembers
 /// which [`AgentCallId`] it stands for until the turn ends; a result or
@@ -125,6 +134,9 @@ pub struct EventMapper {
     asked_models: VecDeque<(String, Option<CommandId>)>,
     /// Effort requests likewise.
     asked_efforts: VecDeque<(Effort, Option<CommandId>)>,
+    /// Task stops the agent has not answered, oldest first, with the
+    /// command asking.
+    asked_stops: VecDeque<(TaskId, Option<CommandId>)>,
 }
 
 /// What the mapper keeps of a logged call to link its result and approval.
@@ -156,6 +168,7 @@ impl EventMapper {
             asked_modes: VecDeque::new(),
             asked_models: VecDeque::new(),
             asked_efforts: VecDeque::new(),
+            asked_stops: VecDeque::new(),
         }
     }
 
@@ -172,6 +185,11 @@ impl EventMapper {
     /// The agent was asked to run at `effort`, for `command` if one asked.
     pub fn asked_effort(&mut self, effort: Effort, command: Option<CommandId>) {
         self.asked_efforts.push_back((effort, command));
+    }
+
+    /// The agent was asked to stop `task`, for `command` if one asked.
+    pub fn asked_stop(&mut self, task: TaskId, command: Option<CommandId>) {
+        self.asked_stops.push_back((task, command));
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -432,9 +450,31 @@ impl EventMapper {
                     )?);
                 }
             }
+            AdapterEvent::TaskStopAnswered { task } => {
+                if self.answer_stop().is_none() {
+                    tracing::debug!(task, "agent answered a stop nobody asked");
+                }
+            }
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                let (task, answers) = match self.answer_stop() {
+                    Some(asked) => asked,
+                    None => {
+                        tracing::debug!(task, "agent refused a stop nobody asked");
+                        (TaskId(cut_line(&task, TASK_ID_MAX_CHARS).0), None)
+                    }
+                };
+                let kind = EventKind::TaskStopRefused {
+                    task,
+                    reason: cut_line(&reason, REFUSAL_MAX_CHARS).0,
+                    answers,
+                };
+                seqs.push(self.append(log, storage, kind)?);
+            }
             AdapterEvent::Exited { error } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
+                // The empty set logged below settles them.
+                self.asked_stops.clear();
                 self.calls.clear();
                 // Nothing outlives the process, durable schedules included.
                 if !self.work.tasks.is_empty() {
@@ -500,6 +540,11 @@ impl EventMapper {
             tracing::debug!("agent answered an effort request nobody asked");
         }
         asked.and_then(|(_, command)| command)
+    }
+
+    /// The oldest stop asked, now answered, with its command.
+    fn answer_stop(&mut self) -> Option<(TaskId, Option<CommandId>)> {
+        self.asked_stops.pop_front()
     }
 
     /// Refuses every mode, model and effort request the agent left

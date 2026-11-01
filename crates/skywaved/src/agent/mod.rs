@@ -66,6 +66,12 @@
 //!   often as it changes. An adapter reports the empty set once the agent
 //!   is ready, since nothing is reported at start; the mapper logs only
 //!   changes.
+//! - [`AgentSession::stop_task`] asks the agent to stop one of those tasks,
+//!   at any time. Each ask gets exactly one answer, in the order asked:
+//!   [`AdapterEvent::TaskStopAnswered`] when the agent took it (the task
+//!   leaves a later `BackgroundTasks`; an agent may answer so for a task it
+//!   no longer has) or [`AdapterEvent::TaskStopRefused`], unless the agent
+//!   exits first.
 //! - Wakeups the agent scheduled for itself are reported as
 //!   [`AdapterEvent::Schedules`], the whole set, whenever the agent says;
 //!   they are information only and never keep the agent running.
@@ -346,6 +352,12 @@ pub enum AdapterEvent {
     /// Every scheduled wakeup, in the agent's order; replaces the set
     /// reported before. May repeat it.
     Schedules(Vec<AgentSchedule>),
+    /// The answer to the oldest unanswered stop: the agent took it. The
+    /// task leaving the set is the outcome; this only retires the ask.
+    TaskStopAnswered { task: String },
+    /// The answer to the oldest unanswered stop: the agent did not stop
+    /// `task`.
+    TaskStopRefused { task: String, reason: String },
     /// The agent stopped; no further events follow. `error` is set when it
     /// stopped abnormally (crash, startup failure).
     Exited { error: Option<String> },
@@ -424,6 +436,10 @@ pub trait AgentSession: Send + 'static {
     /// `EffortRefused`.
     fn set_effort(&mut self, effort: Effort)
     -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Asks the agent to stop background task `task` (an [`AgentTask::id`]);
+    /// answered by `TaskStopAnswered` or `TaskStopRefused`.
+    fn stop_task(&mut self, task: String) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
     /// Interrupt first to stop a running turn cleanly; a turn still running

@@ -53,6 +53,13 @@
 //!   replaced before the supervisor reached it is skipped, so requests
 //!   never land out of order, and one the agent's start already asked for
 //!   is not asked again.
+//! - `TaskStopRequested` → [`AgentSession::stop_task`], noted with the
+//!   mapper ([`EventMapper::asked_stop`]) so a refusal names the command.
+//!   Never starts an agent: with none running, the supervisor logs
+//!   `TaskStopRefused` ("agent not running") answering the command, in the
+//!   event's context. A stop the agent took shows as the task leaving its
+//!   next task set; the busy count and idle clock follow that set as for
+//!   any other change.
 //!
 //! **Conversations.** A context starts in its own conversation, resumed
 //! with its stored [`ResumeHandle`](crate::agent::ResumeHandle), once it has
@@ -151,7 +158,7 @@ use std::time::Duration;
 use rusqlite::OptionalExtension;
 use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
-    SessionState,
+    SessionState, TaskId,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -170,6 +177,8 @@ pub const DAEMON_RESTARTED: &str = "daemon restarted";
 /// `Errored` message for a session whose turn was running when the daemon
 /// stopped.
 pub const TURN_LOST: &str = "daemon restarted during a turn";
+/// Why a task stop is refused when the session has no agent running.
+pub const AGENT_NOT_RUNNING: &str = "agent not running";
 /// Default for [`SupervisorConfig::idle_timeout`].
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -552,7 +561,39 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.set(session_id, event.context, event.command_id, setting)
                     .await?;
             }
+            EventKind::TaskStopRequested { task, .. } => {
+                self.stop_task(session_id, event.context, event.command_id, task)
+                    .await?;
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Asks the session's agent to stop background `task` on behalf of
+    /// `command`, made in `context`. Never starts an agent: one that is not
+    /// running has no task to stop, so the stop is refused in `context`.
+    async fn stop_task(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+        command: Option<CommandId>,
+        task: TaskId,
+    ) -> Result<()> {
+        let Some(running) = self.running.get_mut(&session_id) else {
+            let kind = EventKind::TaskStopRefused {
+                task,
+                reason: AGENT_NOT_RUNNING.to_owned(),
+                answers: command,
+            };
+            self.log
+                .append(&mut self.storage.db, session_id, context, kind)?;
+            return Ok(());
+        };
+        running.mapper.asked_stop(task.clone(), command);
+        if let Err(error) = running.session.stop_task(task.0).await {
+            // The agent is gone; the empty set its `Exited` logs settles it.
+            tracing::warn!(session = %session_id.0, %error, "cannot ask the agent to stop a task");
         }
         Ok(())
     }

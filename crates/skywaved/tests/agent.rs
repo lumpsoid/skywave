@@ -1745,6 +1745,85 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
 }
 
 // ---------------------------------------------------------------------------
+// Task stops
+
+fn stop_refused(task: &str, answers: CommandId) -> EventKind {
+    EventKind::TaskStopRefused {
+        task: TaskId(task.to_owned()),
+        reason: "no".into(),
+        answers: Some(answers),
+    }
+}
+
+fn refuse(task: &str) -> AdapterEvent {
+    AdapterEvent::TaskStopRefused {
+        task: task.to_owned(),
+        reason: "no".into(),
+    }
+}
+
+fn answered(task: &str) -> AdapterEvent {
+    AdapterEvent::TaskStopAnswered {
+        task: task.to_owned(),
+    }
+}
+
+#[test]
+fn a_refusal_answers_its_own_stop_after_a_success() {
+    for (first, second) in [("a", "b"), ("a", "a")] {
+        let mut f = Fixture::new();
+        let mut mapper = task_mapper(&f, AgentWork::default());
+        let (one, two) = (CommandId::new(), CommandId::new());
+        mapper.asked_stop(TaskId(first.into()), Some(one));
+        mapper.asked_stop(TaskId(second.into()), Some(two));
+        // The success logs nothing but retires the first stop, so the
+        // refusal names the second.
+        apply_all(&mut f, &mut mapper, vec![answered(first), refuse(second)]);
+        assert_eq!(
+            f.kinds(),
+            [stop_refused(second, two)],
+            "{first} then {second}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_alone_answers_the_oldest_stop() {
+    // Positive control for the test above: with no success first, the
+    // refusal names the first command.
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let (one, two) = (CommandId::new(), CommandId::new());
+    mapper.asked_stop(TaskId("a".into()), Some(one));
+    mapper.asked_stop(TaskId("b".into()), Some(two));
+    apply_all(&mut f, &mut mapper, vec![refuse("a"), refuse("b")]);
+    assert_eq!(f.kinds(), [stop_refused("a", one), stop_refused("b", two)]);
+}
+
+#[test]
+fn exit_drops_the_stops_left_unanswered() {
+    let mut f = Fixture::new();
+    let work = AgentWork {
+        tasks: vec![logged_task("a", "sleep")],
+        schedules: vec![],
+    };
+    let mut mapper = task_mapper(&f, work);
+    mapper.asked_stop(TaskId("a".into()), Some(CommandId::new()));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    // The empty set settles the stop; no refusal.
+    assert_eq!(f.kinds(), [changed(vec![])]);
+    // A stop asked of the next run is not answered by the dropped one.
+    let next = CommandId::new();
+    mapper.asked_stop(TaskId("b".into()), Some(next));
+    apply_all(&mut f, &mut mapper, vec![refuse("b")]);
+    assert_eq!(f.kinds()[1..], [stop_refused("b", next)]);
+}
+
+// ---------------------------------------------------------------------------
 // Schedules
 
 fn agent_schedule(id: &str, outlives_agent: Option<bool>) -> AgentSchedule {

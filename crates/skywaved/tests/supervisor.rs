@@ -12,7 +12,7 @@ use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision,
     DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, ToolResult,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
@@ -21,7 +21,7 @@ use skywaved::agent::fake::{
     Step, schedule, task,
 };
 use skywaved::config::AgentConfig;
-use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
+use skywaved::supervisor::{AGENT_NOT_RUNNING, DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
 
@@ -1100,6 +1100,135 @@ async fn a_daemon_restart_ends_the_work_its_agent_left() {
     let supervisor = f.start(&agent).await;
     assert_eq!(f.stamped_after(head), []);
     supervisor.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Stopping one task
+
+/// Sends a `StopTask` for `task` and returns its command id.
+fn stop_task(f: &mut Fixture, task: &str) -> CommandId {
+    f.command(CommandKind::StopTask {
+        session_id: f.session_id,
+        task: TaskId(task.into()),
+    })
+}
+
+fn is_stop_refused(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::TaskStopRefused { .. })
+}
+
+/// Runs a turn that leaves tasks `job` and `keep` live, and waits for it.
+async fn two_live_tasks(f: &mut Fixture) {
+    f.send("run two jobs");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    assert_eq!(tasks_changed(f).len(), 1, "log: {:#?}", f.kinds());
+}
+
+fn two_tasks_script() -> FakeScript {
+    FakeScript::new().turn([Step::tasks([task("job", false), task("keep", false)])])
+}
+
+#[tokio::test]
+async fn a_stop_reaches_the_running_agent_and_the_set_shrinks() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(two_tasks_script());
+    let supervisor = f.start(&agent).await;
+    two_live_tasks(&mut f).await;
+
+    stop_task(&mut f, "job");
+    f.wait_count("the shrunk set", 2, |k| {
+        matches!(k, EventKind::BackgroundTasksChanged { .. })
+    })
+    .await;
+    let EventKind::BackgroundTasksChanged { tasks } = tasks_changed(&f).pop().unwrap() else {
+        unreachable!()
+    };
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.0.as_str()).collect();
+    assert_eq!(ids, ["keep"]);
+    assert_running(&agent, &f, "with a task still live");
+    supervisor.shutdown().await.unwrap();
+
+    // `a_refused_stop_is_logged_answering_its_command` is the positive
+    // control: there the same check sees the refusal.
+    assert!(
+        !f.kinds().iter().any(is_stop_refused),
+        "log: {:#?}",
+        f.kinds()
+    );
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("run two jobs"),
+            FakeInput::StopTask("job".into()),
+            FakeInput::Shutdown
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_stop_is_logged_answering_its_command() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(two_tasks_script().refuse_stops());
+    let supervisor = f.start(&agent).await;
+    two_live_tasks(&mut f).await;
+
+    let command = stop_task(&mut f, "job");
+    f.wait_count("the refusal", 1, is_stop_refused).await;
+    supervisor.shutdown().await.unwrap();
+    assert!(f.kinds().contains(&EventKind::TaskStopRefused {
+        task: TaskId("job".into()),
+        reason: REFUSE_REASON.into(),
+        answers: Some(command),
+    }));
+    assert_eq!(tasks_changed(&f).len(), 1, "the set stays as it was");
+}
+
+#[tokio::test]
+async fn a_stop_with_no_agent_running_is_refused_without_starting_one() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    // A set the log has with no agent running, as a device last saw it.
+    let (session, first) = (f.session_id, f.first());
+    f.log
+        .append(
+            &mut f.storage.db,
+            session,
+            first,
+            EventKind::BackgroundTasksChanged {
+                tasks: vec![skywave_proto::BackgroundTask {
+                    id: TaskId("job".into()),
+                    kind: skywave_proto::TaskKind::Shell,
+                    title: "sleep 60".into(),
+                    parent: None,
+                    ambient: false,
+                }],
+            },
+        )
+        .unwrap();
+
+    let before = f.log.head();
+    let command = stop_task(&mut f, "job");
+    f.wait_count("the refusal", 1, is_stop_refused).await;
+    supervisor.shutdown().await.unwrap();
+    let refusal = EventKind::TaskStopRefused {
+        task: TaskId("job".into()),
+        reason: AGENT_NOT_RUNNING.into(),
+        answers: Some(command),
+    };
+    let after: Vec<_> = f
+        .events_after(before)
+        .into_iter()
+        .map(|(_, e)| (e.kind, e.context, e.command_id))
+        .collect();
+    let [(requested, _, asked), refused] = after.as_slice() else {
+        panic!("expected the request and its refusal: {after:#?}");
+    };
+    assert!(matches!(requested, EventKind::TaskStopRequested { .. }));
+    assert_eq!(*asked, Some(command));
+    assert_eq!(*refused, (refusal, first, None));
+    assert_eq!(agent.inputs(f.session_id), [], "no agent was started");
 }
 
 /// Stopping the agent ends its tasks; the next start reports none and logs

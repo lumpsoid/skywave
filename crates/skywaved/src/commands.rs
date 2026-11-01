@@ -16,6 +16,7 @@
 //! - `SetEffort` → `EffortRequested`;
 //! - `ClearContext` → `ContextStarted` with the normalised name;
 //! - `SwitchContext` → `ContextSwitched`;
+//! - `StopTask` → `TaskStopRequested`;
 //! - `MoveContext` → `SessionCreated { from }` for the new session, naming
 //!   no command, then `ContextMoved` in the source.
 //!
@@ -111,6 +112,15 @@
 //! or `…Refused` naming the command. A model is logged as
 //! [`skywave_proto::normalise_model`] leaves it; a blank one is
 //! `UnknownModel`.
+//!
+//! **StopTask.** `UnknownTask` unless the task is in the session's live
+//! set as last logged (the folded `BackgroundTasksChanged`): a definitive
+//! check, so a device with a stale list cannot stop a task that already
+//! ended. Accepted whether or not the agent runs. The supervisor asks a
+//! running agent to stop the task and never starts one for it; the task
+//! leaving the next `BackgroundTasksChanged` is the success, a
+//! `TaskStopRefused` naming the command the failure, `"agent not running"`
+//! among them.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
@@ -403,6 +413,20 @@ impl EventLog {
                 };
                 let kind = EventKind::EffortRequested {
                     effort: *effort,
+                    by: device,
+                };
+                (*session_id, session.context, kind)
+            }
+            CommandKind::StopTask { session_id, task } => {
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                let work = event_log::agent_work_in(tx, *session_id)?;
+                if !work.tasks.iter().any(|live| live.id == *task) {
+                    return Ok(Err(RejectReason::UnknownTask));
+                }
+                let kind = EventKind::TaskStopRequested {
+                    task: task.clone(),
                     by: device,
                 };
                 (*session_id, session.context, kind)
