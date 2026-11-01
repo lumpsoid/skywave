@@ -62,8 +62,8 @@ use uuid::Uuid;
 
 use super::{display, rules, usage};
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, Effort, ModelChoice, PermissionMode, ResumeHandle,
-    TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentTask, Effort, ModelChoice, PermissionMode,
+    ResumeHandle, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -569,6 +569,9 @@ impl Protocol {
             "system" if str_field(message, "subtype") == "status" => {
                 self.on_status(message, &mut out);
             }
+            "system" if str_field(message, "subtype") == "background_tasks_changed" => {
+                self.on_background_tasks(message, &mut out);
+            }
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
@@ -576,7 +579,9 @@ impl Protocol {
             "control_response" => self.on_control_response(message, &mut out),
             "result" => self.on_result(message, &mut out),
             // rate_limit_event, stream_event, other system subtypes: progress
-            // signals only.
+            // signals only. That includes the edge events of tasks
+            // (task_started, task_updated, task_progress, task_notification):
+            // the task set comes from background_tasks_changed alone.
             _ => {}
         }
         out
@@ -702,7 +707,44 @@ impl Protocol {
         }
     }
 
+    /// `system/background_tasks_changed`: every live task, replacing the
+    /// last report.
+    fn on_background_tasks(&mut self, message: &Value, out: &mut Output) {
+        let tasks = message
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|task| {
+                let id = task.get("task_id").and_then(Value::as_str)?;
+                let kind = match str_field(task, "task_type") {
+                    "local_bash" => TaskKind::Shell,
+                    "local_agent" => TaskKind::Subagent,
+                    _ => TaskKind::Other,
+                };
+                Some(AgentTask {
+                    id: id.to_owned(),
+                    kind,
+                    title: str_field(task, "description").to_owned(),
+                    parent: task
+                        .get("parent_task_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    ambient: task
+                        .get("ambient")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect();
+        out.events.push(AdapterEvent::BackgroundTasks(tasks));
+    }
+
     fn on_assistant(&mut self, message: &Value, out: &mut Output) {
+        if is_subagent_message(message) {
+            return;
+        }
         let Some(blocks) = content_blocks(message) else {
             return;
         };
@@ -735,6 +777,9 @@ impl Protocol {
     }
 
     fn on_user(&mut self, message: &Value, out: &mut Output) {
+        if is_subagent_message(message) {
+            return;
+        }
         // Text blocks here are the CLI's own markers ("[Request interrupted
         // by user]"); only tool results matter.
         let Some(blocks) = content_blocks(message) else {
@@ -1017,6 +1062,8 @@ impl Protocol {
                 out.events.push(AdapterEvent::ModelsOffered(models));
             }
             self.ready = true;
+            // The CLI reports no task set at start: nothing is running.
+            out.events.push(AdapterEvent::BackgroundTasks(Vec::new()));
             // Neither this answer nor `system/init` names the effort.
             self.read_effort(None, out);
         } else {
@@ -1138,4 +1185,13 @@ fn applied_effort(raw: Option<&Value>) -> Option<Option<Effort>> {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A subagent's own message, which comes after the main turn's `result` and
+/// outside any turn. Not reported: the main agent's turn quotes what the
+/// subagent found.
+fn is_subagent_message(message: &Value) -> bool {
+    message
+        .get("parent_tool_use_id")
+        .is_some_and(|id| !id.is_null())
 }

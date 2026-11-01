@@ -6,16 +6,16 @@ use serde_json::Value;
 use skywave_proto::limits::{
     DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX,
     PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
-    RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
-    ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
-    ToolCall, ToolKind, ToolResult,
+    self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, BlobRef, Body, BodyFormat,
+    CallId, CommandId, ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
+    SessionState, ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
-    AdapterEvent, AgentCallId, AgentRequestId, DisplayBody, ResultDisplay, ToolDisplay,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentTask, DisplayBody, ResultDisplay, ToolDisplay,
     TurnOutcome, store_grants, store_resume_handle,
 };
 use crate::error::Result;
@@ -115,6 +115,8 @@ pub struct EventMapper {
     turn_open: bool,
     /// The session's mode, model and effort as the log has them.
     settings: AgentSettings,
+    /// The session's background tasks and schedules as the log has them.
+    work: AgentWork,
     /// Mode requests the agent has not answered, oldest first, with the
     /// command asking.
     asked_modes: VecDeque<(PermissionMode, Option<CommandId>)>,
@@ -134,9 +136,14 @@ struct LoggedCall {
 }
 
 impl EventMapper {
-    /// A mapper for `session_id`, whose log holds `settings`, running its
-    /// agent in session context `context`.
-    pub fn new(session_id: SessionId, context: ContextId, settings: AgentSettings) -> EventMapper {
+    /// A mapper for `session_id`, whose log holds `settings` and `work`,
+    /// running its agent in session context `context`.
+    pub fn new(
+        session_id: SessionId,
+        context: ContextId,
+        settings: AgentSettings,
+        work: AgentWork,
+    ) -> EventMapper {
         EventMapper {
             session_id,
             context,
@@ -144,6 +151,7 @@ impl EventMapper {
             calls: HashMap::new(),
             turn_open: false,
             settings,
+            work,
             asked_modes: VecDeque::new(),
             asked_models: VecDeque::new(),
             asked_efforts: VecDeque::new(),
@@ -403,10 +411,31 @@ impl EventMapper {
             AdapterEvent::ModelsOffered(_) => {
                 tracing::debug!("models offered reach the log through the supervisor");
             }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let tasks = cut_tasks(tasks);
+                if tasks != self.work.tasks {
+                    seqs.push(self.append(
+                        log,
+                        storage,
+                        EventKind::BackgroundTasksChanged { tasks },
+                    )?);
+                }
+            }
             AdapterEvent::Exited { error } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
                 self.calls.clear();
+                // Nothing outlives the process, durable schedules included.
+                if !self.work.tasks.is_empty() {
+                    let kind = EventKind::BackgroundTasksChanged { tasks: Vec::new() };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+                if !self.work.schedules.is_empty() {
+                    let kind = EventKind::SchedulesChanged {
+                        schedules: Vec::new(),
+                    };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
                 let message = match error {
                     Some(error) => Some(format!("agent exited: {error}")),
                     None if self.turn_open => Some("agent exited during a turn".to_owned()),
@@ -428,6 +457,9 @@ impl EventMapper {
     fn append(&mut self, log: &EventLog, storage: &mut Storage, kind: EventKind) -> Result<Seq> {
         if AgentSettings::folds(&kind) {
             self.settings.apply(None, &kind);
+        }
+        if AgentWork::folds(&kind) {
+            self.work.apply(&kind);
         }
         log.append(&mut storage.db, self.session_id, self.context, kind)
     }
@@ -678,6 +710,26 @@ fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
         out.push('…');
     }
     (out, cut)
+}
+
+/// The first [`TASKS_MAX`] tasks, in the agent's order, titles cut to one
+/// line. An entry whose id is too long is dropped: a cut id names nothing.
+/// A parent id too long drops the entry's parent link, not the entry: the
+/// task still runs, and it is the link that names nothing.
+fn cut_tasks(tasks: Vec<AgentTask>) -> Vec<BackgroundTask> {
+    let fits = |id: &str| id.chars().count() <= TASK_ID_MAX_CHARS;
+    tasks
+        .into_iter()
+        .filter(|task| fits(&task.id))
+        .take(TASKS_MAX)
+        .map(|task| BackgroundTask {
+            id: proto::TaskId(task.id),
+            kind: task.kind,
+            title: cut_line(&task.title, TITLE_MAX_CHARS).0,
+            parent: task.parent.filter(|id| fits(id)).map(proto::TaskId),
+            ambient: task.ambient,
+        })
+        .collect()
 }
 
 /// The first [`RULE_SUGGESTIONS_MAX`] suggestions, labels cut to one line
