@@ -17,10 +17,10 @@ use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERS
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice, PermissionMode,
-    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind,
-    TurnOutcome, TurnUsage,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
+    AgentSession, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
+    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay,
+    ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -40,11 +40,17 @@ fn fixture(name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Our own control requests carry ids we choose; compare them without.
+/// Our own control requests carry ids we choose; compare them without. An
+/// initialize request is compared by its subtype alone: the recordings
+/// registered different hooks and flags over time, so what
+/// [`protocol::initialize_request`] sends is pinned by its own test instead.
 fn normalized(message: &Value) -> Value {
     let mut message = message.clone();
     if message["type"] == "control_request" {
         message.as_object_mut().unwrap().remove("request_id");
+        if message["request"]["subtype"] == "initialize" {
+            message["request"] = json!({ "subtype": "initialize" });
+        }
     }
     message
 }
@@ -116,6 +122,8 @@ fn replay_records(
     let mut offers: HashMap<String, Value> = HashMap::new();
     // The id of each of our control requests, by the recorded one.
     let mut our_ids: HashMap<String, String> = HashMap::new();
+    // The ids of the CLI's hook calls: the protocol answers those itself.
+    let mut hook_calls: Vec<String> = Vec::new();
     for record in records {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
@@ -148,6 +156,14 @@ fn replay_records(
                     ("control_request", Some("get_settings")) => Default::default(),
                     ("user", _) => protocol
                         .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
+                    // Written by the protocol on the hook call it answers.
+                    ("control_response", _)
+                        if hook_calls
+                            .iter()
+                            .any(|id| msg["response"]["request_id"] == **id) =>
+                    {
+                        Default::default()
+                    }
                     ("control_response", _) => {
                         let response = &msg["response"];
                         let decision = match response["response"]["behavior"].as_str() {
@@ -182,6 +198,9 @@ fn replay_records(
                 n_in += 1;
             }
             "out" => {
+                if msg["request"]["subtype"] == "hook_callback" {
+                    hook_calls.push(msg["request_id"].as_str().unwrap().to_owned());
+                }
                 if msg["request"]["subtype"] == "can_use_tool" {
                     offers.insert(
                         msg["request_id"].as_str().unwrap().to_owned(),
@@ -237,7 +256,11 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
     events
         .iter()
         .filter(|event| {
-            !observes_settings(event) && !matches!(event, AdapterEvent::BackgroundTasks(_))
+            !observes_settings(event)
+                && !matches!(
+                    event,
+                    AdapterEvent::BackgroundTasks(_) | AdapterEvent::Schedules(_)
+                )
         })
         .map(|event| match event {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
@@ -281,12 +304,14 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
             // Filtered out above: [`timeline`] lists the task sets.
             AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
+            AdapterEvent::Schedules(schedules) => format!("schedules: {}", schedules.len()),
         })
         .collect()
 }
 
-/// The turns, texts and task sets of `events`, one line each; a task reads
-/// `id:kind` or `id:kind<parent`, and `ambient` ones end in `~`.
+/// The turns, texts, task sets and schedule sets of `events`, one line
+/// each; a task reads `id:kind` or `id:kind<parent`, and `ambient` ones end
+/// in `~`; a schedule reads its id.
 fn timeline(events: &[AdapterEvent]) -> Vec<String> {
     events
         .iter()
@@ -310,6 +335,10 @@ fn timeline(events: &[AdapterEvent]) -> Vec<String> {
                     })
                     .collect();
                 Some(format!("tasks: [{}]", tasks.join(", ")))
+            }
+            AdapterEvent::Schedules(schedules) => {
+                let schedules: Vec<&str> = schedules.iter().map(|s| s.id.as_str()).collect();
+                Some(format!("schedules: [{}]", schedules.join(", ")))
             }
             _ => None,
         })
@@ -2816,4 +2845,148 @@ fn replay_loop_reports_no_task() {
     // Positive control: the reports are seen, only none is non-empty.
     assert!(!sets.is_empty());
     assert!(sets.iter().all(Vec::is_empty));
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+
+#[test]
+fn initialize_registers_the_stop_hook_alone() {
+    assert_eq!(
+        protocol::initialize_request("r1"),
+        json!({
+            "type": "control_request",
+            "request_id": "r1",
+            "request": {
+                "subtype": "initialize",
+                "hooks": { "Stop": [{ "hookCallbackIds": ["skywave-stop"] }] },
+            },
+        })
+    );
+}
+
+/// The CLI's Stop hook call `request_id` for callback `callback_id`, listing
+/// `crons`.
+fn hook_call(request_id: &str, callback_id: &str, crons: Value) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": { "hook_event_name": "Stop", "background_tasks": [], "session_crons": crons },
+            "tool_use_id": "t1",
+        },
+    })
+}
+
+fn schedule(id: &str, when: &str, prompt: &str, outlives_agent: Option<bool>) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: when.to_owned(),
+        recurring: true,
+        prompt: prompt.to_owned(),
+        outlives_agent,
+    }
+}
+
+fn schedule_sets(events: &[AdapterEvent]) -> Vec<Vec<AgentSchedule>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Schedules(schedules) => Some(schedules.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_stop_hook_is_answered_with_its_schedules_and_others_are_refused() {
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let crons =
+        json!([{ "id": "j1", "schedule": "*/1 * * * *", "recurring": true, "prompt": "tick" }]);
+    let line = hook_call("h1", "skywave-stop", crons.clone()).to_string();
+    let out = protocol.on_line(&line);
+    assert_eq!(
+        out.events,
+        [AdapterEvent::Schedules(vec![schedule(
+            "j1",
+            "*/1 * * * *",
+            "tick",
+            None
+        )])]
+    );
+    assert_eq!(
+        out.writes,
+        [json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "h1", "response": {} },
+        })]
+    );
+
+    let line = hook_call("h2", "someone-else", crons).to_string();
+    let out = protocol.on_line(&line);
+    assert_eq!(out.events, []);
+    assert_eq!(
+        out.writes,
+        [protocol::error_response(
+            "h2",
+            "unsupported control request: hook_callback"
+        )]
+    );
+}
+
+#[test]
+fn replay_stop_hook_reports_the_schedules_at_each_turn_end() {
+    let events = replay("stop_hook", Uuid::new_v4(), false, &[]);
+    let tick = schedule("1363496f", "*/1 * * * *", "reply only TICK", Some(false));
+    // Asked for durable, the CLI made it not durable all the same.
+    let daily = schedule("20244679", "0 4 * * *", "reply only DURABLE", Some(false));
+    assert_eq!(
+        schedule_sets(&events),
+        [
+            vec![tick.clone()],
+            // The loop's own tick.
+            vec![tick],
+            // Deleted.
+            vec![],
+            vec![daily],
+            vec![],
+        ]
+    );
+    // Each set is reported before the turn it ends ends.
+    let lines = timeline(&events);
+    let ends = lines.iter().filter(|l| *l == "turn ended").count();
+    assert_eq!(ends, 5, "{lines:?}");
+    for (n, line) in lines.iter().enumerate() {
+        if line.starts_with("schedules: ") {
+            assert_eq!(lines[n + 1], "turn ended", "{lines:?}");
+        }
+    }
+}
+
+#[test]
+fn replay_loop_keeps_whether_its_job_outlives_the_agent() {
+    let mut records = fixture("loop");
+    let crons = json!([
+        { "id": "b6841368", "schedule": "*/1 * * * *", "recurring": true, "prompt": "reply only TICK" },
+        { "id": "elsewhere", "schedule": "0 4 * * *", "recurring": false, "prompt": "x" },
+    ]);
+    records.push(json!({ "dir": "out", "msg": hook_call("h1", "skywave-stop", crons) }));
+    records.push(json!({ "dir": "in", "msg": {
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "h1", "response": {} },
+    }}));
+    let (events, _) = replay_records("loop", records, Uuid::new_v4(), false, &[], false);
+    let mut elsewhere = schedule("elsewhere", "0 4 * * *", "x", None);
+    elsewhere.recurring = false;
+    assert_eq!(
+        schedule_sets(&events),
+        [vec![
+            // Several turns after the one that made it.
+            schedule("b6841368", "*/1 * * * *", "reply only TICK", Some(false)),
+            // Not made in this process: unknown.
+            elsewhere,
+        ]]
+    );
 }

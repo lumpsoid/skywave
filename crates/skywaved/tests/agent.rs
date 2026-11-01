@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS,
-    TASKS_MAX, TITLE_MAX_CHARS,
+    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
+    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
@@ -21,9 +21,9 @@ use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
 };
 use skywaved::agent::{
-    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, AgentTask,
-    Conversation, DisplayBody, EventMapper, ResultDisplay, StartSpec, TaskKind, TurnOutcome,
-    load_resume_handle,
+    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSchedule, AgentSession,
+    AgentTask, Conversation, DisplayBody, EventMapper, ResultDisplay, StartSpec, TaskKind,
+    TurnOutcome, load_resume_handle,
 };
 use skywaved::{EventLog, Storage};
 use tempfile::TempDir;
@@ -1742,4 +1742,80 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
         vec![AdapterEvent::Exited { error: None }],
     );
     assert_eq!(f.kinds(), []);
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+
+fn agent_schedule(id: &str, outlives_agent: Option<bool>) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: "*/5 * * * *".to_owned(),
+        recurring: true,
+        prompt: "check".to_owned(),
+        outlives_agent,
+    }
+}
+
+#[test]
+fn an_equal_schedule_set_is_logged_once_and_a_different_one_again() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let one = || AdapterEvent::Schedules(vec![agent_schedule("s1", Some(false))]);
+    apply_all(&mut f, &mut mapper, vec![one(), one()]);
+    assert_eq!(
+        f.kinds(),
+        [EventKind::SchedulesChanged {
+            schedules: vec![schedule("s1", Some(false))]
+        }]
+    );
+    // Positive control: a different set logs, the empty one included.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::Schedules(vec![]),
+            AdapterEvent::Schedules(vec![]),
+        ],
+    );
+    assert_eq!(f.kinds().len(), 2);
+    assert_eq!(
+        f.kinds()[1],
+        EventKind::SchedulesChanged { schedules: vec![] }
+    );
+}
+
+#[test]
+fn schedules_are_cut_to_the_limits() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let mut long = agent_schedule("long", None);
+    long.when = "w".repeat(SCHEDULE_WHEN_MAX_CHARS + 5);
+    long.prompt = format!("{}\nsecond line", "p".repeat(TITLE_MAX_CHARS + 20));
+    let mut schedules = vec![
+        agent_schedule(&"i".repeat(TASK_ID_MAX_CHARS + 1), None),
+        long,
+    ];
+    schedules.extend((0..SCHEDULES_MAX + 1).map(|n| agent_schedule(&format!("s{n}"), None)));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Schedules(schedules)],
+    );
+    let kinds = f.kinds();
+    let [EventKind::SchedulesChanged { schedules }] = kinds.as_slice() else {
+        panic!("expected one change");
+    };
+    assert_eq!(schedules.len(), SCHEDULES_MAX);
+    // The too-long id is gone; the rest keep the agent's order.
+    assert_eq!(schedules[0].id.0, "long");
+    assert_eq!(chars(&schedules[0].when), SCHEDULE_WHEN_MAX_CHARS);
+    assert!(schedules[0].when.ends_with('…'));
+    assert_eq!(chars(&schedules[0].prompt), TITLE_MAX_CHARS);
+    assert!(!schedules[0].prompt.contains('\n'));
+    assert_eq!(schedules[1].id.0, "s0");
+    assert_eq!(
+        schedules.last().unwrap().id.0,
+        format!("s{}", SCHEDULES_MAX - 2)
+    );
 }

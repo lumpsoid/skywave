@@ -6,17 +6,18 @@ use serde_json::Value;
 use skywave_proto::limits::{
     DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX,
     PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
-    RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
+    TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, BlobRef, Body, BodyFormat,
-    CallId, CommandId, ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
-    SessionState, ToolCall, ToolKind, ToolResult,
+    CallId, CommandId, ContextId, Effort, EventKind, ModelChoice, PermissionMode, Schedule, Seq,
+    SessionId, SessionState, ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
-    AdapterEvent, AgentCallId, AgentRequestId, AgentTask, DisplayBody, ResultDisplay, ToolDisplay,
-    TurnOutcome, store_grants, store_resume_handle,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, DisplayBody,
+    ResultDisplay, ToolDisplay, TurnOutcome, store_grants, store_resume_handle,
 };
 use crate::error::Result;
 use crate::{EventLog, Storage};
@@ -421,6 +422,16 @@ impl EventMapper {
                     )?);
                 }
             }
+            AdapterEvent::Schedules(schedules) => {
+                let schedules = cut_schedules(schedules);
+                if schedules != self.work.schedules {
+                    seqs.push(self.append(
+                        log,
+                        storage,
+                        EventKind::SchedulesChanged { schedules },
+                    )?);
+                }
+            }
             AdapterEvent::Exited { error } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
@@ -728,6 +739,24 @@ fn cut_tasks(tasks: Vec<AgentTask>) -> Vec<BackgroundTask> {
             title: cut_line(&task.title, TITLE_MAX_CHARS).0,
             parent: task.parent.filter(|id| fits(id)).map(proto::TaskId),
             ambient: task.ambient,
+        })
+        .collect()
+}
+
+/// The first [`SCHEDULES_MAX`] schedules, in the agent's order, `when` and
+/// prompt cut to one line. An entry whose id is too long is dropped, as in
+/// [`cut_tasks`].
+fn cut_schedules(schedules: Vec<AgentSchedule>) -> Vec<Schedule> {
+    schedules
+        .into_iter()
+        .filter(|schedule| schedule.id.chars().count() <= TASK_ID_MAX_CHARS)
+        .take(SCHEDULES_MAX)
+        .map(|schedule| Schedule {
+            id: proto::ScheduleId(schedule.id),
+            when: cut_line(&schedule.when, SCHEDULE_WHEN_MAX_CHARS).0,
+            recurring: schedule.recurring,
+            prompt: cut_line(&schedule.prompt, TITLE_MAX_CHARS).0,
+            outlives_agent: schedule.outlives_agent,
         })
         .collect()
 }

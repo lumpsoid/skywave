@@ -66,6 +66,9 @@
 //!   often as it changes. An adapter reports the empty set once the agent
 //!   is ready, since nothing is reported at start; the mapper logs only
 //!   changes.
+//! - Wakeups the agent scheduled for itself are reported as
+//!   [`AdapterEvent::Schedules`], the whole set, whenever the agent says;
+//!   they are information only and never keep the agent running.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -137,6 +140,21 @@ pub struct AgentTask {
     pub parent: Option<String>,
     /// Not activity (see [`skywave_proto::BackgroundTask::ambient`]).
     pub ambient: bool,
+}
+
+/// One scheduled wakeup of the agent: a prompt it runs on its own when
+/// `when` comes. Uncut, its id the agent's own and opaque; the
+/// [`EventMapper`] cuts the rest for the log. Information only: nothing
+/// keeps the agent running for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSchedule {
+    pub id: String,
+    /// When it fires, in the agent's own words.
+    pub when: String,
+    pub recurring: bool,
+    pub prompt: String,
+    /// Whether it outlives the agent; `None` when the agent does not say.
+    pub outlives_agent: Option<bool>,
 }
 
 /// How to show a tool call, uncut. Agent-agnostic (D3): the adapter maps its
@@ -325,6 +343,9 @@ pub enum AdapterEvent {
     /// Every live background task, in the agent's order; replaces the set
     /// reported before. May repeat it.
     BackgroundTasks(Vec<AgentTask>),
+    /// Every scheduled wakeup, in the agent's order; replaces the set
+    /// reported before. May repeat it.
+    Schedules(Vec<AgentSchedule>),
     /// The agent stopped; no further events follow. `error` is set when it
     /// stopped abnormally (crash, startup failure).
     Exited { error: Option<String> },
