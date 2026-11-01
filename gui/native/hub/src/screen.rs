@@ -11,9 +11,9 @@ use skywave_core::{
 };
 use skywave_present::format::{
     agent_effort_label, agent_mode_label, agent_model_label, answer_words, blob_size, bytes,
-    delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail, mode_label,
-    mode_needs_confirmation, mode_refusal, model_refusal, outgoing_label, scope_label, tokens,
-    turn_time,
+    context_row, delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail,
+    mode_label, mode_needs_confirmation, mode_refusal, model_refusal, outgoing_label, scope_label,
+    tokens, turn_time, viewing_hint,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -21,8 +21,8 @@ use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sec
 use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerView, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption,
-    ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
+    ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
+    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
     ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
@@ -277,6 +277,28 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .stop
             .as_ref()
             .map(|o| format!("stop {}", outgoing_label(o))),
+        clear_label: session
+            .clear
+            .as_ref()
+            .map(|o| format!("new context {}", outgoing_label(o))),
+        switch_label: session
+            .switch
+            .as_ref()
+            .map(|o| format!("switch {}", outgoing_label(o))),
+        can_clear: session.can_clear,
+        contexts: session
+            .contexts
+            .iter()
+            .map(|c| ContextRow {
+                context_id: c.id.0.to_string(),
+                label: clean_line(&context_row(c)),
+                current: c.current,
+                outgoing_label: c.outgoing.as_ref().map(outgoing_label),
+            })
+            .collect(),
+        context_id: session.context.0.to_string(),
+        viewing_id: session.viewing.map(|v| v.0.to_string()),
+        viewing_hint: viewing_hint(session).map(|h| clean_line(&h)),
         rules: session.rules.iter().map(rule_text).collect(),
         rules_label: match session.rules.len() {
             0 => None,

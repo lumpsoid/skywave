@@ -712,6 +712,108 @@ fn a_context_cleared_or_switched_is_a_divider_row() {
     );
 }
 
+impl Rig {
+    fn open_session(&self) -> crate::signals::SessionScreen {
+        match &self.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Session { session } => session.clone(),
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn context_intents_map_to_actions_and_the_screen_lists_the_contexts() {
+    let mut rig = Rig::new();
+    let first = skywave_proto::ContextId::first_of(rig.session);
+    let before = rig.open_session();
+    assert!(!before.can_clear, "nothing to clear in an empty context");
+    assert_eq!(before.contexts.len(), 1, "{:?}", before.contexts);
+    assert!(before.contexts[0].current);
+    assert_eq!(before.context_id, first.0.to_string());
+    assert_eq!(before.viewing_hint, None);
+
+    rig.log(vec![EventKind::UserMessage {
+        device_id: DeviceId::new(),
+        text: "fix the flaky test\nplease".into(),
+    }]);
+    let session = rig.open_session();
+    assert!(session.can_clear, "positive control");
+    assert_eq!(session.contexts[0].label, "start · fix the flaky test");
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ClearContext {
+            session_id: rig.session.0.to_string(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::ClearContext {
+            session_id: rig.session
+        }]
+    );
+    rig.actions.clear();
+    rig.results();
+    rig.view();
+    let session = rig.open_session();
+    assert_eq!(session.clear_label.as_deref(), Some("new context queued"));
+    assert_eq!(session.contexts.len(), 2, "{:?}", session.contexts);
+    let (old, new) = (&session.contexts[0], &session.contexts[1]);
+    assert!(!old.current && new.current);
+    assert_eq!(new.outgoing_label.as_deref(), Some("queued"));
+    assert_eq!(session.context_id, new.context_id);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::ViewContext {
+            session_id: rig.session.0.to_string(),
+            context_id: Some(old.context_id.clone()),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::ViewContext {
+            session_id: rig.session,
+            context: Some(first)
+        }]
+    );
+    rig.actions.clear();
+    rig.results();
+    rig.view();
+    let session = rig.open_session();
+    assert_eq!(session.viewing_id, Some(first.0.to_string()));
+    let hint = session.viewing_hint.expect("viewing an earlier context");
+    assert!(
+        hint.starts_with("Viewing start — messages go to "),
+        "{hint}"
+    );
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::SwitchContext {
+            session_id: rig.session.0.to_string(),
+            context_id: first.0.to_string(),
+        },
+    });
+    assert_eq!(
+        rig.actions,
+        [Action::SwitchContext {
+            session_id: rig.session,
+            context: first
+        }]
+    );
+}
+
+#[test]
+fn a_malformed_context_id_is_an_error_not_an_action() {
+    let mut rig = Rig::new();
+    let outs = rig.intent(GuiIntent::Act {
+        action: ActionIntent::SwitchContext {
+            session_id: rig.session.0.to_string(),
+            context_id: "not-an-id".into(),
+        },
+    });
+    assert!(rig.actions.is_empty());
+    assert_eq!(errors(&outs), ["not a context id: \"not-an-id\""]);
+}
+
 /// An edit's call and result as skywaved logs them for the stub agent:
 /// a diff body whole in its preview, the input as a blob, and a result
 /// with no preview whose whole text is a 70 B blob.
