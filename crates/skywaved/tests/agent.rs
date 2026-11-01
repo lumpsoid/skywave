@@ -741,6 +741,48 @@ async fn a_fork_copies_a_conversation_of_another_session() {
 }
 
 #[tokio::test]
+async fn adopting_copies_an_outside_conversation() {
+    let f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::text("hi")]))
+        .with_outside_conversation("ext-1");
+    let adopt = |id: &str| StartSpec {
+        conversation: Conversation::Adopt(id.to_owned()),
+        ..f.spec()
+    };
+
+    // An id nobody registered is refused, and no start is recorded.
+    let refused = agent.start(adopt("ext-2")).await;
+    assert!(matches!(refused, Err(AgentError::Resume(_))));
+    assert_eq!(agent.inputs(f.session_id), []);
+
+    // Positive control: the registered id starts, on a clone too.
+    let (mut session, mut events) = agent.clone().start(adopt("ext-1")).await.unwrap();
+    let context = ContextId::first_of(f.session_id);
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [FakeInput::Started {
+            conversation: FakeConversation::Adopt("ext-1".into()),
+            context,
+            grants: None,
+        }]
+    );
+    // The copy is the adopting context's own: its handle comes with its
+    // first message, never the outside id.
+    session.send_message("a".into()).await.unwrap();
+    assert_eq!(
+        events.recv().await,
+        Some(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(
+            context
+        )))
+    );
+    session.shutdown().await.unwrap();
+
+    // Once it has its own conversation, adopting into it again is refused.
+    let again = agent.start(adopt("ext-1")).await;
+    assert!(matches!(again, Err(AgentError::Start(_))));
+}
+
+#[tokio::test]
 async fn failures_and_exits_mark_the_session_errored() {
     let mut f = Fixture::new();
     let agent = FakeAgent::new(
