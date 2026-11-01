@@ -75,6 +75,16 @@
 //! of the new session is handled. Its late events (the interrupted turn's
 //! `Idle`, its exit) stay in the source, stamped with the moved context.
 //!
+//! Likewise the first context of a session created by adoption starts as
+//! [`Conversation::Adopt`] with the agent's own id of the outside
+//! conversation until its copy reports a handle, so a start stopped before
+//! any message adopts again, under a new id, and nothing leaks; an id the
+//! agent does not know fails that start, so each message errors and the
+//! session stays. Unlike a move, the outside conversation may still be
+//! live: a terminal agent may still be writing it, and nothing tells
+//! skywaved. The fork reads whatever the conversation held when it was
+//! made; later outside turns never reach the copy.
+//!
 //! **Mode, model and effort.** Every agent starts with the mode, model and
 //! effort the session's log wants
 //! ([`Setting::wanted`](skywave_proto::Setting::wanted)): an open request,
@@ -165,7 +175,7 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, Conversation, EventMapper, StartSpec,
-    bounded_models, load_grants, load_origin, load_resume_handle,
+    bounded_models, load_adopted, load_grants, load_origin, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -1016,17 +1026,23 @@ fn run_thread<A: AgentAdapter>(
 
 /// The conversation session context `context` starts in: its own, resumed
 /// with its handle; else, for the first context of a session a context was
-/// moved into, a fork of its origin's; else a fresh one. An origin without
-/// a handle is refused (`Err`, for the log) rather than started fresh,
-/// which would silently drop the conversation the context continues;
-/// command validation moves only a context with a handle, so this is a
-/// guard.
+/// moved into, a fork of its origin's; else, for the first context of a
+/// session created by adoption, the outside conversation adopted by the
+/// agent's id; else a fresh one. Its own handle comes first: a context that
+/// forked or adopted keeps its copy from then on, where forking again would
+/// drop every turn it took since. An origin without a handle is refused
+/// (`Err`, for the log) rather than started fresh, which would silently
+/// drop the conversation the context continues; command validation moves
+/// only a context with a handle, so this is a guard.
 fn conversation(db: &Db, context: ContextId) -> Result<Result<Conversation, String>> {
     if let Some(handle) = load_resume_handle(db, context)? {
         return Ok(Ok(Conversation::Resume(handle)));
     }
     let Some(origin) = load_origin(db, context)? else {
-        return Ok(Ok(Conversation::Fresh));
+        return Ok(Ok(match load_adopted(db, context)? {
+            Some(id) => Conversation::Adopt(id),
+            None => Conversation::Fresh,
+        }));
     };
     Ok(match load_resume_handle(db, origin)? {
         Some(handle) => Ok(Conversation::Fork(handle)),
