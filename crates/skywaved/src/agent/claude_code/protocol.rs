@@ -145,7 +145,10 @@ pub fn user_message(text: &str) -> Value {
 pub const STOP_HOOK_ID: &str = "skywave-stop";
 
 /// The initialize handshake request. It registers the Stop hook, whose
-/// calls carry the session's scheduled wakeups.
+/// calls carry the session's scheduled wakeups, and declares that both
+/// heads render a per-task stop: an interrupt then spares background agents
+/// (it aborts the turn only), where a consumer that does not declare it has
+/// them killed.
 pub fn initialize_request(request_id: &str) -> Value {
     json!({
         "type": "control_request",
@@ -153,6 +156,7 @@ pub fn initialize_request(request_id: &str) -> Value {
         "request": {
             "subtype": "initialize",
             "hooks": { "Stop": [{ "hookCallbackIds": [STOP_HOOK_ID] }] },
+            "perTaskStopAffordance": true,
         },
     })
 }
