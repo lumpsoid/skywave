@@ -236,7 +236,9 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
     }
     events
         .iter()
-        .filter(|event| !observes_settings(event))
+        .filter(|event| {
+            !observes_settings(event) && !matches!(event, AdapterEvent::BackgroundTasks(_))
+        })
         .map(|event| match event {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
             AdapterEvent::Text(text) => format!("text: {}", cut(text)),
@@ -277,11 +279,45 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 format!("effort refused {effort:?}: {}", cut(reason))
             }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            // Filtered out above: [`timeline`] lists the task sets.
+            AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
         })
         .collect()
 }
 
-/// What the agent reports unasked about its mode and model.
+/// The turns, texts and task sets of `events`, one line each; a task reads
+/// `id:kind` or `id:kind<parent`, and `ambient` ones end in `~`.
+fn timeline(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::TurnStarted => Some("turn started".to_owned()),
+            AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
+            AdapterEvent::Text(text) => {
+                Some(format!("text: {}", text.lines().next().unwrap_or("")))
+            }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let tasks: Vec<String> = tasks
+                    .iter()
+                    .map(|t| {
+                        let parent = t
+                            .parent
+                            .as_deref()
+                            .map(|p| format!("<{p}"))
+                            .unwrap_or_default();
+                        let ambient = if t.ambient { "~" } else { "" };
+                        format!("{}:{:?}{parent}{ambient}", t.id, t.kind)
+                    })
+                    .collect();
+                Some(format!("tasks: [{}]", tasks.join(", ")))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the agent reports unasked about its mode and model, and the empty
+/// task set it reports once ready.
 fn observes_settings(event: &AdapterEvent) -> bool {
     matches!(
         event,
@@ -289,7 +325,7 @@ fn observes_settings(event: &AdapterEvent) -> bool {
             | AdapterEvent::Model(_)
             | AdapterEvent::Effort(_)
             | AdapterEvent::ModelsOffered(_)
-    )
+    ) || matches!(event, AdapterEvent::BackgroundTasks(tasks) if tasks.is_empty())
 }
 
 /// `events` as [`describe`] lists them.
@@ -2117,8 +2153,9 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     // status echo of the switch is not reported. The handshake and the
     // model switch each read the effort back.
     assert_eq!(
-        take_raw(&mut events, 4).await,
+        take_raw(&mut events, 5).await,
         [
+            AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
             AdapterEvent::PermissionModeSet(PermissionMode::Plan),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
@@ -2572,11 +2609,13 @@ fn replay_effort_switches_settle_from_get_settings() {
     let [
         AdapterEvent::PermissionMode(PermissionMode::Ask),
         AdapterEvent::ModelsOffered(_),
+        AdapterEvent::BackgroundTasks(none),
         rest @ ..,
     ] = events.as_slice()
     else {
         panic!("unexpected start: {events:?}");
     };
+    assert!(none.is_empty());
     let haiku = "claude-haiku-4-5-20251001";
     let set = |effort| AdapterEvent::EffortSet(Some(effort));
     let model_set = |model: &str| AdapterEvent::ModelSet(model.to_owned());
@@ -2622,8 +2661,9 @@ async fn a_session_starts_with_and_switches_its_effort() {
     // The looks after the handshake and the model switch are answered while
     // the start's effort chain runs, so they report nothing.
     assert_eq!(
-        take_raw(&mut events, 2).await,
+        take_raw(&mut events, 3).await,
         [
+            AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
             AdapterEvent::EffortSet(Some(Effort::High)),
         ]
@@ -2677,4 +2717,103 @@ async fn take_raw(events: &mut AdapterEvents, n: usize) -> Vec<AdapterEvent> {
         out.push(next_raw(events).await);
     }
     out
+}
+
+#[test]
+fn replay_background_bash_reports_the_shell_and_its_end() {
+    let events = replay("background_bash", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        timeline(&events),
+        [
+            "turn started",
+            "tasks: []",
+            "tasks: [bt1yntsud:Shell]",
+            "text: STARTED",
+            "turn ended",
+            // The shell ended; the CLI starts the next turn itself.
+            "tasks: []",
+            "turn started",
+            "text: DONE",
+            "turn ended",
+        ]
+    );
+}
+
+#[test]
+fn replay_subagent_messages_stay_off_the_main_timeline() {
+    // Positive control: the recording holds a subagent message that says
+    // PONG, so the absence below is the protocol's doing.
+    let from_subagent = fixture("subagent")
+        .iter()
+        .filter(|r| r["dir"] == "out")
+        .filter(|r| !r["msg"]["parent_tool_use_id"].is_null())
+        .filter(|r| r["msg"].to_string().contains("PONG"))
+        .count();
+    assert!(from_subagent > 0);
+    let events = replay("subagent", Uuid::new_v4(), false, &[]);
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"The subagent replied: **PONG**"),
+        "the main agent's own text is reported: {texts:?}"
+    );
+    assert!(!texts.contains(&"PONG"), "{texts:?}");
+    assert_eq!(texts.len(), 2, "{texts:?}");
+}
+
+#[test]
+fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
+    let events = replay("subagent_background_bash", Uuid::new_v4(), false, &[]);
+    let sub = "ad175146a4bfec159";
+    let sets: Vec<String> = timeline(&events)
+        .into_iter()
+        .filter(|l| l.starts_with("tasks: "))
+        .collect();
+    assert_eq!(
+        sets,
+        [
+            "tasks: []".to_owned(),
+            format!("tasks: [{sub}:Subagent]"),
+            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [b0mpthszv:Shell<{sub}]"),
+            // The re-woken subagent comes first, though it started first
+            // only by luck of the list: the CLI's order is kept.
+            format!("tasks: [{sub}:Subagent, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [b0mpthszv:Shell<{sub}]"),
+            "tasks: []".to_owned(),
+            format!("tasks: [{sub}:Subagent]"),
+            "tasks: []".to_owned(),
+        ]
+    );
+    // The set is empty only at the end.
+    let last_nonempty = sets.iter().rposition(|l| l != "tasks: []").unwrap();
+    assert_eq!(last_nonempty, sets.len() - 2);
+    assert!(
+        sets[..sets.len() - 3]
+            .iter()
+            .skip(1)
+            .all(|l| l != "tasks: []")
+    );
+}
+
+#[test]
+fn replay_loop_reports_no_task() {
+    let events = replay("loop", Uuid::new_v4(), false, &[]);
+    let sets: Vec<Vec<_>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::BackgroundTasks(tasks) => Some(tasks.clone()),
+            _ => None,
+        })
+        .collect();
+    // Positive control: the reports are seen, only none is non-empty.
+    assert!(!sets.is_empty());
+    assert!(sets.iter().all(Vec::is_empty));
 }

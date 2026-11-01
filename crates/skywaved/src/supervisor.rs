@@ -685,6 +685,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        let work = self.log.agent_work(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
         // An effort the running model takes none of, like an unknown one,
@@ -703,7 +704,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
                 tracing::info!(session = %session_id.0, context = %context.0, conversation = how, "agent started");
-                let mut mapper = EventMapper::new(session_id, context, settings.clone());
+                let mut mapper = EventMapper::new(session_id, context, settings.clone(), work);
                 let mut asked = HashSet::new();
                 if let Some(mode) = mode {
                     let command = settings.mode.requested.as_ref().map(|r| r.command);

@@ -61,6 +61,11 @@
 //!   `ModelsOffered`. [`StartSpec`] names the mode, model and effort to
 //!   start with; the adapter applies them as requests, so each is answered
 //!   the same way.
+//! - Work the agent runs outside a turn (background shells, subagents) is
+//!   reported as [`AdapterEvent::BackgroundTasks`], the whole live set, as
+//!   often as it changes. An adapter reports the empty set once the agent
+//!   is ready, since nothing is reported at start; the mapper logs only
+//!   changes.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -79,7 +84,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{ContextId, Decision, SessionId};
 pub use skywave_proto::{
-    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage,
+    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TaskKind, TurnUsage,
 };
 use tokio::sync::mpsc;
 
@@ -119,6 +124,19 @@ impl From<&str> for AgentCallId {
     fn from(id: &str) -> Self {
         AgentCallId(id.to_owned())
     }
+}
+
+/// One background task of the agent, uncut. The ids are the agent's own,
+/// opaque; the [`EventMapper`] cuts the rest for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTask {
+    pub id: String,
+    pub kind: TaskKind,
+    pub title: String,
+    /// The id of the subagent task that launched this one, if any.
+    pub parent: Option<String>,
+    /// Not activity (see [`skywave_proto::BackgroundTask::ambient`]).
+    pub ambient: bool,
 }
 
 /// How to show a tool call, uncut. Agent-agnostic (D3): the adapter maps its
@@ -304,6 +322,9 @@ pub enum AdapterEvent {
     EffortRefused { effort: Effort, reason: String },
     /// The models the agent offers, uncut.
     ModelsOffered(Vec<ModelChoice>),
+    /// Every live background task, in the agent's order; replaces the set
+    /// reported before. May repeat it.
+    BackgroundTasks(Vec<AgentTask>),
     /// The agent stopped; no further events follow. `error` is set when it
     /// stopped abnormally (crash, startup failure).
     Exited { error: Option<String> },
