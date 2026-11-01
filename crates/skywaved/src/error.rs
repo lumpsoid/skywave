@@ -59,6 +59,8 @@ pub enum Error {
     Qr(String),
     #[error("no session context with id {}", .0.0)]
     UnknownContext(skywave_proto::ContextId),
+    #[error("no session with id {}", .0.0)]
+    UnknownSession(skywave_proto::SessionId),
     #[error("agent supervisor: {0}")]
     Supervisor(String),
 }

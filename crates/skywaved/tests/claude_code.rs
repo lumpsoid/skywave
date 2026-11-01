@@ -18,8 +18,9 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, DisplayBody, Effort, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
-    RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    BodyFormat, DisplayBody, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay,
+    ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome,
+    TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -246,6 +247,7 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                     handle.0["session_id"].as_str().unwrap()
                 )
             }
+            AdapterEvent::Grants(grants) => format!("grants: {}", grants.0),
             AdapterEvent::Exited { error } => format!("exited: {error:?}"),
             AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
             AdapterEvent::PermissionModeSet(mode) => format!("mode set: {mode:?}"),
@@ -1304,26 +1306,20 @@ fn a_failed_turn_and_unknown_messages() {
 }
 
 #[test]
-fn resume_handles_round_trip() {
+fn resume_handles_round_trip_and_carry_no_rules() {
     let id = Uuid::new_v4();
-    let handle = protocol::resume_handle(id, &[]);
+    let handle = protocol::resume_handle(id);
     assert_eq!(handle.0, json!({ "session_id": id.to_string() }));
-    assert_eq!(protocol::parse_resume_handle(&handle), Ok((id, Vec::new())));
+    assert_eq!(protocol::parse_resume_handle(&handle), Ok(id));
+    // A handle stored while grants rode in it still names its session.
     let rules = [json!({"type":"setMode","mode":"acceptEdits","destination":"session"})];
-    let handle = protocol::resume_handle(id, &rules);
-    assert_eq!(
-        handle.0,
-        json!({ "session_id": id.to_string(), "rules": rules })
-    );
-    assert_eq!(
-        protocol::parse_resume_handle(&handle),
-        Ok((id, rules.to_vec()))
-    );
+    let old = ResumeHandle(json!({ "session_id": id.to_string(), "rules": rules }));
+    assert_eq!(protocol::parse_resume_handle(&old), Ok(id));
     assert!(protocol::parse_resume_handle(&ResumeHandle(json!({ "other": 1 }))).is_err());
 }
 
 #[test]
-fn a_granted_session_rule_is_added_to_the_resume_handle() {
+fn a_granted_session_rule_is_reported_as_the_sessions_grants() {
     let requests = permission_requests("permissions");
     // Request #1 offers a project rule (0), then session ones (1, 2).
     let request = &requests[1];
@@ -1333,21 +1329,21 @@ fn a_granted_session_rule_is_added_to_the_resume_handle() {
     let id = Uuid::new_v4();
     let earlier = json!({"type":"addDirectories","directories":["/srv"],"destination":"session"});
 
-    // A project rule is kept by the CLI's settings: no new handle.
+    // A project rule is kept by the CLI's settings: no new grants.
     let mut protocol = Protocol::new(id, true).with_session_rules(vec![earlier.clone()]);
     protocol.on_line(&line);
     let out = protocol.answer(&request_id, Decision::Approve, Some(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
 
-    // A session rule joins the ones the process was started with.
+    // A session rule joins the ones the process was started with: the
+    // whole set is reported, and no handle.
     let mut protocol = Protocol::new(id, true).with_session_rules(vec![earlier.clone()]);
     protocol.on_line(&line);
     let out = protocol.answer(&request_id, Decision::Approve, Some(2));
     assert_eq!(
         out.events,
-        [AdapterEvent::ResumeHandle(protocol::resume_handle(
-            id,
-            &[earlier, offered[2].clone()]
+        [AdapterEvent::Grants(Grants(
+            json!({ "rules": [earlier, offered[2].clone()] })
         ))]
     );
 
@@ -1356,6 +1352,55 @@ fn a_granted_session_rule_is_added_to_the_resume_handle() {
     protocol.on_line(&line);
     let out = protocol.answer(&request_id, Decision::Deny, Some(2));
     assert!(out.events.is_empty());
+}
+
+#[test]
+fn a_fresh_process_reports_its_handle_with_its_first_turn_only() {
+    let id = Uuid::new_v4();
+    let handle = AdapterEvent::ResumeHandle(protocol::resume_handle(id));
+    let mut protocol = Protocol::new(id, false);
+    assert!(protocol.start().events.is_empty());
+    let first = protocol.send_message("hi".into());
+    assert_eq!(first.events, [handle, AdapterEvent::TurnStarted]);
+    protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    let second = protocol.send_message("again".into());
+    assert_eq!(second.events, [AdapterEvent::TurnStarted]);
+
+    // A resumed process has its handle stored already.
+    let mut protocol = Protocol::new(id, true);
+    assert!(protocol.start().events.is_empty());
+    let first = protocol.send_message("hi".into());
+    assert_eq!(first.events, [AdapterEvent::TurnStarted]);
+}
+
+#[test]
+fn a_session_id_change_reports_the_handle_once_with_the_new_id() {
+    let id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let init = format!(r#"{{"type":"system","subtype":"init","session_id":"{other}"}}"#);
+
+    // A turn the CLI starts on its own, before any handle: one report,
+    // already naming the id the CLI runs under.
+    let mut protocol = Protocol::new(id, false);
+    protocol.start();
+    let out = protocol.on_line(&init);
+    assert_eq!(
+        out.events,
+        [
+            AdapterEvent::ResumeHandle(protocol::resume_handle(other)),
+            AdapterEvent::TurnStarted,
+        ]
+    );
+
+    // A handle reported with the old id is reported anew.
+    let mut protocol = Protocol::new(id, false);
+    protocol.start();
+    protocol.send_message("hi".into());
+    let out = protocol.on_line(&init);
+    assert_eq!(
+        out.events,
+        [AdapterEvent::ResumeHandle(protocol::resume_handle(other))]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,6 +1427,7 @@ fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
         context: ContextId::first_of(session_id),
         workdir: workdir.to_owned(),
         resume,
+        grants: None,
         mode: None,
         model: None,
         effort: None,
@@ -1412,6 +1458,29 @@ async fn take(events: &mut AdapterEvents, n: usize) -> Vec<AdapterEvent> {
         out.push(next(events).await);
     }
     out
+}
+
+/// The first turn of a fresh process: its resume handle, `{"session_id"}`
+/// alone, then `TurnStarted`. The CLI session id the handle names.
+async fn handle_then_turn(events: &mut AdapterEvents) -> Uuid {
+    let AdapterEvent::ResumeHandle(handle) = next(events).await else {
+        panic!("expected the resume handle with the first turn");
+    };
+    let id = protocol::parse_resume_handle(&handle).unwrap();
+    assert_eq!(
+        handle,
+        protocol::resume_handle(id),
+        "a handle with more in it"
+    );
+    assert_eq!(next(events).await, AdapterEvent::TurnStarted);
+    id
+}
+
+/// The `--session-id` the last process was started with.
+fn session_id_arg(workdir: &Path) -> Uuid {
+    let argv = argv(workdir);
+    let at = argv.iter().position(|a| a == "--session-id").unwrap();
+    Uuid::parse_str(&argv[at + 1]).unwrap()
 }
 
 fn argv(workdir: &Path) -> Vec<String> {
@@ -1498,21 +1567,14 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
 
-    // The handle is known before any turn, and names the --session-id.
-    let AdapterEvent::ResumeHandle(handle) = next(&mut events).await else {
-        panic!("expected the resume handle first");
-    };
-    let (id, _) = protocol::parse_resume_handle(&handle).unwrap();
+    // The handle comes with the first turn, and names the --session-id.
+    session.send_message("hello".to_owned()).await.unwrap();
+    let id = handle_then_turn(&mut events).await;
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
     expected.extend(["--session-id".to_owned(), id.to_string()]);
     expected.extend(["--model".to_owned(), "haiku".to_owned()]);
     assert_eq!(argv(tmp.path()), expected);
-
-    session.send_message("hello".to_owned()).await.unwrap();
-    assert_eq!(
-        take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
-    );
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
 
     // Allow, with a message queued behind the approval and a stale answer.
     session
@@ -1617,34 +1679,36 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     assert!(events.recv().await.is_none());
 }
 
-#[tokio::test]
-async fn a_restart_resumes_with_the_handle_and_its_session_rules() {
-    let tmp = tempfile::tempdir().unwrap();
-    let id = Uuid::new_v4();
+/// Session rules the CLI keeps in its process only, and the flags that
+/// grant them again.
+fn session_rules() -> (Grants, [&'static str; 4]) {
     let rules = [
         json!({"type":"setMode","mode":"acceptEdits","destination":"session"}),
         json!({"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo test"}],
                "behavior":"allow","destination":"session"}),
     ];
-    let handle = protocol::resume_handle(id, &rules);
-    let (mut session, mut events) = adapter()
-        .start(spec(tmp.path(), Some(handle)))
-        .await
-        .unwrap();
+    let flags = [
+        "--permission-mode",
+        "acceptEdits",
+        "--allowedTools",
+        "Bash(cargo test)",
+    ];
+    (rules::grants(&rules), flags)
+}
+
+#[tokio::test]
+async fn a_restart_resumes_with_the_handle_and_the_sessions_grants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = Uuid::new_v4();
+    let (grants, flags) = session_rules();
+    let spec = StartSpec {
+        grants: Some(grants),
+        ..spec(tmp.path(), Some(protocol::resume_handle(id)))
+    };
+    let (mut session, mut events) = adapter().start(spec).await.unwrap();
     let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
-    expected.extend(
-        [
-            "--permission-mode",
-            "acceptEdits",
-            "--allowedTools",
-            "Bash(cargo test)",
-            "--resume",
-            &id.to_string(),
-            "--model",
-            "haiku",
-        ]
-        .map(str::to_owned),
-    );
+    expected.extend(flags.map(str::to_owned));
+    expected.extend(["--resume", &id.to_string(), "--model", "haiku"].map(str::to_owned));
     assert_eq!(argv(tmp.path()), expected);
 
     // No new handle: the first event is the turn.
@@ -1664,9 +1728,107 @@ async fn a_restart_resumes_with_the_handle_and_its_session_rules() {
 }
 
 #[tokio::test]
+async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (grants, flags) = session_rules();
+    let spec = StartSpec {
+        grants: Some(grants),
+        ..spec(tmp.path(), None)
+    };
+    let (mut session, mut events) = adapter().start(spec).await.unwrap();
+    session.send_message("hello".to_owned()).await.unwrap();
+    let id = handle_then_turn(&mut events).await;
+    let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+    expected.extend(flags.map(str::to_owned));
+    expected.extend(["--session-id", &id.to_string(), "--model", "haiku"].map(str::to_owned));
+    assert_eq!(argv(tmp.path()), expected);
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
+    // Reported once: the next turn brings none.
+    session.send_message("again".to_owned()).await.unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let first = session_id_arg(tmp.path());
+    session.shutdown().await.unwrap();
+    // Nothing between the start and the exit: the CLI holds no
+    // conversation to resume, so the context stores no handle.
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(events.recv().await.is_none());
+
+    // So the context's next start is fresh again, with a new id; with a
+    // message, that one does report its handle.
+    let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
+    let second = session_id_arg(tmp.path());
+    assert_ne!(first, second);
+    session.send_message("hello".to_owned()).await.unwrap();
+    assert_eq!(handle_then_turn(&mut events).await, second);
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_old_handle_with_rules_still_resumes_without_granting_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = Uuid::new_v4();
+    let (grants, flags) = session_rules();
+    // Stored while grants rode in the handle: its rules are not granted;
+    // only `spec.grants` are.
+    let old = ResumeHandle(json!({ "session_id": id.to_string(), "rules": grants.0["rules"] }));
+    let resume_args: Vec<String> = ["--resume", &id.to_string(), "--model", "haiku"]
+        .map(str::to_owned)
+        .into();
+    let required: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+
+    let (session, _events) = adapter()
+        .start(spec(tmp.path(), Some(old.clone())))
+        .await
+        .unwrap();
+    assert_eq!(
+        argv(tmp.path()),
+        [required.clone(), resume_args.clone()].concat()
+    );
+    session.shutdown().await.unwrap();
+
+    // Control: the same rules given as the session's grants are granted.
+    let spec = StartSpec {
+        grants: Some(grants),
+        ..spec(tmp.path(), Some(old))
+    };
+    let (session, _events) = adapter().start(spec).await.unwrap();
+    let flags: Vec<String> = flags.map(str::to_owned).into();
+    assert_eq!(argv(tmp.path()), [required, flags, resume_args].concat());
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn foreign_grants_are_a_start_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = StartSpec {
+        grants: Some(Grants(json!({ "fake": 1 }))),
+        ..spec(tmp.path(), None)
+    };
+    let error = adapter().start(spec).await.unwrap_err();
+    assert!(matches!(error, AgentError::Start(_)), "{error:?}");
+}
+
+#[tokio::test]
 async fn resuming_an_unknown_session_is_a_resume_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let handle = protocol::resume_handle(Uuid::nil(), &[]);
+    let handle = protocol::resume_handle(Uuid::nil());
     let error = adapter()
         .start(spec(tmp.path(), Some(handle)))
         .await
@@ -1705,15 +1867,9 @@ async fn a_missing_command_is_a_start_error() {
 async fn shutdown_after_an_interrupt_waits_for_the_result() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
-    assert!(matches!(
-        next(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     session.send_message("hang".to_owned()).await.unwrap();
-    assert_eq!(
-        take(&mut events, 2).await,
-        [AdapterEvent::TurnStarted, text("working")]
-    );
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
     // A message queued behind the running turn is dropped by the shutdown.
     session.send_message("never sent".to_owned()).await.unwrap();
     session.interrupt().await.unwrap();
@@ -1729,15 +1885,9 @@ async fn shutdown_after_an_interrupt_waits_for_the_result() {
 async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
-    assert!(matches!(
-        next(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     session.send_message("approve".to_owned()).await.unwrap();
-    assert_eq!(
-        take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, write_call(), write_approval()]
-    );
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 2).await, [write_call(), write_approval()]);
     let pid = fake_pid(tmp.path());
     session.shutdown().await.unwrap();
     // Neither cancelled nor ended: the process was killed, not interrupted.
@@ -1753,19 +1903,13 @@ async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
 async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
-    assert!(matches!(
-        next(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     session.send_message("crash".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
     assert_eq!(
-        take(&mut events, 2).await,
-        [
-            AdapterEvent::TurnStarted,
-            AdapterEvent::Exited {
-                error: Some("boom: the agent fell over".to_owned())
-            },
-        ]
+        take(&mut events, 1).await,
+        [AdapterEvent::Exited {
+            error: Some("boom: the agent fell over".to_owned())
+        },]
     );
     assert!(events.recv().await.is_none());
     assert!(matches!(
@@ -1778,15 +1922,9 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
 async fn dropping_the_session_stops_the_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter().start(spec(tmp.path(), None)).await.unwrap();
-    assert!(matches!(
-        next(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     session.send_message("hang".to_owned()).await.unwrap();
-    assert_eq!(
-        take(&mut events, 2).await,
-        [AdapterEvent::TurnStarted, text("working")]
-    );
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
     let pid = fake_pid(tmp.path());
     drop(session);
     assert_eq!(
@@ -1804,10 +1942,6 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     spec.mode = Some(PermissionMode::Plan);
     spec.model = Some("sonnet".to_owned());
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
-    assert!(matches!(
-        next_raw(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     // Asked for after the handshake, answered like any request; the
     // status echo of the switch is not reported. The handshake and the
     // model switch each read the effort back.
@@ -1822,6 +1956,11 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     );
 
     session.send_message("hello".to_owned()).await.unwrap();
+    // The handle comes with the first turn.
+    assert!(matches!(
+        next_raw(&mut events).await,
+        AdapterEvent::ResumeHandle(_)
+    ));
     let usage = AdapterEvent::TurnUsage(TurnUsage {
         model: Some("resolved-sonnet".to_owned()),
         ..TurnUsage::default()
@@ -2258,8 +2397,8 @@ fn a_model_switch_reads_the_effort_and_a_refused_one_does_not() {
 #[test]
 fn replay_effort_switches_settle_from_get_settings() {
     let events = replay_strict("effort_switch", Uuid::new_v4(), &[]);
+    // No message, so no conversation: no handle either.
     let [
-        AdapterEvent::ResumeHandle(_),
         AdapterEvent::PermissionMode(PermissionMode::Ask),
         AdapterEvent::ModelsOffered(_),
         rest @ ..,
@@ -2309,10 +2448,6 @@ async fn a_session_starts_with_and_switches_its_effort() {
     spec.model = Some("sonnet".to_owned());
     spec.effort = Some(Effort::High);
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
-    assert!(matches!(
-        next_raw(&mut events).await,
-        AdapterEvent::ResumeHandle(_)
-    ));
     // The looks after the handshake and the model switch are answered while
     // the start's effort chain runs, so they report nothing.
     assert_eq!(

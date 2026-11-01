@@ -75,6 +75,7 @@ impl Fixture {
             workdir: self.workdir.clone(),
             resume: load_resume_handle(&self.storage.db, ContextId::first_of(self.session_id))
                 .unwrap(),
+            grants: None,
             mode: None,
             model: None,
             effort: None,
@@ -349,6 +350,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
             FakeInput::Started {
                 resumed: false,
                 context: ContextId::first_of(f.session_id),
+                grants: None,
             },
             FakeInput::Message("look around".into()),
             FakeInput::Answer("req-1".into(), Decision::Approve, None),

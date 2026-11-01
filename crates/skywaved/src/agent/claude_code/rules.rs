@@ -18,12 +18,30 @@
 //! **Session rules outlive the process.** The CLI keeps a granted update
 //! with destination `session` or `cliArg` in its process only, but the rule
 //! was granted for the Skywave session, which outlives it (an idle shutdown,
-//! a daemon restart). [`keep`] collects those updates for the resume handle;
-//! [`cli_args`] grants them again to the resumed process as flags.
+//! a daemon restart, a new context). [`keep`] collects those updates; they
+//! are the session's [`Grants`] `{"rules": [...]}` ([`grants`]), stored per
+//! Skywave session apart from each context's resume handle, and
+//! [`cli_args`] grants them again as flags to every later process of the
+//! session, fresh or resumed, whichever context it runs.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::agent::{RuleScope, RuleSuggestion};
+use crate::agent::{Grants, RuleScope, RuleSuggestion};
+
+/// The session's grants holding `kept`, the whole set.
+pub fn grants(kept: &[Value]) -> Grants {
+    Grants(json!({ "rules": kept }))
+}
+
+/// The kept updates in grants made by [`grants`].
+pub fn parse_grants(grants: &Grants) -> Result<Vec<Value>, String> {
+    grants
+        .0
+        .get("rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| format!("not grants of this adapter: {}", grants.0))
+}
 
 /// The suggestions of a request worth offering, each with the update to
 /// send back when it is granted, in the request's order.
@@ -58,7 +76,7 @@ pub fn keep(kept: &mut Vec<Value>, update: &Value) -> bool {
 }
 
 /// The CLI flags that grant `kept` again, in order. Updates that allow
-/// nothing more are skipped, so a stored handle cannot narrow the process.
+/// nothing more are skipped, so stored grants cannot narrow the process.
 pub fn cli_args(kept: &[Value]) -> Vec<String> {
     let mut args = Vec::new();
     for update in kept.iter().filter(|u| label(u).is_some()) {
@@ -237,6 +255,15 @@ mod tests {
                 "/srv/b",
             ]
         );
+    }
+
+    #[test]
+    fn grants_round_trip_and_foreign_ones_are_refused() {
+        let kept = vec![json!({"type":"setMode","mode":"acceptEdits","destination":"session"})];
+        assert_eq!(grants(&kept).0, json!({ "rules": kept }));
+        assert_eq!(parse_grants(&grants(&kept)).unwrap(), kept);
+        assert_eq!(parse_grants(&grants(&[])).unwrap(), Vec::<Value>::new());
+        assert!(parse_grants(&Grants(json!({ "session_id": "x" }))).is_err());
     }
 
     #[test]
