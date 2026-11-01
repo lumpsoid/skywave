@@ -503,6 +503,18 @@ pub fn load_origin(db: &Db, context: ContextId) -> Result<Option<ContextId>> {
     }
 }
 
+/// The agent's own id of the outside conversation session context
+/// `context` adopts: set on the first context of a session created by
+/// adoption, `None` for any other.
+pub fn load_adopted(db: &Db, context: ContextId) -> Result<Option<String>> {
+    let row: Option<Option<String>> = db
+        .conn()
+        .prepare_cached("SELECT adopted FROM contexts WHERE id = ?1")?
+        .query_row([context.0.to_string()], |r| r.get(0))
+        .optional()?;
+    row.ok_or(Error::UnknownContext(context))
+}
+
 /// Persists `grants` as session `session`'s grants, replacing any earlier.
 pub fn store_grants(db: &Db, session: SessionId, grants: &Grants) -> Result<()> {
     let changed = db
