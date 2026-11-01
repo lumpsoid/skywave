@@ -36,7 +36,13 @@
 //! the first message of a fresh start, not at the start itself. Starting a
 //! context fresh after it got a message fails ("already exists; resume
 //! it"); starting one that never got a message fresh again is fine. A
-//! handle for another context is refused.
+//! handle for another context is refused. A fork names the handle of a
+//! context whose conversation exists, in any session (progress is kept per
+//! session, so the lookup crosses them), and is recorded as
+//! [`FakeConversation::Fork`] of that context; like a fresh start, it
+//! reports the forking context's own handle at its first message. A fork of
+//! a context with no conversation is refused, and so is forking into a
+//! context that already has one.
 //!
 //! ```
 //! use skywaved::agent::fake::{FakeAgent, FakeScript, Step};
@@ -74,8 +80,8 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
-    RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSession, Conversation, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay,
+    ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -306,11 +312,22 @@ impl Default for Gate {
     }
 }
 
+/// Which conversation a fake start ran, as recorded in
+/// [`FakeInput::Started`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeConversation {
+    Fresh,
+    /// The started context's own.
+    Resume,
+    /// A copy of this context's conversation.
+    Fork(ContextId),
+}
+
 /// A request a fake session received, as recorded by [`FakeAgent::inputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeInput {
     Started {
-        resumed: bool,
+        conversation: FakeConversation,
         context: ContextId,
         /// The session's grants the start was given.
         grants: Option<Grants>,
@@ -362,26 +379,53 @@ impl FakeAgent {
     pub fn resume_handle(context: ContextId) -> ResumeHandle {
         ResumeHandle(json!({ "fake_context": context.0 }))
     }
+
+    /// The context `handle` names, if it is one the fake reported.
+    fn handle_context(handle: &ResumeHandle) -> Option<ContextId> {
+        handle
+            .0
+            .get("fake_context")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .map(ContextId)
+    }
 }
 
 impl AgentAdapter for FakeAgent {
     type Session = FakeSession;
 
     async fn start(&self, spec: StartSpec) -> Result<(FakeSession, AdapterEvents), AgentError> {
-        let resumed = spec.resume.is_some();
-        if let Some(handle) = &spec.resume {
-            let named = handle
-                .0
-                .get("fake_context")
-                .and_then(Value::as_str)
-                .and_then(|id| Uuid::parse_str(id).ok());
-            if named != Some(spec.context.0) {
-                return Err(AgentError::Resume(format!(
-                    "handle {} is not for context {}",
-                    handle.0, spec.context.0
-                )));
+        let conversation = match &spec.conversation {
+            Conversation::Fresh => FakeConversation::Fresh,
+            Conversation::Resume(handle) => {
+                if FakeAgent::handle_context(handle) != Some(spec.context) {
+                    return Err(AgentError::Resume(format!(
+                        "handle {} is not for context {}",
+                        handle.0, spec.context.0
+                    )));
+                }
+                FakeConversation::Resume
             }
-        }
+            Conversation::Fork(handle) => {
+                let shared = lock(&self.shared);
+                match FakeAgent::handle_context(handle) {
+                    Some(origin)
+                        if shared
+                            .values()
+                            .any(|progress| progress.conversations.contains(&origin)) =>
+                    {
+                        FakeConversation::Fork(origin)
+                    }
+                    _ => {
+                        return Err(AgentError::Resume(format!(
+                            "handle {} names no conversation to fork",
+                            handle.0
+                        )));
+                    }
+                }
+            }
+        };
+        let resumed = conversation == FakeConversation::Resume;
         {
             let mut shared = lock(&self.shared);
             let progress = shared.entry(spec.session_id).or_default();
@@ -392,7 +436,7 @@ impl AgentAdapter for FakeAgent {
                 )));
             }
             progress.inputs.push(FakeInput::Started {
-                resumed,
+                conversation,
                 context: spec.context,
                 grants: spec.grants.clone(),
             });
@@ -427,7 +471,8 @@ impl AgentAdapter for FakeAgent {
         let runner = Runner {
             session_id: spec.session_id,
             context: spec.context,
-            // A resumed conversation exists and its handle is stored.
+            // A resumed conversation exists and its handle is stored; a
+            // fork's copy, like a fresh one, exists from its first message.
             handle_reported: resumed,
             script: Arc::clone(&self.script),
             shared: Arc::clone(&self.shared),
