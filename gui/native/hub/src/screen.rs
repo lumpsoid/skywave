@@ -10,10 +10,12 @@ use skywave_core::{
     ViewState,
 };
 use skywave_present::format::{
-    agent_effort_label, agent_mode_label, agent_model_label, answer_words, blob_size, bytes,
-    context_moved_label, context_row, delivery_label, dollars, effort_label, effort_refusal,
-    fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal,
-    move_refusal, outgoing_label, scope_label, tokens, turn_time, viewing_hint,
+    AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
+    agent_effort_label, agent_mode_label, agent_model_label, answer_words, background_rows,
+    blob_size, bytes, context_moved_label, context_row, delivery_label, dollars, effort_label,
+    effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
+    model_refusal, move_refusal, outgoing_label, repeat_word, scope_label, stop_heading,
+    stop_warning, task_kind_word, tokens, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -23,7 +25,8 @@ use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
     ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, ToolKindView,
+    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
+    StopHeadings, TaskRow, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -286,6 +289,46 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .as_ref()
             .map(|o| format!("switch {}", outgoing_label(o))),
         can_clear: session.can_clear,
+        work_label: work_summary(&session.work),
+        stop_warning: stop_warning(&session.work),
+        stop_headings: StopHeadings {
+            stop_agent: stop_heading(StopAction::Agent).to_owned(),
+            new_context: stop_heading(StopAction::NewContext).to_owned(),
+            switch_context: stop_heading(StopAction::SwitchContext).to_owned(),
+            move_context: stop_heading(StopAction::MoveContext).to_owned(),
+        },
+        tasks: background_rows(&session.work)
+            .into_iter()
+            .filter_map(|row| match row {
+                BackgroundRow::Task(task, depth) => Some(TaskRow {
+                    task_id: task.id.0.clone(),
+                    depth: depth as u32,
+                    kind_label: task_kind_word(task.kind).to_owned(),
+                    title: clean_line(&task.title),
+                    ambient_label: task.ambient.then(|| AMBIENT_WORD.to_owned()),
+                    stop_label: session
+                        .task_stops
+                        .iter()
+                        .find(|(id, _)| *id == task.id)
+                        .map(|(_, outgoing)| outgoing_label(outgoing)),
+                }),
+                BackgroundRow::Loop(_) => None,
+            })
+            .collect(),
+        schedules: session
+            .work
+            .schedules
+            .iter()
+            .map(|s| ScheduleRow {
+                schedule_id: s.id.0.clone(),
+                when: clean_line(&s.when),
+                repeat_label: repeat_word(s.recurring).to_owned(),
+                prompt: clean_line(&s.prompt),
+                saved_label: (s.outlives_agent == Some(true)).then(|| SAVED_IN_FOLDER.to_owned()),
+            })
+            .collect(),
+        loops_note: (!session.work.schedules.is_empty()).then(|| LOOPS_NOTE.to_owned()),
+        work_empty_label: NOTHING_RUNNING.to_owned(),
         contexts: session
             .contexts
             .iter()
@@ -667,5 +710,153 @@ fn badge(state: &SessionState) -> &'static str {
         SessionState::AwaitingApproval(_) => "approval",
         SessionState::Errored(_) => "error",
         SessionState::Stopped => "stopped",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use skywave_core::{
+        AgentWork, Attention, BackgroundTask, Link, Outgoing, Schedule, ScheduleId, Seq, TaskId,
+        TaskKind,
+    };
+
+    use super::*;
+
+    fn task(id: &str, parent: Option<&str>, ambient: bool) -> BackgroundTask {
+        BackgroundTask {
+            id: TaskId(id.into()),
+            kind: TaskKind::Shell,
+            title: format!("run {id}"),
+            parent: parent.map(|p| TaskId(p.into())),
+            ambient,
+        }
+    }
+
+    fn session_screen(work: AgentWork, task_stops: Vec<(TaskId, Outgoing)>) -> SessionScreen {
+        let session = SessionView {
+            id: skywave_core::SessionId::new(),
+            title: "x".into(),
+            named: false,
+            rename: None,
+            archived: false,
+            workdir: None,
+            state: SessionState::Idle,
+            timeline: Vec::new(),
+            pending_approval: None,
+            rules: Vec::new(),
+            usage: None,
+            agent: AgentView::default(),
+            contexts: Vec::new(),
+            context: skywave_core::ContextId::new(),
+            viewing: None,
+            can_clear: false,
+            clear: None,
+            switch: None,
+            interrupt: None,
+            stop: None,
+            work,
+            task_stops,
+            draft: None,
+            draft_rev: 0,
+            last_seq: Seq(0),
+            unread_from: None,
+        };
+        let view = ViewState {
+            link: Link::Connecting,
+            queued: 0,
+            attention: Attention::default(),
+            screen: Screen::Session(Box::new(session)),
+            can_go_back: true,
+            snippets: Vec::new(),
+        };
+        let form = PairForm::default();
+        let ui = Ui {
+            form: &form,
+            create: None,
+            rename: None,
+            composer: None,
+            revoked_dismissed: false,
+        };
+        match update(&view, ui).screen {
+            ScreenView::Session { session } => session,
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_work_says_nothing() {
+        let screen = session_screen(AgentWork::default(), Vec::new());
+        assert_eq!(screen.work_label, None);
+        assert_eq!(screen.stop_warning, None);
+        assert!(screen.tasks.is_empty() && screen.schedules.is_empty());
+        assert_eq!(screen.loops_note, None);
+    }
+
+    #[test]
+    fn work_rows_carry_depth_labels_and_this_devices_stop() {
+        let work = AgentWork {
+            tasks: vec![
+                task("child", Some("top"), false),
+                task("top", None, false),
+                task("watch", None, true),
+            ],
+            schedules: vec![
+                Schedule {
+                    id: ScheduleId("s1".into()),
+                    when: "*/5 * * * *".into(),
+                    recurring: true,
+                    prompt: "check".into(),
+                    outlives_agent: Some(true),
+                },
+                Schedule {
+                    id: ScheduleId("s2".into()),
+                    when: "in 1h".into(),
+                    recurring: false,
+                    prompt: "later".into(),
+                    outlives_agent: None,
+                },
+            ],
+        };
+        let screen = session_screen(work, vec![(TaskId("top".into()), Outgoing::Queued)]);
+        assert_eq!(
+            screen.work_label.as_deref(),
+            Some("2 background tasks · 2 loops")
+        );
+        assert!(screen.stop_warning.as_deref().is_some_and(|w| {
+            w.starts_with("Stopping ends 2 background tasks and pauses 2 loops.")
+        }));
+        let shape: Vec<(&str, u32)> = screen
+            .tasks
+            .iter()
+            .map(|t| (t.task_id.as_str(), t.depth))
+            .collect();
+        assert_eq!(shape, [("top", 0), ("child", 1), ("watch", 0)]);
+        assert_eq!(screen.tasks[0].kind_label, "shell");
+        assert_eq!(screen.tasks[0].stop_label.as_deref(), Some("queued"));
+        assert_eq!(screen.tasks[1].stop_label, None);
+        assert_eq!(screen.tasks[2].ambient_label.as_deref(), Some("watcher"));
+        assert_eq!(screen.tasks[0].ambient_label, None);
+        assert_eq!(screen.schedules[0].repeat_label, "repeats");
+        assert_eq!(
+            screen.schedules[0].saved_label.as_deref(),
+            Some("saved in this folder")
+        );
+        assert_eq!(screen.schedules[1].repeat_label, "once");
+        assert_eq!(screen.schedules[1].saved_label, None);
+        assert!(screen.loops_note.is_some());
+        assert_eq!(screen.stop_headings.stop_agent, "Stop the agent?");
+    }
+
+    #[test]
+    fn a_watcher_alone_needs_no_confirmation() {
+        let work = AgentWork {
+            tasks: vec![task("watch", None, true)],
+            schedules: Vec::new(),
+        };
+        let screen = session_screen(work, Vec::new());
+        assert_eq!(screen.stop_warning, None);
+        assert_eq!(screen.work_label, None);
+        assert_eq!(screen.tasks.len(), 1, "still listed");
     }
 }

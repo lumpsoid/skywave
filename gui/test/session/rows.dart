@@ -163,6 +163,10 @@ SessionScreen screenWith({
   String? viewingHint,
   String? clearLabel,
   String? switchLabel,
+  String? workLabel,
+  String? stopWarning,
+  List<TaskRow> tasks = const [],
+  List<ScheduleRow> schedules = const [],
 }) => SessionScreen(
   sessionId: 's1',
   title: 'work',
@@ -174,6 +178,20 @@ SessionScreen screenWith({
   interruptBusy: interruptBusy,
   interruptRefusal: interruptRefusal,
   canClear: canClear,
+  workLabel: workLabel,
+  stopWarning: stopWarning,
+  stopHeadings: const StopHeadings(
+    stopAgent: 'Stop the agent?',
+    newContext: 'Start a new context?',
+    switchContext: 'Switch context?',
+    moveContext: 'Move this context to a new session?',
+  ),
+  tasks: tasks,
+  schedules: schedules,
+  loopsNote: schedules.isEmpty
+      ? null
+      : 'Loops as of the last turn; ask the agent to end one.',
+  workEmptyLabel: 'Nothing is running in the background.',
   contexts: contexts,
   contextId: contextId,
   viewingId: viewingId,

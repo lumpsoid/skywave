@@ -11,12 +11,14 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, AgentWork, ApprovalId, BackgroundTask, BlobPolicy, BlobState, Completion,
-    ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView,
-    PermissionMode, Route, Schedule, Screen, Seq, SessionId, SessionListView, SessionRow,
-    SessionView, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
+    Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
+    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TaskId, TimelineItem,
+    ToolOutcome, ViewState, parse_pair_uri,
 };
-use skywave_present::format::{bytes, mode_needs_confirmation, move_refusal};
+use skywave_present::format::{
+    BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
+};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
     looks_like_pair_uri, stop_needs_confirmation, unanswered,
@@ -402,6 +404,16 @@ pub enum StopKind {
 }
 
 impl StopKind {
+    /// Which action this is, for the wording shared with the other head.
+    pub fn stop_action(self) -> StopAction {
+        match self {
+            StopKind::Session => StopAction::Agent,
+            StopKind::Clear => StopAction::NewContext,
+            StopKind::Switch(_) => StopAction::SwitchContext,
+            StopKind::Move(_) => StopAction::MoveContext,
+        }
+    }
+
     fn action(self, session_id: SessionId) -> Action {
         match self {
             StopKind::Session => Action::StopSession { session_id },
@@ -416,44 +428,6 @@ impl StopKind {
             },
         }
     }
-}
-
-/// A row of [`Picker::Background`].
-pub enum BackgroundRow<'a> {
-    /// A task, `depth` levels under a task that started it.
-    Task(&'a BackgroundTask, usize),
-    /// A loop.
-    Loop(&'a Schedule),
-}
-
-/// The rows of the background picker: each task followed by the tasks it
-/// started, then the loops.
-pub fn background_rows(work: &AgentWork) -> Vec<BackgroundRow<'_>> {
-    fn add<'a>(
-        work: &'a AgentWork,
-        parent: Option<&TaskId>,
-        depth: usize,
-        rows: &mut Vec<BackgroundRow<'a>>,
-    ) {
-        for task in &work.tasks {
-            let top = depth == 0
-                && task
-                    .parent
-                    .as_ref()
-                    .is_none_or(|p| !work.tasks.iter().any(|t| t.id == *p));
-            if top || (depth > 0 && task.parent.as_ref() == parent) {
-                rows.push(BackgroundRow::Task(task, depth));
-                // Bounded: a cycle would otherwise never end.
-                if depth < work.tasks.len() {
-                    add(work, Some(&task.id), depth + 1, rows);
-                }
-            }
-        }
-    }
-    let mut rows = Vec::new();
-    add(work, None, 0, &mut rows);
-    rows.extend(work.schedules.iter().map(BackgroundRow::Loop));
-    rows
 }
 
 /// The rows of [`Picker::Agent`].

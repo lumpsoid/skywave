@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use skywave_core::{
-    AgentSetting, AgentView, AgentWork, BlobState, ContextView, Decision, Delivery, DeviceRef,
-    Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
-    SessionRef, SessionView,
+    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, ContextView, Decision, Delivery,
+    DeviceRef, Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, SessionRef, SessionView, TaskId, TaskKind,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -307,6 +307,95 @@ pub fn stop_warning(work: &AgentWork) -> Option<String> {
         ));
     }
     Some(text)
+}
+
+/// A row of the background work list.
+pub enum BackgroundRow<'a> {
+    /// A task, `depth` levels under a task that started it.
+    Task(&'a BackgroundTask, usize),
+    /// A loop.
+    Loop(&'a Schedule),
+}
+
+/// The rows of the background work list: each task followed by the tasks it
+/// started, then the loops. A task whose parent is not in the list reads as
+/// a top task.
+pub fn background_rows(work: &AgentWork) -> Vec<BackgroundRow<'_>> {
+    fn add<'a>(
+        work: &'a AgentWork,
+        parent: Option<&TaskId>,
+        depth: usize,
+        rows: &mut Vec<BackgroundRow<'a>>,
+    ) {
+        for task in &work.tasks {
+            let top = depth == 0
+                && task
+                    .parent
+                    .as_ref()
+                    .is_none_or(|p| !work.tasks.iter().any(|t| t.id == *p));
+            if top || (depth > 0 && task.parent.as_ref() == parent) {
+                rows.push(BackgroundRow::Task(task, depth));
+                // Bounded: a cycle would otherwise never end.
+                if depth < work.tasks.len() {
+                    add(work, Some(&task.id), depth + 1, rows);
+                }
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    add(work, None, 0, &mut rows);
+    rows.extend(work.schedules.iter().map(BackgroundRow::Loop));
+    rows
+}
+
+/// What kind of task a row is: `shell`, `subagent` or `task`.
+pub fn task_kind_word(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Shell => "shell",
+        TaskKind::Subagent => "subagent",
+        TaskKind::Other => "task",
+    }
+}
+
+/// What an ambient task is called beside its title.
+pub const AMBIENT_WORD: &str = "watcher";
+
+/// Whether a loop runs again: `repeats` or `once`.
+pub fn repeat_word(recurring: bool) -> &'static str {
+    if recurring { "repeats" } else { "once" }
+}
+
+/// Beside a loop that is saved with the folder and can fire in a later agent.
+pub const SAVED_IN_FOLDER: &str = "saved in this folder";
+
+/// Beneath the loops: Skywave lists them but cannot end them.
+pub const LOOPS_NOTE: &str = "Loops as of the last turn; ask the agent to end one.";
+
+/// The list when there is nothing to show.
+pub const NOTHING_RUNNING: &str = "Nothing is running in the background.";
+
+/// An action that stops the agent, and so needs confirming when
+/// [`stop_warning`] has something to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopAction {
+    /// Stop the agent.
+    Agent,
+    /// Start a new context.
+    NewContext,
+    /// Switch to another context.
+    SwitchContext,
+    /// Move the current context to a session of its own.
+    MoveContext,
+}
+
+/// The question a confirmation of `action` asks.
+pub fn stop_heading(action: StopAction) -> &'static str {
+    match action {
+        StopAction::Agent => "Stop the agent?",
+        StopAction::NewContext => "Start a new context?",
+        StopAction::SwitchContext => "Switch context?",
+        StopAction::MoveContext => "Move this context to a new session?",
+    }
 }
 
 /// The mode for a status line: the one in effect, `→` a switch not yet
@@ -629,6 +718,57 @@ mod tests {
         assert!(two.contains("2 loops are saved in this folder"));
         let none = stop_warning(&work(vec![], vec![schedule(None)])).unwrap();
         assert!(!none.contains("saved in this folder"));
+    }
+
+    #[test]
+    fn background_rows_put_children_under_parents_and_loops_last() {
+        let mut parent = task(false);
+        parent.id = TaskId("p".into());
+        let mut child = task(false);
+        child.id = TaskId("c".into());
+        child.parent = Some(TaskId("p".into()));
+        let mut orphan = task(false);
+        orphan.id = TaskId("o".into());
+        orphan.parent = Some(TaskId("gone".into()));
+        // The child is listed first: it still follows its parent.
+        let w = work(vec![child, parent, orphan], vec![schedule(None)]);
+        let shape: Vec<String> = background_rows(&w)
+            .iter()
+            .map(|row| match row {
+                BackgroundRow::Task(t, depth) => format!("{}{}", depth, t.id.0),
+                BackgroundRow::Loop(_) => "loop".to_owned(),
+            })
+            .collect();
+        assert_eq!(shape, ["0p", "1c", "0o", "loop"]);
+    }
+
+    #[test]
+    fn background_rows_survive_a_parent_cycle() {
+        let mut a = task(false);
+        a.id = TaskId("a".into());
+        a.parent = Some(TaskId("b".into()));
+        let mut b = task(false);
+        b.id = TaskId("b".into());
+        b.parent = Some(TaskId("a".into()));
+        // Neither is a top task, so neither is listed; what matters is that
+        // it ends.
+        assert!(background_rows(&work(vec![a, b], vec![])).is_empty());
+    }
+
+    #[test]
+    fn the_work_words() {
+        assert_eq!(task_kind_word(TaskKind::Shell), "shell");
+        assert_eq!(task_kind_word(TaskKind::Subagent), "subagent");
+        assert_eq!(task_kind_word(TaskKind::Other), "task");
+        assert_eq!(repeat_word(true), "repeats");
+        assert_eq!(repeat_word(false), "once");
+        assert_eq!(stop_heading(StopAction::Agent), "Stop the agent?");
+        assert_eq!(stop_heading(StopAction::NewContext), "Start a new context?");
+        assert_eq!(stop_heading(StopAction::SwitchContext), "Switch context?");
+        assert_eq!(
+            stop_heading(StopAction::MoveContext),
+            "Move this context to a new session?"
+        );
     }
 
     #[test]
