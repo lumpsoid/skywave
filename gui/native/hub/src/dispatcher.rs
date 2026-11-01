@@ -116,6 +116,7 @@ mod tests {
             dispatcher.send(
                 tag as Tag,
                 Action::CreateSession {
+                    conversation: None,
                     workdir: workdir.clone(),
                 },
             );

@@ -172,6 +172,7 @@ async fn commands_survive(n: usize, profile: LinkProfile, limit: Duration) {
         texts.push(text);
         if i % 10 == 9 {
             client.dispatch(Action::CreateSession {
+                conversation: None,
                 workdir: daemon.workdir(),
             });
         }
@@ -342,6 +343,7 @@ async fn two_devices_converge_over_different_links() {
 
     // Sessions made on each side; A's appear on B and B's on A.
     a.dispatch(Action::CreateSession {
+        conversation: None,
         workdir: daemon.workdir(),
     });
     b.create_session(&daemon).await;
@@ -635,6 +637,7 @@ async fn offline_compose_drains_over_a_lossy_link() {
         });
     }
     client.dispatch(Action::CreateSession {
+        conversation: None,
         workdir: daemon.workdir(),
     });
     let queued = client.seam.pending_outbox().unwrap();
@@ -715,6 +718,7 @@ async fn soak_two_devices_random_links() {
             let sessions = client.sessions();
             match rng.below(100) {
                 0..=4 if sessions.len() < 12 => client.dispatch(Action::CreateSession {
+                    conversation: None,
                     workdir: daemon.workdir(),
                 }),
                 5..=7 => proxy.set_profile(LinkProfile::random(&mut rng)),

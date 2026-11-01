@@ -478,11 +478,13 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     let mut h = Harness::paired();
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/a".into(),
         })
         .unwrap();
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/b".into(),
         })
         .unwrap();
@@ -505,6 +507,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     // Another snapshot in the same wait does not restart the countdown.
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/c".into(),
         })
         .unwrap();
@@ -997,6 +1000,7 @@ fn create_session_goes_from_queued_to_the_real_row() {
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/new".into()
         })
     );
@@ -1154,6 +1158,7 @@ fn tab_fills_in_the_only_directory() {
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/api/".into()
         })
     );
@@ -1909,6 +1914,32 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
     h.key(KeyCode::Up);
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
     assert_contains(&h.screen(), "── Continues start from “work” ──");
+}
+
+#[test]
+fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
+    use skywave_proto::SessionOrigin;
+    let mut h = Harness::paired();
+    let new = SessionId::new();
+    pull(
+        &mut h,
+        vec![event(
+            new,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/work".into(),
+                context_name: "start".into(),
+                from: Some(SessionOrigin::Agent {
+                    conversation: "3f2a-91bc".into(),
+                }),
+            },
+        )],
+    );
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
+    assert_contains(
+        &h.screen(),
+        "Continues agent conversation 3f2a-91bc from outside Skywave",
+    );
 }
 
 /// A session whose first context ("start") holds "alpha question" and

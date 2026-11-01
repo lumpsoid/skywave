@@ -268,6 +268,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
         | Entry::ContextSwitched { name, .. }
         | Entry::ContextMoved { name, .. }
         | Entry::MovedFrom { name, .. } => vec![name],
+        Entry::Adopted { conversation } => vec![conversation],
         Entry::AgentSetting {
             setting, refused, ..
         } => {
@@ -459,6 +460,22 @@ mod tests {
         assert_eq!(hit("interrupted"), Vec::<usize>::new());
         assert_eq!(hit("queued"), [8]);
         assert_eq!(hit("e"), [0, 1, 2, 3, 4, 5, 6, 8]);
+    }
+
+    #[test]
+    fn an_adopted_entry_is_found_by_its_conversation_id() {
+        let timeline = vec![
+            logged(Entry::Adopted {
+                conversation: "3f2a-91bc".into(),
+            }),
+            logged(Entry::Adopted {
+                conversation: "7c00-aaaa".into(),
+            }),
+        ];
+        let hit = |q: &str| indices(&timeline, &Query::new(q));
+        assert_eq!(hit("91bc"), [0]);
+        assert_eq!(hit("aaaa"), [1]);
+        assert!(hit("zzzz").is_empty());
     }
 
     #[test]

@@ -579,6 +579,14 @@ pub fn moved_from_line(name: &str, from: &SessionRef) -> String {
     format!("Continues {name} from {}", session_word(from))
 }
 
+/// An adopted session's first item: `Continues agent conversation 3f2a from
+/// outside Skywave; its earlier history is not shown here`.
+pub fn adopted_line(conversation: &str) -> String {
+    format!(
+        "Continues agent conversation {conversation} from outside Skywave; its earlier history is not shown here"
+    )
+}
+
 /// What a picker adds to a moved context's row: `moved → “fix the flaky
 /// test”`. `None` for one not moved.
 pub fn context_moved_label(context: &ContextView) -> Option<String> {
@@ -1008,6 +1016,10 @@ mod tests {
         assert_eq!(
             moved_from_line("velvet walrus", &unknown),
             "Continues velvet walrus from another session"
+        );
+        assert_eq!(
+            adopted_line("3f2a"),
+            "Continues agent conversation 3f2a from outside Skywave; its earlier history is not shown here"
         );
 
         let mut view = SessionView {

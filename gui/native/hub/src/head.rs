@@ -665,6 +665,7 @@ impl Head {
                     // Blank or unacceptable paths are refused by the core
                     // or the server, not here.
                     let action = Action::CreateSession {
+                        conversation: None,
                         workdir: create.input.clone(),
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);

@@ -1107,6 +1107,7 @@ mod tests {
         let published = links.lock().unwrap().len();
         seam.core
             .dispatch(crate::Action::CreateSession {
+                conversation: None,
                 workdir: "/srv".into(),
             })
             .unwrap();
@@ -1475,6 +1476,7 @@ mod tests {
     fn create(seam: &Seam, workdir: &str) {
         seam.core
             .dispatch(crate::Action::CreateSession {
+                conversation: None,
                 workdir: workdir.into(),
             })
             .unwrap();

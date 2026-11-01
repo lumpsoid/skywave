@@ -1729,6 +1729,7 @@ impl App {
             KeyCode::Enter => {
                 create.submitted = true;
                 return Some(Action::CreateSession {
+                    conversation: None,
                     workdir: create.text.clone(),
                 });
             }

@@ -22,7 +22,7 @@ use skywave_core::{
     Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
-    agent_setting_line, answer_words, asked_by, blob_size, bytes, context_moved_line,
+    adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes, context_moved_line,
     context_started_line, context_switched_line, decision_label, delivery_label, dollars,
     fail_reason, moved_from_line, outgoing_label, percent, seconds, took_label, turn_time,
 };
@@ -304,6 +304,9 @@ impl Layout<'_> {
             }
             Entry::MovedFrom { from, name } => {
                 return context_divider(lead, &moved_from_line(name, from));
+            }
+            Entry::Adopted { conversation } => {
+                return context_divider(lead, &adopted_line(conversation));
             }
             Entry::Renamed { name, by } => {
                 let who = if by.me {
