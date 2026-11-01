@@ -91,6 +91,11 @@ void main() {
         RowKind.settingRefused,
         'mode bypass refused: not launched for it',
       ),
+      anyRow(
+        's:15',
+        RowKind.contextDivider,
+        'New context · velvet walrus · by laptop',
+      ),
     ]);
     final sent = <GuiIntent>[];
     await pumpSession(
@@ -124,9 +129,12 @@ void main() {
       r'turn · 12.4s · $0.04',
       'mode → plan by laptop',
       'mode bypass refused: not launched for it',
+      'New context · velvet walrus · by laptop',
     ]) {
       expect(find.text(text, findRichText: true), findsWidgets, reason: text);
     }
+    // A context divider reads as a branch, not a warning.
+    expect(find.byIcon(Icons.alt_route), findsOneWidget);
 
     await tester.tap(find.text('Discard'));
     expect(

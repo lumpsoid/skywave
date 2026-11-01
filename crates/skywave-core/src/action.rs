@@ -2,7 +2,8 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CommandId, Decision, Effort, PermissionMode, Seq, SessionId, SnippetId,
+    ApprovalId, BlobId, CommandId, ContextId, Decision, Effort, PermissionMode, Seq, SessionId,
+    SnippetId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +35,8 @@ pub enum Action {
     /// The new-session prompt closed: forget the completion and its
     /// listing.
     EndCompletion,
+    /// Queue a message, written for the session view's
+    /// [`context`](crate::SessionView::context).
     SendMessage {
         session_id: SessionId,
         text: String,
@@ -89,6 +92,28 @@ pub enum Action {
     /// Shut down the session's agent; the next message starts it again.
     StopSession {
         session_id: SessionId,
+    },
+    /// Start the session afresh in a new, empty context, which messages go
+    /// to from now on; the earlier ones stay to switch back to. The core
+    /// picks its id and a name no context of the session has, as far as
+    /// this device knows. It is current at once, marked by the view's
+    /// `clear` until its effect is in the replica.
+    ClearContext {
+        session_id: SessionId,
+    },
+    /// Make one of the session's contexts current again: messages go to it
+    /// and its agent resumes it. Shown at once, marked by the view's
+    /// `switch` until its effect is in the replica.
+    SwitchContext {
+        session_id: SessionId,
+        context: ContextId,
+    },
+    /// Narrow the open session's timeline to one context (`None`: the whole
+    /// session). This device only, kept until the session closes; where
+    /// messages go does not change.
+    ViewContext {
+        session_id: SessionId,
+        context: Option<ContextId>,
     },
     /// Name the session, or with a blank `name` restore its default title.
     /// The core normalises the name as the server will (control characters

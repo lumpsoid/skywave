@@ -129,10 +129,10 @@ impl SessionSummary {
     /// Folds one event of this session into the summary.
     ///
     /// A rename only sets the name, an archive only the archived flag, a
-    /// mode or model event only the agent settings, and the models an agent
-    /// offers nothing here: none is activity, so they move neither
-    /// `last_seq` nor `last_activity` and the session keeps its place in
-    /// the list.
+    /// mode or model event only the agent settings, a context cleared or
+    /// switched only the current context, and the models an agent offers
+    /// nothing here: none is activity, so they move neither `last_seq` nor
+    /// `last_activity` and the session keeps its place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
@@ -147,6 +147,10 @@ impl SessionSummary {
                 self.name = name.clone();
                 return;
             }
+            EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
+                self.context = event.context;
+                return;
+            }
             EventKind::SessionArchived { .. } | EventKind::ModelsOffered { .. } => return,
             _ => {}
         }
@@ -158,9 +162,6 @@ impl SessionSummary {
         match &event.kind {
             EventKind::SessionCreated { workdir, .. } => {
                 self.workdir = Some(workdir.clone());
-                self.context = event.context;
-            }
-            EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
                 self.context = event.context;
             }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
@@ -199,7 +200,9 @@ impl SessionSummary {
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => {}
+            | EventKind::EffortRefused { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. } => {}
         }
     }
 
@@ -241,7 +244,7 @@ impl SessionSummary {
 
 /// The first line of `text` with leading blank lines skipped, trimmed and
 /// cut to `max` chars; `None` if `text` is blank.
-fn first_line(text: &str, max: usize) -> Option<String> {
+pub(crate) fn first_line(text: &str, max: usize) -> Option<String> {
     let line = text.trim_start().lines().next()?.trim_end();
     Some(line.chars().take(max).collect())
 }
@@ -523,6 +526,54 @@ mod tests {
             event(sid, 0, EventKind::TurnInterrupted).at
         );
         assert_eq!(summary.notable, 0);
+    }
+
+    #[test]
+    fn a_context_cleared_or_switched_is_not_activity() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let first = ContextId::first_of(sid);
+        assert_eq!(summary.context, first);
+        let by = DeviceId::new();
+        let cleared = ContextId::new();
+        let started = EventKind::ContextStarted {
+            by,
+            name: "velvet walrus".into(),
+        };
+        assert!(!is_notable(&started));
+        summary.apply(
+            Seq(5),
+            &Event {
+                context: cleared,
+                ..event(sid, 20, started)
+            },
+        );
+        assert_eq!(summary.context, cleared);
+        summary.apply(
+            Seq(9),
+            &Event {
+                context: first,
+                ..event(sid, 30, EventKind::ContextSwitched { by })
+            },
+        );
+        assert_eq!(summary.context, first);
+        assert_eq!(summary.last_seq, Seq(1));
+        assert_eq!(
+            summary.last_activity,
+            event(sid, 0, EventKind::TurnInterrupted).at
+        );
+        assert_eq!(summary.notable, 0);
+        // A positive control: a message is activity.
+        let message = EventKind::UserMessage {
+            device_id: by,
+            text: "hi".into(),
+        };
+        summary.apply(Seq(10), &event(sid, 40, message));
+        assert_eq!(summary.last_seq, Seq(10));
     }
 
     #[test]

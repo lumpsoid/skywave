@@ -587,6 +587,31 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                     "ApprovalResolved"
                 }
                 (CommandKind::Interrupt { .. }, EventKind::TurnInterrupted) => "TurnInterrupted",
+                (
+                    CommandKind::ClearContext {
+                        session_id,
+                        context,
+                        name,
+                    },
+                    EventKind::ContextStarted { by, name: logged },
+                ) => {
+                    assert_eq!((by, logged), (&device, name));
+                    assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);
+                    assert_eq!(events[(seq.0 - 1) as usize].context, *context);
+                    "ContextStarted"
+                }
+                (
+                    CommandKind::SwitchContext {
+                        session_id,
+                        context,
+                    },
+                    EventKind::ContextSwitched { by },
+                ) => {
+                    assert_eq!(by, &device);
+                    assert_eq!(events[(seq.0 - 1) as usize].session_id, *session_id);
+                    assert_eq!(events[(seq.0 - 1) as usize].context, *context);
+                    "ContextSwitched"
+                }
                 (command, event) => panic!("seq {seq:?} holds {event:?}, not {command:?}"),
             };
             *accepted.entry(name).or_default() += 1;
@@ -600,6 +625,8 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                 EventKind::UserMessage { .. } => "UserMessage",
                 EventKind::ApprovalResolved { .. } => "ApprovalResolved",
                 EventKind::TurnInterrupted => "TurnInterrupted",
+                EventKind::ContextStarted { .. } => "ContextStarted",
+                EventKind::ContextSwitched { .. } => "ContextSwitched",
                 _ => "",
             }
         })
@@ -609,6 +636,8 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
         "UserMessage",
         "ApprovalResolved",
         "TurnInterrupted",
+        "ContextStarted",
+        "ContextSwitched",
     ] {
         assert_eq!(
             logged(name),
@@ -642,9 +671,15 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
         .iter()
         .cloned()
         .map(|item| match item {
-            TimelineItem::Logged { seq, at, entry } => TimelineItem::Logged {
+            TimelineItem::Logged {
                 seq,
                 at,
+                context,
+                entry,
+            } => TimelineItem::Logged {
+                seq,
+                at,
+                context,
                 entry: match entry {
                     Entry::UserMessage {
                         command_id,
