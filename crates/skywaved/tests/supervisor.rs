@@ -811,6 +811,46 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     );
 }
 
+/// A turn the agent starts on its own (a scheduled wakeup, like `/loop`)
+/// keeps it running past the idle deadline of the turn before, and the idle
+/// timer starts again once it ends.
+#[tokio::test]
+async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
+    const IDLE: Duration = Duration::from_millis(600);
+    let mut f = Fixture::new();
+    let tick = Gate::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::wake(Duration::from_millis(50), [Step::Wait(tick.clone()), Step::text("tick")]),
+        Step::text("scheduled"),
+    ]));
+    let config = SupervisorConfig { idle_timeout: IDLE };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("loop");
+    let working = |k: &EventKind| *k == state(SessionState::AgentWorking);
+    f.wait_count("the wakeup's turn", 2, working).await;
+    // Proving the agent is not stopped takes waiting past the deadline the
+    // first turn armed; a stop there logs the open turn as `Errored`.
+    tokio::time::sleep(IDLE + IDLE / 2).await;
+    assert!(
+        !agent.inputs(f.session_id).contains(&FakeInput::Shutdown),
+        "agent stopped mid-turn"
+    );
+    assert!(!f.kinds().iter().any(is_errored), "log: {:#?}", f.kinds());
+
+    tick.open();
+    f.wait_count("the wakeup's end", 2, is_idle).await;
+    wait_for_shutdowns(&agent, &f, 1).await;
+    supervisor.shutdown().await.unwrap();
+    let kinds = f.kinds();
+    assert!(!kinds.iter().any(is_errored), "log: {kinds:#?}");
+    assert!(kinds.contains(&EventKind::AgentMessage { text: "tick".into() }));
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [f.started(false), message("loop"), FakeInput::Shutdown]
+    );
+}
+
 #[tokio::test]
 async fn stop_mid_turn_interrupts_shuts_down_and_resumes() {
     let mut f = Fixture::new();
