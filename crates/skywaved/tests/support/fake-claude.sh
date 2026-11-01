@@ -8,7 +8,9 @@
 # workdir). A user message containing "approve" asks for a Write permission;
 # one containing "hang" streams until interrupted; one containing "crash"
 # exits 3 with a stderr line; any other message gets the text "echo".
-# `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id.
+# `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id,
+# with `--fork-session` too (the parent is unknown; §5). A fork otherwise
+# runs as its `--session-id`, as the real CLI does.
 # `set_permission_mode` and `set_model` are answered like the real CLI's
 # (§3.7): bypassPermissions and the model "bogus" are refused.
 # `apply_flag_settings` and `get_settings` are answered like the real CLI's
@@ -25,15 +27,26 @@ mode="default"
 # No model until one is set, so a turn reports no usage by default.
 model=""
 effort="medium"
+resume=""
+fork=""
 prev=""
 for arg in "$@"; do
-  case "$prev" in --session-id|--resume) sid="$arg" ;; esac
+  case "$prev" in
+    --session-id) sid="$arg" ;;
+    --resume) resume="$arg" ;;
+  esac
+  case "$arg" in --fork-session) fork=1 ;; esac
   prev="$arg"
 done
+# Without --fork-session the process runs as the session it resumes.
+if [ -z "$fork" ] && [ -n "$resume" ]; then
+  sid="$resume"
+fi
 
-if [ "$sid" = "00000000-0000-0000-0000-000000000000" ]; then
-  echo "No conversation found with session ID: $sid" >&2
-  printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"result":null,"errors":["No conversation found with session ID: %s"],"session_id":"%s"}\n' "$sid" "$sid"
+if [ "$resume" = "00000000-0000-0000-0000-000000000000" ]; then
+  # The real CLI names the unknown parent, under the id it would run as.
+  echo "No conversation found with session ID: $resume" >&2
+  printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"result":null,"errors":["No conversation found with session ID: %s"],"session_id":"%s"}\n' "$resume" "$sid"
   exit 1
 fi
 
