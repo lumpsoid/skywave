@@ -36,6 +36,25 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::CreateSessionLike { session_id } => {
             Action::CreateSessionLike(id("session", &session_id)?)
         }
+        ActionIntent::ClearContext { session_id } => Action::ClearContext {
+            session_id: id("session", &session_id)?,
+        },
+        ActionIntent::SwitchContext {
+            session_id,
+            context_id,
+        } => Action::SwitchContext {
+            session_id: id("session", &session_id)?,
+            context: id("context", &context_id)?,
+        },
+        ActionIntent::ViewContext {
+            session_id,
+            context_id,
+        } => Action::ViewContext {
+            session_id: id("session", &session_id)?,
+            context: context_id
+                .map(|context| id("context", &context))
+                .transpose()?,
+        },
         ActionIntent::SetPermissionMode { session_id, mode } => Action::SetPermissionMode {
             session_id: id("session", &session_id)?,
             mode: permission_mode(mode),
@@ -172,6 +191,34 @@ mod tests {
                 session_id: session,
                 effort: Effort::XHigh,
             })
+        );
+        let context = skywave_core::ContextId::new();
+        assert_eq!(
+            action(ActionIntent::SwitchContext {
+                session_id: session.0.to_string(),
+                context_id: context.0.to_string(),
+            }),
+            Ok(Action::SwitchContext {
+                session_id: session,
+                context
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::ViewContext {
+                session_id: session.0.to_string(),
+                context_id: None,
+            }),
+            Ok(Action::ViewContext {
+                session_id: session,
+                context: None
+            })
+        );
+        assert!(
+            action(ActionIntent::ViewContext {
+                session_id: session.0.to_string(),
+                context_id: Some("nope".into()),
+            })
+            .is_err()
         );
         assert!(
             action(ActionIntent::ResolveApproval {

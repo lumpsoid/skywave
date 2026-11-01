@@ -1153,6 +1153,129 @@ void main() {
     }
   });
 
+  group('contexts', () {
+    const two = [
+      ContextRow(
+        contextId: 'c1',
+        label: 'start · fix the test',
+        current: false,
+      ),
+      ContextRow(contextId: 'c2', label: 'velvet walrus', current: true),
+    ];
+
+    Future<void> openMore(
+      WidgetTester tester,
+      SessionScreen screen,
+      List<GuiIntent> sent,
+    ) async {
+      await pumpSession(
+        tester,
+        screen: screen,
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('New context is disabled in an empty context, sends once '
+        'there is something to clear', (tester) async {
+      final sent = <GuiIntent>[];
+      await openMore(tester, screenWith(), sent);
+      expect(find.text('This context is empty'), findsOneWidget);
+      await tester.tap(find.text('New context'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), isEmpty);
+      await tester.tapAt(Offset.zero);
+      await tester.pumpAndSettle();
+
+      await openMore(tester, screenWith(canClear: true), sent);
+      await tester.tap(find.text('New context'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentClearContext(sessionId: 's1')),
+      ]);
+    });
+
+    testWidgets('the picker lists contexts; switching sends the intent, '
+        'the current one offers no switch', (tester) async {
+      final sent = <GuiIntent>[];
+      await openMore(tester, screenWith(contexts: two, contextId: 'c2'), sent);
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      expect(find.text('start · fix the test'), findsOneWidget);
+      expect(find.text('velvet walrus'), findsOneWidget);
+      expect(find.text('Switch'), findsOneWidget, reason: 'not on current');
+      await tester.tap(find.text('Switch'));
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(
+          action: ActionIntentSwitchContext(sessionId: 's1', contextId: 'c1'),
+        ),
+      ]);
+    });
+
+    testWidgets('viewing another context sends it, the current one shows '
+        'all', (tester) async {
+      final sent = <GuiIntent>[];
+      final screen = screenWith(contexts: two, contextId: 'c2');
+      await openMore(tester, screen, sent);
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('View').first);
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(
+          action: ActionIntentViewContext(sessionId: 's1', contextId: 'c1'),
+        ),
+      ]);
+
+      sent.clear();
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Contexts…'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('View').last);
+      await tester.pumpAndSettle();
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentViewContext(sessionId: 's1')),
+      ]);
+    });
+
+    testWidgets('viewing shows the hub\'s hint with a way back', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([]),
+        sent: sent,
+      );
+      expect(find.text('Show all'), findsNothing, reason: 'no banner');
+
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          contexts: two,
+          contextId: 'c2',
+          viewingId: 'c1',
+          viewingHint: 'Viewing start — messages go to velvet walrus',
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      expect(
+        find.text('Viewing start — messages go to velvet walrus'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Show all'));
+      expect(sent.whereType<GuiIntentAct>(), [
+        const GuiIntentAct(action: ActionIntentViewContext(sessionId: 's1')),
+      ]);
+    });
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(

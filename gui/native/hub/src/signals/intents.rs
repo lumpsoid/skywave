@@ -177,6 +177,23 @@ pub enum ActionIntent {
     CreateSessionLike {
         session_id: String,
     },
+    /// Clear the session's agent context: a fresh conversation in the same
+    /// workdir, in a new context.
+    ClearContext {
+        session_id: String,
+    },
+    /// Make `context_id` (one the session lists) the context messages go
+    /// to; the agent resumes its conversation.
+    SwitchContext {
+        session_id: String,
+        context_id: String,
+    },
+    /// Show only `context_id`'s part of the timeline; `None` shows the
+    /// whole session. Messages still go to the current context.
+    ViewContext {
+        session_id: String,
+        context_id: Option<String>,
+    },
     /// Switch the session's agent to `mode`, starting it if need be.
     SetPermissionMode {
         session_id: String,

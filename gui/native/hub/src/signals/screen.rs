@@ -201,6 +201,21 @@ pub struct SessionScreen {
     pub interrupt_refusal: Option<String>,
     /// `stop queued`, `stop failed: <why>`, while on its way.
     pub stop_label: Option<String>,
+    /// `new context queued`, `new context failed: <why>`, while on its way.
+    pub clear_label: Option<String>,
+    /// `switch queued`, `switch failed: <why>`, while on its way.
+    pub switch_label: Option<String>,
+    /// Offer "New context"; false in a context with no message yet.
+    pub can_clear: bool,
+    /// The contexts the picker lists, in order.
+    pub contexts: Vec<ContextRow>,
+    /// The context messages go to.
+    pub context_id: String,
+    /// The context the timeline is filtered to; `None` for the whole session.
+    pub viewing_id: Option<String>,
+    /// `Viewing start — messages go to velvet walrus`; `None` while the
+    /// whole session or the current context shows.
+    pub viewing_hint: Option<String>,
     /// The lasting rules granted here, `label (scope)`.
     pub rules: Vec<String>,
     /// `2 rules`; `None` for none.
@@ -219,6 +234,19 @@ pub struct SessionScreen {
     pub snippets: Vec<SnippetView>,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+}
+
+/// One context in the picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ContextRow {
+    pub context_id: String,
+    /// `velvet walrus · fix the flaky test`, or the name alone.
+    pub label: String,
+    /// Messages go here.
+    pub current: bool,
+    /// `queued`, `sending`, ...: this device's clear or switch making it
+    /// current, while on its way.
+    pub outgoing_label: Option<String>,
 }
 
 /// A saved prompt, as the composer's picker lists it.
