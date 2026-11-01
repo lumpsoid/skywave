@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use skywave_core::{
     AgentSetting, AgentView, BlobState, ContextView, Decision, Delivery, DeviceRef, Effort,
-    FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionView,
+    FailReason, Outgoing, PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionRef,
+    SessionView,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -394,6 +395,39 @@ pub fn context_switched_line(name: &str, by: &DeviceRef) -> String {
     format!("Back to {name} · by {}", device_word(by))
 }
 
+/// A session the timeline names: its title quoted (`“fix the flaky
+/// test”`), or `another session` for one this device deleted or has not
+/// pulled yet.
+pub fn session_word(session: &SessionRef) -> String {
+    match &session.title {
+        Some(title) => format!("“{title}”"),
+        None => "another session".to_owned(),
+    }
+}
+
+/// The divider where a context was moved into a session of its own:
+/// `velvet walrus went on in “fix the flaky test” · by you`.
+pub fn context_moved_line(name: &str, to: &SessionRef, by: &DeviceRef) -> String {
+    format!(
+        "{name} went on in {} · by {}",
+        session_word(to),
+        device_word(by)
+    )
+}
+
+/// A moved context's new session's first item: `Continues velvet walrus
+/// from “fix the flaky test”`.
+pub fn moved_from_line(name: &str, from: &SessionRef) -> String {
+    format!("Continues {name} from {}", session_word(from))
+}
+
+/// What a picker adds to a moved context's row: `moved → “fix the flaky
+/// test”`. `None` for one not moved.
+pub fn context_moved_label(context: &ContextView) -> Option<String> {
+    let to = context.moved_to.as_ref()?;
+    Some(format!("moved → {}", session_word(to)))
+}
+
 /// A context as a picker row reads: its name, then its first prompt
 /// (`velvet walrus · fix the flaky test`), or the name alone while it has
 /// no message.
@@ -622,6 +656,9 @@ mod tests {
             last_activity: None,
             current,
             outgoing: None,
+            moved_to: None,
+            discard_move: None,
+            can_move: false,
         };
         let contexts = vec![
             context(start, "start", Some("fix the flaky test"), false),
@@ -629,6 +666,39 @@ mod tests {
         ];
         assert_eq!(context_row(&contexts[0]), "start · fix the flaky test");
         assert_eq!(context_row(&contexts[1]), "velvet walrus");
+        assert_eq!(context_moved_label(&contexts[0]), None);
+        let titled = SessionRef {
+            id: SessionId::new(),
+            title: Some("fix the flaky test".into()),
+        };
+        let unknown = SessionRef {
+            title: None,
+            ..titled.clone()
+        };
+        let moved = ContextView {
+            moved_to: Some(titled.clone()),
+            ..contexts[0].clone()
+        };
+        assert_eq!(
+            context_moved_label(&moved).as_deref(),
+            Some("moved → “fix the flaky test”")
+        );
+        assert_eq!(
+            context_moved_line("velvet walrus", &titled, &me),
+            "velvet walrus went on in “fix the flaky test” · by you"
+        );
+        assert_eq!(
+            context_moved_line("start", &unknown, &laptop),
+            "start went on in another session · by laptop"
+        );
+        assert_eq!(
+            moved_from_line("velvet walrus", &titled),
+            "Continues velvet walrus from “fix the flaky test”"
+        );
+        assert_eq!(
+            moved_from_line("velvet walrus", &unknown),
+            "Continues velvet walrus from another session"
+        );
 
         let mut view = SessionView {
             id: sid,

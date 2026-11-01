@@ -545,9 +545,22 @@ pub struct ContextView {
     pub last_activity: Option<DateTime<Utc>>,
     /// Messages sent now go here ([`SessionView::context`]).
     pub current: bool,
-    /// This device's latest clear or switch making it current, until its
-    /// effect is in the replica.
+    /// This device's latest clear or switch making it current, or move of
+    /// it, until its effect is in the replica.
     pub outgoing: Option<Outgoing>,
+    /// The session it was moved into; it is never current here again.
+    pub moved_to: Option<SessionRef>,
+    /// This device's move of it that [`Action::Discard`](crate::Action::Discard)
+    /// takes back: refused (it shows in [`outgoing`](Self::outgoing)), or
+    /// not sent yet.
+    pub discard_move: Option<CommandId>,
+    /// [`Action::MoveContext`](crate::Action::MoveContext) is worth
+    /// offering: its agent has worked in it (so there is a conversation to
+    /// fork), it is not moved nor is this device's move of it on its way,
+    /// and no message of this device to it is still outside the replica
+    /// (it would go out before the clear that comes with moving the
+    /// current context, and the clear would interrupt the turn it starts).
+    pub can_move: bool,
 }
 
 /// A session's agent settings as the session view shows them.
@@ -734,6 +747,15 @@ impl DeviceRef {
     }
 }
 
+/// A session the log names, as the views show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRef {
+    pub id: SessionId,
+    /// Its title as this device knows it; `None` for a session it deleted
+    /// or has not pulled yet.
+    pub title: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     UserMessage {
@@ -793,6 +815,19 @@ pub enum Entry {
     ContextSwitched {
         name: String,
         by: DeviceRef,
+    },
+    /// A device moved the context `name` into the session `to`, where it
+    /// goes on; here it is never current again.
+    ContextMoved {
+        name: String,
+        to: SessionRef,
+        by: DeviceRef,
+    },
+    /// The session's first item when it was made by moving the context
+    /// `name` out of `from`: its conversation goes on here.
+    MovedFrom {
+        from: SessionRef,
+        name: String,
     },
     /// The session was renamed; `None` restored its default title.
     Renamed {

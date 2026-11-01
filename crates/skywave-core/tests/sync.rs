@@ -983,3 +983,240 @@ async fn a_message_refused_for_a_changed_context_is_edited_and_resent() {
         "the refused one never logged"
     );
 }
+
+/// Moving the context messages go to: the core clears it first, then
+/// moves it under its own name. Both are accepted in that order, the new
+/// session (logged by the daemon, right before the move) opens on its
+/// own once the move is pulled, and starts with where it came from; the
+/// source goes on in the fresh context with the moved one frozen.
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_the_current_context_opens_it_in_a_new_session() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&daemon).await;
+    let start = skywave_proto::ContextId::first_of(session);
+    client.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "hello".into(),
+    });
+    daemon
+        .wait_log("the agent's answer", |events| {
+            count(events, |k| matches!(k, EventKind::AgentMessage { .. })) == 1
+        })
+        .await;
+    let view = client
+        .open_session(session, |s| s.contexts.iter().any(|c| c.can_move))
+        .await;
+    assert_eq!(view.context, start);
+    let start_name = view.contexts[0].name.clone();
+
+    client.dispatch(Action::MoveContext {
+        session_id: session,
+        context: start,
+    });
+    let outbox = client.outbox();
+    let (clear, fresh, fresh_name) = match &outbox[outbox.len() - 2].command.kind {
+        CommandKind::ClearContext { context, name, .. } => {
+            (outbox[outbox.len() - 2].command.id, *context, name.clone())
+        }
+        other => panic!("expected the clear first, got {other:?}"),
+    };
+    let moved = outbox.last().unwrap().command.id;
+    assert_eq!(
+        outbox.last().unwrap().command.kind,
+        CommandKind::MoveContext {
+            session_id: session,
+            context: start,
+            name: start_name.clone(),
+        },
+        "under its own name"
+    );
+
+    let view = client
+        .wait("the new session open", |c, view| {
+            matches!(&view.screen, Screen::Session(s) if s.id != session)
+                && view.queued == 0
+                && c.cursor() == daemon.head()
+        })
+        .await;
+    let Screen::Session(new) = view.screen else {
+        unreachable!()
+    };
+    let seq_of = |id: CommandId| match client
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == id)
+        .map(|e| e.status)
+    {
+        Some(OutboxStatus::Done(CommandResult::Accepted { seq })) => seq,
+        other => panic!("expected accepted, got {other:?}"),
+    };
+    assert!(seq_of(clear) < seq_of(moved), "in the order queued");
+    let events = daemon.events();
+    assert_eq!(
+        events[(seq_of(moved).0 - 1) as usize].kind,
+        EventKind::ContextMoved {
+            to: new.id,
+            by: client.device(),
+        }
+    );
+    support::assert_exactly_once(&daemon, &[&client]);
+
+    let source_title = |rows: &[SessionRow]| {
+        rows.iter()
+            .find(|r| r.id == session)
+            .map(|r| r.title.clone())
+            .unwrap()
+    };
+    let rows = client.session_list().await;
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [new.id, session],
+        "the new session first"
+    );
+    assert!(matches!(
+        new.timeline.first(),
+        Some(TimelineItem::Logged {
+            entry: Entry::MovedFrom { from, name },
+            ..
+        }) if from.id == session
+            && from.title.as_deref() == Some(source_title(&rows).as_str())
+            && *name == start_name
+    ));
+
+    let view = client
+        .open_session(session, |s| s.contexts.iter().any(|c| c.moved_to.is_some()))
+        .await;
+    assert_eq!((view.context, view.clear), (fresh, None));
+    let row = view.contexts.iter().find(|c| c.id == start).unwrap();
+    assert_eq!(row.moved_to.as_ref().map(|to| to.id), Some(new.id));
+    assert!(!row.can_move && !row.current && row.outgoing.is_none());
+    let dividers: Vec<&Entry> = view
+        .timeline
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Logged {
+                entry: entry @ (Entry::ContextStarted { .. } | Entry::ContextMoved { .. }),
+                ..
+            } => Some(entry),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            &dividers[..],
+            [
+                Entry::ContextStarted { name, by },
+                Entry::ContextMoved { name: moved, to, by: mover },
+            ] if *name == fresh_name && by.me && *moved == start_name && to.id == new.id && mover.me
+        ),
+        "{dividers:?}"
+    );
+}
+
+/// A move of a context another device made current again before it
+/// arrived is refused: shown failed on the context's row, discardable,
+/// and messages go where the replica says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_of_a_context_made_current_meanwhile_is_refused_and_discarded() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let (a, b) = (Client::open(config()), Client::open(config()));
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let session = a.create_session(&daemon).await;
+    let start = skywave_proto::ContextId::first_of(session);
+    a.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "hello".into(),
+    });
+    daemon
+        .wait_log("the agent's answer", |events| {
+            count(events, |k| matches!(k, EventKind::AgentMessage { .. })) == 1
+        })
+        .await;
+    a.dispatch(Action::ClearContext {
+        session_id: session,
+    });
+    let view = a
+        .open_session(session, |s| {
+            s.clear.is_none() && s.context != start && s.contexts.iter().any(|c| c.can_move)
+        })
+        .await;
+    let fresh = view.context;
+
+    proxy_a.down();
+    a.wait("a offline", |_, view| is_reconnecting(&view.link))
+        .await;
+    a.dispatch(Action::MoveContext {
+        session_id: session,
+        context: start,
+    });
+    let moved = a.outbox().pop().unwrap();
+    assert!(
+        matches!(moved.command.kind, CommandKind::MoveContext { context, .. } if context == start),
+        "a context not current moves alone: {moved:?}"
+    );
+    let moved = moved.command.id;
+    daemon.settle(&[&b], SOON).await;
+    b.dispatch(Action::SwitchContext {
+        session_id: session,
+        context: start,
+    });
+    daemon
+        .wait_log("b's switch", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ContextSwitched { .. }))
+        })
+        .await;
+
+    proxy_a.up();
+    let refused = Outgoing::Failed(FailReason::Rejected(RejectReason::ContextCurrent));
+    let view = a
+        .open_session(session, |s| {
+            s.context == start
+                && s.contexts
+                    .iter()
+                    .any(|c| c.id == start && c.outgoing == Some(refused))
+        })
+        .await;
+    let row = view.contexts.iter().find(|c| c.id == start).unwrap();
+    assert_eq!(
+        (row.discard_move, row.moved_to.as_ref()),
+        (Some(moved), None)
+    );
+    assert_ne!(view.context, fresh, "the replica's, b's switch");
+
+    a.dispatch(Action::Discard(moved));
+    let view = a
+        .open_session(session, |s| {
+            s.contexts
+                .iter()
+                .any(|c| c.id == start && c.outgoing.is_none())
+        })
+        .await;
+    assert_eq!(
+        view.contexts
+            .iter()
+            .find(|c| c.id == start)
+            .unwrap()
+            .discard_move,
+        None
+    );
+    assert!(
+        a.outbox().iter().all(|e| e.command.id != moved),
+        "taken back"
+    );
+    assert!(
+        !daemon
+            .events()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ContextMoved { .. })),
+        "never moved"
+    );
+}

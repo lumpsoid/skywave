@@ -13,9 +13,9 @@ use skywave_core::{
     read_head,
 };
 use skywave_present::format::{
-    agent_setting_line, answer_words, asked_by, bytes, context_started_line, context_switched_line,
-    decision_label, delivery_label, dollars, fail_reason, outgoing_label, percent, seconds,
-    took_label, turn_time,
+    agent_setting_line, answer_words, asked_by, bytes, context_moved_line, context_started_line,
+    context_switched_line, decision_label, delivery_label, dollars, fail_reason, moved_from_line,
+    outgoing_label, percent, seconds, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
@@ -237,6 +237,16 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             &mut row,
             RowKind::ContextDivider,
             clean_line(&context_switched_line(name, by)),
+        ),
+        Entry::ContextMoved { name, to, by } => set(
+            &mut row,
+            RowKind::ContextDivider,
+            clean_line(&context_moved_line(name, to, by)),
+        ),
+        Entry::MovedFrom { from, name } => set(
+            &mut row,
+            RowKind::ContextDivider,
+            clean_line(&moved_from_line(name, from)),
         ),
         Entry::Renamed { name, by } => set(
             &mut row,
