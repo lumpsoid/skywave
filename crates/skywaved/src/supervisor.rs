@@ -778,6 +778,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             Conversation::Fresh => "fresh",
             Conversation::Resume(_) => "resumed",
             Conversation::Fork(_) => "forked",
+            Conversation::Adopt(_) => "adopted",
         };
         let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;

@@ -52,7 +52,12 @@
 //! [`FakeConversation::Fork`] of that context; like a fresh start, it
 //! reports the forking context's own handle at its first message. A fork of
 //! a context with no conversation is refused, and so is forking into a
-//! context that already has one.
+//! context that already has one. An outside conversation is one registered
+//! with [`FakeAgent::with_outside_conversation`]; adopting it is recorded as
+//! [`FakeConversation::Adopt`] with its id and, like a fork, reports the
+//! adopting context's own handle at its first message. Adopting an id nobody
+//! registered is refused, and so is adopting into a context that already
+//! has a conversation.
 //!
 //! ```
 //! use skywaved::agent::fake::{FakeAgent, FakeScript, Step};
@@ -399,13 +404,15 @@ impl Default for Gate {
 
 /// Which conversation a fake start ran, as recorded in
 /// [`FakeInput::Started`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeConversation {
     Fresh,
     /// The started context's own.
     Resume,
     /// A copy of this context's conversation.
     Fork(ContextId),
+    /// A copy of the outside conversation with this id.
+    Adopt(String),
 }
 
 /// A request a fake session received, as recorded by [`FakeAgent::inputs`].
@@ -433,6 +440,8 @@ pub enum FakeInput {
 pub struct FakeAgent {
     script: Arc<FakeScript>,
     shared: Arc<Mutex<HashMap<SessionId, Progress>>>,
+    /// Ids of conversations that exist outside Skywave, shared by clones.
+    outside: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -450,7 +459,15 @@ impl FakeAgent {
         FakeAgent {
             script: Arc::new(script),
             shared: Arc::default(),
+            outside: Arc::default(),
         }
+    }
+
+    /// Makes `id` name a conversation outside Skywave that a start may
+    /// adopt ([`Conversation::Adopt`]). Visible to every clone.
+    pub fn with_outside_conversation(self, id: &str) -> FakeAgent {
+        lock(&self.outside).insert(id.to_owned());
+        self
     }
 
     /// Everything sessions of `session_id` received, in order.
@@ -509,6 +526,14 @@ impl AgentAdapter for FakeAgent {
                         )));
                     }
                 }
+            }
+            Conversation::Adopt(id) => {
+                if !lock(&self.outside).contains(id) {
+                    return Err(AgentError::Resume(format!(
+                        "{id} names no outside conversation"
+                    )));
+                }
+                FakeConversation::Adopt(id.clone())
             }
         };
         let resumed = conversation == FakeConversation::Resume;
@@ -1020,9 +1045,7 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-fn lock(
-    shared: &Mutex<HashMap<SessionId, Progress>>,
-) -> MutexGuard<'_, HashMap<SessionId, Progress>> {
+fn lock<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panicking test thread must not hide the progress from the others.
     shared
         .lock()

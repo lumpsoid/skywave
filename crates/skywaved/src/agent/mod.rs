@@ -20,7 +20,9 @@
 //! [`store_resume_handle`] / [`load_resume_handle`]. A context moved into
 //! a new session leaves that session's first context its origin
 //! ([`load_origin`]), whose conversation the new one continues as a fork.
-//! What the agent was
+//! A session may instead adopt a conversation the agent had outside
+//! Skywave, named by the agent's own id ([`Conversation::Adopt`]): a copy
+//! too, so the outside conversation is never written. What the agent was
 //! granted for the whole Skywave session (for example lasting permission
 //! rules) is opaque [`Grants`], persisted per session in
 //! `sessions.agent_grants` with [`store_grants`] / [`load_grants`] and given
@@ -28,10 +30,10 @@
 //!
 //! **Protocol between supervisor and session.**
 //! - [`AgentAdapter::start`] runs the [`Conversation`] in `spec`: a fresh
-//!   one, the context's own resumed with its stored handle, or a fork of
-//!   the origin's. The adapter reports the handle to persist as
+//!   one, the context's own resumed with its stored handle, a fork of
+//!   the origin's, or a copy of an outside conversation. The adapter reports the handle to persist as
 //!   [`AdapterEvent::ResumeHandle`] once the context's conversation exists
-//!   and before the first turn ends (for a fork, the copy's handle, as for
+//!   and before the first turn ends (for a fork or an adoption, the copy's handle, as for
 //!   a fresh start); a process stopped before any message reports none, so
 //!   the context's next start is fresh (or a fork) again. `spec.grants` are the session's grants; when they
 //!   change the adapter reports the whole new set as
@@ -232,6 +234,10 @@ pub enum Conversation {
     /// continues), which becomes this context's own: the adapter reports
     /// the new conversation's handle as for a fresh start.
     Fork(ResumeHandle),
+    /// A copy of a conversation the agent had outside Skywave, named by the
+    /// agent's own id; it becomes this context's own, and the adapter
+    /// reports its handle as for a fresh start.
+    Adopt(String),
 }
 
 /// How to start an agent session.
