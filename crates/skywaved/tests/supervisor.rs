@@ -18,7 +18,7 @@ use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, REFUSE_REASON,
-    Step, task,
+    Step, schedule, task,
 };
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{DAEMON_RESTARTED, TURN_LOST};
@@ -952,6 +952,43 @@ async fn ambient_tasks_do_not_keep_the_agent() {
     supervisor.shutdown().await.unwrap();
     // Its exit ended the ambient task in the log.
     assert_eq!(tasks_changed(&f).last(), Some(&no_tasks()));
+}
+
+/// Schedules are information only: an idle agent with a wakeup scheduled
+/// stops at its deadline all the same. The positive control is
+/// `a_live_background_task_keeps_the_agent_until_it_ends`, the same script
+/// with a task.
+#[tokio::test]
+async fn schedules_do_not_keep_the_agent() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::schedules([schedule("tick")]),
+        Step::later(TASK_IDLE * 5 / 2, [AdapterEvent::Schedules(Vec::new())]),
+    ]));
+    let config = SupervisorConfig {
+        idle_timeout: TASK_IDLE,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    f.send("loop it");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    let idle = tokio::time::Instant::now();
+    wait_for_shutdowns(&agent, &f, 1).await;
+    // Stopped at the deadline, long before the schedule's end was due.
+    assert!(idle.elapsed() < TASK_IDLE * 2, "{:?}", idle.elapsed());
+    supervisor.shutdown().await.unwrap();
+    let schedules: Vec<_> = f
+        .kinds()
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::SchedulesChanged { schedules } => Some(schedules),
+            _ => None,
+        })
+        .collect();
+    // The schedule was logged, and its exit emptied the set.
+    assert_eq!(schedules.len(), 2, "log: {:#?}", f.kinds());
+    assert_eq!(schedules[0][0].id.0, "tick");
+    assert_eq!(schedules[1], []);
 }
 
 /// An idle agent reporting again that it runs nothing keeps its deadline:

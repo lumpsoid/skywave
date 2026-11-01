@@ -53,6 +53,16 @@
 //! switch, which can change the effort, and report what runs; one answered
 //! while a chain runs or waits is dropped, as the chain's own read is newer.
 //! A chain that ends without a read (an error) writes the dropped one again.
+//!
+//! **Schedules** (`/loop`, `CronCreate`). The CLI lists its scheduled
+//! wakeups only in the input of a Stop hook, which the initialize request
+//! registers as [`STOP_HOOK_ID`]. The hook is called once at the end of
+//! every turn that completes (not one interrupted), before its `result`;
+//! each call reports the whole set as `Schedules` and is answered at once
+//! with an empty success, the one answer that lets the turn end as it
+//! would without the hook (others can hold the stop and run another turn).
+//! Whether a job outlives the process is read from its `CronCreate`
+//! result's structured `durable`, kept by job id for the whole process.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -62,8 +72,8 @@ use uuid::Uuid;
 
 use super::{display, rules, usage};
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, AgentTask, Effort, ModelChoice, PermissionMode,
-    ResumeHandle, TaskKind, TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
+    PermissionMode, ResumeHandle, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -116,12 +126,19 @@ pub fn user_message(text: &str) -> Value {
     })
 }
 
-/// The initialize handshake request.
+/// The callback id the Stop hook is registered under.
+pub const STOP_HOOK_ID: &str = "skywave-stop";
+
+/// The initialize handshake request. It registers the Stop hook, whose
+/// calls carry the session's scheduled wakeups.
 pub fn initialize_request(request_id: &str) -> Value {
     json!({
         "type": "control_request",
         "request_id": request_id,
-        "request": { "subtype": "initialize", "hooks": null },
+        "request": {
+            "subtype": "initialize",
+            "hooks": { "Stop": [{ "hookCallbackIds": [STOP_HOOK_ID] }] },
+        },
     })
 }
 
@@ -279,6 +296,12 @@ pub fn deny_response(request_id: &str, message: &str) -> Value {
     )
 }
 
+/// Answers hook callback `request_id` with nothing to say: the CLI goes on
+/// as it would without the hook.
+pub fn hook_response(request_id: &str) -> Value {
+    control_success(request_id, json!({}))
+}
+
 /// Refuses a control request this adapter does not handle.
 pub fn error_response(request_id: &str, error: &str) -> Value {
     json!({
@@ -333,6 +356,10 @@ pub struct Protocol {
     /// Tool name of each call this turn that has no result yet, by
     /// tool-use id: a structured result is read by its tool.
     tools: HashMap<String, String>,
+    /// Whether each scheduled job created in this process outlives it, by
+    /// job id, as its `CronCreate` result said. Kept across turns: a job
+    /// is listed long after the turn that made it.
+    durable: HashMap<String, bool>,
     shutting_down: bool,
     /// Mode, model and effort requests and effort reads the CLI has not
     /// answered, by request id.
@@ -384,6 +411,7 @@ impl Protocol {
             queued: VecDeque::new(),
             pending: Vec::new(),
             tools: HashMap::new(),
+            durable: HashMap::new(),
             shutting_down: false,
             settings: HashMap::new(),
             efforts: VecDeque::new(),
@@ -823,6 +851,9 @@ impl Protocol {
                 });
             }
             let tool = tool_use_id.and_then(|id| self.tools.remove(id));
+            if tool.as_deref() == Some("CronCreate") && !is_error {
+                self.note_durable(structured);
+            }
             out.events.push(AdapterEvent::ToolResult {
                 call: tool_use_id.map(AgentCallId::from),
                 result: display::result_display(tool.as_deref(), structured, output, is_error),
@@ -834,6 +865,10 @@ impl Protocol {
         let request_id = str_field(message, "request_id");
         let request = message.get("request").unwrap_or(&Value::Null);
         let subtype = str_field(request, "subtype");
+        if subtype == "hook_callback" && str_field(request, "callback_id") == STOP_HOOK_ID {
+            self.on_stop_hook(request_id, request.get("input"), out);
+            return;
+        }
         if subtype != "can_use_tool" {
             tracing::warn!(
                 subtype,
@@ -869,6 +904,47 @@ impl Protocol {
             input,
             suggestions,
         });
+    }
+
+    /// A `CronCreate` result's structured `{id, durable}`: whether the job
+    /// outlives the process.
+    fn note_durable(&mut self, structured: Option<&Value>) {
+        let Some(result) = structured else {
+            return;
+        };
+        if let (Some(id), Some(durable)) = (
+            result.get("id").and_then(Value::as_str),
+            result.get("durable").and_then(Value::as_bool),
+        ) {
+            self.durable.insert(id.to_owned(), durable);
+        }
+    }
+
+    /// A Stop hook call: reports the scheduled wakeups its input lists and
+    /// lets the turn end.
+    fn on_stop_hook(&mut self, request_id: &str, input: Option<&Value>, out: &mut Output) {
+        let schedules = input
+            .and_then(|input| input.get("session_crons"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|cron| {
+                let id = cron.get("id").and_then(Value::as_str)?;
+                Some(AgentSchedule {
+                    id: id.to_owned(),
+                    when: str_field(cron, "schedule").to_owned(),
+                    recurring: cron
+                        .get("recurring")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    prompt: str_field(cron, "prompt").to_owned(),
+                    outlives_agent: self.durable.get(id).copied(),
+                })
+            })
+            .collect();
+        out.events.push(AdapterEvent::Schedules(schedules));
+        out.writes.push(hook_response(request_id));
     }
 
     fn on_cancel(&mut self, message: &Value, out: &mut Output) {

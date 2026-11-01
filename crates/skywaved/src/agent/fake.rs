@@ -92,8 +92,8 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, AgentTask, Conversation, Effort, Grants, ModelChoice, PermissionMode,
-    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, ModelChoice,
+    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -229,6 +229,17 @@ pub fn task(id: &str, ambient: bool) -> AgentTask {
     }
 }
 
+/// A recurring schedule `id` for [`Step::schedules`].
+pub fn schedule(id: &str) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: "*/1 * * * *".to_owned(),
+        recurring: true,
+        prompt: format!("wake {id}"),
+        outlives_agent: None,
+    }
+}
+
 impl Step {
     pub fn text(text: impl Into<String>) -> Step {
         Step::Emit(AdapterEvent::Text(text.into()))
@@ -298,6 +309,11 @@ impl Step {
     /// Reports `tasks` as the agent's whole set of background tasks.
     pub fn tasks(tasks: impl IntoIterator<Item = AgentTask>) -> Step {
         Step::Emit(AdapterEvent::BackgroundTasks(tasks.into_iter().collect()))
+    }
+
+    /// Reports `schedules` as the agent's whole set of scheduled wakeups.
+    pub fn schedules(schedules: impl IntoIterator<Item = AgentSchedule>) -> Step {
+        Step::Emit(AdapterEvent::Schedules(schedules.into_iter().collect()))
     }
 
     /// Reports `grants` as the session's whole set of grants.
