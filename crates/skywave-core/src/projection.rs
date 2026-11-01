@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, ApprovalId, BlobRef, ContextId, Event, EventKind, Seq, SessionId, SessionState,
-    ToolCall, ToolResult, TurnUsage,
+    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, Seq, SessionId,
+    SessionState, ToolCall, ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -48,6 +48,9 @@ pub struct SessionSummary {
     /// The agent's permission mode and model, folded with
     /// [`AgentSettings::apply`].
     pub agent: AgentSettings,
+    /// The agent's background tasks and schedules, folded with
+    /// [`AgentWork::apply`]: each set as its last event left it.
+    pub work: AgentWork,
     /// The session's current context: its first (which has the session's
     /// id) until a `ContextStarted` or `ContextSwitched` names another.
     pub context: ContextId,
@@ -120,6 +123,7 @@ impl SessionSummary {
             archived: false,
             usage: None,
             agent: AgentSettings::default(),
+            work: AgentWork::default(),
             context: ContextId::first_of(event.session_id),
         };
         summary.apply(seq, event);
@@ -129,10 +133,12 @@ impl SessionSummary {
     /// Folds one event of this session into the summary.
     ///
     /// A rename only sets the name, an archive only the archived flag, a
-    /// mode or model event only the agent settings, a context cleared or
+    /// mode or model event only the agent settings, a change of background
+    /// tasks or schedules only the agent's work, a context cleared or
     /// switched only the current context, and the models an agent offers
-    /// or a context moved away nothing here: none is activity, so they move neither `last_seq` nor
-    /// `last_activity` and the session keeps its place in the list.
+    /// or a context moved away nothing here: none is activity, so they move
+    /// neither `last_seq` nor `last_activity` and the session keeps its
+    /// place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
         debug_assert_eq!(event.session_id, self.id, "event of another session");
         if let Some(archived) = event.kind.archived_effect() {
@@ -140,6 +146,10 @@ impl SessionSummary {
         }
         if AgentSettings::folds(&event.kind) {
             self.agent.apply(event.command_id, &event.kind);
+            return;
+        }
+        if AgentWork::folds(&event.kind) {
+            self.work.apply(&event.kind);
             return;
         }
         match &event.kind {
@@ -205,7 +215,9 @@ impl SessionSummary {
             | EventKind::EffortRefused { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
-            | EventKind::ContextMoved { .. } => {}
+            | EventKind::ContextMoved { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. } => {}
         }
     }
 
@@ -282,7 +294,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::EffortRefused { .. }
         | EventKind::ContextStarted { .. }
         | EventKind::ContextSwitched { .. }
-        | EventKind::ContextMoved { .. } => false,
+        | EventKind::ContextMoved { .. }
+        | EventKind::BackgroundTasksChanged { .. }
+        | EventKind::SchedulesChanged { .. } => false,
     }
 }
 
@@ -319,7 +333,9 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::EffortRefused { .. }
         | EventKind::ContextStarted { .. }
         | EventKind::ContextSwitched { .. }
-        | EventKind::ContextMoved { .. } => (None, None),
+        | EventKind::ContextMoved { .. }
+        | EventKind::BackgroundTasksChanged { .. }
+        | EventKind::SchedulesChanged { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }

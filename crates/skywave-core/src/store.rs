@@ -214,6 +214,12 @@ UPDATE outbox SET command = json_set(command, '$.kind.context',
         json_extract(command, '$.kind.session_id'))
     WHERE json_extract(command, '$.kind.type') = 'send_message';
 "#,
+    r#"
+-- `SessionSummary::work` as JSON (protocol v11). A replica from before this
+-- holds no background work events, so every session starts with none:
+-- nothing to backfill.
+ALTER TABLE sessions ADD COLUMN work TEXT;
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -1211,7 +1217,7 @@ fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Resu
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage, agent, context";
+    stopped, notable, name, first_prompt, archived, usage, agent, context, work";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -1226,7 +1232,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
         ),
         params![
             summary.id.0.to_string(),
@@ -1243,6 +1249,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.usage.as_ref().map(to_json).transpose()?,
             to_json(&summary.agent)?,
             summary.context.0.to_string(),
+            to_json(&summary.work)?,
         ],
     )?;
     Ok(())
@@ -1268,6 +1275,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         usage: opt_json_col(row, 11)?,
         agent: opt_json_col(row, 12)?.unwrap_or_default(),
         context: ContextId(uuid_col(row, 13)?),
+        work: opt_json_col(row, 14)?.unwrap_or_default(),
     })
 }
 

@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
-    DeviceId, Effort, Event, EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
-    SessionState,
+    AgentWork, ApprovalId, BackgroundTask, Command, CommandId, CommandKind, CommandResult,
+    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -1032,6 +1032,75 @@ fn set_effort_logs_one_request_the_agent_answers() {
     let settings = f.log.agent_settings(&f.storage.db, session).unwrap();
     assert_eq!(settings.effort.requested, None);
     assert_eq!(settings.effort.current, Some(Some(Effort::XHigh)));
+}
+
+#[test]
+fn background_work_folds_each_set_on_its_own() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let other = f.create_session();
+    let work = |f: &Fixture, id| f.log.agent_work(&f.storage.db, id).unwrap();
+    assert_eq!(work(&f, session), AgentWork::default());
+
+    let tasks = vec![
+        BackgroundTask {
+            id: TaskId("a1".into()),
+            kind: TaskKind::Subagent,
+            title: "Explore the repo".into(),
+            parent: None,
+            ambient: false,
+        },
+        BackgroundTask {
+            id: TaskId("b2".into()),
+            kind: TaskKind::Shell,
+            title: "cargo test".into(),
+            parent: Some(TaskId("a1".into())),
+            ambient: true,
+        },
+    ];
+    let schedules = vec![Schedule {
+        id: ScheduleId("s1".into()),
+        when: "*/5 * * * *".into(),
+        recurring: true,
+        prompt: "check the deploy".into(),
+        outlives_agent: Some(false),
+    }];
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: tasks.clone(),
+        },
+    );
+    f.agent(
+        session,
+        EventKind::SchedulesChanged {
+            schedules: schedules.clone(),
+        },
+    );
+    assert_eq!(
+        work(&f, session),
+        AgentWork {
+            tasks,
+            schedules: schedules.clone(),
+        }
+    );
+    assert_eq!(work(&f, other), AgentWork::default(), "per session");
+
+    // A new set replaces the old one whole and leaves the other set alone.
+    f.agent(session, EventKind::BackgroundTasksChanged { tasks: vec![] });
+    assert_eq!(
+        work(&f, session),
+        AgentWork {
+            tasks: vec![],
+            schedules,
+        }
+    );
+    // Another connection reads the same fold.
+    let other_db = f.connection();
+    assert_eq!(
+        f.log.agent_work(&other_db.db, session).unwrap(),
+        work(&f, session)
+    );
 }
 
 #[test]
