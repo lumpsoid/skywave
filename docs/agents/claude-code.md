@@ -650,6 +650,86 @@ haiku 4.5 reads `null`, and switching back to sonnet reads `high`.
   Since the level outlasts the switch, the order would only matter for the
   reply to a model that takes none, which reads `null` either way.
 
+### 3.11 Background tasks and schedules [C]
+
+Work the agent runs outside a turn: shells started with
+`run_in_background`, Monitors, background subagents, and cron jobs
+(`CronCreate`, `/loop`). Skywave reports tasks and schedules as two whole
+sets (D31). Fixtures: `background_bash`, `subagent`,
+`subagent_background_bash`, `stop_task`, `stop_hook`, `loop`, `loop_resume`,
+`subagent_approval`, `interrupt_spares_tasks`, `interrupt_kills_tasks`.
+
+**The level signal.** `{"type":"system","subtype":"background_tasks_changed",
+"tasks":[…]}` carries the CLI's whole live set each time it changes
+(REPLACE semantics: the last event wins). A task has `task_id`, `run_id?`,
+`task_type` (`local_bash`, `local_agent`, …), `subagent_type?`,
+`description`, `parent_task_id?` (a shell started by a subagent names it)
+and `ambient?`. Notes:
+- Nothing is sent at process start; the adapter reports an empty set when
+  the agent is ready.
+- A Monitor is a `local_bash` task. List order is not start order.
+- The edge events (`task_started`, `task_updated`, `task_progress`,
+  `task_notification`) are not used for state: a missed edge would wedge a
+  set, a missed level event cannot (the next one replaces it).
+- A foreground Bash gets edge events but never enters the level.
+
+**Subagent messages.** A subagent's `assistant` and `user` messages carry
+`parent_tool_use_id` and may arrive after the main `result`. They are not
+reported: the main timeline drops them (`subagent`).
+
+**Self-started turns.** When a task ends or a cron fires, the CLI starts a
+turn with no user message: `system/init`, a whole turn, `result` (a cron's
+turn is framed by `command_lifecycle`). Such a turn counts as work for the
+idle timer, so the agent is not stopped under it.
+
+**Keep-alive.** A live non-ambient task keeps the agent running; it is
+counted from the uncut set. The idle stop (`idle_timeout`) runs once the set
+is empty. Schedules never keep the agent alive.
+
+**`stop_task`.**
+`{"subtype":"stop_task","task_id":"…"}` (`stop_task`). The success response
+is `{}` even for an unknown or already ended id; the only error is a
+non-string id (`stop_task: task_id must be a string`), which the adapter
+never sends. The CLI sends `task_updated` (`killed`), `task_notification`
+(`stopped`) and the level without the task, **then** the success. Stopping a
+subagent also stops its own shells, and the CLI then starts a turn. So the
+level is the only truth: the adapter answers each stop from the CLI's
+success (which follows the level), and `TaskStopRefused` from the CLI is practically
+unreachable.
+
+**The Stop hook.** `initialize` registers
+`hooks.Stop[{hookCallbackIds:["skywave-stop"]}]`. The CLI then sends a
+`hook_callback` control request (`stop_hook`) with `callback_id` and
+`input`: `session_id, transcript_path, cwd, prompt_id, permission_mode,
+effort{level}, hook_event_name:"Stop", stop_hook_active,
+last_assistant_message, background_tasks[…],
+session_crons[{id,schedule,recurring,prompt}]`. It comes once per completed
+turn end, self-started turns included, after the last `assistant` and
+before `result`, and never for an interrupted turn. The adapter answers
+success `{}` at once, in the same output as the request; other answers can
+block the stop and make the CLI run another turn, so they are never sent. A
+callback id other than ours gets an error. `session_crons` is where the
+schedules come from.
+
+**Crons are not tasks.** No stdin command can delete one: there is no
+control subtype for it, `bash_command` runs in a separate shell, `/loops` is
+disabled; only a model turn calling `CronDelete`, or the process ending,
+removes one. `CronCreate`'s structured `tool_use_result` is `{id, durable}`;
+2.1.310 ignores `durable: true` (always `false`, "Session-only", no
+`.claude/scheduled_tasks.json`), but the adapter still reads it. Session-only
+jobs come back after `--resume` (`loop_resume`), so a stop **pauses** a loop;
+it does not end it. Skywave therefore shows schedules as information only.
+
+**Approvals from a background subagent.** A subagent's `can_use_tool`
+arrives after the main `result`, outside a turn, with `agent_id` equal to the
+subagent's `task_id` and no `parent_tool_use_id` (`subagent_approval`). Such
+an approval survives main-turn ends. It is cancelled when its task leaves
+the set (reason `task ended`), by the CLI's `control_cancel_request`, or on
+exit. An `agent_id` not in the last live set counts as the turn's.
+
+**`perTaskStopAffordance`.** `initialize` carries
+`"perTaskStopAffordance": true`: see §4.4.
+
 ## 4. Interrupt
 
 Request **[C]**:
@@ -695,6 +775,25 @@ than rely on that.
 
 After both interrupt cases, the next `user` message ran a normal turn in the
 same process, with the same session id.
+
+### 4.4 Background work [C] (`interrupt_spares_tasks.ndjson`, `interrupt_kills_tasks.ndjson`)
+
+What an interrupt does to background tasks depends on `initialize`'s
+`"perTaskStopAffordance"`. The CLI's schema: the consumer renders a
+per-task stop control wired to `stop_task`; when declared, an interrupt on
+an open-input session spares running background agents and workflows (it
+aborts the turn only). Absence fails closed.
+- **Without it** (`interrupt_kills_tasks`): `task_updated` `killed`,
+  `task_notification` `stopped`, the empty level, then the interrupt's
+  response.
+- **With it** (`interrupt_spares_tasks`): only the main turn's foreground
+  work stops. The background subagent stays in the level, its shell
+  completes, it ends `completed`, the level empties, and the CLI starts a
+  turn of its own.
+
+An interrupted turn gets no Stop hook call. Skywave declares the flag
+because both heads render a per-task stop; an approval a spared subagent is
+waiting on stays pending.
 
 ## 5. Session id and resume
 
@@ -803,7 +902,13 @@ notes above:
   closed, or a future CLI-side timeout, §3.4) reports `ApprovalCancelled`
   with the result's first line as the reason.
 - **Approvals still pending at `result`** are cancelled (`interrupted` or
-  `turn ended`) before `TurnEnded`.
+  `turn ended`) before `TurnEnded`, except a background subagent's: a
+  `can_use_tool` whose `agent_id` is a live task's id (from
+  `background_tasks_changed`; `subagent_approval.ndjson`) can come outside
+  any turn and is that task's. It stays pending across main turns and is
+  cancelled (`task ended`) when a `background_tasks_changed` no longer lists
+  the task, or withdrawn by the CLI's own cancel. An `agent_id` no task set
+  listed (a foreground subagent) is the turn's.
 - **The turn's usage** (§2.5) is reported as `TurnUsage` just before
   `TurnEnded`, per-turn figures only; nothing is carried between turns or
   processes, so a restart needs no reset. Core sums them per session.

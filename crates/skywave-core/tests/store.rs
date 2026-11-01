@@ -9,9 +9,10 @@ use skywave_core::{
     Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContextId,
-    Decision, DeviceId, DeviceInfo, Event, EventBatch, EventKind, RejectReason, Seq, SessionId,
-    SessionState, ToolResult, TurnUsage,
+    AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, Command, CommandId, CommandKind,
+    CommandResult, ContextId, Decision, DeviceId, DeviceInfo, Event, EventBatch, EventKind,
+    RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind, ToolResult,
+    TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -540,6 +541,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_drafts(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 2);
@@ -674,11 +676,114 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_usage(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
+}
+
+#[test]
+fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_migration() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let task = BackgroundTask {
+        id: TaskId("b7".into()),
+        kind: TaskKind::Shell,
+        title: "npm run dev".into(),
+        parent: None,
+        ambient: false,
+    };
+    let schedule = Schedule {
+        id: ScheduleId("s1".into()),
+        when: "0 9 * * *".into(),
+        recurring: true,
+        prompt: "summarise the night's CI".into(),
+        outlives_agent: None,
+    };
+    let created = event(
+        id,
+        0,
+        EventKind::SessionCreated {
+            workdir: "/srv/x".into(),
+            context_name: "start".into(),
+            from: None,
+        },
+    );
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: vec![
+                    created,
+                    event(
+                        id,
+                        1,
+                        EventKind::BackgroundTasksChanged {
+                            tasks: vec![task.clone()],
+                        },
+                    ),
+                    event(
+                        id,
+                        2,
+                        EventKind::SchedulesChanged {
+                            schedules: vec![schedule.clone()],
+                        },
+                    ),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let summary = store.session(id).unwrap().unwrap();
+    assert_eq!(
+        summary.work,
+        AgentWork {
+            tasks: vec![task],
+            schedules: vec![schedule.clone()],
+        }
+    );
+    // Neither is news nor activity.
+    assert_eq!((summary.notable, summary.last_seq), (0, Seq(1)));
+
+    // The last set wins and leaves the other set alone; a notable event in
+    // the same session does count, so the check above can see one.
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(4),
+                events: vec![
+                    event(id, 3, EventKind::BackgroundTasksChanged { tasks: vec![] }),
+                    event(id, 4, EventKind::AgentMessage { text: "hi".into() }),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    drop(store);
+
+    // Kept over a reopen.
+    let store = Store::open(&dir).unwrap();
+    let summary = store.session(id).unwrap().unwrap();
+    assert_eq!(
+        summary.work,
+        AgentWork {
+            tasks: vec![],
+            schedules: vec![schedule],
+        }
+    );
+    assert_eq!((summary.notable, summary.last_seq), (1, Seq(5)));
+    drop(store);
+
+    // A replica from before the column holds no background work events.
+    drop_work(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    let store = Store::open(&dir).unwrap();
+    let summary = store.session(id).unwrap().unwrap();
+    assert_eq!(summary.work, AgentWork::default());
+    assert_eq!(summary.notable, 1, "the rest of the row is kept");
 }
 
 #[test]
@@ -741,6 +846,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_archived(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 6);
@@ -825,6 +931,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_titles(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 5);
@@ -920,6 +1027,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_unread(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 4);
@@ -1090,6 +1198,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_drafts(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 1);
@@ -1758,6 +1867,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop_alerted(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
+    drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
     set_user_version(&dir, 9);
@@ -1839,8 +1949,9 @@ fn a_v8_replica_moves_into_first_contexts() {
             .unwrap();
         assert_eq!(v8, 3);
     }
+    drop_work(&dir);
     drop_contexts(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -1876,6 +1987,13 @@ fn a_v8_replica_moves_into_first_contexts() {
 fn drop_contexts(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN context;")
+        .unwrap();
+}
+
+/// Undoes the background work migration.
+fn drop_work(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN work;")
         .unwrap();
 }
 

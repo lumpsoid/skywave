@@ -28,7 +28,8 @@ pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
     ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
+    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
+    StopHeadings, TaskRow,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use timeline::{

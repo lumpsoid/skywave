@@ -17,7 +17,10 @@
 //! and stays pending, with no timeout (D8), until it is answered, the CLI
 //! withdraws it (`control_cancel_request`, or an error `tool_result` for its
 //! tool call), or the turn ends; the last two are reported as
-//! `ApprovalCancelled`. An answer to a request that is no longer pending
+//! `ApprovalCancelled`. A background subagent's request (its `agent_id` is a
+//! live task's id) is that task's, not the turn's: it may come outside any
+//! turn, and instead of the turn's end, the task leaving the set
+//! (`background_tasks_changed`) cancels it. An answer to a request that is no longer pending
 //! writes nothing. The request's `permission_suggestions` worth offering
 //! ([`rules::offered`]) ride along as rule suggestions; an approval granting
 //! one sends that update back as `updatedPermissions`, so the CLI keeps the
@@ -53,8 +56,27 @@
 //! switch, which can change the effort, and report what runs; one answered
 //! while a chain runs or waits is dropped, as the chain's own read is newer.
 //! A chain that ends without a read (an error) writes the dropped one again.
+//!
+//! **Stopping a background task.** A `stop_task` control request naming
+//! the task id; its `control_response` is the answer, `TaskStopAnswered`
+//! on success, `TaskStopRefused` with the CLI's error otherwise. The CLI
+//! acks an id it does not know, or one already ended, with success too;
+//! its only error is for a `task_id` that is not a string. The stop
+//! itself shows in the task lines before the ack (the task leaves the
+//! set); stopping a subagent stops the shells it owns, and the CLI may
+//! then start a turn on its own.
+//!
+//! **Schedules** (`/loop`, `CronCreate`). The CLI lists its scheduled
+//! wakeups only in the input of a Stop hook, which the initialize request
+//! registers as [`STOP_HOOK_ID`]. The hook is called once at the end of
+//! every turn that completes (not one interrupted), before its `result`;
+//! each call reports the whole set as `Schedules` and is answered at once
+//! with an empty success, the one answer that lets the turn end as it
+//! would without the hook (others can hold the stop and run another turn).
+//! Whether a job outlives the process is read from its `CronCreate`
+//! result's structured `durable`, kept by job id for the whole process.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 use skywave_proto::Decision;
@@ -62,8 +84,8 @@ use uuid::Uuid;
 
 use super::{display, rules, usage};
 use crate::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, Effort, ModelChoice, PermissionMode, ResumeHandle,
-    TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
+    PermissionMode, ResumeHandle, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -79,6 +101,9 @@ pub const INTERRUPT_REASON: &str = "interrupted";
 pub const WITHDRAWN_REASON: &str = "withdrawn by the agent";
 /// Reason for approvals still pending when their turn ended.
 pub const TURN_ENDED_REASON: &str = "turn ended";
+/// Reason for a background task's approvals still pending when the task
+/// left the set.
+pub const TASK_ENDED_REASON: &str = "task ended";
 
 /// What one protocol step produces, in order.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -116,12 +141,23 @@ pub fn user_message(text: &str) -> Value {
     })
 }
 
-/// The initialize handshake request.
+/// The callback id the Stop hook is registered under.
+pub const STOP_HOOK_ID: &str = "skywave-stop";
+
+/// The initialize handshake request. It registers the Stop hook, whose
+/// calls carry the session's scheduled wakeups, and declares that both
+/// heads render a per-task stop: an interrupt then spares background agents
+/// (it aborts the turn only), where a consumer that does not declare it has
+/// them killed.
 pub fn initialize_request(request_id: &str) -> Value {
     json!({
         "type": "control_request",
         "request_id": request_id,
-        "request": { "subtype": "initialize", "hooks": null },
+        "request": {
+            "subtype": "initialize",
+            "hooks": { "Stop": [{ "hookCallbackIds": [STOP_HOOK_ID] }] },
+            "perTaskStopAffordance": true,
+        },
     })
 }
 
@@ -243,6 +279,15 @@ pub fn offered_models(models: Option<&Value>) -> Vec<ModelChoice> {
         .collect()
 }
 
+/// The request that stops background task `task_id`.
+pub fn stop_task_request(request_id: &str, task_id: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "stop_task", "task_id": task_id },
+    })
+}
+
 /// The request that stops the current turn.
 pub fn interrupt_request(request_id: &str) -> Value {
     json!({
@@ -279,6 +324,12 @@ pub fn deny_response(request_id: &str, message: &str) -> Value {
     )
 }
 
+/// Answers hook callback `request_id` with nothing to say: the CLI goes on
+/// as it would without the hook.
+pub fn hook_response(request_id: &str) -> Value {
+    control_success(request_id, json!({}))
+}
+
 /// Refuses a control request this adapter does not handle.
 pub fn error_response(request_id: &str, error: &str) -> Value {
     json!({
@@ -302,6 +353,9 @@ struct Pending {
     input: Value,
     /// The permission update behind each suggestion offered, by index.
     updates: Vec<Value>,
+    /// The live background task asking (its `agent_id`), or `None` for
+    /// the turn's own.
+    task: Option<String>,
 }
 
 /// The protocol state of one CLI process.
@@ -333,9 +387,15 @@ pub struct Protocol {
     /// Tool name of each call this turn that has no result yet, by
     /// tool-use id: a structured result is read by its tool.
     tools: HashMap<String, String>,
+    /// Whether each scheduled job created in this process outlives it, by
+    /// job id, as its `CronCreate` result said. Kept across turns: a job
+    /// is listed long after the turn that made it.
+    durable: HashMap<String, bool>,
+    /// The ids of the live background tasks, as last reported.
+    tasks: HashSet<String>,
     shutting_down: bool,
-    /// Mode, model and effort requests and effort reads the CLI has not
-    /// answered, by request id.
+    /// Mode, model and effort requests, effort reads and task stops the
+    /// CLI has not answered, by request id.
     settings: HashMap<String, Asked>,
     /// Effort requests waiting for the chain in flight, oldest first.
     efforts: VecDeque<Effort>,
@@ -361,6 +421,8 @@ enum Asked {
     EffortRead {
         asked: Option<Effort>,
     },
+    /// A `stop_task` for the task with this id.
+    StopTask(String),
 }
 
 impl Protocol {
@@ -384,6 +446,8 @@ impl Protocol {
             queued: VecDeque::new(),
             pending: Vec::new(),
             tools: HashMap::new(),
+            durable: HashMap::new(),
+            tasks: HashSet::new(),
             shutting_down: false,
             settings: HashMap::new(),
             efforts: VecDeque::new(),
@@ -516,6 +580,19 @@ impl Protocol {
         }
     }
 
+    /// Asks the CLI to stop background task `task`; answered by
+    /// `TaskStopAnswered` or `TaskStopRefused` when its `control_response`
+    /// comes.
+    pub fn stop_task(&mut self, task: String) -> Output {
+        let id = self.request_id();
+        let write = stop_task_request(&id, &task);
+        self.settings.insert(id, Asked::StopTask(task));
+        Output {
+            writes: vec![write],
+            events: Vec::new(),
+        }
+    }
+
     /// Asks the CLI to switch to `model`; answered by `ModelSet` or
     /// `ModelRefused`.
     pub fn set_model(&mut self, model: String) -> Output {
@@ -569,6 +646,9 @@ impl Protocol {
             "system" if str_field(message, "subtype") == "status" => {
                 self.on_status(message, &mut out);
             }
+            "system" if str_field(message, "subtype") == "background_tasks_changed" => {
+                self.on_background_tasks(message, &mut out);
+            }
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
@@ -576,7 +656,9 @@ impl Protocol {
             "control_response" => self.on_control_response(message, &mut out),
             "result" => self.on_result(message, &mut out),
             // rate_limit_event, stream_event, other system subtypes: progress
-            // signals only.
+            // signals only. That includes the edge events of tasks
+            // (task_started, task_updated, task_progress, task_notification):
+            // the task set comes from background_tasks_changed alone.
             _ => {}
         }
         out
@@ -702,7 +784,52 @@ impl Protocol {
         }
     }
 
+    /// `system/background_tasks_changed`: every live task, replacing the
+    /// last report. The approvals of a task no longer in it are cancelled
+    /// first.
+    fn on_background_tasks(&mut self, message: &Value, out: &mut Output) {
+        let tasks: Vec<AgentTask> = message
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|task| {
+                let id = task.get("task_id").and_then(Value::as_str)?;
+                let kind = match str_field(task, "task_type") {
+                    "local_bash" => TaskKind::Shell,
+                    "local_agent" => TaskKind::Subagent,
+                    _ => TaskKind::Other,
+                };
+                Some(AgentTask {
+                    id: id.to_owned(),
+                    kind,
+                    title: str_field(task, "description").to_owned(),
+                    parent: task
+                        .get("parent_task_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    ambient: task
+                        .get("ambient")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect();
+        let live: HashSet<String> = tasks.iter().map(|task| task.id.clone()).collect();
+        self.cancel_pending(
+            |p| p.task.as_ref().is_some_and(|task| !live.contains(task)),
+            TASK_ENDED_REASON,
+            out,
+        );
+        self.tasks = live;
+        out.events.push(AdapterEvent::BackgroundTasks(tasks));
+    }
+
     fn on_assistant(&mut self, message: &Value, out: &mut Output) {
+        if is_subagent_message(message) {
+            return;
+        }
         let Some(blocks) = content_blocks(message) else {
             return;
         };
@@ -735,6 +862,9 @@ impl Protocol {
     }
 
     fn on_user(&mut self, message: &Value, out: &mut Output) {
+        if is_subagent_message(message) {
+            return;
+        }
         // Text blocks here are the CLI's own markers ("[Request interrupted
         // by user]"); only tool results matter.
         let Some(blocks) = content_blocks(message) else {
@@ -778,6 +908,9 @@ impl Protocol {
                 });
             }
             let tool = tool_use_id.and_then(|id| self.tools.remove(id));
+            if tool.as_deref() == Some("CronCreate") && !is_error {
+                self.note_durable(structured);
+            }
             out.events.push(AdapterEvent::ToolResult {
                 call: tool_use_id.map(AgentCallId::from),
                 result: display::result_display(tool.as_deref(), structured, output, is_error),
@@ -789,6 +922,10 @@ impl Protocol {
         let request_id = str_field(message, "request_id");
         let request = message.get("request").unwrap_or(&Value::Null);
         let subtype = str_field(request, "subtype");
+        if subtype == "hook_callback" && str_field(request, "callback_id") == STOP_HOOK_ID {
+            self.on_stop_hook(request_id, request.get("input"), out);
+            return;
+        }
         if subtype != "can_use_tool" {
             tracing::warn!(
                 subtype,
@@ -809,6 +946,13 @@ impl Protocol {
         let (suggestions, updates) = rules::offered(request.get("permission_suggestions"))
             .into_iter()
             .unzip();
+        // A background subagent asks under its task id; one not live (a
+        // foreground subagent) works for the turn, so is the turn's.
+        let task = request
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .filter(|id| self.tasks.contains(*id))
+            .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
         self.pending.push(Pending {
@@ -816,6 +960,7 @@ impl Protocol {
             tool_use_id,
             input: input.clone(),
             updates,
+            task: task.clone(),
         });
         out.events.push(AdapterEvent::ApprovalRequested {
             request,
@@ -823,7 +968,49 @@ impl Protocol {
             tool,
             input,
             suggestions,
+            task,
         });
+    }
+
+    /// A `CronCreate` result's structured `{id, durable}`: whether the job
+    /// outlives the process.
+    fn note_durable(&mut self, structured: Option<&Value>) {
+        let Some(result) = structured else {
+            return;
+        };
+        if let (Some(id), Some(durable)) = (
+            result.get("id").and_then(Value::as_str),
+            result.get("durable").and_then(Value::as_bool),
+        ) {
+            self.durable.insert(id.to_owned(), durable);
+        }
+    }
+
+    /// A Stop hook call: reports the scheduled wakeups its input lists and
+    /// lets the turn end.
+    fn on_stop_hook(&mut self, request_id: &str, input: Option<&Value>, out: &mut Output) {
+        let schedules = input
+            .and_then(|input| input.get("session_crons"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|cron| {
+                let id = cron.get("id").and_then(Value::as_str)?;
+                Some(AgentSchedule {
+                    id: id.to_owned(),
+                    when: str_field(cron, "schedule").to_owned(),
+                    recurring: cron
+                        .get("recurring")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    prompt: str_field(cron, "prompt").to_owned(),
+                    outlives_agent: self.durable.get(id).copied(),
+                })
+            })
+            .collect();
+        out.events.push(AdapterEvent::Schedules(schedules));
+        out.writes.push(hook_response(request_id));
     }
 
     fn on_cancel(&mut self, message: &Value, out: &mut Output) {
@@ -841,6 +1028,20 @@ impl Protocol {
             request: pending.request,
             reason: reason.to_owned(),
         });
+    }
+
+    /// Cancels the pending approvals `which` picks, oldest first.
+    fn cancel_pending(&mut self, which: impl Fn(&Pending) -> bool, reason: &str, out: &mut Output) {
+        let (cancelled, kept) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(which);
+        self.pending = kept;
+        for pending in cancelled {
+            out.events.push(AdapterEvent::ApprovalCancelled {
+                request: pending.request,
+                reason: reason.to_owned(),
+            });
+        }
     }
 
     /// A `system/status`: the mode now, unless it echoes a switch the
@@ -861,7 +1062,8 @@ impl Protocol {
         out.events.push(AdapterEvent::PermissionMode(mode));
     }
 
-    /// The answer to a mode, model or effort request, or to an effort read.
+    /// The answer to a mode, model or effort request, an effort read or a
+    /// task stop.
     fn on_setting_response(&mut self, asked: Asked, response: &Value, out: &mut Output) {
         let success = str_field(response, "subtype") == "success";
         let reason = || {
@@ -912,6 +1114,13 @@ impl Protocol {
                 self.end_effort(out);
             }
             Asked::EffortRead { asked } => self.on_effort_read(asked, response, out),
+            Asked::StopTask(task) if success => {
+                out.events.push(AdapterEvent::TaskStopAnswered { task });
+            }
+            Asked::StopTask(task) => out.events.push(AdapterEvent::TaskStopRefused {
+                task,
+                reason: reason(),
+            }),
         }
     }
 
@@ -1017,6 +1226,8 @@ impl Protocol {
                 out.events.push(AdapterEvent::ModelsOffered(models));
             }
             self.ready = true;
+            // The CLI reports no task set at start: nothing is running.
+            out.events.push(AdapterEvent::BackgroundTasks(Vec::new()));
             // Neither this answer nor `system/init` names the effort.
             self.read_effort(None, out);
         } else {
@@ -1059,12 +1270,8 @@ impl Protocol {
         } else {
             TURN_ENDED_REASON
         };
-        for pending in self.pending.drain(..) {
-            out.events.push(AdapterEvent::ApprovalCancelled {
-                request: pending.request,
-                reason: reason.to_owned(),
-            });
-        }
+        // A background task's approvals outlive the turn.
+        self.cancel_pending(|p| p.task.is_none(), reason, out);
         let usage = usage::turn_usage(message, self.model.as_deref());
         if !usage.is_empty() {
             out.events.push(AdapterEvent::TurnUsage(usage));
@@ -1138,4 +1345,13 @@ fn applied_effort(raw: Option<&Value>) -> Option<Option<Effort>> {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A subagent's own message, which comes after the main turn's `result` and
+/// outside any turn. Not reported: the main agent's turn quotes what the
+/// subagent found.
+fn is_subagent_message(message: &Value) -> bool {
+    message
+        .get("parent_tool_use_id")
+        .is_some_and(|id| !id.is_null())
 }

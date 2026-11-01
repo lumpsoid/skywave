@@ -12,6 +12,16 @@
 //! - [`Step::Hang`] blocks until interrupted, like a tool that never ends;
 //! - [`Step::Wait`] blocks until the test opens a [`Gate`].
 //!
+//! [`Step::Wake`] schedules a turn the agent starts on its own, with no
+//! message, like a CLI's scheduled wakeup: it runs once the session is idle
+//! and its time has come, before any queued message, and is lost with the
+//! session. [`Step::Later`] is the same without a turn: its events are
+//! emitted between turns, like a CLI reporting that a background job
+//! ended. A `Later` and a `Wake` due at the same time play in script order,
+//! so `[Step::later(t, [no tasks]), Step::wake(t, ..)]` is a task that ends
+//! and the turn the agent starts to report it. [`task`] makes an
+//! [`AgentTask`] for [`Step::tasks`].
+//!
 //! An interrupt is seen while blocked, or between two steps; the rest of the
 //! turn is dropped, a pending approval is reported `ApprovalCancelled`, and
 //! the turn ends `Interrupted`. So a test that interrupts while the agent is
@@ -69,19 +79,27 @@
 //! [`FakeScript::refuse_effort`]). A start naming a mode, model or effort
 //! asks for it the same way, after reporting the models the script offers
 //! ([`FakeScript::offer_models`]), if any.
+//!
+//! **Stopping a task.** A stop is answered at once, idle or mid-turn, like
+//! the CLI's ack: `TaskStopAnswered`, then, between turns, the last task
+//! set the fake reported without that task (nothing when it was not in
+//! the set, as the CLI acks an unknown id). [`FakeScript::refuse_stops`]
+//! makes it answer every stop `TaskStopRefused` instead.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use skywave_proto::{ContextId, Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId, TaskKind};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSession, Conversation, Effort, Grants, ModelChoice, PermissionMode, ResultDisplay,
-    ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, ModelChoice,
+    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -89,7 +107,7 @@ const EVENT_CAPACITY: usize = 64;
 
 /// The reason a fake reports for an approval it drops on interrupt.
 pub const INTERRUPT_REASON: &str = "interrupted";
-/// The reason a fake refuses a mode, model or effort with.
+/// The reason a fake refuses a mode, model, effort or task stop with.
 pub const REFUSE_REASON: &str = "refused by the script";
 
 /// Turns a [`FakeAgent`] plays, in order, for every session.
@@ -100,6 +118,7 @@ pub struct FakeScript {
     refused_models: Vec<String>,
     refused_efforts: Vec<Effort>,
     models: Vec<ModelChoice>,
+    refuse_stops: bool,
 }
 
 impl FakeScript {
@@ -122,6 +141,12 @@ impl FakeScript {
     /// Refuses requests for `effort`.
     pub fn refuse_effort(mut self, effort: Effort) -> FakeScript {
         self.refused_efforts.push(effort);
+        self
+    }
+
+    /// Refuses every task stop.
+    pub fn refuse_stops(mut self) -> FakeScript {
+        self.refuse_stops = true;
         self
     }
 
@@ -194,6 +219,38 @@ pub enum Step {
     Fail(String),
     /// Exits mid-turn: emits `Exited { error }` and ends the session.
     Exit(Option<String>),
+    /// Emits nothing; `after` from now the agent starts a turn of `steps`
+    /// on its own, with no message, like a scheduled wakeup.
+    Wake { after: Duration, steps: Vec<Step> },
+    /// Emits nothing; `after` from now, once the agent is idle, it emits
+    /// `events` outside any turn, like a background job ending.
+    Later {
+        after: Duration,
+        events: Vec<AdapterEvent>,
+    },
+}
+
+/// A shell task `id` for [`Step::tasks`]; `ambient` for one that is not
+/// activity.
+pub fn task(id: &str, ambient: bool) -> AgentTask {
+    AgentTask {
+        id: id.to_owned(),
+        kind: TaskKind::Shell,
+        title: format!("task {id}"),
+        parent: None,
+        ambient,
+    }
+}
+
+/// A recurring schedule `id` for [`Step::schedules`].
+pub fn schedule(id: &str) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: "*/1 * * * *".to_owned(),
+        recurring: true,
+        prompt: format!("wake {id}"),
+        outlives_agent: None,
+    }
 }
 
 impl Step {
@@ -242,6 +299,34 @@ impl Step {
             on_approve: Vec::new(),
             on_deny: Vec::new(),
         }
+    }
+
+    /// Schedules a turn of `steps` the agent starts on its own `after` from
+    /// now ([`Step::Wake`]).
+    pub fn wake(after: Duration, steps: impl IntoIterator<Item = Step>) -> Step {
+        Step::Wake {
+            after,
+            steps: steps.into_iter().collect(),
+        }
+    }
+
+    /// Emits events the agent reports `after` from now, outside any turn
+    /// ([`Step::Later`]).
+    pub fn later(after: Duration, events: impl IntoIterator<Item = AdapterEvent>) -> Step {
+        Step::Later {
+            after,
+            events: events.into_iter().collect(),
+        }
+    }
+
+    /// Reports `tasks` as the agent's whole set of background tasks.
+    pub fn tasks(tasks: impl IntoIterator<Item = AgentTask>) -> Step {
+        Step::Emit(AdapterEvent::BackgroundTasks(tasks.into_iter().collect()))
+    }
+
+    /// Reports `schedules` as the agent's whole set of scheduled wakeups.
+    pub fn schedules(schedules: impl IntoIterator<Item = AgentSchedule>) -> Step {
+        Step::Emit(AdapterEvent::Schedules(schedules.into_iter().collect()))
     }
 
     /// Reports `grants` as the session's whole set of grants.
@@ -339,6 +424,7 @@ pub enum FakeInput {
     SetPermissionMode(PermissionMode),
     SetModel(String),
     SetEffort(Effort),
+    StopTask(String),
     Shutdown,
 }
 
@@ -479,6 +565,8 @@ impl AgentAdapter for FakeAgent {
             commands: commands_rx,
             events,
             queued: VecDeque::new(),
+            wakeups: Vec::new(),
+            tasks: Vec::new(),
         };
         let task = tokio::spawn(runner.run());
         let session = FakeSession {
@@ -569,6 +657,20 @@ impl AgentSession for FakeSession {
         self.answer(FakeInput::SetEffort(effort), answer).await
     }
 
+    async fn stop_task(&mut self, task: String) -> Result<(), AgentError> {
+        let input = FakeInput::StopTask(task.clone());
+        if self.script.refuse_stops {
+            let reason = REFUSE_REASON.to_owned();
+            return self
+                .answer(input, AdapterEvent::TaskStopRefused { task, reason })
+                .await;
+        }
+        let answer = AdapterEvent::TaskStopAnswered { task };
+        self.answer(input.clone(), answer).await?;
+        // The runner reports the shrunk set between turns.
+        self.commands.send(input).map_err(|_| AgentError::Closed)
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(FakeInput::Shutdown);
@@ -613,28 +715,89 @@ struct Runner {
     events: mpsc::Sender<AdapterEvent>,
     /// Messages received during a turn, each starting a later turn.
     queued: VecDeque<String>,
+    /// What [`Step::Wake`] and [`Step::Later`] scheduled, and stopped
+    /// tasks to report, with when each is due.
+    wakeups: Vec<(Instant, Wakeup)>,
+    /// The last task set emitted, which a stop shrinks.
+    tasks: Vec<AgentTask>,
+}
+
+/// Something the agent does on its own once idle.
+enum Wakeup {
+    /// A turn of these steps ([`Step::Wake`]).
+    Turn(Vec<Step>),
+    /// These events, outside a turn ([`Step::Later`]).
+    Report(Vec<AdapterEvent>),
+    /// The task set without this stopped task, outside a turn.
+    Stopped(String),
 }
 
 impl Runner {
     async fn run(mut self) {
         let error = loop {
-            let text = match self.queued.pop_front() {
-                Some(text) => text,
-                None => match self.commands.recv().await {
-                    Some(FakeInput::Message(text)) => text,
-                    // Idle: nothing to interrupt or answer.
-                    Some(
-                        FakeInput::Interrupt
-                        | FakeInput::Answer(..)
-                        | FakeInput::Started { .. }
-                        | FakeInput::SetPermissionMode(_)
-                        | FakeInput::SetModel(_)
-                        | FakeInput::SetEffort(_),
-                    ) => {
+            if let Some(wakeup) = self.take_due_wakeup() {
+                let steps = match wakeup {
+                    Wakeup::Turn(steps) => steps,
+                    Wakeup::Report(events) => {
+                        for event in events {
+                            if !self.emit(event).await {
+                                return;
+                            }
+                        }
                         continue;
                     }
-                    Some(FakeInput::Shutdown) | None => break None,
-                },
+                    Wakeup::Stopped(task) => {
+                        if self.tasks.iter().any(|live| live.id == task) {
+                            let mut tasks = self.tasks.clone();
+                            tasks.retain(|live| live.id != task);
+                            if !self.emit(AdapterEvent::BackgroundTasks(tasks)).await {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if !self.emit(AdapterEvent::TurnStarted).await {
+                    return;
+                }
+                match self.run_turn(steps).await {
+                    Flow::Ended(outcome) => {
+                        if !self.emit(AdapterEvent::TurnEnded(outcome)).await {
+                            return;
+                        }
+                    }
+                    Flow::Exit(error) => break error,
+                }
+                continue;
+            }
+            let text = match self.queued.pop_front() {
+                Some(text) => text,
+                None => {
+                    let next_wakeup = self.wakeups.iter().map(|(due, _)| *due).min();
+                    let input = tokio::select! {
+                        input = self.commands.recv() => input,
+                        () = sleep_until(next_wakeup) => continue,
+                    };
+                    match input {
+                        Some(FakeInput::Message(text)) => text,
+                        Some(FakeInput::StopTask(task)) => {
+                            self.stopped(task);
+                            continue;
+                        }
+                        // Idle: nothing to interrupt or answer.
+                        Some(
+                            FakeInput::Interrupt
+                            | FakeInput::Answer(..)
+                            | FakeInput::Started { .. }
+                            | FakeInput::SetPermissionMode(_)
+                            | FakeInput::SetModel(_)
+                            | FakeInput::SetEffort(_),
+                        ) => {
+                            continue;
+                        }
+                        Some(FakeInput::Shutdown) | None => break None,
+                    }
+                }
             };
             if !self.handle_reported {
                 // The conversation exists from its first message on.
@@ -663,6 +826,19 @@ impl Runner {
             }
         };
         self.emit(AdapterEvent::Exited { error }).await;
+    }
+
+    /// The earliest wakeup that is due, if one is; of those due at once,
+    /// the first scheduled.
+    fn take_due_wakeup(&mut self) -> Option<Wakeup> {
+        let now = Instant::now();
+        let (index, _) = self
+            .wakeups
+            .iter()
+            .enumerate()
+            .filter(|(_, (due, _))| *due <= now)
+            .min_by_key(|(_, (due, _))| *due)?;
+        Some(self.wakeups.remove(index).1)
     }
 
     /// Steps of the session's next scripted turn, or an echo of `text`.
@@ -701,6 +877,7 @@ impl Runner {
                         tool,
                         input,
                         suggestions,
+                        task: None,
                     };
                     if !self.emit(asked).await {
                         return Flow::Exit(None);
@@ -740,6 +917,14 @@ impl Runner {
                 }
                 Step::Fail(message) => return Flow::Ended(TurnOutcome::Failed(message)),
                 Step::Exit(error) => return Flow::Exit(error),
+                Step::Wake { after, steps } => {
+                    self.wakeups
+                        .push((Instant::now() + after, Wakeup::Turn(steps)));
+                }
+                Step::Later { after, events } => {
+                    self.wakeups
+                        .push((Instant::now() + after, Wakeup::Report(events)));
+                }
             }
         }
         Flow::Ended(TurnOutcome::Completed)
@@ -799,6 +984,10 @@ impl Runner {
                 self.queued.push_back(text);
                 Ok(())
             }
+            Some(FakeInput::StopTask(task)) => {
+                self.stopped(task);
+                Ok(())
+            }
             Some(
                 FakeInput::Answer(..)
                 | FakeInput::Started { .. }
@@ -809,9 +998,25 @@ impl Runner {
         }
     }
 
+    /// Reports the set without stopped `task` as soon as the agent is idle.
+    fn stopped(&mut self, task: String) {
+        self.wakeups.push((Instant::now(), Wakeup::Stopped(task)));
+    }
+
     /// Sends `event`; false when the receiver is gone and the session over.
-    async fn emit(&self, event: AdapterEvent) -> bool {
+    async fn emit(&mut self, event: AdapterEvent) -> bool {
+        if let AdapterEvent::BackgroundTasks(tasks) = &event {
+            self.tasks.clone_from(tasks);
+        }
         self.events.send(event).await.is_ok()
+    }
+}
+
+/// Sleeps until `deadline`; with none, forever.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

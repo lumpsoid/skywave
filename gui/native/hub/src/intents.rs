@@ -1,7 +1,7 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
-use skywave_core::{Action, BlobPolicy, Decision, Effort, PermissionMode, Route};
+use skywave_core::{Action, BlobPolicy, Decision, Effort, PermissionMode, Route, TaskId};
 use uuid::Uuid;
 
 use crate::signals::{
@@ -38,6 +38,17 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         }
         ActionIntent::ClearContext { session_id } => Action::ClearContext {
             session_id: id("session", &session_id)?,
+        },
+        ActionIntent::StopTask {
+            session_id,
+            task_id,
+        } => Action::StopTask {
+            session_id: id("session", &session_id)?,
+            // The agent's own opaque id; only an empty one is no task.
+            task: match task_id.as_str() {
+                "" => return Err("no task id".to_owned()),
+                _ => TaskId(task_id),
+            },
         },
         ActionIntent::SwitchContext {
             session_id,
@@ -209,6 +220,30 @@ mod tests {
                 session_id: session,
                 context
             })
+        );
+        assert_eq!(
+            action(ActionIntent::StopTask {
+                session_id: session.0.to_string(),
+                task_id: "bg-1".into(),
+            }),
+            Ok(Action::StopTask {
+                session_id: session,
+                task: skywave_core::TaskId("bg-1".into()),
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::StopTask {
+                session_id: "nope".into(),
+                task_id: "bg-1".into(),
+            }),
+            Err("not a session id: \"nope\"".to_owned())
+        );
+        assert_eq!(
+            action(ActionIntent::StopTask {
+                session_id: session.0.to_string(),
+                task_id: String::new(),
+            }),
+            Err("no task id".to_owned())
         );
         assert_eq!(
             action(ActionIntent::ViewContext {

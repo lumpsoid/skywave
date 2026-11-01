@@ -17,10 +17,10 @@ use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERS
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice, PermissionMode,
-    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind,
-    TurnOutcome, TurnUsage,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
+    AgentSession, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
+    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay,
+    ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -40,11 +40,17 @@ fn fixture(name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Our own control requests carry ids we choose; compare them without.
+/// Our own control requests carry ids we choose; compare them without. An
+/// initialize request is compared by its subtype alone: the recordings
+/// registered different hooks and flags over time, so what
+/// [`protocol::initialize_request`] sends is pinned by its own test instead.
 fn normalized(message: &Value) -> Value {
     let mut message = message.clone();
     if message["type"] == "control_request" {
         message.as_object_mut().unwrap().remove("request_id");
+        if message["request"]["subtype"] == "initialize" {
+            message["request"] = json!({ "subtype": "initialize" });
+        }
     }
     message
 }
@@ -116,6 +122,8 @@ fn replay_records(
     let mut offers: HashMap<String, Value> = HashMap::new();
     // The id of each of our control requests, by the recorded one.
     let mut our_ids: HashMap<String, String> = HashMap::new();
+    // The ids of the CLI's hook calls: the protocol answers those itself.
+    let mut hook_calls: Vec<String> = Vec::new();
     for record in records {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
@@ -144,10 +152,24 @@ fn replay_records(
                         .and_then(protocol::parse_effort)
                         .map(|effort| protocol.set_effort(effort))
                         .unwrap_or_default(),
+                    // An id that is not a string the adapter can never
+                    // send: the test lists it as dropped.
+                    ("control_request", Some("stop_task")) => msg["request"]["task_id"]
+                        .as_str()
+                        .map(|task| protocol.stop_task(task.to_owned()))
+                        .unwrap_or_default(),
                     // Written by the protocol on the answer it follows.
                     ("control_request", Some("get_settings")) => Default::default(),
                     ("user", _) => protocol
                         .send_message(msg["message"]["content"].as_str().unwrap().to_owned()),
+                    // Written by the protocol on the hook call it answers.
+                    ("control_response", _)
+                        if hook_calls
+                            .iter()
+                            .any(|id| msg["response"]["request_id"] == **id) =>
+                    {
+                        Default::default()
+                    }
                     ("control_response", _) => {
                         let response = &msg["response"];
                         let decision = match response["response"]["behavior"].as_str() {
@@ -182,6 +204,9 @@ fn replay_records(
                 n_in += 1;
             }
             "out" => {
+                if msg["request"]["subtype"] == "hook_callback" {
+                    hook_calls.push(msg["request_id"].as_str().unwrap().to_owned());
+                }
                 if msg["request"]["subtype"] == "can_use_tool" {
                     offers.insert(
                         msg["request_id"].as_str().unwrap().to_owned(),
@@ -236,7 +261,13 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
     }
     events
         .iter()
-        .filter(|event| !observes_settings(event))
+        .filter(|event| {
+            !observes_settings(event)
+                && !matches!(
+                    event,
+                    AdapterEvent::BackgroundTasks(_) | AdapterEvent::Schedules(_)
+                )
+        })
         .map(|event| match event {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
             AdapterEvent::Text(text) => format!("text: {}", cut(text)),
@@ -277,11 +308,55 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 format!("effort refused {effort:?}: {}", cut(reason))
             }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            // Filtered out above: [`timeline`] lists the task sets.
+            AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
+            AdapterEvent::Schedules(schedules) => format!("schedules: {}", schedules.len()),
+            AdapterEvent::TaskStopAnswered { task } => format!("stop answered: {task}"),
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                format!("stop refused {task}: {}", cut(reason))
+            }
         })
         .collect()
 }
 
-/// What the agent reports unasked about its mode and model.
+/// The turns, texts, task sets and schedule sets of `events`, one line
+/// each; a task reads `id:kind` or `id:kind<parent`, and `ambient` ones end
+/// in `~`; a schedule reads its id.
+fn timeline(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::TurnStarted => Some("turn started".to_owned()),
+            AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
+            AdapterEvent::Text(text) => {
+                Some(format!("text: {}", text.lines().next().unwrap_or("")))
+            }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let tasks: Vec<String> = tasks
+                    .iter()
+                    .map(|t| {
+                        let parent = t
+                            .parent
+                            .as_deref()
+                            .map(|p| format!("<{p}"))
+                            .unwrap_or_default();
+                        let ambient = if t.ambient { "~" } else { "" };
+                        format!("{}:{:?}{parent}{ambient}", t.id, t.kind)
+                    })
+                    .collect();
+                Some(format!("tasks: [{}]", tasks.join(", ")))
+            }
+            AdapterEvent::Schedules(schedules) => {
+                let schedules: Vec<&str> = schedules.iter().map(|s| s.id.as_str()).collect();
+                Some(format!("schedules: [{}]", schedules.join(", ")))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the agent reports unasked about its mode and model, and the empty
+/// task set it reports once ready.
 fn observes_settings(event: &AdapterEvent) -> bool {
     matches!(
         event,
@@ -289,7 +364,7 @@ fn observes_settings(event: &AdapterEvent) -> bool {
             | AdapterEvent::Model(_)
             | AdapterEvent::Effort(_)
             | AdapterEvent::ModelsOffered(_)
-    )
+    ) || matches!(event, AdapterEvent::BackgroundTasks(tasks) if tasks.is_empty())
 }
 
 /// `events` as [`describe`] lists them.
@@ -1644,6 +1719,7 @@ fn write_approval() -> AdapterEvent {
         tool: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
         suggestions: Vec::new(),
+        task: None,
     }
 }
 
@@ -2117,8 +2193,9 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     // status echo of the switch is not reported. The handshake and the
     // model switch each read the effort back.
     assert_eq!(
-        take_raw(&mut events, 4).await,
+        take_raw(&mut events, 5).await,
         [
+            AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
             AdapterEvent::PermissionModeSet(PermissionMode::Plan),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
@@ -2572,11 +2649,13 @@ fn replay_effort_switches_settle_from_get_settings() {
     let [
         AdapterEvent::PermissionMode(PermissionMode::Ask),
         AdapterEvent::ModelsOffered(_),
+        AdapterEvent::BackgroundTasks(none),
         rest @ ..,
     ] = events.as_slice()
     else {
         panic!("unexpected start: {events:?}");
     };
+    assert!(none.is_empty());
     let haiku = "claude-haiku-4-5-20251001";
     let set = |effort| AdapterEvent::EffortSet(Some(effort));
     let model_set = |model: &str| AdapterEvent::ModelSet(model.to_owned());
@@ -2622,8 +2701,9 @@ async fn a_session_starts_with_and_switches_its_effort() {
     // The looks after the handshake and the model switch are answered while
     // the start's effort chain runs, so they report nothing.
     assert_eq!(
-        take_raw(&mut events, 2).await,
+        take_raw(&mut events, 3).await,
         [
+            AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
             AdapterEvent::EffortSet(Some(Effort::High)),
         ]
@@ -2677,4 +2757,580 @@ async fn take_raw(events: &mut AdapterEvents, n: usize) -> Vec<AdapterEvent> {
         out.push(next_raw(events).await);
     }
     out
+}
+
+#[test]
+fn replay_background_bash_reports_the_shell_and_its_end() {
+    let events = replay("background_bash", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        timeline(&events),
+        [
+            "turn started",
+            "tasks: []",
+            "tasks: [bt1yntsud:Shell]",
+            "text: STARTED",
+            "turn ended",
+            // The shell ended; the CLI starts the next turn itself.
+            "tasks: []",
+            "turn started",
+            "text: DONE",
+            "turn ended",
+        ]
+    );
+}
+
+/// The `stop_task` recording's first CLI process; a second process with a
+/// fresh `initialize` follows it in the same file.
+fn stop_task_first_process() -> Vec<Value> {
+    let records = fixture("stop_task");
+    let second = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["dir"] == "in" && r["msg"]["request"]["subtype"] == "initialize")
+        .map(|(n, _)| n)
+        .nth(1)
+        .expect("a second process");
+    records[..second].to_vec()
+}
+
+#[test]
+fn replay_stop_task_answers_each_stop_after_the_task_leaves() {
+    let (events, _) = replay_records(
+        "stop_task",
+        stop_task_first_process(),
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
+    );
+    let lines: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::TaskStopAnswered { task } => Some(format!("stop answered: {task}")),
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                Some(format!("stop refused {task}: {reason}"))
+            }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                Some(format!("tasks: [{}]", ids.join(", ")))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "tasks: []",
+            "tasks: [b1wyh3vwb]",
+            "tasks: [b1wyh3vwb, ad1d67e1d863e85eb]",
+            // The CLI drops the task from its set before it acks the stop.
+            "tasks: [ad1d67e1d863e85eb]",
+            "stop answered: b1wyh3vwb",
+            "tasks: []",
+            "stop answered: ad1d67e1d863e85eb",
+            // An unknown id, and one already stopped, are acked as success.
+            "stop answered: bnosuchtask",
+            "stop answered: b1wyh3vwb",
+        ]
+    );
+}
+
+#[test]
+fn stop_task_error_answer_is_a_refusal_with_the_cli_text() {
+    // The recorded error, from the recording's second process: the CLI's
+    // only `stop_task` error, for an id that is not a string, which the
+    // adapter never sends.
+    let recorded = fixture("stop_task")
+        .into_iter()
+        .find(|r| r["dir"] == "out" && r["msg"]["response"]["subtype"] == "error")
+        .expect("a recorded stop_task error")["msg"]
+        .clone();
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    protocol.start();
+    let out = protocol.stop_task("b1wyh3vwb".to_owned());
+    assert_eq!(out.writes.len(), 1);
+    assert_eq!(
+        out.writes[0]["request"],
+        json!({ "subtype": "stop_task", "task_id": "b1wyh3vwb" })
+    );
+    let mut answer = recorded;
+    answer["response"]["request_id"] = out.writes[0]["request_id"].clone();
+    let out = protocol.on_line(&answer.to_string());
+    assert_eq!(
+        out.events,
+        [AdapterEvent::TaskStopRefused {
+            task: "b1wyh3vwb".to_owned(),
+            reason: "stop_task: task_id must be a string".to_owned(),
+        }]
+    );
+    // A second answer to the same request finds nothing asked.
+    assert_eq!(protocol.on_line(&answer.to_string()).events, []);
+}
+
+#[test]
+fn replay_subagent_messages_stay_off_the_main_timeline() {
+    // Positive control: the recording holds a subagent message that says
+    // PONG, so the absence below is the protocol's doing.
+    let from_subagent = fixture("subagent")
+        .iter()
+        .filter(|r| r["dir"] == "out")
+        .filter(|r| !r["msg"]["parent_tool_use_id"].is_null())
+        .filter(|r| r["msg"].to_string().contains("PONG"))
+        .count();
+    assert!(from_subagent > 0);
+    let events = replay("subagent", Uuid::new_v4(), false, &[]);
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"The subagent replied: **PONG**"),
+        "the main agent's own text is reported: {texts:?}"
+    );
+    assert!(!texts.contains(&"PONG"), "{texts:?}");
+    assert_eq!(texts.len(), 2, "{texts:?}");
+}
+
+#[test]
+fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
+    let events = replay("subagent_background_bash", Uuid::new_v4(), false, &[]);
+    let sub = "ad175146a4bfec159";
+    let sets: Vec<String> = timeline(&events)
+        .into_iter()
+        .filter(|l| l.starts_with("tasks: "))
+        .collect();
+    assert_eq!(
+        sets,
+        [
+            "tasks: []".to_owned(),
+            format!("tasks: [{sub}:Subagent]"),
+            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [b0mpthszv:Shell<{sub}]"),
+            // The re-woken subagent comes first, though it started first
+            // only by luck of the list: the CLI's order is kept.
+            format!("tasks: [{sub}:Subagent, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [b0mpthszv:Shell<{sub}]"),
+            "tasks: []".to_owned(),
+            format!("tasks: [{sub}:Subagent]"),
+            "tasks: []".to_owned(),
+        ]
+    );
+    // The set is empty only at the end.
+    let last_nonempty = sets.iter().rposition(|l| l != "tasks: []").unwrap();
+    assert_eq!(last_nonempty, sets.len() - 2);
+    assert!(
+        sets[..sets.len() - 3]
+            .iter()
+            .skip(1)
+            .all(|l| l != "tasks: []")
+    );
+}
+
+#[test]
+fn replay_loop_reports_no_task() {
+    let events = replay("loop", Uuid::new_v4(), false, &[]);
+    let sets: Vec<Vec<_>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::BackgroundTasks(tasks) => Some(tasks.clone()),
+            _ => None,
+        })
+        .collect();
+    // Positive control: the reports are seen, only none is non-empty.
+    assert!(!sets.is_empty());
+    assert!(sets.iter().all(Vec::is_empty));
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+
+#[test]
+fn initialize_registers_the_stop_hook_and_the_per_task_stop() {
+    assert_eq!(
+        protocol::initialize_request("r1"),
+        json!({
+            "type": "control_request",
+            "request_id": "r1",
+            "request": {
+                "subtype": "initialize",
+                "hooks": { "Stop": [{ "hookCallbackIds": ["skywave-stop"] }] },
+                "perTaskStopAffordance": true,
+            },
+        })
+    );
+}
+
+/// The task ids of each reported set, and `"interrupted"` where a turn ended
+/// as [`TurnOutcome::Interrupted`].
+fn task_sets_and_interrupts(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                Some(format!("tasks: [{}]", ids.join(", ")))
+            }
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted) => Some("interrupted".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn replay_an_interrupt_spares_the_background_agent() {
+    let events = replay("interrupt_spares_tasks", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        task_sets_and_interrupts(&events),
+        [
+            "tasks: []",
+            "tasks: [a2384c814f3a1cabf]",
+            // The interrupt ends the turn; the agent stays in the set.
+            "interrupted",
+            // It leaves only when it completes.
+            "tasks: []",
+        ]
+    );
+}
+
+#[test]
+fn replay_an_interrupt_without_the_flag_kills_the_background_agent() {
+    // The contrast: a CLI not told of a per-task stop kills the task at the
+    // interrupt. (The harness ignores `initialize`'s content; the recording
+    // documents the CLI.)
+    let events = replay("interrupt_kills_tasks", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        task_sets_and_interrupts(&events),
+        [
+            "tasks: []",
+            "tasks: [ade77bae3441b384c]",
+            // The task is gone before the interrupt's turn ends.
+            "tasks: []",
+            "interrupted",
+        ]
+    );
+}
+
+/// The CLI's Stop hook call `request_id` for callback `callback_id`, listing
+/// `crons`.
+fn hook_call(request_id: &str, callback_id: &str, crons: Value) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "hook_callback",
+            "callback_id": callback_id,
+            "input": { "hook_event_name": "Stop", "background_tasks": [], "session_crons": crons },
+            "tool_use_id": "t1",
+        },
+    })
+}
+
+fn schedule(id: &str, when: &str, prompt: &str, outlives_agent: Option<bool>) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: when.to_owned(),
+        recurring: true,
+        prompt: prompt.to_owned(),
+        outlives_agent,
+    }
+}
+
+fn schedule_sets(events: &[AdapterEvent]) -> Vec<Vec<AgentSchedule>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Schedules(schedules) => Some(schedules.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_stop_hook_is_answered_with_its_schedules_and_others_are_refused() {
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let crons =
+        json!([{ "id": "j1", "schedule": "*/1 * * * *", "recurring": true, "prompt": "tick" }]);
+    let line = hook_call("h1", "skywave-stop", crons.clone()).to_string();
+    let out = protocol.on_line(&line);
+    assert_eq!(
+        out.events,
+        [AdapterEvent::Schedules(vec![schedule(
+            "j1",
+            "*/1 * * * *",
+            "tick",
+            None
+        )])]
+    );
+    assert_eq!(
+        out.writes,
+        [json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "h1", "response": {} },
+        })]
+    );
+
+    let line = hook_call("h2", "someone-else", crons).to_string();
+    let out = protocol.on_line(&line);
+    assert_eq!(out.events, []);
+    assert_eq!(
+        out.writes,
+        [protocol::error_response(
+            "h2",
+            "unsupported control request: hook_callback"
+        )]
+    );
+}
+
+#[test]
+fn replay_stop_hook_reports_the_schedules_at_each_turn_end() {
+    let events = replay("stop_hook", Uuid::new_v4(), false, &[]);
+    let tick = schedule("1363496f", "*/1 * * * *", "reply only TICK", Some(false));
+    // Asked for durable, the CLI made it not durable all the same.
+    let daily = schedule("20244679", "0 4 * * *", "reply only DURABLE", Some(false));
+    assert_eq!(
+        schedule_sets(&events),
+        [
+            vec![tick.clone()],
+            // The loop's own tick.
+            vec![tick],
+            // Deleted.
+            vec![],
+            vec![daily],
+            vec![],
+        ]
+    );
+    // Each set is reported before the turn it ends ends.
+    let lines = timeline(&events);
+    let ends = lines.iter().filter(|l| *l == "turn ended").count();
+    assert_eq!(ends, 5, "{lines:?}");
+    for (n, line) in lines.iter().enumerate() {
+        if line.starts_with("schedules: ") {
+            assert_eq!(lines[n + 1], "turn ended", "{lines:?}");
+        }
+    }
+}
+
+#[test]
+fn replay_loop_keeps_whether_its_job_outlives_the_agent() {
+    let mut records = fixture("loop");
+    let crons = json!([
+        { "id": "b6841368", "schedule": "*/1 * * * *", "recurring": true, "prompt": "reply only TICK" },
+        { "id": "elsewhere", "schedule": "0 4 * * *", "recurring": false, "prompt": "x" },
+    ]);
+    records.push(json!({ "dir": "out", "msg": hook_call("h1", "skywave-stop", crons) }));
+    records.push(json!({ "dir": "in", "msg": {
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "h1", "response": {} },
+    }}));
+    let (events, _) = replay_records("loop", records, Uuid::new_v4(), false, &[], false);
+    let mut elsewhere = schedule("elsewhere", "0 4 * * *", "x", None);
+    elsewhere.recurring = false;
+    assert_eq!(
+        schedule_sets(&events),
+        [vec![
+            // Several turns after the one that made it.
+            schedule("b6841368", "*/1 * * * *", "reply only TICK", Some(false)),
+            // Not made in this process: unknown.
+            elsewhere,
+        ]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Background approvals
+
+const SUBAGENT_APPROVAL: &str = "d8debad5-cc3b-4785-835c-f163b612eacc";
+
+/// The `subagent_approval` recording with a main turn run while the
+/// subagent's approval waits: a user message, then the CLI's `init` and
+/// `result` for it (copies of the recording's second turn), just before the
+/// held answer.
+fn subagent_approval_with_a_turn_between() -> Vec<Value> {
+    let records = fixture("subagent_approval");
+    let answer = records
+        .iter()
+        .position(|r| r["dir"] == "in" && r["msg"]["response"]["request_id"] == SUBAGENT_APPROVAL)
+        .expect("the held answer");
+    let out_of = |kind: &str| {
+        records
+            .iter()
+            .rfind(|r| r["dir"] == "out" && r["msg"]["type"] == kind)
+            .unwrap()
+            .clone()
+    };
+    let turn = [
+        json!({ "dir": "in", "msg": protocol::user_message("meanwhile") }),
+        records
+            .iter()
+            .rfind(|r| r["msg"]["subtype"] == "init")
+            .unwrap()
+            .clone(),
+        out_of("result"),
+    ];
+    let mut records = records;
+    records.splice(answer..answer, turn);
+    records
+}
+
+#[test]
+fn replay_a_subagent_approval_outlives_the_main_turns() {
+    let (events, _) = replay_records(
+        "subagent_approval",
+        subagent_approval_with_a_turn_between(),
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
+    );
+    // The replay checked that the held allow was written: an answer to an
+    // approval no longer pending writes nothing.
+    let asked = events
+        .iter()
+        .position(|e| {
+            matches!(e, AdapterEvent::ApprovalRequested { request, task: Some(task), .. }
+                if request.0 == SUBAGENT_APPROVAL && task == "add5b3d5dc618eaff")
+        })
+        .expect("the subagent's approval, as its task's");
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, AdapterEvent::TurnEnded(_)))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(ends.len(), 3, "{:?}", describe(&events));
+    // Asked outside any turn, and still pending at the next turn's end.
+    assert!(ends[0] < asked && asked < ends[1]);
+    assert!(!events[ends[0]..asked].contains(&AdapterEvent::TurnStarted));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ApprovalCancelled { .. })),
+        "{:?}",
+        describe(&events)
+    );
+}
+
+fn subagent_tasks(ids: &[&str]) -> String {
+    let tasks: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({ "task_id": id, "task_type": "local_agent", "description": "sub" }))
+        .collect();
+    json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": tasks }).to_string()
+}
+
+fn can_use_tool(request_id: &str, agent: Option<&str>) -> String {
+    let mut request = json!({
+        "subtype": "can_use_tool",
+        "tool_name": "Write",
+        "input": { "file_path": "a.txt", "content": "hi" },
+        "tool_use_id": format!("call-{request_id}"),
+    });
+    if let Some(agent) = agent {
+        request["agent_id"] = json!(agent);
+    }
+    json!({ "type": "control_request", "request_id": request_id, "request": request }).to_string()
+}
+
+const RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+
+fn cancelled(request: &str, reason: &str) -> AdapterEvent {
+    AdapterEvent::ApprovalCancelled {
+        request: request.into(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn running_protocol() -> Protocol {
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    protocol.start();
+    protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
+    assert!(protocol.ready());
+    protocol
+}
+
+#[test]
+fn a_subagent_approval_outlives_main_turns_until_its_task_leaves() {
+    let mut protocol = running_protocol();
+    protocol.send_message("one".to_owned());
+    protocol.on_line(&subagent_tasks(&["sub1"]));
+    protocol.on_line(RESULT_OK);
+    let asked = protocol.on_line(&can_use_tool("p1", Some("sub1")));
+    assert!(matches!(
+        &asked.events[..],
+        [AdapterEvent::ApprovalRequested { task: Some(task), .. }] if task == "sub1"
+    ));
+    // A second turn's result cancels that turn's own approval only.
+    protocol.send_message("two".to_owned());
+    let main = protocol.on_line(&can_use_tool("p2", None));
+    assert!(matches!(
+        &main.events[..],
+        [AdapterEvent::ApprovalRequested { task: None, .. }]
+    ));
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [
+            cancelled("p2", protocol::TURN_ENDED_REASON),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
+    );
+    // An interrupted turn leaves it too.
+    protocol.send_message("three".to_owned());
+    protocol.interrupt();
+    let end = protocol.on_line(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools"}"#,
+    );
+    assert_eq!(
+        end.events,
+        [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]
+    );
+    // A set still holding the task keeps it; one without cancels it.
+    let kept = protocol.on_line(&subagent_tasks(&["sub1", "sub2"]));
+    assert!(matches!(
+        &kept.events[..],
+        [AdapterEvent::BackgroundTasks(_)]
+    ));
+    let left = protocol.on_line(&subagent_tasks(&["sub2"]));
+    assert!(matches!(
+        &left.events[..],
+        [cancel, AdapterEvent::BackgroundTasks(_)]
+            if *cancel == cancelled("p1", protocol::TASK_ENDED_REASON)
+    ));
+    // No longer pending: the answer writes nothing.
+    let answer = protocol.answer(&"p1".into(), Decision::Approve, None);
+    assert_eq!(answer, Default::default());
+}
+
+#[test]
+fn a_subagent_approval_is_withdrawn_by_the_cli_outside_a_turn() {
+    let mut protocol = running_protocol();
+    protocol.on_line(&subagent_tasks(&["sub1"]));
+    protocol.on_line(&can_use_tool("p1", Some("sub1")));
+    let out = protocol.on_line(r#"{"type":"control_cancel_request","request_id":"p1"}"#);
+    assert_eq!(out.events, [cancelled("p1", protocol::WITHDRAWN_REASON)]);
+}
+
+#[test]
+fn an_approval_from_no_live_task_is_the_turns() {
+    let mut protocol = running_protocol();
+    protocol.send_message("go".to_owned());
+    // A foreground subagent asks under an id no task set listed.
+    let asked = protocol.on_line(&can_use_tool("p1", Some("foreground")));
+    assert!(matches!(
+        &asked.events[..],
+        [AdapterEvent::ApprovalRequested { task: None, .. }]
+    ));
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [
+            cancelled("p1", protocol::TURN_ENDED_REASON),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ]
+    );
 }

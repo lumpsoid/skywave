@@ -385,3 +385,65 @@ again before it has had a turn (`NoConversation`); a different workdir for
 the new session (blocked: resuming from another cwd is untested); and a
 reason in the core for why a context cannot move, so heads can tell "the
 agent never ran in it" from "a message of yours is on its way".
+
+## D31. Background work: level sets, per-task stop, best-effort schedules
+The agent's work outside a turn reaches the log as two whole-set events per
+session: `BackgroundTasksChanged { tasks }` and `SchedulesChanged
+{ schedules }`. Both are agent-agnostic (D3: `TaskKind` is `Shell`,
+`Subagent`, `Other`; a schedule's `when` is the agent's own words, never
+parsed). The last event wins, server and clients fold them with the one rule
+`AgentWork::apply`. Neither is notable or activity. `Exited` and `recover()`
+empty both sets, durable schedules too.
+**Why whole sets:** a missed event cannot wedge a set, since the next one
+replaces it and process exit empties it. **Rejected:** edge events
+(`TaskStarted` / `TaskEnded`: a lost end leaves a task live forever, and the
+keep-alive with it), and one combined event (a schedule change would restate
+the tasks, and the two come from different CLI signals at different times).
+**Bounds:** `TASKS_MAX` 32, `SCHEDULES_MAX` 16, the first N kept; an id over
+`TASK_ID_MAX_CHARS` is dropped, not cut (a cut id names another task). The
+keep-alive counts the uncut set, so a bound never lets the agent idle out
+under live work. **Rejected:** keeping durable schedules across `Exited`
+(nothing would clear them).
+**Stopping a task.** `StopTask { session_id, task }` is validated against the
+server's fold (`UnknownTask`) and logs `TaskStopRequested`. It never starts
+an agent: with none running it is refused ("agent not running",
+`TaskStopRefused`). Success is settled only by the level (the task leaves the
+set); **rejected:** a `TaskStopped` ack, which would be a second truth. Every
+stop the agent is asked gets exactly one answer, so the supervisor's FIFO of
+asks stays aligned with the adapter's answers; stops left over at exit are
+dropped. A refusal is `TaskStopRefused { answers }`.
+**Schedules are information only** (user decision, 2026-11-01): they do not
+keep the agent alive, have no limit, and Skywave cannot cancel one; the agent
+ends one when asked. The CLI offers no way, and a stop only **pauses** a
+loop: session-only jobs come back after `--resume`. So stopping the agent
+(Stop agent, new context, switch, move of the current context) asks for
+confirmation in both heads whenever non-ambient tasks run or a schedule
+exists, with the shared `skywave-present::format::stop_warning`, which says
+background tasks end and loops are paused, not ended. There is no always-on
+indicator (user decision); the work shows in a place the user opens.
+**Subagents.** A subagent's own messages are dropped from the main timeline.
+A background subagent's approval stays open past the main turn, tied to its
+task, and is cancelled when the task leaves the set.
+**`perTaskStopAffordance`.** The adapter declares it in `initialize`: an
+interrupt then aborts the turn and spares background agents, instead of the
+CLI killing them. It is a promise that the consumer can stop a task on its
+own, true because both heads render a per-task stop.
+**Deferred:**
+- cancelling a schedule from Skywave by any means (revisit only if a CLI adds
+  a control request);
+- an always-on indicator;
+- a subagent transcript view (needs `parent` on `ToolCall` / `AgentMessage`
+  and `forwardSubagentText`);
+- task output (`output_file`, `summary`, `usage`);
+- backgrounding a foreground task (`background_tasks` control request,
+  Ctrl+B);
+- durable schedules across sessions (listing them while no agent runs;
+  reading `.claude/scheduled_tasks.json` would break D3), moot while the CLI
+  ignores `durable`;
+- push/desktop notifications when background work finishes;
+- a per-task stop for tasks inside a subagent beyond what `stop_task` allows;
+- waking a stopped agent for a pending durable schedule;
+- showing a stop refusal's reason in the heads (core `task_stops` drops a
+  refused stop silently; `TaskStopRefused` has no timeline entry);
+- GUI sheet polish: the Stop button is not disabled while a stop is pending,
+  and the contexts dialog's confirm uses the warning as of when it opened.

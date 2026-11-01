@@ -32,7 +32,7 @@ pub use history::{PromptHistory, Recall};
 pub use read::{READ_MARK_EVERY, ReadMarker};
 pub use search::{Jump, TimelineSearch};
 
-use skywave_core::{ApprovalPrompt, Outgoing, PendingSession, SessionListView};
+use skywave_core::{AgentWork, ApprovalPrompt, Outgoing, PendingSession, SessionListView};
 
 /// This device has not answered `prompt`, or its answer was refused in a
 /// way that leaves it open to another: it may be answered (again), and a
@@ -47,6 +47,15 @@ pub fn dismissable(list: &SessionListView) -> Option<&PendingSession> {
     list.creating
         .iter()
         .find(|p| p.discardable && matches!(p.outgoing, Outgoing::Failed(_)))
+}
+
+/// Whether stopping the agent is worth a confirmation: it runs a
+/// background task (an ambient one is not activity) or has a schedule. The
+/// same rule covers Stop agent, clear, switch and move of the current
+/// context, which all stop the agent. A schedule is paused, not ended, by
+/// the stop; it still earns the warning.
+pub fn stop_needs_confirmation(work: &AgentWork) -> bool {
+    work.tasks.iter().any(|task| !task.ambient) || !work.schedules.is_empty()
 }
 
 /// Whether `text` is meant as a pairing URI (spec §6), so a malformed one
@@ -67,6 +76,34 @@ pub(crate) mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_stop_is_worth_confirming_for_activity_only() {
+        use skywave_core::{BackgroundTask, Schedule, ScheduleId, TaskId, TaskKind};
+        let task = |ambient| BackgroundTask {
+            id: TaskId("t".into()),
+            kind: TaskKind::Other,
+            title: "t".into(),
+            parent: None,
+            ambient,
+        };
+        let schedule = |outlives_agent| Schedule {
+            id: ScheduleId("s".into()),
+            when: "5m".into(),
+            recurring: false,
+            prompt: "p".into(),
+            outlives_agent,
+        };
+        let work = |tasks, schedules| AgentWork { tasks, schedules };
+        assert!(!stop_needs_confirmation(&work(vec![], vec![])));
+        assert!(!stop_needs_confirmation(&work(vec![task(true)], vec![])));
+        assert!(stop_needs_confirmation(&work(vec![task(false)], vec![])));
+        assert!(stop_needs_confirmation(&work(vec![], vec![schedule(None)])));
+        assert!(stop_needs_confirmation(&work(
+            vec![],
+            vec![schedule(Some(true))]
+        )));
+    }
 
     pub fn session(timeline: Vec<TimelineItem>) -> SessionView {
         let last_seq = timeline
@@ -98,6 +135,8 @@ pub(crate) mod tests {
             switch: None,
             interrupt: None,
             stop: None,
+            work: Default::default(),
+            task_stops: Vec::new(),
             draft: None,
             draft_rev: 0,
             last_seq,

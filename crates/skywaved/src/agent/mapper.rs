@@ -6,17 +6,18 @@ use serde_json::Value;
 use skywave_proto::limits::{
     DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX,
     PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
-    RULE_SUGGESTIONS_MAX, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
+    RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
+    TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    self as proto, AgentSettings, ApprovalId, BlobRef, Body, BodyFormat, CallId, CommandId,
-    ContextId, Effort, EventKind, ModelChoice, PermissionMode, Seq, SessionId, SessionState,
-    ToolCall, ToolKind, ToolResult,
+    self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, BlobRef, Body, BodyFormat,
+    CallId, CommandId, ContextId, Effort, EventKind, ModelChoice, PermissionMode, Schedule, Seq,
+    SessionId, SessionState, TaskId, ToolCall, ToolKind, ToolResult,
 };
 
 use super::{
-    AdapterEvent, AgentCallId, AgentRequestId, DisplayBody, ResultDisplay, ToolDisplay,
-    TurnOutcome, store_grants, store_resume_handle,
+    AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, DisplayBody,
+    ResultDisplay, ToolDisplay, TurnOutcome, store_grants, store_resume_handle,
 };
 use crate::error::Result;
 use crate::{EventLog, Storage};
@@ -39,18 +40,20 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `Text` | `AgentMessage` |
 /// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display |
 /// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
-/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call |
+/// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call; a task's (`task` set) is kept apart from the turn's |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
-/// | `TurnEnded(Completed \| Interrupted)` | leftover approvals cancelled, `SessionStateChanged(Idle)` |
-/// | `TurnEnded(Failed)` | leftover approvals cancelled, `SessionStateChanged(Errored)` |
+/// | `TurnEnded(Completed \| Interrupted)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Idle)` |
+/// | `TurnEnded(Failed)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
 /// | `Grants` | stored in `sessions.agent_grants` for the mapper's session (whichever context), no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
-/// | `Exited` | leftover approvals cancelled, leftover mode, model and effort requests refused; `Errored` if a turn was open or the exit was abnormal |
+/// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
+/// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
+/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped; `Errored` if a turn was open or the exit was abnormal |
 ///
 /// **Settings.** The supervisor tells the mapper of every mode, model or
 /// effort request it hands the agent ([`EventMapper::asked_mode`],
@@ -59,6 +62,13 @@ const AGENT_EXITED: &str = "agent exited";
 /// answers requests in order, so each answer names the oldest one asked.
 /// What the agent reports unasked is logged only when it changes what the
 /// log has, starting from the [`AgentSettings`] the mapper is made with.
+///
+/// **Stops.** Likewise the supervisor tells the mapper of every task stop
+/// it hands the agent ([`EventMapper::asked_stop`]). Both answers retire
+/// the oldest stop asked, the success too though it logs nothing: with two
+/// stops in flight, a success that kept its place would hand the next
+/// refusal the wrong command. Stops left on `Exited` are dropped, not
+/// refused: the empty task set logged on exit settles them.
 ///
 /// **Calls.** Every `ToolCall` gets a fresh [`CallId`]. The mapper remembers
 /// which [`AgentCallId`] it stands for until the turn ends; a result or
@@ -99,6 +109,12 @@ const AGENT_EXITED: &str = "agent exited";
 /// supervisor calls [`EventMapper::take_approval`] for the agent's id and
 /// answers the agent.
 ///
+/// What a turn's end cancels is the adapter's rule: it cancels the turn's
+/// own leftover approvals before `TurnEnded`, and a background task's when
+/// the task leaves the set, so a task's approval can sit pending in an idle
+/// session. The `TurnEnded` cancel is only a backstop for the turn's own
+/// approvals an adapter left; it never touches a task's.
+///
 /// Blocking: it runs SQLite and blob writes.
 #[derive(Debug)]
 pub struct EventMapper {
@@ -108,13 +124,15 @@ pub struct EventMapper {
     context: ContextId,
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
-    approvals: Vec<(AgentRequestId, ApprovalId)>,
+    approvals: Vec<LoggedApproval>,
     /// Calls logged in the current turn, by the agent's id.
     calls: HashMap<AgentCallId, LoggedCall>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
     turn_open: bool,
     /// The session's mode, model and effort as the log has them.
     settings: AgentSettings,
+    /// The session's background tasks and schedules as the log has them.
+    work: AgentWork,
     /// Mode requests the agent has not answered, oldest first, with the
     /// command asking.
     asked_modes: VecDeque<(PermissionMode, Option<CommandId>)>,
@@ -122,6 +140,18 @@ pub struct EventMapper {
     asked_models: VecDeque<(String, Option<CommandId>)>,
     /// Effort requests likewise.
     asked_efforts: VecDeque<(Effort, Option<CommandId>)>,
+    /// Task stops the agent has not answered, oldest first, with the
+    /// command asking.
+    asked_stops: VecDeque<(TaskId, Option<CommandId>)>,
+}
+
+/// An approval the mapper logged that no answer has taken yet.
+#[derive(Debug)]
+struct LoggedApproval {
+    request: AgentRequestId,
+    id: ApprovalId,
+    /// A background task asked, not the turn: the turn's end leaves it.
+    of_task: bool,
 }
 
 /// What the mapper keeps of a logged call to link its result and approval.
@@ -134,9 +164,14 @@ struct LoggedCall {
 }
 
 impl EventMapper {
-    /// A mapper for `session_id`, whose log holds `settings`, running its
-    /// agent in session context `context`.
-    pub fn new(session_id: SessionId, context: ContextId, settings: AgentSettings) -> EventMapper {
+    /// A mapper for `session_id`, whose log holds `settings` and `work`,
+    /// running its agent in session context `context`.
+    pub fn new(
+        session_id: SessionId,
+        context: ContextId,
+        settings: AgentSettings,
+        work: AgentWork,
+    ) -> EventMapper {
         EventMapper {
             session_id,
             context,
@@ -144,9 +179,11 @@ impl EventMapper {
             calls: HashMap::new(),
             turn_open: false,
             settings,
+            work,
             asked_modes: VecDeque::new(),
             asked_models: VecDeque::new(),
             asked_efforts: VecDeque::new(),
+            asked_stops: VecDeque::new(),
         }
     }
 
@@ -163,6 +200,11 @@ impl EventMapper {
     /// The agent was asked to run at `effort`, for `command` if one asked.
     pub fn asked_effort(&mut self, effort: Effort, command: Option<CommandId>) {
         self.asked_efforts.push_back((effort, command));
+    }
+
+    /// The agent was asked to stop `task`, for `command` if one asked.
+    pub fn asked_stop(&mut self, task: TaskId, command: Option<CommandId>) {
+        self.asked_stops.push_back((task, command));
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -182,15 +224,15 @@ impl EventMapper {
 
     /// Approvals logged by this mapper that are still waiting for an answer.
     pub fn pending_approvals(&self) -> impl Iterator<Item = ApprovalId> + '_ {
-        self.approvals.iter().map(|(_, id)| *id)
+        self.approvals.iter().map(|a| a.id)
     }
 
     /// The agent's id for approval `id`, forgetting it: call once when the
     /// log shows `id` resolved, then answer the agent. `None` if `id` is not
     /// this mapper's or was already taken or cancelled.
     pub fn take_approval(&mut self, id: ApprovalId) -> Option<AgentRequestId> {
-        let index = self.approvals.iter().position(|(_, a)| *a == id)?;
-        Some(self.approvals.remove(index).0)
+        let index = self.approvals.iter().position(|a| a.id == id)?;
+        Some(self.approvals.remove(index).request)
     }
 
     /// Records `event` in the log and returns the seqs it appended, in order.
@@ -255,6 +297,7 @@ impl EventMapper {
                 tool,
                 input,
                 suggestions,
+                task,
             } => {
                 let (call, summary, input) = match self.linked(call.as_ref()) {
                     Some(logged) => {
@@ -288,12 +331,16 @@ impl EventMapper {
                         suggestions: bounded_suggestions(suggestions),
                     },
                 )?);
-                self.approvals.push((request, id));
+                self.approvals.push(LoggedApproval {
+                    request,
+                    id,
+                    of_task: task.is_some(),
+                });
             }
             AdapterEvent::ApprovalCancelled { request, reason } => {
-                match self.approvals.iter().position(|(r, _)| *r == request) {
+                match self.approvals.iter().position(|a| a.request == request) {
                     Some(index) => {
-                        let (_, id) = self.approvals.remove(index);
+                        let id = self.approvals.remove(index).id;
                         seqs.extend(log.cancel_approval(&mut storage.db, id, &reason)?);
                     }
                     None => {
@@ -316,7 +363,8 @@ impl EventMapper {
                     TurnOutcome::Interrupted => (TURN_INTERRUPTED, SessionState::Idle),
                     TurnOutcome::Failed(message) => (TURN_ENDED, SessionState::Errored { message }),
                 };
-                self.cancel_pending(log, storage, reason, &mut seqs)?;
+                // A backstop: the adapter cancels the turn's own first.
+                self.cancel_pending(log, storage, reason, |a| !a.of_task, &mut seqs)?;
                 seqs.push(self.append(log, storage, EventKind::SessionStateChanged(state))?);
             }
             AdapterEvent::ResumeHandle(handle) => {
@@ -403,10 +451,63 @@ impl EventMapper {
             AdapterEvent::ModelsOffered(_) => {
                 tracing::debug!("models offered reach the log through the supervisor");
             }
+            AdapterEvent::BackgroundTasks(tasks) => {
+                let tasks = cut_tasks(tasks);
+                if tasks != self.work.tasks {
+                    seqs.push(self.append(
+                        log,
+                        storage,
+                        EventKind::BackgroundTasksChanged { tasks },
+                    )?);
+                }
+            }
+            AdapterEvent::Schedules(schedules) => {
+                let schedules = cut_schedules(schedules);
+                if schedules != self.work.schedules {
+                    seqs.push(self.append(
+                        log,
+                        storage,
+                        EventKind::SchedulesChanged { schedules },
+                    )?);
+                }
+            }
+            AdapterEvent::TaskStopAnswered { task } => {
+                if self.answer_stop().is_none() {
+                    tracing::debug!(task, "agent answered a stop nobody asked");
+                }
+            }
+            AdapterEvent::TaskStopRefused { task, reason } => {
+                let (task, answers) = match self.answer_stop() {
+                    Some(asked) => asked,
+                    None => {
+                        tracing::debug!(task, "agent refused a stop nobody asked");
+                        (TaskId(cut_line(&task, TASK_ID_MAX_CHARS).0), None)
+                    }
+                };
+                let kind = EventKind::TaskStopRefused {
+                    task,
+                    reason: cut_line(&reason, REFUSAL_MAX_CHARS).0,
+                    answers,
+                };
+                seqs.push(self.append(log, storage, kind)?);
+            }
             AdapterEvent::Exited { error } => {
-                self.cancel_pending(log, storage, AGENT_EXITED, &mut seqs)?;
+                self.cancel_pending(log, storage, AGENT_EXITED, |_| true, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
+                // The empty set logged below settles them.
+                self.asked_stops.clear();
                 self.calls.clear();
+                // Nothing outlives the process, durable schedules included.
+                if !self.work.tasks.is_empty() {
+                    let kind = EventKind::BackgroundTasksChanged { tasks: Vec::new() };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
+                if !self.work.schedules.is_empty() {
+                    let kind = EventKind::SchedulesChanged {
+                        schedules: Vec::new(),
+                    };
+                    seqs.push(self.append(log, storage, kind)?);
+                }
                 let message = match error {
                     Some(error) => Some(format!("agent exited: {error}")),
                     None if self.turn_open => Some("agent exited during a turn".to_owned()),
@@ -428,6 +529,9 @@ impl EventMapper {
     fn append(&mut self, log: &EventLog, storage: &mut Storage, kind: EventKind) -> Result<Seq> {
         if AgentSettings::folds(&kind) {
             self.settings.apply(None, &kind);
+        }
+        if AgentWork::folds(&kind) {
+            self.work.apply(&kind);
         }
         log.append(&mut storage.db, self.session_id, self.context, kind)
     }
@@ -457,6 +561,11 @@ impl EventMapper {
             tracing::debug!("agent answered an effort request nobody asked");
         }
         asked.and_then(|(_, command)| command)
+    }
+
+    /// The oldest stop asked, now answered, with its command.
+    fn answer_stop(&mut self) -> Option<(TaskId, Option<CommandId>)> {
+        self.asked_stops.pop_front()
     }
 
     /// Refuses every mode, model and effort request the agent left
@@ -504,17 +613,22 @@ impl EventMapper {
         logged
     }
 
-    /// Cancels every approval still pending, oldest first. One already
-    /// answered in the log stays answered (D5).
+    /// Cancels every approval still pending that `which` picks, oldest
+    /// first. One already answered in the log stays answered (D5).
     fn cancel_pending(
         &mut self,
         log: &EventLog,
         storage: &mut Storage,
         reason: &str,
+        which: impl Fn(&LoggedApproval) -> bool,
         seqs: &mut Vec<Seq>,
     ) -> Result<()> {
-        for (_, id) in std::mem::take(&mut self.approvals) {
-            seqs.extend(log.cancel_approval(&mut storage.db, id, reason)?);
+        let (cancelled, kept) = std::mem::take(&mut self.approvals)
+            .into_iter()
+            .partition(which);
+        self.approvals = kept;
+        for approval in cancelled {
+            seqs.extend(log.cancel_approval(&mut storage.db, approval.id, reason)?);
         }
         Ok(())
     }
@@ -678,6 +792,44 @@ fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
         out.push('…');
     }
     (out, cut)
+}
+
+/// The first [`TASKS_MAX`] tasks, in the agent's order, titles cut to one
+/// line. An entry whose id is too long is dropped: a cut id names nothing.
+/// A parent id too long drops the entry's parent link, not the entry: the
+/// task still runs, and it is the link that names nothing.
+fn cut_tasks(tasks: Vec<AgentTask>) -> Vec<BackgroundTask> {
+    let fits = |id: &str| id.chars().count() <= TASK_ID_MAX_CHARS;
+    tasks
+        .into_iter()
+        .filter(|task| fits(&task.id))
+        .take(TASKS_MAX)
+        .map(|task| BackgroundTask {
+            id: proto::TaskId(task.id),
+            kind: task.kind,
+            title: cut_line(&task.title, TITLE_MAX_CHARS).0,
+            parent: task.parent.filter(|id| fits(id)).map(proto::TaskId),
+            ambient: task.ambient,
+        })
+        .collect()
+}
+
+/// The first [`SCHEDULES_MAX`] schedules, in the agent's order, `when` and
+/// prompt cut to one line. An entry whose id is too long is dropped, as in
+/// [`cut_tasks`].
+fn cut_schedules(schedules: Vec<AgentSchedule>) -> Vec<Schedule> {
+    schedules
+        .into_iter()
+        .filter(|schedule| schedule.id.chars().count() <= TASK_ID_MAX_CHARS)
+        .take(SCHEDULES_MAX)
+        .map(|schedule| Schedule {
+            id: proto::ScheduleId(schedule.id),
+            when: cut_line(&schedule.when, SCHEDULE_WHEN_MAX_CHARS).0,
+            recurring: schedule.recurring,
+            prompt: cut_line(&schedule.prompt, TITLE_MAX_CHARS).0,
+            outlives_agent: schedule.outlives_agent,
+        })
+        .collect()
 }
 
 /// The first [`RULE_SUGGESTIONS_MAX`] suggestions, labels cut to one line

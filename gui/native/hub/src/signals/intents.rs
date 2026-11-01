@@ -172,6 +172,12 @@ pub enum ActionIntent {
     StopSession {
         session_id: String,
     },
+    /// End one of the session's background tasks, the agent otherwise
+    /// running on.
+    StopTask {
+        session_id: String,
+        task_id: String,
+    },
     /// Start a session in the open session's workdir and open it once
     /// the server logged it.
     CreateSessionLike {

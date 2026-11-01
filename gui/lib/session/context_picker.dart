@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
+import 'package:skywave_gui/session/background_sheet.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -28,7 +29,16 @@ Future<void> pickContext(
               _ContextTile(
                 context: c,
                 viewing: c.contextId == screen.viewingId,
-                onSwitch: () {
+                onSwitch: () async {
+                  if (screen.stopWarning case final warning?) {
+                    final ok = await confirmStop(
+                      context,
+                      heading: screen.stopHeadings.switchContext,
+                      warning: warning,
+                      action: 'Switch',
+                    );
+                    if (!ok || !context.mounted) return;
+                  }
                   Navigator.of(context).pop();
                   send.act(
                     ActionIntentSwitchContext(
@@ -44,7 +54,7 @@ Future<void> pickContext(
                   );
                 },
                 onMove: () async {
-                  final ok = await _confirmMove(context, c);
+                  final ok = await _confirmMove(context, c, screen);
                   if (ok != true || !context.mounted) return;
                   Navigator.of(context).pop();
                   send.act(
@@ -81,12 +91,23 @@ Future<void> pickContext(
   );
 }
 
-Future<bool?> _confirmMove(BuildContext context, ContextRow c) {
+/// The move confirm. Moving the current context stops the agent, so its
+/// warning joins the confirm rather than following it with a second one.
+Future<bool?> _confirmMove(
+  BuildContext context,
+  ContextRow c,
+  SessionScreen screen,
+) {
   return showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
       title: Text('Move ${c.label} to a new session?'),
-      content: const Text('It goes on there; here it stays as it was.'),
+      content: Text(
+        [
+          'It goes on there; here it stays as it was.',
+          if (c.current) ?screen.stopWarning,
+        ].join('\n\n'),
+      ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(false),

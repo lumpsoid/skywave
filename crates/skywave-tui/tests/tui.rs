@@ -6186,3 +6186,267 @@ fn agent_setting_keys_are_in_help() {
     assert_keys(&help, &["p", "m"]);
     assert_contains(&help.join("\n"), "bypass lets every tool run");
 }
+
+fn task(
+    id: &str,
+    kind: skywave_proto::TaskKind,
+    title: &str,
+    parent: Option<&str>,
+    ambient: bool,
+) -> skywave_proto::BackgroundTask {
+    skywave_proto::BackgroundTask {
+        id: skywave_proto::TaskId(id.into()),
+        kind,
+        title: title.into(),
+        parent: parent.map(|p| skywave_proto::TaskId(p.into())),
+        ambient,
+    }
+}
+
+fn a_loop(outlives_agent: Option<bool>) -> skywave_proto::Schedule {
+    skywave_proto::Schedule {
+        id: skywave_proto::ScheduleId("s1".into()),
+        when: "*/1 * * * *".into(),
+        recurring: true,
+        prompt: "check the deploy".into(),
+        outlives_agent,
+    }
+}
+
+/// An open session (on the timeline) whose agent reported this work.
+fn with_work(
+    tasks: Vec<skywave_proto::BackgroundTask>,
+    schedules: Vec<skywave_proto::Schedule>,
+) -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    let mut events = Vec::new();
+    if !tasks.is_empty() {
+        events.push(event(id, 1, EventKind::BackgroundTasksChanged { tasks }));
+    }
+    if !schedules.is_empty() {
+        events.push(event(id, 2, EventKind::SchedulesChanged { schedules }));
+    }
+    pull(&mut h, events);
+    (h, id, me)
+}
+
+fn one_task() -> Vec<skywave_proto::BackgroundTask> {
+    vec![task(
+        "t1",
+        skywave_proto::TaskKind::Shell,
+        "npm run dev",
+        None,
+        false,
+    )]
+}
+
+#[test]
+fn stop_with_background_work_warns_and_waits_for_y() {
+    let (mut h, id, _) = with_work(one_task(), vec![a_loop(None)]);
+    assert_eq!(h.key(KeyCode::Char('S')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Stop the agent?");
+    assert_contains(
+        &screen,
+        "Stopping ends 1 background task and pauses 1 loop.",
+    );
+    // Any other key cancels and sends nothing.
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert!(!h.screen().contains("Stop the agent?"));
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    // Positive control: asked again, `y` stops.
+    h.key(KeyCode::Char('S'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::StopSession { session_id: id })
+    );
+}
+
+#[test]
+fn stop_without_work_or_with_only_ambient_work_is_at_once() {
+    let (mut h, id, _) = with_work(vec![], vec![]);
+    assert_eq!(
+        h.key(KeyCode::Char('S')),
+        Some(Action::StopSession { session_id: id })
+    );
+    let ambient = vec![task(
+        "w",
+        skywave_proto::TaskKind::Shell,
+        "watch",
+        None,
+        true,
+    )];
+    let (mut h, id, _) = with_work(ambient, vec![]);
+    assert_eq!(
+        h.key(KeyCode::Char('S')),
+        Some(Action::StopSession { session_id: id })
+    );
+}
+
+#[test]
+fn clear_and_switch_with_work_warn_and_wait_for_y() {
+    let (mut h, id, _) = two_contexts();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            10,
+            EventKind::BackgroundTasksChanged { tasks: one_task() },
+        )],
+    );
+    // Switch to the earlier context.
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "Switch context?");
+    assert_contains(&h.screen(), "Stopping ends 1 background task.");
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::SwitchContext {
+            session_id: id,
+            context: skywave_proto::ContextId::first_of(id),
+        })
+    );
+    // Clear: row 0.
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "Start a new context?");
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::ClearContext { session_id: id })
+    );
+}
+
+#[test]
+fn moving_the_current_context_warns_but_another_does_not() {
+    // The current context is the movable one: it has an answer in it.
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    pull(
+        &mut h,
+        vec![
+            message(id, 1, CommandId::new(), me, "alpha question"),
+            event(
+                id,
+                2,
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+            ),
+            event(
+                id,
+                3,
+                EventKind::AgentMessage {
+                    text: "alpha answer".into(),
+                },
+            ),
+            event(
+                id,
+                4,
+                EventKind::BackgroundTasksChanged { tasks: one_task() },
+            ),
+        ],
+    );
+    h.key(KeyCode::Char('C'));
+    assert_eq!(h.key(KeyCode::Char('M')), None);
+    assert_contains(&h.screen(), "Move this context to a new session?");
+    assert_contains(&h.screen(), "Stopping ends 1 background task.");
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Char('M'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::MoveContext {
+            session_id: id,
+            context: skywave_proto::ContextId::first_of(id),
+        })
+    );
+
+    // Another context moves with the ordinary confirm, work or not.
+    let (mut h, id, _) = movable_context();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            10,
+            EventKind::BackgroundTasksChanged { tasks: one_task() },
+        )],
+    );
+    h.key(KeyCode::Char('C'));
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Char('M'));
+    let screen = h.screen();
+    assert_contains(&screen, "Move start · alpha question to a new session?");
+    assert!(!screen.contains("Stopping"), "{screen}");
+}
+
+#[test]
+fn the_background_picker_lists_work_and_stops_a_task_after_y() {
+    let tasks = vec![
+        task(
+            "t1",
+            skywave_proto::TaskKind::Subagent,
+            "review the diff",
+            None,
+            false,
+        ),
+        task(
+            "t2",
+            skywave_proto::TaskKind::Shell,
+            "cargo watch",
+            Some("t1"),
+            false,
+        ),
+    ];
+    let (mut h, id, _) = with_work(tasks, vec![a_loop(Some(true))]);
+    assert_eq!(h.key(KeyCode::Char('B')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "2 background tasks · 1 loop");
+    let parent = line_with(&screen, "review the diff");
+    let child = line_with(&screen, "cargo watch");
+    // The child sits one level (two columns) in under its parent.
+    let col = |l: &str, n: &str| l[..l.find(n).unwrap()].chars().count();
+    assert_eq!(
+        col(&child, "cargo watch"),
+        col(&parent, "review the diff") + 2,
+        "{screen}"
+    );
+    assert_contains(&screen, "*/1 * * * * repeats check the deploy");
+    assert_contains(&screen, "saved in this folder");
+    assert_contains(&screen, "as of the last turn");
+
+    // Enter on the child asks, `n` backs off, `y` stops that task.
+    h.key(KeyCode::Down);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "Stop cargo watch?");
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    h.key(KeyCode::Enter);
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::StopTask {
+            session_id: id,
+            task: skywave_proto::TaskId("t2".into()),
+        })
+    );
+}
+
+#[test]
+fn enter_on_a_loop_sends_nothing() {
+    let (mut h, _, _) = with_work(one_task(), vec![a_loop(None)]);
+    h.key(KeyCode::Char('B'));
+    h.key(KeyCode::Down);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    let screen = h.screen();
+    assert!(!screen.contains("y stops it"), "{screen}");
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    // Positive control: the same keys on the task do ask.
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    assert_contains(&h.screen(), "Stop npm run dev?");
+}

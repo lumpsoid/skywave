@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionState as LogState, ToolCall,
+    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionState as LogState, TaskId,
+    ToolCall,
 };
 
 use crate::action::{Action, Route};
@@ -446,6 +447,12 @@ impl Model {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::SetPermissionMode { session_id, mode })
+            }
+            Action::StopTask { session_id, task } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::StopTask { session_id, task })
             }
             Action::SetModel { session_id, model } => {
                 // As the server will log it, so the switch shows it unchanged.
@@ -1334,6 +1341,8 @@ impl Model {
             switch,
             interrupt,
             stop,
+            work: summary.work.clone(),
+            task_stops: self.task_stops(summary, events),
             draft: self.drafts.get(&id).cloned(),
             draft_rev: self.draft_rev,
             last_seq: summary.last_seq,
@@ -1420,6 +1429,39 @@ impl Model {
         answers
             .and_then(|command| asked_by.get(&command))
             .map(|device| self.device_ref(*device))
+    }
+
+    /// This device's stops still on their way, one per task: the newest
+    /// `StopTask` of each task in the session's work, unless its refusal
+    /// is in the loaded `events` (the open session's).
+    fn task_stops(
+        &self,
+        summary: &SessionSummary,
+        events: &[(Seq, Event)],
+    ) -> Vec<(TaskId, Outgoing)> {
+        let mut stops: Vec<(TaskId, Outgoing)> = Vec::new();
+        for entry in self.outbox.iter().rev() {
+            let CommandKind::StopTask { session_id, task } = &entry.command.kind else {
+                continue;
+            };
+            if *session_id != summary.id
+                || stops.iter().any(|(t, _)| t == task)
+                || !summary.work.tasks.iter().any(|t| t.id == *task)
+            {
+                continue;
+            }
+            let outgoing = Outgoing::from(&entry.status);
+            let refused = self.in_replica(outgoing)
+                && events.iter().any(|(_, e)| {
+                    matches!(&e.kind, EventKind::TaskStopRefused { answers, .. }
+                        if *answers == Some(entry.command.id))
+                });
+            if !refused {
+                stops.push((task.clone(), outgoing));
+            }
+        }
+        stops.reverse();
+        stops
     }
 
     /// The session's agent settings: the summary's fold, with this device's
@@ -1868,6 +1910,13 @@ impl Model {
                     }
                 }
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
+                // Folded into the session summary; nothing in the timeline.
+                EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
+                    None
+                }
+                // A stop shows as its task leaving the set; nothing in the
+                // timeline.
+                EventKind::TaskStopRequested { .. } | EventKind::TaskStopRefused { .. } => None,
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
@@ -2228,7 +2277,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::SetEffort { session_id, .. }
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
-        | CommandKind::MoveContext { session_id, .. } => Some(*session_id),
+        | CommandKind::MoveContext { session_id, .. }
+        | CommandKind::StopTask { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }
@@ -3097,6 +3147,102 @@ mod tests {
             ]
         );
         assert_eq!(view.rules, [edits, ls]);
+    }
+
+    fn work_task(id: &str) -> skywave_proto::BackgroundTask {
+        skywave_proto::BackgroundTask {
+            id: TaskId(id.into()),
+            kind: skywave_proto::TaskKind::Shell,
+            title: id.into(),
+            parent: None,
+            ambient: false,
+        }
+    }
+
+    /// A stop of task `t1` accepted at the end of the log, with `t1` listed.
+    fn accepted_stop(f: &mut Fixture, sid: SessionId) -> Command {
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged {
+                tasks: vec![work_task("t1")],
+            }],
+        );
+        f.open(sid);
+        assert_eq!(f.session_view().work.tasks.len(), 1);
+        let command = queued(&f.dispatch(Action::StopTask {
+            session_id: sid,
+            task: TaskId("t1".into()),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::StopTask {
+                session_id: sid,
+                task: TaskId("t1".into())
+            }
+        );
+        assert_eq!(
+            f.session_view().task_stops,
+            vec![(TaskId("t1".into()), Outgoing::Queued)]
+        );
+        let me = f.me;
+        f.log_commands(
+            sid,
+            vec![(
+                Some(command.id),
+                EventKind::TaskStopRequested {
+                    task: TaskId("t1".into()),
+                    by: me,
+                },
+            )],
+        );
+        let seq = Seq(f.events.len() as u64);
+        f.model
+            .command_result(command.id, CommandResult::Accepted { seq }, Utc::now());
+        assert_eq!(
+            f.session_view().task_stops,
+            vec![(TaskId("t1".into()), Outgoing::Accepted(seq))]
+        );
+        command
+    }
+
+    #[test]
+    fn a_task_stop_shows_until_the_task_leaves_the_work() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        accepted_stop(&mut f, sid);
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
+        );
+        assert_eq!(f.session_view().task_stops, vec![]);
+    }
+
+    #[test]
+    fn a_refusal_answering_a_task_stop_clears_it() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let command = accepted_stop(&mut f, sid);
+        // Positive control: a refusal answering another command leaves it.
+        f.log(
+            sid,
+            vec![EventKind::TaskStopRefused {
+                task: TaskId("t1".into()),
+                reason: "no".into(),
+                answers: Some(CommandId::new()),
+            }],
+        );
+        assert_eq!(f.session_view().task_stops.len(), 1);
+        f.log(
+            sid,
+            vec![EventKind::TaskStopRefused {
+                task: TaskId("t1".into()),
+                reason: "no".into(),
+                answers: Some(command.id),
+            }],
+        );
+        assert_eq!(f.session_view().task_stops, vec![]);
+        // The task is still listed: it can be stopped again.
+        assert_eq!(f.session_view().work.tasks.len(), 1);
     }
 
     #[test]
