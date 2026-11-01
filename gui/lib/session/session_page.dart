@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
+import 'package:skywave_gui/session/background_sheet.dart';
 import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/context_picker.dart';
 import 'package:skywave_gui/session/look.dart';
@@ -53,9 +54,17 @@ class _SessionPageState extends State<SessionPage> {
 
   SessionScreen get _screen => widget.screen;
 
+  /// The screen for the background work sheet, which stays open across
+  /// updates.
+  late final _work = ValueNotifier<SessionScreen>(widget.screen);
+
   @override
   void didUpdateWidget(SessionPage oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // After the frame: the sheet rebuilds from this, not during our build.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _work.value = widget.screen;
+    });
     _announceRefusals(oldWidget.screen);
   }
 
@@ -99,7 +108,27 @@ class _SessionPageState extends State<SessionPage> {
     _composerFocus.dispose();
     _searchFocus.dispose();
     _ownSearch?.dispose();
+    _work.dispose();
     super.dispose();
+  }
+
+  /// Runs [go], after a confirmation naming what it ends when the agent has
+  /// background work an action that stops it would end or pause.
+  Future<void> _stopping(
+    String Function(StopHeadings) heading,
+    String action,
+    VoidCallback go,
+  ) async {
+    if (_screen.stopWarning case final warning?) {
+      final ok = await confirmStop(
+        context,
+        heading: heading(_screen.stopHeadings),
+        warning: warning,
+        action: action,
+      );
+      if (!ok || !mounted) return;
+    }
+    go();
   }
 
   /// Interrupts the agent's turn, if it has one and no interrupt from
@@ -238,9 +267,13 @@ class _SessionPageState extends State<SessionPage> {
                         ),
                         PopupMenuItem(
                           enabled: screen.canClear,
-                          value: () => widget.send.act(
-                            ActionIntentClearContext(
-                              sessionId: screen.sessionId,
+                          value: () => _stopping(
+                            (h) => h.newContext,
+                            'New context',
+                            () => widget.send.act(
+                              ActionIntentClearContext(
+                                sessionId: screen.sessionId,
+                              ),
                             ),
                           ),
                           child: ListTile(
@@ -268,10 +301,28 @@ class _SessionPageState extends State<SessionPage> {
                           ),
                         ),
                         PopupMenuItem(
+                          value: () => showBackgroundWork(
+                            this.context,
+                            _work,
+                            widget.send,
+                          ),
+                          child: ListTile(
+                            leading: const Icon(Icons.pending_actions),
+                            title: const Text('Background work'),
+                            subtitle: Text(
+                              screen.workLabel ?? 'nothing running',
+                            ),
+                          ),
+                        ),
+                        PopupMenuItem(
                           enabled: !stopped,
-                          value: () => widget.send.act(
-                            ActionIntentStopSession(
-                              sessionId: screen.sessionId,
+                          value: () => _stopping(
+                            (h) => h.stopAgent,
+                            'Stop agent',
+                            () => widget.send.act(
+                              ActionIntentStopSession(
+                                sessionId: screen.sessionId,
+                              ),
                             ),
                           ),
                           child: ListTile(

@@ -385,6 +385,10 @@ impl AgentSession for ClaudeCodeSession {
         self.request(Request::Effort(effort))
     }
 
+    async fn stop_task(&mut self, task: String) -> Result<(), AgentError> {
+        self.request(Request::StopTask(task))
+    }
+
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(Request::Shutdown);
@@ -403,6 +407,7 @@ enum Request {
     Mode(PermissionMode),
     Model(String),
     Effort(Effort),
+    StopTask(String),
     Shutdown,
 }
 
@@ -543,6 +548,7 @@ impl Driver {
                         Some(Request::Mode(mode)) => self.protocol.set_permission_mode(mode),
                         Some(Request::Model(model)) => self.protocol.set_model(model),
                         Some(Request::Effort(effort)) => self.protocol.set_effort(effort),
+                        Some(Request::StopTask(task)) => self.protocol.stop_task(task),
                         Some(Request::Shutdown) | None => break self.shutdown().await,
                     };
                     if !self.apply(out).await {

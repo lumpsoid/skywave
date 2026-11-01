@@ -53,6 +53,13 @@
 //!   replaced before the supervisor reached it is skipped, so requests
 //!   never land out of order, and one the agent's start already asked for
 //!   is not asked again.
+//! - `TaskStopRequested` → [`AgentSession::stop_task`], noted with the
+//!   mapper ([`EventMapper::asked_stop`]) so a refusal names the command.
+//!   Never starts an agent: with none running, the supervisor logs
+//!   `TaskStopRefused` ("agent not running") answering the command, in the
+//!   event's context. A stop the agent took shows as the task leaving its
+//!   next task set; the busy count and idle clock follow that set as for
+//!   any other change.
 //!
 //! **Conversations.** A context starts in its own conversation, resumed
 //! with its stored [`ResumeHandle`](crate::agent::ResumeHandle), once it has
@@ -97,9 +104,16 @@
 //! nothing.
 //!
 //! **Lifecycle.** An agent session is started on the first message and kept
-//! while it has work: a turn open or a delivered message whose turn has not
-//! ended. Once idle it is kept warm for [`SupervisorConfig::idle_timeout`]
-//! and then shut down; the next message resumes it.
+//! while it has work: a turn open (also one the agent started on its own,
+//! e.g. a scheduled wakeup), a delivered message whose turn has not ended,
+//! or a live background task that is not ambient (a shell job, a
+//! subagent). The tasks are counted as the agent reports them, before the
+//! log cuts the set, so a task the log has no room for still counts.
+//! Schedules are not work: the agent is not kept for one, and a schedule
+//! that fires while it runs starts a turn, which is. Once idle it is kept
+//! warm for [`SupervisorConfig::idle_timeout`] and then shut down; the next
+//! message resumes it. The clock starts when the last work ends; a later
+//! report of still nothing to do does not restart it.
 //!
 //! **Daemon start.** Before following the log the supervisor settles what the
 //! previous run left open (F13):
@@ -115,7 +129,11 @@
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
 //!   handed to is gone. One after the cursor is handled as usual. Settings
 //!   belong to the session, so the refusal is stamped with the current
-//!   context.
+//!   context;
+//! - a session whose logged background tasks or schedules are not empty gets
+//!   the empty set(s), `BackgroundTasksChanged` and/or `SchedulesChanged`:
+//!   its agent died with the daemon, and its work with it. They are stamped
+//!   with the context of the last such event, the agent's own.
 //!
 //! [`SupervisorHandle::shutdown`] stops the agents without interrupting them
 //! ([`AgentSession::shutdown`] abandons a running turn, so the agent cancels
@@ -140,7 +158,7 @@ use std::time::Duration;
 use rusqlite::OptionalExtension;
 use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
-    SessionState,
+    SessionState, TaskId,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -159,6 +177,8 @@ pub const DAEMON_RESTARTED: &str = "daemon restarted";
 /// `Errored` message for a session whose turn was running when the daemon
 /// stopped.
 pub const TURN_LOST: &str = "daemon restarted during a turn";
+/// Why a task stop is refused when the session has no agent running.
+pub const AGENT_NOT_RUNNING: &str = "agent not running";
 /// Default for [`SupervisorConfig::idle_timeout`].
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -228,7 +248,11 @@ struct Running<S> {
     turn_started: Option<Seq>,
     /// Messages delivered whose turn has not ended yet.
     owed_turns: usize,
+    /// The live background tasks the agent last reported that are not
+    /// ambient, counted before the mapper cuts the set.
+    busy_tasks: usize,
     /// When the session last ran out of work; `None` while it has some.
+    /// Written only by [`Running::settle_idle`].
     idle_since: Option<Instant>,
     /// The setting requests this agent was asked for, by command.
     asked: HashSet<Option<CommandId>>,
@@ -243,6 +267,23 @@ impl<S> Running<S> {
 
     fn idle_deadline(&self, timeout: Duration) -> Option<Instant> {
         self.idle_since.map(|since| since + timeout)
+    }
+
+    /// A turn owed or open, or a busy background task. Schedules are not
+    /// work; see the module docs.
+    fn has_work(&self) -> bool {
+        self.owed_turns > 0 || self.mapper.turn_open() || self.busy_tasks > 0
+    }
+
+    /// Stops the idle clock while the agent has work and starts it once it
+    /// has none. A clock already running keeps its start, so a repeated
+    /// report of nothing to do does not push the deadline back.
+    fn settle_idle(&mut self) {
+        if self.has_work() {
+            self.idle_since = None;
+        } else if self.idle_since.is_none() {
+            self.idle_since = Some(Instant::now());
+        }
     }
 }
 
@@ -320,6 +361,30 @@ impl<A: AgentAdapter> Supervisor<A> {
                 context,
                 EventKind::SessionStateChanged(settle),
             )?;
+        }
+        for session in self.log.sessions(db)? {
+            let work = self.log.agent_work(db, session.id)?;
+            let mut ended = Vec::new();
+            if !work.tasks.is_empty() {
+                ended.push(EventKind::BackgroundTasksChanged { tasks: Vec::new() });
+            }
+            if !work.schedules.is_empty() {
+                ended.push(EventKind::SchedulesChanged {
+                    schedules: Vec::new(),
+                });
+            }
+            if ended.is_empty() {
+                continue;
+            }
+            // Stamped like the work it ends: the context of the agent that
+            // reported it, not one switched to since.
+            let Some(context) = last_work_context(db, session.id)? else {
+                continue;
+            };
+            for kind in ended {
+                tracing::info!(session = %session.id.0, ?kind, "ending work lost with the daemon");
+                self.log.append(db, session.id, context, kind)?;
+            }
         }
         self.cursor = load_cursor(db)?;
         self.stored_cursor = self.cursor;
@@ -496,7 +561,39 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.set(session_id, event.context, event.command_id, setting)
                     .await?;
             }
+            EventKind::TaskStopRequested { task, .. } => {
+                self.stop_task(session_id, event.context, event.command_id, task)
+                    .await?;
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Asks the session's agent to stop background `task` on behalf of
+    /// `command`, made in `context`. Never starts an agent: one that is not
+    /// running has no task to stop, so the stop is refused in `context`.
+    async fn stop_task(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+        command: Option<CommandId>,
+        task: TaskId,
+    ) -> Result<()> {
+        let Some(running) = self.running.get_mut(&session_id) else {
+            let kind = EventKind::TaskStopRefused {
+                task,
+                reason: AGENT_NOT_RUNNING.to_owned(),
+                answers: command,
+            };
+            self.log
+                .append(&mut self.storage.db, session_id, context, kind)?;
+            return Ok(());
+        };
+        running.mapper.asked_stop(task.clone(), command);
+        if let Err(error) = running.session.stop_task(task.0).await {
+            // The agent is gone; the empty set its `Exited` logs settles it.
+            tracing::warn!(session = %session_id.0, %error, "cannot ask the agent to stop a task");
         }
         Ok(())
     }
@@ -635,7 +732,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             match running.session.send_message(text.clone()).await {
                 Ok(()) => {
                     running.owed_turns += 1;
-                    running.idle_since = None;
+                    running.settle_idle();
                     return Ok(());
                 }
                 Err(error) => {
@@ -684,6 +781,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let grants = load_grants(&self.storage.db, session_id)?;
         let settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        let work = self.log.agent_work(&self.storage.db, session_id)?;
         let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
         // An effort the running model takes none of, like an unknown one,
@@ -702,7 +800,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         match self.adapter.start(spec).await {
             Ok((session, events)) => {
                 tracing::info!(session = %session_id.0, context = %context.0, conversation = how, "agent started");
-                let mut mapper = EventMapper::new(session_id, context, settings.clone());
+                let mut mapper = EventMapper::new(session_id, context, settings.clone(), work);
                 let mut asked = HashSet::new();
                 if let Some(mode) = mode {
                     let command = settings.mode.requested.as_ref().map(|r| r.command);
@@ -719,19 +817,19 @@ impl<A: AgentAdapter> Supervisor<A> {
                     mapper.asked_effort(effort, command);
                     asked.insert(command);
                 }
-                self.running.insert(
-                    session_id,
-                    Running {
-                        session,
-                        events,
-                        mapper,
-                        turn_started: None,
-                        owed_turns: 0,
-                        // Nothing to do until a message comes, if one does.
-                        idle_since: Some(Instant::now()),
-                        asked,
-                    },
-                );
+                let mut running = Running {
+                    session,
+                    events,
+                    mapper,
+                    turn_started: None,
+                    owed_turns: 0,
+                    busy_tasks: 0,
+                    idle_since: None,
+                    asked,
+                };
+                // Nothing to do until a message comes, if one does.
+                running.settle_idle();
+                self.running.insert(session_id, running);
                 Ok(Ok(()))
             }
             Err(error) => {
@@ -777,6 +875,10 @@ impl<A: AgentAdapter> Supervisor<A> {
                 models,
             );
         }
+        if let AdapterEvent::BackgroundTasks(tasks) = &event {
+            // Counted uncut: a task the log has no room for still runs.
+            running.busy_tasks = tasks.iter().filter(|t| !t.ambient).count();
+        }
         let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
         if started && let Some(&seq) = seqs.first() {
             running.turn_started = Some(seq);
@@ -784,10 +886,9 @@ impl<A: AgentAdapter> Supervisor<A> {
         if ended {
             running.turn_started = None;
             running.owed_turns = running.owed_turns.saturating_sub(1);
-            if running.owed_turns == 0 && !running.mapper.turn_open() {
-                running.idle_since = Some(Instant::now());
-            }
         }
+        // A turn the agent started on its own is work too, as is a task.
+        running.settle_idle();
         Ok(())
     }
 
@@ -1007,6 +1108,21 @@ fn last_state_event(db: &Db, session_id: SessionId) -> Result<Option<(EventKind,
         return Ok(None);
     };
     Ok(Some((serde_json::from_str(&kind)?, parse_id(&context)?)))
+}
+
+/// The context of the session's newest `BackgroundTasksChanged` or
+/// `SchedulesChanged`.
+fn last_work_context(db: &Db, session_id: SessionId) -> Result<Option<ContextId>> {
+    let context: Option<String> = db
+        .conn()
+        .prepare_cached(
+            "SELECT context FROM events WHERE session_id = ?1 \
+             AND json_extract(kind, '$.type') IN ('background_tasks_changed', 'schedules_changed') \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([session_id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    context.map(|c| parse_id(&c)).transpose()
 }
 
 fn load_cursor(db: &Db) -> Result<Seq> {

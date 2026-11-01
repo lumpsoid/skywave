@@ -4,24 +4,27 @@
 //! `EventLog::handle`, the agent is told directly, and every adapter event is
 //! fed to the mapper.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
 use serde_json::json;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, STATUS_MAX_CHARS, TITLE_MAX_CHARS,
+    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
+    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
-    AgentSettings, ApprovalId, BodyFormat, CallId, Command, CommandId, CommandKind, CommandResult,
-    ContextId, Decision, DeviceId, EventKind, RejectReason, Seq, SessionId, SessionState, ToolCall,
-    ToolDisplay, ToolKind, ToolResult,
+    AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
+    CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind, RejectReason, Schedule,
+    ScheduleId, Seq, SessionId, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
 };
 use skywaved::agent::{
-    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation,
-    DisplayBody, EventMapper, ResultDisplay, StartSpec, TurnOutcome, load_resume_handle,
+    self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSchedule, AgentSession,
+    AgentTask, Conversation, DisplayBody, EventMapper, ResultDisplay, StartSpec, TaskKind,
+    TurnOutcome, load_resume_handle,
 };
 use skywaved::{EventLog, Storage};
 use tempfile::TempDir;
@@ -215,6 +218,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
 
     accepted(f.handle(CommandKind::SendMessage {
@@ -388,6 +392,7 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
 
     session.send_message("clean up".into()).await.unwrap();
@@ -468,6 +473,7 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
 
     session.send_message("first".into()).await.unwrap();
@@ -525,6 +531,7 @@ async fn denied_approval_runs_the_deny_branch() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     session.send_message("write x".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, approval_requested).await;
@@ -578,6 +585,7 @@ async fn restart_resumes_with_the_stored_handle() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     session.shutdown().await.unwrap();
     let rest = f.pump(&mut events, &mut mapper, |_| true).await;
@@ -588,6 +596,7 @@ async fn restart_resumes_with_the_stored_handle() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     session.send_message("a".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
@@ -612,6 +621,7 @@ async fn restart_resumes_with_the_stored_handle() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     session.send_message("b".into()).await.unwrap();
     let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
@@ -673,7 +683,12 @@ async fn a_fork_copies_a_conversation_of_another_session() {
     assert_eq!(agent.inputs(other), []);
 
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, origin, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        origin,
+        AgentSettings::default(),
+        AgentWork::default(),
+    );
     session.send_message("a".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
     session.shutdown().await.unwrap();
@@ -740,6 +755,7 @@ async fn failures_and_exits_mark_the_session_errored() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     session.send_message("1".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
@@ -797,6 +813,7 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let long = "x".repeat(RULE_LABEL_MAX_CHARS + 10);
     let mut suggestions = vec![
@@ -821,6 +838,7 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
             tool: "write".into(),
             input: json!("short"),
             suggestions,
+            task: None,
         },
     ] {
         mapper.apply(&f.log, &mut f.storage, event).unwrap();
@@ -848,6 +866,7 @@ fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let usage = TurnUsage {
         duration_ms: Some(12_400),
@@ -882,6 +901,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     for event in [
         AdapterEvent::TurnStarted,
@@ -897,6 +917,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
             tool: "write".into(),
             input: json!("short"),
             suggestions: Vec::new(),
+            task: None,
         },
         AdapterEvent::ToolResult {
             call: None,
@@ -987,6 +1008,7 @@ fn large_content_gives_small_events_and_blobs() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let huge = huge_text();
     let input = json!({ "command": huge.clone() });
@@ -1007,6 +1029,7 @@ fn large_content_gives_small_events_and_blobs() {
                 tool: "shell".into(),
                 input: input.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1108,6 +1131,7 @@ fn content_shown_whole_makes_no_blob() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let eight_lines: String = (0..PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
     apply_all(
@@ -1182,6 +1206,7 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let input = json!({ "command": "make", "timeout": 600 });
     let note = "built\n(a note for the model)";
@@ -1248,6 +1273,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let write = json!({ "path": "a.txt", "content": "hi" });
     let edited = json!({ "path": "a.txt", "content": "bye" });
@@ -1268,6 +1294,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 tool: "write".into(),
                 input: write.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ApprovalRequested {
                 request: "q2".into(),
@@ -1275,6 +1302,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 tool: "write".into(),
                 input: edited.clone(),
                 suggestions: Vec::new(),
+                task: None,
             },
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1341,6 +1369,7 @@ fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     apply_all(
         f,
@@ -1415,6 +1444,7 @@ fn an_unasked_effort_is_logged_only_when_it_changes() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     apply_all(
         &mut f,
@@ -1447,7 +1477,12 @@ fn an_unasked_effort_is_logged_only_when_it_changes() {
 
     // A mapper made later starts from what the log has.
     let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
-    let mut mapper = EventMapper::new(f.session_id, ContextId::first_of(f.session_id), settings);
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        settings,
+        AgentWork::default(),
+    );
     apply_all(
         &mut f,
         &mut mapper,
@@ -1465,6 +1500,7 @@ fn effort_answers_name_the_requests_in_the_order_asked() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let (high, low, max) = (CommandId::new(), CommandId::new(), CommandId::new());
     mapper.asked_effort(Effort::High, Some(high));
@@ -1525,6 +1561,7 @@ fn exit_refuses_the_efforts_left_unanswered() {
         f.session_id,
         ContextId::first_of(f.session_id),
         AgentSettings::default(),
+        AgentWork::default(),
     );
     let (high, low) = (CommandId::new(), CommandId::new());
     mapper.asked_effort(Effort::High, Some(high));
@@ -1551,4 +1588,404 @@ fn exit_refuses_the_efforts_left_unanswered() {
             },
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+
+fn agent_task(id: &str, title: &str) -> AgentTask {
+    AgentTask {
+        id: id.to_owned(),
+        kind: TaskKind::Shell,
+        title: title.to_owned(),
+        parent: None,
+        ambient: false,
+    }
+}
+
+fn logged_task(id: &str, title: &str) -> BackgroundTask {
+    BackgroundTask {
+        id: TaskId(id.to_owned()),
+        kind: TaskKind::Shell,
+        title: title.to_owned(),
+        parent: None,
+        ambient: false,
+    }
+}
+
+fn task_mapper(f: &Fixture, work: AgentWork) -> EventMapper {
+    EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+        work,
+    )
+}
+
+fn changed(tasks: Vec<BackgroundTask>) -> EventKind {
+    EventKind::BackgroundTasksChanged { tasks }
+}
+
+fn schedule(id: &str, outlives_agent: Option<bool>) -> Schedule {
+    Schedule {
+        id: ScheduleId(id.to_owned()),
+        when: "*/5 * * * *".to_owned(),
+        recurring: true,
+        prompt: "check".to_owned(),
+        outlives_agent,
+    }
+}
+
+#[test]
+fn an_equal_set_is_logged_once_and_a_different_one_again() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let one = || AdapterEvent::BackgroundTasks(vec![agent_task("a", "sleep")]);
+    apply_all(&mut f, &mut mapper, vec![one(), one()]);
+    assert_eq!(f.kinds(), [changed(vec![logged_task("a", "sleep")])]);
+    // Positive control: a different set logs.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::BackgroundTasks(vec![
+            agent_task("a", "sleep"),
+            agent_task("b", "tail"),
+        ])],
+    );
+    assert_eq!(f.kinds().len(), 2);
+}
+
+#[test]
+fn tasks_are_cut_to_the_limits() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let long_title = format!("{}\nsecond line", "t".repeat(TITLE_MAX_CHARS + 20));
+    let mut tasks = vec![
+        agent_task(&"i".repeat(TASK_ID_MAX_CHARS + 1), "dropped"),
+        agent_task("long-title", &long_title),
+    ];
+    let mut child = agent_task("child", "orphaned");
+    child.parent = Some("p".repeat(TASK_ID_MAX_CHARS + 1));
+    tasks.push(child);
+    tasks.extend((0..TASKS_MAX + 1).map(|n| agent_task(&format!("t{n}"), "x")));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::BackgroundTasks(tasks)],
+    );
+    let kinds = f.kinds();
+    let [EventKind::BackgroundTasksChanged { tasks }] = kinds.as_slice() else {
+        panic!("expected one change");
+    };
+    assert_eq!(tasks.len(), TASKS_MAX);
+    // The too-long id is gone; the rest keep the agent's order.
+    assert_eq!(tasks[0].id.0, "long-title");
+    assert_eq!(chars(&tasks[0].title), TITLE_MAX_CHARS);
+    assert!(tasks[0].title.ends_with('…'));
+    assert_eq!(tasks[1].id.0, "child");
+    assert_eq!(tasks[1].parent, None);
+    assert_eq!(tasks[2].id.0, "t0");
+    assert_eq!(tasks.last().unwrap().id.0, format!("t{}", TASKS_MAX - 3));
+}
+
+#[test]
+fn the_seed_decides_whether_the_startup_report_logs() {
+    let mut f = Fixture::new();
+    let mut empty = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut empty,
+        vec![AdapterEvent::BackgroundTasks(vec![])],
+    );
+    assert_eq!(f.kinds(), []);
+
+    let seeded = AgentWork {
+        tasks: vec![logged_task("old", "sleep")],
+        schedules: vec![],
+    };
+    let mut mapper = task_mapper(&f, seeded);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::BackgroundTasks(vec![])],
+    );
+    assert_eq!(f.kinds(), [changed(vec![])]);
+}
+
+#[test]
+fn exit_empties_tasks_and_schedules_that_are_not_empty() {
+    let mut f = Fixture::new();
+    let work = AgentWork {
+        tasks: vec![logged_task("a", "sleep")],
+        schedules: vec![schedule("s1", Some(true)), schedule("s2", None)],
+    };
+    let mut mapper = task_mapper(&f, work);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    assert_eq!(
+        f.kinds(),
+        [
+            changed(vec![]),
+            EventKind::SchedulesChanged { schedules: vec![] },
+        ]
+    );
+    // Both sets are empty now: another exit logs neither.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    assert_eq!(f.kinds().len(), 2);
+
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    assert_eq!(f.kinds(), []);
+}
+
+// ---------------------------------------------------------------------------
+// Task stops
+
+fn stop_refused(task: &str, answers: CommandId) -> EventKind {
+    EventKind::TaskStopRefused {
+        task: TaskId(task.to_owned()),
+        reason: "no".into(),
+        answers: Some(answers),
+    }
+}
+
+fn refuse(task: &str) -> AdapterEvent {
+    AdapterEvent::TaskStopRefused {
+        task: task.to_owned(),
+        reason: "no".into(),
+    }
+}
+
+fn answered(task: &str) -> AdapterEvent {
+    AdapterEvent::TaskStopAnswered {
+        task: task.to_owned(),
+    }
+}
+
+#[test]
+fn a_refusal_answers_its_own_stop_after_a_success() {
+    for (first, second) in [("a", "b"), ("a", "a")] {
+        let mut f = Fixture::new();
+        let mut mapper = task_mapper(&f, AgentWork::default());
+        let (one, two) = (CommandId::new(), CommandId::new());
+        mapper.asked_stop(TaskId(first.into()), Some(one));
+        mapper.asked_stop(TaskId(second.into()), Some(two));
+        // The success logs nothing but retires the first stop, so the
+        // refusal names the second.
+        apply_all(&mut f, &mut mapper, vec![answered(first), refuse(second)]);
+        assert_eq!(
+            f.kinds(),
+            [stop_refused(second, two)],
+            "{first} then {second}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_alone_answers_the_oldest_stop() {
+    // Positive control for the test above: with no success first, the
+    // refusal names the first command.
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let (one, two) = (CommandId::new(), CommandId::new());
+    mapper.asked_stop(TaskId("a".into()), Some(one));
+    mapper.asked_stop(TaskId("b".into()), Some(two));
+    apply_all(&mut f, &mut mapper, vec![refuse("a"), refuse("b")]);
+    assert_eq!(f.kinds(), [stop_refused("a", one), stop_refused("b", two)]);
+}
+
+#[test]
+fn exit_drops_the_stops_left_unanswered() {
+    let mut f = Fixture::new();
+    let work = AgentWork {
+        tasks: vec![logged_task("a", "sleep")],
+        schedules: vec![],
+    };
+    let mut mapper = task_mapper(&f, work);
+    mapper.asked_stop(TaskId("a".into()), Some(CommandId::new()));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    // The empty set settles the stop; no refusal.
+    assert_eq!(f.kinds(), [changed(vec![])]);
+    // A stop asked of the next run is not answered by the dropped one.
+    let next = CommandId::new();
+    mapper.asked_stop(TaskId("b".into()), Some(next));
+    apply_all(&mut f, &mut mapper, vec![refuse("b")]);
+    assert_eq!(f.kinds()[1..], [stop_refused("b", next)]);
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+
+fn agent_schedule(id: &str, outlives_agent: Option<bool>) -> AgentSchedule {
+    AgentSchedule {
+        id: id.to_owned(),
+        when: "*/5 * * * *".to_owned(),
+        recurring: true,
+        prompt: "check".to_owned(),
+        outlives_agent,
+    }
+}
+
+#[test]
+fn an_equal_schedule_set_is_logged_once_and_a_different_one_again() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let one = || AdapterEvent::Schedules(vec![agent_schedule("s1", Some(false))]);
+    apply_all(&mut f, &mut mapper, vec![one(), one()]);
+    assert_eq!(
+        f.kinds(),
+        [EventKind::SchedulesChanged {
+            schedules: vec![schedule("s1", Some(false))]
+        }]
+    );
+    // Positive control: a different set logs, the empty one included.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::Schedules(vec![]),
+            AdapterEvent::Schedules(vec![]),
+        ],
+    );
+    assert_eq!(f.kinds().len(), 2);
+    assert_eq!(
+        f.kinds()[1],
+        EventKind::SchedulesChanged { schedules: vec![] }
+    );
+}
+
+#[test]
+fn schedules_are_cut_to_the_limits() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let mut long = agent_schedule("long", None);
+    long.when = "w".repeat(SCHEDULE_WHEN_MAX_CHARS + 5);
+    long.prompt = format!("{}\nsecond line", "p".repeat(TITLE_MAX_CHARS + 20));
+    let mut schedules = vec![
+        agent_schedule(&"i".repeat(TASK_ID_MAX_CHARS + 1), None),
+        long,
+    ];
+    schedules.extend((0..SCHEDULES_MAX + 1).map(|n| agent_schedule(&format!("s{n}"), None)));
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Schedules(schedules)],
+    );
+    let kinds = f.kinds();
+    let [EventKind::SchedulesChanged { schedules }] = kinds.as_slice() else {
+        panic!("expected one change");
+    };
+    assert_eq!(schedules.len(), SCHEDULES_MAX);
+    // The too-long id is gone; the rest keep the agent's order.
+    assert_eq!(schedules[0].id.0, "long");
+    assert_eq!(chars(&schedules[0].when), SCHEDULE_WHEN_MAX_CHARS);
+    assert!(schedules[0].when.ends_with('…'));
+    assert_eq!(chars(&schedules[0].prompt), TITLE_MAX_CHARS);
+    assert!(!schedules[0].prompt.contains('\n'));
+    assert_eq!(schedules[1].id.0, "s0");
+    assert_eq!(
+        schedules.last().unwrap().id.0,
+        format!("s{}", SCHEDULES_MAX - 2)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Background approvals
+
+fn asked(request: &str, task: Option<&str>) -> AdapterEvent {
+    AdapterEvent::ApprovalRequested {
+        request: request.into(),
+        call: None,
+        tool: "write".into(),
+        input: json!(request),
+        suggestions: Vec::new(),
+        task: task.map(str::to_owned),
+    }
+}
+
+/// The ids of the approvals logged, by their summary (the request's input).
+fn approval_ids(f: &Fixture) -> HashMap<String, ApprovalId> {
+    f.kinds()
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::ApprovalRequested { id, summary, .. } => Some((summary, id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cancelled_ids(f: &Fixture) -> Vec<(ApprovalId, String)> {
+    f.kinds()
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::ApprovalCancelled { id, reason } => Some((id, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_tasks_approval_outlives_the_turn_and_exit_cancels_every_approval() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            asked("task", Some("sub")),
+            asked("turn", None),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ],
+    );
+    let ids = approval_ids(&f);
+    // The turn's end cancels the turn's own leftover only.
+    assert_eq!(cancelled_ids(&f), [(ids["turn"], "turn ended".to_owned())]);
+    assert_eq!(
+        mapper.pending_approvals().collect::<Vec<_>>(),
+        [ids["task"]]
+    );
+    // A later turn's end leaves it too.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
+            AdapterEvent::TurnStarted,
+            asked("next", None),
+        ],
+    );
+    assert_eq!(cancelled_ids(&f).len(), 1);
+    // Exit cancels both, the task's and the open turn's.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::Exited { error: None }],
+    );
+    let ids = approval_ids(&f);
+    assert_eq!(
+        cancelled_ids(&f)[1..],
+        [
+            (ids["task"], "agent exited".to_owned()),
+            (ids["next"], "agent exited".to_owned()),
+        ]
+    );
+    assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
 }

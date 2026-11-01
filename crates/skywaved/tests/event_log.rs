@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
-    DeviceId, Effort, Event, EventKind, RejectReason, RuleScope, RuleSuggestion, Seq, SessionId,
-    SessionState,
+    AgentWork, ApprovalId, BackgroundTask, Command, CommandId, CommandKind, CommandResult,
+    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -1034,6 +1034,190 @@ fn set_effort_logs_one_request_the_agent_answers() {
     assert_eq!(settings.effort.current, Some(Some(Effort::XHigh)));
 }
 
+// --- StopTask ----------------------------------------------------------------
+
+fn shell(id: &str) -> BackgroundTask {
+    BackgroundTask {
+        id: TaskId(id.into()),
+        kind: TaskKind::Shell,
+        title: "sleep 60".into(),
+        parent: None,
+        ambient: false,
+    }
+}
+
+fn stop_kind(session: SessionId, task: &str) -> CommandKind {
+    CommandKind::StopTask {
+        session_id: session,
+        task: TaskId(task.into()),
+    }
+}
+
+#[test]
+fn stop_task_needs_a_known_session_and_a_live_task() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(stop_kind(SessionId::new(), "t1")),
+        rejected(RejectReason::UnknownSession)
+    );
+    // No task was ever logged.
+    assert_eq!(
+        f.handle(stop_kind(session, "t1")),
+        rejected(RejectReason::UnknownTask)
+    );
+    // A live task of another session is not this one's.
+    let other = f.create_session();
+    f.agent(
+        other,
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![shell("t1")],
+        },
+    );
+    let head_other = f.log.head();
+    assert_eq!(
+        f.handle(stop_kind(session, "t1")),
+        rejected(RejectReason::UnknownTask)
+    );
+    assert_eq!(f.log.head(), head_other, "a rejected command logs nothing");
+    assert!(head_other > head);
+
+    // Positive control: once the session's set lists it, it is accepted.
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![shell("t1"), shell("t2")],
+        },
+    );
+    accepted(f.handle(stop_kind(session, "t1")));
+    // A task that ended since is no longer stoppable, however recently
+    // a device saw it.
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![shell("t2")],
+        },
+    );
+    assert_eq!(
+        f.handle(stop_kind(session, "t1")),
+        rejected(RejectReason::UnknownTask)
+    );
+}
+
+#[test]
+fn stop_task_logs_one_request_naming_the_command() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![shell("t1")],
+        },
+    );
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: stop_kind(session, "t1"),
+    };
+    let before = f.log.head();
+    let seq = accepted(f.log.handle(&mut f.storage.db, device, &command).unwrap());
+    assert_eq!(seq, before.next(), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(event.context, ContextId::first_of(session));
+    assert_eq!(
+        event.kind,
+        EventKind::TaskStopRequested {
+            task: TaskId("t1".into()),
+            by: device,
+        }
+    );
+    // The request changes no set: only the agent's next one does.
+    assert_eq!(
+        f.log.agent_work(&f.storage.db, session).unwrap().tasks,
+        [shell("t1")]
+    );
+    // A refusal is an agent event.
+    f.agent(
+        session,
+        EventKind::TaskStopRefused {
+            task: TaskId("t1".into()),
+            reason: "agent not running".into(),
+            answers: Some(command.id),
+        },
+    );
+}
+
+#[test]
+fn background_work_folds_each_set_on_its_own() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let other = f.create_session();
+    let work = |f: &Fixture, id| f.log.agent_work(&f.storage.db, id).unwrap();
+    assert_eq!(work(&f, session), AgentWork::default());
+
+    let tasks = vec![
+        BackgroundTask {
+            id: TaskId("a1".into()),
+            kind: TaskKind::Subagent,
+            title: "Explore the repo".into(),
+            parent: None,
+            ambient: false,
+        },
+        BackgroundTask {
+            id: TaskId("b2".into()),
+            kind: TaskKind::Shell,
+            title: "cargo test".into(),
+            parent: Some(TaskId("a1".into())),
+            ambient: true,
+        },
+    ];
+    let schedules = vec![Schedule {
+        id: ScheduleId("s1".into()),
+        when: "*/5 * * * *".into(),
+        recurring: true,
+        prompt: "check the deploy".into(),
+        outlives_agent: Some(false),
+    }];
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: tasks.clone(),
+        },
+    );
+    f.agent(
+        session,
+        EventKind::SchedulesChanged {
+            schedules: schedules.clone(),
+        },
+    );
+    assert_eq!(
+        work(&f, session),
+        AgentWork {
+            tasks,
+            schedules: schedules.clone(),
+        }
+    );
+    assert_eq!(work(&f, other), AgentWork::default(), "per session");
+
+    // A new set replaces the old one whole and leaves the other set alone.
+    f.agent(session, EventKind::BackgroundTasksChanged { tasks: vec![] });
+    assert_eq!(
+        work(&f, session),
+        AgentWork {
+            tasks: vec![],
+            schedules,
+        }
+    );
+    // Another connection reads the same fold.
+    let other_db = f.connection();
+    assert_eq!(
+        f.log.agent_work(&other_db.db, session).unwrap(),
+        work(&f, session)
+    );
+}
+
 #[test]
 fn agent_appends_are_checked() {
     let mut f = Fixture::new();
@@ -1096,6 +1280,10 @@ fn agent_appends_are_checked() {
         },
         EventKind::EffortRequested {
             effort: Effort::High,
+            by: DeviceId::new(),
+        },
+        EventKind::TaskStopRequested {
+            task: TaskId("t1".into()),
             by: DeviceId::new(),
         },
     ] {

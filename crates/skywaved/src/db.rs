@@ -175,6 +175,13 @@ const MIGRATIONS: &[&str] = &[
     -- or started again.
     ALTER TABLE contexts ADD COLUMN moved_to TEXT REFERENCES sessions (id);
     "#,
+    // v9: the agent's background work (protocol v11).
+    r#"
+    -- The session's agent's background tasks and schedules as the log has
+    -- them, folded with `AgentWork::apply`; NULL until the first such event.
+    ALTER TABLE sessions ADD COLUMN
+        agent_work TEXT CHECK (agent_work IS NULL OR json_valid(agent_work));
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -542,6 +549,48 @@ mod tests {
             .unwrap();
         assert_eq!(current, c);
         assert_eq!(db.context_stamp_violations().unwrap(), Vec::<String>::new());
+    }
+
+    /// A v8 database, from before background work, gains
+    /// `sessions.agent_work`, NULL for every session it has, and the column
+    /// takes JSON only.
+    #[test]
+    fn v9_adds_agent_work_to_every_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let a = "01920000-0000-7000-8000-00000000000a";
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..8] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO sessions (id, workdir, current_context, agent_settings)
+                    VALUES ('{a}', '/w/a', '{a}', '{{}}');
+                INSERT INTO contexts (id, session_id) VALUES ('{a}', '{a}');
+                "#
+            ))
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let row: (String, Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT workdir, agent_settings, agent_work FROM sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("/w/a".to_owned(), Some("{}".to_owned()), None));
+        let set = |json: &str| {
+            db.conn()
+                .execute("UPDATE sessions SET agent_work = ?1", [json])
+        };
+        assert!(set(r#"{"tasks":[],"schedules":[]}"#).is_ok());
+        assert!(set("not json").is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
-  "protocol_version": 10,
+  "protocol_version": 11,
   "hello": {
-    "protocol_version": 10,
+    "protocol_version": 11,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -590,6 +590,96 @@
           "reason": "not on this model",
           "answers": "01920000-0000-7000-8000-000000000002"
         }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "background_tasks_changed",
+          "tasks": [
+            {
+              "id": "a1b2c3",
+              "kind": "subagent",
+              "title": "Explore the codebase",
+              "parent": null,
+              "ambient": false
+            },
+            {
+              "id": "d4e5f6",
+              "kind": "shell",
+              "title": "cargo test",
+              "parent": "a1b2c3",
+              "ambient": true
+            },
+            {
+              "id": "g7",
+              "kind": "other",
+              "title": "workflow",
+              "parent": null,
+              "ambient": false
+            }
+          ]
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "background_tasks_changed",
+          "tasks": []
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "schedules_changed",
+          "schedules": [
+            {
+              "id": "s1",
+              "when": "*/5 * * * *",
+              "recurring": true,
+              "prompt": "check the deploy",
+              "outlives_agent": null
+            },
+            {
+              "id": "s2",
+              "when": "30 14 1 11 *",
+              "recurring": false,
+              "prompt": "remind me",
+              "outlives_agent": false
+            }
+          ]
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "task_stop_requested",
+          "task": "a1b2c3",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "task_stop_refused",
+          "task": "a1b2c3",
+          "reason": "agent not running",
+          "answers": "01920000-0000-7000-8000-000000000002"
+        }
       }
     ]
   },
@@ -732,6 +822,14 @@
         "context": "01920000-0000-7000-8000-000000000008",
         "name": "amber otter"
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "stop_task",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "task": "a1b2c3"
+      }
     }
   ],
   "command_results": [
@@ -798,6 +896,10 @@
     {
       "result": "rejected",
       "reason": "no_conversation"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_task"
     }
   ]
 }

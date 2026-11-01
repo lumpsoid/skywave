@@ -97,6 +97,13 @@ ScreenUpdate listScreen() => const ScreenUpdate(
   revokedFullScreen: false,
 );
 
+const _headings = StopHeadings(
+  stopAgent: 'Stop the agent?',
+  newContext: 'Start a new context?',
+  switchContext: 'Switch context?',
+  moveContext: 'Move this context to a new session?',
+);
+
 ScreenUpdate sessionScreen() => const ScreenUpdate(
   screen: ScreenViewSession(
     session: SessionScreen(
@@ -108,6 +115,10 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
       canInterrupt: false,
       interruptBusy: false,
       canClear: false,
+      stopHeadings: _headings,
+      tasks: [],
+      schedules: [],
+      workEmptyLabel: 'Nothing is running in the background.',
       contexts: [
         ContextRow(
           contextId: 'c1',

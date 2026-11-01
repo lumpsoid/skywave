@@ -61,6 +61,20 @@
 //!   `ModelsOffered`. [`StartSpec`] names the mode, model and effort to
 //!   start with; the adapter applies them as requests, so each is answered
 //!   the same way.
+//! - Work the agent runs outside a turn (background shells, subagents) is
+//!   reported as [`AdapterEvent::BackgroundTasks`], the whole live set, as
+//!   often as it changes. An adapter reports the empty set once the agent
+//!   is ready, since nothing is reported at start; the mapper logs only
+//!   changes.
+//! - [`AgentSession::stop_task`] asks the agent to stop one of those tasks,
+//!   at any time. Each ask gets exactly one answer, in the order asked:
+//!   [`AdapterEvent::TaskStopAnswered`] when the agent took it (the task
+//!   leaves a later `BackgroundTasks`; an agent may answer so for a task it
+//!   no longer has) or [`AdapterEvent::TaskStopRefused`], unless the agent
+//!   exits first.
+//! - Wakeups the agent scheduled for itself are reported as
+//!   [`AdapterEvent::Schedules`], the whole set, whenever the agent says;
+//!   they are information only and never keep the agent running.
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
@@ -79,7 +93,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{ContextId, Decision, SessionId};
 pub use skywave_proto::{
-    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TurnUsage,
+    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TaskKind, TurnUsage,
 };
 use tokio::sync::mpsc;
 
@@ -119,6 +133,34 @@ impl From<&str> for AgentCallId {
     fn from(id: &str) -> Self {
         AgentCallId(id.to_owned())
     }
+}
+
+/// One background task of the agent, uncut. The ids are the agent's own,
+/// opaque; the [`EventMapper`] cuts the rest for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTask {
+    pub id: String,
+    pub kind: TaskKind,
+    pub title: String,
+    /// The id of the subagent task that launched this one, if any.
+    pub parent: Option<String>,
+    /// Not activity (see [`skywave_proto::BackgroundTask::ambient`]).
+    pub ambient: bool,
+}
+
+/// One scheduled wakeup of the agent: a prompt it runs on its own when
+/// `when` comes. Uncut, its id the agent's own and opaque; the
+/// [`EventMapper`] cuts the rest for the log. Information only: nothing
+/// keeps the agent running for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSchedule {
+    pub id: String,
+    /// When it fires, in the agent's own words.
+    pub when: String,
+    pub recurring: bool,
+    pub prompt: String,
+    /// Whether it outlives the agent; `None` when the agent does not say.
+    pub outlives_agent: Option<bool>,
 }
 
 /// How to show a tool call, uncut. Agent-agnostic (D3): the adapter maps its
@@ -251,12 +293,20 @@ pub enum AdapterEvent {
     /// `request` (D8). `call` is the tool call the approval gates, if known.
     /// `suggestions` are the lasting rules the agent offers to grant with an
     /// approval, labelled uncut; an answer names one by its index.
+    ///
+    /// `task` is the background task asking, by its [`AgentTask::id`], or
+    /// `None` for the current turn's own. A task's approval is not the
+    /// turn's: it may come outside any turn and outlives the turn's end. The
+    /// adapter cancels it when the task leaves the set, or the agent
+    /// withdraws it; a turn's leftover approvals the adapter cancels before
+    /// `TurnEnded`.
     ApprovalRequested {
         request: AgentRequestId,
         call: Option<AgentCallId>,
         tool: String,
         input: serde_json::Value,
         suggestions: Vec<RuleSuggestion>,
+        task: Option<String>,
     },
     /// The agent withdrew `request`; an answer to it is no longer read.
     ApprovalCancelled {
@@ -304,6 +354,18 @@ pub enum AdapterEvent {
     EffortRefused { effort: Effort, reason: String },
     /// The models the agent offers, uncut.
     ModelsOffered(Vec<ModelChoice>),
+    /// Every live background task, in the agent's order; replaces the set
+    /// reported before. May repeat it.
+    BackgroundTasks(Vec<AgentTask>),
+    /// Every scheduled wakeup, in the agent's order; replaces the set
+    /// reported before. May repeat it.
+    Schedules(Vec<AgentSchedule>),
+    /// The answer to the oldest unanswered stop: the agent took it. The
+    /// task leaving the set is the outcome; this only retires the ask.
+    TaskStopAnswered { task: String },
+    /// The answer to the oldest unanswered stop: the agent did not stop
+    /// `task`.
+    TaskStopRefused { task: String, reason: String },
     /// The agent stopped; no further events follow. `error` is set when it
     /// stopped abnormally (crash, startup failure).
     Exited { error: Option<String> },
@@ -382,6 +444,10 @@ pub trait AgentSession: Send + 'static {
     /// `EffortRefused`.
     fn set_effort(&mut self, effort: Effort)
     -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Asks the agent to stop background task `task` (an [`AgentTask::id`]);
+    /// answered by `TaskStopAnswered` or `TaskStopRefused`.
+    fn stop_task(&mut self, task: String) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
     /// Interrupt first to stop a running turn cleanly; a turn still running

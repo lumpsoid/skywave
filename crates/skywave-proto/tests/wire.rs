@@ -288,6 +288,59 @@ fn all_event_kinds() -> Vec<EventKind> {
             reason: "not on this model".into(),
             answers: Some(command()),
         },
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![
+                BackgroundTask {
+                    id: TaskId("a1b2c3".into()),
+                    kind: TaskKind::Subagent,
+                    title: "Explore the codebase".into(),
+                    parent: None,
+                    ambient: false,
+                },
+                BackgroundTask {
+                    id: TaskId("d4e5f6".into()),
+                    kind: TaskKind::Shell,
+                    title: "cargo test".into(),
+                    parent: Some(TaskId("a1b2c3".into())),
+                    ambient: true,
+                },
+                BackgroundTask {
+                    id: TaskId("g7".into()),
+                    kind: TaskKind::Other,
+                    title: "workflow".into(),
+                    parent: None,
+                    ambient: false,
+                },
+            ],
+        },
+        EventKind::BackgroundTasksChanged { tasks: vec![] },
+        EventKind::SchedulesChanged {
+            schedules: vec![
+                Schedule {
+                    id: ScheduleId("s1".into()),
+                    when: "*/5 * * * *".into(),
+                    recurring: true,
+                    prompt: "check the deploy".into(),
+                    outlives_agent: None,
+                },
+                Schedule {
+                    id: ScheduleId("s2".into()),
+                    when: "30 14 1 11 *".into(),
+                    recurring: false,
+                    prompt: "remind me".into(),
+                    outlives_agent: Some(false),
+                },
+            ],
+        },
+        EventKind::TaskStopRequested {
+            task: TaskId("a1b2c3".into()),
+            by: device(),
+        },
+        EventKind::TaskStopRefused {
+            task: TaskId("a1b2c3".into()),
+            reason: "agent not running".into(),
+            answers: Some(command()),
+        },
     ]
 }
 
@@ -364,6 +417,10 @@ fn all_command_kinds() -> Vec<CommandKind> {
             context: context(),
             name: "amber otter".into(),
         },
+        CommandKind::StopTask {
+            session_id: session(),
+            task: TaskId("a1b2c3".into()),
+        },
     ]
 }
 
@@ -386,6 +443,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ContextMoved,
             RejectReason::ContextCurrent,
             RejectReason::NoConversation,
+            RejectReason::UnknownTask,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -672,8 +730,8 @@ fn tool_events_without_display_or_summary_are_rejected() {
 }
 
 #[test]
-fn protocol_is_v10() {
-    assert_eq!(PROTOCOL_VERSION, 10);
+fn protocol_is_v11() {
+    assert_eq!(PROTOCOL_VERSION, 11);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);
@@ -697,6 +755,58 @@ fn display_caps() {
     assert_eq!(limits::PREVIEW_MAX_BYTES, 512);
     assert_eq!(limits::RULE_LABEL_MAX_CHARS, 120);
     assert_eq!(limits::RULE_SUGGESTIONS_MAX, 8);
+    assert_eq!(limits::TASKS_MAX, 32);
+    assert_eq!(limits::SCHEDULES_MAX, 16);
+    assert_eq!(limits::TASK_ID_MAX_CHARS, 64);
+    assert_eq!(limits::SCHEDULE_WHEN_MAX_CHARS, 60);
+}
+
+/// Each set replaces the last one whole and leaves the other set alone;
+/// nothing else touches the work.
+#[test]
+fn agent_work_keeps_the_last_set_of_each() {
+    let task = |id: &str| BackgroundTask {
+        id: TaskId(id.into()),
+        kind: TaskKind::Shell,
+        title: id.into(),
+        parent: None,
+        ambient: false,
+    };
+    let schedule = Schedule {
+        id: ScheduleId("s".into()),
+        when: "* * * * *".into(),
+        recurring: true,
+        prompt: "p".into(),
+        outlives_agent: None,
+    };
+    let mut work = AgentWork::default();
+    for kind in [
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![task("a"), task("b")],
+        },
+        EventKind::SchedulesChanged {
+            schedules: vec![schedule.clone()],
+        },
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![task("c")],
+        },
+        EventKind::AgentMessage { text: "x".into() },
+    ] {
+        work.apply(&kind);
+    }
+    assert_eq!(
+        work,
+        AgentWork {
+            tasks: vec![task("c")],
+            schedules: vec![schedule],
+        }
+    );
+    let quiet = EventKind::BackgroundTasksChanged { tasks: vec![] };
+    assert!(AgentWork::folds(&quiet));
+    assert!(!AgentWork::folds(&EventKind::TurnInterrupted));
+    assert_eq!(quiet.device(), None);
+    assert!(!quiet.logged_by_command());
+    assert_eq!(quiet.archived_effect(), None);
 }
 
 #[test]

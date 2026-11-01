@@ -840,6 +840,8 @@ mod tests {
             switch: None,
             interrupt: None,
             stop: None,
+            work: Default::default(),
+            task_stops: Vec::new(),
             draft: None,
             draft_rev: 0,
             last_seq: Seq(0),

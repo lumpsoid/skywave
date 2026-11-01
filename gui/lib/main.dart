@@ -20,9 +20,8 @@ Future<void> main() async {
   final notifications = SystemNotifications(sendToRust);
   // Not awaited: on iOS and macOS it waits for the permission prompt.
   unawaited(notifications.init());
-  final holders = Holders(
-    effects: AppEffectSink(messenger, notifications),
-  )..connect();
+  final holders = Holders(effects: AppEffectSink(messenger, notifications))
+    ..connect();
   final boot = BootHolder();
   unawaited(boot.connect());
 

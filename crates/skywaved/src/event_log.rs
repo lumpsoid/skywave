@@ -31,8 +31,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, ApprovalId, CommandId, ContextId, Event, EventBatch, EventKind, ModelChoice,
-    Seq, SessionId, SessionState,
+    AgentSettings, AgentWork, ApprovalId, CommandId, ContextId, Event, EventBatch, EventKind,
+    ModelChoice, Seq, SessionId, SessionState,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -200,7 +200,10 @@ impl EventLog {
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
             | EventKind::EffortChanged { .. }
-            | EventKind::EffortRefused { .. } => {}
+            | EventKind::EffortRefused { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRefused { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -214,7 +217,8 @@ impl EventLog {
             | EventKind::EffortRequested { .. }
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
-            | EventKind::ContextMoved { .. } => {
+            | EventKind::ContextMoved { .. }
+            | EventKind::TaskStopRequested { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -321,6 +325,12 @@ impl EventLog {
     /// default when it has none or is unknown.
     pub fn agent_settings(&self, db: &Db, id: SessionId) -> Result<AgentSettings> {
         agent_settings_in(db.conn(), id)
+    }
+
+    /// Session `id`'s agent's background tasks and schedules as its log has
+    /// them; empty when it has none or is unknown.
+    pub fn agent_work(&self, db: &Db, id: SessionId) -> Result<AgentWork> {
+        agent_work_in(db.conn(), id)
     }
 
     /// Seq of the event command `id` logged, if it was accepted.
@@ -489,6 +499,14 @@ pub(crate) fn append_in(
                 params![session, serde_json::to_string(&settings)?],
             )?;
         }
+        EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
+            let mut work = agent_work_in(conn, session_id)?;
+            work.apply(kind);
+            conn.execute(
+                "UPDATE sessions SET agent_work = ?2 WHERE id = ?1",
+                params![session, serde_json::to_string(&work)?],
+            )?;
+        }
         // A stopped turn ends with the state change the agent reports. No
         // archived flag is kept: nothing on the server reads it, clients
         // fold `EventKind::archived_effect` themselves.
@@ -500,7 +518,9 @@ pub(crate) fn append_in(
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::TurnUsage(_)
-        | EventKind::ModelsOffered { .. } => {}
+        | EventKind::ModelsOffered { .. }
+        | EventKind::TaskStopRequested { .. }
+        | EventKind::TaskStopRefused { .. } => {}
     }
     Ok(seq)
 }
@@ -508,6 +528,19 @@ pub(crate) fn append_in(
 fn agent_settings_in(conn: &Connection, id: SessionId) -> Result<AgentSettings> {
     let json: Option<Option<String>> = conn
         .prepare_cached("SELECT agent_settings FROM sessions WHERE id = ?1")?
+        .query_row([id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    Ok(json
+        .flatten()
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub(crate) fn agent_work_in(conn: &Connection, id: SessionId) -> Result<AgentWork> {
+    let json: Option<Option<String>> = conn
+        .prepare_cached("SELECT agent_work FROM sessions WHERE id = ?1")?
         .query_row([id.0.to_string()], |r| r.get(0))
         .optional()?;
     Ok(json
@@ -691,6 +724,10 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ContextStarted { .. } => "ContextStarted",
         EventKind::ContextSwitched { .. } => "ContextSwitched",
         EventKind::ContextMoved { .. } => "ContextMoved",
+        EventKind::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
+        EventKind::SchedulesChanged { .. } => "SchedulesChanged",
+        EventKind::TaskStopRequested { .. } => "TaskStopRequested",
+        EventKind::TaskStopRefused { .. } => "TaskStopRefused",
     }
 }
 
