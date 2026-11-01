@@ -3,8 +3,8 @@
 //! is resent (D7).
 //!
 //! What each command appends, and the seq its `Accepted` names:
-//! - `CreateSession` → `SessionCreated` with the canonical workdir and a new
-//!   [`SessionId`];
+//! - `CreateSession` → `SessionCreated` with the canonical workdir, a new
+//!   [`SessionId`] and a generated name for its first context;
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`, echoing the granted `rule`;
 //! - `Interrupt` → `TurnInterrupted`;
@@ -13,7 +13,9 @@
 //! - `SetSessionArchived` → `SessionArchived`;
 //! - `SetPermissionMode` → `PermissionModeRequested`;
 //! - `SetModel` → `ModelRequested` with the normalised model;
-//! - `SetEffort` → `EffortRequested`.
+//! - `SetEffort` → `EffortRequested`;
+//! - `ClearContext` → `ContextStarted` with the normalised name;
+//! - `SwitchContext` → `ContextSwitched`.
 //!
 //! Each appends exactly that one event and nothing else, carrying the
 //! command's id ([`Event::command_id`](skywave_proto::Event::command_id)),
@@ -21,6 +23,31 @@
 //! device whose reply was lost settles the command when it pulls the
 //! event. A rejected command appends nothing; only its stored result
 //! answers it.
+//!
+//! **Context stamps.** The server stamps each event with the context it
+//! belongs to ([`Event::context`](skywave_proto::Event::context)):
+//! `SessionCreated` with the session's first context, which has the
+//! session's id; `ContextStarted` and `ContextSwitched` with the context
+//! they make current; `ApprovalResolved` with the approval's context;
+//! `TurnInterrupted` with the context of the running turn, which after a
+//! switch is the old context until its agent reports the turn over; every
+//! other event with the session's current context.
+//!
+//! **SendMessage.** `ContextChanged` when its `context` is no longer the
+//! session's current one: the message was written for a conversation the
+//! agent has left.
+//!
+//! **ClearContext.** The new context's id is the client's, so an offline
+//! device can address it before the server answers; one that is already a
+//! context of any session is `ContextExists` (a resend of the same command
+//! is answered by its stored result first). The name is logged as
+//! [`skywave_proto::normalise_context_name`] leaves it; one that ends up
+//! empty is replaced by a generated name, never refused: a refusal would
+//! turn the message the device queued next into `ContextChanged`.
+//!
+//! **SwitchContext.** Absolute: switching to the current context is
+//! accepted and logged. A context of another session, or none, is
+//! `UnknownContext`.
 //!
 //! **Interrupt.** `TurnInterrupted` is appended when the command is
 //! accepted, not when the agent has actually stopped. The result is then
@@ -68,8 +95,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, Decision, DeviceId, EventKind, RejectReason,
-    Seq, SessionId,
+    Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind,
+    RejectReason, Seq, SessionId, context_name, normalise_context_name,
 };
 
 use crate::db::Db;
@@ -129,22 +156,37 @@ impl EventLog {
         device: DeviceId,
         command: &Command,
     ) -> Result<Result<Seq, RejectReason>> {
-        let (session_id, kind) = match &command.kind {
+        let known = |id: SessionId| event_log::session_in(tx, id);
+        let (session_id, context, kind) = match &command.kind {
             CommandKind::CreateSession { workdir } => {
                 match dirs::canonical_under_roots(self.roots(), workdir) {
-                    Ok(workdir) => (SessionId::new(), EventKind::SessionCreated { workdir }),
+                    Ok(workdir) => {
+                        let session = SessionId::new();
+                        let kind = EventKind::SessionCreated {
+                            workdir,
+                            context_name: context_name::random(),
+                        };
+                        (session, ContextId::first_of(session), kind)
+                    }
                     Err(reason) => return Ok(Err(reason)),
                 }
             }
-            CommandKind::SendMessage { session_id, text } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+            CommandKind::SendMessage {
+                session_id,
+                context,
+                text,
+            } => {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
+                };
+                if session.context != *context {
+                    return Ok(Err(RejectReason::ContextChanged));
                 }
                 let kind = EventKind::UserMessage {
                     device_id: device,
                     text: text.clone(),
                 };
-                (*session_id, kind)
+                (*session_id, session.context, kind)
             }
             CommandKind::ResolveApproval { id, decision, rule } => {
                 let Some(approval) = event_log::approval_in(tx, *id)? else {
@@ -167,82 +209,124 @@ impl EventLog {
                     by: device,
                     rule: *rule,
                 };
-                (approval.session_id, kind)
+                (approval.session_id, approval.context, kind)
             }
             CommandKind::Interrupt { session_id } => {
-                match event_log::session_in(tx, *session_id)? {
+                let session = match known(*session_id)? {
                     None => return Ok(Err(RejectReason::UnknownSession)),
                     Some(session) if !session.turn_active => {
                         return Ok(Err(RejectReason::NoActiveTurn));
                     }
-                    Some(_) => {}
+                    Some(session) => session,
+                };
+                (
+                    *session_id,
+                    session.running_turn_context(),
+                    EventKind::TurnInterrupted,
+                )
+            }
+            CommandKind::ClearContext {
+                session_id,
+                context,
+                name,
+            } => {
+                if known(*session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
                 }
-                (*session_id, EventKind::TurnInterrupted)
+                if event_log::context_session_in(tx, *context)?.is_some() {
+                    return Ok(Err(RejectReason::ContextExists));
+                }
+                let kind = EventKind::ContextStarted {
+                    by: device,
+                    name: normalise_context_name(name).unwrap_or_else(context_name::random),
+                };
+                (*session_id, *context, kind)
+            }
+            CommandKind::SwitchContext {
+                session_id,
+                context,
+            } => {
+                if known(*session_id)?.is_none() {
+                    return Ok(Err(RejectReason::UnknownSession));
+                }
+                if event_log::context_session_in(tx, *context)? != Some(*session_id) {
+                    return Ok(Err(RejectReason::UnknownContext));
+                }
+                (
+                    *session_id,
+                    *context,
+                    EventKind::ContextSwitched { by: device },
+                )
             }
             CommandKind::StopSession { session_id } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
-                (*session_id, EventKind::SessionStopped)
+                };
+                (*session_id, session.context, EventKind::SessionStopped)
             }
             CommandKind::RenameSession { session_id, name } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
+                };
                 let kind = EventKind::SessionRenamed {
                     name: name
                         .as_deref()
                         .and_then(skywave_proto::normalise_session_name),
                     by: device,
                 };
-                (*session_id, kind)
+                (*session_id, session.context, kind)
             }
             CommandKind::SetSessionArchived {
                 session_id,
                 archived,
             } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
+                };
                 let kind = EventKind::SessionArchived {
                     archived: *archived,
                     by: device,
                 };
-                (*session_id, kind)
+                (*session_id, session.context, kind)
             }
             CommandKind::SetPermissionMode { session_id, mode } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
+                };
                 let kind = EventKind::PermissionModeRequested {
                     mode: *mode,
                     by: device,
                 };
-                (*session_id, kind)
+                (*session_id, session.context, kind)
             }
             CommandKind::SetModel { session_id, model } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
+                };
                 let Some(model) = skywave_proto::normalise_model(model) else {
                     return Ok(Err(RejectReason::UnknownModel));
                 };
-                (*session_id, EventKind::ModelRequested { model, by: device })
+                (
+                    *session_id,
+                    session.context,
+                    EventKind::ModelRequested { model, by: device },
+                )
             }
             CommandKind::SetEffort { session_id, effort } => {
-                if event_log::session_in(tx, *session_id)?.is_none() {
+                let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
-                }
+                };
                 let kind = EventKind::EffortRequested {
                     effort: *effort,
                     by: device,
                 };
-                (*session_id, kind)
+                (*session_id, session.context, kind)
             }
         };
         Ok(Ok(event_log::append_in(
             tx,
             session_id,
+            context,
             Some(command.id),
             &kind,
         )?))

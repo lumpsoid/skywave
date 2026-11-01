@@ -13,7 +13,7 @@ use skywave_proto::limits::{
 };
 use skywave_proto::{
     AgentSettings, ApprovalId, BodyFormat, CallId, Command, CommandId, CommandKind, CommandResult,
-    Decision, DeviceId, EventKind, RejectReason, Seq, SessionId, SessionState, ToolCall,
+    ContextId, Decision, DeviceId, EventKind, RejectReason, Seq, SessionId, SessionState, ToolCall,
     ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step};
@@ -72,7 +72,8 @@ impl Fixture {
         StartSpec {
             session_id: self.session_id,
             workdir: self.workdir.clone(),
-            resume: load_resume_handle(&self.storage.db, self.session_id).unwrap(),
+            resume: load_resume_handle(&self.storage.db, ContextId::first_of(self.session_id))
+                .unwrap(),
             mode: None,
             model: None,
             effort: None,
@@ -199,10 +200,15 @@ async fn full_turn_with_blob_output_and_approved_approval() {
         ]),
     );
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
 
     accepted(f.handle(CommandKind::SendMessage {
         session_id: f.session_id,
+        context: ContextId::first_of(f.session_id),
         text: "look around".into(),
     }));
     session.send_message("look around".into()).await.unwrap();
@@ -210,7 +216,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
 
     // The resume handle arrived before the turn finished.
     assert_eq!(
-        load_resume_handle(&f.storage.db, f.session_id).unwrap(),
+        load_resume_handle(&f.storage.db, ContextId::first_of(f.session_id)).unwrap(),
         Some(FakeAgent::resume_handle(f.session_id))
     );
     let id = f.approval_id();
@@ -363,7 +369,11 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
             .turn([Step::text("Second turn.")]),
     );
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
 
     session.send_message("clean up".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, approval_requested).await;
@@ -439,7 +449,11 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
             .turn([Step::Wait(gate.clone()), Step::text("released")]),
     );
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
 
     session.send_message("first".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, |e| {
@@ -492,7 +506,11 @@ async fn denied_approval_runs_the_deny_branch() {
             .on_deny([Step::tool_error("denied by user"), Step::text("Skipping.")])]),
     );
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     session.send_message("write x".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, approval_requested).await;
     let id = f.approval_id();
@@ -539,7 +557,11 @@ async fn restart_resumes_with_the_stored_handle() {
     );
     assert_eq!(f.spec().resume, None);
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     session.send_message("a".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
     session.shutdown().await.unwrap();
@@ -556,7 +578,11 @@ async fn restart_resumes_with_the_stored_handle() {
     let spec = f.spec();
     assert_eq!(spec.resume, Some(FakeAgent::resume_handle(f.session_id)));
     let (mut session, mut events) = agent.start(spec).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     session.send_message("b".into()).await.unwrap();
     let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
     assert_eq!(turn[1], AdapterEvent::Text("two".into()));
@@ -596,7 +622,11 @@ async fn failures_and_exits_mark_the_session_errored() {
             ]),
     );
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     session.send_message("1".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, turn_ended).await;
     assert_eq!(
@@ -649,7 +679,11 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
     use skywaved::agent::{RuleScope, RuleSuggestion};
 
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let long = "x".repeat(RULE_LABEL_MAX_CHARS + 10);
     let mut suggestions = vec![
         RuleSuggestion {
@@ -696,7 +730,11 @@ fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
     use skywaved::agent::TurnUsage;
 
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let usage = TurnUsage {
         duration_ms: Some(12_400),
         cost_usd: Some(0.04),
@@ -726,7 +764,11 @@ fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
 #[tokio::test]
 async fn exit_with_a_pending_approval_cancels_it() {
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     for event in [
         AdapterEvent::TurnStarted,
         AdapterEvent::ToolCall {
@@ -827,7 +869,11 @@ fn huge_text() -> String {
 #[test]
 fn large_content_gives_small_events_and_blobs() {
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let huge = huge_text();
     let input = json!({ "command": huge.clone() });
     apply_all(
@@ -944,7 +990,11 @@ fn large_content_gives_small_events_and_blobs() {
 #[test]
 fn content_shown_whole_makes_no_blob() {
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let eight_lines: String = (0..PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
     apply_all(
         &mut f,
@@ -1014,7 +1064,11 @@ fn content_shown_whole_makes_no_blob() {
 #[test]
 fn omitted_input_and_a_separate_preview_are_blobs() {
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let input = json!({ "command": "make", "timeout": 600 });
     let note = "built\n(a note for the model)";
     apply_all(
@@ -1076,7 +1130,11 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
 #[test]
 fn call_approval_and_result_share_one_call_id_within_a_turn() {
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let write = json!({ "path": "a.txt", "content": "hi" });
     let edited = json!({ "path": "a.txt", "content": "bye" });
     apply_all(
@@ -1165,7 +1223,11 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
 /// A shell call shown by the adapter with `title` and no body; the input is
 /// a blob exactly when the body is cut.
 fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     apply_all(
         f,
         &mut mapper,
@@ -1235,7 +1297,11 @@ fn an_unasked_effort_is_logged_only_when_it_changes() {
     use skywaved::agent::Effort;
 
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     apply_all(
         &mut f,
         &mut mapper,
@@ -1267,7 +1333,7 @@ fn an_unasked_effort_is_logged_only_when_it_changes() {
 
     // A mapper made later starts from what the log has.
     let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
-    let mut mapper = EventMapper::new(f.session_id, settings);
+    let mut mapper = EventMapper::new(f.session_id, ContextId::first_of(f.session_id), settings);
     apply_all(
         &mut f,
         &mut mapper,
@@ -1281,7 +1347,11 @@ fn effort_answers_name_the_requests_in_the_order_asked() {
     use skywaved::agent::Effort;
 
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let (high, low, max) = (CommandId::new(), CommandId::new(), CommandId::new());
     mapper.asked_effort(Effort::High, Some(high));
     mapper.asked_effort(Effort::Low, Some(low));
@@ -1337,7 +1407,11 @@ fn exit_refuses_the_efforts_left_unanswered() {
     use skywaved::agent::Effort;
 
     let mut f = Fixture::new();
-    let mut mapper = EventMapper::new(f.session_id, AgentSettings::default());
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
     let (high, low) = (CommandId::new(), CommandId::new());
     mapper.asked_effort(Effort::High, Some(high));
     mapper.asked_effort(Effort::Low, Some(low));

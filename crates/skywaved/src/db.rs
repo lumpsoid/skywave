@@ -121,6 +121,50 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN
         agent_settings TEXT CHECK (agent_settings IS NULL OR json_valid(agent_settings));
     "#,
+    // v7: session contexts (protocol v9). A session holds an ordered list
+    // of contexts, each with its own resume handle; every event and
+    // approval names the context it belongs to. A session's first context
+    // has the session's own id, so existing data moves into one context per
+    // session. SQLite adds a NOT NULL column only with a constant default:
+    // the '' defaults stay in the schema, so every INSERT must name these
+    // columns.
+    r#"
+    -- The contexts of every session, in the order they entered the log
+    -- (rowid). Names live in the log only: nothing on the server reads them.
+    CREATE TABLE contexts (
+        id          TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL REFERENCES sessions (id),
+        -- The agent's opaque resume handle for this context; NULL until the
+        -- agent reports one.
+        agent_state TEXT CHECK (agent_state IS NULL OR json_valid(agent_state))
+    ) STRICT;
+    CREATE INDEX contexts_session ON contexts (session_id);
+    INSERT INTO contexts (id, session_id, agent_state)
+        SELECT id, id, agent_state FROM sessions ORDER BY rowid;
+
+    -- The context the session runs in now: set by SessionCreated,
+    -- ContextStarted and ContextSwitched.
+    ALTER TABLE sessions ADD COLUMN current_context TEXT NOT NULL DEFAULT '';
+    UPDATE sessions SET current_context = id;
+    -- The context of the turn turn_active describes: set with it by
+    -- SessionStateChanged(AgentWorking), cleared with it.
+    ALTER TABLE sessions ADD COLUMN turn_context TEXT;
+    UPDATE sessions SET turn_context = id WHERE turn_active = 1;
+    -- Opaque grants the agent keeps for the whole session, across contexts.
+    ALTER TABLE sessions ADD COLUMN
+        agent_grants TEXT CHECK (agent_grants IS NULL OR json_valid(agent_grants));
+    ALTER TABLE sessions DROP COLUMN agent_state;
+
+    -- The context the event belongs to (Event::context).
+    ALTER TABLE events ADD COLUMN context TEXT NOT NULL DEFAULT '';
+    UPDATE events SET context = session_id;
+    UPDATE events SET kind = json_set(kind, '$.context_name', 'start')
+        WHERE json_extract(kind, '$.type') = 'session_created';
+
+    -- The context the approval was requested in; its answer is stamped so.
+    ALTER TABLE approvals ADD COLUMN context TEXT NOT NULL DEFAULT '';
+    UPDATE approvals SET context = session_id;
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -162,6 +206,45 @@ impl Db {
     /// Current `user_version` of the database.
     pub fn schema_version(&self) -> Result<u32> {
         user_version(&self.conn)
+    }
+
+    /// Every row that breaks the context stamp invariant, described; empty
+    /// when it holds. The invariant: every event, approval and session
+    /// names a context (never the `''` the v7 defaults leave behind an
+    /// `INSERT` that forgot the column), and that context is a `contexts`
+    /// row of the same session. Test support: the daemon's test fixtures
+    /// check it after every test.
+    #[doc(hidden)]
+    pub fn context_stamp_violations(&self) -> Result<Vec<String>> {
+        // Each query yields (table, row key, context) for a bad row.
+        const CHECKS: [&str; 4] = [
+            "SELECT 'events', CAST(seq AS TEXT), context FROM events e WHERE NOT EXISTS
+               (SELECT 1 FROM contexts c WHERE c.id = e.context AND c.session_id = e.session_id)",
+            "SELECT 'approvals', id, context FROM approvals a WHERE NOT EXISTS
+               (SELECT 1 FROM contexts c WHERE c.id = a.context AND c.session_id = a.session_id)",
+            "SELECT 'sessions.current_context', id, current_context FROM sessions s
+               WHERE NOT EXISTS (SELECT 1 FROM contexts c
+                 WHERE c.id = s.current_context AND c.session_id = s.id)",
+            "SELECT 'sessions.turn_context', id, turn_context FROM sessions s
+               WHERE turn_context IS NOT NULL AND NOT EXISTS (SELECT 1 FROM contexts c
+                 WHERE c.id = s.turn_context AND c.session_id = s.id)",
+        ];
+        let mut found = Vec::new();
+        for sql in CHECKS {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!(
+                    "{} {}: context {:?}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            })?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+        Ok(found)
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -207,10 +290,11 @@ fn check_supported(found: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    const TABLES: [&str; 8] = [
+    const TABLES: [&str; 9] = [
         "approvals",
         "blobs",
         "commands",
+        "contexts",
         "devices",
         "events",
         "pair_codes",
@@ -304,6 +388,129 @@ mod tests {
             Db::open(&path),
             Err(Error::SchemaTooNew { found, .. }) if found == SCHEMA_VERSION + 1
         ));
+    }
+
+    /// A v6 database, from before session contexts, moves each session into
+    /// one context with the session's id.
+    #[test]
+    fn v7_moves_every_session_into_its_first_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let (a, b) = (
+            "01920000-0000-7000-8000-00000000000a",
+            "01920000-0000-7000-8000-00000000000b",
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..6] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO sessions (id, workdir, agent_state, turn_active)
+                    VALUES ('{a}', '/w/a', '{{"session":"agent-a"}}', 1),
+                           ('{b}', '/w/b', NULL, 0);
+                INSERT INTO events (seq, session_id, at, command_id, kind) VALUES
+                    (1, '{a}', 't', 'c1', '{{"type":"session_created","workdir":"/w/a"}}'),
+                    (2, '{b}', 't', 'c2', '{{"type":"session_created","workdir":"/w/b"}}'),
+                    (3, '{a}', 't', NULL, '{{"type":"session_state_changed","state":"agent_working"}}'),
+                    (4, '{a}', 't', NULL, '{{"type":"approval_requested","id":"p1","tool":"x","summary":"y","input":null}}');
+                INSERT INTO approvals (id, session_id, closed_seq) VALUES ('p1', '{a}', NULL);
+                "#
+            ))
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = db.conn();
+        let rows = |sql: &str| -> Vec<Vec<Option<String>>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let s = |v: &str| Some(v.to_owned());
+
+        // One context per session, with its id and the handle moved there.
+        assert_eq!(
+            rows("SELECT id, session_id, agent_state FROM contexts ORDER BY rowid"),
+            [
+                vec![s(a), s(a), s(r#"{"session":"agent-a"}"#)],
+                vec![s(b), s(b), None],
+            ]
+        );
+        assert_eq!(
+            rows("SELECT current_context, turn_context, agent_grants FROM sessions ORDER BY rowid"),
+            [vec![s(a), s(a), None], vec![s(b), None, None]]
+        );
+        let columns = rows("SELECT name FROM pragma_table_info('sessions')");
+        assert!(!columns.contains(&vec![s("agent_state")]), "{columns:?}");
+        assert!(columns.contains(&vec![s("agent_grants")]), "{columns:?}");
+
+        // Every event and approval is stamped with its session's id.
+        assert_eq!(
+            rows("SELECT context FROM events ORDER BY seq"),
+            [vec![s(a)], vec![s(b)], vec![s(a)], vec![s(a)]]
+        );
+        assert_eq!(rows("SELECT context FROM approvals"), [vec![s(a)]]);
+        // The first contexts of old sessions are named "start"; other kinds
+        // are untouched.
+        assert_eq!(
+            rows("SELECT kind FROM events ORDER BY seq"),
+            [
+                vec![s(
+                    r#"{"type":"session_created","workdir":"/w/a","context_name":"start"}"#
+                )],
+                vec![s(
+                    r#"{"type":"session_created","workdir":"/w/b","context_name":"start"}"#
+                )],
+                vec![s(
+                    r#"{"type":"session_state_changed","state":"agent_working"}"#
+                )],
+                vec![s(
+                    r#"{"type":"approval_requested","id":"p1","tool":"x","summary":"y","input":null}"#
+                )],
+            ]
+        );
+        assert_eq!(db.context_stamp_violations().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_stamp_check_names_rows_without_a_context_of_their_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO sessions (id, workdir, current_context) VALUES ('a', '/', 'a'),
+                                                                         ('b', '/', 'b');
+                 INSERT INTO contexts (id, session_id) VALUES ('a', 'a'), ('b', 'b');
+                 INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (1, 'a', 't', 'a', '{}');",
+            )
+            .unwrap();
+        assert_eq!(db.context_stamp_violations().unwrap(), Vec::<String>::new());
+        db.conn()
+            .execute_batch(
+                "INSERT INTO events (seq, session_id, at, kind) VALUES (2, 'a', 't', '{}');
+                 INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (3, 'a', 't', 'b', '{}');
+                 INSERT INTO approvals (id, session_id) VALUES ('p', 'a');
+                 UPDATE sessions SET current_context = 'a', turn_context = 'a' WHERE id = 'b';",
+            )
+            .unwrap();
+        assert_eq!(
+            db.context_stamp_violations().unwrap(),
+            [
+                r#"events 2: context """#,
+                r#"events 3: context "b""#,
+                r#"approvals p: context """#,
+                r#"sessions.current_context b: context "a""#,
+                r#"sessions.turn_context b: context "a""#,
+            ]
+        );
     }
 
     #[test]

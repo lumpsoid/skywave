@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, ApprovalId, BlobRef, Event, EventKind, Seq, SessionId, SessionState, ToolCall,
-    ToolResult, TurnUsage,
+    AgentSettings, ApprovalId, BlobRef, ContextId, Event, EventKind, Seq, SessionId, SessionState,
+    ToolCall, ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -48,6 +48,9 @@ pub struct SessionSummary {
     /// The agent's permission mode and model, folded with
     /// [`AgentSettings::apply`].
     pub agent: AgentSettings,
+    /// The session's current context: its first (which has the session's
+    /// id) until a `ContextStarted` or `ContextSwitched` names another.
+    pub context: ContextId,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -117,6 +120,7 @@ impl SessionSummary {
             archived: false,
             usage: None,
             agent: AgentSettings::default(),
+            context: ContextId::first_of(event.session_id),
         };
         summary.apply(seq, event);
         summary
@@ -152,7 +156,13 @@ impl SessionSummary {
             self.notable += 1;
         }
         match &event.kind {
-            EventKind::SessionCreated { workdir } => self.workdir = Some(workdir.clone()),
+            EventKind::SessionCreated { workdir, .. } => {
+                self.workdir = Some(workdir.clone());
+                self.context = event.context;
+            }
+            EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
+                self.context = event.context;
+            }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } => {
                 if !self.pending_approvals.contains(id) {
@@ -263,7 +273,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ModelsOffered { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
-        | EventKind::EffortRefused { .. } => false,
+        | EventKind::EffortRefused { .. }
+        | EventKind::ContextStarted { .. }
+        | EventKind::ContextSwitched { .. } => false,
     }
 }
 
@@ -297,7 +309,9 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ModelsOffered { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
-        | EventKind::EffortRefused { .. } => (None, None),
+        | EventKind::EffortRefused { .. }
+        | EventKind::ContextStarted { .. }
+        | EventKind::ContextSwitched { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -313,8 +327,55 @@ mod tests {
             session_id,
             at: Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap(),
             command_id: kind.logged_by_command().then(skywave_proto::CommandId::new),
+            context: ContextId::first_of(session_id),
             kind,
         }
+    }
+
+    #[test]
+    fn the_current_context_follows_starts_and_switches() {
+        let sid = SessionId::new();
+        let first = ContextId::first_of(sid);
+        let mut summary = SessionSummary::new(
+            Seq(1),
+            &event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/x".into(),
+                    context_name: "start".into(),
+                },
+            ),
+        );
+        assert_eq!(summary.context, first);
+        let by = DeviceId::new();
+        let fresh = ContextId::new();
+        let in_context = |context, kind| Event {
+            context,
+            ..event(sid, 1, kind)
+        };
+        summary.apply(
+            Seq(2),
+            &in_context(
+                fresh,
+                EventKind::ContextStarted {
+                    by,
+                    name: "fresh".into(),
+                },
+            ),
+        );
+        assert_eq!(summary.context, fresh);
+        // Other events leave it, whatever their stamp.
+        summary.apply(
+            Seq(3),
+            &in_context(first, EventKind::AgentMessage { text: "x".into() }),
+        );
+        assert_eq!(summary.context, fresh);
+        summary.apply(
+            Seq(4),
+            &in_context(first, EventKind::ContextSwitched { by }),
+        );
+        assert_eq!(summary.context, first);
     }
 
     #[test]
@@ -326,6 +387,7 @@ mod tests {
             0,
             EventKind::SessionCreated {
                 workdir: "/srv/x".into(),
+                context_name: "start".into(),
             },
         );
         let mut summary = SessionSummary::new(Seq(1), &created);
@@ -400,6 +462,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.title(), "app");
@@ -444,6 +507,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         let renamed = EventKind::SessionRenamed {
@@ -466,6 +530,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert!(!summary.archived);
@@ -497,6 +562,7 @@ mod tests {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
+            context_name: "start".into(),
         };
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         assert_eq!(summary.usage, None);
