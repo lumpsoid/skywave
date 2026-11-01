@@ -160,9 +160,13 @@ pub struct ResumeHandle(pub serde_json::Value);
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartSpec {
     pub session_id: SessionId,
+    /// The session context the agent runs in. For logging and the fake's
+    /// keying only: adapters must not interpret it (the context's
+    /// conversation is `resume`).
+    pub context: ContextId,
     /// Canonical working directory of the session (D14); the agent runs here.
     pub workdir: PathBuf,
-    /// The handle stored for this session, to resume it; `None` starts fresh.
+    /// The handle stored for `context`, to resume it; `None` starts fresh.
     pub resume: Option<ResumeHandle>,
     /// The mode to run in, asked for once the agent is up; `None` leaves
     /// the agent's own.

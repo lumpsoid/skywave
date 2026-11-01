@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use skywave_proto::{Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId};
 use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
@@ -1376,8 +1376,10 @@ fn adapter() -> ClaudeCodeAdapter {
 }
 
 fn spec(workdir: &Path, resume: Option<ResumeHandle>) -> StartSpec {
+    let session_id = SessionId::new();
     StartSpec {
-        session_id: SessionId::new(),
+        session_id,
+        context: ContextId::first_of(session_id),
         workdir: workdir.to_owned(),
         resume,
         mode: None,

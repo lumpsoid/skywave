@@ -29,7 +29,9 @@ const AGENT_EXITED: &str = "agent exited";
 /// Turns one session's adapter events into log events.
 ///
 /// The supervisor owns one mapper per running agent session and feeds it
-/// every [`AdapterEvent`] in order:
+/// every [`AdapterEvent`] in order. Every event it logs is stamped with the
+/// mapper's context, the one the agent process was started for, even when
+/// it arrives after the session switched to another context:
 ///
 /// | adapter event | log |
 /// |---------------|-----|
@@ -164,6 +166,12 @@ impl EventMapper {
 
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// The session context the agent runs in. Everything the mapper logs
+    /// is stamped with it.
+    pub fn context(&self) -> ContextId {
+        self.context
     }
 
     /// A turn has started and not yet ended.
@@ -417,7 +425,7 @@ impl EventMapper {
         if AgentSettings::folds(&kind) {
             self.settings.apply(None, &kind);
         }
-        log.append(&mut storage.db, self.session_id, kind)
+        log.append(&mut storage.db, self.session_id, self.context, kind)
     }
 
     /// The command of the oldest mode request, now answered.

@@ -71,6 +71,7 @@ impl Fixture {
     fn spec(&self) -> StartSpec {
         StartSpec {
             session_id: self.session_id,
+            context: ContextId::first_of(self.session_id),
             workdir: self.workdir.clone(),
             resume: load_resume_handle(&self.storage.db, ContextId::first_of(self.session_id))
                 .unwrap(),
@@ -217,7 +218,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     // The resume handle arrived before the turn finished.
     assert_eq!(
         load_resume_handle(&f.storage.db, ContextId::first_of(f.session_id)).unwrap(),
-        Some(FakeAgent::resume_handle(f.session_id))
+        Some(FakeAgent::resume_handle(ContextId::first_of(f.session_id)))
     );
     let id = f.approval_id();
     assert_eq!(mapper.pending_approvals().collect::<Vec<_>>(), [id]);
@@ -345,7 +346,10 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     assert_eq!(
         agent.inputs(f.session_id),
         [
-            FakeInput::Started { resumed: false },
+            FakeInput::Started {
+                resumed: false,
+                context: ContextId::first_of(f.session_id),
+            },
             FakeInput::Message("look around".into()),
             FakeInput::Answer("req-1".into(), Decision::Approve, None),
         ]
@@ -556,6 +560,18 @@ async fn restart_resumes_with_the_stored_handle() {
             .turn([Step::text("two")]),
     );
     assert_eq!(f.spec().resume, None);
+    // A start that got no message leaves no conversation and no handle, so
+    // starting fresh again is fine.
+    let (session, mut events) = agent.start(f.spec()).await.unwrap();
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+    );
+    session.shutdown().await.unwrap();
+    let rest = f.pump(&mut events, &mut mapper, |_| true).await;
+    assert_eq!(rest, [AdapterEvent::Exited { error: None }]);
+    assert_eq!(f.spec().resume, None);
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -574,9 +590,12 @@ async fn restart_resumes_with_the_stored_handle() {
         AgentError::Start(_)
     ));
 
-    // The restart finds the handle in sessions.agent_state.
+    // The restart finds the handle in contexts.agent_state.
     let spec = f.spec();
-    assert_eq!(spec.resume, Some(FakeAgent::resume_handle(f.session_id)));
+    assert_eq!(
+        spec.resume,
+        Some(FakeAgent::resume_handle(ContextId::first_of(f.session_id)))
+    );
     let (mut session, mut events) = agent.start(spec).await.unwrap();
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -591,9 +610,9 @@ async fn restart_resumes_with_the_stored_handle() {
     let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
     assert_eq!(turn[1], AdapterEvent::Text("echo: c".into()));
 
-    // A handle for another session is refused.
+    // A handle for another context is refused.
     let mut wrong = f.spec();
-    wrong.resume = Some(FakeAgent::resume_handle(SessionId::new()));
+    wrong.resume = Some(FakeAgent::resume_handle(ContextId::new()));
     assert!(matches!(
         agent.start(wrong).await,
         Err(AgentError::Resume(_))

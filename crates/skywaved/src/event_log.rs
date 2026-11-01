@@ -173,10 +173,19 @@ impl EventLog {
     /// mode, model and effort, and `ModelsOffered`. Kinds that only
     /// commands produce, and `ApprovalCancelled` (use
     /// [`EventLog::cancel_approval`]), are refused with
-    /// [`Error::InvalidAppend`], as is an unknown session.
+    /// [`Error::InvalidAppend`], as is an unknown session or a `context`
+    /// that is not one of the session's.
     ///
-    /// The event is stamped with the session's current context.
-    pub fn append(&self, db: &mut Db, session_id: SessionId, kind: EventKind) -> Result<Seq> {
+    /// The event is stamped with `context`: the context of the agent
+    /// process that produced it, or of the command the supervisor answers
+    /// with no process (spec §5). Nothing defaults to the current context.
+    pub fn append(
+        &self,
+        db: &mut Db,
+        session_id: SessionId,
+        context: ContextId,
+        kind: EventKind,
+    ) -> Result<Seq> {
         match &kind {
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall { .. }
@@ -211,12 +220,18 @@ impl EventLog {
             }
         }
         let tx = begin(db)?;
-        let Some(session) = session_in(&tx, session_id)? else {
+        if session_in(&tx, session_id)?.is_none() {
             return Err(Error::InvalidAppend(format!(
                 "unknown session {}",
                 session_id.0
             )));
-        };
+        }
+        if context_session_in(&tx, context)? != Some(session_id) {
+            return Err(Error::InvalidAppend(format!(
+                "context {} is not a context of session {}",
+                context.0, session_id.0
+            )));
+        }
         if let EventKind::ApprovalRequested { id, .. } = &kind
             && approval_in(&tx, *id)?.is_some()
         {
@@ -225,7 +240,7 @@ impl EventLog {
                 id.0
             )));
         }
-        let seq = append_in(&tx, session_id, session.context, None, &kind)?;
+        let seq = append_in(&tx, session_id, context, None, &kind)?;
         tx.commit()?;
         self.published(seq);
         Ok(seq)

@@ -148,6 +148,7 @@ impl Fixture {
             .append(
                 &mut self.storage.db,
                 session,
+                ContextId::first_of(session),
                 EventKind::AgentMessage { text: text.into() },
             )
             .unwrap()
