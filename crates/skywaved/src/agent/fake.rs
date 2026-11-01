@@ -12,6 +12,11 @@
 //! - [`Step::Hang`] blocks until interrupted, like a tool that never ends;
 //! - [`Step::Wait`] blocks until the test opens a [`Gate`].
 //!
+//! [`Step::Wake`] schedules a turn the agent starts on its own, with no
+//! message, like a CLI's scheduled wakeup: it runs once the session is idle
+//! and its time has come, before any queued message, and is lost with the
+//! session.
+//!
 //! An interrupt is seen while blocked, or between two steps; the rest of the
 //! turn is dropped, a pending approval is reported `ApprovalCancelled`, and
 //! the turn ends `Interrupted`. So a test that interrupts while the agent is
@@ -72,10 +77,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::{
@@ -194,6 +201,9 @@ pub enum Step {
     Fail(String),
     /// Exits mid-turn: emits `Exited { error }` and ends the session.
     Exit(Option<String>),
+    /// Emits nothing; `after` from now the agent starts a turn of `steps`
+    /// on its own, with no message, like a scheduled wakeup.
+    Wake { after: Duration, steps: Vec<Step> },
 }
 
 impl Step {
@@ -241,6 +251,15 @@ impl Step {
             suggestions: Vec::new(),
             on_approve: Vec::new(),
             on_deny: Vec::new(),
+        }
+    }
+
+    /// Schedules a turn of `steps` the agent starts on its own `after` from
+    /// now ([`Step::Wake`]).
+    pub fn wake(after: Duration, steps: impl IntoIterator<Item = Step>) -> Step {
+        Step::Wake {
+            after,
+            steps: steps.into_iter().collect(),
         }
     }
 
@@ -479,6 +498,7 @@ impl AgentAdapter for FakeAgent {
             commands: commands_rx,
             events,
             queued: VecDeque::new(),
+            wakeups: Vec::new(),
         };
         let task = tokio::spawn(runner.run());
         let session = FakeSession {
@@ -613,28 +633,51 @@ struct Runner {
     events: mpsc::Sender<AdapterEvent>,
     /// Messages received during a turn, each starting a later turn.
     queued: VecDeque<String>,
+    /// Turns scheduled by [`Step::Wake`], with when each is due.
+    wakeups: Vec<(Instant, Vec<Step>)>,
 }
 
 impl Runner {
     async fn run(mut self) {
         let error = loop {
+            if let Some(steps) = self.take_due_wakeup() {
+                if !self.emit(AdapterEvent::TurnStarted).await {
+                    return;
+                }
+                match self.run_turn(steps).await {
+                    Flow::Ended(outcome) => {
+                        if !self.emit(AdapterEvent::TurnEnded(outcome)).await {
+                            return;
+                        }
+                    }
+                    Flow::Exit(error) => break error,
+                }
+                continue;
+            }
             let text = match self.queued.pop_front() {
                 Some(text) => text,
-                None => match self.commands.recv().await {
-                    Some(FakeInput::Message(text)) => text,
-                    // Idle: nothing to interrupt or answer.
-                    Some(
-                        FakeInput::Interrupt
-                        | FakeInput::Answer(..)
-                        | FakeInput::Started { .. }
-                        | FakeInput::SetPermissionMode(_)
-                        | FakeInput::SetModel(_)
-                        | FakeInput::SetEffort(_),
-                    ) => {
-                        continue;
+                None => {
+                    let next_wakeup = self.wakeups.iter().map(|(due, _)| *due).min();
+                    let input = tokio::select! {
+                        input = self.commands.recv() => input,
+                        () = sleep_until(next_wakeup) => continue,
+                    };
+                    match input {
+                        Some(FakeInput::Message(text)) => text,
+                        // Idle: nothing to interrupt or answer.
+                        Some(
+                            FakeInput::Interrupt
+                            | FakeInput::Answer(..)
+                            | FakeInput::Started { .. }
+                            | FakeInput::SetPermissionMode(_)
+                            | FakeInput::SetModel(_)
+                            | FakeInput::SetEffort(_),
+                        ) => {
+                            continue;
+                        }
+                        Some(FakeInput::Shutdown) | None => break None,
                     }
-                    Some(FakeInput::Shutdown) | None => break None,
-                },
+                }
             };
             if !self.handle_reported {
                 // The conversation exists from its first message on.
@@ -663,6 +706,18 @@ impl Runner {
             }
         };
         self.emit(AdapterEvent::Exited { error }).await;
+    }
+
+    /// Steps of the earliest wakeup that is due, if one is.
+    fn take_due_wakeup(&mut self) -> Option<Vec<Step>> {
+        let now = Instant::now();
+        let (index, _) = self
+            .wakeups
+            .iter()
+            .enumerate()
+            .filter(|(_, (due, _))| *due <= now)
+            .min_by_key(|(_, (due, _))| *due)?;
+        Some(self.wakeups.remove(index).1)
     }
 
     /// Steps of the session's next scripted turn, or an echo of `text`.
@@ -740,6 +795,7 @@ impl Runner {
                 }
                 Step::Fail(message) => return Flow::Ended(TurnOutcome::Failed(message)),
                 Step::Exit(error) => return Flow::Exit(error),
+                Step::Wake { after, steps } => self.wakeups.push((Instant::now() + after, steps)),
             }
         }
         Flow::Ended(TurnOutcome::Completed)
@@ -812,6 +868,14 @@ impl Runner {
     /// Sends `event`; false when the receiver is gone and the session over.
     async fn emit(&self, event: AdapterEvent) -> bool {
         self.events.send(event).await.is_ok()
+    }
+}
+
+/// Sleeps until `deadline`; with none, forever.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

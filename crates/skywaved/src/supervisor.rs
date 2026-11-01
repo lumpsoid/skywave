@@ -97,7 +97,8 @@
 //! nothing.
 //!
 //! **Lifecycle.** An agent session is started on the first message and kept
-//! while it has work: a turn open or a delivered message whose turn has not
+//! while it has work: a turn open (also one the agent started on its own,
+//! e.g. a scheduled wakeup) or a delivered message whose turn has not
 //! ended. Once idle it is kept warm for [`SupervisorConfig::idle_timeout`]
 //! and then shut down; the next message resumes it.
 //!
@@ -778,8 +779,12 @@ impl<A: AgentAdapter> Supervisor<A> {
             );
         }
         let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
-        if started && let Some(&seq) = seqs.first() {
-            running.turn_started = Some(seq);
+        if started {
+            // A turn the agent started on its own is work too.
+            running.idle_since = None;
+            if let Some(&seq) = seqs.first() {
+                running.turn_started = Some(seq);
+            }
         }
         if ended {
             running.turn_started = None;
