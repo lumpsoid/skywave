@@ -75,6 +75,10 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
                 .map(|context| id("context", &context))
                 .transpose()?,
         },
+        ActionIntent::ViewSubagent { session_id, call } => Action::ViewSubagent {
+            session_id: id("session", &session_id)?,
+            call: call.map(|call| id("call", &call)).transpose()?,
+        },
         ActionIntent::SetPermissionMode { session_id, mode } => Action::SetPermissionMode {
             session_id: id("session", &session_id)?,
             mode: permission_mode(mode),
@@ -281,6 +285,34 @@ mod tests {
             action(ActionIntent::ViewContext {
                 session_id: session.0.to_string(),
                 context_id: Some("nope".into()),
+            })
+            .is_err()
+        );
+        let call = skywave_core::CallId::new();
+        assert_eq!(
+            action(ActionIntent::ViewSubagent {
+                session_id: session.0.to_string(),
+                call: Some(call.0.to_string()),
+            }),
+            Ok(Action::ViewSubagent {
+                session_id: session,
+                call: Some(call)
+            })
+        );
+        assert_eq!(
+            action(ActionIntent::ViewSubagent {
+                session_id: session.0.to_string(),
+                call: None,
+            }),
+            Ok(Action::ViewSubagent {
+                session_id: session,
+                call: None
+            })
+        );
+        assert!(
+            action(ActionIntent::ViewSubagent {
+                session_id: session.0.to_string(),
+                call: Some("nope".into()),
             })
             .is_err()
         );

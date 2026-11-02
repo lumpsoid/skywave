@@ -29,7 +29,7 @@ pub use screen::{
     ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
     ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
     ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, TaskRow,
+    StopHeadings, SubagentHeaderView, TaskRow,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use timeline::{

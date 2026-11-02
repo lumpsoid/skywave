@@ -199,7 +199,11 @@ class ComposerState extends State<Composer> {
     final theme = Theme.of(context);
     final colors = SkyColors.of(context);
     final composer = widget.composer;
-    final notes = [?composer.offlineLabel, ?composer.historyLabel];
+    final notes = [
+      ?composer.toLabel,
+      ?composer.offlineLabel,
+      ?composer.historyLabel,
+    ];
     return Material(
       color: theme.colorScheme.surfaceContainer,
       child: SafeArea(
@@ -218,7 +222,9 @@ class ComposerState extends State<Composer> {
                       Icon(
                         composer.offlineLabel != null
                             ? Icons.cloud_off
-                            : Icons.history,
+                            : composer.historyLabel != null
+                            ? Icons.history
+                            : Icons.call_made,
                         size: 14,
                         color: composer.offlineLabel != null
                             ? colors.warning

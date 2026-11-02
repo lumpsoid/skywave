@@ -4,7 +4,8 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/section_block.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The approval the agent is blocked on, above the composer: the gated
+/// The approval the agent is blocked on, above the composer: which
+/// subagent asks, if one does, the gated
 /// call and what it will do, then Approve, Deny and Always allow while
 /// this device may answer, and this device's answer once it did.
 class ApprovalPanelView extends StatelessWidget {
@@ -102,6 +103,16 @@ class ApprovalPanelView extends StatelessWidget {
                     ),
                 ],
               ),
+              if (approval.from case final from?)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    from,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: colors.warning,
+                    ),
+                  ),
+                ),
               const SizedBox(height: 6),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,

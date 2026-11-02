@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobId, BlobState, Entry, PairUri, PairingView, Screen, Seq, SessionId, SessionView,
-    SnippetId, TimelineItem, ViewState, parse_pair_uri,
+    Action, BlobId, BlobState, CallId, Entry, PairUri, PairingView, Screen, Seq, SessionId,
+    SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
@@ -124,6 +124,7 @@ impl Composer {
                 rev,
                 history_label: None,
                 offline_label: None,
+                to_label: None,
             },
             text,
             cursor,
@@ -148,6 +149,8 @@ struct SessionHead {
     marker: ReadMarker,
     /// The newest row is on screen (Dart says so).
     following: bool,
+    /// The `Agent` call of the subagent shown; `None` in the main view.
+    subagent: Option<CallId>,
     /// Items whose content shows whole; only logged items expand.
     expanded: HashSet<Seq>,
     /// Blobs fetched because their item was expanded, so each is asked
@@ -168,12 +171,19 @@ impl SessionHead {
             history: PromptHistory::new(),
             marker: ReadMarker::new(view.id),
             following: false,
+            subagent: view.subagent.as_ref().map(|s| s.call),
             expanded: HashSet::new(),
             fetched: HashSet::new(),
             search: None,
             heads: BlobHeads::default(),
             sending: None,
         }
+    }
+
+    /// The newest row of the main view is on screen: a subagent's view
+    /// says nothing of the main view's news, so nothing is read there.
+    fn following(&self, view: &SessionView) -> bool {
+        self.following && view.subagent.is_none()
     }
 }
 
@@ -182,8 +192,9 @@ impl SessionHead {
 struct Sent {
     link: Option<LinkUpdate>,
     screen: Option<ScreenUpdate>,
-    /// The session the rows are of, and the rows.
-    timeline: Option<(Option<SessionId>, Vec<TimelineRow>)>,
+    /// The session the rows are of, the subagent whose view they are
+    /// (`None` for the main view), and the rows.
+    timeline: Option<(Option<SessionId>, Option<CallId>, Vec<TimelineRow>)>,
     search: Option<SearchUpdate>,
 }
 
@@ -376,7 +387,7 @@ impl Head {
             session.and_then(|s| s.saver.next_wake()),
             session
                 .zip(open)
-                .and_then(|(s, v)| s.marker.next_wake(clock.now, v.last_seq, s.following)),
+                .and_then(|(s, v)| s.marker.next_wake(clock.now, v.last_seq, s.following(v))),
             link::next_change(&view.link, clock.wall_ms).map(|d| clock.now + d),
             open.filter(|v| timeline::live(v)).map(|_| clock.now + TICK),
         ]
@@ -877,7 +888,7 @@ impl Head {
         if let Some(action) =
             session
                 .marker
-                .mark(clock.now, view.last_seq, session.following, force)
+                .mark(clock.now, view.last_seq, session.following(view), force)
         {
             self.dispatch(action, Purpose::Plain, out);
         }
@@ -953,15 +964,19 @@ impl Head {
         }
 
         let open = open_session(&self.view);
-        let (id, rows) = match (open, &mut self.session) {
+        let (id, call, rows) = match (open, &mut self.session) {
             (Some(view), Some(session)) => (
                 Some(view.id),
+                view.subagent.as_ref().map(|s| s.call),
                 timeline::rows(view, &session.expanded, &mut session.heads, clock.wall_ms),
             ),
-            _ => (None, Rows::default()),
+            _ => (None, None, Rows::default()),
         };
+        // Another view's rows are another list: a snapshot, not a diff.
         let updates = match &self.sent.timeline {
-            Some((sent_id, old)) if *sent_id == id => timeline::diff(old, &rows),
+            Some((sent_id, sent_call, old)) if (*sent_id, *sent_call) == (id, call) => {
+                timeline::diff(old, &rows)
+            }
             _ => None,
         };
         match updates {
@@ -975,7 +990,7 @@ impl Head {
             (Some(view), Some(search)) => search::update(search, view, &rows.rows),
             _ => search::closed(),
         };
-        self.sent.timeline = Some((id, rows.rows));
+        self.sent.timeline = Some((id, call, rows.rows));
         if self.sent.search.as_ref() != Some(&found) {
             self.sent.search = Some(found.clone());
             out.push(Out::Search(found));
@@ -983,13 +998,24 @@ impl Head {
     }
 
     /// A fresh session head when another session opens; none off a session.
+    /// Another view of the same session (a subagent's, or back to the main
+    /// view) is another page in Dart, whose new composer field takes only a
+    /// new `rev`: the text Dart reported last goes out again under one.
     fn follow_session(&mut self) {
         match open_session(&self.view) {
             Some(view) if self.session.as_ref().is_none_or(|s| s.id != view.id) => {
                 self.revs += 1;
                 self.session = Some(SessionHead::new(view, self.revs));
             }
-            Some(_) => {}
+            Some(view) => {
+                let call = view.subagent.as_ref().map(|s| s.call);
+                if let Some(session) = self.session.as_mut().filter(|s| s.subagent != call) {
+                    session.subagent = call;
+                    self.revs += 1;
+                    let Composer { text, cursor, .. } = &session.composer;
+                    session.composer = Composer::new(text.clone(), *cursor, self.revs);
+                }
+            }
             None => self.session = None,
         }
     }

@@ -11,7 +11,8 @@ import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The booted app: the banner over a navigator whose one page is the
-/// screen Rust sent (D18). System back is `Back` while Rust says it goes
+/// screen Rust sent (D18), but in a subagent's view, which is a second
+/// page over its session's. System back is `Back` while Rust says it goes
 /// somewhere; otherwise it leaves the app.
 class ScreenNavigator extends StatelessWidget {
   const ScreenNavigator({required this.holders, required this.send, super.key});
@@ -43,6 +44,8 @@ class ScreenNavigator extends StatelessWidget {
                     body: Center(child: CircularProgressIndicator()),
                   );
                 }
+                final revoked = update.revokedFullScreen;
+                final subagent = revoked ? null : _subagentCall(update);
                 return PopScope(
                   canPop: !update.canGoBack,
                   onPopInvokedWithResult: (didPop, _) {
@@ -51,11 +54,19 @@ class ScreenNavigator extends StatelessWidget {
                   child: Navigator(
                     pages: [
                       MaterialPage<void>(
-                        key: ValueKey((kind, update.revokedFullScreen)),
-                        child: update.revokedFullScreen
+                        key: ValueKey((kind, null, revoked)),
+                        child: revoked
                             ? RevokedPage(send: send)
-                            : _page(update),
+                            : _page(update, top: subagent == null),
                       ),
+                      // A subagent's view goes over its session's, which
+                      // stays: its composer keeps what was typed in it,
+                      // and back pops to it.
+                      if (subagent != null)
+                        MaterialPage<void>(
+                          key: ValueKey((kind, subagent, revoked)),
+                          child: _page(update, top: true),
+                        ),
                     ],
                     onDidRemovePage: (_) {},
                   ),
@@ -68,30 +79,44 @@ class ScreenNavigator extends StatelessWidget {
     );
   }
 
-  Widget _page(ScreenUpdate update) => switch (update.screen) {
-    final ScreenViewPairing screen => PairingPage(
-      screen: screen,
-      canGoBack: update.canGoBack,
-      send: send,
-      scan: platformScanQr,
-    ),
-    final ScreenViewSessionList screen => SessionListPage(
-      screen: screen,
-      canGoBack: update.canGoBack,
-      send: send,
-    ),
-    ScreenViewSession(:final session) => SessionPage(
-      screen: session,
-      timeline: holders.timeline,
-      search: holders.search,
-      send: send,
-    ),
-    final ScreenViewSettings screen => SettingsPage(
-      screen: screen,
-      link: holders.link,
-      canGoBack: update.canGoBack,
-      send: send,
-    ),
-    _ => const SizedBox.shrink(),
+  /// The `Agent` call of the subagent whose view is shown, if one is.
+  static String? _subagentCall(ScreenUpdate update) => switch (update.screen) {
+    ScreenViewSession(:final session) => session.subagent?.call,
+    _ => null,
   };
+
+  /// The page for [update]. One under the [top] page is kept for its
+  /// state and sends nothing.
+  Widget _page(ScreenUpdate update, {required bool top}) =>
+      _pageFor(update, top ? send : _quiet);
+
+  static void _quiet(GuiIntent _) {}
+
+  Widget _pageFor(ScreenUpdate update, SendIntent send) =>
+      switch (update.screen) {
+        final ScreenViewPairing screen => PairingPage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+          scan: platformScanQr,
+        ),
+        final ScreenViewSessionList screen => SessionListPage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        ScreenViewSession(:final session) => SessionPage(
+          screen: session,
+          timeline: holders.timeline,
+          search: holders.search,
+          send: send,
+        ),
+        final ScreenViewSettings screen => SettingsPage(
+          screen: screen,
+          link: holders.link,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        _ => const SizedBox.shrink(),
+      };
 }

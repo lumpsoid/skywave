@@ -146,6 +146,14 @@ pub struct ToolFacts {
     /// While collapsed, the state of a blob no visible section shows:
     /// `input 4.2 KiB`, `output 1.0 MiB · requested`.
     pub aside: Option<String>,
+    /// The call id to open with `ViewSubagent`: set only for a call that
+    /// starts a subagent whose steps are known.
+    pub opens: Option<String>,
+    /// How the subagent it starts stands: `running · 14 steps · Write
+    /// src/sync.rs`, `finished · 14 steps`. Shown instead of
+    /// `state_label`, which then says how the launch itself went; `None`
+    /// for any other call, and while its approval is pending or it failed.
+    pub status: Option<String>,
 }
 
 /// Which kind of tool, for its icon. Never its name.
