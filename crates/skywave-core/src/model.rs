@@ -31,11 +31,11 @@ use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
     BlobState, BlobView, BodyView, CallId, CommandId, ContextId, ContextView, Decision, Delivery,
-    DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, ListKind, ModelChoice,
-    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, Screen,
-    Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
-    SettingChange, SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval, ToolOutcome,
-    ToolView, ViewState,
+    DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, LinkRejection, ListKind,
+    ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
+    PendingSession, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
+    SessionView, SettingChange, SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval,
+    ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -532,6 +532,11 @@ impl Model {
             }
             Action::RetryNow => match self.link {
                 Link::Reconnecting { .. } => vec![Effect::Request(Request::RetryNow)],
+                // The server may have been updated since: ask it again.
+                Link::Rejected(LinkRejection::ProtocolMismatch { .. }) => {
+                    self.link = Link::Connecting;
+                    vec![Effect::Request(Request::Connect)]
+                }
                 _ => Vec::new(),
             },
             Action::Navigate(route) => {
@@ -4954,6 +4959,23 @@ mod tests {
             f.dispatch(Action::RetryNow),
             vec![Effect::Request(Request::RetryNow)]
         );
+    }
+
+    /// A mismatch may have been the server's, since updated: retrying
+    /// connects again, where a revoked device has to re-pair.
+    #[test]
+    fn retry_now_after_a_protocol_mismatch_connects_again() {
+        let mut f = Fixture::paired();
+        f.model
+            .set_link(Link::Rejected(LinkRejection::ProtocolMismatch {
+                client: 3,
+                server: 2,
+            }));
+        assert_eq!(
+            f.dispatch(Action::RetryNow),
+            vec![Effect::Request(Request::Connect)]
+        );
+        assert_eq!(f.model.view().link, Link::Connecting);
     }
 
     // Tool timeline (spec §7): calls group their approval and result.

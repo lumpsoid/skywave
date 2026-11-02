@@ -138,7 +138,7 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
             format!("device revoked · re-pair to reconnect{queued_part}")
         }
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => format!(
-            "protocol mismatch · client v{client}, server v{server} · update to reconnect{queued_part}"
+            "protocol mismatch · client v{client}, server v{server} · update, then Ctrl-R{queued_part}"
         ),
     }
 }

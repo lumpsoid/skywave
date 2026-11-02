@@ -6,7 +6,8 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The link banner across the top of every screen: Rust's label on the
-/// state's colour, "Retry now" while reconnecting, and the approvals
+/// state's colour, "Retry now" while reconnecting or after a protocol
+/// mismatch (the server may have been updated since), and the approvals
 /// waiting in other sessions as a button to the next one. Nothing while
 /// Rust's label is empty: unpaired, or online with nothing waiting.
 class LinkBanner extends StatelessWidget {

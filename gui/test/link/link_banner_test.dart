@@ -57,7 +57,7 @@ void main() {
       (LinkState.revoked, 'device revoked · re-pair to reconnect'),
       (
         LinkState.protocolMismatch,
-        'protocol mismatch · client v2, server v3 · update to reconnect',
+        'protocol mismatch · client v2, server v3 · update, then retry',
       ),
     ]) {
       holder.apply(link(state, label));
