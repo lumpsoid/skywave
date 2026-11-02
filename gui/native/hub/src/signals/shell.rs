@@ -48,7 +48,7 @@ pub struct ShellRunRow {
     /// that always runs. Words, never shell operators.
     pub when_label: Option<String>,
     pub state: ShellRunKind,
-    /// How it stands: `queued 40s`, `failed: …`, `running 12s`, `exit 1 ·
+    /// How it stands: `queued 14:02:11`, `failed: …`, `running 12s`, `exit 1 ·
     /// 3.2s`, `skipped: previous failed`.
     pub state_label: String,
     /// `by <device>` for another device's run; `None` for this device's.

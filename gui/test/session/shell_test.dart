@@ -141,7 +141,7 @@ void main() {
               'r2',
               'make',
               state: ShellRunKind.pending,
-              stateLabel: 'queued 2s',
+              stateLabel: 'queued 14:02:11',
               discardable: true,
             ),
           ],
@@ -157,7 +157,7 @@ void main() {
     expect(find.text('from the agent'), findsNothing);
     expect(find.text('cargo test'), findsOneWidget);
     expect(find.text('running 3 tests'), findsOneWidget);
-    expect(find.text('queued 2s'), findsOneWidget);
+    expect(find.text('queued 14:02:11'), findsOneWidget);
     // The prompt reads cwd, condition, sigil, left to right.
     final cwd = tester.getTopLeft(find.byKey(const Key('shell-cwd')));
     final chip = tester.getTopLeft(find.byKey(const Key('shell-condition')));

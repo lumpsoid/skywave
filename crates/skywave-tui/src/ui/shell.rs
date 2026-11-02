@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skywave_core::{BlobId, BlobState, SessionView, ShellEnd, ShellRun, ShellRunState};
 use skywave_present::format::{
-    blob_size, bytes, outgoing_label, queued_age, shell_end_label, shell_took, when_marker,
+    blob_size, bytes, outgoing_label, queued_label, shell_end_label, shell_took, when_marker,
 };
 use skywave_present::output::{
     OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
@@ -154,8 +154,8 @@ fn state_spans(run: &ShellRun, now: DateTime<Utc>) -> Vec<Span<'static>> {
                     outgoing_badge(outgoing).1,
                 )];
             }
-            let age = queued_age(run, now).unwrap_or_else(|| "queued".to_owned());
-            vec![Span::raw(age).dark_gray()]
+            let queued = queued_label(run).unwrap_or_else(|| "queued".to_owned());
+            vec![Span::raw(queued).dark_gray()]
         }
         ShellRunState::Running => {
             let took = shell_took(run, now).unwrap_or_default();
