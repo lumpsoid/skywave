@@ -514,15 +514,23 @@ pub struct ComposerView {
     /// The server runs shell commands: the shell toggle shows. Switching
     /// back out of shell mode works without it.
     pub shell_enabled: bool,
-    /// In shell mode, the prompt before the field: the last part of the
-    /// session's cwd and `$` (`work $`, or a bare `$` before any is known).
-    pub prompt_label: Option<String>,
-    /// In shell mode, the condition chip's label: `if ok ✓`, `if failed
-    /// ✗`; `None` for always. `CycleCondition` steps it; it resets after
-    /// each run sent.
-    pub when_label: Option<String>,
+    /// In shell mode, the prompt before the field.
+    pub prompt: Option<ShellPromptView>,
     /// In shell mode, the stop button does something (`StopShell`).
     pub can_stop: bool,
+}
+
+/// The shell prompt in its parts, shown in order: `work [if ok ✓] $`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ShellPromptView {
+    /// The last part of the session's cwd: `work`; `None` before any is
+    /// known.
+    pub cwd: Option<String>,
+    /// The condition chip's label: `if ok ✓`, `if failed ✗`; `None` for
+    /// always. `CycleCondition` steps it; it resets after each run sent.
+    pub when_label: Option<String>,
+    /// What closes the prompt: `$`.
+    pub sigil: String,
 }
 
 /// What a session's composer writes on this device.

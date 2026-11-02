@@ -9,7 +9,7 @@ use skywave_present::format::{
     outgoing_label, queued_age, shell_end_label, shell_prompt, shell_took, when_marker,
 };
 
-use crate::signals::{ShellRunKind, ShellRunRow, ShellUpdate};
+use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
 use crate::timeline::{blob_facts, clean_line, clean_text, outgoing_view};
 
 /// Every run of `view`'s, oldest first, at `wall_ms`.
@@ -94,14 +94,15 @@ pub fn live(view: &SessionView) -> bool {
     })
 }
 
-/// The shell composer's prompt label: the cwd's last part and `$`.
-pub fn prompt_label(view: &SessionView) -> String {
-    clean_line(&shell_prompt(view.shell.cwd.as_deref()))
-}
-
-/// The condition chip's label; `None` for always.
-pub fn when_label(when: RunWhen) -> Option<String> {
-    when_marker(when).map(str::to_owned)
+/// The shell composer's prompt for `view`, the next command running on
+/// `when`.
+pub fn prompt(view: &SessionView, when: RunWhen) -> ShellPromptView {
+    let prompt = shell_prompt(view.shell.cwd.as_deref(), when);
+    ShellPromptView {
+        cwd: prompt.cwd.map(clean_line),
+        when_label: prompt.marker.map(str::to_owned),
+        sigil: prompt.sigil.to_owned(),
+    }
 }
 
 /// The condition after `when` in the chip's cycle: always → if ok → if

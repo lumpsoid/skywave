@@ -20,7 +20,7 @@ use skywave_present::format::{
     answer_words, approval_origin, background_rows, blob_size, bytes, context_moved_label,
     context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, outgoing_label,
     repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status, task_kind_word, tokens,
-    trail, turn_time, viewing_hint, when_marker, work_summary,
+    trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -830,17 +830,7 @@ fn capitalised(text: &str) -> String {
 /// condition picked with Ctrl-O, then `$`, e.g. `skywave [if ok ✓] $`.
 /// The condition is never part of the text written.
 fn shell_prompt_line(session: Option<&SessionView>, when: RunWhen) -> String {
-    let prompt = shell_prompt(session.and_then(|s| s.shell.cwd.as_deref()));
-    let cwd = prompt.strip_suffix('$').unwrap_or(&prompt).trim_end();
-    let mut parts = Vec::new();
-    if !cwd.is_empty() {
-        parts.push(clean(cwd));
-    }
-    if let Some(marker) = when_marker(when) {
-        parts.push(format!("[{marker}]"));
-    }
-    parts.push("$".to_owned());
-    parts.join(" ")
+    clean(&shell_prompt(session.and_then(|s| s.shell.cwd.as_deref()), when).to_string())
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, app: &App, ui: &SessionUi) {

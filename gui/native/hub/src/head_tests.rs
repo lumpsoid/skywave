@@ -6,7 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ListKindView, RouteView, RowKind, ScreenView};
+use crate::signals::{ActionIntent, ListKindView, RouteView, RowKind, ScreenView, ShellPromptView};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -195,6 +195,11 @@ impl Rig {
             ScreenView::Session { session } => session.composer.clone(),
             other => panic!("not a session: {other:?}"),
         }
+    }
+
+    /// The shell prompt; the composer must be in shell mode.
+    fn prompt(&self) -> ShellPromptView {
+        self.composer().prompt.expect("no shell prompt")
     }
 
     fn text(&self) -> String {
@@ -1908,8 +1913,14 @@ fn toggling_saves_the_agent_draft_first_and_loads_the_shell_draft_once_switched(
         ("cargo test", 5)
     );
     assert!(composer.rev > rev, "Dart's field is not reset");
-    assert_eq!(composer.when_label.as_deref(), Some("if ok ✓"));
-    assert_eq!(composer.prompt_label.as_deref(), Some("$"));
+    assert_eq!(
+        composer.prompt,
+        Some(ShellPromptView {
+            cwd: None,
+            when_label: Some("if ok ✓".into()),
+            sigil: "$".into(),
+        })
+    );
     let Screen::Session(view) = rig.core.view().screen else {
         panic!("left the session");
     };
@@ -1933,7 +1944,7 @@ fn toggling_saves_the_agent_draft_first_and_loads_the_shell_draft_once_switched(
     let composer = rig.composer();
     assert_eq!(composer.mode, ComposerModeView::Agent);
     assert_eq!(composer.text, "half a message, more");
-    assert_eq!((composer.prompt_label, composer.when_label), (None, None));
+    assert_eq!(composer.prompt, None);
 }
 
 #[test]
@@ -1945,11 +1956,11 @@ fn a_shell_submit_runs_on_the_chip_condition_which_then_resets() {
     rig.intent(GuiIntent::CycleCondition {
         session_id: id.clone(),
     });
-    assert_eq!(rig.composer().when_label.as_deref(), Some("if ok ✓"));
+    assert_eq!(rig.prompt().when_label.as_deref(), Some("if ok ✓"));
     rig.intent(GuiIntent::CycleCondition {
         session_id: id.clone(),
     });
-    assert_eq!(rig.composer().when_label.as_deref(), Some("if failed ✗"));
+    assert_eq!(rig.prompt().when_label.as_deref(), Some("if failed ✗"));
     // The condition is saved with the draft.
     rig.wait(DRAFT_SAVE_AFTER + Duration::from_millis(10));
     assert!(matches!(
@@ -1969,14 +1980,18 @@ fn a_shell_submit_runs_on_the_chip_condition_which_then_resets() {
     rig.results();
     let composer = rig.composer();
     assert_eq!(composer.text, "");
-    assert_eq!(composer.when_label, None, "the chip resets after a send");
+    assert_eq!(
+        composer.prompt.unwrap().when_label,
+        None,
+        "the chip resets after a send"
+    );
 
     // Nothing to run: no action, and a picked condition stays.
     rig.actions.clear();
     rig.intent(GuiIntent::CycleCondition { session_id: id });
     rig.submit();
     assert!(!rig.kinds().contains(&"run shell"), "{:?}", rig.actions);
-    assert_eq!(rig.composer().when_label.as_deref(), Some("if ok ✓"));
+    assert_eq!(rig.prompt().when_label.as_deref(), Some("if ok ✓"));
 }
 
 #[test]
@@ -2062,7 +2077,11 @@ fn the_stops_take_back_a_pending_run_and_stop_a_running_one() {
     let row = rig.runs()[0].clone();
     assert_eq!(row.state, crate::signals::ShellRunKind::Running);
     assert!(row.by_label.is_some_and(|by| by.starts_with("by device")));
-    assert_eq!(rig.composer().prompt_label.as_deref(), Some("work $"));
+    let prompt = rig.prompt();
+    assert_eq!(
+        (prompt.cwd.as_deref(), prompt.sigil.as_str()),
+        (Some("work"), "$")
+    );
     rig.actions.clear();
     rig.intent(GuiIntent::StopShellRun {
         session_id: id.clone(),

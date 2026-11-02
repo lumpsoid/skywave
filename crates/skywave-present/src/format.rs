@@ -710,19 +710,50 @@ pub fn when_marker(when: RunWhen) -> Option<&'static str> {
     }
 }
 
-/// The shell composer's prompt: the last part of the session's last known
-/// cwd, then `$`: `skywave $`, `/ $`, or a bare `$` before any is known.
-pub fn shell_prompt(cwd: Option<&str>) -> String {
-    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
-        return "$".to_owned();
-    };
-    let trimmed = cwd.trim_end_matches('/');
-    let tail = match trimmed.rsplit_once('/') {
-        _ if trimmed.is_empty() => "/",
-        Some((_, tail)) => tail,
-        None => trimmed,
-    };
-    format!("{tail} $")
+/// The shell composer's prompt, in parts so a head can style or wire each
+/// one (the GUI's marker is a chip that steps the condition). Its
+/// [`Display`](std::fmt::Display) is the whole prompt: `skywave [if ok ✓] $`,
+/// `/ $`, or a bare `$` before any cwd is known. The marker is never part
+/// of the command written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellPrompt<'a> {
+    /// The last part of the session's last known cwd: `skywave`, `/`;
+    /// `None` before any is known. Unsanitized: a head cleans it.
+    pub cwd: Option<&'a str>,
+    /// The condition the next command runs on, as [`when_marker`].
+    pub marker: Option<&'static str>,
+    /// What closes the prompt: `$`.
+    pub sigil: &'static str,
+}
+
+impl std::fmt::Display for ShellPrompt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(cwd) = self.cwd {
+            write!(f, "{cwd} ")?;
+        }
+        if let Some(marker) = self.marker {
+            write!(f, "[{marker}] ")?;
+        }
+        f.write_str(self.sigil)
+    }
+}
+
+/// The shell composer's prompt for a session last seen in `cwd`, with
+/// the condition `when` the next command runs on.
+pub fn shell_prompt(cwd: Option<&str>, when: RunWhen) -> ShellPrompt<'_> {
+    let tail = cwd.filter(|cwd| !cwd.is_empty()).map(|cwd| {
+        let trimmed = cwd.trim_end_matches('/');
+        match trimmed.rsplit_once('/') {
+            _ if trimmed.is_empty() => "/",
+            Some((_, tail)) => tail,
+            None => trimmed,
+        }
+    });
+    ShellPrompt {
+        cwd: tail,
+        marker: when_marker(when),
+        sigil: "$",
+    }
 }
 
 /// What a shell run took: from its start to its end, or to `now` while it
@@ -813,12 +844,33 @@ mod tests {
 
     #[test]
     fn the_shell_prompt_names_the_cwd_tail() {
-        assert_eq!(shell_prompt(Some("/srv/skywave")), "skywave $");
-        assert_eq!(shell_prompt(Some("/srv/skywave/")), "skywave $");
-        assert_eq!(shell_prompt(Some("/")), "/ $");
-        assert_eq!(shell_prompt(Some("relative")), "relative $");
-        assert_eq!(shell_prompt(Some("")), "$");
-        assert_eq!(shell_prompt(None), "$");
+        let line = |cwd| shell_prompt(cwd, RunWhen::Always).to_string();
+        assert_eq!(line(Some("/srv/skywave")), "skywave $");
+        assert_eq!(line(Some("/srv/skywave/")), "skywave $");
+        assert_eq!(line(Some("/")), "/ $");
+        assert_eq!(line(Some("relative")), "relative $");
+        assert_eq!(line(Some("")), "$");
+        assert_eq!(line(None), "$");
+    }
+
+    #[test]
+    fn the_shell_prompt_puts_the_condition_before_the_sigil() {
+        let prompt = shell_prompt(Some("/srv/skywave"), RunWhen::OnSuccess);
+        assert_eq!(
+            prompt,
+            ShellPrompt {
+                cwd: Some("skywave"),
+                marker: Some("if ok ✓"),
+                sigil: "$",
+            }
+        );
+        assert_eq!(prompt.to_string(), "skywave [if ok ✓] $");
+        assert_eq!(
+            shell_prompt(None, RunWhen::OnFailure).to_string(),
+            "[if failed ✗] $"
+        );
+        let always = shell_prompt(Some("/srv/skywave"), RunWhen::Always);
+        assert_eq!((always.cwd, always.marker), (Some("skywave"), None));
     }
 
     fn shell_run(state: ShellRunState) -> ShellRun {
