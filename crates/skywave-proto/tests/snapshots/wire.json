@@ -1,7 +1,7 @@
 {
-  "protocol_version": 14,
+  "protocol_version": 15,
   "hello": {
-    "protocol_version": 14,
+    "protocol_version": 15,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1245,6 +1245,248 @@
     {
       "result": "rejected",
       "reason": "bad_shell_command"
+    }
+  ],
+  "workdir_query": {
+    "session": "01920000-0000-7000-8000-000000000001",
+    "path": "src/agent"
+  },
+  "workdir_changes": [
+    {
+      "result": "changes",
+      "at": "2026-10-29T12:00:00Z",
+      "branch": "main",
+      "head": "e3c8849",
+      "files": [
+        {
+          "path": "a.rs",
+          "from": null,
+          "change": "added",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "blob",
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        },
+        {
+          "path": "b.rs",
+          "from": null,
+          "change": "modified",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "omitted"
+          }
+        },
+        {
+          "path": "c.rs",
+          "from": null,
+          "change": "deleted",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "blob",
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        },
+        {
+          "path": "d.rs",
+          "from": "old/name.rs",
+          "change": "renamed",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "blob",
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        },
+        {
+          "path": "e.png",
+          "from": null,
+          "change": "type_changed",
+          "added": null,
+          "removed": null,
+          "diff": {
+            "diff": "binary"
+          }
+        },
+        {
+          "path": "f.log",
+          "from": null,
+          "change": "untracked",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "too_large",
+            "bytes": 2097152
+          }
+        },
+        {
+          "path": "g.rs",
+          "from": null,
+          "change": "conflicted",
+          "added": 12,
+          "removed": 3,
+          "diff": {
+            "diff": "blob",
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          }
+        }
+      ],
+      "total": 9
+    },
+    {
+      "result": "changes",
+      "at": "2026-10-29T12:00:00Z",
+      "branch": null,
+      "head": null,
+      "files": [],
+      "total": 0
+    },
+    {
+      "result": "not_git"
+    },
+    {
+      "result": "failed",
+      "reason": "git: command not found"
+    },
+    {
+      "result": "unknown_session"
+    },
+    {
+      "result": "workdir_gone"
+    }
+  ],
+  "workdir_list": [
+    {
+      "result": "listed",
+      "at": "2026-10-29T12:00:00Z",
+      "path": "src",
+      "entries": [
+        {
+          "name": "agent",
+          "kind": {
+            "kind": "dir"
+          },
+          "size": null
+        },
+        {
+          "name": "lib.rs",
+          "kind": {
+            "kind": "file"
+          },
+          "size": 1234
+        },
+        {
+          "name": "pipe",
+          "kind": {
+            "kind": "other"
+          },
+          "size": null
+        },
+        {
+          "name": "to_dir",
+          "kind": {
+            "kind": "link",
+            "to": "dir"
+          },
+          "size": null
+        },
+        {
+          "name": "to_file",
+          "kind": {
+            "kind": "link",
+            "to": "file"
+          },
+          "size": null
+        },
+        {
+          "name": "to_etc",
+          "kind": {
+            "kind": "link",
+            "to": "outside"
+          },
+          "size": null
+        },
+        {
+          "name": "broken",
+          "kind": {
+            "kind": "link",
+            "to": "dangling"
+          },
+          "size": null
+        }
+      ],
+      "truncated": true
+    },
+    {
+      "result": "not_a_directory"
+    },
+    {
+      "result": "unknown_session"
+    },
+    {
+      "result": "workdir_gone"
+    },
+    {
+      "result": "not_allowed"
+    },
+    {
+      "result": "not_found"
+    }
+  ],
+  "workdir_file": [
+    {
+      "result": "file",
+      "at": "2026-10-29T12:00:00Z",
+      "path": "src/lib.rs",
+      "size": 48213,
+      "content": {
+        "content": "blob",
+        "id": "01920000-0000-7000-8000-000000000005",
+        "size": 48213
+      }
+    },
+    {
+      "result": "file",
+      "at": "2026-10-29T12:00:00Z",
+      "path": "src/lib.rs",
+      "size": 48213,
+      "content": {
+        "content": "binary"
+      }
+    },
+    {
+      "result": "file",
+      "at": "2026-10-29T12:00:00Z",
+      "path": "src/lib.rs",
+      "size": 48213,
+      "content": {
+        "content": "too_large"
+      }
+    },
+    {
+      "result": "is_a_directory"
+    },
+    {
+      "result": "not_a_file"
+    },
+    {
+      "result": "unknown_session"
+    },
+    {
+      "result": "workdir_gone"
+    },
+    {
+      "result": "not_allowed"
+    },
+    {
+      "result": "not_found"
     }
   ]
 }
