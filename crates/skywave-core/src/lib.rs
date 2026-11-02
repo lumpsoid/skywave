@@ -72,8 +72,9 @@ pub use view::{
     ContextView, Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo,
     FailReason, Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
     PairingView, PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason,
-    RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, Snippet, SnippetId, SubagentHeader, SubagentStatus, TaskId, TaskKind,
-    TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
+    RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq,
+    SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
+    ToolOutcome, ToolView, TurnUsage, ViewState,
 };

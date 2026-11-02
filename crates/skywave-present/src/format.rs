@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use skywave_core::{
     AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView, Decision,
     Delivery, DeviceRef, Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, SessionRef, SessionView, SubagentStatus, TaskId, TaskKind,
+    RuleSuggestion, RunWhen, Schedule, SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState,
+    SubagentStatus, TaskId, TaskKind,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -675,6 +677,85 @@ pub fn approval_origin(from: &str, shown: bool) -> String {
     }
 }
 
+/// How a shell run ended: `exit 0`, `exit 1`, `killed by signal 9`,
+/// `stopped`, `skipped: previous failed` (an `if ok` run) or `skipped:
+/// previous succeeded` (an `if failed` run), `lost: daemon restarted`,
+/// `could not start: <reason>`. `when` is the run's condition, which is
+/// what a skip went by.
+pub fn shell_end_label(end: &ShellEnd, when: RunWhen) -> String {
+    match end {
+        ShellEnd::Exited { code } => format!("exit {code}"),
+        ShellEnd::Signalled { signal } => format!("killed by signal {signal}"),
+        ShellEnd::Stopped => "stopped".to_owned(),
+        ShellEnd::Skipped => match when {
+            RunWhen::OnSuccess => "skipped: previous failed",
+            RunWhen::OnFailure => "skipped: previous succeeded",
+            RunWhen::Always => "skipped",
+        }
+        .to_owned(),
+        ShellEnd::Lost => "lost: daemon restarted".to_owned(),
+        ShellEnd::NotStarted { reason } => format!("could not start: {reason}"),
+    }
+}
+
+/// The marker of a run's condition, in a run's row and beside the shell
+/// prompt: `if ok ✓`, `if failed ✗`; `None` for one that always runs.
+/// Words, never `&&`, `||` or `;`: the command text is never parsed, and
+/// the marker must not read as part of it.
+pub fn when_marker(when: RunWhen) -> Option<&'static str> {
+    match when {
+        RunWhen::Always => None,
+        RunWhen::OnSuccess => Some("if ok ✓"),
+        RunWhen::OnFailure => Some("if failed ✗"),
+    }
+}
+
+/// The shell composer's prompt: the last part of the session's last known
+/// cwd, then `$`: `skywave $`, `/ $`, or a bare `$` before any is known.
+pub fn shell_prompt(cwd: Option<&str>) -> String {
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return "$".to_owned();
+    };
+    let trimmed = cwd.trim_end_matches('/');
+    let tail = match trimmed.rsplit_once('/') {
+        _ if trimmed.is_empty() => "/",
+        Some((_, tail)) => tail,
+        None => trimmed,
+    };
+    format!("{tail} $")
+}
+
+/// What a shell run took: from its start to its end, or to `now` while it
+/// runs, as [`took_label`]. `None` for one that never started.
+pub fn shell_took(run: &ShellRun, now: DateTime<Utc>) -> Option<String> {
+    let started = run.started_at?;
+    let end = run.finished_at.unwrap_or(now);
+    Some(took_label((end - started).to_std().unwrap_or_default()))
+}
+
+/// How long a run not started yet has waited, coarse: `queued 40s`,
+/// `queued 12m`, `queued 2h`, `queued 3d`. From its logged request (the
+/// server's clock), or for this device's run not in the log yet from when
+/// it was queued here. `None` once started, for a
+/// [`refused`](ShellRun::refused) run (it is not queued: it will never
+/// run), or for a run whose id carries no time.
+pub fn queued_age(run: &ShellRun, now: DateTime<Utc>) -> Option<String> {
+    if !matches!(run.state, ShellRunState::Pending | ShellRunState::Queued) || run.refused() {
+        return None;
+    }
+    let since = run
+        .requested_at
+        .or(run.delivery.map(|delivery| delivery.queued_at))?;
+    let s = (now - since).to_std().unwrap_or_default().as_secs();
+    let age = match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    };
+    Some(format!("queued {age}"))
+}
+
 #[cfg(test)]
 mod tests {
     use skywave_core::{
@@ -682,6 +763,134 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn every_shell_end_is_worded() {
+        let always = RunWhen::Always;
+        let cases = [
+            (ShellEnd::Exited { code: 0 }, always, "exit 0"),
+            (ShellEnd::Exited { code: 1 }, always, "exit 1"),
+            (
+                ShellEnd::Signalled { signal: 9 },
+                always,
+                "killed by signal 9",
+            ),
+            (ShellEnd::Stopped, always, "stopped"),
+            (
+                ShellEnd::Skipped,
+                RunWhen::OnSuccess,
+                "skipped: previous failed",
+            ),
+            (
+                ShellEnd::Skipped,
+                RunWhen::OnFailure,
+                "skipped: previous succeeded",
+            ),
+            (ShellEnd::Lost, always, "lost: daemon restarted"),
+            (
+                ShellEnd::NotStarted {
+                    reason: "shell disabled".into(),
+                },
+                always,
+                "could not start: shell disabled",
+            ),
+        ];
+        for (end, when, text) in cases {
+            assert_eq!(shell_end_label(&end, when), text, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn run_conditions_read_as_words_not_shell_operators() {
+        assert_eq!(when_marker(RunWhen::Always), None);
+        assert_eq!(when_marker(RunWhen::OnSuccess), Some("if ok ✓"));
+        assert_eq!(when_marker(RunWhen::OnFailure), Some("if failed ✗"));
+        for when in [RunWhen::OnSuccess, RunWhen::OnFailure] {
+            let marker = when_marker(when).unwrap();
+            assert!(!["&&", "||", ";"].iter().any(|op| marker.contains(op)));
+        }
+    }
+
+    #[test]
+    fn the_shell_prompt_names_the_cwd_tail() {
+        assert_eq!(shell_prompt(Some("/srv/skywave")), "skywave $");
+        assert_eq!(shell_prompt(Some("/srv/skywave/")), "skywave $");
+        assert_eq!(shell_prompt(Some("/")), "/ $");
+        assert_eq!(shell_prompt(Some("relative")), "relative $");
+        assert_eq!(shell_prompt(Some("")), "$");
+        assert_eq!(shell_prompt(None), "$");
+    }
+
+    fn shell_run(state: ShellRunState) -> ShellRun {
+        ShellRun {
+            run: skywave_core::CommandId::new(),
+            command: "make".into(),
+            when: RunWhen::Always,
+            by: DeviceRef {
+                id: skywave_core::DeviceId::new(),
+                name: None,
+                me: true,
+            },
+            state,
+            requested_at: None,
+            started_at: None,
+            finished_at: None,
+            tail_or_preview: String::new(),
+            lines: 0,
+            output: None,
+            truncated: false,
+            outgoing: None,
+            discardable: false,
+            stopping: false,
+            delivery: None,
+        }
+    }
+
+    #[test]
+    fn a_run_takes_from_its_start_to_its_end_or_now() {
+        use chrono::TimeZone;
+        let at = |s: i64| Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap();
+        let mut run = shell_run(ShellRunState::Running);
+        assert_eq!(shell_took(&run, at(5)), None, "not started");
+        run.started_at = Some(at(0));
+        assert_eq!(shell_took(&run, at(3)).as_deref(), Some("3.0s"));
+        run.state = ShellRunState::Finished(ShellEnd::Exited { code: 0 });
+        run.finished_at = Some(at(125));
+        assert_eq!(shell_took(&run, at(9000)).as_deref(), Some("2m05s"));
+    }
+
+    #[test]
+    fn a_waiting_run_says_how_long_it_has_been_queued() {
+        use chrono::TimeZone;
+        let at = |s: i64| Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap();
+        let mut run = shell_run(ShellRunState::Queued);
+        assert_eq!(queued_age(&run, at(0)), None, "no time known");
+        run.requested_at = Some(at(0));
+        for (now, text) in [
+            (40, "queued 40s"),
+            (12 * 60 + 5, "queued 12m"),
+            (2 * 3600 + 59, "queued 2h"),
+            (3 * 86_400, "queued 3d"),
+        ] {
+            assert_eq!(queued_age(&run, at(now)).as_deref(), Some(text));
+        }
+        // This device's run not logged yet goes by when it was queued here.
+        let mut pending = shell_run(ShellRunState::Pending);
+        pending.delivery = Some(Delivery {
+            queued_at: at(0),
+            first_sent_at: None,
+            answered_at: None,
+            tries: 0,
+        });
+        assert_eq!(queued_age(&pending, at(90)).as_deref(), Some("queued 1m"));
+        // Refused, it is not queued at all, however long ago it was sent.
+        pending.outgoing = Some(Outgoing::Failed(FailReason::Rejected(
+            RejectReason::BadShellCommand,
+        )));
+        assert_eq!(queued_age(&pending, at(3 * 86_400)), None, "refused");
+        run.state = ShellRunState::Running;
+        assert_eq!(queued_age(&run, at(40)), None, "started");
+    }
 
     fn task(ambient: bool) -> BackgroundTask {
         BackgroundTask {
@@ -1140,7 +1349,7 @@ mod tests {
             draft: None,
             shell_draft: None,
             draft_rev: 0,
-            shell_enabled: false,
+            shell: Default::default(),
             last_seq: skywave_core::Seq(1),
             unread_from: None,
         };

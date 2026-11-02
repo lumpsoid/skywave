@@ -1074,7 +1074,7 @@ impl SessionUi {
     fn recall(&mut self, view: &SessionView, older: bool) {
         if older {
             let composer = &self.composer;
-            if let Some(prompt) = self.history.older(view, || composer.clone()) {
+            if let Some(prompt) = self.history.older(|| view.prompts(), || composer.clone()) {
                 self.composer.replace(prompt);
             }
             return;

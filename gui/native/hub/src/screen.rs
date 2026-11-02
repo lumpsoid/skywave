@@ -815,7 +815,7 @@ mod tests {
             draft: None,
             shell_draft: None,
             draft_rev: 0,
-            shell_enabled: false,
+            shell: Default::default(),
             last_seq: Seq(0),
             unread_from: None,
         };

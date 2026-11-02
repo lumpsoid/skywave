@@ -1047,7 +1047,7 @@ impl Head {
         let next = if older {
             session
                 .history
-                .older(view, || stash)
+                .older(|| view.prompts(), || stash)
                 .map(|prompt| (prompt.to_owned(), prompt.chars().count()))
         } else {
             session.history.newer().map(|recall| match recall {

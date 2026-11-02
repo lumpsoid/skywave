@@ -15,8 +15,8 @@ use uuid::Uuid;
 pub use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, CommandId, ContextId,
     Decision, DeviceId, Effort, ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, TaskId, TaskKind, ToolKind,
-    TurnUsage,
+    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind,
+    ToolKind, TurnUsage,
 };
 
 pub use crate::projection::SessionUsage;
@@ -66,6 +66,38 @@ pub struct Attention {
     /// snapshot, as where it started. Which approvals a bump was for is
     /// each one's [`PendingApprovalRef::alerted_at`].
     pub alerts: u64,
+    /// Bumped once for each shell run of this device's that finished after
+    /// running at least [`SHELL_ALERT_AFTER`], by the server's clock (its
+    /// `ShellStarted` to its `ShellFinished`), unless its session was on
+    /// screen in [`ComposerMode::Shell`] then. A run that never started
+    /// never alerts. Read from the `ShellFinished` alone, so it works for a
+    /// session not open and in a catch-up too: unlike
+    /// [`alerts`](Self::alerts), it is not held back until online.
+    ///
+    /// Counts from 0 in every core and only grows, but unlike `alerts` it
+    /// may already be above 0 in a head's first snapshot (a catch-up at
+    /// start can finish first): heads alert when it grows past 0, not past
+    /// the first snapshot. Nothing is stored: each batch is applied once.
+    pub shell_alerts: u64,
+    /// The run [`shell_alerts`](Self::shell_alerts) was last bumped for.
+    pub last_shell: Option<ShellAlert>,
+}
+
+/// How long a shell run of this device's must have run for its finish to
+/// alert ([`Attention::shell_alerts`]).
+pub const SHELL_ALERT_AFTER: Duration = Duration::from_secs(10);
+
+/// A finished shell run worth an alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellAlert {
+    pub session_id: SessionId,
+    /// The session's title when the run finished, as
+    /// [`SessionRow::title`]. Text from the server: heads sanitise it.
+    pub title: String,
+    /// The command's first line, as the server cut it. Text from the
+    /// server: heads sanitise it.
+    pub command_line: String,
+    pub end: ShellEnd,
 }
 
 /// One pending approval, and which session waits on it.
@@ -522,9 +554,10 @@ pub struct SessionView {
     /// keeps its own copy of the text being written replaces it with
     /// `draft` or `shell_draft` then.
     pub draft_rev: u64,
-    /// Whether the server runs shell commands, as its last `hello` said;
-    /// stored, so it shows offline too. `false` until a server said so.
-    pub shell_enabled: bool,
+    /// The session's shell runs, whatever [`viewing`](Self::viewing) or
+    /// [`subagent`](Self::subagent) narrows the timeline to: they are
+    /// session-wide and never in the timeline.
+    pub shell: ShellView,
     /// Seq of the session's newest event: what
     /// [`Action::MarkRead`](crate::Action::MarkRead) marks through once the
     /// end of the timeline was on screen.
@@ -558,6 +591,108 @@ impl SessionView {
         }
         prompts
     }
+}
+
+/// A session's shell commands as the session view shows them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShellView {
+    /// Whether the server runs shell commands, as its last `hello` said;
+    /// stored, so it shows offline too. `false` until a server said so.
+    pub enabled: bool,
+    /// Where the session's next run starts, as last known: the `cwd` of the
+    /// newest `ShellStarted`, or of a newer `ShellFinished` that knew one,
+    /// whichever is later in the log (the server starts a run where the
+    /// last finished run that knew its cwd ended, or in the workdir when
+    /// that is gone, and `ShellStarted` says which). `None` before any.
+    pub cwd: Option<String>,
+    /// Every device's logged runs in log order, then this device's not yet
+    /// in the log, in send order. Empty of logged runs until the session's
+    /// events are loaded.
+    pub runs: Vec<ShellRun>,
+}
+
+impl ShellView {
+    /// The commands run in the session, newest first, for a head to recall
+    /// into its shell composer: every device's logged runs, then this
+    /// device's not yet logged, a command repeated back to back listed once.
+    pub fn commands(&self) -> Vec<&str> {
+        let mut commands: Vec<&str> = Vec::new();
+        for run in self.runs.iter().rev() {
+            if commands.last() != Some(&run.command.as_str()) {
+                commands.push(&run.command);
+            }
+        }
+        commands
+    }
+}
+
+/// One shell run of a session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShellRun {
+    /// The run's id: its `RunShell` command's. What
+    /// [`Action::StopShell`](crate::Action::StopShell),
+    /// [`Action::Discard`](crate::Action::Discard) and
+    /// [`Action::EditQueued`](crate::Action::EditQueued) name.
+    pub run: CommandId,
+    /// As written, unparsed. Text from the server for another device's.
+    pub command: String,
+    pub when: RunWhen,
+    /// Who asked for it.
+    pub by: DeviceRef,
+    pub state: ShellRunState,
+    /// When the server logged its request; `None` while
+    /// [`Pending`](ShellRunState::Pending) (its [`delivery`](Self::delivery)
+    /// says when this device queued it).
+    pub requested_at: Option<DateTime<Utc>>,
+    /// When it started, by the server's clock; `None` until then and for a
+    /// run that never started.
+    pub started_at: Option<DateTime<Utc>>,
+    /// When it finished, by the server's clock.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// The output's tail: the newest `ShellOutput`'s while running, the
+    /// `ShellFinished` preview once finished; empty before any output.
+    /// ANSI stripped, never ending in a line break. Text from the server.
+    pub tail_or_preview: String,
+    /// The output's line count so far, or in all once finished.
+    pub lines: u32,
+    /// The whole output, once finished, when the preview does not hold it.
+    pub output: Option<BlobView>,
+    /// The preview is cut: [`output`](Self::output) has the rest.
+    pub truncated: bool,
+    /// This device's `RunShell`'s progress, while it is in the outbox.
+    pub outgoing: Option<Outgoing>,
+    /// [`Action::Discard`](crate::Action::Discard) and
+    /// [`Action::EditQueued`](crate::Action::EditQueued) take it back: the
+    /// server never saw it, or refused it.
+    pub discardable: bool,
+    /// A stop of it is on its way or logged: any device's
+    /// `ShellStopRequested`, or this device's `StopShell` not refused. A
+    /// stopping run may still be running for a while (the server's grace
+    /// before it kills).
+    pub stopping: bool,
+    pub delivery: Option<Delivery>,
+}
+
+impl ShellRun {
+    /// This device's run that failed for good on its way (refused, or
+    /// undeliverable): it will never run, though it stays in sight to take
+    /// back.
+    pub fn refused(&self) -> bool {
+        matches!(self.outgoing, Some(Outgoing::Failed(_)))
+    }
+}
+
+/// Where a shell run is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellRunState {
+    /// This device's run not in the log yet: queued here, on its way,
+    /// accepted but not pulled, or refused.
+    Pending,
+    /// Logged, waiting for its turn in the session's queue.
+    Queued,
+    /// Started and not finished.
+    Running,
+    Finished(ShellEnd),
 }
 
 /// One of a session's contexts as a picker lists it.
@@ -1174,7 +1309,7 @@ mod tests {
             draft: None,
             shell_draft: None,
             draft_rev: 0,
-            shell_enabled: false,
+            shell: ShellView::default(),
             last_seq: Seq(6),
             unread_from: None,
         };

@@ -34,10 +34,10 @@ use crate::view::{
     BlobState, BlobView, BodyView, CallId, CommandId, ComposerMode, ContextId, ContextView,
     Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link,
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingApprovalRef, PendingSession, RunWhen, Screen, Seq, SessionId, SessionListView,
-    SessionRef, SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet,
-    SnippetId, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    ViewState,
+    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -180,6 +180,10 @@ pub(crate) struct Model {
     /// What `alerts` was bumped to for each pending approval that alerted
     /// in this process ([`PendingApprovalRef::alerted_at`]); in memory only.
     alerted_at: HashMap<ApprovalId, u64>,
+    /// How often a long shell run of this device's finished
+    /// ([`Attention::shell_alerts`]), and the last one; in memory only.
+    shell_alerts: u64,
+    last_shell: Option<ShellAlert>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
@@ -227,6 +231,8 @@ impl Model {
             alerted: HashSet::new(),
             alerts: 0,
             alerted_at: HashMap::new(),
+            shell_alerts: 0,
+            last_shell: None,
             completer: Completer::default(),
             opening: None,
             devices: HashMap::new(),
@@ -1049,6 +1055,7 @@ impl Model {
                 Some(summary) => summary.apply(seq, event),
                 None => self.sessions.push(SessionSummary::new(seq, event)),
             }
+            self.note_shell_finish(event);
             for blob in blob_refs(&event.kind) {
                 self.blobs.entry(blob.id).or_insert_with(|| BlobRecord {
                     id: blob.id,
@@ -1081,6 +1088,41 @@ impl Model {
         }
         self.sessions.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
         self.note_new_approvals()
+    }
+
+    /// Bumps `shell_alerts` for `event` if it finishes a run of this
+    /// device's that ran at least [`SHELL_ALERT_AFTER`] (both ends the
+    /// server's clock), unless its session is on screen in shell mode. All
+    /// of it is read from the `ShellFinished` itself, so it holds for a
+    /// session not loaded and a run requested in an earlier batch.
+    fn note_shell_finish(&mut self, event: &Event) {
+        let EventKind::ShellFinished {
+            by,
+            started_at: Some(started_at),
+            command_line,
+            end,
+            ..
+        } = &event.kind
+        else {
+            return;
+        };
+        let session_id = event.session_id;
+        let ran = (event.at - *started_at).to_std().unwrap_or_default();
+        let watched = self.open_session() == Some(session_id)
+            && self.composer_mode(session_id) == ComposerMode::Shell;
+        if self.device() != Some(*by) || ran < SHELL_ALERT_AFTER || watched {
+            return;
+        }
+        let Some(title) = self.summary(session_id).map(|s| self.title(s).text) else {
+            return;
+        };
+        self.shell_alerts += 1;
+        self.last_shell = Some(ShellAlert {
+            session_id,
+            title,
+            command_line: command_line.clone(),
+            end: end.clone(),
+        });
     }
 
     pub(crate) fn session_loaded(&mut self, id: SessionId, events: Vec<(Seq, Event)>) {
@@ -1332,6 +1374,8 @@ impl Model {
                 .count(),
             approvals,
             alerts: self.alerts,
+            shell_alerts: self.shell_alerts,
+            last_shell: self.last_shell.clone(),
         }
     }
 
@@ -1560,7 +1604,7 @@ impl Model {
             draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
             shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
-            shell_enabled: self.settings.shell_enabled,
+            shell: self.shell_view(id, events),
             last_seq: summary.last_seq,
             unread_from: open.and_then(|open| open.unread_from),
         })
@@ -1683,6 +1727,149 @@ impl Model {
         }
         stops.reverse();
         stops
+    }
+
+    /// The session's shell runs: the loaded `events` (the open session's)
+    /// folded in log order, then this device's runs not in them yet, as
+    /// pending timeline items are; each marked stopping by a logged stop
+    /// or this device's not refused.
+    fn shell_view(&self, id: SessionId, events: &[(Seq, Event)]) -> ShellView {
+        let outbox: HashMap<CommandId, &OutboxEntry> =
+            self.outbox.iter().map(|e| (e.command.id, e)).collect();
+        let mut runs: Vec<ShellRun> = Vec::new();
+        let mut cwd = None;
+        let find = |runs: &[ShellRun], run: CommandId| -> Option<usize> {
+            runs.iter().position(|r| r.run == run)
+        };
+        for (_, event) in events {
+            match &event.kind {
+                EventKind::ShellRequested { command, when, by } => {
+                    // The server logs each with its command id, the run's.
+                    let Some(run) = event.command_id.filter(|run| find(&runs, *run).is_none())
+                    else {
+                        continue;
+                    };
+                    let sent = outbox.get(&run);
+                    runs.push(ShellRun {
+                        run,
+                        command: command.clone(),
+                        when: *when,
+                        by: DeviceRef {
+                            me: self.is_own_message(sent.is_some(), *by),
+                            ..self.device_ref(*by)
+                        },
+                        state: ShellRunState::Queued,
+                        requested_at: Some(event.at),
+                        started_at: None,
+                        finished_at: None,
+                        tail_or_preview: String::new(),
+                        lines: 0,
+                        output: None,
+                        truncated: false,
+                        outgoing: sent.map(|e| Outgoing::from(&e.status)),
+                        discardable: sent.is_some_and(|e| e.discardable()),
+                        stopping: false,
+                        delivery: sent.and_then(|e| Delivery::of(e)),
+                    });
+                }
+                EventKind::ShellStopRequested { run, .. } => {
+                    if let Some(i) = find(&runs, *run) {
+                        runs[i].stopping = true;
+                    }
+                }
+                EventKind::ShellStarted { run, cwd: started } => {
+                    cwd = Some(started.clone());
+                    if let Some(i) = find(&runs, *run) {
+                        runs[i].state = ShellRunState::Running;
+                        runs[i].started_at = Some(event.at);
+                    }
+                }
+                EventKind::ShellOutput {
+                    run, tail, lines, ..
+                } => {
+                    if let Some(r) = find(&runs, *run)
+                        .map(|i| &mut runs[i])
+                        .filter(|r| r.state == ShellRunState::Running)
+                    {
+                        r.tail_or_preview.clone_from(tail);
+                        r.lines = *lines;
+                    }
+                }
+                EventKind::ShellFinished {
+                    run,
+                    started_at,
+                    end,
+                    cwd: ended,
+                    preview,
+                    lines,
+                    output,
+                    truncated,
+                    ..
+                } => {
+                    if let Some(ended) = ended {
+                        cwd = Some(ended.clone());
+                    }
+                    if let Some(i) = find(&runs, *run) {
+                        let r = &mut runs[i];
+                        r.state = ShellRunState::Finished(end.clone());
+                        r.started_at = started_at.or(r.started_at);
+                        r.finished_at = Some(event.at);
+                        r.tail_or_preview.clone_from(preview);
+                        r.lines = *lines;
+                        r.output = output.as_ref().map(|b| self.blob_view(b));
+                        r.truncated = *truncated;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(me) = self.device() {
+            let logged: HashSet<CommandId> = runs.iter().map(|r| r.run).collect();
+            runs.extend(self.outbox.iter().filter_map(|e| match &e.command.kind {
+                CommandKind::RunShell {
+                    session_id,
+                    command,
+                    when,
+                } if *session_id == id && !logged.contains(&e.command.id) => Some(ShellRun {
+                    run: e.command.id,
+                    command: command.clone(),
+                    when: *when,
+                    by: DeviceRef {
+                        me: true,
+                        ..self.device_ref(me)
+                    },
+                    state: ShellRunState::Pending,
+                    requested_at: None,
+                    started_at: None,
+                    finished_at: None,
+                    tail_or_preview: String::new(),
+                    lines: 0,
+                    output: None,
+                    truncated: false,
+                    outgoing: Some(Outgoing::from(&e.status)),
+                    discardable: e.discardable(),
+                    stopping: false,
+                    delivery: Delivery::of(e),
+                }),
+                _ => None,
+            }));
+        }
+        // This device's stops, unless refused: one accepted but not yet
+        // pulled is as good as logged.
+        for e in &self.outbox {
+            if let CommandKind::StopShell { session_id, run } = &e.command.kind
+                && *session_id == id
+                && !matches!(Outgoing::from(&e.status), Outgoing::Failed(_))
+                && let Some(i) = find(&runs, *run)
+            {
+                runs[i].stopping = true;
+            }
+        }
+        ShellView {
+            enabled: self.settings.shell_enabled,
+            cwd,
+            runs,
+        }
     }
 
     /// The session's agent settings: the summary's fold, with this device's
@@ -2153,7 +2340,8 @@ impl Model {
                     tools.unanswered(&mut items, calls);
                     None
                 }
-                // Not shown yet: the shell timeline entry comes later.
+                // Shell runs are session-wide, not the agent's: they fold
+                // into `SessionView::shell` (`Model::shell_view`) instead.
                 EventKind::ShellRequested { .. }
                 | EventKind::ShellStopRequested { .. }
                 | EventKind::ShellStarted { .. }

@@ -1230,7 +1230,7 @@ async fn a_move_of_a_context_made_current_meanwhile_is_refused_and_discarded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shell_flag_from_hello_is_kept_for_offline() {
     let shown = |view: &ViewState| match &view.screen {
-        Screen::Session(session) => Some(session.shell_enabled),
+        Screen::Session(session) => Some(session.shell.enabled),
         _ => None,
     };
     for shell in [true, false] {
