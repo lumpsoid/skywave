@@ -6,7 +6,9 @@
 
 use std::ffi::CString;
 use std::io::Read;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -630,8 +632,86 @@ async fn fd_3_is_closed_to_the_command() {
     runner.shutdown().await.unwrap();
 }
 
+/// Set in the copy of this test binary that [`there_is_no_controlling_terminal`]
+/// starts on a pty.
+const ON_A_TERMINAL: &str = "SKYWAVE_TEST_ON_A_TERMINAL";
+
+/// `cargo test` has no controlling terminal, so the runner here would pass
+/// without its shell's `setsid`. The test reruns itself as a session leader
+/// with a pty as its terminal, and runs the shell there: without `setsid`
+/// the shell would inherit that terminal and `cat /dev/tty` would block,
+/// since nobody ever writes to the pty.
 #[tokio::test]
 async fn there_is_no_controlling_terminal() {
+    if std::env::var_os(ON_A_TERMINAL).is_some() {
+        return no_terminal_from_a_terminal().await;
+    }
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes the two fds; null name, termios and winsize
+    // ask for the defaults.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty just opened both fds; nothing else owns them.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "there_is_no_controlling_terminal",
+            "--test-threads=1",
+        ])
+        .env(ON_A_TERMINAL, "1")
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // SAFETY: the closure runs in the forked child before exec and only
+    // calls setsid and ioctl, which are async-signal-safe, and builds
+    // errors without allocating.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Stdin, the pty's slave, becomes the new session's terminal.
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(command);
+    // The bound only guards a hang: the copy waits at most `WAIT` itself.
+    let output = tokio::time::timeout(2 * WAIT, child.wait_with_output())
+        .await
+        .expect("the run on a terminal ends")
+        .unwrap();
+    drop(master);
+    assert!(
+        output.status.success(),
+        "the test on a terminal failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // The copy really ran the test, not nothing.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}
+
+/// [`there_is_no_controlling_terminal`] in the copy whose terminal is a pty.
+async fn no_terminal_from_a_terminal() {
+    // The copy has a terminal; otherwise the test proves nothing.
+    let tty = std::fs::File::open("/dev/tty").expect("the test runs on a terminal");
+    drop(tty);
     let mut f = Fixture::new();
     let runner = f.start().await;
     let run = f.run("cat /dev/tty");
@@ -640,6 +720,7 @@ async fn there_is_no_controlling_terminal() {
         matches!(finished.end, ShellEnd::Exited { code } if code != 0),
         "{finished:?}"
     );
+    assert!(finished.preview.contains("/dev/tty"), "{finished:?}");
     runner.shutdown().await.unwrap();
 }
 
