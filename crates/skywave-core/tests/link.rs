@@ -539,7 +539,7 @@ async fn first_answer_wins_across_devices() {
         Decision::Approve => count(&events, |k| matches!(k, EventKind::ToolResult { .. })),
         Decision::Deny => count(
             &events,
-            |k| matches!(k, EventKind::AgentMessage { text } if text == "Not writing it."),
+            |k| matches!(k, EventKind::AgentMessage { text, .. } if text == "Not writing it."),
         ),
     };
     assert_eq!(followed, 1);

@@ -731,6 +731,7 @@ mod tests {
 
     fn task(id: &str, parent: Option<&str>, ambient: bool) -> BackgroundTask {
         BackgroundTask {
+            call: None,
             id: TaskId(id.into()),
             kind: TaskKind::Shell,
             title: format!("run {id}"),

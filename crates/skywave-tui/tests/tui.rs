@@ -1468,6 +1468,7 @@ fn every_timeline_entry_renders_distinctly() {
                 id,
                 2,
                 EventKind::AgentMessage {
+                    parent: None,
                     text: "Looking.\nSecond line".into(),
                 },
             ),
@@ -1475,6 +1476,7 @@ fn every_timeline_entry_renders_distinctly() {
                 id,
                 3,
                 EventKind::ToolCall(ToolCall {
+                    parent: None,
                     call: None,
                     name: "shell".into(),
                     display: ToolDisplay {
@@ -2154,6 +2156,7 @@ fn movable_context() -> (Harness, SessionId, DeviceId) {
                 id,
                 3,
                 EventKind::AgentMessage {
+                    parent: None,
                     text: "alpha answer".into(),
                 },
             ),
@@ -2406,6 +2409,7 @@ fn tool_output_expands_through_every_blob_state() {
                 id,
                 1,
                 EventKind::ToolCall(ToolCall {
+                    parent: None,
                     call: None,
                     name: "shell".into(),
                     display: ToolDisplay {
@@ -2539,6 +2543,7 @@ fn footer_names_blob_size() {
             id,
             1,
             EventKind::ToolCall(ToolCall {
+                parent: None,
                 call: None,
                 name: "write".into(),
                 display: ToolDisplay {
@@ -2615,6 +2620,7 @@ fn timeline_follows_new_items_until_scrolled_back() {
                     id,
                     1,
                     EventKind::AgentMessage {
+                        parent: None,
                         text: format!("message {i:02}"),
                     },
                 )
@@ -2664,6 +2670,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
         id,
         1,
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: None,
             name: "early".into(),
             display: ToolDisplay {
@@ -2680,6 +2687,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
             id,
             2,
             EventKind::AgentMessage {
+                parent: None,
                 text: format!("chatter {i}"),
             },
         )
@@ -2688,6 +2696,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
         id,
         3,
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: None,
             name: "late".into(),
             display: ToolDisplay {
@@ -3239,6 +3248,7 @@ fn a_grouped_tool_call_shows_its_approval_and_result() {
                 id,
                 1,
                 EventKind::ToolCall(ToolCall {
+                    parent: None,
                     call: Some(call),
                     name: "Write".into(),
                     display: ToolDisplay {
@@ -3305,6 +3315,7 @@ fn at_s(minute: u32, second: u32) -> DateTime<Utc> {
 
 fn call(call: CallId, name: &str, kind: ToolKind, title: &str) -> ToolCall {
     ToolCall {
+        parent: None,
         call: Some(call),
         name: name.into(),
         display: ToolDisplay {
@@ -3346,7 +3357,10 @@ fn user(device: DeviceId, text: &str) -> EventKind {
 }
 
 fn agent(text: &str) -> EventKind {
-    EventKind::AgentMessage { text: text.into() }
+    EventKind::AgentMessage {
+        parent: None,
+        text: text.into(),
+    }
 }
 
 /// What the wall clock reads in the mock-up: 42 s into the running call.
@@ -6334,6 +6348,7 @@ fn task(
     ambient: bool,
 ) -> skywave_proto::BackgroundTask {
     skywave_proto::BackgroundTask {
+        call: None,
         id: skywave_proto::TaskId(id.into()),
         kind,
         title: title.into(),
@@ -6482,6 +6497,7 @@ fn moving_the_current_context_warns_but_another_does_not() {
                 id,
                 3,
                 EventKind::AgentMessage {
+                    parent: None,
                     text: "alpha answer".into(),
                 },
             ),

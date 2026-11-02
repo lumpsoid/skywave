@@ -135,7 +135,7 @@ async fn offline_queue_drains_exactly_once() {
     let echoed = |events: &[Event]| {
         count(
             events,
-            |k| matches!(k, EventKind::AgentMessage { text } if text.starts_with("echo:")),
+            |k| matches!(k, EventKind::AgentMessage { text, .. } if text.starts_with("echo:")),
         ) == texts.len()
             && events
                 .iter()
@@ -445,7 +445,7 @@ async fn withdrawn_message_never_reaches_the_server() {
             view.queued == 0
                 && count(
                     &events,
-                    |k| matches!(k, EventKind::AgentMessage { text } if text.starts_with("echo:")),
+                    |k| matches!(k, EventKind::AgentMessage { text, .. } if text.starts_with("echo:")),
                 ) == 1
                 && c.cursor() == Seq(events.len() as u64)
         })

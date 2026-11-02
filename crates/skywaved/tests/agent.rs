@@ -272,6 +272,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     assert_eq!(
         kinds[2],
         EventKind::AgentMessage {
+            parent: None,
             text: "Looking around.".into()
         }
     );
@@ -280,6 +281,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     assert_eq!(
         kinds[3],
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: Some(shell),
             name: "shell".into(),
             display: ToolDisplay {
@@ -345,6 +347,7 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     assert_eq!(
         kinds[9],
         EventKind::AgentMessage {
+            parent: None,
             text: "Done.".into()
         }
     );
@@ -507,11 +510,13 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
         [
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
+                parent: None,
                 text: "working".into()
             },
             state(SessionState::Idle),
             state(SessionState::AgentWorking),
             EventKind::AgentMessage {
+                parent: None,
                 text: "released".into()
             },
             state(SessionState::Idle),
@@ -564,6 +569,7 @@ async fn denied_approval_runs_the_deny_branch() {
     assert_eq!(
         kinds[n - 2],
         EventKind::AgentMessage {
+            parent: None,
             text: "Skipping.".into()
         }
     );
@@ -1213,6 +1219,7 @@ fn content_shown_whole_makes_no_blob() {
     assert_eq!(
         kinds[1],
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: Some(call),
             name: "shell".into(),
             display: ToolDisplay {
@@ -1648,6 +1655,7 @@ fn agent_task(id: &str, title: &str) -> AgentTask {
 
 fn logged_task(id: &str, title: &str) -> BackgroundTask {
     BackgroundTask {
+        call: None,
         id: TaskId(id.to_owned()),
         kind: TaskKind::Shell,
         title: title.to_owned(),

@@ -85,9 +85,15 @@ fn all_event_kinds() -> Vec<EventKind> {
             text: "run the tests".into(),
         },
         EventKind::AgentMessage {
+            parent: None,
             text: "Running cargo test.".into(),
         },
+        EventKind::AgentMessage {
+            parent: Some(call()),
+            text: "Found three call sites.".into(),
+        },
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: Some(call()),
             name: "exec".into(),
             display: ToolDisplay {
@@ -99,6 +105,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             input: None,
         }),
         EventKind::ToolCall(ToolCall {
+            parent: Some(call()),
             call: Some(call()),
             name: "patch".into(),
             display: ToolDisplay {
@@ -115,6 +122,7 @@ fn all_event_kinds() -> Vec<EventKind> {
             input: Some(blob()),
         }),
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: None,
             name: "put".into(),
             display: ToolDisplay {
@@ -298,6 +306,7 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::BackgroundTasksChanged {
             tasks: vec![
                 BackgroundTask {
+                    call: Some(call()),
                     id: TaskId("a1b2c3".into()),
                     kind: TaskKind::Subagent,
                     title: "Explore the codebase".into(),
@@ -305,6 +314,7 @@ fn all_event_kinds() -> Vec<EventKind> {
                     ambient: false,
                 },
                 BackgroundTask {
+                    call: None,
                     id: TaskId("d4e5f6".into()),
                     kind: TaskKind::Shell,
                     title: "cargo test".into(),
@@ -312,6 +322,7 @@ fn all_event_kinds() -> Vec<EventKind> {
                     ambient: true,
                 },
                 BackgroundTask {
+                    call: None,
                     id: TaskId("g7".into()),
                     kind: TaskKind::Other,
                     title: "workflow".into(),
@@ -347,6 +358,9 @@ fn all_event_kinds() -> Vec<EventKind> {
             task: TaskId("a1b2c3".into()),
             reason: "agent not running".into(),
             answers: Some(command()),
+        },
+        EventKind::CallsUnanswered {
+            calls: vec![call()],
         },
     ]
 }
@@ -562,58 +576,6 @@ fn decode(json: &str) -> EventKind {
     serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}"))
 }
 
-/// Literal events as a v1 server wrote them still decode.
-#[test]
-fn v1_tool_call_decodes_with_an_other_display() {
-    let kind = decode(
-        r#"{"type":"tool_call","name":"exec","summary":"cargo test","input":{"id":"01920000-0000-7000-8000-000000000005","size":48213}}"#,
-    );
-    assert_eq!(
-        kind,
-        EventKind::ToolCall(ToolCall {
-            call: None,
-            name: "exec".into(),
-            display: ToolDisplay {
-                kind: ToolKind::Other,
-                title: "cargo test".into(),
-                detail: None,
-                body: None,
-            },
-            input: Some(blob()),
-        })
-    );
-    let kind = decode(r#"{"type":"tool_call","name":"exec","summary":"ls","input":null}"#);
-    let EventKind::ToolCall(call) = kind else {
-        panic!("{kind:?}")
-    };
-    assert_eq!(call.display.title, "ls");
-    assert_eq!(call.input, None);
-}
-
-#[test]
-fn v1_tool_result_decodes_with_the_summary_as_preview() {
-    let kind =
-        decode(r#"{"type":"tool_result","summary":"[error] line one\nline two","output":null}"#);
-    assert_eq!(
-        kind,
-        EventKind::ToolResult(ToolResult {
-            call: None,
-            is_error: false,
-            status: None,
-            preview: "[error] line one\nline two".into(),
-            lines: 2,
-            output: None,
-        })
-    );
-    let kind = decode(
-        r#"{"type":"tool_result","summary":"(no output)","output":{"id":"01920000-0000-7000-8000-000000000005","size":48213}}"#,
-    );
-    let EventKind::ToolResult(result) = kind else {
-        panic!("{kind:?}")
-    };
-    assert_eq!((result.lines, result.output), (1, Some(blob())));
-}
-
 #[test]
 fn v1_approval_requested_decodes_without_a_call() {
     let kind = decode(
@@ -806,19 +768,8 @@ fn a_conversation_id_is_trimmed_and_otherwise_kept_or_refused() {
 }
 
 #[test]
-fn tool_events_without_display_or_summary_are_rejected() {
-    for json in [
-        r#"{"type":"tool_call","name":"exec","input":null}"#,
-        r#"{"type":"tool_result","output":null}"#,
-        r#"{"type":"tool_result","preview":"half","output":null}"#,
-    ] {
-        assert!(serde_json::from_str::<EventKind>(json).is_err(), "{json}");
-    }
-}
-
-#[test]
-fn protocol_is_v12() {
-    assert_eq!(PROTOCOL_VERSION, 12);
+fn protocol_is_v13() {
+    assert_eq!(PROTOCOL_VERSION, 13);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     // A session's first context has the session's own id.
@@ -854,6 +805,7 @@ fn display_caps() {
 #[test]
 fn agent_work_keeps_the_last_set_of_each() {
     let task = |id: &str| BackgroundTask {
+        call: None,
         id: TaskId(id.into()),
         kind: TaskKind::Shell,
         title: id.into(),
@@ -878,7 +830,10 @@ fn agent_work_keeps_the_last_set_of_each() {
         EventKind::BackgroundTasksChanged {
             tasks: vec![task("c")],
         },
-        EventKind::AgentMessage { text: "x".into() },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "x".into(),
+        },
     ] {
         work.apply(&kind);
     }
@@ -949,7 +904,10 @@ fn batch_assigns_contiguous_seqs() {
         events: vec![
             event(EventKind::TurnInterrupted),
             event(EventKind::SessionStateChanged(SessionState::Idle)),
-            event(EventKind::AgentMessage { text: "ok".into() }),
+            event(EventKind::AgentMessage {
+                parent: None,
+                text: "ok".into(),
+            }),
         ],
     };
     let seqs: Vec<Seq> = batch.iter().map(|(seq, _)| seq).collect();

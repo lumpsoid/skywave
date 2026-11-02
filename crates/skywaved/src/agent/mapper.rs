@@ -255,7 +255,11 @@ impl EventMapper {
                 }
             }
             AdapterEvent::Text(text) => {
-                seqs.push(self.append(log, storage, EventKind::AgentMessage { text })?);
+                seqs.push(self.append(
+                    log,
+                    storage,
+                    EventKind::AgentMessage { parent: None, text },
+                )?);
             }
             AdapterEvent::ToolCall {
                 call,
@@ -279,6 +283,7 @@ impl EventMapper {
                     log,
                     storage,
                     EventKind::ToolCall(ToolCall {
+                        parent: None,
                         call: Some(id),
                         name,
                         display,
@@ -805,6 +810,7 @@ fn cut_tasks(tasks: Vec<AgentTask>) -> Vec<BackgroundTask> {
         .filter(|task| fits(&task.id))
         .take(TASKS_MAX)
         .map(|task| BackgroundTask {
+            call: None,
             id: proto::TaskId(task.id),
             kind: task.kind,
             title: cut_line(&task.title, TITLE_MAX_CHARS).0,

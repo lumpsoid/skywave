@@ -689,6 +689,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     let (_tmp, dir) = data_dir();
     let id = SessionId::new();
     let task = BackgroundTask {
+        call: None,
         id: TaskId("b7".into()),
         kind: TaskKind::Shell,
         title: "npm run dev".into(),
@@ -756,7 +757,14 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
                 from: Seq(4),
                 events: vec![
                     event(id, 3, EventKind::BackgroundTasksChanged { tasks: vec![] }),
-                    event(id, 4, EventKind::AgentMessage { text: "hi".into() }),
+                    event(
+                        id,
+                        4,
+                        EventKind::AgentMessage {
+                            parent: None,
+                            text: "hi".into(),
+                        },
+                    ),
                 ],
             },
             Utc::now(),
@@ -981,7 +989,14 @@ fn notable_count_is_projected_and_backfilled() {
                 3,
                 EventKind::SessionStateChanged(SessionState::AgentWorking),
             ),
-            event(a, 4, EventKind::AgentMessage { text: "ok".into() }),
+            event(
+                a,
+                4,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "ok".into(),
+                },
+            ),
             event(
                 a,
                 5,
@@ -1787,7 +1802,14 @@ fn alerted_approvals_are_kept_until_they_stop_pending() {
                             rule: None,
                         },
                     ),
-                    event(a, 6, EventKind::AgentMessage { text: "ok".into() }),
+                    event(
+                        a,
+                        6,
+                        EventKind::AgentMessage {
+                            parent: None,
+                            text: "ok".into(),
+                        },
+                    ),
                 ],
             },
             Utc::now(),
@@ -1922,7 +1944,14 @@ fn a_v8_replica_moves_into_first_contexts() {
             events: vec![
                 created(session),
                 created(other),
-                event(session, 1, EventKind::AgentMessage { text: "hi".into() }),
+                event(
+                    session,
+                    1,
+                    EventKind::AgentMessage {
+                        parent: None,
+                        text: "hi".into(),
+                    },
+                ),
             ],
         };
         store.apply_batch(&batch, Utc::now()).unwrap();
