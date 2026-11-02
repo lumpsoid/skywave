@@ -244,6 +244,20 @@ pub fn task(id: &str, ambient: bool) -> AgentTask {
         title: format!("task {id}"),
         parent: None,
         ambient,
+        call: None,
+    }
+}
+
+/// A background subagent task `id` for [`Step::tasks`], running the agent's
+/// call `call`.
+pub fn subagent_task(id: &str, call: &str) -> AgentTask {
+    AgentTask {
+        id: id.to_owned(),
+        kind: TaskKind::Subagent,
+        title: format!("subagent {id}"),
+        parent: None,
+        ambient: false,
+        call: Some(call.into()),
     }
 }
 
@@ -260,12 +274,16 @@ pub fn schedule(id: &str) -> AgentSchedule {
 
 impl Step {
     pub fn text(text: impl Into<String>) -> Step {
-        Step::Emit(AdapterEvent::Text(text.into()))
+        Step::Emit(AdapterEvent::Text {
+            text: text.into(),
+            parent: None,
+        })
     }
 
     pub fn tool_call(name: impl Into<String>, input: Value) -> Step {
         Step::Emit(AdapterEvent::ToolCall {
             call: None,
+            parent: None,
             name: name.into(),
             input,
             display: None,
@@ -360,6 +378,19 @@ impl Step {
             )
             | Step::Approval { call, .. } => *call = Some(id.into()),
             _ => {}
+        }
+        self
+    }
+
+    /// Names the agent's call `id` as the parent of a text or tool call
+    /// step: a step of the subagent that call started. No effect on other
+    /// steps.
+    pub fn parent(mut self, id: &str) -> Step {
+        if let Step::Emit(
+            AdapterEvent::Text { parent, .. } | AdapterEvent::ToolCall { parent, .. },
+        ) = &mut self
+        {
+            *parent = Some(id.into());
         }
         self
     }

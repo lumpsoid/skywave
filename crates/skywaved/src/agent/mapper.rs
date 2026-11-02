@@ -37,14 +37,14 @@ const AGENT_EXITED: &str = "agent exited";
 /// | adapter event | log |
 /// |---------------|-----|
 /// | `TurnStarted` | `SessionStateChanged(AgentWorking)` |
-/// | `Text` | `AgentMessage` |
-/// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display |
+/// | `Text` | `AgentMessage`, `parent` linked to its call |
+/// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display, `parent` linked to its call |
 /// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
 /// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call; a task's (`task` set) is kept apart from the turn's |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
-/// | `TurnEnded(Completed \| Interrupted)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Idle)` |
-/// | `TurnEnded(Failed)` | the turn's leftover approvals cancelled (not a task's), `SessionStateChanged(Errored)` |
+/// | `TurnEnded(Completed \| Interrupted)` | the turn's leftover approvals cancelled (not a task's), `CallsUnanswered` for the turn's open calls, `SessionStateChanged(Idle)` |
+/// | `TurnEnded(Failed)` | the turn's leftover approvals cancelled (not a task's), `CallsUnanswered` for the turn's open calls, `SessionStateChanged(Errored)` |
 /// | `ResumeHandle` | stored in `contexts.agent_state` for the mapper's context, no event |
 /// | `Grants` | stored in `sessions.agent_grants` for the mapper's session (whichever context), no event |
 /// | `PermissionMode` / `Model` / `Effort` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering nothing, only when it differs from what the log has |
@@ -53,7 +53,8 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
 /// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
 /// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
-/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped; `Errored` if a turn was open or the exit was abnormal |
+/// | `BackgroundTasks` | `CallsUnanswered` for the open calls of the subagents whose task left, then `BackgroundTasksChanged` if the set changed, `call` linked to its call |
+/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped, `CallsUnanswered` for every open call; `Errored` if a turn was open or the exit was abnormal |
 ///
 /// **Settings.** The supervisor tells the mapper of every mode, model or
 /// effort request it hands the agent ([`EventMapper::asked_mode`],
@@ -71,9 +72,37 @@ const AGENT_EXITED: &str = "agent exited";
 /// refused: the empty task set logged on exit settles them.
 ///
 /// **Calls.** Every `ToolCall` gets a fresh [`CallId`]. The mapper remembers
-/// which [`AgentCallId`] it stands for until the turn ends; a result or
-/// approval naming that id carries the same [`CallId`], one naming no id or
-/// an unknown one carries `call: None`.
+/// which [`AgentCallId`] it stands for; a result or approval naming that id
+/// carries the same [`CallId`], so does a text or call naming it as its
+/// `parent`, and a task naming it as its `call`. One naming no id or an
+/// unknown one carries `None`: a subagent's step whose parent is unknown
+/// shows on the main timeline rather than vanishing.
+///
+/// A call is the turn's unless its nearest ancestor through `parent` that
+/// some reported task runs (a *root*) is found: then it is that task's.
+/// How long the mapper remembers a call:
+/// - a root, until `Exited`: one call can run several times, its task
+///   leaving the set and coming back, woken by a shell it started even
+///   after the turn that launched it ended;
+/// - a task's call, while the task is live, and past it until the turn
+///   ends if one is open (or right away if none is); its result does not
+///   end it, as a nested subagent's root may be answered before any task
+///   names it;
+/// - any other call (the main agent's, a foreground subagent's), until the
+///   turn ends.
+///
+/// The mapper tracks whether each logged call is settled: its result came,
+/// or it was named unanswered. It logs one `CallsUnanswered` naming the
+/// open calls, in log order (nothing if none is open), wherever it knows
+/// they are abandoned: at `TurnEnded` the turn's (main agent, subagents
+/// with no live task), just before the closing `SessionStateChanged`; on
+/// `BackgroundTasks` those of the tasks that left the set (a task that
+/// stopped has no call in flight; one woken again makes new calls), just
+/// before the set change; on `Exited` all of them. A call the agent gave
+/// no id is open for good, as no result can name it. Tasks that left are
+/// found from the agent's whole report, not the cut set logged. A result
+/// for a call already named is still linked while the mapper remembers
+/// the call.
 ///
 /// **Bounds.** Every event is cut to `skywave_proto::limits`, whatever the
 /// adapter handed over: a title, detail or status to its first non-blank
@@ -125,8 +154,14 @@ pub struct EventMapper {
     /// Approvals this mapper logged that no answer has taken yet, oldest
     /// first.
     approvals: Vec<LoggedApproval>,
-    /// Calls logged in the current turn, by the agent's id.
+    /// Calls logged and remembered, by the agent's id (see **Calls.**).
     calls: HashMap<AgentCallId, LoggedCall>,
+    /// Calls logged with no agent id, all open: no result can name them.
+    unlinked: Vec<UnlinkedCall>,
+    /// The calls any task reported since start has run: the roots.
+    roots: HashSet<AgentCallId>,
+    /// The calls the tasks of the last reported set run.
+    live: HashSet<AgentCallId>,
     /// A `TurnStarted` has been seen and its `TurnEnded` not yet.
     turn_open: bool,
     /// The session's mode, model and effort as the log has them.
@@ -158,9 +193,23 @@ struct LoggedApproval {
 #[derive(Debug)]
 struct LoggedCall {
     id: CallId,
+    seq: Seq,
+    /// The call that started the subagent that made it, as remembered when
+    /// it was logged.
+    parent: Option<AgentCallId>,
+    /// Its result came, or it was named unanswered.
+    settled: bool,
     /// The title as logged.
     title: String,
     input: Value,
+}
+
+/// A logged call the agent gave no id.
+#[derive(Debug)]
+struct UnlinkedCall {
+    id: CallId,
+    seq: Seq,
+    parent: Option<AgentCallId>,
 }
 
 impl EventMapper {
@@ -177,6 +226,9 @@ impl EventMapper {
             context,
             approvals: Vec::new(),
             calls: HashMap::new(),
+            unlinked: Vec::new(),
+            roots: HashSet::new(),
+            live: HashSet::new(),
             turn_open: false,
             settings,
             work,
@@ -254,45 +306,69 @@ impl EventMapper {
                     )?);
                 }
             }
-            AdapterEvent::Text(text) => {
-                seqs.push(self.append(
-                    log,
-                    storage,
-                    EventKind::AgentMessage { parent: None, text },
-                )?);
+            AdapterEvent::Text { text, parent } => {
+                let parent = self.linked(parent.as_ref()).map(|c| c.id);
+                seqs.push(self.append(log, storage, EventKind::AgentMessage { parent, text })?);
             }
             AdapterEvent::ToolCall {
                 call,
+                parent,
                 name,
                 input,
                 display,
             } => {
                 let id = CallId::new();
                 let (display, input_blob) = call_display(storage, &input, display)?;
-                if let Some(agent_id) = call {
-                    let logged = LoggedCall {
-                        id,
-                        title: display.title.clone(),
-                        input,
-                    };
-                    if let Some(earlier) = self.calls.insert(agent_id, logged) {
-                        tracing::debug!(call = %earlier.id.0, "agent reused a call id; linking the newer call");
-                    }
-                }
-                seqs.push(self.append(
+                let parent = parent.filter(|p| self.linked(Some(p)).is_some());
+                let title = display.title.clone();
+                let seq = self.append(
                     log,
                     storage,
                     EventKind::ToolCall(ToolCall {
-                        parent: None,
+                        parent: parent.as_ref().map(|p| self.calls[p].id),
                         call: Some(id),
                         name,
                         display,
                         input: input_blob,
                     }),
-                )?);
+                )?;
+                seqs.push(seq);
+                match call {
+                    Some(agent_id) => {
+                        let logged = LoggedCall {
+                            id,
+                            seq,
+                            parent,
+                            settled: false,
+                            title,
+                            input,
+                        };
+                        if let Some(earlier) = self.calls.insert(agent_id, logged) {
+                            tracing::debug!(call = %earlier.id.0, "agent reused a call id; linking the newer call");
+                            // No result can name the earlier one now.
+                            if !earlier.settled {
+                                self.unlinked.push(UnlinkedCall {
+                                    id: earlier.id,
+                                    seq: earlier.seq,
+                                    parent: earlier.parent,
+                                });
+                            }
+                        }
+                    }
+                    None => self.unlinked.push(UnlinkedCall { id, seq, parent }),
+                }
             }
             AdapterEvent::ToolResult { call, result } => {
-                let call = self.linked(call.as_ref()).map(|c| c.id);
+                let call = match call.as_ref().and_then(|c| self.calls.get_mut(c)) {
+                    Some(logged) => {
+                        logged.settled = true;
+                        Some(logged.id)
+                    }
+                    None => {
+                        self.linked(call.as_ref());
+                        None
+                    }
+                };
                 let result = tool_result(storage, call, result)?;
                 seqs.push(self.append(log, storage, EventKind::ToolResult(result))?);
             }
@@ -362,7 +438,6 @@ impl EventMapper {
             }
             AdapterEvent::TurnEnded(outcome) => {
                 self.turn_open = false;
-                self.calls.clear();
                 let (reason, state) = match outcome {
                     TurnOutcome::Completed => (TURN_ENDED, SessionState::Idle),
                     TurnOutcome::Interrupted => (TURN_INTERRUPTED, SessionState::Idle),
@@ -370,6 +445,10 @@ impl EventMapper {
                 };
                 // A backstop: the adapter cancels the turn's own first.
                 self.cancel_pending(log, storage, reason, |a| !a.of_task, &mut seqs)?;
+                // The turn's calls: those of no live task.
+                let live = self.live.clone();
+                let turns = |owner: Option<&AgentCallId>| owner.is_none_or(|o| !live.contains(o));
+                self.abandon(log, storage, turns, true, &mut seqs)?;
                 seqs.push(self.append(log, storage, EventKind::SessionStateChanged(state))?);
             }
             AdapterEvent::ResumeHandle(handle) => {
@@ -457,7 +536,20 @@ impl EventMapper {
                 tracing::debug!("models offered reach the log through the supervisor");
             }
             AdapterEvent::BackgroundTasks(tasks) => {
-                let tasks = cut_tasks(tasks);
+                // The whole report, not the cut set: a task cut from the
+                // log still runs its call.
+                let live: HashSet<AgentCallId> =
+                    tasks.iter().filter_map(|t| t.call.clone()).collect();
+                self.roots.extend(live.iter().cloned());
+                let left: HashSet<AgentCallId> = self.live.difference(&live).cloned().collect();
+                self.live = live;
+                if !left.is_empty() {
+                    let forget = !self.turn_open;
+                    let of_left =
+                        |owner: Option<&AgentCallId>| owner.is_some_and(|o| left.contains(o));
+                    self.abandon(log, storage, of_left, forget, &mut seqs)?;
+                }
+                let tasks = cut_tasks(tasks, &self.calls);
                 if tasks != self.work.tasks {
                     seqs.push(self.append(
                         log,
@@ -501,7 +593,10 @@ impl EventMapper {
                 self.refuse_asked(log, storage, &mut seqs)?;
                 // The empty set logged below settles them.
                 self.asked_stops.clear();
+                self.abandon(log, storage, |_| true, true, &mut seqs)?;
                 self.calls.clear();
+                self.roots.clear();
+                self.live.clear();
                 // Nothing outlives the process, durable schedules included.
                 if !self.work.tasks.is_empty() {
                     let kind = EventKind::BackgroundTasksChanged { tasks: Vec::new() };
@@ -608,14 +703,82 @@ impl EventMapper {
         Ok(())
     }
 
-    /// The call logged in this turn for the agent's `call`, if any.
+    /// The call remembered for the agent's `call`, if any.
     fn linked(&self, call: Option<&AgentCallId>) -> Option<&LoggedCall> {
         let call = call?;
         let logged = self.calls.get(call);
         if logged.is_none() {
-            tracing::debug!(call = %call.0, "agent named a call not logged in this turn");
+            tracing::debug!(call = %call.0, "agent named a call not logged or no longer remembered");
         }
         logged
+    }
+
+    /// The root that owns a call made under `parent`: the nearest of
+    /// `parent` and its ancestors some task runs. `None` for the turn's.
+    fn owner<'a>(&'a self, parent: Option<&'a AgentCallId>) -> Option<&'a AgentCallId> {
+        let mut at = parent;
+        // Bounded: a reused id could close a loop.
+        for _ in 0..=self.calls.len() {
+            let id = at?;
+            if self.roots.contains(id) {
+                return Some(id);
+            }
+            at = self.calls.get(id).and_then(|c| c.parent.as_ref());
+        }
+        None
+    }
+
+    /// Logs one `CallsUnanswered` for the open calls whose owner `owned`
+    /// picks, in log order, settling them; nothing if none is open. With
+    /// `forget`, the picked calls are forgotten too, roots aside.
+    fn abandon(
+        &mut self,
+        log: &EventLog,
+        storage: &mut Storage,
+        owned: impl Fn(Option<&AgentCallId>) -> bool,
+        forget: bool,
+        seqs: &mut Vec<Seq>,
+    ) -> Result<()> {
+        let picked: Vec<AgentCallId> = self
+            .calls
+            .iter()
+            .filter(|(_, call)| owned(self.owner(call.parent.as_ref())))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let unlinked: Vec<bool> = self
+            .unlinked
+            .iter()
+            .map(|call| owned(self.owner(call.parent.as_ref())))
+            .collect();
+        let mut named = Vec::new();
+        for id in picked {
+            let Some(call) = self.calls.get_mut(&id) else {
+                continue;
+            };
+            if !call.settled {
+                call.settled = true;
+                named.push((call.seq, call.id));
+            }
+            if forget && !self.roots.contains(&id) {
+                self.calls.remove(&id);
+            }
+        }
+        // Named once, an unlinked call has nothing left to settle.
+        let mut picks = unlinked.into_iter();
+        self.unlinked.retain(|call| {
+            let pick = picks.next().unwrap_or(false);
+            if pick {
+                named.push((call.seq, call.id));
+            }
+            !pick
+        });
+        if named.is_empty() {
+            return Ok(());
+        }
+        named.sort();
+        let calls = named.into_iter().map(|(_, id)| id).collect();
+        seqs.push(self.append(log, storage, EventKind::CallsUnanswered { calls })?);
+        Ok(())
     }
 
     /// Cancels every approval still pending that `which` picks, oldest
@@ -800,17 +963,29 @@ fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
 }
 
 /// The first [`TASKS_MAX`] tasks, in the agent's order, titles cut to one
-/// line. An entry whose id is too long is dropped: a cut id names nothing.
+/// line, `call` linked through `calls` (an unknown one is `None`). An entry
+/// whose id is too long is dropped: a cut id names nothing.
 /// A parent id too long drops the entry's parent link, not the entry: the
 /// task still runs, and it is the link that names nothing.
-fn cut_tasks(tasks: Vec<AgentTask>) -> Vec<BackgroundTask> {
+fn cut_tasks(
+    tasks: Vec<AgentTask>,
+    calls: &HashMap<AgentCallId, LoggedCall>,
+) -> Vec<BackgroundTask> {
     let fits = |id: &str| id.chars().count() <= TASK_ID_MAX_CHARS;
+    let linked = |call: Option<AgentCallId>| {
+        let call = call?;
+        let logged = calls.get(&call);
+        if logged.is_none() {
+            tracing::debug!(call = %call.0, "a task runs a call not logged");
+        }
+        logged.map(|c| c.id)
+    };
     tasks
         .into_iter()
         .filter(|task| fits(&task.id))
         .take(TASKS_MAX)
         .map(|task| BackgroundTask {
-            call: None,
+            call: linked(task.call),
             id: proto::TaskId(task.id),
             kind: task.kind,
             title: cut_line(&task.title, TITLE_MAX_CHARS).0,

@@ -20,6 +20,7 @@ use skywave_proto::{
 };
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
+    subagent_task, task,
 };
 use skywaved::agent::{
     self, AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSchedule, AgentSession,
@@ -422,16 +423,26 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
 
     let kinds = f.kinds();
     let n = kinds.len();
-    assert_eq!(kinds[n - 3], EventKind::TurnInterrupted);
+    let shell = kinds
+        .iter()
+        .find(|k| matches!(k, EventKind::ToolCall(_)))
+        .map(call_id)
+        .unwrap();
+    assert_eq!(kinds[n - 4], EventKind::TurnInterrupted);
     assert_eq!(
-        kinds[n - 2],
+        kinds[n - 3],
         EventKind::ApprovalCancelled {
             id,
             reason: INTERRUPT_REASON.into()
         }
     );
+    // The interrupted call never gets its result.
+    assert_eq!(
+        kinds[n - 2],
+        EventKind::CallsUnanswered { calls: vec![shell] }
+    );
     assert_eq!(kinds[n - 1], state(SessionState::Idle));
-    assert_eq!(f.log.head(), Seq(interrupted.0 + 2));
+    assert_eq!(f.log.head(), Seq(interrupted.0 + 3));
     assert!(f.log.pending_approvals(&f.storage.db).unwrap().is_empty());
     assert_eq!(mapper.pending_approvals().count(), 0);
     // Too late: a device answering now is told so.
@@ -457,7 +468,10 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
         next,
         [
             AdapterEvent::TurnStarted,
-            AdapterEvent::Text("Second turn.".into()),
+            AdapterEvent::Text {
+                text: "Second turn.".into(),
+                parent: None,
+            },
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
         ]
     );
@@ -482,7 +496,7 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
 
     session.send_message("first".into()).await.unwrap();
     f.pump(&mut events, &mut mapper, |e| {
-        matches!(e, AdapterEvent::Text(_))
+        matches!(e, AdapterEvent::Text { .. })
     })
     .await;
     // A message sent mid-turn is queued for the next turn.
@@ -500,7 +514,10 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
     assert_eq!(
         tail,
         [
-            AdapterEvent::Text("released".into()),
+            AdapterEvent::Text {
+                text: "released".into(),
+                parent: None,
+            },
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
         ]
     );
@@ -632,11 +649,23 @@ async fn restart_resumes_with_the_stored_handle() {
     );
     session.send_message("b".into()).await.unwrap();
     let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
-    assert_eq!(turn[1], AdapterEvent::Text("two".into()));
+    assert_eq!(
+        turn[1],
+        AdapterEvent::Text {
+            text: "two".into(),
+            parent: None,
+        }
+    );
     // Past the script, the fake echoes.
     session.send_message("c".into()).await.unwrap();
     let turn = f.pump(&mut events, &mut mapper, turn_ended).await;
-    assert_eq!(turn[1], AdapterEvent::Text("echo: c".into()));
+    assert_eq!(
+        turn[1],
+        AdapterEvent::Text {
+            text: "echo: c".into(),
+            parent: None,
+        }
+    );
 
     // A handle for another context is refused.
     let mut wrong = f.spec();
@@ -725,7 +754,10 @@ async fn a_fork_copies_a_conversation_of_another_session() {
     // Scripted turns run per session: the new session starts at the first.
     assert_eq!(
         events.recv().await,
-        Some(AdapterEvent::Text("origin".into()))
+        Some(AdapterEvent::Text {
+            text: "origin".into(),
+            parent: None,
+        })
     );
     session.shutdown().await.unwrap();
 
@@ -956,6 +988,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
         AdapterEvent::TurnStarted,
         AdapterEvent::ToolCall {
             call: None,
+            parent: None,
             name: "write".into(),
             input: json!({ "path": "a.txt", "content": "a long enough body" }),
             display: None,
@@ -1013,8 +1046,15 @@ async fn exit_with_a_pending_approval_cancels_it() {
             reason: "agent exited".into()
         }
     );
+    // A call with no id is never answered: no result can name it.
     assert_eq!(
         kinds[5],
+        EventKind::CallsUnanswered {
+            calls: vec![call_id(&kinds[1])]
+        }
+    );
+    assert_eq!(
+        kinds[6],
         state(SessionState::Errored {
             message: "agent exited during a turn".into()
         })
@@ -1068,6 +1108,7 @@ fn large_content_gives_small_events_and_blobs() {
             AdapterEvent::TurnStarted,
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
+                parent: None,
                 name: "shell".into(),
                 input: input.clone(),
                 display: None,
@@ -1091,6 +1132,7 @@ fn large_content_gives_small_events_and_blobs() {
             },
             AdapterEvent::ToolCall {
                 call: Some("c2".into()),
+                parent: None,
                 name: "edit".into(),
                 input: json!({ "path": "a.txt" }),
                 display: Some(agent::ToolDisplay {
@@ -1190,6 +1232,7 @@ fn content_shown_whole_makes_no_blob() {
             AdapterEvent::TurnStarted,
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
+                parent: None,
                 name: "shell".into(),
                 input: json!({ "command": "ls", "description": "List files" }),
                 display: Some(agent::ToolDisplay {
@@ -1267,6 +1310,7 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
             AdapterEvent::TurnStarted,
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
+                parent: None,
                 name: "shell".into(),
                 input: input.clone(),
                 display: Some(agent::ToolDisplay {
@@ -1334,6 +1378,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
             AdapterEvent::TurnStarted,
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
+                parent: None,
                 name: "write".into(),
                 input: write.clone(),
                 display: None,
@@ -1428,6 +1473,7 @@ fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
             AdapterEvent::TurnStarted,
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
+                parent: None,
                 name: "shell".into(),
                 input: json!({ "command": title }),
                 display: Some(agent::ToolDisplay {
@@ -1650,6 +1696,7 @@ fn agent_task(id: &str, title: &str) -> AgentTask {
         title: title.to_owned(),
         parent: None,
         ambient: false,
+        call: None,
     }
 }
 
@@ -1799,6 +1846,410 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
         vec![AdapterEvent::Exited { error: None }],
     );
     assert_eq!(f.kinds(), []);
+}
+
+// ---------------------------------------------------------------------------
+// Subagent calls
+
+/// A call titled `name` (its generic display), the agent's id `name` too,
+/// made under `parent`.
+fn named_call(name: &str, parent: Option<&str>) -> AdapterEvent {
+    AdapterEvent::ToolCall {
+        call: Some(name.into()),
+        parent: parent.map(Into::into),
+        name: "tool".into(),
+        input: json!({ "name": name }),
+        display: None,
+    }
+}
+
+/// The result of call `name`, its preview `name`.
+fn answer(name: &str) -> AdapterEvent {
+    AdapterEvent::ToolResult {
+        call: Some(name.into()),
+        result: ok(name),
+    }
+}
+
+fn sub_text(text: &str, parent: &str) -> AdapterEvent {
+    AdapterEvent::Text {
+        text: text.into(),
+        parent: Some(parent.into()),
+    }
+}
+
+/// The whole task set: subagent tasks by id and the agent call each runs.
+fn subagents(tasks: &[(&str, Option<&str>)]) -> AdapterEvent {
+    AdapterEvent::BackgroundTasks(
+        tasks
+            .iter()
+            .map(|(id, call)| {
+                let mut task = subagent_task(id, call.unwrap_or_default());
+                task.call = call.map(Into::into);
+                task
+            })
+            .collect(),
+    )
+}
+
+/// Each logged call's id and parent, by its title.
+fn logged_calls(kinds: &[EventKind]) -> HashMap<String, (CallId, Option<CallId>)> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::ToolCall(ToolCall {
+                call: Some(call),
+                parent,
+                display,
+                ..
+            }) => Some((display.title.clone(), (*call, *parent))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each logged result's call, by its preview.
+fn result_calls(kinds: &[EventKind]) -> Vec<(String, Option<CallId>)> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::ToolResult(r) => Some((r.preview.clone(), r.call)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn message_parents(kinds: &[EventKind]) -> Vec<(String, Option<CallId>)> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::AgentMessage { text, parent } => Some((text.clone(), *parent)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unanswered(kinds: &[EventKind]) -> Vec<Vec<CallId>> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::CallsUnanswered { calls } => Some(calls.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_subagent_links_to_its_agent_call_across_turns_and_runs() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let mut shell = task("sh", false);
+    shell.parent = Some("t1".into());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("agent", None),
+            // A background subagent's call is answered at once.
+            answer("agent"),
+            // First reported before its call is known, then again with it.
+            subagents(&[("t1", None)]),
+            subagents(&[("t1", Some("agent"))]),
+            sub_text("first run", "agent"),
+            named_call("s1", Some("agent")),
+            answer("s1"),
+            // It stops inside the turn, its shell still running.
+            AdapterEvent::BackgroundTasks(vec![shell.clone()]),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            // The shell wakes it again, outside any turn.
+            AdapterEvent::BackgroundTasks(vec![subagent_task("t1", "agent"), shell.clone()]),
+            named_call("s2", Some("agent")),
+            answer("s2"),
+            sub_text("second run", "agent"),
+            AdapterEvent::BackgroundTasks(vec![]),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    let (agent, no_parent) = calls["agent"];
+    assert_eq!(no_parent, None);
+    assert_eq!(calls["s1"].1, Some(agent));
+    // Would be None had the root been dropped when the turn ended.
+    assert_eq!(calls["s2"].1, Some(agent));
+    assert_eq!(
+        result_calls(&kinds),
+        [
+            ("agent".to_owned(), Some(agent)),
+            ("s1".to_owned(), Some(calls["s1"].0)),
+            ("s2".to_owned(), Some(calls["s2"].0)),
+        ]
+    );
+    assert_eq!(
+        message_parents(&kinds),
+        [
+            ("first run".to_owned(), Some(agent)),
+            ("second run".to_owned(), Some(agent)),
+        ]
+    );
+    let task_calls: Vec<Vec<Option<CallId>>> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::BackgroundTasksChanged { tasks } => {
+                Some(tasks.iter().map(|t| t.call).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        task_calls,
+        [
+            vec![None],
+            vec![Some(agent)],
+            vec![None],
+            vec![Some(agent), None],
+            vec![],
+        ]
+    );
+    // Everything was answered.
+    assert_eq!(unanswered(&kinds), Vec::<Vec<CallId>>::new());
+}
+
+#[test]
+fn unknown_parents_and_task_calls_map_to_none() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("agent", None),
+            answer("agent"),
+            subagents(&[("t1", Some("agent")), ("t2", Some("ghost"))]),
+            // Positive controls name the known call.
+            sub_text("known", "agent"),
+            sub_text("unknown", "ghost"),
+            named_call("linked", Some("agent")),
+            named_call("orphan", Some("ghost")),
+            answer("linked"),
+            answer("orphan"),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    let agent = calls["agent"].0;
+    assert_eq!(calls["linked"].1, Some(agent));
+    assert_eq!(calls["orphan"].1, None);
+    assert_eq!(
+        message_parents(&kinds),
+        [
+            ("known".to_owned(), Some(agent)),
+            ("unknown".to_owned(), None),
+        ]
+    );
+    let EventKind::BackgroundTasksChanged { tasks } = &kinds[3] else {
+        panic!("expected the task set, got {:?}", kinds[3]);
+    };
+    assert_eq!(
+        tasks.iter().map(|t| t.call).collect::<Vec<_>>(),
+        [Some(agent), None]
+    );
+}
+
+#[test]
+fn a_turn_names_its_open_calls_and_a_task_its_own_when_it_leaves() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("agent", None),
+            answer("agent"),
+            subagents(&[("t1", Some("agent"))]),
+            named_call("main-open", None),
+            named_call("main-done", None),
+            answer("main-done"),
+            named_call("sub-open", Some("agent")),
+            named_call("sub-done", Some("agent")),
+            answer("sub-done"),
+            // A foreground subagent: no task, its steps inside the turn.
+            named_call("fg", None),
+            named_call("fg-open", Some("fg")),
+            named_call("fg-done", Some("fg")),
+            answer("fg-done"),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    let id = |name: &str| calls[name].0;
+    let n = kinds.len();
+    // The background subagent's open call is not the turn's.
+    assert_eq!(
+        kinds[n - 2],
+        EventKind::CallsUnanswered {
+            calls: vec![id("main-open"), id("fg"), id("fg-open")]
+        }
+    );
+    assert_eq!(kinds[n - 1], state(SessionState::Idle));
+
+    // It is named when its task leaves.
+    apply_all(&mut f, &mut mapper, vec![subagents(&[])]);
+    let kinds = f.kinds();
+    assert_eq!(
+        kinds[n..],
+        [
+            EventKind::CallsUnanswered {
+                calls: vec![id("sub-open")]
+            },
+            changed(vec![]),
+        ]
+    );
+
+    // With every call answered, nothing is named: not at a task's leaving,
+    // not at the turn's end.
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            subagents(&[("t1", Some("agent"))]),
+            named_call("again", Some("agent")),
+            answer("again"),
+            subagents(&[]),
+            AdapterEvent::TurnStarted,
+            named_call("quiet", None),
+            answer("quiet"),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+        ],
+    );
+    let kinds = f.kinds();
+    assert_eq!(unanswered(&kinds).len(), 2);
+    assert_eq!(kinds.last(), Some(&state(SessionState::Idle)));
+}
+
+#[test]
+fn a_task_leaving_in_a_turn_names_its_calls_once() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("agent", None),
+            answer("agent"),
+            subagents(&[("t1", Some("agent"))]),
+            named_call("sub-open", Some("agent")),
+            named_call("main-open", None),
+            subagents(&[]),
+            // Late, but the turn still holds the call: linked.
+            answer("sub-open"),
+            AdapterEvent::TurnEnded(TurnOutcome::Failed("boom".into())),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    assert_eq!(
+        unanswered(&kinds),
+        [vec![calls["sub-open"].0], vec![calls["main-open"].0]]
+    );
+    assert_eq!(
+        result_calls(&kinds).last(),
+        Some(&("sub-open".to_owned(), Some(calls["sub-open"].0)))
+    );
+}
+
+#[test]
+fn a_backgrounded_foreground_subagent_leaves_the_turn() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("fg", None),
+            named_call("fg-open", Some("fg")),
+            named_call("main-open", None),
+            // The user backgrounds it: it enters the set under its call.
+            subagents(&[("t1", Some("fg"))]),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            subagents(&[]),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    assert_eq!(
+        unanswered(&kinds),
+        [
+            vec![calls["fg"].0, calls["main-open"].0],
+            vec![calls["fg-open"].0],
+        ]
+    );
+}
+
+#[test]
+fn exit_names_every_open_call() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("agent", None),
+            answer("agent"),
+            subagents(&[("t1", Some("agent"))]),
+            named_call("sub-open", Some("agent")),
+            named_call("sub-done", Some("agent")),
+            answer("sub-done"),
+            named_call("main-open", None),
+            AdapterEvent::ToolCall {
+                call: None,
+                parent: None,
+                name: "tool".into(),
+                input: json!({ "name": "no-id" }),
+                display: None,
+            },
+            AdapterEvent::Exited { error: None },
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    let id = |name: &str| calls[name].0;
+    let n = kinds.len();
+    assert_eq!(
+        kinds[n - 3..],
+        [
+            EventKind::CallsUnanswered {
+                calls: vec![id("sub-open"), id("main-open"), id("no-id")]
+            },
+            changed(vec![]),
+            state(SessionState::Errored {
+                message: "agent exited during a turn".into()
+            }),
+        ]
+    );
+
+    // Nothing is open after an exit, or with nothing logged.
+    let mut fresh = Fixture::new();
+    let mut idle = task_mapper(&fresh, AgentWork::default());
+    apply_all(
+        &mut fresh,
+        &mut idle,
+        vec![
+            AdapterEvent::TurnStarted,
+            named_call("done", None),
+            answer("done"),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            AdapterEvent::Exited { error: None },
+        ],
+    );
+    assert_eq!(unanswered(&fresh.kinds()), Vec::<Vec<CallId>>::new());
 }
 
 // ---------------------------------------------------------------------------

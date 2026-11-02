@@ -66,7 +66,10 @@
 //!   the same way.
 //! - Work the agent runs outside a turn (background shells, subagents) is
 //!   reported as [`AdapterEvent::BackgroundTasks`], the whole live set, as
-//!   often as it changes. An adapter reports the empty set once the agent
+//!   often as it changes. A subagent task names the call it runs
+//!   ([`AgentTask::call`]); the subagent's text and tool calls name that
+//!   call as their `parent`, in a turn or outside one. One call may run
+//!   again: its task leaves the set and comes back under the same call. An adapter reports the empty set once the agent
 //!   is ready, since nothing is reported at start; the mapper logs only
 //!   changes.
 //! - [`AgentSession::stop_task`] asks the agent to stop one of those tasks,
@@ -146,6 +149,10 @@ pub struct AgentTask {
     pub title: String,
     /// The id of the subagent task that launched this one, if any.
     pub parent: Option<String>,
+    /// For a subagent task, the agent's id of the tool call it runs: the
+    /// call its steps name as their `parent`. `None` for other tasks, or
+    /// while the adapter does not know it yet.
+    pub call: Option<AgentCallId>,
     /// Not activity (see [`skywave_proto::BackgroundTask::ambient`]).
     pub ambient: bool,
 }
@@ -279,13 +286,19 @@ pub enum TurnOutcome {
 pub enum AdapterEvent {
     /// The agent began working on a turn.
     TurnStarted,
-    /// Text the agent wrote for the user.
-    Text(String),
+    /// Text the agent wrote for the user. `parent` is the call that started
+    /// the subagent that wrote it, or `None` for the main agent.
+    Text {
+        text: String,
+        parent: Option<AgentCallId>,
+    },
     /// The agent invoked tool `name` with `input`. `call` is the agent's id
-    /// for it, if it has one; `display` is how to show it, or `None` for a
-    /// generic display derived from `input`.
+    /// for it, if it has one; `parent` the call that started the subagent
+    /// that invoked it, or `None` for the main agent; `display` is how to
+    /// show it, or `None` for a generic display derived from `input`.
     ToolCall {
         call: Option<AgentCallId>,
+        parent: Option<AgentCallId>,
         name: String,
         input: serde_json::Value,
         display: Option<ToolDisplay>,
