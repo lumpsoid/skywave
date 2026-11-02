@@ -24,6 +24,7 @@ use crate::projection::{
 };
 use crate::seam::Request;
 use crate::snippets::Snippets;
+use crate::store::WorkdirStored;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
 };
@@ -31,15 +32,17 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
-    BlobState, BlobView, BodyView, CallId, CommandId, ComposerMode, ContextId, ContextView,
-    Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    UsageSession, UsageView, ViewState,
+    BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode,
+    ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry,
+    ErrorInfo, FailReason, FileBody, FileChange, FileResult, Link, LinkRejection, ListKind,
+    ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
+    PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView,
+    SessionRef, SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert,
+    ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState,
+    WorkdirBody, WorkdirPane, WorkdirView,
 };
+use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
 /// Work the core must do for an action, in order. Persistence effects come
 /// before the requests that make the action visible to the network.
@@ -87,6 +90,8 @@ enum Place {
     Pairing,
     Usage,
     Session(SessionId),
+    /// The session's workdir, on [`Model::workdir_pane`].
+    Workdir(SessionId),
 }
 
 impl From<Route> for Place {
@@ -200,6 +205,14 @@ pub(crate) struct Model {
     /// Every turn's usage in the replica, in log order: what the usage
     /// screen totals.
     turns: Vec<TurnRecord>,
+    /// What this device read of sessions' workdirs: as stored, plus the
+    /// reads in flight and failed (in memory only).
+    workdirs: Workdirs,
+    /// The pane the workdir screen shows; reset by [`Action::OpenWorkdir`].
+    workdir_pane: WorkdirPane,
+    /// The last directory the workdir screen showed, where its files pane
+    /// opens; reset by [`Action::OpenWorkdir`].
+    last_dir: String,
 }
 
 impl Model {
@@ -244,6 +257,9 @@ impl Model {
             devices: HashMap::new(),
             models: Vec::new(),
             turns: Vec::new(),
+            workdirs: Workdirs::default(),
+            workdir_pane: WorkdirPane::Changes,
+            last_dir: String::new(),
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -268,6 +284,7 @@ impl Model {
         self.devices = snapshot.devices;
         self.models = snapshot.models;
         self.turns = snapshot.turns;
+        self.workdirs.stored = snapshot.workdirs;
         self.open = None;
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
@@ -369,7 +386,7 @@ impl Model {
                     return Vec::new();
                 }
                 // While the link is down, recent workdirs stand in.
-                let online = !matches!(self.link, Link::Reconnecting { .. } | Link::Rejected(_));
+                let online = self.online();
                 self.completer
                     .complete(input, online)
                     .map(Effect::Request)
@@ -605,6 +622,34 @@ impl Model {
                 session_id,
                 through,
             } => self.mark_read(session_id, through),
+            Action::OpenWorkdir { session_id } => {
+                if self.device().is_none() || self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.place = Place::Workdir(session_id);
+                self.open = None;
+                self.viewing = None;
+                self.subagent = None;
+                self.completer.end();
+                self.last_dir = String::new();
+                self.show_workdir(session_id, WorkdirPane::Changes)
+            }
+            Action::ShowWorkdir(pane) => match self.shown_workdir() {
+                Some(id) => self.show_workdir(id, pane),
+                None => Vec::new(),
+            },
+            Action::RefreshWorkdir => {
+                let Some(id) = self.shown_workdir() else {
+                    return Vec::new();
+                };
+                let ask = pane_ask(id, &self.workdir_pane);
+                let online = self.online();
+                self.workdirs
+                    .ask(ask, online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
             Action::DownloadBlob(id) => match self.blobs.get(&id).map(|b| &b.status) {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
@@ -654,7 +699,7 @@ impl Model {
                     return Vec::new();
                 }
                 match self.back() {
-                    Some(route) => self.dispatch(Action::Navigate(route)),
+                    Some(action) => self.dispatch(action),
                     None => Vec::new(),
                 }
             }
@@ -679,24 +724,112 @@ impl Model {
         subagent_header(&items, call)
     }
 
-    /// Where [`Action::Back`] goes from the screen shown; `None` where back
-    /// leaves the app. Follows [`Model::screen`]: an unpaired device sees
-    /// pairing, a session gone from the replica shows the active list.
-    fn back(&self) -> Option<Route> {
+    /// Where [`Action::Back`] goes from the screen shown, as the action
+    /// that goes there; `None` where back leaves the app. Follows
+    /// [`Model::screen`]: an unpaired device sees pairing, a session gone
+    /// from the replica shows the active list.
+    fn back(&self) -> Option<Action> {
         self.device()?;
-        match self.place {
-            Place::SessionList => None,
-            Place::Archived | Place::Settings | Place::Pairing | Place::Usage => {
-                Some(Route::SessionList)
-            }
-            Place::Session(id) => self.summary(id).map(|s| {
-                if self.archived(s) {
+        let route = match self.place {
+            Place::SessionList => return None,
+            Place::Archived | Place::Settings | Place::Pairing | Place::Usage => Route::SessionList,
+            Place::Session(id) => {
+                if self.archived(self.summary(id)?) {
                     Route::ArchivedSessions
                 } else {
                     Route::SessionList
                 }
-            }),
+            }
+            Place::Workdir(id) => {
+                self.summary(id)?;
+                let up = |path: &str| {
+                    Action::ShowWorkdir(WorkdirPane::Dir {
+                        path: parent(path).to_owned(),
+                    })
+                };
+                return Some(match &self.workdir_pane {
+                    WorkdirPane::File { path } => up(path),
+                    WorkdirPane::Dir { path } if !path.is_empty() => up(path),
+                    WorkdirPane::Diff { .. } => Action::ShowWorkdir(WorkdirPane::Changes),
+                    WorkdirPane::Changes | WorkdirPane::Dir { .. } => Action::OpenSession(id),
+                });
+            }
+        };
+        Some(Action::Navigate(route))
+    }
+
+    /// Whether the link may answer a request now, as far as the model
+    /// knows: not while it waits to reconnect or the server refused it.
+    fn online(&self) -> bool {
+        !matches!(self.link, Link::Reconnecting { .. } | Link::Rejected(_))
+    }
+
+    /// The session whose workdir is on screen.
+    fn shown_workdir(&self) -> Option<SessionId> {
+        match self.place {
+            Place::Workdir(id) if self.device().is_some() && self.summary(id).is_some() => Some(id),
+            _ => None,
         }
+    }
+
+    /// Shows `pane` of session `id`'s workdir: asks for its read if it has
+    /// no stored answer and none on its way, and for its content if that is
+    /// a blob not downloaded.
+    fn show_workdir(&mut self, id: SessionId, pane: WorkdirPane) -> Vec<Effect> {
+        if let WorkdirPane::Dir { path } = &pane {
+            self.last_dir.clone_from(path);
+        }
+        let ask = pane_ask(id, &pane);
+        self.workdir_pane = pane;
+        let mut requests = Vec::new();
+        if self.workdirs.unread(&ask) {
+            let online = self.online();
+            requests.extend(self.workdirs.ask(ask, online));
+        }
+        requests.extend(self.want_shown_blob());
+        requests.into_iter().map(Effect::Request).collect()
+    }
+
+    /// The blob the workdir pane on screen shows: a diff's or a file's.
+    fn shown_blob(&self) -> Option<&BlobRef> {
+        let id = self.shown_workdir()?;
+        match (
+            &self.workdir_pane,
+            self.workdirs
+                .stored
+                .get(&pane_ask(id, &self.workdir_pane))?,
+        ) {
+            (WorkdirPane::Diff { path, untracked }, WorkdirAnswer::Changes(changes)) => {
+                match &changed_file(changes, path, *untracked)?.diff {
+                    DiffBody::Blob(blob) => Some(blob),
+                    DiffBody::Binary | DiffBody::TooLarge { .. } | DiffBody::Omitted => None,
+                }
+            }
+            (
+                WorkdirPane::File { .. },
+                WorkdirAnswer::File(FileResult::File {
+                    content: FileBody::Blob(blob),
+                    ..
+                }),
+            ) => Some(blob),
+            _ => None,
+        }
+    }
+
+    /// Asks for the blob the workdir pane on screen shows, once: if it is
+    /// not downloaded, not asked for yet, and did not fail (asking again
+    /// after a failure is [`Action::DownloadBlob`]'s).
+    fn want_shown_blob(&mut self) -> Option<Request> {
+        let id = self.shown_blob()?.id;
+        let record = self.blobs.get(&id)?;
+        if record.status != BlobStatus::NotDownloaded
+            || self.wanted.contains(&id)
+            || self.failed.contains_key(&id)
+        {
+            return None;
+        }
+        self.wanted.insert(id);
+        Some(Request::DownloadBlob(id))
     }
 
     fn pair(&mut self, address: String, code: String, fingerprint: String) -> Vec<Effect> {
@@ -1245,8 +1378,9 @@ impl Model {
             self.wanted.remove(blob);
             self.failed.remove(blob);
         }
+        self.workdirs.forget(id);
         self.forget_resolved_alerts();
-        if self.place == Place::Session(id) {
+        if self.place == Place::Session(id) || self.place == Place::Workdir(id) {
             self.place = Place::Archived;
             self.open = None;
             self.viewing = None;
@@ -1295,6 +1429,56 @@ impl Model {
         self.completer.listed(req, result);
     }
 
+    /// Whether `req` is the request `ask` still waits on: anything else is
+    /// stale and must touch neither the replica nor the model.
+    pub(crate) fn workdir_awaited(&self, req: u64, ask: &WorkdirAsk) -> bool {
+        self.workdirs.awaited(req, ask)
+    }
+
+    /// The awaited read of `ask` failed (a transport error, git failing):
+    /// the stored answer stays.
+    pub(crate) fn workdir_failed(&mut self, ask: &WorkdirAsk, reason: String) {
+        self.workdirs.failed(ask, reason);
+    }
+
+    /// The awaited answer to `ask` was not stored: its session is gone.
+    pub(crate) fn workdir_dropped(&mut self, ask: &WorkdirAsk) {
+        self.workdirs.dropped(ask);
+    }
+
+    /// Mirrors [`Store::put_workdir`](crate::Store::put_workdir), which
+    /// stored the awaited `answer` to `ask`: the answer replaces the last
+    /// one, the blobs it registered join the blob map and those it purged
+    /// leave it. Returns the download of the blob the pane on screen now
+    /// shows, if it is wanted.
+    pub(crate) fn workdir_stored(
+        &mut self,
+        ask: WorkdirAsk,
+        answer: WorkdirAnswer,
+        stored: &WorkdirStored,
+    ) -> Vec<Request> {
+        for blob in answer.blob_refs() {
+            if stored.registered.contains(&blob.id) {
+                self.blobs.insert(
+                    blob.id,
+                    BlobRecord {
+                        id: blob.id,
+                        size: blob.size,
+                        status: BlobStatus::NotDownloaded,
+                        workdir: true,
+                    },
+                );
+            }
+        }
+        for blob in &stored.purged {
+            self.blobs.remove(blob);
+            self.wanted.remove(blob);
+            self.failed.remove(blob);
+        }
+        self.workdirs.answered(ask, answer);
+        self.want_shown_blob().into_iter().collect()
+    }
+
     /// Mirrors [`Store::reset_for_server`](crate::Store::reset_for_server),
     /// which left the replica as `snapshot`: nothing of the previous
     /// server's log shows any more, nor what was kept for it — download
@@ -1307,6 +1491,7 @@ impl Model {
         self.alerted.clear();
         self.alerted_at.clear();
         self.completer = Completer::default();
+        self.workdirs.reset();
         if had_drafts {
             self.draft_rev += 1;
         }
@@ -1411,7 +1596,57 @@ impl Model {
                 Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
+            Place::Workdir(id) => match self.workdir_view(id) {
+                Some(view) => Screen::Workdir(view),
+                None => Screen::SessionList(self.session_list(ListKind::Active)),
+            },
         }
+    }
+
+    fn workdir_view(&self, id: SessionId) -> Option<WorkdirView> {
+        let summary = self.summary(id)?;
+        let pane = self.workdir_pane.clone();
+        let ask = pane_ask(id, &pane);
+        let body = match (&pane, self.workdirs.stored.get(&ask)) {
+            (WorkdirPane::Changes, Some(WorkdirAnswer::Changes(result))) => {
+                WorkdirBody::Changes(result.clone())
+            }
+            (WorkdirPane::Diff { path, untracked }, Some(WorkdirAnswer::Changes(result))) => {
+                let file = changed_file(result, path, *untracked).cloned();
+                let blob = file.as_ref().and_then(|file| match &file.diff {
+                    DiffBody::Blob(blob) => Some(self.blob_view(blob)),
+                    DiffBody::Binary | DiffBody::TooLarge { .. } | DiffBody::Omitted => None,
+                });
+                WorkdirBody::Diff { file, blob }
+            }
+            (WorkdirPane::Dir { .. }, Some(WorkdirAnswer::List(result))) => {
+                WorkdirBody::Dir(result.clone())
+            }
+            (WorkdirPane::File { .. }, Some(WorkdirAnswer::File(result))) => {
+                let blob = match result {
+                    FileResult::File {
+                        content: FileBody::Blob(blob),
+                        ..
+                    } => Some(self.blob_view(blob)),
+                    _ => None,
+                };
+                WorkdirBody::File {
+                    result: result.clone(),
+                    blob,
+                }
+            }
+            // Never read; a stored answer always answers its ask's kind.
+            _ => WorkdirBody::Nothing,
+        };
+        Some(WorkdirView {
+            session: id,
+            title: self.title(summary).text,
+            workdir: summary.workdir.clone(),
+            pane,
+            last_dir: self.last_dir.clone(),
+            fetch: self.workdirs.fetch(&ask),
+            body,
+        })
     }
 
     fn pairing_view(&self) -> PairingView {
@@ -2598,6 +2833,37 @@ impl Model {
             BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
         BlobView { id: blob.id, state }
+    }
+}
+
+/// The read a workdir pane shows: a diff's is the changes'.
+fn pane_ask(session: SessionId, pane: &WorkdirPane) -> WorkdirAsk {
+    match pane {
+        WorkdirPane::Changes | WorkdirPane::Diff { .. } => WorkdirAsk::Changes { session },
+        WorkdirPane::Dir { path } => WorkdirAsk::List {
+            session,
+            path: path.clone(),
+        },
+        WorkdirPane::File { path } => WorkdirAsk::File {
+            session,
+            path: path.clone(),
+        },
+    }
+}
+
+/// The entry of `changes` for `path`, the untracked one or the other: one
+/// path may have both.
+fn changed_file<'a>(
+    changes: &'a ChangesResult,
+    path: &str,
+    untracked: bool,
+) -> Option<&'a ChangedFile> {
+    match changes {
+        ChangesResult::Changes(set) => set
+            .files
+            .iter()
+            .find(|f| f.path == path && (f.change == FileChange::Untracked) == untracked),
+        _ => None,
     }
 }
 
@@ -6360,8 +6626,7 @@ mod tests {
             models: model.models.clone(),
             snippets: model.snippets.list().to_vec(),
             turns: model.turns.clone(),
-            // The model keeps no workdir answers yet.
-            workdirs: HashMap::new(),
+            workdirs: model.workdirs.stored.clone(),
         }
     }
 
@@ -6817,6 +7082,7 @@ mod tests {
             Screen::Pairing(_) => "pairing",
             Screen::Settings(_) => "settings",
             Screen::Usage(_) => "usage",
+            Screen::Workdir(_) => "workdir",
             Screen::Session(v) if v.archived => "archived session",
             Screen::Session(_) => "session",
             Screen::SessionList(l) if l.kind == ListKind::Archived => "archived list",
@@ -8025,5 +8291,850 @@ mod tests {
         );
         let prompt = f.session_view().pending_approval.expect("pending");
         assert_eq!((prompt.id, prompt.from), (main_ap, None));
+    }
+
+    /// The workdir screen: reads on request, kept per ask.
+    mod workdir {
+        use std::sync::mpsc::Receiver;
+
+        use skywave_proto::{
+            BlobId as ProtoBlobId, ChangeSet, DirEntry, EntryKind, ListResult, ToolResult,
+        };
+
+        use super::*;
+        use crate::identity::PairedCredentials;
+        use crate::view::{WorkdirFetch, WorkdirView};
+        use crate::{Core, Seam};
+
+        fn blob(size: u64) -> BlobRef {
+            BlobRef {
+                id: ProtoBlobId::new(),
+                size,
+            }
+        }
+
+        fn changed(path: &str, change: FileChange, diff: DiffBody) -> ChangedFile {
+            ChangedFile {
+                path: path.into(),
+                from: None,
+                change,
+                added: Some(1),
+                removed: Some(0),
+                diff,
+            }
+        }
+
+        fn changes(files: Vec<ChangedFile>) -> WorkdirAnswer {
+            WorkdirAnswer::Changes(ChangesResult::Changes(ChangeSet {
+                at: Utc::now(),
+                branch: Some("main".into()),
+                head: Some("abc1234".into()),
+                total: files.len() as u32,
+                files,
+            }))
+        }
+
+        fn file(path: &str, content: FileBody) -> WorkdirAnswer {
+            WorkdirAnswer::File(FileResult::File {
+                at: Utc::now(),
+                path: path.into(),
+                size: 4,
+                content,
+            })
+        }
+
+        fn listed(path: &str, names: &[&str]) -> WorkdirAnswer {
+            WorkdirAnswer::List(ListResult::Listed {
+                at: Utc::now(),
+                path: path.into(),
+                entries: names
+                    .iter()
+                    .map(|name| DirEntry {
+                        name: (*name).into(),
+                        kind: EntryKind::File,
+                        size: Some(1),
+                    })
+                    .collect(),
+                truncated: false,
+            })
+        }
+
+        fn requests(effects: Vec<Effect>) -> Vec<Request> {
+            effects
+                .into_iter()
+                .map(|effect| match effect {
+                    Effect::Request(request) => request,
+                    other => panic!("expected only requests, got {other:?}"),
+                })
+                .collect()
+        }
+
+        /// The one workdir read `effects` ask for.
+        fn asked(effects: Vec<Effect>) -> (u64, WorkdirAsk) {
+            match &requests(effects)[..] {
+                [Request::Workdir { req, ask }] => (*req, ask.clone()),
+                other => panic!("expected one workdir read, got {other:?}"),
+            }
+        }
+
+        /// Stores `answer` to the awaited `req` as the seam does, the
+        /// replica registering every blob the model did not know.
+        fn answer(
+            f: &mut Fixture,
+            req: u64,
+            ask: WorkdirAsk,
+            answer: WorkdirAnswer,
+        ) -> Vec<Request> {
+            assert!(f.model.workdir_awaited(req, &ask), "{req} awaited");
+            let registered = answer
+                .blob_refs()
+                .iter()
+                .map(|b| b.id)
+                .filter(|id| !f.model.blobs.contains_key(id))
+                .collect();
+            let stored = WorkdirStored {
+                registered,
+                purged: Vec::new(),
+            };
+            f.model.workdir_stored(ask, answer, &stored)
+        }
+
+        fn view(f: &Fixture) -> WorkdirView {
+            match f.model.view().screen {
+                Screen::Workdir(view) => view,
+                other => panic!("expected the workdir screen, got {other:?}"),
+            }
+        }
+
+        fn offline() -> Link {
+            Link::Reconnecting {
+                attempt: 1,
+                retry_at: Utc::now(),
+                offline_since: Utc::now(),
+            }
+        }
+
+        fn not_connected() -> String {
+            crate::workdir::not_connected().to_string()
+        }
+
+        #[test]
+        fn workdir_first_show_asks_and_a_stored_show_does_not() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            assert_eq!(ask, WorkdirAsk::Changes { session: id });
+            let shown = view(&f);
+            assert_eq!(shown.title, "a");
+            assert_eq!(shown.workdir.as_deref(), Some("/srv/a"));
+            assert_eq!(shown.pane, WorkdirPane::Changes);
+            assert_eq!(shown.fetch, WorkdirFetch::Loading);
+            assert_eq!(shown.body, WorkdirBody::Nothing);
+            // Showing it again while the read is on its way asks nothing.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes))
+                    .is_empty()
+            );
+
+            let set = changes(vec![changed(
+                "a.rs",
+                FileChange::Modified,
+                DiffBody::Binary,
+            )]);
+            assert!(answer(&mut f, req, ask.clone(), set.clone()).is_empty());
+            let shown = view(&f);
+            assert_eq!(shown.fetch, WorkdirFetch::Idle);
+            let WorkdirAnswer::Changes(result) = set else {
+                unreachable!()
+            };
+            assert_eq!(shown.body, WorkdirBody::Changes(result));
+
+            // Stored: leaving and coming back asks nothing.
+            f.dispatch(Action::Navigate(Route::SessionList));
+            assert!(
+                f.dispatch(Action::OpenWorkdir { session_id: id })
+                    .is_empty()
+            );
+            assert_eq!(view(&f).fetch, WorkdirFetch::Idle);
+            // A directory never read is asked for on its first show, once.
+            let (req, ask) =
+                asked(f.dispatch(Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() })));
+            assert_eq!(
+                ask,
+                WorkdirAsk::List {
+                    session: id,
+                    path: "src".into()
+                }
+            );
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() }))
+                    .is_empty()
+            );
+            let dir = listed("src", &["lib.rs"]);
+            answer(&mut f, req, ask, dir.clone());
+            let WorkdirAnswer::List(result) = dir else {
+                unreachable!()
+            };
+            assert_eq!(view(&f).body, WorkdirBody::Dir(result));
+            assert_eq!(view(&f).last_dir, "src");
+        }
+
+        #[test]
+        fn workdir_refresh_asks_again_and_a_diff_refreshes_the_changes() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask.clone(), changes(Vec::new()));
+
+            let (again, asked_again) = asked(f.dispatch(Action::RefreshWorkdir));
+            assert_eq!(asked_again, ask);
+            assert!(again > req, "a fresh request id");
+            assert!(!f.model.workdir_awaited(req, &ask), "the old one is stale");
+            assert_eq!(view(&f).fetch, WorkdirFetch::Loading);
+            assert_ne!(view(&f).body, WorkdirBody::Nothing, "the stored body stays");
+
+            // A diff pane reads the stored changes and refreshes them.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Diff {
+                    path: "a.rs".into(),
+                    untracked: false,
+                }))
+                .is_empty()
+            );
+            let (_, diff_ask) = asked(f.dispatch(Action::RefreshWorkdir));
+            assert_eq!(diff_ask, ask);
+            // Not on the workdir screen, refresh does nothing.
+            f.dispatch(Action::Navigate(Route::SessionList));
+            assert!(f.dispatch(Action::RefreshWorkdir).is_empty());
+        }
+
+        #[test]
+        fn workdir_offline_refresh_fails_at_once_and_keeps_the_stored_body() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask, changes(Vec::new()));
+            let stored = view(&f).body;
+
+            f.model.set_link(offline());
+            assert!(
+                f.dispatch(Action::RefreshWorkdir).is_empty(),
+                "nothing asked"
+            );
+            let shown = view(&f);
+            assert_eq!(shown.fetch, WorkdirFetch::Failed(not_connected()));
+            assert_eq!(shown.body, stored);
+            // A pane never read fails at once too, with nothing to show.
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Dir {
+                    path: String::new()
+                }))
+                .is_empty()
+            );
+            let shown = view(&f);
+            assert_eq!(shown.fetch, WorkdirFetch::Failed(not_connected()));
+            assert_eq!(shown.body, WorkdirBody::Nothing);
+
+            // Back online, a refresh asks again and clears the failure.
+            f.model.set_link(ONLINE);
+            asked(f.dispatch(Action::RefreshWorkdir));
+            assert_eq!(view(&f).fetch, WorkdirFetch::Loading);
+        }
+
+        #[test]
+        fn workdir_a_failure_keeps_the_stored_snapshot() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask.clone(), changes(Vec::new()));
+            let stored = view(&f).body;
+            let (req, _) = asked(f.dispatch(Action::RefreshWorkdir));
+            assert!(f.model.workdir_awaited(req, &ask));
+            f.model.workdir_failed(&ask, "timed out".into());
+            let shown = view(&f);
+            assert_eq!(shown.fetch, WorkdirFetch::Failed("timed out".into()));
+            assert_eq!(shown.body, stored);
+            assert!(!f.model.workdir_awaited(req, &ask), "answered");
+        }
+
+        #[test]
+        fn workdir_diff_and_file_panes_want_an_undownloaded_blob_once() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let diff = blob(10);
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            let set = changes(vec![changed(
+                "a.rs",
+                FileChange::Modified,
+                DiffBody::Blob(diff.clone()),
+            )]);
+            // The changes pane shows no blob, so wants none.
+            assert!(answer(&mut f, req, ask, set).is_empty());
+            assert!(!f.model.wanted.contains(&diff.id));
+
+            let pane = WorkdirPane::Diff {
+                path: "a.rs".into(),
+                untracked: false,
+            };
+            assert_eq!(
+                requests(f.dispatch(Action::ShowWorkdir(pane.clone()))),
+                [Request::DownloadBlob(diff.id)]
+            );
+            let WorkdirBody::Diff {
+                blob: Some(shown), ..
+            } = view(&f).body
+            else {
+                panic!("expected the diff");
+            };
+            assert_eq!(shown.state, BlobState::Requested { size: 10 });
+            // Shown again, or after the changes: asked for once.
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
+            assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
+            // A failed download is asked for again by hand only.
+            f.model.blob_failed(diff.id, "size mismatch".into());
+            f.dispatch(Action::Back);
+            assert!(f.dispatch(Action::ShowWorkdir(pane)).is_empty());
+
+            // A file pane asks for its content as its answer arrives.
+            let content = blob(4);
+            let (req, ask) = asked(f.dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                path: "b.txt".into(),
+            })));
+            assert_eq!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("b.txt", FileBody::Blob(content.clone()))
+                ),
+                [Request::DownloadBlob(content.id)]
+            );
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                    path: "b.txt".into()
+                }))
+                .is_empty()
+            );
+            // An answer arriving for a pane not on screen wants nothing.
+            let other = blob(5);
+            let (req, ask) = asked(f.dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                path: "c.txt".into(),
+            })));
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
+            assert!(
+                answer(
+                    &mut f,
+                    req,
+                    ask,
+                    file("c.txt", FileBody::Blob(other.clone()))
+                )
+                .is_empty()
+            );
+            assert!(!f.model.wanted.contains(&other.id));
+        }
+
+        #[test]
+        fn workdir_diff_picks_the_untracked_or_the_tracked_entry() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (gone, kept) = (blob(1), blob(2));
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            // `git rm --cached f` with `f` still on disk.
+            let deleted = changed("f", FileChange::Deleted, DiffBody::Blob(gone.clone()));
+            let untracked = changed("f", FileChange::Untracked, DiffBody::Blob(kept.clone()));
+            answer(
+                &mut f,
+                req,
+                ask,
+                changes(vec![deleted.clone(), untracked.clone()]),
+            );
+            let shown = |f: &mut Fixture, untracked| {
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Diff {
+                    path: "f".into(),
+                    untracked,
+                }));
+                match view(f).body {
+                    WorkdirBody::Diff { file, blob } => (file, blob.map(|b| b.id)),
+                    other => panic!("expected a diff, got {other:?}"),
+                }
+            };
+            assert_eq!(shown(&mut f, false), (Some(deleted), Some(gone.id)));
+            assert_eq!(shown(&mut f, true), (Some(untracked), Some(kept.id)));
+            // A path the changes do not list shows no file.
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Diff {
+                path: "g".into(),
+                untracked: false,
+            }));
+            assert_eq!(
+                view(&f).body,
+                WorkdirBody::Diff {
+                    file: None,
+                    blob: None
+                }
+            );
+        }
+
+        #[test]
+        fn workdir_back_walks_every_pane_to_the_session() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            f.dispatch(Action::OpenWorkdir { session_id: id });
+            let back = |f: &mut Fixture| {
+                assert!(f.model.view().can_go_back);
+                let effects = f.dispatch(Action::Back);
+                (f.model.view().screen, effects)
+            };
+            let pane = |f: &mut Fixture| view(f).pane;
+            let dir = |path: &str| WorkdirPane::Dir { path: path.into() };
+
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                path: "src/core/lib.rs".into(),
+            }));
+            back(&mut f);
+            assert_eq!(pane(&mut f), dir("src/core"));
+            back(&mut f);
+            assert_eq!(pane(&mut f), dir("src"));
+            back(&mut f);
+            assert_eq!(pane(&mut f), dir(""));
+            let (screen, effects) = back(&mut f);
+            assert!(matches!(screen, Screen::Session(_)), "the session");
+            assert_eq!(effects, [Effect::LoadSession(id)]);
+
+            f.dispatch(Action::OpenWorkdir { session_id: id });
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                path: "top.rs".into(),
+            }));
+            back(&mut f);
+            assert_eq!(
+                pane(&mut f),
+                dir(""),
+                "a top-level file's parent is the root"
+            );
+            f.dispatch(Action::ShowWorkdir(WorkdirPane::Diff {
+                path: "a.rs".into(),
+                untracked: true,
+            }));
+            back(&mut f);
+            assert_eq!(pane(&mut f), WorkdirPane::Changes);
+            let (screen, _) = back(&mut f);
+            assert!(matches!(screen, Screen::Session(_)), "the session");
+        }
+
+        #[test]
+        fn workdir_session_deleted_while_open_falls_back_to_the_list() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let other = f.session("/srv/b");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: other }));
+            answer(&mut f, req, ask.clone(), changes(Vec::new()));
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            f.model.session_deleted(id, &[]);
+            assert_eq!(shown(&f.model.view()), "archived list");
+            assert!(!f.model.workdir_awaited(req, &ask), "its read is forgotten");
+            // Another session's reads stay.
+            assert!(
+                f.model
+                    .workdirs
+                    .stored
+                    .contains_key(&WorkdirAsk::Changes { session: other })
+            );
+            assert!(
+                f.dispatch(Action::OpenWorkdir { session_id: id })
+                    .is_empty()
+            );
+            assert!(
+                f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes))
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn workdir_answers_survive_a_reload_and_a_reset_forgets_the_reads() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let (req, ask) = asked(f.dispatch(Action::OpenWorkdir { session_id: id }));
+            answer(&mut f, req, ask.clone(), changes(Vec::new()));
+            let (req, _) = asked(f.dispatch(Action::RefreshWorkdir));
+            // A restart shows the stored answer and asks nothing.
+            let mut model = Model::new(snapshot(&f.model), Some(paired_as(f.me)));
+            assert!(
+                model
+                    .dispatch(Action::OpenWorkdir { session_id: id })
+                    .is_empty()
+            );
+            let Screen::Workdir(shown) = model.view().screen else {
+                panic!("expected the workdir screen");
+            };
+            assert_eq!(shown.fetch, WorkdirFetch::Idle);
+            assert_eq!(shown.body, view(&f).body);
+            f.model.replica_reset(empty_snapshot());
+            assert!(!f.model.workdir_awaited(req, &ask), "an old server's read");
+        }
+
+        /// A detached core over a real replica with one session, playing
+        /// the engine through its request channel.
+        struct Live {
+            _dir: tempfile::TempDir,
+            core: Core,
+            seam: Seam,
+            requests: Receiver<Request>,
+            session: SessionId,
+        }
+
+        impl Live {
+            fn new() -> Live {
+                let dir = tempfile::tempdir().unwrap();
+                let core = Core::open_detached(dir.path()).unwrap();
+                let seam = core.seam();
+                let requests = seam.take_requests().unwrap();
+                seam.pairing_succeeded("srv:7443", credentials("CA"))
+                    .unwrap();
+                let session = SessionId::new();
+                seam.apply_events(&EventBatch {
+                    from: Seq(1),
+                    events: vec![Event {
+                        session_id: session,
+                        at: Utc::now(),
+                        command_id: None,
+                        context: ContextId::first_of(session),
+                        kind: EventKind::SessionCreated {
+                            workdir: "/srv".into(),
+                            context_name: "start".into(),
+                            from: None,
+                        },
+                    }],
+                })
+                .unwrap();
+                let live = Live {
+                    _dir: dir,
+                    core,
+                    seam,
+                    requests,
+                    session,
+                };
+                live.requests();
+                live
+            }
+
+            fn requests(&self) -> Vec<Request> {
+                self.requests.try_iter().collect()
+            }
+
+            /// Dispatches `action`; the one workdir read it asks for.
+            fn asked(&self, action: Action) -> (u64, WorkdirAsk) {
+                self.core.dispatch(action).unwrap();
+                match &self.requests()[..] {
+                    [Request::Workdir { req, ask }] => (*req, ask.clone()),
+                    other => panic!("expected one workdir read, got {other:?}"),
+                }
+            }
+
+            fn stored(&self) -> HashMap<WorkdirAsk, WorkdirAnswer> {
+                crate::client::lock(&self.core.shared.state)
+                    .store
+                    .workdirs()
+                    .unwrap()
+            }
+
+            fn view(&self) -> WorkdirView {
+                match self.core.view().screen {
+                    Screen::Workdir(view) => view,
+                    other => panic!("expected the workdir screen, got {other:?}"),
+                }
+            }
+        }
+
+        fn credentials(ca: &str) -> PairedCredentials {
+            PairedCredentials {
+                device_id: DeviceId::new(),
+                device_key_pem: "KEY".into(),
+                device_cert_pem: "CERT".into(),
+                ca_cert_pem: ca.into(),
+            }
+        }
+
+        #[test]
+        fn workdir_a_transport_error_and_a_failed_keep_the_stored_snapshot() {
+            let live = Live::new();
+            let diff = blob(10);
+            let set = changes(vec![changed(
+                "a.rs",
+                FileChange::Modified,
+                DiffBody::Blob(diff.clone()),
+            )]);
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(set.clone()))
+                .unwrap();
+            let stored = live.view().body;
+
+            let (req, _) = live.asked(Action::RefreshWorkdir);
+            live.seam
+                .workdir_answered(req, ask.clone(), Err(TransportError::Timeout))
+                .unwrap();
+            let shown = live.view();
+            assert_eq!(
+                shown.fetch,
+                WorkdirFetch::Failed(TransportError::Timeout.to_string())
+            );
+            assert_eq!(shown.body, stored);
+
+            let (req, _) = live.asked(Action::RefreshWorkdir);
+            let failed = WorkdirAnswer::Changes(ChangesResult::Failed {
+                reason: "git timed out".into(),
+            });
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(failed))
+                .unwrap();
+            let shown = live.view();
+            assert_eq!(shown.fetch, WorkdirFetch::Failed("git timed out".into()));
+            assert_eq!(shown.body, stored);
+            assert_eq!(live.stored()[&ask], set, "the store kept the good one");
+            assert!(live.seam.blob(diff.id).unwrap().is_some(), "and its blob");
+            assert!(live.requests().is_empty(), "nothing purged");
+        }
+
+        #[test]
+        fn workdir_a_stale_answer_reaches_neither_model_nor_store() {
+            let live = Live::new();
+            let (old, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            let (new, _) = live.asked(Action::RefreshWorkdir);
+            let newer = changes(vec![changed("new.rs", FileChange::Added, DiffBody::Binary)]);
+            live.seam
+                .workdir_answered(new, ask.clone(), Ok(newer.clone()))
+                .unwrap();
+            // The slow older answer arrives last.
+            let stale = blob(3);
+            let older = changes(vec![changed(
+                "old.rs",
+                FileChange::Added,
+                DiffBody::Blob(stale.clone()),
+            )]);
+            live.seam
+                .workdir_answered(old, ask.clone(), Ok(older))
+                .unwrap();
+            assert_eq!(live.stored()[&ask], newer);
+            assert!(live.seam.blob(stale.id).unwrap().is_none(), "no blob row");
+            let WorkdirAnswer::Changes(result) = newer else {
+                unreachable!()
+            };
+            assert_eq!(live.view().body, WorkdirBody::Changes(result));
+            assert_eq!(live.view().fetch, WorkdirFetch::Idle);
+            // A stale failure does not show either.
+            live.seam
+                .workdir_answered(old, ask, Err(TransportError::Timeout))
+                .unwrap();
+            assert_eq!(live.view().fetch, WorkdirFetch::Idle);
+        }
+
+        #[test]
+        fn workdir_an_available_blob_survives_a_refresh_with_the_same_id() {
+            let live = Live::new();
+            let content = blob(4);
+            let answer = file("a.txt", FileBody::Blob(content.clone()));
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            assert_eq!(
+                ask,
+                WorkdirAsk::Changes {
+                    session: live.session
+                }
+            );
+            live.seam
+                .workdir_answered(req, ask, Ok(changes(Vec::new())))
+                .unwrap();
+            let (req, ask) = live.asked(Action::ShowWorkdir(WorkdirPane::File {
+                path: "a.txt".into(),
+            }));
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(answer.clone()))
+                .unwrap();
+            assert_eq!(live.requests(), [Request::DownloadBlob(content.id)]);
+            let path = PathBuf::from("/blobs/a");
+            live.seam
+                .blob_status(content.id, BlobStatus::Available { path: path.clone() })
+                .unwrap();
+
+            let (req, _) = live.asked(Action::RefreshWorkdir);
+            live.seam.workdir_answered(req, ask, Ok(answer)).unwrap();
+            assert!(live.requests().is_empty(), "nothing fetched nor purged");
+            let WorkdirBody::File {
+                blob: Some(shown), ..
+            } = live.view().body
+            else {
+                panic!("expected the file");
+            };
+            assert_eq!(shown.state, BlobState::Available { path: path.clone() });
+            assert_eq!(
+                live.seam.blob(content.id).unwrap().unwrap().status,
+                BlobStatus::Available { path }
+            );
+        }
+
+        #[test]
+        fn workdir_a_refresh_purges_what_nothing_names_any_more() {
+            let live = Live::new();
+            let (old, new) = (blob(3), blob(4));
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            let diff = |blob: &BlobRef| {
+                changes(vec![changed(
+                    "a.rs",
+                    FileChange::Modified,
+                    DiffBody::Blob(blob.clone()),
+                )])
+            };
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(diff(&old)))
+                .unwrap();
+            let dir = crate::blobs::blob_dir(&live.seam.data_dir());
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(old.id.0.to_string());
+            std::fs::write(&file, b"old").unwrap();
+
+            let (req, _) = live.asked(Action::RefreshWorkdir);
+            live.seam
+                .workdir_answered(req, ask, Ok(diff(&new)))
+                .unwrap();
+            assert_eq!(live.requests(), [Request::BlobsPurged(vec![old.id])]);
+            assert!(!file.exists(), "its file is gone");
+            assert!(live.seam.blob(old.id).unwrap().is_none());
+            // The model's blob map learned both in the same update.
+            let state = crate::client::lock(&live.core.shared.state);
+            assert!(!state.model.blobs.contains_key(&old.id));
+            assert_eq!(
+                state
+                    .model
+                    .blobs
+                    .get(&new.id)
+                    .map(|b| (b.workdir, b.status.clone())),
+                Some((true, BlobStatus::NotDownloaded))
+            );
+        }
+
+        #[test]
+        fn workdir_an_answer_for_a_session_gone_writes_no_row() {
+            // Deleted from this device while the read was in flight.
+            let live = Live::new();
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![Event {
+                        session_id: live.session,
+                        at: Utc::now(),
+                        command_id: Some(CommandId::new()),
+                        context: ContextId::first_of(live.session),
+                        kind: EventKind::SessionArchived {
+                            archived: true,
+                            by: DeviceId::new(),
+                        },
+                    }],
+                })
+                .unwrap();
+            live.core
+                .dispatch(Action::DeleteSessionLocally {
+                    session_id: live.session,
+                })
+                .unwrap();
+            let content = blob(4);
+            live.seam
+                .workdir_answered(
+                    req,
+                    ask,
+                    Ok(changes(vec![changed(
+                        "a",
+                        FileChange::Added,
+                        DiffBody::Blob(content.clone()),
+                    )])),
+                )
+                .unwrap();
+            assert!(live.stored().is_empty());
+            assert!(live.seam.blob(content.id).unwrap().is_none());
+
+            // Re-paired with another server while the read was in flight.
+            let live = Live::new();
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            live.seam
+                .pairing_succeeded("other:7443", credentials("ANOTHER CA"))
+                .unwrap();
+            live.seam
+                .workdir_answered(req, ask, Ok(changes(Vec::new())))
+                .unwrap();
+            assert!(live.stored().is_empty());
+        }
+
+        #[test]
+        fn workdir_eager_never_queues_a_workdir_blob_but_opening_its_pane_wants_it() {
+            let live = Live::new();
+            live.core
+                .dispatch(Action::SetBlobPolicy(BlobPolicy::Eager))
+                .unwrap();
+            live.requests();
+            let diff = blob(10);
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            live.seam
+                .workdir_answered(
+                    req,
+                    ask,
+                    Ok(changes(vec![changed(
+                        "a.rs",
+                        FileChange::Modified,
+                        DiffBody::Blob(diff.clone()),
+                    )])),
+                )
+                .unwrap();
+            assert!(live.requests().is_empty(), "no download asked for");
+            // What the engine's eager queue reads: marked, so skipped.
+            let record = live.seam.blob(diff.id).unwrap().unwrap();
+            assert!(record.workdir);
+            live.core
+                .dispatch(Action::ShowWorkdir(WorkdirPane::Diff {
+                    path: "a.rs".into(),
+                    untracked: false,
+                }))
+                .unwrap();
+            assert_eq!(live.requests(), [Request::DownloadBlob(diff.id)]);
+        }
+
+        /// A tool output blob is no workdir blob, so the eager policy
+        /// still has one to download beside them.
+        #[test]
+        fn workdir_blobs_and_event_blobs_stay_apart_in_the_blob_map() {
+            let mut f = Fixture::paired();
+            let id = f.session("/srv/a");
+            let output = blob(7);
+            f.log(
+                id,
+                vec![EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "out".into(),
+                    lines: 1,
+                    output: Some(output.clone()),
+                })],
+            );
+            let content = blob(4);
+            f.dispatch(Action::OpenWorkdir { session_id: id });
+            let (req, ask) =
+                asked(f.dispatch(Action::ShowWorkdir(WorkdirPane::File { path: "a".into() })));
+            answer(&mut f, req, ask, file("a", FileBody::Blob(content.clone())));
+            assert!(!f.model.blobs[&output.id].workdir);
+            assert!(f.model.blobs[&content.id].workdir);
+        }
     }
 }

@@ -278,7 +278,36 @@ then pushed as a new `ViewState`.
   verified by size and renamed when complete; `Link` ignores them (synced
   metadata counts as synced). Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
-  policy: only asking for one downloads it.
+  policy: only asking for one downloads it. Their ids recur (the server
+  names content by hash), so a refresh can purge a blob a download holds
+  and the next one register it again: each try reads the blob with a lease
+  (its purge count, beside the replica under the same lock), and a report
+  under an older lease fails as for an unknown blob. A request for a blob a
+  download holds is kept and queued once it lets go. The core hands
+  requests to the engine under the state lock, in the order of the changes
+  that made them, so a purge never overtakes a later request for the same
+  id.
+- **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
+  changes; `ShowWorkdir` switches between the changes, one file's diff (a
+  path and whether it is the untracked entry), a directory and a file;
+  `RefreshWorkdir` reads the pane again (a diff: the changes). The fetch
+  rule is plain: showing a pane whose read has no stored answer asks once,
+  a stored one shows with its time until a refresh, and showing a diff or
+  file whose content is not downloaded asks for that blob. Offline nothing
+  is asked or queued: the read fails at once with "not connected" and the
+  stored answer stays. The engine runs each read on its own task within
+  `WORKDIR_TIMEOUT`, on the side transport it keeps for listings, failing
+  at once when unpaired, suspended or rejected. The model keeps the latest
+  answer per read (as stored), the request id each read waits on, and the
+  last failure, in memory. `Seam::workdir_answered` lets the model decide
+  first: an answer to an older request than the read's latest touches
+  neither the replica nor the model. A transport error or
+  `ChangesResult::Failed` stays in memory and never replaces a stored
+  answer; any other answer is stored, and the model learns the blobs it
+  registered and purged in the same update. Back walks file → its
+  directory, diff → changes, directory → its parent, and the changes or
+  the workdir root → the session; a session deleted here falls back to the
+  archived list.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,

@@ -3,7 +3,7 @@
 use crate::store::BlobPolicy;
 use crate::view::{
     ApprovalId, BlobId, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
-    PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId,
+    PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId, WorkdirPane,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,6 +256,21 @@ pub enum Action {
         session_id: SessionId,
         through: Seq,
     },
+    /// Show the session's workdir, on its changes
+    /// ([`Screen::Workdir`](crate::Screen::Workdir)). A no-op for an
+    /// unknown session.
+    OpenWorkdir {
+        session_id: SessionId,
+    },
+    /// Show another pane of the workdir on screen. A pane whose read has no
+    /// stored answer asks the server once (offline it fails at once); a
+    /// stored one shows until [`Action::RefreshWorkdir`]. A diff or file
+    /// pane whose content is not downloaded asks for it: opening it is the
+    /// request, whatever the blob policy.
+    ShowWorkdir(WorkdirPane),
+    /// Read again what the workdir pane on screen shows (a diff: the
+    /// changes). Offline it fails at once, and is not queued.
+    RefreshWorkdir,
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
     SetBlobPolicy(BlobPolicy),
@@ -266,7 +281,9 @@ pub enum Action {
     RetryNow,
     Navigate(Route),
     /// Go back from the screen shown: a subagent's timeline to the one of
-    /// the agent that launched it, a session to the list it is on, the
+    /// the agent that launched it, a workdir file to its directory, a diff
+    /// to the changes, a directory to its parent, the changes or the
+    /// workdir itself to the session, a session to the list it is on, the
     /// archived list, settings and re-pairing to the active list. A no-op
     /// where [`ViewState::can_go_back`](crate::ViewState::can_go_back) is
     /// false (the active list, pairing an unpaired device): there back

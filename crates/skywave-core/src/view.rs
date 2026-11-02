@@ -13,10 +13,11 @@ use skywave_proto::Fingerprint;
 use uuid::Uuid;
 
 pub use skywave_proto::{
-    AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, CommandId, ContextId,
-    Decision, DeviceId, Effort, ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind,
-    ToolKind, TurnUsage,
+    AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, ChangeSet, ChangedFile,
+    ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
+    FileBody, FileChange, FileResult, LinkTarget, ListResult, ModelChoice, PermissionMode, Refusal,
+    RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId,
+    ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 
 pub use crate::projection::{SessionUsage, TurnRecord};
@@ -300,6 +301,72 @@ pub enum Screen {
     Session(Box<SessionView>),
     Settings(SettingsView),
     Usage(UsageView),
+    Workdir(WorkdirView),
+}
+
+/// Where the workdir screen is ([`Action::ShowWorkdir`](crate::Action::ShowWorkdir)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkdirPane {
+    /// What changed against `HEAD`.
+    Changes,
+    /// One changed file's diff, from the stored changes. `untracked` tells
+    /// apart the two entries one path can have
+    /// ([`ChangeSet::files`](skywave_proto::ChangeSet::files)).
+    Diff { path: String, untracked: bool },
+    /// One directory; `path` relative to the workdir, empty for the
+    /// workdir itself.
+    Dir { path: String },
+    /// One file; `path` relative to the workdir.
+    File { path: String },
+}
+
+/// A session's workdir as last read from the server
+/// ([`Action::OpenWorkdir`](crate::Action::OpenWorkdir)): read on request
+/// only, and kept, so what was read shows offline too.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkdirView {
+    pub session: SessionId,
+    /// The session's title, as [`SessionRow::title`].
+    pub title: String,
+    pub workdir: Option<String>,
+    pub pane: WorkdirPane,
+    /// The directory the files pane shows when switched to: the last one
+    /// shown, the workdir itself at first.
+    pub last_dir: String,
+    /// This pane's read (a diff's is the changes').
+    pub fetch: WorkdirFetch,
+    pub body: WorkdirBody,
+}
+
+/// The state of the read a workdir pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkdirFetch {
+    Idle,
+    /// Asked for and not answered yet.
+    Loading,
+    /// The last ask failed (offline, a timeout, git failing): the stored
+    /// answer, if any, still shows.
+    Failed(String),
+}
+
+/// What a workdir pane shows: the latest stored answer, with its time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkdirBody {
+    /// Never read: offline, or before the answer.
+    Nothing,
+    Changes(ChangesResult),
+    /// `file` from the stored changes, `None` once they no longer list it
+    /// (or are no change set); `blob` its diff, if it has one.
+    Diff {
+        file: Option<ChangedFile>,
+        blob: Option<BlobView>,
+    },
+    Dir(ListResult),
+    /// `blob` the content, if the server sent it.
+    File {
+        result: FileResult,
+        blob: Option<BlobView>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -33,10 +33,28 @@
 //! size the event's `BlobRef` gave, and the server must agree on it; a
 //! mismatch, an unknown blob or a local file error deletes the `.part`
 //! file, logs an error and leaves the blob `NotDownloaded`, failed with
-//! that reason, until it is asked for again. A blob whose session is deleted
-//! from this device loses both files; a download of it stops, without a
+//! that reason, until it is asked for again. A blob that leaves the replica
+//! (its session deleted from this device, or no stored workdir answer
+//! naming it any more) loses both files; a download of it stops, without a
 //! retry, when its next report finds the blob unknown, and removes what it
 //! wrote meanwhile.
+//!
+//! **Purged, then registered again.** Workdir blob ids recur: the server
+//! names content by its hash, so a refresh can drop a blob and the next
+//! one name it again while a worker still writes the old download. A row
+//! with that id existing again is no proof the download is current, so
+//! each try reads the blob's record together with a lease (the blob's
+//! purge count, kept beside the replica under the same lock), and every
+//! report carries it: once the blob was purged, the report fails as for
+//! an unknown blob, whatever row has the id now, and the worker lets go
+//! as above. A request for the blob made while a worker holds it is kept
+//! and queued once the worker lets go, so asking for the registered-again
+//! blob is not lost to the stale download. A waiting request needs no
+//! lease: the core hands requests over in the order of the changes that
+//! made them (`Shared::update` sends under the state lock), so the purge's
+//! `BlobsPurged` always reaches the queue before a later change's request
+//! for the same id, which then stays queued, and after any earlier one,
+//! which it drops.
 //!
 //! **Status.** `Downloading { got, path }` (`path` the `.part` file) is
 //! reported when a response starts, then at most every
@@ -54,7 +72,7 @@ use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OnceCell};
 
-use crate::client::{CoreError, lock};
+use crate::client::{BlobLease, CoreError, lock};
 use crate::engine::EngineConfig;
 use crate::identity::Identity;
 use crate::seam::Seam;
@@ -98,6 +116,9 @@ struct Queue {
     waiting: VecDeque<Queued>,
     /// Blobs a worker holds.
     active: HashSet<BlobId>,
+    /// Blobs asked for while a worker held them: queued again, as asked
+    /// for, once it lets go.
+    again: HashSet<BlobId>,
 }
 
 impl Queue {
@@ -151,6 +172,7 @@ impl BlobQueue {
     pub(crate) fn want(&self, id: BlobId) {
         let mut queue = lock(&self.queue);
         if queue.active.contains(&id) {
+            queue.again.insert(id);
             return;
         }
         queue.waiting.retain(|q| q.id != id);
@@ -194,11 +216,14 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
-    /// These blobs left the replica (a session deleted from this device):
-    /// they wait no longer. One a worker holds is let go by the worker
-    /// itself, when its next report finds the blob unknown.
+    /// These blobs left the replica (a session deleted from this device, or
+    /// a refreshed workdir answer no longer naming them): they wait no
+    /// longer. One a worker holds is let go by the worker itself, when its
+    /// next report finds the blob unknown.
     pub(crate) fn purged(&self, ids: &[BlobId]) {
-        lock(&self.queue).waiting.retain(|q| !ids.contains(&q.id));
+        let mut queue = lock(&self.queue);
+        queue.waiting.retain(|q| !ids.contains(&q.id));
+        queue.again.retain(|id| !ids.contains(id));
     }
 
     /// Waits for the next blob `slot` takes and holds it.
@@ -236,8 +261,8 @@ enum Slot {
     Wanted,
 }
 
-/// A blob a worker holds. Dropped unfinished (the downloader stopped), it
-/// goes back to the front of the queue.
+/// A blob a worker holds. Dropped unfinished (the downloader stopped), or
+/// asked for again meanwhile, it goes back to the front of the queue.
 struct Claim<'a> {
     queue: &'a BlobQueue,
     item: Queued,
@@ -254,7 +279,12 @@ impl Drop for Claim<'_> {
     fn drop(&mut self) {
         let mut queue = lock(&self.queue.queue);
         queue.active.remove(&self.item.id);
-        if !self.done {
+        if queue.again.remove(&self.item.id) {
+            queue.waiting.push_front(Queued {
+                id: self.item.id,
+                wanted: true,
+            });
+        } else if !self.done {
             queue.waiting.push_front(self.item);
         }
         drop(queue);
@@ -290,7 +320,8 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
         let mut attempt = 0u32;
         loop {
             let mut progressed = false;
-            let error = match fetch(ctx, transport, id, &mut progressed).await {
+            let mut lease = None;
+            let error = match fetch(ctx, transport, id, &mut lease, &mut progressed).await {
                 Ok(()) => break,
                 Err(error) => error,
             };
@@ -301,7 +332,7 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                 break;
             }
             if !error.is_retryable() {
-                give_up(ctx, id, &error).await;
+                give_up(ctx, id, lease, &error).await;
                 break;
             }
             attempt = if progressed {
@@ -334,8 +365,9 @@ enum FetchError {
 
 impl FetchError {
     /// The blob left the replica mid-download (its session was deleted from
-    /// this device, or the device paired with another server): nothing to
-    /// retry, and its files must go.
+    /// this device, no workdir answer names it any more, or the device
+    /// paired with another server), even if its id is registered again
+    /// since: nothing to retry, and its files must go.
     fn is_purged(&self) -> bool {
         matches!(
             self,
@@ -357,11 +389,17 @@ impl FetchError {
 
 /// Deletes what was fetched of a blob and leaves it `NotDownloaded`, with
 /// the reason shown until it is asked for again.
-async fn give_up(ctx: &BlobCtx, id: BlobId, error: &FetchError) {
+async fn give_up(ctx: &BlobCtx, id: BlobId, lease: Option<BlobLease>, error: &FetchError) {
     tracing::error!(?id, %error, "blob download failed");
     let part = part_path(&blob_dir(&ctx.seam.data_dir()), id);
     let _ = tokio::fs::remove_file(&part).await;
-    match ctx.seam.blob_failed(id, error.to_string()) {
+    let failed = match lease {
+        Some(lease) => ctx.seam.leased_blob_failed(id, lease, error.to_string()),
+        // Failed before the record was read: whatever registration the
+        // blob has now never started.
+        None => ctx.seam.blob_failed(id, error.to_string()),
+    };
+    match failed {
         Ok(())
         | Err(CoreError::Store(crate::store::StoreError::UnknownBlob(_)) | CoreError::Superseded) =>
             {}
@@ -396,18 +434,21 @@ pub(crate) fn remove_all_blob_files(data_dir: &Path) {
     }
 }
 
-/// One try at a blob: resume its `.part` file and finish it.
-/// `progressed` is set once some bytes arrived.
+/// One try at a blob: resume its `.part` file and finish it. `lease` is
+/// set once the record is read; every report holds it. `progressed` is set
+/// once some bytes arrived.
 async fn fetch(
     ctx: &BlobCtx,
     transport: &OnceCell<Arc<dyn Transport>>,
     id: BlobId,
+    lease_out: &mut Option<BlobLease>,
     progressed: &mut bool,
 ) -> Result<(), FetchError> {
-    let Some(record) = ctx.seam.blob(id)? else {
+    let Some((record, lease)) = ctx.seam.leased_blob(id)? else {
         tracing::warn!(?id, "asked to download an unknown blob");
         return Ok(());
     };
+    *lease_out = Some(lease);
     let dir = blob_dir(&ctx.seam.data_dir());
     let done = dir.join(id.0.to_string());
     if let BlobStatus::Available { path } = &record.status
@@ -426,7 +467,7 @@ async fn fetch(
         Err(error) => return Err(error.into()),
     };
     if have == Some(size) {
-        return complete(ctx, id, &part, &done, size).await;
+        return complete(ctx, id, lease, &part, &done, size).await;
     }
     let from = have.unwrap_or(0);
 
@@ -467,8 +508,9 @@ async fn fetch(
     file.set_len(got).await?;
     file.seek(SeekFrom::Start(got)).await?;
     let report = |got: u64| {
-        ctx.seam.blob_status(
+        ctx.seam.leased_blob_status(
             id,
+            lease,
             BlobStatus::Downloading {
                 got,
                 path: part.clone(),
@@ -510,7 +552,7 @@ async fn fetch(
     }
     file.sync_all().await?;
     drop(file);
-    complete(ctx, id, &part, &done, size).await
+    complete(ctx, id, lease, &part, &done, size).await
 }
 
 /// The `.part` file holds the whole blob: check its size, move it in place
@@ -518,6 +560,7 @@ async fn fetch(
 async fn complete(
     ctx: &BlobCtx,
     id: BlobId,
+    lease: BlobLease,
     part: &Path,
     done: &Path,
     size: u64,
@@ -530,8 +573,9 @@ async fn complete(
         });
     }
     tokio::fs::rename(part, done).await?;
-    ctx.seam.blob_status(
+    ctx.seam.leased_blob_status(
         id,
+        lease,
         BlobStatus::Available {
             path: done.to_owned(),
         },
@@ -572,6 +616,8 @@ mod tests {
         calls: AtomicUsize,
         /// Runs once, as the first response starts.
         on_blob: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Runs once, before the first response's second chunk.
+        mid_body: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Blobs never served.
         held: Mutex<HashMap<ProtoBlobId, Hold>>,
     }
@@ -587,11 +633,21 @@ mod tests {
 
     struct Chunks {
         chunks: VecDeque<Result<Bytes, TransportError>>,
+        served: usize,
+        mid_body: Option<Box<dyn FnOnce() + Send>>,
     }
 
     impl BlobBody for Chunks {
         fn next_chunk(&mut self) -> BoxFuture<'_, Result<Option<Bytes>, TransportError>> {
-            Box::pin(async move { self.chunks.pop_front().transpose() })
+            Box::pin(async move {
+                if self.served == 1
+                    && let Some(hook) = self.mid_body.take()
+                {
+                    hook();
+                }
+                self.served += 1;
+                self.chunks.pop_front().transpose()
+            })
         }
     }
 
@@ -640,7 +696,11 @@ mod tests {
                 Ok(BlobDownload {
                     offset: from,
                     total: self.total,
-                    body: Box::new(Chunks { chunks }),
+                    body: Box::new(Chunks {
+                        chunks,
+                        served: 0,
+                        mid_body: self.mid_body.lock().unwrap().take(),
+                    }),
                 })
             })
         }
@@ -712,6 +772,7 @@ mod tests {
                 froms: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 on_blob: Mutex::new(None),
+                mid_body: Mutex::new(None),
                 held: Mutex::new(HashMap::new()),
             });
             Fixture {
@@ -980,6 +1041,128 @@ mod tests {
         assert!(!done.exists());
     }
 
+    /// Workdir blob ids recur: a refresh purges the blob a worker is
+    /// writing and the next one names it again. The stale download must not
+    /// write for the new registration, and the request the pane makes for
+    /// the new one, while the worker still holds the blob, is kept and
+    /// downloaded afresh once it lets go.
+    #[tokio::test]
+    async fn a_blob_purged_and_registered_again_while_held_downloads_afresh() {
+        use std::sync::mpsc::Receiver;
+
+        use skywave_proto::{ChangesResult, FileBody, FileResult};
+
+        use crate::Request;
+        use crate::view::{WorkdirBody, WorkdirPane};
+        use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+
+        let bytes = content(5000);
+        let f = Fixture::new(5000, bytes.clone(), 5000);
+        let requests = f.seam.take_requests().unwrap();
+        let blob = BlobRef {
+            id: ProtoBlobId::new(),
+            size: 5000,
+        };
+        // Plays the engine for the requests waiting: answers every workdir
+        // read (the file's with `content`), returns the downloads asked for.
+        let serve = {
+            let seam = f.seam.clone();
+            move |requests: &Receiver<Request>, content: FileBody| {
+                let mut downloads = Vec::new();
+                while let Ok(request) = requests.try_recv() {
+                    match request {
+                        Request::Workdir { req, ask } => {
+                            let answer = match ask {
+                                WorkdirAsk::Changes { .. } => {
+                                    WorkdirAnswer::Changes(ChangesResult::NotGit)
+                                }
+                                _ => WorkdirAnswer::File(FileResult::File {
+                                    at: Utc::now(),
+                                    path: "a.txt".into(),
+                                    size: 5000,
+                                    content: content.clone(),
+                                }),
+                            };
+                            seam.workdir_answered(req, ask, Ok(answer)).unwrap();
+                        }
+                        Request::DownloadBlob(id) => downloads.push(id),
+                        _ => {}
+                    }
+                }
+                downloads
+            }
+        };
+        f.core
+            .dispatch(Action::OpenWorkdir {
+                session_id: f.session_id,
+            })
+            .unwrap();
+        f.core
+            .dispatch(Action::ShowWorkdir(WorkdirPane::File {
+                path: "a.txt".into(),
+            }))
+            .unwrap();
+        assert_eq!(serve(&requests, FileBody::Blob(blob.clone())), [blob.id]);
+        f.queue.want(blob.id);
+
+        let (core, queue, again) = (f.core.clone(), f.queue.clone(), blob.clone());
+        let seam = f.seam.clone();
+        *f.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+            // What the running download holds.
+            let (_, held) = seam.leased_blob(again.id).unwrap().unwrap();
+            // Refreshed twice mid-download: gone, then named again.
+            core.dispatch(Action::RefreshWorkdir).unwrap();
+            assert!(serve(&requests, FileBody::Binary).is_empty());
+            core.dispatch(Action::RefreshWorkdir).unwrap();
+            let downloads = serve(&requests, FileBody::Blob(again.clone()));
+            // The row is back, but not for the download running: what it
+            // would report is refused and the new row stays untouched.
+            let done = BlobStatus::Available {
+                path: "/gone".into(),
+            };
+            assert!(matches!(
+                seam.leased_blob_status(again.id, held, done),
+                Err(CoreError::Store(crate::store::StoreError::UnknownBlob(_)))
+            ));
+            assert_eq!(
+                seam.blob(again.id).unwrap().map(|b| b.status),
+                Some(BlobStatus::NotDownloaded)
+            );
+            // The pane on screen asks for it again, as the engine passes on.
+            assert_eq!(downloads, [again.id]);
+            queue.want(again.id);
+        }));
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        let status = || f.seam.blob(blob.id).unwrap().map(|b| b.status);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(status(), Some(BlobStatus::Available { .. }))
+                || !lock(&f.queue.queue).active.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("blob status stuck at {:?}", status()));
+        downloader.abort();
+
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 0], "downloaded afresh");
+        let Some(BlobStatus::Available { path }) = status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(!part_path(&blob_dir(&f.seam.data_dir()), blob.id).exists());
+        let Screen::Workdir(view) = f.core.view().screen else {
+            panic!("expected the workdir screen");
+        };
+        let WorkdirBody::File {
+            blob: Some(shown), ..
+        } = view.body
+        else {
+            panic!("expected the file, got {:?}", view.body);
+        };
+        assert!(matches!(shown.state, BlobState::Available { .. }));
+    }
+
     #[tokio::test]
     async fn a_wanted_blob_passes_stalled_eager_downloads() {
         let bytes = content(3000);
@@ -995,6 +1178,63 @@ mod tests {
     async fn a_wanted_blob_passes_eager_downloads_retrying_offline() {
         let f = Fixture::new(3000, content(3000), 3000);
         f.want_past_held_eager(Hold::Offline).await;
+    }
+
+    /// Changes on many threads hand their requests to the engine in the
+    /// order they were made, so a purge's `BlobsPurged` can never land
+    /// after the `DownloadBlob` of a later change re-registering the id.
+    #[test]
+    fn requests_reach_the_engine_in_the_order_of_their_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_detached(dir.path()).unwrap();
+        let requests = core.seam().take_requests().unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let core = core.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        core.shared
+                            .update::<(), Infallible>(|state| {
+                                let req = state.version;
+                                Ok((
+                                    (),
+                                    vec![crate::Request::ListDirs {
+                                        req,
+                                        dir: String::new(),
+                                    }],
+                                ))
+                            })
+                            .unwrap_or_else(|never| match never {});
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let order: Vec<u64> = requests
+            .try_iter()
+            .map(|request| match request {
+                crate::Request::ListDirs { req, .. } => req,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(order.len(), 16_000);
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "out of change order");
+    }
+
+    /// What the engine then sees for a blob purged by one answer and
+    /// registered again (and asked for) by the next: the purge first, so
+    /// the request stays queued.
+    #[test]
+    fn a_purge_before_a_request_for_the_registered_again_blob_keeps_it_queued() {
+        let queue = BlobQueue::default();
+        let id = ProtoBlobId::new();
+        queue.want(id);
+        queue.purged(&[id]);
+        assert!(waiting(&queue).is_empty(), "the old request goes");
+        queue.want(id);
+        assert_eq!(waiting(&queue), [(id, true)]);
     }
 
     #[test]

@@ -79,5 +79,10 @@ pub use view::{
     SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
     SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
-    ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState,
+    ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirFetch, WorkdirPane, WorkdirView,
+};
+pub use view::{
+    ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,
+    FileResult, LinkTarget, ListResult,
 };
