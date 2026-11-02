@@ -52,7 +52,7 @@
 //! stream ends with `Exited`.
 //!
 //! **Killing.** A kill is SIGTERM to the CLI's process group, then SIGKILL
-//! for whatever is left after the term grace ([`group`]). The SIGTERM is
+//! for whatever is left after the term grace ([`crate::process`]). The SIGTERM is
 //! what stops the CLI's tools: it runs each Bash command in a session of
 //! its own, out of the group's reach, and on SIGTERM kills its running
 //! command and background tasks and reports them before it exits
@@ -65,7 +65,6 @@
 //! session.
 
 pub mod display;
-mod group;
 pub mod protocol;
 pub mod rules;
 pub mod usage;
@@ -85,13 +84,13 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tracing::Instrument;
 use uuid::Uuid;
 
-use self::group::Group;
 use self::protocol::{Output, Protocol};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
     Conversation, Effort, PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
+use crate::process::{self, DEFAULT_TERM_GRACE, Group};
 
 /// Flags every CLI process gets, before the session flag and `agent.args`.
 pub const REQUIRED_ARGS: [&str; 8] = [
@@ -112,8 +111,6 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a write may wait for the CLI to read its stdin before the
 /// process counts as wedged and is killed.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a killed process group gets between SIGTERM and SIGKILL.
-pub const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(5);
 
 /// Capacity of a session's event channel.
 const EVENT_CAPACITY: usize = 256;
@@ -196,7 +193,7 @@ impl ClaudeCodeAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        group::isolate(&mut command);
+        process::isolate(&mut command);
         command.spawn().map_err(|e| {
             AgentError::Start(format!(
                 "cannot run {} in {}: {e}",

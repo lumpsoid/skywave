@@ -17,6 +17,7 @@ pub mod event_log;
 pub mod identity;
 pub mod logging;
 pub mod pairing;
+mod process;
 pub mod server;
 pub mod supervisor;
 
