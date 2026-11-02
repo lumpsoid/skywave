@@ -17,6 +17,7 @@ void main() {
             blobPolicy: BlobPolicyView.onDemand,
             blobPolicyLabel: 'on demand (download when opened)',
             server: 'srv:7443',
+            editableAddress: 'srv:7443',
             device: 'dev-1',
             fingerprint: 'AB:CD',
           ),
@@ -48,6 +49,52 @@ void main() {
       ),
       const GuiIntentAct(action: ActionIntentBack()),
     ]);
+  });
+
+  Widget settings(List<GuiIntent> sent, {String? editableAddress}) =>
+      MaterialApp(
+        home: SettingsPage(
+          screen: ScreenViewSettings(
+            blobPolicy: BlobPolicyView.onDemand,
+            blobPolicyLabel: 'on demand (download when opened)',
+            server: editableAddress ?? 'not paired',
+            editableAddress: editableAddress,
+            device: 'dev-1',
+            fingerprint: null,
+          ),
+          link: LinkHolder(),
+          send: sent.add,
+        ),
+      );
+
+  testWidgets('a paired server address is changed in place', (tester) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(settings(sent, editableAddress: 'srv:7443'));
+    final edit = find.byKey(const Key('edit-server-address'));
+
+    await tester.tap(edit);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    await tester.tap(edit);
+    await tester.pumpAndSettle();
+    final field = find.byKey(const Key('server-address-field'));
+    expect(tester.widget<TextField>(field).controller!.text, 'srv:7443');
+    await tester.enterText(field, '10.0.0.7:7443');
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(sent, [
+      const GuiIntentAct(
+        action: ActionIntentSetServerAddress(address: '10.0.0.7:7443'),
+      ),
+    ]);
+  });
+
+  testWidgets('an unpaired device has no address to change', (tester) async {
+    await tester.pumpWidget(settings([]));
+    expect(find.byKey(const Key('edit-server-address')), findsNothing);
   });
 
   testWidgets('the connection tile follows the link and its latency', (

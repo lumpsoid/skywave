@@ -184,6 +184,38 @@ fn settings_view(core: &Core) -> SettingsView {
 }
 
 #[test]
+fn a_new_server_address_reconnects_keeps_the_pairing_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, device) = paired_core(dir.path());
+    core.dispatch(Action::CreateSession {
+        workdir: "/srv/a".into(),
+        conversation: None,
+    })
+    .unwrap();
+    drain(&requests);
+
+    core.dispatch(Action::SetServerAddress {
+        address: " 10.0.0.7:7443 ".into(),
+    })
+    .unwrap();
+    assert_eq!(drain(&requests), vec![Request::Connect]);
+    let settings = settings_view(&core);
+    assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+    assert_eq!(settings.device_id, Some(device));
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    let settings = settings_view(&core);
+    assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+    assert_eq!(settings.device_id, Some(device), "no re-pairing");
+    core.dispatch(Action::Navigate(Route::SessionList)).unwrap();
+    match core.view().screen {
+        Screen::SessionList(list) => assert_eq!(list.creating.len(), 1, "the outbox is kept"),
+        other => panic!("expected the session list, got {other:?}"),
+    }
+}
+
+#[test]
 fn settings_show_the_pinned_server_fingerprint_also_after_restart() {
     let key = rcgen::KeyPair::generate().unwrap();
     let ca = rcgen::CertificateParams::new(Vec::new())

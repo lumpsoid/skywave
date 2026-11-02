@@ -683,6 +683,9 @@ fn settings_view(settings: &SettingsView) -> ScreenView {
             .server_address
             .clone()
             .unwrap_or_else(|| "not paired".to_owned()),
+        editable_address: settings
+            .device_id
+            .map(|_| settings.server_address.clone().unwrap_or_default()),
         device: settings
             .device_id
             .map_or_else(|| "not paired".to_owned(), |id| id.0.to_string()),

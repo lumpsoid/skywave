@@ -15,6 +15,14 @@ pub enum Action {
         code: String,
         fingerprint: String,
     },
+    /// Reach the paired server at another address, e.g. after its IP
+    /// changed, and reconnect there. No re-pairing: the pinned CA and this
+    /// device's certificate still decide whom the link trusts, so a wrong
+    /// address can only fail to connect. Trimmed; a no-op when unpaired,
+    /// unchanged or not a [`ServerAddress`](crate::ServerAddress).
+    SetServerAddress {
+        address: String,
+    },
     /// Start a session in a server directory under a configured root (D14).
     ///
     /// `conversation` is the agent's own id of a conversation it had

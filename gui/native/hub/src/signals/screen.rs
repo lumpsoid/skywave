@@ -63,6 +63,9 @@ pub enum ScreenView {
         blob_policy_label: String,
         /// The server address, or `not paired`.
         server: String,
+        /// The address to start editing from; `None` while unpaired, when
+        /// there is no server to move.
+        editable_address: Option<String>,
         /// This device's id, or `not paired`.
         device: String,
         /// The pinned server CA fingerprint, to compare with what

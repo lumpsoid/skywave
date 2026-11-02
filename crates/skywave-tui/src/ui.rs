@@ -71,7 +71,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
                     session::render(frame, body, app, session, ui, wall);
                 }
             }
-            Screen::Settings(settings) => render_settings(frame, body, settings),
+            Screen::Settings(settings) => render_settings(frame, body, app, settings),
         }
     }
 
@@ -324,6 +324,7 @@ pub(crate) fn render_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: &P
         }
         PromptKind::Adopt => " Continue an outside conversation · agent session id (paste it) ",
         PromptKind::Rename(_) => " Rename session · empty restores the default title ",
+        PromptKind::ServerAddress => " Server address · host:port, same server ",
     };
     let block = Block::bordered().title(title).cyan();
     let inner = block.inner(area);
@@ -491,7 +492,13 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
+fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &SettingsView) {
+    let prompt = app.ui().prompt.as_ref();
+    let [area, prompt_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(if prompt.is_some() { 3 } else { 0 }),
+    ])
+    .areas(area);
     let policy = match settings.blob_policy {
         BlobPolicy::Eager => "eager (download every blob)",
         BlobPolicy::OnDemand => "on demand (download when opened)",
@@ -541,10 +548,20 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &SettingsView) {
             second.trim_start_matches(':')
         )));
     }
+    if settings.device_id.is_some() {
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from("  Press a to change the server address (same server, no re-pairing).")
+                .dark_gray(),
+        );
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Settings ")),
         area,
     );
+    if let Some(prompt) = prompt {
+        render_prompt(frame, prompt_area, app, prompt);
+    }
 }
 
 /// Key hints for the footer, the search prompt while it is open, and where
@@ -705,7 +722,12 @@ fn footer_keys(app: &App) -> &'static str {
                 "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
             }
         },
-        Screen::Settings(_) => "b toggle blob policy · p re-pair · Esc back · ? help · q quit",
+        Screen::Settings(_) if app.ui().prompt.is_some() => {
+            "Enter reconnect there · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        Screen::Settings(_) => {
+            "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
+        }
     }
 }
 
@@ -912,6 +934,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Settings(_) => lines.extend([
             section("Settings"),
             key("b", "toggle blob policy: on demand / eager"),
+            key(
+                "a",
+                "change the server address, e.g. after its IP changed (no re-pairing)",
+            ),
             key("p", "re-pair"),
             key("Esc", "back to sessions"),
         ]),

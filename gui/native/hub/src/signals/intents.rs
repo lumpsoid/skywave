@@ -254,6 +254,12 @@ pub enum ActionIntent {
         policy: BlobPolicyChoice,
     },
     RetryNow,
+    /// Reach the paired server at `address` (`host:port`) from now on,
+    /// without re-pairing. One that does not parse is answered with
+    /// `PlatformEffect::Error`.
+    SetServerAddress {
+        address: String,
+    },
     Navigate {
         route: RouteView,
     },

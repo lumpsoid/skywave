@@ -13,8 +13,8 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
     Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
-    Screen, Seq, SessionId, SessionListView, SessionRow, SessionView, TaskId, TimelineItem,
-    ToolOutcome, ViewState, parse_pair_uri,
+    Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView, TaskId,
+    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
@@ -142,6 +142,9 @@ pub enum PromptKind {
     /// A new name for the session, on the session list or the session
     /// itself; blank restores the default title (the core decides).
     Rename(SessionId),
+    /// Where the paired server is now, on settings: Enter reconnects there
+    /// without re-pairing; an address that does not parse stays to fix.
+    ServerAddress,
 }
 
 /// A one-line prompt over the session list or a session.
@@ -178,7 +181,7 @@ impl Prompt {
         match self.kind {
             PromptKind::Create => true,
             PromptKind::Adopt => self.workdir.is_none(),
-            PromptKind::Rename(_) => false,
+            PromptKind::Rename(_) | PromptKind::ServerAddress => false,
         }
     }
 
@@ -192,9 +195,11 @@ impl Prompt {
     }
 
     /// Whether the prompt still belongs on `screen`: a new-session prompt
-    /// on the session list, a rename there or on its session.
+    /// on the session list, a rename there or on its session, an address
+    /// on settings.
     fn fits(&self, screen: &Screen) -> bool {
         match (self.kind, screen) {
+            (PromptKind::ServerAddress, screen) => matches!(screen, Screen::Settings(_)),
             (_, Screen::SessionList(_)) => true,
             (PromptKind::Rename(id), Screen::Session(view)) => view.id == id,
             _ => false,
@@ -1457,7 +1462,7 @@ impl App {
             && match self.view.screen {
                 Screen::Pairing(_) => true,
                 Screen::SessionList(_) => self.ui.prompt.is_some(),
-                Screen::Session(_) if self.ui.prompt.is_some() => true,
+                Screen::Session(_) | Screen::Settings(_) if self.ui.prompt.is_some() => true,
                 Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| match &s.picker {
                     Some(picker) => matches!(picker, Picker::Model { .. }),
                     None => {
@@ -1471,7 +1476,7 @@ impl App {
     /// Bracketed paste: on the pairing screen a pairing URI fills the whole
     /// form, a malformed one is reported, anything else goes into the
     /// focused field; an open prompt
-    /// (new session, rename) takes it; on a session it goes into the
+    /// (new session, rename, server address) takes it; on a session it goes into the
     /// search prompt while that is open, else into the composer, line
     /// breaks included.
     pub fn on_paste(&mut self, text: &str) {
@@ -1602,6 +1607,7 @@ impl App {
             }
             Some(PromptKind::Adopt) => return self.adopt_id_key(key, ctrl),
             Some(PromptKind::Rename(id)) => return self.rename_key(id, key, ctrl),
+            Some(PromptKind::ServerAddress) => return self.address_key(key, ctrl),
             None => {}
         }
         match &self.view.screen {
@@ -1681,6 +1687,11 @@ impl App {
                     BlobPolicy::OnDemand => BlobPolicy::Eager,
                 })),
                 KeyCode::Char('p') => Some(Action::Navigate(Route::Pairing)),
+                KeyCode::Char('a') if settings.device_id.is_some() => {
+                    let address = settings.server_address.clone().unwrap_or_default();
+                    self.ui.prompt = Some(Prompt::new(PromptKind::ServerAddress, address));
+                    None
+                }
                 _ => None,
             },
         }
@@ -1827,6 +1838,31 @@ impl App {
                     name: prompt.text.clone(),
                 });
             }
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => prompt.text.clear(),
+            KeyCode::Char(c) if !ctrl => prompt.insert(c.encode_utf8(&mut [0; 4])),
+            _ => {}
+        }
+        None
+    }
+
+    /// Keys while the server address prompt is open. Enter moves the link
+    /// to the address, or shows why it is not one; Esc cancels.
+    fn address_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let prompt = self.ui.prompt.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.ui.prompt = None,
+            KeyCode::Enter => match ServerAddress::parse(&prompt.text) {
+                Ok(_) => {
+                    prompt.submitted = true;
+                    return Some(Action::SetServerAddress {
+                        address: prompt.text.clone(),
+                    });
+                }
+                Err(err) => self.ui.error = Some(err.to_string()),
+            },
             KeyCode::Backspace => {
                 prompt.text.pop();
             }

@@ -16,6 +16,7 @@ use skywave_proto::{
 };
 
 use crate::action::{Action, Route};
+use crate::address::ServerAddress;
 use crate::completion::Completer;
 use crate::identity::Identity;
 use crate::projection::{
@@ -45,6 +46,7 @@ pub(crate) enum Effect {
     /// Write the command to the outbox.
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
+    SaveServerAddress(String),
     /// Keep the session's draft; `None` deletes it.
     SaveDraft(SessionId, Option<Draft>),
     SaveReadMark(SessionId, ReadMark),
@@ -282,6 +284,21 @@ impl Model {
                 code,
                 fingerprint,
             } => self.pair(address, code, fingerprint),
+            Action::SetServerAddress { address } => {
+                let address = address.trim();
+                if self.device().is_none()
+                    || self.settings.server_address.as_deref() == Some(address)
+                    || ServerAddress::parse(address).is_err()
+                {
+                    return Vec::new();
+                }
+                self.settings.server_address = Some(address.to_owned());
+                self.link = Link::Connecting;
+                vec![
+                    Effect::SaveServerAddress(address.to_owned()),
+                    Effect::Request(Request::Connect),
+                ]
+            }
             Action::CreateSession {
                 workdir,
                 conversation,
@@ -4532,6 +4549,39 @@ mod tests {
             )],
             "a moved cursor is a change"
         );
+    }
+
+    #[test]
+    fn a_new_server_address_is_saved_and_reconnects() {
+        let mut model = Model::new(empty_snapshot(), None);
+        let set = |address: &str| Action::SetServerAddress {
+            address: address.into(),
+        };
+        assert!(model.dispatch(set("10.0.0.7:7443")).is_empty(), "unpaired");
+
+        let mut f = Fixture::paired();
+        f.model.paired(paired_as(f.me), "host:7443".into());
+        f.model.set_link(Link::Rejected(LinkRejection::Revoked));
+        assert!(f.dispatch(set(" host:7443 ")).is_empty(), "unchanged");
+        assert!(f.dispatch(set("not an address:x")).is_empty(), "invalid");
+        assert!(f.dispatch(set("  ")).is_empty(), "blank");
+        assert_eq!(
+            f.dispatch(set(" 10.0.0.7:7443 ")),
+            vec![
+                Effect::SaveServerAddress("10.0.0.7:7443".into()),
+                Effect::Request(Request::Connect),
+            ]
+        );
+        let view = f.model.view();
+        assert_eq!(view.link, Link::Connecting);
+        f.dispatch(Action::Navigate(Route::Settings));
+        match f.model.view().screen {
+            Screen::Settings(settings) => {
+                assert_eq!(settings.server_address.as_deref(), Some("10.0.0.7:7443"));
+                assert_eq!(settings.device_id, Some(f.me));
+            }
+            other => panic!("expected settings, got {other:?}"),
+        }
     }
 
     #[test]
