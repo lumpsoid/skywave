@@ -31,12 +31,13 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
-    BlobState, BlobView, BodyView, CallId, CommandId, ContextId, ContextView, Decision, Delivery,
-    DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, LinkRejection, ListKind,
-    ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
-    PendingSession, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    BlobState, BlobView, BodyView, CallId, CommandId, ComposerMode, ContextId, ContextView,
+    Decision, Delivery, DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    PendingApprovalRef, PendingSession, RunWhen, Screen, Seq, SessionId, SessionListView,
+    SessionRef, SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet,
+    SnippetId, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -47,8 +48,9 @@ pub(crate) enum Effect {
     Enqueue(Command),
     SaveBlobPolicy(BlobPolicy),
     SaveServerAddress(String),
-    /// Keep the session's draft; `None` deletes it.
-    SaveDraft(SessionId, Option<Draft>),
+    /// Keep the session's draft in that mode; `None` deletes it.
+    SaveDraft((SessionId, ComposerMode), Option<Draft>),
+    SaveComposerMode(SessionId, ComposerMode),
     SaveReadMark(SessionId, ReadMark),
     SaveSnippet(Snippet),
     DeleteSnippet(SnippetId),
@@ -56,7 +58,7 @@ pub(crate) enum Effect {
     /// one write: the text is never lost nor kept twice.
     Withdraw {
         id: CommandId,
-        draft: Option<(SessionId, Draft)>,
+        draft: Option<((SessionId, ComposerMode), Draft)>,
     },
     /// Read the session's events from the replica into the model.
     LoadSession(SessionId),
@@ -144,8 +146,11 @@ pub(crate) struct Model {
     wanted: HashSet<BlobId>,
     /// Why the last download of a blob was given up; in memory only.
     failed: HashMap<BlobId, String>,
-    /// This device's unsent messages, as stored.
-    drafts: HashMap<SessionId, Draft>,
+    /// This device's unsent messages and shell commands, as stored.
+    drafts: HashMap<(SessionId, ComposerMode), Draft>,
+    /// What each session's composer writes where it is not the agent, as
+    /// stored.
+    composer_modes: HashMap<SessionId, ComposerMode>,
     /// Bumped whenever the model itself rewrites a draft, so heads know to
     /// replace the text they hold; never goes back, not even on reload.
     draft_rev: u64,
@@ -211,6 +216,7 @@ impl Model {
             wanted: HashSet::new(),
             failed: HashMap::new(),
             drafts: HashMap::new(),
+            composer_modes: HashMap::new(),
             draft_rev: 0,
             read_marks: HashMap::new(),
             snippets: Snippets::default(),
@@ -242,6 +248,7 @@ impl Model {
         self.outbox = snapshot.outbox;
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
         self.drafts = snapshot.drafts;
+        self.composer_modes = snapshot.composer_modes;
         self.read_marks = snapshot.read_marks;
         self.snippets = Snippets::new(snapshot.snippets);
         self.deleted = snapshot.deleted;
@@ -376,18 +383,57 @@ impl Model {
                 });
                 // The store drops the draft with the enqueue.
                 if !effects.is_empty() {
-                    self.drafts.remove(&session_id);
+                    self.drafts.remove(&(session_id, ComposerMode::Agent));
                 }
                 effects
             }
+            Action::RunShell {
+                session_id,
+                command,
+                when,
+            } => {
+                // Over the size limit is the server's to refuse: a refused
+                // run can be taken back with its text, a dropped one not.
+                if self.summary(session_id).is_none() || command.trim().is_empty() {
+                    return Vec::new();
+                }
+                let effects = self.enqueue(CommandKind::RunShell {
+                    session_id,
+                    command,
+                    when,
+                });
+                // The store drops the shell draft with the enqueue.
+                if !effects.is_empty() {
+                    self.drafts.remove(&(session_id, ComposerMode::Shell));
+                }
+                effects
+            }
+            Action::StopShell { session_id, run } => {
+                if self.summary(session_id).is_none() {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::StopShell { session_id, run })
+            }
+            Action::SetComposerMode { session_id, mode } => {
+                if self.summary(session_id).is_none() || self.composer_mode(session_id) == mode {
+                    return Vec::new();
+                }
+                match mode {
+                    ComposerMode::Agent => self.composer_modes.remove(&session_id),
+                    ComposerMode::Shell => self.composer_modes.insert(session_id, mode),
+                };
+                vec![Effect::SaveComposerMode(session_id, mode)]
+            }
             Action::SaveDraft {
                 session_id,
+                mode,
                 text,
                 cursor,
-            } => self.save_draft(session_id, text, cursor),
-            Action::SaveSnippet { name, text } => self
+                when,
+            } => self.save_draft((session_id, mode), text, cursor, when),
+            Action::SaveSnippet { name, text, kind } => self
                 .snippets
-                .save(&name, text)
+                .save(&name, text, kind)
                 .map(Effect::SaveSnippet)
                 .into_iter()
                 .collect(),
@@ -753,24 +799,45 @@ impl Model {
             .any(|(_, e)| e.context == context && matches!(e.kind, EventKind::ContextMoved { .. }))
     }
 
-    /// Keeps the session's draft; blank text drops it. Nothing to write when
-    /// the draft is unchanged or the session unknown.
-    fn save_draft(&mut self, session_id: SessionId, text: String, cursor: usize) -> Vec<Effect> {
-        if self.summary(session_id).is_none() {
+    /// What the session's composer writes on this device.
+    fn composer_mode(&self, session_id: SessionId) -> ComposerMode {
+        self.composer_modes
+            .get(&session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Keeps the session's draft in a mode; blank text drops it, unless a
+    /// shell draft keeps a condition picked before typing. An agent draft
+    /// runs on nothing: its `when` is always `Always`. Nothing to write
+    /// when the draft is unchanged or the session unknown.
+    fn save_draft(
+        &mut self,
+        key: (SessionId, ComposerMode),
+        text: String,
+        cursor: usize,
+        when: RunWhen,
+    ) -> Vec<Effect> {
+        if self.summary(key.0).is_none() {
             return Vec::new();
         }
-        let draft = (!text.trim().is_empty()).then(|| Draft {
+        let when = match key.1 {
+            ComposerMode::Agent => RunWhen::Always,
+            ComposerMode::Shell => when,
+        };
+        let draft = (!text.trim().is_empty() || when != RunWhen::Always).then(|| Draft {
             cursor: cursor.min(text.chars().count()),
             text,
+            when,
         });
-        if self.drafts.get(&session_id) == draft.as_ref() {
+        if self.drafts.get(&key) == draft.as_ref() {
             return Vec::new();
         }
         match &draft {
-            Some(draft) => self.drafts.insert(session_id, draft.clone()),
-            None => self.drafts.remove(&session_id),
+            Some(draft) => self.drafts.insert(key, draft.clone()),
+            None => self.drafts.remove(&key),
         };
-        vec![Effect::SaveDraft(session_id, draft)]
+        vec![Effect::SaveDraft(key, draft)]
     }
 
     /// Marks the open session read through `through`, clamped to its newest
@@ -807,10 +874,11 @@ impl Model {
     }
 
     /// Takes back a [`discardable`](OutboxEntry::discardable) command; with
-    /// `edit`, a message goes back into its session's draft, ahead of what
-    /// the draft held, the cursor after the message. The state lock is the
-    /// one the engine's claim takes, so a command it claimed meanwhile is no
-    /// longer discardable here: nothing happens.
+    /// `edit`, a message goes back into its session's agent draft, ahead of
+    /// what the draft held, the cursor after the message; a shell run
+    /// likewise into the shell draft, which takes the run's `when`. The
+    /// state lock is the one the engine's claim takes, so a command it
+    /// claimed meanwhile is no longer discardable here: nothing happens.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -819,29 +887,44 @@ impl Model {
         else {
             return Vec::new();
         };
-        let draft = match &self.outbox[index].command.kind {
+        // A message is set off from the draft by a blank line, a shell
+        // command by a line break: the next line is the next command.
+        let (key, text, when, separator) = match &self.outbox[index].command.kind {
             CommandKind::SendMessage {
                 session_id, text, ..
-            } if edit => {
-                let joined = match self.drafts.get(session_id) {
-                    Some(old) => format!("{text}\n\n{}", old.text),
-                    None => text.clone(),
-                };
-                let draft = Draft {
-                    cursor: text.chars().count(),
-                    text: joined,
-                };
-                Some((*session_id, draft))
-            }
+            } if edit => (
+                (*session_id, ComposerMode::Agent),
+                text,
+                RunWhen::Always,
+                "\n\n",
+            ),
+            CommandKind::RunShell {
+                session_id,
+                command,
+                when,
+            } if edit => ((*session_id, ComposerMode::Shell), command, *when, "\n"),
             _ if edit => return Vec::new(),
-            _ => None,
+            _ => {
+                self.outbox.remove(index);
+                return vec![Effect::Withdraw { id, draft: None }];
+            }
+        };
+        let joined = match self.drafts.get(&key) {
+            Some(old) if !old.text.trim().is_empty() => format!("{text}{separator}{}", old.text),
+            _ => text.clone(),
+        };
+        let draft = Draft {
+            cursor: text.chars().count(),
+            text: joined,
+            when,
         };
         self.outbox.remove(index);
-        if let Some((session_id, draft)) = &draft {
-            self.drafts.insert(*session_id, draft.clone());
-            self.draft_rev += 1;
-        }
-        vec![Effect::Withdraw { id, draft }]
+        self.drafts.insert(key, draft.clone());
+        self.draft_rev += 1;
+        vec![Effect::Withdraw {
+            id,
+            draft: Some((key, draft)),
+        }]
     }
 
     /// Pending in the replica and not already answered from this device
@@ -1070,6 +1153,11 @@ impl Model {
         }
     }
 
+    /// The server said whether it runs shell commands (already stored).
+    pub(crate) fn shell_enabled(&mut self, enabled: bool) {
+        self.settings.shell_enabled = enabled;
+    }
+
     /// Devices the events name that this device knows no name for.
     pub(crate) fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
         batch
@@ -1092,7 +1180,8 @@ impl Model {
     pub(crate) fn session_deleted(&mut self, id: SessionId, blobs: &[BlobId]) {
         self.deleted.insert(id);
         self.sessions.retain(|s| s.id != id);
-        self.drafts.remove(&id);
+        self.drafts.retain(|(session, _), _| *session != id);
+        self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
         self.outbox
             .retain(|e| e.status.is_pending() || command_session(&e.command.kind) != Some(id));
@@ -1295,7 +1384,13 @@ impl Model {
                     state: session_state(s),
                     pending_approvals: s.pending_approvals.len(),
                     last_activity: s.last_activity,
-                    has_draft: self.drafts.contains_key(&s.id),
+                    has_draft: [ComposerMode::Agent, ComposerMode::Shell]
+                        .iter()
+                        .any(|mode| {
+                            self.drafts
+                                .get(&(s.id, *mode))
+                                .is_some_and(|d| !d.text.trim().is_empty())
+                        }),
                     unread: match self.read_marks.get(&s.id) {
                         Some(mark) => s.notable.saturating_sub(mark.notable),
                         None => s.notable,
@@ -1461,8 +1556,11 @@ impl Model {
             stop,
             work: summary.work.clone(),
             task_stops: self.task_stops(summary, events),
-            draft: self.drafts.get(&id).cloned(),
+            mode: self.composer_mode(id),
+            draft: self.drafts.get(&(id, ComposerMode::Agent)).cloned(),
+            shell_draft: self.drafts.get(&(id, ComposerMode::Shell)).cloned(),
             draft_rev: self.draft_rev,
+            shell_enabled: self.settings.shell_enabled,
             last_seq: summary.last_seq,
             unread_from: open.and_then(|open| open.unread_from),
         })
@@ -1496,8 +1594,8 @@ impl Model {
 
     /// Whether a session is on the archived list: the replica's flag, unless
     /// this device's latest archiving of it is on its way (and has not
-    /// failed); either way a message queued here after that brings it back,
-    /// as it will in the log.
+    /// failed); either way a message or shell run queued here after that
+    /// brings it back, as it will in the log.
     fn archived(&self, summary: &SessionSummary) -> bool {
         let id = summary.id;
         let on_its_way = |e: &OutboxEntry| {
@@ -1519,7 +1617,12 @@ impl Model {
         let after = latest.map_or(0, |i| i + 1);
         let message = self.outbox[after..].iter().any(|e| {
             on_its_way(e)
-                && matches!(&e.command.kind, CommandKind::SendMessage { session_id, .. } if *session_id == id)
+                && matches!(
+                    &e.command.kind,
+                    CommandKind::SendMessage { session_id, .. }
+                        | CommandKind::RunShell { session_id, .. }
+                        if *session_id == id
+                )
         });
         archived && !message
     }
@@ -2734,6 +2837,7 @@ mod tests {
             blobs: Vec::new(),
             settings: Settings::default(),
             drafts: HashMap::new(),
+            composer_modes: HashMap::new(),
             read_marks: HashMap::new(),
             deleted: HashSet::new(),
             alerted: HashSet::new(),
@@ -4387,6 +4491,52 @@ mod tests {
     }
 
     #[test]
+    fn a_later_shell_run_brings_the_session_back() {
+        let run = |sid: SessionId| Action::RunShell {
+            session_id: sid,
+            command: "make test".into(),
+            when: RunWhen::Always,
+        };
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        // Archive, then a run, both still queued: active, as the log will
+        // have it once `ShellRequested` is in.
+        queued(&f.dispatch(archive(sid, true)));
+        let sent = queued(&f.dispatch(run(sid)));
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        // A refused run brings nothing back.
+        f.model.command_result(
+            sent.id,
+            CommandResult::Rejected {
+                reason: RejectReason::ShellDisabled,
+            },
+            Utc::now(),
+        );
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+
+        // Archived by another device: a run queued here brings it back at
+        // once.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+        queued(&f.dispatch(run(sid)));
+        assert_eq!(lists(&mut f), (vec![sid], vec![]));
+        f.open(sid);
+        assert!(!f.session_view().archived);
+
+        // A stop is no run: it brings nothing back.
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/app");
+        f.log(sid, vec![archived_event(true, DeviceId::new())]);
+        queued(&f.dispatch(Action::StopShell {
+            session_id: sid,
+            run: CommandId::new(),
+        }));
+        assert_eq!(lists(&mut f), (vec![], vec![sid]));
+    }
+
+    #[test]
     fn archiving_keeps_the_order_is_not_unread_and_approvals_still_count() {
         let mut f = Fixture::paired();
         let old = f.session("/srv/old");
@@ -4654,6 +4804,7 @@ mod tests {
         let save = |name: &str, text: &str| Action::SaveSnippet {
             name: name.into(),
             text: text.into(),
+            kind: ComposerMode::Agent,
         };
         let [Effect::SaveSnippet(tests)] = &f.dispatch(save("tests", "run the tests"))[..] else {
             panic!("one snippet to store");
@@ -4710,8 +4861,10 @@ mod tests {
     fn save_draft(session_id: SessionId, text: &str, cursor: usize) -> Action {
         Action::SaveDraft {
             session_id,
+            mode: ComposerMode::Agent,
             text: text.into(),
             cursor,
+            when: RunWhen::Always,
         }
     }
 
@@ -4723,11 +4876,15 @@ mod tests {
         let draft = Draft {
             text: "héllo".into(),
             cursor: 5,
+            when: RunWhen::Always,
         };
         // The cursor is clamped to the text's chars.
         assert_eq!(
             f.dispatch(save_draft(sid, "héllo", 99)),
-            vec![Effect::SaveDraft(sid, Some(draft.clone()))]
+            vec![Effect::SaveDraft(
+                (sid, ComposerMode::Agent),
+                Some(draft.clone())
+            )]
         );
         let rows = f.list_view().sessions;
         let has_draft = |id| rows.iter().find(|r| r.id == id).unwrap().has_draft;
@@ -4745,7 +4902,7 @@ mod tests {
         f.dispatch(save_draft(sid, "x", 1));
         assert_eq!(
             f.dispatch(save_draft(sid, " \n ", 2)),
-            vec![Effect::SaveDraft(sid, None)]
+            vec![Effect::SaveDraft((sid, ComposerMode::Agent), None)]
         );
         assert_eq!(f.session_view().draft, None);
     }
@@ -4767,10 +4924,11 @@ mod tests {
         assert_eq!(
             f.dispatch(save_draft(sid, "abc", 1)),
             vec![Effect::SaveDraft(
-                sid,
+                (sid, ComposerMode::Agent),
                 Some(Draft {
                     text: "abc".into(),
-                    cursor: 1
+                    cursor: 1,
+                    when: RunWhen::Always,
                 })
             )],
             "a moved cursor is a change"
@@ -4965,12 +5123,13 @@ mod tests {
         let draft = Draft {
             text: "fix the tests\n\nhalf typed".into(),
             cursor: "fix the tests".len(),
+            when: RunWhen::Always,
         };
         assert_eq!(
             effects,
             vec![Effect::Withdraw {
                 id: first.id,
-                draft: Some((sid, draft.clone())),
+                draft: Some(((sid, ComposerMode::Agent), draft.clone())),
             }]
         );
         let view = f.session_view();
@@ -4991,10 +5150,11 @@ mod tests {
             vec![Effect::Withdraw {
                 id: second.id,
                 draft: Some((
-                    sid,
+                    (sid, ComposerMode::Agent),
                     Draft {
                         text: "then lint".into(),
                         cursor: 9,
+                        when: RunWhen::Always,
                     }
                 )),
             }]
@@ -5928,6 +6088,7 @@ mod tests {
             blobs: model.blobs.values().cloned().collect(),
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
+            composer_modes: model.composer_modes.clone(),
             read_marks: model.read_marks.clone(),
             deleted: model.deleted.clone(),
             alerted: model.alerted.clone(),

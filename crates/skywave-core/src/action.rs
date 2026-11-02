@@ -2,8 +2,8 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CallId, CommandId, ContextId, Decision, Effort, PermissionMode, Seq,
-    SessionId, SnippetId, TaskId,
+    ApprovalId, BlobId, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
+    PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,40 +54,71 @@ pub enum Action {
         session_id: SessionId,
         text: String,
     },
-    /// Keep the session's unsent message on this device; blank text drops
-    /// it. `cursor` counts `char`s. Heads save when the user pauses or
+    /// Queue a shell command to run in the session's workdir on the server,
+    /// in send order with its messages. `when` is the condition it runs on,
+    /// as the user picked it; the core adds nothing. Blank text (after
+    /// trimming), or an unknown session, is a no-op. A command over the
+    /// server's size limit is queued anyway and shows as refused, so its
+    /// text can be taken back. Queuing drops the session's shell draft.
+    RunShell {
+        session_id: SessionId,
+        command: String,
+        when: RunWhen,
+    },
+    /// Ask the server to stop the shell run `run` (the id of this or any
+    /// device's `RunShell`). A no-op for an unknown session.
+    StopShell {
+        session_id: SessionId,
+        run: CommandId,
+    },
+    /// Switch what the session's composer writes on this device. Kept per
+    /// session across restarts; a no-op for an unknown session.
+    SetComposerMode {
+        session_id: SessionId,
+        mode: ComposerMode,
+    },
+    /// Keep the session's unsent message (`mode` agent) or shell command
+    /// (`mode` shell) on this device. `cursor` counts `char`s. Blank text
+    /// drops the draft, except a shell draft whose `when` is not
+    /// [`RunWhen::Always`]: the condition was picked before typing. `when`
+    /// is ignored for an agent draft. Heads save when the user pauses or
     /// leaves, not per keystroke: every save is a durable write.
     SaveDraft {
         session_id: SessionId,
+        mode: ComposerMode,
         text: String,
         cursor: usize,
+        when: RunWhen,
     },
-    /// Keep `text` on this device as a snippet, to use again in any
-    /// session, named `name` (blank for none; normalised as a session
-    /// name). It lists first. Saving a text saved already moves that
-    /// snippet first instead, renamed unless `name` is blank. Blank text
-    /// is a no-op.
+    /// Keep `text` on this device as a snippet of `kind`, to use again in
+    /// any session, named `name` (blank for none; normalised as a session
+    /// name). It lists first. Saving a text saved already as that kind
+    /// moves that snippet first instead, renamed unless `name` is blank.
+    /// Blank text is a no-op.
     SaveSnippet {
         name: String,
         text: String,
+        kind: ComposerMode,
     },
     /// The snippet was put into a composer: it lists first.
     UseSnippet(SnippetId),
     /// Change a snippet's name (blank for none; normalised as a session
-    /// name) and text; it keeps its place. Another snippet with that text
-    /// already goes. Blank text, or an unknown snippet, is a no-op.
+    /// name) and text; it keeps its place and kind. Another snippet of its
+    /// kind with that text already goes. Blank text, or an unknown snippet,
+    /// is a no-op.
     EditSnippet {
         id: SnippetId,
         name: String,
         text: String,
     },
     DeleteSnippet(SnippetId),
-    /// Take back one of this device's messages or session creations that
-    /// the server never saw, or dismiss one it refused. Only items shown as
-    /// `discardable` can be; anything else is a no-op.
+    /// Take back one of this device's messages, shell runs or session
+    /// creations that the server never saw, or dismiss one it refused. Only
+    /// items shown as `discardable` can be; anything else is a no-op.
     Discard(CommandId),
     /// Take back a `discardable` message into its session's draft, ahead of
-    /// what the draft held, to edit and send again. The session view's
+    /// what the draft held, to edit and send again; a shell run likewise
+    /// into the shell draft, with its `when`. The session view's
     /// `draft_rev` changes so heads refill their composer.
     EditQueued(CommandId),
     /// Answer an approval. `rule` grants the prompt's suggestion with that

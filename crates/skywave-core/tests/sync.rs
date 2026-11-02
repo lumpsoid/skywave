@@ -1224,3 +1224,39 @@ async fn a_move_of_a_context_made_current_meanwhile_is_refused_and_discarded() {
         "never moved"
     );
 }
+
+/// The server's `hello` says whether it runs shell commands; the device
+/// keeps that, so a cold start without a link shows it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shell_flag_from_hello_is_kept_for_offline() {
+    let shown = |view: &ViewState| match &view.screen {
+        Screen::Session(session) => Some(session.shell_enabled),
+        _ => None,
+    };
+    for shell in [true, false] {
+        let agent = FakeAgent::new(FakeScript::new());
+        let daemon = Daemon::start_with_shell(agent, shell).await;
+        let proxy = proxy(&daemon).await;
+        let client = Client::open(config());
+        daemon.pair(&client, &proxy.address()).await;
+        let session = client.create_session(&daemon).await;
+        client.dispatch(Action::OpenSession(session));
+        let view = client
+            .wait("online", |_, view| matches!(view.link, Link::Online { .. }))
+            .await;
+        assert_eq!(shown(&view), Some(shell), "as the server said");
+        let dir = client.stop();
+
+        let offline = std::thread::spawn(move || {
+            let core = Core::open_detached(dir.path()).unwrap();
+            core.dispatch(Action::OpenSession(session)).unwrap();
+            let view = core.view();
+            core.shutdown(SOON).unwrap();
+            view
+        })
+        .join()
+        .unwrap();
+        assert_eq!(offline.link, Link::Connecting, "never online");
+        assert_eq!(shown(&offline), Some(shell), "kept over a restart");
+    }
+}

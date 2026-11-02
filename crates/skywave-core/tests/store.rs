@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    BlobPolicy, BlobStatus, Core, Draft, OutboxStatus, PairedCredentials, ReadMark, Settings,
-    Snippet, SnippetId, Store, StoreError,
+    BlobPolicy, BlobStatus, ComposerMode, Core, Draft, OutboxStatus, PairedCredentials, ReadMark,
+    RunWhen, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, Command, CommandId, CommandKind,
@@ -150,7 +150,8 @@ fn fresh_store_is_empty_with_defaults() {
         snapshot.settings,
         Settings {
             blob_policy: BlobPolicy::OnDemand,
-            server_address: None
+            server_address: None,
+            shell_enabled: false,
         }
     );
 }
@@ -531,6 +532,7 @@ fn migration_marks_existing_rows_attempted() {
             .unwrap();
     }
     // A replica from before the columns.
+    drop_shell(&dir);
     drop_outbox_delivery_columns(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
@@ -671,6 +673,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop(store);
 
     // A replica from before the column holds no usage events.
+    drop_shell(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
@@ -786,8 +789,9 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop(store);
 
     // A replica from before the column holds no background work events.
+    drop_shell(&dir);
     drop_work(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -848,6 +852,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
 
     // A replica from before the column (protocol v3: it holds no archive
     // events): everything starts active.
+    drop_shell(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
@@ -932,6 +937,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
 
     // A replica from before the columns (protocol v3: it holds no renames):
     // the migration derives the first prompts from the log like the fold.
+    drop_shell(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
@@ -1034,6 +1040,7 @@ fn notable_count_is_projected_and_backfilled() {
 
     // A replica from before the column: the migration derives it from the
     // log and marks everything stored as read, so nothing shows up as new.
+    drop_shell(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
     drop_usage(&dir);
@@ -1203,6 +1210,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN stopped")
         .unwrap();
     drop(conn);
+    drop_shell(&dir);
     drop_outbox_delivery_columns(&dir);
     drop_alerted(&dir);
     drop_deleted(&dir);
@@ -1222,6 +1230,9 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     assert!(!stopped(&store, b));
 }
 
+const AGENT: ComposerMode = ComposerMode::Agent;
+const SHELL: ComposerMode = ComposerMode::Shell;
+
 fn set_user_version(dir: &Path, version: i64) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.pragma_update(None, "user_version", version).unwrap();
@@ -1234,22 +1245,34 @@ fn drafts_round_trip_and_blank_deletes() {
     let draft = |text: &str, cursor| Draft {
         text: text.into(),
         cursor,
+        when: RunWhen::Always,
     };
     {
         let store = Store::open(&dir).unwrap();
-        store.set_draft(a, Some(&draft("héllo\nwörld", 7))).unwrap();
-        store.set_draft(b, Some(&draft("first", 0))).unwrap();
-        store.set_draft(b, Some(&draft("second", 6))).unwrap();
+        store
+            .set_draft(a, AGENT, Some(&draft("héllo\nwörld", 7)))
+            .unwrap();
+        store.set_draft(b, AGENT, Some(&draft("first", 0))).unwrap();
+        store
+            .set_draft(b, AGENT, Some(&draft("second", 6)))
+            .unwrap();
     }
     let store = Store::open(&dir).unwrap();
     let drafts = store.load().unwrap().drafts;
     assert_eq!(drafts.len(), 2);
-    assert_eq!(drafts[&a], draft("héllo\nwörld", 7));
-    assert_eq!(drafts[&b], draft("second", 6), "a save replaces the draft");
+    assert_eq!(drafts[&(a, AGENT)], draft("héllo\nwörld", 7));
+    assert_eq!(
+        drafts[&(b, AGENT)],
+        draft("second", 6),
+        "a save replaces the draft"
+    );
 
-    store.set_draft(a, None).unwrap();
-    store.set_draft(SessionId::new(), None).unwrap();
-    assert_eq!(store.drafts().unwrap().keys().collect::<Vec<_>>(), [&b]);
+    store.set_draft(a, AGENT, None).unwrap();
+    store.set_draft(SessionId::new(), AGENT, None).unwrap();
+    assert_eq!(
+        store.drafts().unwrap().keys().collect::<Vec<_>>(),
+        [&(b, AGENT)]
+    );
 }
 
 #[test]
@@ -1259,10 +1282,11 @@ fn enqueue_message_clears_its_draft_atomically() {
     let draft = |text: &str| Draft {
         text: text.into(),
         cursor: 0,
+        when: RunWhen::Always,
     };
     let store = Store::open(&dir).unwrap();
-    store.set_draft(a, Some(&draft("to a"))).unwrap();
-    store.set_draft(b, Some(&draft("to b"))).unwrap();
+    store.set_draft(a, AGENT, Some(&draft("to a"))).unwrap();
+    store.set_draft(b, AGENT, Some(&draft("to b"))).unwrap();
 
     // Other commands leave drafts alone.
     store
@@ -1286,7 +1310,10 @@ fn enqueue_message_clears_its_draft_atomically() {
 
     conn.execute_batch("DROP TRIGGER full").unwrap();
     store.enqueue(&send(a, "to a")).unwrap();
-    assert_eq!(store.drafts().unwrap().keys().collect::<Vec<_>>(), [&b]);
+    assert_eq!(
+        store.drafts().unwrap().keys().collect::<Vec<_>>(),
+        [&(b, AGENT)]
+    );
     assert_eq!(store.pending_outbox().unwrap().len(), 2);
 }
 
@@ -1405,14 +1432,16 @@ fn withdraw_into_draft_is_one_transaction() {
     let older = Draft {
         text: "older".into(),
         cursor: 0,
+        when: RunWhen::Always,
     };
     let draft = Draft {
         text: "edit me\n\nolder".into(),
         cursor: 7,
+        when: RunWhen::Always,
     };
     let store = Store::open(&dir).unwrap();
     store.enqueue(&command).unwrap();
-    store.set_draft(session, Some(&older)).unwrap();
+    store.set_draft(session, AGENT, Some(&older)).unwrap();
 
     // A draft write that fails after the delete keeps the message queued:
     // the text is never lost.
@@ -1421,35 +1450,46 @@ fn withdraw_into_draft_is_one_transaction() {
         "CREATE TRIGGER full BEFORE UPDATE ON drafts BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
     )
     .unwrap();
-    assert!(store.withdraw(command.id, Some((session, &draft))).is_err());
+    assert!(
+        store
+            .withdraw(command.id, Some(((session, AGENT), &draft)))
+            .is_err()
+    );
     assert_eq!(store.pending_outbox().unwrap().len(), 1);
-    assert_eq!(store.drafts().unwrap()[&session], older);
+    assert_eq!(store.drafts().unwrap()[&(session, AGENT)], older);
 
     // Once it succeeds the text is in the draft only, never in both.
     conn.execute_batch("DROP TRIGGER full").unwrap();
-    store.withdraw(command.id, Some((session, &draft))).unwrap();
+    store
+        .withdraw(command.id, Some(((session, AGENT), &draft)))
+        .unwrap();
     drop(store);
     let store = Store::open(&dir).unwrap();
     assert!(store.outbox().unwrap().is_empty());
-    assert_eq!(store.drafts().unwrap()[&session], draft);
+    assert_eq!(store.drafts().unwrap()[&(session, AGENT)], draft);
 
     // A refused withdraw writes no draft either.
     let other = SessionId::new();
-    assert!(store.withdraw(command.id, Some((other, &draft))).is_err());
-    assert!(!store.drafts().unwrap().contains_key(&other));
+    assert!(
+        store
+            .withdraw(command.id, Some(((other, AGENT), &draft)))
+            .is_err()
+    );
+    assert!(!store.drafts().unwrap().contains_key(&(other, AGENT)));
 }
 
 // ---- local delete ---------------------------------------------------------------
 
 /// The whole log applied, plus what this device keeps for both sessions:
-/// drafts, read marks, an answered and an unanswered message each, and
-/// session A's blob downloaded.
+/// drafts of both modes, shell composers, read marks, an answered and an
+/// unanswered message each, and session A's blob downloaded.
 fn replica_with_both_sessions(dir: &Path, log: &Log) -> (Store, [Command; 4]) {
     let mut store = Store::open(dir).unwrap();
     store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
     let draft = Draft {
         text: "later".into(),
         cursor: 0,
+        when: RunWhen::Always,
     };
     let commands = [
         send(log.a, "answered a"),
@@ -1465,7 +1505,9 @@ fn replica_with_both_sessions(dir: &Path, log: &Log) -> (Store, [Command; 4]) {
         }
     }
     for id in [log.a, log.b] {
-        store.set_draft(id, Some(&draft)).unwrap();
+        store.set_draft(id, AGENT, Some(&draft)).unwrap();
+        store.set_draft(id, SHELL, Some(&draft)).unwrap();
+        store.set_composer_mode(id, SHELL).unwrap();
         let mark = ReadMark {
             seq: Seq(2),
             notable: 0,
@@ -1517,7 +1559,10 @@ fn local_delete_is_one_transaction() {
     assert!(store.session_events(log.a).unwrap().is_empty());
     assert_eq!(store.session_events(log.b).unwrap().len(), 2);
     assert!(after.blobs.is_empty());
-    assert_eq!(after.drafts.keys().collect::<Vec<_>>(), [&log.b]);
+    let mut drafts: Vec<_> = after.drafts.keys().copied().collect();
+    drafts.sort_by_key(|(_, mode)| *mode == SHELL);
+    assert_eq!(drafts, [(log.b, AGENT), (log.b, SHELL)]);
+    assert_eq!(after.composer_modes.keys().collect::<Vec<_>>(), [&log.b]);
     assert_eq!(after.read_marks.keys().collect::<Vec<_>>(), [&log.b]);
     // Only A's answered command goes; an unanswered one is the caller's to
     // refuse the delete over.
@@ -1635,6 +1680,7 @@ fn server_rows(dir: &Path) -> Vec<(&'static str, i64)> {
         "outbox",
         "blobs",
         "drafts",
+        "composer_modes",
         "read_marks",
         "deleted_sessions",
     ]
@@ -1678,8 +1724,11 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
     let draft = Draft {
         text: "unsent".into(),
         cursor: 0,
+        when: RunWhen::Always,
     };
-    store.set_draft(log.a, Some(&draft)).unwrap();
+    store.set_draft(log.a, AGENT, Some(&draft)).unwrap();
+    store.set_composer_mode(log.a, ComposerMode::Shell).unwrap();
+    store.set_shell_enabled(true).unwrap();
     let mark = ReadMark {
         seq: Seq(3),
         notable: 1,
@@ -1712,8 +1761,9 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
         Settings {
             blob_policy: BlobPolicy::Eager,
             server_address: Some("new.example:7443".into()),
+            shell_enabled: false,
         },
-        "the blob policy is this device's"
+        "the blob policy is this device's; the shell flag was the old server's"
     );
     assert!(!blob_file.exists(), "blob files go with their rows");
 
@@ -1887,6 +1937,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop(store);
 
     // A replica from before the table: what is pending is old news.
+    drop_shell(&dir);
     drop_alerted(&dir);
     drop_devices(&dir);
     drop_snippets(&dir);
@@ -1979,9 +2030,10 @@ fn a_v8_replica_moves_into_first_contexts() {
             .unwrap();
         assert_eq!(v8, 3);
     }
+    drop_shell(&dir);
     drop_work(&dir);
     drop_contexts(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2018,6 +2070,25 @@ fn drop_contexts(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN context;")
         .unwrap();
+}
+
+/// Undoes the shell commands migration: no composer modes, one agent
+/// draft per session, snippets without a kind.
+fn drop_shell(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE composer_modes;
+         CREATE TABLE old_drafts (
+             session_id TEXT PRIMARY KEY,
+             text TEXT NOT NULL,
+             cursor INTEGER NOT NULL
+         );
+         INSERT INTO old_drafts SELECT session_id, text, cursor FROM drafts WHERE mode = 'agent';
+         DROP TABLE drafts;
+         ALTER TABLE old_drafts RENAME TO drafts;
+         ALTER TABLE snippets DROP COLUMN kind;",
+    )
+    .unwrap();
 }
 
 /// Undoes the background work migration.
@@ -2067,12 +2138,14 @@ fn snippets_survive_a_reopen_and_a_new_server() {
         id: SnippetId::new(),
         name: Some("tests".into()),
         text: "run the tests".into(),
+        kind: AGENT,
         used: 1,
     };
     let plain = Snippet {
         id: SnippetId::new(),
         name: None,
         text: "commit this".into(),
+        kind: AGENT,
         used: 2,
     };
     let store = Store::open(&dir).unwrap();
@@ -2193,4 +2266,270 @@ fn an_agents_effort_is_kept() {
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.agent.effort.current, Some(Some(Effort::XHigh)));
+}
+
+// ---- shell commands -----------------------------------------------------------
+
+fn run_shell(session_id: SessionId, command: &str, when: RunWhen) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id,
+            command: command.into(),
+            when,
+        },
+    }
+}
+
+#[test]
+fn drafts_are_kept_per_mode_with_the_shell_condition() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let agent = Draft {
+        text: "fix the tests".into(),
+        cursor: 3,
+        when: RunWhen::Always,
+    };
+    let shell = Draft {
+        text: "make test".into(),
+        cursor: 9,
+        when: RunWhen::OnFailure,
+    };
+    {
+        let store = Store::open(&dir).unwrap();
+        store.set_draft(session, AGENT, Some(&agent)).unwrap();
+        store.set_draft(session, SHELL, Some(&shell)).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let drafts = store.load().unwrap().drafts;
+    assert_eq!(drafts.len(), 2, "one per mode");
+    assert_eq!(drafts[&(session, AGENT)], agent);
+    assert_eq!(drafts[&(session, SHELL)], shell);
+
+    // Deleting one mode's draft leaves the other.
+    store.set_draft(session, SHELL, None).unwrap();
+    assert_eq!(
+        store.drafts().unwrap().keys().collect::<Vec<_>>(),
+        [&(session, AGENT)]
+    );
+}
+
+#[test]
+fn a_queued_run_drops_the_shell_draft_and_a_message_the_agent_draft() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let draft = |text: &str| Draft {
+        text: text.into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    let store = Store::open(&dir).unwrap();
+    store
+        .set_draft(session, AGENT, Some(&draft("a message")))
+        .unwrap();
+    store.set_draft(session, SHELL, Some(&draft("ls"))).unwrap();
+
+    store
+        .enqueue(&run_shell(session, "ls", RunWhen::OnSuccess))
+        .unwrap();
+    assert_eq!(
+        store.drafts().unwrap().keys().collect::<Vec<_>>(),
+        [&(session, AGENT)]
+    );
+
+    store
+        .set_draft(session, SHELL, Some(&draft("pwd")))
+        .unwrap();
+    store.enqueue(&send(session, "a message")).unwrap();
+    assert_eq!(
+        store.drafts().unwrap().keys().collect::<Vec<_>>(),
+        [&(session, SHELL)]
+    );
+
+    // The run is queued as the head wrote it, and may be taken back.
+    let outbox = store.pending_outbox().unwrap();
+    assert!(matches!(
+        &outbox[0].command.kind,
+        CommandKind::RunShell { command, when: RunWhen::OnSuccess, .. } if command == "ls"
+    ));
+    assert!(outbox[0].discardable());
+    store.claim_send(outbox[0].command.id, at(1)).unwrap();
+    assert!(
+        !store.pending_outbox().unwrap()[0].discardable(),
+        "it may have reached the server"
+    );
+}
+
+#[test]
+fn withdrawing_a_run_keeps_it_as_the_shell_draft() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let agent = Draft {
+        text: "a message".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    let run = run_shell(session, "make test", RunWhen::OnSuccess);
+    let draft = Draft {
+        text: "make test".into(),
+        cursor: 9,
+        when: RunWhen::OnSuccess,
+    };
+    let store = Store::open(&dir).unwrap();
+    store.set_draft(session, AGENT, Some(&agent)).unwrap();
+    store.enqueue(&run).unwrap();
+    store
+        .withdraw(run.id, Some(((session, SHELL), &draft)))
+        .unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+    let drafts = store.drafts().unwrap();
+    assert_eq!(drafts[&(session, SHELL)], draft);
+    assert_eq!(
+        drafts[&(session, AGENT)],
+        agent,
+        "the agent draft is untouched"
+    );
+}
+
+#[test]
+fn composer_mode_is_kept_per_session() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    {
+        let store = Store::open(&dir).unwrap();
+        store.set_composer_mode(a, SHELL).unwrap();
+        store.set_composer_mode(b, SHELL).unwrap();
+        store.set_composer_mode(b, AGENT).unwrap();
+    }
+    let store = Store::open(&dir).unwrap();
+    let modes = store.load().unwrap().composer_modes;
+    assert_eq!(modes.len(), 1, "no row is the agent");
+    assert_eq!(modes[&a], SHELL);
+}
+
+#[test]
+fn snippets_of_both_kinds_keep_the_same_text() {
+    let (_tmp, dir) = data_dir();
+    let snippet = |kind, used| Snippet {
+        id: SnippetId::new(),
+        name: None,
+        text: "make test".into(),
+        kind,
+        used,
+    };
+    let (prompt, command) = (snippet(AGENT, 1), snippet(SHELL, 2));
+    {
+        let store = Store::open(&dir).unwrap();
+        store.set_snippet(&prompt).unwrap();
+        store.set_snippet(&command).unwrap();
+    }
+    let mut snippets = Store::open(&dir).unwrap().snippets().unwrap();
+    snippets.sort_by_key(|s| s.used);
+    assert_eq!(snippets, [prompt, command]);
+}
+
+#[test]
+fn the_shell_flag_is_kept_in_the_settings() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    assert!(
+        !store.settings().unwrap().shell_enabled,
+        "off until a hello"
+    );
+    store.set_shell_enabled(true).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    assert!(store.load().unwrap().settings.shell_enabled);
+    store.set_shell_enabled(false).unwrap();
+    assert!(!store.settings().unwrap().shell_enabled);
+}
+
+/// Name, type, `NOT NULL`, default and primary key position of each column.
+fn table_info(dir: &Path, table: &str) -> Vec<(String, String, bool, Option<String>, i64)> {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+#[test]
+fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    drop(Store::open(&dir).unwrap());
+    let fresh = table_info(&dir, "drafts");
+
+    // A replica from before shell commands, holding a draft and a snippet.
+    drop_shell(&dir);
+    let snippet = SnippetId::new();
+    {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute(
+            "INSERT INTO drafts (session_id, text, cursor) VALUES (?1, 'half typed', 4)",
+            [session.0.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snippets (id, name, text, used) VALUES (?1, NULL, 'run the tests', 1)",
+            [snippet.0.to_string()],
+        )
+        .unwrap();
+    }
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let store = Store::open(&dir).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.drafts.len(), 1);
+    assert_eq!(
+        snapshot.drafts[&(session, AGENT)],
+        Draft {
+            text: "half typed".into(),
+            cursor: 4,
+            when: RunWhen::Always,
+        }
+    );
+    assert_eq!(snapshot.snippets.len(), 1);
+    assert_eq!(
+        (snapshot.snippets[0].id, snapshot.snippets[0].kind),
+        (snippet, AGENT)
+    );
+    assert!(snapshot.composer_modes.is_empty());
+    drop(store);
+
+    let column = |name: &str, ty: &str, default: Option<&str>, pk| {
+        (
+            name.to_owned(),
+            ty.to_owned(),
+            true,
+            default.map(str::to_owned),
+            pk,
+        )
+    };
+    let expected = vec![
+        column("session_id", "TEXT", None, 1),
+        column("mode", "TEXT", None, 2),
+        column("text", "TEXT", None, 0),
+        column("cursor", "INTEGER", None, 0),
+        column("when", "TEXT", Some("'always'"), 0),
+    ];
+    assert_eq!(
+        table_info(&dir, "drafts"),
+        expected,
+        "keyed by session and mode"
+    );
+    assert_eq!(fresh, expected, "as a fresh replica has it");
 }

@@ -139,8 +139,11 @@ pub(crate) mod tests {
             stop: None,
             work: Default::default(),
             task_stops: Vec::new(),
+            mode: skywave_core::ComposerMode::Agent,
             draft: None,
+            shell_draft: None,
             draft_rev: 0,
+            shell_enabled: false,
             last_seq,
             unread_from: None,
         }
