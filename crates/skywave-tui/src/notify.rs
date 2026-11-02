@@ -1,4 +1,5 @@
-//! Alerting the user through the terminal when an approval comes in: a bell
+//! Alerting the user through the terminal when an approval comes in, or a
+//! long shell run of this device's finishes: a bell
 //! (BEL), which every terminal and tmux pass on, and/or a desktop
 //! notification with OSC 9 (iTerm2, kitty, WezTerm, foot, Ghostty) or
 //! OSC 777 (rxvt, VTE terminals). Inside tmux the OSC ones are wrapped for
@@ -7,7 +8,8 @@
 //! [`App`](crate::App) decides when to alert
 //! ([`take_alert`](crate::App::take_alert)); [`send`] does the I/O for
 //! [`run`](crate::run).
-//! What goes out names the session, never what the agent wants to run.
+//! An approval's alert names the session, never what the agent wants to
+//! run; a shell run's names the command this device asked for.
 
 use std::io::{self, Write};
 
@@ -77,6 +79,13 @@ pub fn message(title: Option<&str>) -> String {
     }
 }
 
+/// The notification's text for a long shell run of this device's that
+/// finished. `notice` is [`ShellNotice::notice`](skywave_present::policy::ShellNotice::notice):
+/// its parts are [`sanitise`]d, so it is safe to send.
+pub fn shell_message(notice: &str) -> String {
+    format!("skywave: {notice}")
+}
+
 /// Wraps `sequence` for tmux's DCS passthrough: its escapes doubled.
 pub fn tmux_wrap(sequence: &str) -> String {
     format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
@@ -103,15 +112,10 @@ pub fn in_tmux() -> bool {
     std::env::var_os("TMUX").is_some_and(|v| !v.is_empty())
 }
 
-/// Alerts through `out` that an approval is needed in the session titled
-/// `title`.
-pub fn send(
-    out: &mut impl Write,
-    notify: Notify,
-    title: Option<&str>,
-    tmux: bool,
-) -> io::Result<()> {
-    let sequences = sequences(notify, &message(title), tmux);
+/// Alerts through `out` with `message`, made by [`message`] or
+/// [`shell_message`].
+pub fn send(out: &mut impl Write, notify: Notify, message: &str, tmux: bool) -> io::Result<()> {
+    let sequences = sequences(notify, message, tmux);
     if sequences.is_empty() {
         return Ok(());
     }
@@ -172,7 +176,7 @@ mod tests {
         );
         assert_eq!(sequences(Notify::OFF, "hi", false), "");
         let mut out = Vec::new();
-        send(&mut out, Notify::OFF, Some("app"), false).unwrap();
+        send(&mut out, Notify::OFF, &message(Some("app")), false).unwrap();
         assert!(out.is_empty());
     }
 }

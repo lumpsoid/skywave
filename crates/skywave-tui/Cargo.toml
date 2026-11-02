@@ -19,12 +19,14 @@ ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 # Cell widths for laying out wrapped timeline text; already in the tree
 # through ratatui.
 unicode-width = "0.2"
+# `strip_ansi` only: a shell run's output blob is raw, and `y` copies it
+# stripped, as every head shows it.
+skywave-proto.workspace = true
+# The wall clock as the shell runs' times (`shell_took`, `queued_age`).
+chrono.workspace = true
 
 [dev-dependencies]
 # Tests play the engine through `core.seam()`, which speaks proto types.
-# The head itself depends on skywave-core only.
-skywave-proto.workspace = true
-chrono.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 # End-to-end tests (tests/e2e.rs) run a real server with the fake agent.

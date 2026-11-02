@@ -9,12 +9,13 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use crossterm::execute;
 use crossterm::style::Print;
+use skywave_proto::strip_ansi;
 
 /// Most raw bytes sent: about 100 KB once base64-encoded, which common
 /// terminals accept. [`MAX_VAR`] overrides it.
@@ -32,6 +33,11 @@ pub enum Clip {
     File {
         path: PathBuf,
         strip: Option<&'static str>,
+    },
+    /// A shell run's downloaded output blob, which holds the raw output:
+    /// copied with its ANSI sequences stripped, as every head shows it.
+    Output {
+        path: PathBuf,
     },
 }
 
@@ -75,23 +81,7 @@ pub fn load(clip: &Clip, max: usize) -> Result<Vec<u8>, CopyError> {
         }),
         Clip::Text(text) => Ok(text.as_bytes().to_vec()),
         Clip::File { path, strip } => {
-            let read = |error| CopyError::Read {
-                file: path.clone(),
-                error,
-            };
-            let file = File::open(path).map_err(read)?;
-            let size = file.metadata().map_err(read)?.len();
-            let mut bytes = Vec::new();
-            file.take(max as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(read)?;
-            if bytes.len() > max {
-                return Err(CopyError::TooLarge {
-                    size: size.max(bytes.len() as u64),
-                    max,
-                    file: Some(path.clone()),
-                });
-            }
+            let mut bytes = read_capped(path, max)?;
             if let Some(strip) = strip
                 && bytes.starts_with(strip.as_bytes())
             {
@@ -99,7 +89,45 @@ pub fn load(clip: &Clip, max: usize) -> Result<Vec<u8>, CopyError> {
             }
             Ok(bytes)
         }
+        // The cap holds for the raw file, so a huge output is never read
+        // whole; stripping only shrinks it, bar invalid UTF-8 decoded to
+        // replacement characters, hence the second check.
+        Clip::Output { path } => {
+            let bytes = read_capped(path, max)?;
+            let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+            if text.len() > max {
+                return Err(CopyError::TooLarge {
+                    size: text.len() as u64,
+                    max,
+                    file: Some(path.clone()),
+                });
+            }
+            Ok(text.into_bytes())
+        }
     }
+}
+
+/// The file at `path`, if it holds at most `max` bytes: it is read no
+/// further than `max + 1`.
+fn read_capped(path: &Path, max: usize) -> Result<Vec<u8>, CopyError> {
+    let read = |error| CopyError::Read {
+        file: path.to_owned(),
+        error,
+    };
+    let file = File::open(path).map_err(read)?;
+    let size = file.metadata().map_err(read)?.len();
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read)?;
+    if bytes.len() > max {
+        return Err(CopyError::TooLarge {
+            size: size.max(bytes.len() as u64),
+            max,
+            file: Some(path.to_owned()),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Sends `clip` to the terminal's clipboard through `out`; returns how many

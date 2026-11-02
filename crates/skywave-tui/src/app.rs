@@ -6,22 +6,25 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, CallId, Completion, ComposerMode,
-    ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView,
-    PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId, SessionListView,
-    SessionRow, SessionView, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, BlobView, CallId, CommandId, Completion,
+    ComposerMode, ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri,
+    PairingView, PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId,
+    SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId, TimelineItem,
+    ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
 };
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
-    looks_like_pair_uri, stop_needs_confirmation, unanswered,
+    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop, stop_needs_confirmation,
+    unanswered,
 };
 use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
@@ -350,6 +353,20 @@ pub struct SessionUi {
     saver: DraftSaver,
     /// Earlier prompts being recalled into the composer; any edit ends it.
     history: PromptHistory<Composer>,
+    /// What the composer writes, as the core last said ([`SessionView::mode`]).
+    /// The core's switch is followed in [`SessionUi::follow_mode`], after
+    /// the old mode's draft was saved: [`DraftSaver::flushes_before`] the
+    /// `SetComposerMode` that Ctrl-T sends.
+    pub mode: ComposerMode,
+    /// The condition the shell command being written runs on (Ctrl-O),
+    /// saved with the shell draft; back to always after each run sent.
+    pub when: RunWhen,
+    /// Earlier shell commands being recalled, apart from the prompts.
+    shell_history: PromptHistory<Composer>,
+    /// The highlighted run while the run list has the focus.
+    pub shell_selected: Option<CommandId>,
+    /// The runs whose whole output the run list shows.
+    pub shell_expanded: HashSet<CommandId>,
     /// When what is seen is marked read ([`App::read_mark`]).
     marker: ReadMarker,
     /// The list of rules `A` opened in the approval prompt; see
@@ -892,6 +909,11 @@ impl SessionUi {
             composer: composer_of(view),
             saver: DraftSaver::new(view),
             history: PromptHistory::new(),
+            mode: view.mode,
+            when: when_of(view),
+            shell_history: PromptHistory::new(),
+            shell_selected: None,
+            shell_expanded: HashSet::new(),
             marker: ReadMarker::new(view.id),
             rule_pick: None,
             picker: None,
@@ -1057,7 +1079,21 @@ impl SessionUi {
     /// While browsing earlier prompts: the shown one's place, 1 the newest,
     /// and how many there are.
     pub fn history_position(&self) -> Option<(usize, usize)> {
-        self.history.position()
+        match self.mode {
+            ComposerMode::Agent => self.history.position(),
+            ComposerMode::Shell => self.shell_history.position(),
+        }
+    }
+
+    /// Ends browsing earlier prompts or commands: the shown one stays.
+    fn end_history(&mut self) {
+        self.history.end();
+        self.shell_history.end();
+    }
+
+    /// Whether the composer writes shell commands.
+    pub fn shell(&self) -> bool {
+        self.mode == ComposerMode::Shell
     }
 
     /// Tells the draft saver of composer edits made since it last heard,
@@ -1071,15 +1107,30 @@ impl SessionUi {
     /// Shows the next older (`older`) or newer earlier prompt; newer than
     /// the newest is the text that was being written. The shown text is
     /// the draft: it is saved like typed text.
+    /// In shell mode the same over earlier shell commands, from a history
+    /// of their own.
     fn recall(&mut self, view: &SessionView, older: bool) {
+        let shell = self.shell();
+        let history = if shell {
+            &mut self.shell_history
+        } else {
+            &mut self.history
+        };
         if older {
             let composer = &self.composer;
-            if let Some(prompt) = self.history.older(|| view.prompts(), || composer.clone()) {
+            let source = || {
+                if shell {
+                    view.shell.commands()
+                } else {
+                    view.prompts()
+                }
+            };
+            if let Some(prompt) = history.older(source, || composer.clone()) {
                 self.composer.replace(prompt);
             }
             return;
         }
-        match self.history.newer() {
+        match history.newer() {
             Some(Recall::Prompt(prompt)) => self.composer.replace(prompt),
             Some(Recall::Stash(stash)) => {
                 self.composer = stash;
@@ -1093,17 +1144,99 @@ impl SessionUi {
     fn follow_draft(&mut self, view: &SessionView) {
         if self.saver.refill(view) {
             self.composer = composer_of(view);
-            self.history.end();
+            self.when = when_of(view);
+            self.end_history();
             self.focus = Focus::Composer;
         }
     }
+
+    /// Follows the core's switch of the composer's mode: the old mode's
+    /// draft was saved before the switch went out, so the composer loads
+    /// the new mode's draft, condition included, focused. Both drafts stay
+    /// in the core.
+    fn follow_mode(&mut self, view: &SessionView) {
+        if view.mode == self.mode {
+            return;
+        }
+        self.mode = view.mode;
+        self.composer = composer_of(view);
+        self.when = when_of(view);
+        self.end_history();
+        self.focus = Focus::Composer;
+    }
+
+    /// The selected run, while it is still in the session's runs.
+    pub fn selected_run<'a>(&self, view: &'a SessionView) -> Option<&'a ShellRun> {
+        let id = self.shell_selected?;
+        view.shell.runs.iter().find(|run| run.run == id)
+    }
+
+    /// Moves the run selection up (older) or down; with none, either
+    /// starts at the newest run.
+    fn select_run(&mut self, view: &SessionView, up: bool) {
+        let runs = &view.shell.runs;
+        let Some(last) = runs.len().checked_sub(1) else {
+            return;
+        };
+        let at = self
+            .selected_run(view)
+            .and_then(|run| runs.iter().position(|r| r.run == run.run));
+        let index = match at {
+            None => last,
+            Some(i) if up => i.saturating_sub(1),
+            Some(i) => (i + 1).min(last),
+        };
+        self.shell_selected = Some(runs[index].run);
+    }
+
+    /// Enter/Space on a run: shows its whole output, or only the tail
+    /// again. Expanding a cut preview downloads the output if needed.
+    fn toggle_run(&mut self, view: &SessionView) -> Option<Action> {
+        let run = self.selected_run(view)?;
+        if !self.shell_expanded.insert(run.run) {
+            self.shell_expanded.remove(&run.run);
+            return None;
+        }
+        run.output.as_ref().and_then(output_download)
+    }
 }
 
+/// The download a run's output blob needs before it can be shown or
+/// copied: none while it is here or on its way.
+fn output_download(blob: &BlobView) -> Option<Action> {
+    matches!(
+        blob.state,
+        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+    )
+    .then_some(Action::DownloadBlob(blob.id))
+}
+
+/// The composer's text as the core keeps it for `view`'s mode.
 fn composer_of(view: &SessionView) -> Composer {
-    view.draft
+    let draft = match view.mode {
+        ComposerMode::Agent => &view.draft,
+        ComposerMode::Shell => &view.shell_draft,
+    };
+    draft
         .as_ref()
         .map(|d| Composer::from_draft(d.text.clone(), d.cursor))
         .unwrap_or_default()
+}
+
+/// The condition the shell draft was saved with.
+fn when_of(view: &SessionView) -> RunWhen {
+    view.shell_draft
+        .as_ref()
+        .map_or(RunWhen::Always, |d| d.when)
+}
+
+/// Ctrl-O's cycle: always → if ok → if failed → always.
+fn next_when(when: RunWhen) -> RunWhen {
+    match when {
+        RunWhen::Always => RunWhen::OnSuccess,
+        RunWhen::OnSuccess => RunWhen::OnFailure,
+        RunWhen::OnFailure => RunWhen::Always,
+    }
 }
 
 /// Presentation state owned by the head.
@@ -1139,8 +1272,12 @@ pub struct UiState {
     /// Watches the core's [`alerts`](skywave_core::Attention::alerts)
     /// count; the first snapshot's needs no alert.
     pub alerts: AlertWatcher,
-    /// An alert that new approvals came in, for the event loop to send
-    /// ([`App::take_alert`]): the newest one's session title.
+    /// Watches the core's [`shell_alerts`](skywave_core::Attention::shell_alerts)
+    /// count from 0: a run that finished before the first snapshot is news.
+    pub shell_alerts: ShellAlertWatcher,
+    /// An alert for the event loop to send ([`App::take_alert`]), as the
+    /// notification's text: new approvals came in (naming the newest
+    /// one's session), else a long shell run of this device's finished.
     pub alert: Option<String>,
     /// Ctrl-G asked for the next approval's session: it opens on the
     /// timeline, so `a`/`x` answer at once.
@@ -1173,11 +1310,13 @@ impl App {
                 notice: None,
                 copy: None,
                 alerts: AlertWatcher::new(&view.attention),
+                shell_alerts: ShellAlertWatcher::new(),
                 alert: None,
                 jumped: false,
                 quit: false,
             },
         };
+        app.observe_shell_alerts(&view);
         app.prefill(&view);
         app.keep_selection(None);
         app.follow_session();
@@ -1214,9 +1353,12 @@ impl App {
         {
             self.ui.prompt = None;
         }
+        self.observe_shell_alerts(&view);
+        // After the shell's: an approval waits on the user, so it wins the
+        // one notification.
         if let Some(alert) = self.ui.alerts.observe(&view.attention) {
             self.ui.notice = Some(alert.notice());
-            self.ui.alert = Some(alert.title.unwrap_or_default());
+            self.ui.alert = Some(notify::message(alert.title.as_deref()));
         }
         let old_index = self
             .session_list()
@@ -1244,10 +1386,20 @@ impl App {
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
             session.keep_scroll(view);
+            session.follow_mode(view);
             session.follow_draft(view);
             if let Some(search) = &mut session.shown.search {
                 search.refresh(view, old_match);
             }
+        }
+    }
+
+    /// Alerts, and says in the footer, that a long shell run of this
+    /// device's finished, when `view` counts a new one.
+    fn observe_shell_alerts(&mut self, view: &ViewState) {
+        if let Some(notice) = self.ui.shell_alerts.observe(&view.attention) {
+            self.ui.notice = Some(notice.notice());
+            self.ui.alert = Some(notify::shell_message(&notice.notice()));
         }
     }
 
@@ -1278,7 +1430,8 @@ impl App {
         }
     }
 
-    /// The screen shows a clock that runs: a tool call's elapsed time.
+    /// The screen shows a clock that runs: a tool call's or a shell run's
+    /// elapsed time.
     pub fn live(&self) -> bool {
         self.session().is_some_and(|(view, _)| {
             view.timeline.iter().any(|item| {
@@ -1287,7 +1440,11 @@ impl App {
                     TimelineItem::Logged { entry: Entry::Tool(tool), .. }
                         if matches!(tool.outcome, ToolOutcome::Running { .. })
                 )
-            })
+            }) || view
+                .shell
+                .runs
+                .iter()
+                .any(|run| run.state == ShellRunState::Running)
         })
     }
 
@@ -1317,6 +1474,10 @@ impl App {
                 // next save drops its draft; otherwise that save writes
                 // nothing.
                 session.composer.clear();
+                // A run's condition is for that run only.
+                if session.shell() {
+                    session.when = RunWhen::Always;
+                }
                 session.note_edits(Instant::now());
             }
         }
@@ -1332,8 +1493,8 @@ impl App {
         self.ui.copy.take()
     }
 
-    /// The alert [`App::set_view`] asked for, if any: the session title to
-    /// name, maybe empty.
+    /// The alert [`App::set_view`] asked for, if any: the notification's
+    /// text, made safe to send.
     pub fn take_alert(&mut self) -> Option<String> {
         self.ui.alert.take()
     }
@@ -1380,9 +1541,35 @@ impl App {
             }
             Content::Blob { blob, strip } => (blob, strip),
         };
+        self.copy_blob(key, blob, |path| Clip::File { path, strip })
+    }
+
+    /// `y` on a shell run: its whole output once downloaded, ANSI
+    /// stripped; until then the preview, which holds all of it when there
+    /// is no blob and is stripped already.
+    fn copy_run(&mut self, run: &ShellRun) -> Option<Action> {
+        match &run.output {
+            Some(blob) if matches!(blob.state, BlobState::Available { .. }) => {
+                self.copy_blob('y', blob.clone(), |path| Clip::Output { path })
+            }
+            _ => {
+                self.ui.copy = Some(Clip::Text(run.tail_or_preview.clone()));
+                None
+            }
+        }
+    }
+
+    /// Copies `blob` as `clip` makes of its file once it is here; else
+    /// downloads it, and the notice says to press `key` again.
+    fn copy_blob(
+        &mut self,
+        key: char,
+        blob: BlobView,
+        clip: impl FnOnce(PathBuf) -> Clip,
+    ) -> Option<Action> {
         let (size, action) = match blob.state {
             BlobState::Available { path } => {
-                self.ui.copy = Some(Clip::File { path, strip });
+                self.ui.copy = Some(clip(path));
                 return None;
             }
             BlobState::NotDownloaded { size } | BlobState::Failed { size, .. } => {
@@ -1404,13 +1591,17 @@ impl App {
     pub fn draft_save(&mut self, now: Instant, force: bool) -> Option<Action> {
         let session = self.ui.session.as_mut()?;
         let composer = &session.composer;
+        let when = match session.mode {
+            ComposerMode::Agent => RunWhen::Always,
+            ComposerMode::Shell => session.when,
+        };
         session.saver.save(
             now,
             force,
-            ComposerMode::Agent,
+            session.mode,
             composer.text(),
             composer.cursor_chars(),
-            RunWhen::Always,
+            when,
         )
     }
 
@@ -1583,7 +1774,7 @@ impl App {
         }
         if let Some(session) = &mut self.ui.session {
             session.focus = Focus::Composer;
-            session.history.end();
+            session.end_history();
             session.composer.insert(text);
             session.note_edits(Instant::now());
             return;
@@ -1976,15 +2167,42 @@ impl App {
                 return None;
             }
         }
+        let shell = session.shell();
         match key.code {
-            KeyCode::Char('f') if ctrl => {
-                session.open_search();
+            // Into shell mode only while the server runs shell commands;
+            // back out always, should it have stopped since.
+            KeyCode::Char('t') if ctrl => {
+                if !shell && !view.shell.enabled {
+                    self.ui.notice = Some("shell commands are off on this server".into());
+                    return None;
+                }
+                let mode = if shell {
+                    ComposerMode::Agent
+                } else {
+                    ComposerMode::Shell
+                };
+                return Some(Action::SetComposerMode {
+                    session_id: view.id,
+                    mode,
+                });
+            }
+            KeyCode::Char('o') if ctrl && shell => {
+                session.when = next_when(session.when);
+                session.composer.edited = true;
                 return None;
             }
+            KeyCode::Char('x') if ctrl && shell => return shell_stop(view),
             KeyCode::Char('x') if ctrl => {
                 return Some(Action::Interrupt {
                     session_id: view.id,
                 });
+            }
+            // The timeline's: the run list has neither search nor pages.
+            KeyCode::Char('f') if ctrl && shell => return None,
+            KeyCode::PageUp | KeyCode::PageDown if shell => return None,
+            KeyCode::Char('f') if ctrl => {
+                session.open_search();
+                return None;
             }
             KeyCode::PageUp => {
                 session.page(true);
@@ -2022,12 +2240,23 @@ impl App {
                     }
                     return None;
                 }
-                session.history.end();
+                session.end_history();
+                let when = session.when;
                 let draft = &mut session.composer;
                 match key.code {
                     KeyCode::Esc => session.focus = Focus::Timeline,
                     KeyCode::Enter if alt || shift => draft.newline(),
                     KeyCode::Char('j') if ctrl => draft.newline(),
+                    // Nothing to run: the condition picked stays.
+                    KeyCode::Enter if shell && draft.is_blank() => {}
+                    KeyCode::Enter if shell => {
+                        draft.submitted = true;
+                        return Some(Action::RunShell {
+                            session_id: view.id,
+                            command: draft.text().to_owned(),
+                            when,
+                        });
+                    }
                     // A blank draft is refused by the core.
                     KeyCode::Enter => {
                         draft.submitted = true;
@@ -2051,6 +2280,56 @@ impl App {
             Focus::Timeline if session.rule_pick(view).is_some() => {
                 session.rule_pick_key(view, key.code)
             }
+            // In shell mode the run list stands in for the timeline.
+            Focus::Timeline if shell => match key.code {
+                KeyCode::Esc => Some(Action::Back),
+                KeyCode::Char('q') => {
+                    self.ui.quit = true;
+                    None
+                }
+                KeyCode::Char('i') | KeyCode::Char('c') => {
+                    session.focus = Focus::Composer;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    session.select_run(view, true);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    session.select_run(view, false);
+                    None
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    session.shell_selected = view.shell.runs.first().map(|r| r.run);
+                    None
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    session.shell_selected = view.shell.runs.last().map(|r| r.run);
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => session.toggle_run(view),
+                KeyCode::Char('d') => session
+                    .selected_run(view)?
+                    .output
+                    .as_ref()
+                    .and_then(output_download),
+                KeyCode::Char('y') => {
+                    let run = session.selected_run(view)?.clone();
+                    self.copy_run(&run)
+                }
+                // Only what the core marks discardable, as in the timeline.
+                KeyCode::Char('e') => session
+                    .selected_run(view)
+                    .filter(|run| run.discardable)
+                    .map(|run| Action::EditQueued(run.run)),
+                KeyCode::Delete => session
+                    .selected_run(view)
+                    .filter(|run| run.discardable)
+                    .map(|run| Action::Discard(run.run)),
+                KeyCode::Char('a') => answer(view, Decision::Approve),
+                KeyCode::Char('x') => answer(view, Decision::Deny),
+                _ => None,
+            },
             Focus::Timeline => match key.code {
                 // A kept search goes first; the next Esc leaves.
                 KeyCode::Esc if session.shown.search.is_some() => {

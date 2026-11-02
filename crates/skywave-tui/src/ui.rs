@@ -7,6 +7,7 @@
 //! I/O is reading downloaded blobs to show them.
 
 mod session;
+mod shell;
 mod timeline;
 
 use timeline::wall_ms;
@@ -23,9 +24,9 @@ use ratatui::widgets::{
     Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use skywave_core::{
-    BlobPolicy, CandidateSource, Completion, CompletionStatus, Link, LinkRejection, ListKind,
-    Outgoing, PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen, SessionListView,
-    SessionRow, SessionState, SettingsView,
+    BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, Link, LinkRejection,
+    ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen,
+    SessionListView, SessionRow, SessionState, SettingsView,
 };
 use skywave_present::format::{blob_size, bytes, dollars, fail_reason, scope_label};
 use skywave_present::sections::{discardable, wanted_blob};
@@ -569,6 +570,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
 fn footer_hint(app: &App) -> Cow<'static, str> {
     if !app.ui().help
         && let Some((view, ui)) = app.session()
+        && !ui.shell()
         && let Some(search) = &ui.shown.search
     {
         if search.editing {
@@ -591,7 +593,8 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
         && ui.focus == Focus::Composer
         && let Some((at, of)) = ui.history_position()
     {
-        return format!("history {at}/{of} · Ctrl-P/N older/newer · edit to keep · Enter send")
+        let enter = if ui.shell() { "run" } else { "send" };
+        return format!("history {at}/{of} · Ctrl-P/N older/newer · edit to keep · Enter {enter}")
             .into();
     }
     let keys = footer_keys(app);
@@ -599,10 +602,16 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
     if !app.ui().help
         && let Some((view, ui)) = app.session()
         && ui.focus == Focus::Timeline
-        && let Some(size) = ui
-            .selected_entry(view)
-            .and_then(wanted_blob)
-            .and_then(|blob| blob_size(&blob.state))
+        && let Some(size) = if ui.shell() {
+            ui.selected_run(view)
+                .and_then(|run| run.output.as_ref())
+                .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
+                .and_then(|blob| blob_size(&blob.state))
+        } else {
+            ui.selected_entry(view)
+                .and_then(wanted_blob)
+                .and_then(|blob| blob_size(&blob.state))
+        }
     {
         return keys
             .replacen("d download", &format!("d download ({})", bytes(size)), 1)
@@ -697,6 +706,19 @@ fn footer_keys(app: &App) -> &'static str {
             Some((view, ui, Focus::Timeline)) if ui.rule_pick(view).is_some() => {
                 "↑↓ choose · Enter approve and always allow · Esc back to a/x · ? help"
             }
+            Some((view, ui, Focus::Timeline)) if ui.shell() => {
+                match ui.selected_run(view).filter(|run| run.discardable) {
+                    Some(_) => {
+                        "e edit · Del take back · ↑↓ select · Enter expand · y copy · Ctrl-X stop · Tab write · Esc back · ? help"
+                    }
+                    None => {
+                        "↑↓ select · Enter expand · d download · y copy · Ctrl-X stop · Ctrl-T agent · Tab write · ? help"
+                    }
+                }
+            }
+            Some((_, ui, _)) if ui.shell() => {
+                "Enter run · Ctrl-O condition · Ctrl-P/N history · Ctrl-X stop · Ctrl-T agent · Esc runs · F1 help"
+            }
             Some((view, ui, Focus::Timeline)) => match discardable(view, ui.shown.selected) {
                 Some((_, Outgoing::Failed(_))) => {
                     "e edit · Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
@@ -724,6 +746,10 @@ fn footer_keys(app: &App) -> &'static str {
                     "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
+            // The toggle only where the server runs shell commands.
+            Some((view, _, _)) if view.shell.enabled => {
+                "Enter send · Ctrl-J newline · Ctrl-X interrupt · Ctrl-T shell · Esc timeline · F1 help"
+            }
             _ => {
                 "Enter send · Ctrl-J newline · Ctrl-X interrupt · PgUp/PgDn · Esc timeline · F1 help"
             }
@@ -867,17 +893,70 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  command from this device: answer or cancel first."),
         ]),
         Screen::Session(_) => {
-            lines.extend([
-                section("Session"),
-                key("Ctrl-X", "interrupt the agent's turn"),
-                key("Ctrl-F", "search the timeline (also / on it)"),
-                key("PgUp / PgDn", "scroll the timeline"),
-                key("Tab", "switch between message and timeline"),
-                Line::from(""),
-            ]);
+            let (shell, enabled) = app.session().map_or((false, false), |(view, ui)| {
+                (ui.shell(), view.shell.enabled)
+            });
+            lines.push(section("Session"));
+            if shell {
+                lines.extend([
+                    key("Ctrl-X", "stop the running shell command, else the newest"),
+                    key("", "waiting one (yours never sent: taken back)"),
+                ]);
+            } else {
+                lines.push(key("Ctrl-X", "interrupt the agent's turn"));
+            }
+            // Only where the server runs shell commands.
+            if shell || enabled {
+                lines.push(key(
+                    "Ctrl-T",
+                    "switch between writing to the agent and shell commands",
+                ));
+            }
+            if shell {
+                lines.push(key("Tab", "switch between command and runs"));
+            } else {
+                lines.extend([
+                    key("Ctrl-F", "search the timeline (also / on it)"),
+                    key("PgUp / PgDn", "scroll the timeline"),
+                    key("Tab", "switch between message and timeline"),
+                ]);
+            }
+            lines.push(Line::from(""));
             lines.extend(rules_lines(app));
             // One focus at a time, so the overlay fits a small terminal.
             match app.session().map(|(_, ui)| ui.focus) {
+                Some(Focus::Timeline) if shell => lines.extend([
+                    section("Shell runs (Tab or i: command keys)"),
+                    key("↑↓ / k j", "select a run"),
+                    key("Home g/End G", "oldest / newest run"),
+                    key(
+                        "Enter / Space",
+                        "show its whole output; downloads it if needed",
+                    ),
+                    key("d", "download its whole output"),
+                    key("y", "copy its output, colours stripped (the whole"),
+                    key("", "output once downloaded, else what shows)"),
+                    key("e", "edit your never-sent or refused command"),
+                    key("Del", "take back your never-sent command, or dismiss"),
+                    key("", "a refused one"),
+                    key("a / x", "approve / deny the pending approval"),
+                    key("Esc", "back to sessions"),
+                ]),
+                _ if shell => lines.extend([
+                    section("Shell command (Esc or Tab: run keys)"),
+                    key("Enter", "run it on the server, in the session's directory"),
+                    key("", "(in send order with your messages; queued offline)"),
+                    key("Ctrl-O", "run it only if the previous run succeeded,"),
+                    key("", "then only if it failed, then always"),
+                    key("Ctrl-J", "new line (also Alt-Enter, Shift-Enter)"),
+                    key("←→↑↓ Home End", "move the cursor"),
+                    key(
+                        "Ctrl-P / N",
+                        "earlier / later command (also ↑ on the first line, ↓ on the last)",
+                    ),
+                    key("Ctrl-U", "clear the command"),
+                    key("Esc", "go to the runs"),
+                ]),
                 Some(Focus::Timeline) => lines.extend([
                     section("Timeline (Tab or i: message keys)"),
                     key("↑↓ / k j", "select a tool call or agent message"),

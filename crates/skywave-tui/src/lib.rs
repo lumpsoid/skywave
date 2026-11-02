@@ -166,10 +166,10 @@ pub fn copy(app: &mut App, out: &mut impl Write, max: usize) {
 
 /// Sends the alert [`App::take_alert`] has, if any, through `out`; `tmux`
 /// wraps desktop notifications for its passthrough. A failed write is
-/// dropped: the screen shows the approval anyway.
+/// dropped: the screen shows the approval or the run anyway.
 pub fn alert(app: &mut App, out: &mut impl Write, notify: Notify, tmux: bool) {
-    if let Some(title) = app.take_alert() {
-        let _ = notify::send(out, notify, Some(&title), tmux);
+    if let Some(message) = app.take_alert() {
+        let _ = notify::send(out, notify, &message, tmux);
     }
 }
 

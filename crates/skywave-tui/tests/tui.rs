@@ -13,15 +13,16 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
-    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, Delivery,
-    DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request, Route,
-    RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
+    Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, ComposerMode, Core, Decision,
+    Delivery, DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request,
+    Route, RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
 };
+use skywave_present::format::took_label;
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
     EventKind, HelloResponse, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
-    SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
+    SessionState as LogState, ShellEnd, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -6983,4 +6984,448 @@ fn the_help_lists_o_and_the_subagent_stop() {
     let help = read_help(&mut h).join("\n");
     assert_contains(&help, "open the selected subagent");
     assert_contains(&help, "in a subagent's view: stop its task");
+}
+
+// ---- shell mode -------------------------------------------------------------
+
+/// The server's `hello`, saying whether it runs shell commands.
+fn hello(h: &mut Harness, me: DeviceId, shell: bool) {
+    h.seam
+        .hello_received(&HelloResponse {
+            protocol_version: skywave_proto::PROTOCOL_VERSION,
+            server_id: skywave_proto::ServerId::new(),
+            device_id: me,
+            head: Seq::ZERO,
+            devices: Vec::new(),
+            shell,
+        })
+        .unwrap();
+    h.sync();
+}
+
+/// [`open_session`] on a server that runs shell commands.
+fn shell_session() -> (Harness, SessionId, DeviceId) {
+    let (mut h, id, me) = open_session();
+    hello(&mut h, me, true);
+    (h, id, me)
+}
+
+/// The open session as the core shows it.
+fn session_view(h: &Harness) -> skywave_core::SessionView {
+    match h.core.view().screen {
+        Screen::Session(view) => *view,
+        other => panic!("expected the session screen, got {other:?}"),
+    }
+}
+
+fn mode(h: &Harness) -> ComposerMode {
+    h.app.session().unwrap().1.mode
+}
+
+/// `command`, run `run`, as the log holds its request from `by`.
+fn requested(id: SessionId, minute: u32, run: CommandId, by: DeviceId, command: &str) -> Event {
+    Event {
+        command_id: Some(run),
+        ..event(
+            id,
+            minute,
+            EventKind::ShellRequested {
+                command: command.into(),
+                when: RunWhen::Always,
+                by,
+            },
+        )
+    }
+}
+
+fn started(id: SessionId, at: DateTime<Utc>, run: CommandId) -> Event {
+    Event {
+        at,
+        ..event(
+            id,
+            0,
+            EventKind::ShellStarted {
+                run,
+                cwd: "/srv/work".into(),
+            },
+        )
+    }
+}
+
+/// The end of run `run`: `exit 1` at `at`, with `preview` and, when it
+/// does not hold all of it, the `output` blob.
+fn finished(
+    id: SessionId,
+    at: DateTime<Utc>,
+    run: CommandId,
+    by: DeviceId,
+    started_at: DateTime<Utc>,
+    preview: &str,
+    output: Option<BlobRef>,
+) -> Event {
+    Event {
+        at,
+        ..event(
+            id,
+            0,
+            EventKind::ShellFinished {
+                run,
+                by,
+                started_at: Some(started_at),
+                command_line: "make test".into(),
+                end: ShellEnd::Exited { code: 1 },
+                cwd: Some("/srv/work".into()),
+                preview: preview.into(),
+                lines: preview.lines().count() as u32,
+                truncated: output.is_some(),
+                output,
+            },
+        )
+    }
+}
+
+/// The composer's border line: the prompt in shell mode.
+fn composer_border(h: &Harness) -> String {
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    // The composer is the last box: its top border is the last line with
+    // a top-left corner.
+    lines
+        .iter()
+        .rev()
+        .find(|l| l.contains('┌'))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn ctrl_t_switches_to_shell_commands_and_keeps_both_drafts() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    pull(
+        &mut h,
+        vec![
+            message(id, 1, CommandId::new(), me, "an earlier prompt"),
+            requested(id, 2, run, me, "make"),
+            started(id, at(2), run),
+        ],
+    );
+    h.type_text("hello agent");
+    assert_contains(&h.screen(), "you: an earlier prompt");
+
+    assert_eq!(
+        h.key_with(ctrl('t')),
+        Some(Action::SetComposerMode {
+            session_id: id,
+            mode: ComposerMode::Shell,
+        })
+    );
+    assert_eq!(mode(&h), ComposerMode::Shell);
+    // The agent's draft was saved on the way; the shell one is empty.
+    assert_eq!(h.core_draft().unwrap().text, "hello agent");
+    assert_eq!(composer_text(&h), "");
+    // The runs stand in for the timeline.
+    let screen = h.screen();
+    assert_contains(&screen, "$ make");
+    assert!(!screen.contains("you: an earlier prompt"), "{screen}");
+    assert_contains(&composer_border(&h), "work $");
+
+    // `&&` is text; the condition is not.
+    h.type_text("ls && pwd");
+    assert_eq!(h.key_with(ctrl('o')), None);
+    let border = composer_border(&h);
+    assert_contains(&border, "work [if ok ✓] $");
+    assert!(!border.contains("ls"), "{border}");
+    let typed = line_with(&h.screen(), "ls && pwd");
+    assert!(!typed.contains("if ok"), "{typed}");
+    assert_eq!(composer_text(&h), "ls && pwd");
+    h.key_with(ctrl('o'));
+    assert_contains(&composer_border(&h), "work [if failed ✗] $");
+    h.key_with(ctrl('o'));
+    let border = composer_border(&h);
+    assert_contains(&border, "work $");
+    assert!(!border.contains("if "), "{border}");
+    h.key_with(ctrl('o'));
+
+    // Back: each mode has its own draft, the condition with the shell's.
+    assert_eq!(
+        h.key_with(ctrl('t')),
+        Some(Action::SetComposerMode {
+            session_id: id,
+            mode: ComposerMode::Agent,
+        })
+    );
+    assert_eq!(composer_text(&h), "hello agent");
+    assert_contains(&h.screen(), "you: an earlier prompt");
+    let shell = session_view(&h).shell_draft.unwrap();
+    assert_eq!(
+        (shell.text.as_str(), shell.when),
+        ("ls && pwd", RunWhen::OnSuccess)
+    );
+    h.key_with(ctrl('t'));
+    assert_eq!(composer_text(&h), "ls && pwd");
+    assert_contains(&composer_border(&h), "[if ok ✓] $");
+
+    // Enter runs it with its condition, which goes back to none.
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RunShell {
+            session_id: id,
+            command: "ls && pwd".into(),
+            when: RunWhen::OnSuccess,
+        })
+    );
+    assert_eq!(composer_text(&h), "");
+    assert_eq!(h.app.session().unwrap().1.when, RunWhen::Always);
+    assert!(!composer_border(&h).contains("if ok"));
+    let row = line_with(&h.screen(), "$ ls && pwd");
+    assert_contains(&row, "[if ok ✓]");
+    h.idle_save();
+    assert_eq!(session_view(&h).shell_draft, None);
+    // A blank command is not sent; the condition picked stays.
+    h.key_with(ctrl('o'));
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(h.app.session().unwrap().1.when, RunWhen::OnSuccess);
+}
+
+#[test]
+fn the_shell_mode_and_condition_survive_a_restart() {
+    let (mut h, id, _) = shell_session();
+    h.key_with(ctrl('t'));
+    h.type_text("cargo test");
+    h.key_with(ctrl('o'));
+    h.idle_save();
+
+    let mut h = h.restart();
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    assert_eq!(mode(&h), ComposerMode::Shell);
+    assert_eq!(composer_text(&h), "cargo test");
+    assert_contains(&composer_border(&h), "[if ok ✓] $");
+}
+
+#[test]
+fn an_edited_run_comes_back_with_its_condition() {
+    let (mut h, id, _) = shell_session();
+    h.key_with(ctrl('t'));
+    h.type_text("make deploy");
+    h.key_with(ctrl('o'));
+    h.key_with(ctrl('o'));
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::RunShell {
+            session_id: id,
+            command: "make deploy".into(),
+            when: RunWhen::OnFailure,
+        })
+    );
+    let run = last_command(&h);
+    assert!(!composer_border(&h).contains("if failed"));
+
+    // Never sent: `e` on it takes it back into the composer.
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Char('k'));
+    assert_contains(&footer(&h), "e edit");
+    assert_eq!(h.key(KeyCode::Char('e')), Some(Action::EditQueued(run)));
+    assert_eq!(
+        h.app.session().unwrap().1.focus,
+        skywave_tui::app::Focus::Composer
+    );
+    assert_eq!(composer_text(&h), "make deploy");
+    assert_contains(&composer_border(&h), "[if failed ✗] $");
+    assert!(session_view(&h).shell.runs.is_empty());
+
+    // Sent again and taken back with Delete instead.
+    h.key(KeyCode::Enter);
+    let run = last_command(&h);
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Char('k'));
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(run)));
+    assert!(session_view(&h).shell.runs.is_empty());
+}
+
+#[test]
+fn ctrl_x_stops_a_shell_run_in_shell_mode_and_interrupts_otherwise() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    pull(
+        &mut h,
+        vec![
+            requested(id, 1, run, me, "sleep 60"),
+            started(id, at(1), run),
+        ],
+    );
+    assert_eq!(
+        h.key_with(ctrl('x')),
+        Some(Action::Interrupt { session_id: id })
+    );
+    h.key_with(ctrl('t'));
+    assert_eq!(
+        h.key_with(ctrl('x')),
+        Some(Action::StopShell {
+            session_id: id,
+            run
+        })
+    );
+    let row = line_with(&h.screen(), "running");
+    assert_contains(&row, "stopping");
+    // Already stopping: nothing else to stop.
+    assert_eq!(h.key_with(ctrl('x')), None);
+}
+
+#[test]
+fn up_recalls_shell_commands_in_shell_mode_and_prompts_otherwise() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    pull(
+        &mut h,
+        vec![
+            message(id, 1, CommandId::new(), me, "a prompt"),
+            requested(id, 2, run, me, "make test"),
+        ],
+    );
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "a prompt");
+    h.key(KeyCode::Down);
+    h.key_with(ctrl('t'));
+    h.key(KeyCode::Up);
+    assert_eq!(composer_text(&h), "make test");
+    assert_contains(&footer(&h), "history 1/1");
+    assert_contains(&footer(&h), "Enter run");
+    h.key(KeyCode::Up);
+    assert_eq!(
+        composer_text(&h),
+        "make test",
+        "the prompt is not a command"
+    );
+}
+
+#[test]
+fn with_shell_commands_off_there_is_no_toggle() {
+    let (mut h, _, me) = open_session();
+    assert!(!footer(&h).contains("Ctrl-T"), "{}", footer(&h));
+    assert_eq!(h.key_with(ctrl('t')), None);
+    assert_eq!(mode(&h), ComposerMode::Agent);
+    assert_eq!(
+        h.app.ui().notice.as_deref(),
+        Some("shell commands are off on this server")
+    );
+    let help = read_help(&mut h).join("\n");
+    assert!(!help.contains("Ctrl-T"), "{help}");
+
+    // On a server that runs them, the same keys show the toggle.
+    hello(&mut h, me, true);
+    assert_contains(&footer(&h), "Ctrl-T shell");
+    let help = read_help(&mut h).join("\n");
+    assert_contains(&help, "Ctrl-T");
+    assert!(matches!(
+        h.key_with(ctrl('t')),
+        Some(Action::SetComposerMode { .. })
+    ));
+    // Turned off while in shell mode: the way back stays.
+    hello(&mut h, me, false);
+    assert_eq!(
+        h.key_with(ctrl('t')),
+        Some(Action::SetComposerMode {
+            session_id: h.app.session().unwrap().0.id,
+            mode: ComposerMode::Agent,
+        })
+    );
+}
+
+#[test]
+fn y_copies_a_runs_output_with_ansi_stripped() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    let (blob_id, output) = blob(40);
+    pull(
+        &mut h,
+        vec![
+            requested(id, 1, run, me, "make test"),
+            started(id, at(1), run),
+            finished(id, at_s(1, 5), run, me, at(1), "the tail\n", Some(output)),
+        ],
+    );
+    h.key_with(ctrl('t'));
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Char('k'));
+    let row = line_with(&h.screen(), "exit 1");
+    assert_contains(&row, &took_label(Duration::from_secs(5)));
+
+    // Not here yet: the preview, stripped already.
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("the tail\n".into())));
+    send_copy(&mut h, clipboard::MAX);
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"\x1b[31mred\x1b[0m\nthe tail\n").unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path: path.clone() })
+        .unwrap();
+    h.sync();
+    assert_eq!(h.key(KeyCode::Char('d')), None, "here already");
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Output { path: path.clone() }));
+    assert_eq!(
+        send_copy(&mut h, clipboard::MAX),
+        clipboard::osc52(b"red\nthe tail\n").into_bytes()
+    );
+    // Expanded, the whole output shows, stripped too.
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    let red = line_with(&screen, "red");
+    assert!(!red.contains('\u{1b}') && !red.contains("[31m"), "{red}");
+}
+
+#[test]
+fn the_clock_ticks_while_a_run_runs() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    h.key_with(ctrl('t'));
+    pull(&mut h, vec![requested(id, 1, run, me, "sleep 60")]);
+    assert!(!h.app.live(), "queued: no clock");
+    pull(&mut h, vec![started(id, at(1), run)]);
+    assert!(h.app.live());
+    let running = |h: &Harness, s: u32| line_with(&h.screen_at(at_s(1, s)), "running");
+    assert_contains(
+        &running(&h, 5),
+        &format!("running {}", took_label(Duration::from_secs(5))),
+    );
+    assert_contains(
+        &running(&h, 8),
+        &format!("running {}", took_label(Duration::from_secs(8))),
+    );
+    pull(
+        &mut h,
+        vec![finished(id, at_s(1, 9), run, me, at(1), "", None)],
+    );
+    assert!(!h.app.live(), "over: the clock stops");
+}
+
+#[test]
+fn a_long_run_alerts_when_it_finishes_out_of_sight() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    pull(
+        &mut h,
+        vec![
+            requested(id, 1, run, me, "make test"),
+            started(id, at(1), run),
+            finished(id, at(3), run, me, at(1), "", None),
+        ],
+    );
+    let notify = skywave_tui::Notify::parse("osc9").unwrap();
+    let mut out = Vec::new();
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    let sent = String::from_utf8(out).unwrap();
+    assert_contains(&sent, "skywave: make test · exit 1 · ");
+    assert_contains(&h.app.ui().notice.clone().unwrap(), "make test · exit 1");
+    // Once.
+    let mut out = Vec::new();
+    skywave_tui::alert(&mut h.app, &mut out, notify, false);
+    assert!(out.is_empty());
 }
