@@ -2,6 +2,7 @@
 //! pure [`Model`] and pushes a full [`ViewState`] to subscribers after every
 //! change.
 
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -20,7 +21,7 @@ use crate::identity::{FileIdentity, IdentityError};
 use crate::model::{Effect, Model, Paired};
 use crate::seam::{Request, Seam};
 use crate::store::{Store, StoreError};
-use crate::view::ViewState;
+use crate::view::{BlobId, ViewState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -186,9 +187,19 @@ pub(crate) struct State {
     /// Bumped whenever pairing with another server resets the replica; a
     /// [`Seam`] bound to an older one may no longer write.
     pub(crate) server_epoch: u64,
+    /// How often each blob left the replica in this process
+    /// ([`State::blobs_purged`]): a download holds the count it read
+    /// ([`BlobLease`]), so its reports fail once the blob is purged, even
+    /// if a workdir answer registers the same id again meanwhile.
+    purges: HashMap<BlobId, u64>,
     /// Bumped for every change, so delivery never goes back in time.
-    version: u64,
+    pub(crate) version: u64,
 }
+
+/// Which registration of a blob a download writes for: the blob's purge
+/// count when the download read its record ([`Seam`]'s leased reports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobLease(u64);
 
 impl Core {
     /// Opens the core over `data_dir` — the replica and, if the device is
@@ -298,6 +309,7 @@ impl Core {
                         .delete_session_locally(id, Utc::now())
                         .map(|blobs| {
                             state.model.session_deleted(id, &blobs);
+                            state.blobs_purged(&blobs);
                             for blob in &blobs {
                                 remove_blob_files(data_dir, *blob);
                             }
@@ -436,6 +448,7 @@ impl Shared {
                 model,
                 identity,
                 server_epoch: 0,
+                purges: HashMap::new(),
                 version: 0,
             }),
             requests,
@@ -447,22 +460,27 @@ impl Shared {
     /// Runs `change` under the state lock, hands its requests to the engine
     /// and publishes the change — also after an error, since the model may
     /// have been resynced. The snapshot is rendered at delivery, not here.
+    ///
+    /// The requests are sent before the lock is released (sending never
+    /// blocks), so the engine receives them in the order the changes were
+    /// made. The blob queue relies on it: a `BlobsPurged` for a blob always
+    /// reaches it before the `DownloadBlob` of a later change that
+    /// registered the same id again, never after.
     pub(crate) fn update<R, E>(
         &self,
         change: impl FnOnce(&mut State) -> Result<(R, Vec<Request>), E>,
     ) -> Result<R, E> {
-        let result = {
+        let outcome = {
             let mut state = lock(&self.state);
             let result = change(&mut state);
             state.version += 1;
-            result
+            result.map(|(value, requests)| {
+                for request in requests {
+                    self.requests.send(request);
+                }
+                value
+            })
         };
-        let outcome = result.map(|(value, requests)| {
-            for request in requests {
-                self.requests.send(request);
-            }
-            value
-        });
         self.publish();
         outcome
     }
@@ -577,6 +595,19 @@ impl Shared {
 }
 
 impl State {
+    /// These blobs left the replica: a download that read one before now
+    /// writes for a registration that is gone ([`BlobLease`]).
+    pub(crate) fn blobs_purged(&mut self, ids: &[BlobId]) {
+        for id in ids {
+            *self.purges.entry(*id).or_default() += 1;
+        }
+    }
+
+    /// The lease a download of `id` reading its record now holds.
+    pub(crate) fn blob_lease(&self, id: BlobId) -> BlobLease {
+        BlobLease(self.purges.get(&id).copied().unwrap_or(0))
+    }
+
     /// Rebuilds the model from the store after a failed write, so it never
     /// shows what was not persisted. Best effort: if the store cannot be
     /// read either, the model keeps its state.

@@ -75,6 +75,19 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Settings(settings) => settings_view(settings),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
+        // Placeholder until this head shows workdirs (nothing opens one
+        // yet): an empty list saying so, so no new signal is needed.
+        Screen::Workdir(workdir) => ScreenView::SessionList {
+            kind: ListKindView::Active,
+            title: clean_line(&workdir.title),
+            empty_label: Some("Workdir: not shown in this head yet.".to_owned()),
+            rows: Vec::new(),
+            other_count: 0,
+            creating: Vec::new(),
+            dismissable: None,
+            create: None,
+            rename: None,
+        },
     };
     ScreenUpdate {
         screen,

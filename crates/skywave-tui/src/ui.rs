@@ -75,6 +75,14 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             }
             Screen::Settings(settings) => render_settings(frame, body, app, settings),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
+            // Placeholder until this head shows workdirs; nothing opens one.
+            Screen::Workdir(workdir) => frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(notify::sanitise(&workdir.title)).bold(),
+                    Line::from("Workdir: not shown in this head yet.").dark_gray(),
+                ]),
+                body,
+            ),
         }
     }
 
@@ -763,6 +771,7 @@ fn footer_keys(app: &App) -> &'static str {
             "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
         }
         Screen::Usage(_) => "r range · Tab group · ↑↓ scroll · Esc back · ? help · q quit",
+        Screen::Workdir(_) => "Esc back · ? help · q quit",
     }
 }
 
@@ -1045,6 +1054,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  A turn whose agent reported no cost is unpriced, not free."),
             Line::from("  Archived sessions count; sessions deleted here do not."),
         ]),
+        Screen::Workdir(_) => lines.extend([section("Workdir"), key("Esc", "back")]),
     }
     lines
 }

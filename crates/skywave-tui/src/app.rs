@@ -1999,6 +1999,12 @@ impl App {
                 _ => None,
             },
             Screen::Session(_) => self.session_key(key, ctrl),
+            // Placeholder until this head shows workdirs.
+            Screen::Workdir(_) => match key.code {
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            },
             Screen::Usage(_) => {
                 let usage = &mut self.ui.usage;
                 match key.code {

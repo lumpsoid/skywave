@@ -29,6 +29,7 @@ use skywaved::agent::fake::FakeAgent;
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing;
 use skywaved::server::Server;
+use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
@@ -70,11 +71,16 @@ impl Daemon {
         let log = EventLog::open(&storage.db, vec![tmp.path().join("root")])
             .unwrap()
             .with_shell(shell);
-        let server = Server::bind(
+        // The daemon's git (workdir changes), immune to the user's config.
+        let git = Git::default()
+            .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_env("GIT_CONFIG_NOSYSTEM", "1");
+        let server = Server::bind_with_git(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log.clone(),
+            git,
         )
         .await
         .unwrap();

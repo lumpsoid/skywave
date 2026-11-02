@@ -13,15 +13,18 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
-use skywave_proto::{CommandResult, DirsResult, EventBatch, HelloResponse};
+use skywave_proto::{ChangesResult, CommandResult, DirsResult, EventBatch, HelloResponse};
 
-use crate::blobs::remove_all_blob_files;
-use crate::client::{Core, CoreError, State, lock};
+use crate::blobs::{remove_all_blob_files, remove_blob_files};
+use crate::client::{BlobLease, Core, CoreError, State, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
-use crate::store::{Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings};
+use crate::store::{
+    Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings, StoreError,
+};
 use crate::transport::TransportError;
 use crate::view::{ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId};
+use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// Work the core asks the engine to do. Sent only after the action that
 /// caused it is persisted.
@@ -42,8 +45,9 @@ pub enum Request {
     /// The user wants this blob's content.
     DownloadBlob(BlobId),
     BlobPolicyChanged(BlobPolicy),
-    /// These blobs left the replica with a locally deleted session, their
-    /// files already removed: stop waiting to download them.
+    /// These blobs left the replica (with a locally deleted session, or no
+    /// longer named by a refreshed workdir answer), their files already
+    /// removed: stop waiting to download them.
     BlobsPurged(Vec<BlobId>),
     /// The user wants the link to stop waiting out its backoff.
     RetryNow,
@@ -53,6 +57,13 @@ pub enum Request {
     ListDirs {
         req: u64,
         dir: String,
+    },
+    /// Read the session's workdir as `ask` says, within
+    /// [`WORKDIR_TIMEOUT`](crate::workdir::WORKDIR_TIMEOUT). Answer with
+    /// [`Seam::workdir_answered`], naming `req`.
+    Workdir {
+        req: u64,
+        ask: WorkdirAsk,
     },
 }
 
@@ -127,6 +138,18 @@ impl Seam {
     /// One blob, `None` if no event references it.
     pub fn blob(&self, id: BlobId) -> Result<Option<BlobRecord>, CoreError> {
         Ok(lock(&self.core.shared.state).store.blob(id)?)
+    }
+
+    /// One blob with the lease a download of it holds: its reports through
+    /// [`Seam::leased_blob_status`] fail with `UnknownBlob` once the blob
+    /// is purged, even if the same id is registered again meanwhile.
+    pub(crate) fn leased_blob(
+        &self,
+        id: BlobId,
+    ) -> Result<Option<(BlobRecord, BlobLease)>, CoreError> {
+        let state = lock(&self.core.shared.state);
+        let lease = state.blob_lease(id);
+        Ok(state.store.blob(id)?.map(|record| (record, lease)))
     }
 
     /// Stores a pulled batch (one transaction, cursor included) and shows
@@ -254,6 +277,62 @@ impl Seam {
             .unwrap_or_else(|never| match never {});
     }
 
+    /// The answer to [`Request::Workdir`] `req`, for `ask`. In one update:
+    /// the model first decides whether `req` is still the latest for `ask`
+    /// (a stale answer touches neither the replica nor the model); a domain
+    /// answer other than `ChangesResult::Failed` is then stored
+    /// ([`Store::put_workdir`](crate::Store::put_workdir)) and the model
+    /// takes it with the blobs it registered and purged, whose files go.
+    /// A transport error or a `Failed` stays in memory as the read's
+    /// failure, and the stored answer stays. An answer for a session no
+    /// longer in the replica is dropped.
+    pub fn workdir_answered(
+        &self,
+        req: u64,
+        ask: WorkdirAsk,
+        result: Result<WorkdirAnswer, TransportError>,
+    ) -> Result<(), CoreError> {
+        let data_dir = self.data_dir();
+        self.update(|state| {
+            if !state.model.workdir_awaited(req, &ask) {
+                return Ok(((), Vec::new()));
+            }
+            let answer = match result {
+                Err(error) => {
+                    state.model.workdir_failed(&ask, error.to_string());
+                    return Ok(((), Vec::new()));
+                }
+                Ok(WorkdirAnswer::Changes(ChangesResult::Failed { reason })) => {
+                    state.model.workdir_failed(&ask, reason);
+                    return Ok(((), Vec::new()));
+                }
+                Ok(answer) => answer,
+            };
+            let stored = match state.store.put_workdir(&ask, &answer) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    state.model.workdir_dropped(&ask);
+                    return Ok(((), Vec::new()));
+                }
+                Err(error) => {
+                    state.model.workdir_failed(&ask, error.to_string());
+                    return Err(error.into());
+                }
+            };
+            state.blobs_purged(&stored.purged);
+            let wanted = state.model.workdir_stored(ask, answer, &stored);
+            for blob in &stored.purged {
+                remove_blob_files(&data_dir, *blob);
+            }
+            let mut requests = Vec::new();
+            if !stored.purged.is_empty() {
+                requests.push(Request::BlobsPurged(stored.purged));
+            }
+            requests.extend(wanted);
+            Ok(((), requests))
+        })
+    }
+
     /// The answer to [`Request::ListDirs`] `req`. Kept in memory only; an
     /// answer to an older request than the latest is ignored.
     pub fn dirs_listed(&self, req: u64, result: Result<DirsResult, TransportError>) {
@@ -328,7 +407,28 @@ impl Seam {
 
     /// Download progress or completion of a blob.
     pub fn blob_status(&self, id: BlobId, status: BlobStatus) -> Result<(), CoreError> {
+        self.report_blob(id, None, status)
+    }
+
+    /// [`Seam::blob_status`] for the download holding `lease`
+    /// ([`Seam::leased_blob`]).
+    pub(crate) fn leased_blob_status(
+        &self,
+        id: BlobId,
+        lease: BlobLease,
+        status: BlobStatus,
+    ) -> Result<(), CoreError> {
+        self.report_blob(id, Some(lease), status)
+    }
+
+    fn report_blob(
+        &self,
+        id: BlobId,
+        lease: Option<BlobLease>,
+        status: BlobStatus,
+    ) -> Result<(), CoreError> {
         self.update(|state| {
+            check_lease(state, id, lease)?;
             state.store.set_blob_status(id, &status)?;
             state.model.blob_status(id, status);
             Ok(((), Vec::new()))
@@ -338,8 +438,27 @@ impl Seam {
     /// The download of `id` was given up for `reason`: back to
     /// `NotDownloaded`, the reason shown until it is asked for again.
     pub fn blob_failed(&self, id: BlobId, reason: impl Into<String>) -> Result<(), CoreError> {
-        let reason = reason.into();
+        self.fail_blob(id, None, reason.into())
+    }
+
+    /// [`Seam::blob_failed`] for the download holding `lease`.
+    pub(crate) fn leased_blob_failed(
+        &self,
+        id: BlobId,
+        lease: BlobLease,
+        reason: String,
+    ) -> Result<(), CoreError> {
+        self.fail_blob(id, Some(lease), reason)
+    }
+
+    fn fail_blob(
+        &self,
+        id: BlobId,
+        lease: Option<BlobLease>,
+        reason: String,
+    ) -> Result<(), CoreError> {
         self.update(|state| {
+            check_lease(state, id, lease)?;
             state
                 .store
                 .set_blob_status(id, &BlobStatus::NotDownloaded)?;
@@ -361,6 +480,16 @@ impl Seam {
             }
             change(state)
         })
+    }
+}
+
+/// A report of a download holding `lease` is for a registration of `id`
+/// that was purged since: the blob is unknown to it, whatever row has the
+/// id now.
+fn check_lease(state: &State, id: BlobId, lease: Option<BlobLease>) -> Result<(), CoreError> {
+    match lease {
+        Some(lease) if lease != state.blob_lease(id) => Err(StoreError::UnknownBlob(id).into()),
+        _ => Ok(()),
     }
 }
 

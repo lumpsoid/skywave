@@ -16,9 +16,11 @@
 //!   downloader (see [`crate::blobs`]) runs beside the link, on its own
 //!   task and connections, so blobs never hold up the pull or the sender.
 //! - `ListDirs` lists a server directory on its own task within
-//!   [`DIRS_TIMEOUT`], on a transport kept for listings, and answers with
-//!   [`Seam::dirs_listed`]; unpaired, suspended or rejected, it fails at
-//!   once. A failure never touches the link.
+//!   [`DIRS_TIMEOUT`], on a side transport kept for listings and workdir
+//!   reads, and answers with [`Seam::dirs_listed`]; unpaired, suspended or
+//!   rejected, it fails at once. A failure never touches the link.
+//! - `Workdir` reads a session's workdir the same way, within
+//!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
 //! **The link** runs while the device is paired, not rejected and not
 //! suspended. Each connection starts with `hello`, then runs two loops side
@@ -83,6 +85,7 @@ use crate::seam::{Request, Seam};
 use crate::store::{OutboxEntry, StoreError};
 use crate::transport::{Transport, TransportError};
 use crate::view::{CommandId, Link, LinkRejection};
+use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
 pub const DEFAULT_WAIT_SECS: u32 = 30;
@@ -239,9 +242,10 @@ pub(crate) struct Engine {
     rejected: watch::Sender<bool>,
     /// Blobs waiting for the downloader; outlives each downloader.
     blobs: Arc<BlobQueue>,
-    /// The transport directory listings use, built on the first; dropped
-    /// whenever the link restarts, as the identity may have changed.
-    dirs: Option<Arc<dyn Transport>>,
+    /// The transport kept for listings and workdir reads, built on the
+    /// first; dropped whenever the link restarts, as the identity may have
+    /// changed.
+    side: Option<Arc<dyn Transport>>,
 }
 
 impl Engine {
@@ -267,7 +271,7 @@ impl Engine {
             downloader: None,
             rejected: watch::Sender::new(false),
             blobs: Arc::new(BlobQueue::restore(&seam)),
-            dirs: None,
+            side: None,
         }
     }
 
@@ -331,9 +335,8 @@ impl Engine {
             }
             Request::ListDirs { req, dir } => {
                 let seam = self.seam.clone();
-                let Some(transport) = self.dirs_transport() else {
-                    let error = TransportError::Unreachable("not connected".into());
-                    seam.dirs_listed(req, Err(error));
+                let Some(transport) = self.side_transport() else {
+                    seam.dirs_listed(req, Err(not_connected()));
                     return;
                 };
                 tokio::spawn(async move {
@@ -343,15 +346,30 @@ impl Engine {
                     seam.dirs_listed(req, result);
                 });
             }
+            Request::Workdir { req, ask } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    answer_workdir(&seam, req, ask, Err(not_connected()));
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result =
+                        tokio::time::timeout(WORKDIR_TIMEOUT, read_workdir(&*transport, &ask))
+                            .await
+                            .unwrap_or(Err(TransportError::Timeout));
+                    answer_workdir(&seam, req, ask, result);
+                });
+            }
         }
     }
 
-    /// The transport for directory listings, if the link may run.
-    fn dirs_transport(&mut self) -> Option<Arc<dyn Transport>> {
+    /// The side transport, for listings and workdir reads, if the link may
+    /// run.
+    fn side_transport(&mut self) -> Option<Arc<dyn Transport>> {
         if *self.suspended.borrow() || *self.rejected.borrow() {
             return None;
         }
-        if let Some(transport) = &self.dirs {
+        if let Some(transport) = &self.side {
             return Some(transport.clone());
         }
         let identity = self.seam.identity()?;
@@ -360,9 +378,9 @@ impl Engine {
             .config
             .connector
             .connect(&address, identity.as_ref(), &self.config.transport)
-            .inspect_err(|error| tracing::debug!(%error, "no transport for listings"))
+            .inspect_err(|error| tracing::debug!(%error, "no side transport"))
             .ok()?;
-        self.dirs = Some(transport.clone());
+        self.side = Some(transport.clone());
         Some(transport)
     }
 
@@ -370,7 +388,7 @@ impl Engine {
     /// paired, not rejected and not suspended.
     fn start_link(&mut self) {
         self.stop_link();
-        self.dirs = None;
+        self.side = None;
         if *self.suspended.borrow() || *self.rejected.borrow() {
             return;
         }
@@ -423,6 +441,39 @@ impl Engine {
         if let Some(downloader) = self.downloader.take() {
             downloader.abort();
         }
+    }
+}
+
+/// One workdir read, as `ask` says.
+async fn read_workdir(
+    transport: &dyn Transport,
+    ask: &WorkdirAsk,
+) -> Result<WorkdirAnswer, TransportError> {
+    let query = ask.query();
+    match ask {
+        WorkdirAsk::Changes { .. } => transport
+            .workdir_changes(&query)
+            .await
+            .map(WorkdirAnswer::Changes),
+        WorkdirAsk::List { .. } => transport
+            .workdir_list(&query)
+            .await
+            .map(WorkdirAnswer::List),
+        WorkdirAsk::File { .. } => transport
+            .workdir_file(&query)
+            .await
+            .map(WorkdirAnswer::File),
+    }
+}
+
+fn answer_workdir(
+    seam: &Seam,
+    req: u64,
+    ask: WorkdirAsk,
+    result: Result<WorkdirAnswer, TransportError>,
+) {
+    if let Err(error) = seam.workdir_answered(req, ask, result) {
+        tracing::warn!(%error, "cannot keep a workdir answer");
     }
 }
 
