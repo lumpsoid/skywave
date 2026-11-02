@@ -210,6 +210,13 @@ pub enum ActionIntent {
         session_id: String,
         context_id: Option<String>,
     },
+    /// Show the steps of the subagent the call `call` (a row's `opens`, a
+    /// task's `call`) starts; `None` shows the main view. Messages still
+    /// go to the main agent.
+    ViewSubagent {
+        session_id: String,
+        call: Option<String>,
+    },
     /// Switch the session's agent to `mode`, starting it if need be.
     SetPermissionMode {
         session_id: String,

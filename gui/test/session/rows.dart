@@ -167,6 +167,7 @@ SessionScreen screenWith({
   String? stopWarning,
   List<TaskRow> tasks = const [],
   List<ScheduleRow> schedules = const [],
+  SubagentHeaderView? subagent,
 }) => SessionScreen(
   sessionId: 's1',
   title: 'work',
@@ -185,6 +186,7 @@ SessionScreen screenWith({
     newContext: 'Start a new context?',
     switchContext: 'Switch context?',
     moveContext: 'Move this context to a new session?',
+    stopTask: 'Stop this subagent?',
   ),
   tasks: tasks,
   schedules: schedules,
@@ -204,6 +206,7 @@ SessionScreen screenWith({
   composer: composer,
   snippets: snippets,
   approval: approval,
+  subagent: subagent,
   renamePrompt: renamePrompt,
   archivedLabel: archivedLabel,
 );

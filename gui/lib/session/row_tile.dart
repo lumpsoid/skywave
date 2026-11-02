@@ -11,9 +11,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// A tap selects it and expands or collapses it; a long press or right
 /// click opens its menu (copy, save as snippet, download, edit or
 /// discard). A message's
-/// text selects, with its own menu.
+/// text selects, with its own menu. A call that starts a subagent has an
+/// Open that shows the subagent's own steps.
 class RowTile extends StatelessWidget {
   const RowTile({
+    required this.sessionId,
     required this.row,
     required this.send,
     required this.onSelect,
@@ -25,6 +27,8 @@ class RowTile extends StatelessWidget {
     super.key,
   });
 
+  /// The session the row is of.
+  final String sessionId;
   final TimelineRow row;
   final SendIntent send;
 
@@ -148,7 +152,17 @@ class RowTile extends StatelessWidget {
       RowKind.tool ||
       RowKind.toolCall ||
       RowKind.toolResult ||
-      RowKind.approval => _ToolCard(row: row, hit: hit, mark: mark),
+      RowKind.approval => _ToolCard(
+        row: row,
+        hit: hit,
+        mark: mark,
+        onOpen: switch (row.tool?.opens) {
+          final call? => () => send.act(
+            ActionIntentViewSubagent(sessionId: sessionId, call: call),
+          ),
+          null => null,
+        },
+      ),
       RowKind.interrupted || RowKind.stopped => _Notice(
         row: row,
         icon: row.kind == RowKind.stopped
@@ -583,14 +597,23 @@ class _LinkButton extends StatelessWidget {
   }
 }
 
-/// A tool item's head: its kind's icon, name and title, its state, and
-/// the first line of its detail.
+/// A tool item's head: its kind's icon, name and title, its state (for a
+/// call that starts a subagent, how the subagent stands, and its Open),
+/// and the first line of its detail.
 class _ToolCard extends StatelessWidget {
-  const _ToolCard({required this.row, required this.hit, required this.mark});
+  const _ToolCard({
+    required this.row,
+    required this.hit,
+    required this.mark,
+    this.onOpen,
+  });
 
   final TimelineRow row;
   final SearchHit? hit;
   final TextStyle mark;
+
+  /// Shows the subagent the call starts; null for any other call.
+  final VoidCallback? onOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -608,6 +631,7 @@ class _ToolCard extends StatelessWidget {
       fontFamilyFallback: monoFallback,
     );
     final small = theme.textTheme.bodySmall?.copyWith(color: colors.muted);
+    final state = tool.status ?? tool.stateLabel;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -648,8 +672,9 @@ class _ToolCard extends StatelessWidget {
                     maxLines: row.expanded ? null : 3,
                     overflow: row.expanded ? null : TextOverflow.ellipsis,
                   ),
-                  if (tool.stateLabel.isNotEmpty)
-                    StateBadge(label: tool.stateLabel, color: color),
+                  if (state.isNotEmpty) StateBadge(label: state, color: color),
+                  if (onOpen case final open?)
+                    _LinkButton(label: 'Open', onPressed: open),
                 ],
               ),
               if (tool.detail case final detail?)

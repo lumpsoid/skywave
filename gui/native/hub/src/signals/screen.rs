@@ -248,6 +248,9 @@ pub struct SessionScreen {
     pub usage: Vec<String>,
     /// The approval the agent is blocked on.
     pub approval: Option<ApprovalPanel>,
+    /// The subagent whose own steps the timeline shows; `None` in the main
+    /// view.
+    pub subagent: Option<SubagentHeaderView>,
     pub composer: ComposerView,
     /// This device's snippets for the composer's picker, the most recently
     /// used or saved first.
@@ -263,6 +266,28 @@ pub struct StopHeadings {
     pub new_context: String,
     pub switch_context: String,
     pub move_context: String,
+    /// Stopping the shown subagent's task.
+    pub stop_task: String,
+}
+
+/// The subagent a session view shows, for its header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct SubagentHeaderView {
+    /// Its `Agent` call: which subagent this is.
+    pub call: String,
+    /// As its call's title.
+    pub title: String,
+    /// Where it is: the session, then the subagents it runs under,
+    /// outermost first: `work › outer`.
+    pub trail: String,
+    /// `running · 14 steps · Write src/sync.rs`, `finished · 14 steps`.
+    pub status_label: String,
+    /// Still at work.
+    pub live: bool,
+    /// The task to stop with `StopTask` while it runs as one; `None` for
+    /// a finished subagent and for a foreground one, which has no task
+    /// (Interrupt ends it with the turn).
+    pub task_id: Option<String>,
 }
 
 /// One background task.
@@ -279,6 +304,9 @@ pub struct TaskRow {
     /// `queued`, `sending`, `failed: <why>`: this device's stop of it, while
     /// on its way.
     pub stop_label: Option<String>,
+    /// The `Agent` call of the subagent it runs, to open with
+    /// `ViewSubagent`; `None` for any other task.
+    pub call: Option<String>,
 }
 
 /// One loop.
@@ -428,6 +456,9 @@ pub enum PermissionModeView {
 #[derive(Debug, Clone, PartialEq, Serialize, SignalPiece)]
 pub struct ApprovalPanel {
     pub approval_id: String,
+    /// `from subagent: Explore`, with `· open it to see the call` where the
+    /// view does not show the call; `None` for the main agent's.
+    pub from: Option<String>,
     /// The timeline row of the call it gates (to reveal and expand it).
     pub gated_key: Option<String>,
     pub kind: ToolKindView,
@@ -474,6 +505,9 @@ pub struct ComposerView {
     pub history_label: Option<String>,
     /// `offline, sends when back online`, while reconnecting.
     pub offline_label: Option<String>,
+    /// `to the main agent` in a subagent's view, which takes no message
+    /// of its own.
+    pub to_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]

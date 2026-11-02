@@ -15,7 +15,8 @@ use skywave_core::{
 use skywave_present::format::{
     adopted_line, agent_setting_line, answer_words, asked_by, bytes, context_moved_line,
     context_started_line, context_switched_line, decision_label, delivery_label, dollars,
-    fail_reason, moved_from_line, outgoing_label, percent, seconds, took_label, turn_time,
+    fail_reason, moved_from_line, outgoing_label, percent, seconds, subagent_status, took_label,
+    turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
@@ -413,6 +414,10 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
     {
         label = format!("{label} · {note}");
     }
+    let (state, status) = match subagent_state(view) {
+        Some((state, status)) => (state, Some(status)),
+        None => (state, None),
+    };
     ToolFacts {
         kind: tool_kind(view.kind),
         name: clean_line(&view.name),
@@ -421,7 +426,37 @@ fn tool_facts(view: &ToolView, wall_ms: i64, expanded: bool, entry: &Entry) -> T
         state,
         state_label: label,
         aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
+        opens: view.subagent.as_ref().map(|_| view.call.0.to_string()),
+        status,
     }
+}
+
+/// How the subagent a call starts stands, where that says more than the
+/// call: its own state, not the launch's, as a background subagent's call
+/// is done long before it ends. Not while its approval is pending or the
+/// call failed: those the call says.
+fn subagent_state(view: &ToolView) -> Option<(ToolState, String)> {
+    let status = view.subagent.as_ref()?;
+    let pending = matches!(
+        view.approval.as_ref().map(|a| &a.status),
+        Some(ApprovalStatus::Pending)
+    );
+    let shows = matches!(
+        view.outcome,
+        ToolOutcome::Running { .. }
+            | ToolOutcome::Done {
+                is_error: false,
+                ..
+            }
+    );
+    (shows && !pending).then(|| {
+        let state = if status.live {
+            ToolState::Running
+        } else {
+            ToolState::Done
+        };
+        (state, clean_line(&subagent_status(status)))
+    })
 }
 
 /// A legacy call or result: its name and the first line of its summary.
@@ -434,6 +469,8 @@ fn plain_facts(name: &str, summary: &str, expanded: bool, entry: &Entry) -> Tool
         state: ToolState::Plain,
         state_label: String::new(),
         aside: (!expanded).then(|| unseen_blob(entry)).flatten(),
+        opens: None,
+        status: None,
     }
 }
 

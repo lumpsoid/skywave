@@ -102,9 +102,12 @@ const _headings = StopHeadings(
   newContext: 'Start a new context?',
   switchContext: 'Switch context?',
   moveContext: 'Move this context to a new session?',
+  stopTask: 'Stop this subagent?',
 );
 
-ScreenUpdate sessionScreen() => const ScreenUpdate(
+/// The session `s1`, in the view of [subagent] if given; its composer
+/// is always the one it opened with (rev 1, empty).
+ScreenUpdate sessionScreen({SubagentHeaderView? subagent}) => ScreenUpdate(
   screen: ScreenViewSession(
     session: SessionScreen(
       sessionId: 's1',
@@ -116,10 +119,10 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
       interruptBusy: false,
       canClear: false,
       stopHeadings: _headings,
-      tasks: [],
-      schedules: [],
+      tasks: const [],
+      schedules: const [],
       workEmptyLabel: 'Nothing is running in the background.',
-      contexts: [
+      contexts: const [
         ContextRow(
           contextId: 'c1',
           label: 'start',
@@ -128,13 +131,28 @@ ScreenUpdate sessionScreen() => const ScreenUpdate(
         ),
       ],
       contextId: 'c1',
-      rules: [],
+      rules: const [],
       agent: unknownAgent,
-      usage: [],
+      usage: const [],
       composer: _composer,
-      snippets: [],
+      snippets: const [],
+      subagent: subagent,
     ),
   ),
   canGoBack: true,
   revokedFullScreen: false,
+);
+
+/// A subagent's header: its `Agent` call is [call].
+SubagentHeaderView subagentHeader(
+  String call, {
+  String title = 'Explore sync',
+  String? taskId,
+}) => SubagentHeaderView(
+  call: call,
+  title: title,
+  trail: 'work',
+  statusLabel: 'running · 3 steps · Write src/sync.rs',
+  live: true,
+  taskId: taskId,
 );

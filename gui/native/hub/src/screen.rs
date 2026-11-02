@@ -6,16 +6,17 @@ use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, Effort, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
     PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView,
-    SessionRow, SessionState, SessionUsage, SessionView, SettingsView, Snippet, TimelineItem,
-    ViewState,
+    SessionRow, SessionState, SessionUsage, SessionView, SettingsView, Snippet, SubagentHeader,
+    TimelineItem, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
-    agent_effort_label, agent_mode_label, agent_model_label, answer_words, background_rows,
-    blob_size, bytes, context_moved_label, context_row, delivery_label, dollars, effort_label,
-    effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
-    model_refusal, move_refusal, outgoing_label, repeat_word, scope_label, stop_heading,
-    stop_warning, task_kind_word, tokens, turn_time, viewing_hint, work_summary,
+    TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, answer_words,
+    approval_origin, background_rows, blob_size, bytes, context_moved_label, context_row,
+    delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail, mode_label,
+    mode_needs_confirmation, mode_refusal, model_refusal, move_refusal, outgoing_label,
+    repeat_word, scope_label, stop_heading, stop_warning, subagent_status, task_kind_word, tokens,
+    trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -26,7 +27,7 @@ use crate::signals::{
     ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
     ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
     ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, TaskRow, ToolKindView,
+    StopHeadings, SubagentHeaderView, TaskRow, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -299,6 +300,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             new_context: stop_heading(StopAction::NewContext).to_owned(),
             switch_context: stop_heading(StopAction::SwitchContext).to_owned(),
             move_context: stop_heading(StopAction::MoveContext).to_owned(),
+            stop_task: stop_heading(StopAction::Task).to_owned(),
         },
         tasks: background_rows(&session.work)
             .into_iter()
@@ -314,6 +316,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
                         .iter()
                         .find(|(id, _)| *id == task.id)
                         .map(|(_, outgoing)| outgoing_label(outgoing)),
+                    call: task.call.map(|call| call.0.to_string()),
                 }),
                 BackgroundRow::Loop(_) => None,
             })
@@ -367,12 +370,17 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .pending_approval
             .as_ref()
             .map(|prompt| approval_panel(prompt, session)),
+        subagent: session
+            .subagent
+            .as_ref()
+            .map(|header| subagent_header(header, &session.title)),
         composer: ui.composer.cloned().unwrap_or_else(|| ComposerView {
             text: String::new(),
             cursor_utf16: 0,
             rev: 0,
             history_label: None,
             offline_label: None,
+            to_label: None,
         }),
         snippets: view.snippets.iter().map(snippet_view).collect(),
         rename_prompt: ui
@@ -381,6 +389,31 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .cloned(),
     }
     .with_offline(&view.link)
+    .with_recipient(session)
+}
+
+/// The header of a subagent's view in the session titled `session`.
+fn subagent_header(header: &SubagentHeader, session: &str) -> SubagentHeaderView {
+    let status = &header.status;
+    let path = [session.to_owned(), trail(&header.trail)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(TRAIL_SEPARATOR);
+    SubagentHeaderView {
+        call: header.call.0.to_string(),
+        title: clean_line(&header.title),
+        trail: clean_line(&path),
+        status_label: clean_line(&subagent_status(status)),
+        live: status.live,
+        // A foreground subagent has no task: the server refuses to stop
+        // one, and Interrupt ends it with the turn.
+        task_id: status
+            .task
+            .as_ref()
+            .filter(|_| status.live)
+            .map(|task| task.0.clone()),
+    }
 }
 
 fn snippet_view(snippet: &Snippet) -> SnippetView {
@@ -402,6 +435,15 @@ impl SessionScreen {
     fn with_offline(mut self, link: &Link) -> SessionScreen {
         self.composer.offline_label = matches!(link, Link::Reconnecting { .. })
             .then(|| "offline, sends when back online".to_owned());
+        self
+    }
+
+    /// Says on the composer, in a subagent's view, who a message goes to.
+    fn with_recipient(mut self, session: &SessionView) -> SessionScreen {
+        self.composer.to_label = session
+            .subagent
+            .is_some()
+            .then(|| "to the main agent".to_owned());
         self
     }
 }
@@ -647,6 +689,10 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
     });
     ApprovalPanel {
         approval_id: prompt.id.0.to_string(),
+        from: prompt
+            .from
+            .as_deref()
+            .map(|from| clean_line(&approval_origin(from, gated.is_some()))),
         gated_key,
         kind,
         tool,

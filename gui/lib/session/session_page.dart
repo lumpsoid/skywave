@@ -84,6 +84,9 @@ class _SessionPageState extends State<SessionPage> {
   /// opened, or another session was shown, were not news here.
   void _announceRefusals(SessionScreen before) {
     if (before.sessionId != _screen.sessionId) return;
+    // A page kept under a subagent's is the same session's: the top one
+    // says it.
+    if (!(ModalRoute.isCurrentOf(context) ?? true)) return;
     final was = _refusalsOf(before);
     final now = _refusalsOf(_screen);
     final news = [
@@ -129,6 +132,20 @@ class _SessionPageState extends State<SessionPage> {
       if (!ok || !mounted) return;
     }
     go();
+  }
+
+  /// Stops the task of the subagent shown, once confirmed.
+  Future<void> _stopSubagent(SubagentHeaderView subagent, String task) async {
+    final ok = await confirmStop(
+      context,
+      heading: _screen.stopHeadings.stopTask,
+      warning: subagent.title,
+      action: 'Stop subagent',
+    );
+    if (!ok || !mounted) return;
+    widget.send.act(
+      ActionIntentStopTask(sessionId: _screen.sessionId, taskId: task),
+    );
   }
 
   /// Interrupts the agent's turn, if it has one and no interrupt from
@@ -232,6 +249,16 @@ class _SessionPageState extends State<SessionPage> {
                     ),
                     const SizedBox(width: 4),
                     Expanded(child: _Title(screen: screen)),
+                    if (screen.subagent case final subagent?)
+                      if (subagent.taskId case final task?)
+                        IconButton(
+                          tooltip: 'Stop this subagent',
+                          onPressed: () => _stopSubagent(subagent, task),
+                          icon: Icon(
+                            Icons.stop_circle_outlined,
+                            color: theme.colorScheme.error,
+                          ),
+                        ),
                     IconButton(
                       tooltip: 'Search (Ctrl+F)',
                       onPressed: _openSearch,
@@ -540,7 +567,9 @@ class _Column extends StatelessWidget {
 }
 
 /// The header's title: the session's name with its rename on the way,
-/// then the workdir. The agent's state is on the status line.
+/// then the workdir; in a subagent's view, the subagent's title with how
+/// it stands, then where it is (`work › outer`). The agent's state is on
+/// the status line.
 class _Title extends StatelessWidget {
   const _Title({required this.screen});
 
@@ -562,6 +591,8 @@ class _Title extends StatelessWidget {
     final colors = SkyColors.of(context);
     final rename = screen.rename;
     final sub = theme.textTheme.labelMedium?.copyWith(color: colors.muted);
+    final subagent = screen.subagent;
+    final under = subagent?.trail ?? screen.workdir;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -570,13 +601,21 @@ class _Title extends StatelessWidget {
           children: [
             Flexible(
               child: Text(
-                screen.title,
+                subagent?.title ?? screen.title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: theme.textTheme.titleMedium,
               ),
             ),
-            if (screen.renameLabel case final label?) ...[
+            if (subagent != null) ...[
+              const SizedBox(width: 8),
+              StateBadge(
+                label: subagent.statusLabel,
+                color: colors.tool(
+                  subagent.live ? ToolState.running : ToolState.done,
+                ),
+              ),
+            ] else if (screen.renameLabel case final label?) ...[
               const SizedBox(width: 8),
               StateBadge(
                 label: label,
@@ -587,13 +626,8 @@ class _Title extends StatelessWidget {
             ],
           ],
         ),
-        if (screen.workdir case final workdir?)
-          Text(
-            workdir,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: sub,
-          ),
+        if (under case final under?)
+          Text(under, maxLines: 1, overflow: TextOverflow.ellipsis, style: sub),
       ],
     );
   }

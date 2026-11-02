@@ -415,7 +415,7 @@ fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     rig.submit();
     rig.results();
     rig.view();
-    let key = rig.head.sent.timeline.as_ref().unwrap().1[0].key.clone();
+    let key = rig.head.sent.timeline.as_ref().unwrap().2[0].key.clone();
     let outs = rig.intent(GuiIntent::SaveSnippet {
         key,
         name: "tests".into(),
@@ -679,8 +679,8 @@ fn a_tapped_candidate_fills_the_create_prompt() {
 
 impl Rig {
     /// Logs `kinds` as the agent's events in the open session, and shows
-    /// the head the view that follows.
-    fn log(&mut self, kinds: Vec<EventKind>) {
+    /// the head the view that follows; what it sent Dart then.
+    fn log(&mut self, kinds: Vec<EventKind>) -> Vec<Out> {
         let from = Seq(self.seam.cursor().unwrap().0 + 1);
         let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
         let events = kinds
@@ -696,12 +696,12 @@ impl Rig {
         self.seam
             .apply_events(&EventBatch { from, events })
             .unwrap();
-        self.view();
+        self.view()
     }
 
     /// The rows the head last sent Dart.
     fn rows(&self) -> &[TimelineRow] {
-        &self.head.sent.timeline.as_ref().unwrap().1
+        &self.head.sent.timeline.as_ref().unwrap().2
     }
 }
 
@@ -1491,4 +1491,251 @@ fn the_conversation_field_does_nothing_while_the_prompt_is_closed() {
     });
     rig.intent(GuiIntent::CompletionAccept);
     assert_eq!(queued_creations(&rig), [("/srv/app".to_owned(), None)]);
+}
+
+/// A call `call` of `kind` titled `title`, made by the subagent `parent`
+/// starts (`None`: the main agent).
+fn a_call(
+    parent: Option<skywave_proto::CallId>,
+    call: skywave_proto::CallId,
+    name: &str,
+    kind: skywave_proto::ToolKind,
+    title: &str,
+) -> EventKind {
+    use skywave_proto::{ToolCall, ToolDisplay};
+    EventKind::ToolCall(ToolCall {
+        parent,
+        call: Some(call),
+        name: name.into(),
+        display: ToolDisplay {
+            kind,
+            title: title.into(),
+            detail: None,
+            body: None,
+        },
+        input: None,
+    })
+}
+
+fn snapshots(outs: &[Out]) -> Vec<Vec<String>> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Timeline(TimelineUpdate::Snapshot { items, .. }) => {
+                Some(items.iter().map(|row| row.key.clone()).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn upserts(outs: &[Out]) -> usize {
+    outs.iter()
+        .filter(|out| matches!(out, Out::Timeline(TimelineUpdate::Upserted { .. })))
+        .count()
+}
+
+impl Rig {
+    fn view_subagent(&mut self, call: Option<skywave_proto::CallId>) -> Vec<Out> {
+        self.intent(GuiIntent::Act {
+            action: ActionIntent::ViewSubagent {
+                session_id: self.session.0.to_string(),
+                call: call.map(|call| call.0.to_string()),
+            },
+        });
+        self.results();
+        self.view()
+    }
+
+    /// The facts of the row of the tool named `name`.
+    fn tool_row(&self, name: &str) -> crate::signals::ToolFacts {
+        self.rows()
+            .iter()
+            .find_map(|row| row.tool.clone().filter(|tool| tool.name == name))
+            .unwrap_or_else(|| panic!("no {name} row in {:?}", self.rows()))
+    }
+}
+
+#[test]
+fn a_subagent_row_opens_its_view_and_switching_views_sends_a_snapshot() {
+    use skywave_proto::{CallId, ToolKind};
+    let mut rig = Rig::new();
+    let (agent, step, read) = (CallId::new(), CallId::new(), CallId::new());
+    rig.log(vec![
+        a_call(None, agent, "Agent", ToolKind::Subagent, "Explore sync"),
+        a_call(Some(agent), step, "Bash", ToolKind::Shell, "ls src"),
+        a_call(None, read, "Read", ToolKind::FileRead, "/srv/work/a.rs"),
+    ]);
+    let launch = rig.tool_row("Agent");
+    assert_eq!(launch.opens, Some(agent.0.to_string()));
+    assert_eq!(launch.status.as_deref(), Some("running · 1 step · ls src"));
+    // The main agent's other call, in the same timeline, opens nothing.
+    let other = rig.tool_row("Read");
+    assert_eq!((other.opens, other.status), (None, None));
+    let main_keys: Vec<String> = rig.rows().iter().map(|r| r.key.clone()).collect();
+
+    // Typed and not saved yet: only the hub's copy of Dart's text has it.
+    rig.edit("half a thought");
+    assert!(!rig.kinds().contains(&"save draft"), "{:?}", rig.actions);
+    let rev = rig.composer().rev;
+
+    let outs = rig.view_subagent(Some(agent));
+    let shown = snapshots(&outs);
+    assert_eq!(
+        shown.len(),
+        1,
+        "one snapshot of the subagent's rows: {outs:?}"
+    );
+    assert_eq!(shown[0].len(), 1, "its one step: {shown:?}");
+    assert_eq!(rig.tool_row("Bash").opens, None);
+    let session = rig.open_session();
+    let header = session.subagent.expect("a subagent's view");
+    assert_eq!(header.call, agent.0.to_string());
+    assert_eq!(header.title, "Explore sync");
+    assert_eq!(header.trail, "work");
+    assert_eq!(header.status_label, "running · 1 step · ls src");
+    assert!(header.live);
+    // A foreground subagent has no task to stop.
+    assert_eq!(header.task_id, None);
+    // The subagent page's new field takes the text under a new rev.
+    let composer = rig.composer();
+    assert_eq!(composer.text, "half a thought");
+    assert!(composer.rev > rev, "{} after {rev}", composer.rev);
+    assert_eq!(composer.to_label.as_deref(), Some("to the main agent"));
+
+    // Positive control: staying in the view, a new step is a diff.
+    let outs = rig.log(vec![a_call(
+        Some(agent),
+        CallId::new(),
+        "Grep",
+        ToolKind::Search,
+        "fn sync",
+    )]);
+    assert!(snapshots(&outs).is_empty(), "{outs:?}");
+    assert_eq!(upserts(&outs), 1, "{outs:?}");
+    let rev = rig.composer().rev;
+
+    let outs = rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    assert!(snapshots(&outs).is_empty(), "the core has not moved yet");
+    rig.results();
+    let outs = rig.view();
+    assert_eq!(snapshots(&outs), [main_keys]);
+    assert_eq!(rig.open_session().subagent, None);
+    let composer = rig.composer();
+    assert_eq!(composer.text, "half a thought");
+    assert!(composer.rev > rev);
+    assert_eq!(composer.to_label, None);
+}
+
+#[test]
+fn a_background_subagent_opens_from_its_task_and_says_where_its_approval_is() {
+    use skywave_proto::{ApprovalId, CallId, TaskId, TaskKind, ToolKind, ToolResult};
+    let mut rig = Rig::new();
+    let (agent, step) = (CallId::new(), CallId::new());
+    let shell = skywave_proto::BackgroundTask {
+        id: TaskId("t0".into()),
+        kind: TaskKind::Shell,
+        title: "npm test".into(),
+        parent: None,
+        call: None,
+        ambient: false,
+    };
+    rig.log(vec![
+        a_call(None, agent, "Agent", ToolKind::Subagent, "Explore sync"),
+        EventKind::ToolResult(ToolResult {
+            call: Some(agent),
+            is_error: false,
+            status: None,
+            preview: "Async agent launched".into(),
+            lines: 1,
+            output: None,
+        }),
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![
+                shell.clone(),
+                skywave_proto::BackgroundTask {
+                    id: TaskId("t1".into()),
+                    kind: TaskKind::Subagent,
+                    title: "Explore sync".into(),
+                    call: Some(agent),
+                    ..shell
+                },
+            ],
+        },
+        a_call(
+            Some(agent),
+            step,
+            "Write",
+            ToolKind::FileWrite,
+            "src/sync.rs",
+        ),
+        EventKind::ApprovalRequested {
+            id: ApprovalId::new(),
+            call: Some(step),
+            tool: "Write".into(),
+            summary: "src/sync.rs".into(),
+            input: None,
+            suggestions: Vec::new(),
+        },
+    ]);
+    let session = rig.open_session();
+    let calls: Vec<_> = session
+        .tasks
+        .iter()
+        .map(|t| (t.task_id.as_str(), t.call.clone()))
+        .collect();
+    assert_eq!(calls, [("t0", None), ("t1", Some(agent.0.to_string()))]);
+    // The launch is done; the subagent still runs.
+    let launch = rig.tool_row("Agent");
+    assert_eq!(launch.state, crate::signals::ToolState::Running);
+    assert_eq!(
+        launch.status.as_deref(),
+        Some("running · 1 step · src/sync.rs")
+    );
+    let approval = session.approval.expect("the subagent's approval");
+    assert_eq!(
+        approval.from.as_deref(),
+        Some("from subagent: Explore sync · open it to see the call")
+    );
+
+    rig.view_subagent(Some(agent));
+    let session = rig.open_session();
+    assert_eq!(session.subagent.unwrap().task_id.as_deref(), Some("t1"));
+    assert_eq!(session.stop_headings.stop_task, "Stop this subagent?");
+    assert_eq!(
+        session.approval.unwrap().from.as_deref(),
+        Some("from subagent: Explore sync")
+    );
+}
+
+#[test]
+fn nothing_is_marked_read_from_a_subagents_view() {
+    use skywave_proto::{CallId, ToolKind};
+    let mut rig = Rig::new();
+    let agent = CallId::new();
+    rig.log(vec![a_call(
+        None,
+        agent,
+        "Agent",
+        ToolKind::Subagent,
+        "Explore sync",
+    )]);
+    rig.view_subagent(Some(agent));
+    rig.actions.clear();
+    rig.intent(GuiIntent::FollowingChanged { following: true });
+    rig.log(vec![a_call(
+        Some(agent),
+        CallId::new(),
+        "Bash",
+        ToolKind::Shell,
+        "ls",
+    )]);
+    // Past the throttle, so an earlier mark cannot be what holds it back.
+    rig.wait(skywave_present::policy::READ_MARK_EVERY * 2);
+    assert!(!rig.kinds().contains(&"mark read"), "{:?}", rig.actions);
+    // Positive control: the main view, following, marks.
+    rig.view_subagent(None);
+    rig.intent(GuiIntent::FollowingChanged { following: true });
+    assert!(rig.kinds().contains(&"mark read"), "{:?}", rig.actions);
 }

@@ -5,7 +5,8 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Lists the agent's background work in a sheet: the tasks, each under the
-/// one that started it, with a Stop that asks first, then the loops, which
+/// one that started it, with a Stop that asks first (and, for a subagent's
+/// task, an Open that closes the sheet on its steps), then the loops, which
 /// only inform (Skywave cannot end a loop; the agent can, when asked). The
 /// sheet follows [screen], so a stop's progress shows in its row.
 Future<void> showBackgroundWork(
@@ -61,6 +62,18 @@ class BackgroundSheet extends StatelessWidget {
             for (final task in screen.tasks)
               _TaskTile(
                 task: task,
+                onOpen: switch (task.call) {
+                  final call? => () {
+                    Navigator.of(context).pop();
+                    send.act(
+                      ActionIntentViewSubagent(
+                        sessionId: screen.sessionId,
+                        call: call,
+                      ),
+                    );
+                  },
+                  null => null,
+                },
                 onStop: () async {
                   final ok = await _confirmTaskStop(context, task);
                   if (!ok || !context.mounted) return;
@@ -87,10 +100,13 @@ class BackgroundSheet extends StatelessWidget {
 }
 
 class _TaskTile extends StatelessWidget {
-  const _TaskTile({required this.task, required this.onStop});
+  const _TaskTile({required this.task, required this.onStop, this.onOpen});
 
   final TaskRow task;
   final VoidCallback onStop;
+
+  /// Shows the steps of the subagent the task runs; null for any other.
+  final VoidCallback? onOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -110,7 +126,14 @@ class _TaskTile extends StatelessWidget {
             ? null
             : theme.textTheme.bodySmall?.copyWith(color: colors.warning),
       ),
-      trailing: TextButton(onPressed: onStop, child: const Text('Stop')),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (onOpen case final open?)
+            TextButton(onPressed: open, child: const Text('Open')),
+          TextButton(onPressed: onStop, child: const Text('Stop')),
+        ],
+      ),
     );
   }
 }

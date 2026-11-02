@@ -94,6 +94,14 @@ class TimelineViewState extends State<TimelineView> {
       oldWidget.search.removeListener(_searchChanged);
       widget.search.addListener(_searchChanged);
     }
+    // Shown again (a subagent's page over it went): the hub heard the
+    // other page's following last.
+    if (oldWidget.send != widget.send) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        widget.send(GuiIntentFollowingChanged(following: _following));
+      });
+    }
   }
 
   @override
@@ -332,6 +340,7 @@ class TimelineViewState extends State<TimelineView> {
                           rowKey: row.key,
                           slots: _slots,
                           child: RowTile(
+                            sessionId: widget.sessionId,
                             row: row,
                             send: widget.send,
                             selected: row.key == selectedKey,

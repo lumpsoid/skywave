@@ -2165,4 +2165,187 @@ void main() {
       expect(find.textContaining(warning), findsOneWidget);
     });
   });
+
+  group('subagent', () {
+    ToolFacts agentFacts(String? opens) => ToolFacts(
+      kind: ToolKindView.subagent,
+      name: 'Agent',
+      title: 'Explore sync',
+      state: ToolState.running,
+      stateLabel: 'Async agent launched · 0.1s',
+      opens: opens,
+      status: opens == null ? null : 'running · 3 steps · Write src/sync.rs',
+    );
+
+    testWidgets('a subagent row shows how it stands; Open sends '
+        'ViewSubagent; another call has no Open', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(),
+        timeline: holding([
+          anyRow('s:1', RowKind.tool, '', tool: agentFacts('call-1')),
+          anyRow('s:2', RowKind.tool, '', tool: shellFacts('ls')),
+        ]),
+        sent: sent,
+      );
+      expect(
+        find.text('running · 3 steps · Write src/sync.rs'),
+        findsOneWidget,
+      );
+      // The status stands in for the launch's own label.
+      expect(find.text('Async agent launched · 0.1s'), findsNothing);
+      expect(find.text('exit 0 · 0.4s'), findsOneWidget);
+      expect(find.widgetWithText(TextButton, 'Open'), findsOneWidget);
+      sent.clear();
+      await tester.tap(find.widgetWithText(TextButton, 'Open'));
+      await tester.pump();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentViewSubagent(sessionId: 's1', call: 'call-1'),
+        ),
+      ]);
+    });
+
+    testWidgets('its approval says which subagent asks', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: const ApprovalPanel(
+            approvalId: 'a1',
+            from: 'from subagent: Explore sync · open it to see the call',
+            kind: ToolKindView.fileWrite,
+            tool: 'Write',
+            title: 'src/sync.rs',
+            canAnswer: true,
+            suggestions: [],
+            alwaysPicks: false,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('Approval needed'), findsOneWidget);
+      expect(
+        find.text('from subagent: Explore sync · open it to see the call'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the main agent\'s approval names no subagent', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: const ApprovalPanel(
+            approvalId: 'a1',
+            kind: ToolKindView.shell,
+            tool: 'Bash',
+            title: 'ls',
+            canAnswer: true,
+            suggestions: [],
+            alwaysPicks: false,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('Approval needed'), findsOneWidget);
+      expect(find.textContaining('from subagent'), findsNothing);
+    });
+
+    testWidgets('a subagent\'s task opens from the background sheet', (
+      tester,
+    ) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          workLabel: '2 background tasks',
+          tasks: const [
+            TaskRow(
+              taskId: 't0',
+              depth: 0,
+              kindLabel: 'shell',
+              title: 'npm test',
+            ),
+            TaskRow(
+              taskId: 't1',
+              depth: 0,
+              kindLabel: 'subagent',
+              title: 'Explore sync',
+              call: 'call-1',
+            ),
+          ],
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Background work'));
+      await tester.pumpAndSettle();
+      expect(find.widgetWithText(TextButton, 'Stop'), findsNWidgets(2));
+      expect(find.widgetWithText(TextButton, 'Open'), findsOneWidget);
+      sent.clear();
+      await tester.tap(find.widgetWithText(TextButton, 'Open'));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentViewSubagent(sessionId: 's1', call: 'call-1'),
+        ),
+      ]);
+      expect(find.text('npm test'), findsNothing, reason: 'the sheet closed');
+    });
+
+    testWidgets('its view is headed by its title, where it is and how it '
+        'stands; Stop asks, then stops its task', (tester) async {
+      final sent = <GuiIntent>[];
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          subagent: subagentHeader('call-1', taskId: 't1'),
+          composer: const ComposerView(
+            text: '',
+            cursorUtf16: 0,
+            rev: 1,
+            toLabel: 'to the main agent',
+          ),
+        ),
+        timeline: holding([]),
+        sent: sent,
+      );
+      expect(find.text('Explore sync'), findsOneWidget);
+      expect(find.text('work'), findsOneWidget);
+      expect(find.text('/home/me/work'), findsNothing);
+      expect(
+        find.text('running · 3 steps · Write src/sync.rs'),
+        findsOneWidget,
+      );
+      expect(find.text('to the main agent'), findsOneWidget);
+
+      sent.clear();
+      await tester.tap(find.byTooltip('Stop this subagent'));
+      await tester.pumpAndSettle();
+      expect(find.text('Stop this subagent?'), findsOneWidget);
+      expect(sent, isEmpty);
+      await tester.tap(find.widgetWithText(FilledButton, 'Stop subagent'));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentStopTask(sessionId: 's1', taskId: 't1'),
+        ),
+      ]);
+    });
+
+    testWidgets('a subagent with no task to stop has no Stop', (tester) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(subagent: subagentHeader('call-1')),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('Explore sync'), findsOneWidget);
+      expect(find.byTooltip('Stop this subagent'), findsNothing);
+    });
+  });
 }
