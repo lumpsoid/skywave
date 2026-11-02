@@ -107,6 +107,12 @@ cargo build --release
 listen = "0.0.0.0:7443"
 roots = ["/home/me/code"]            # where sessions may run
 server_names = ["devbox.example.net"] # names in the server certificate
+
+[shell]                 # shell commands from devices; off by default
+enabled = true
+program = "/bin/sh"     # any POSIX sh
+# rc = "/home/me/.config/skywave/shellrc" # sourced before every command
+output_max = "64MiB"    # output kept per command; the rest is dropped
 ```
 
 ```sh
@@ -115,7 +121,19 @@ skywaved serve
 
 The first run creates the CA, the server certificate and the database.
 In a container, run it under an init (`docker run --init`, or `tini`):
-`skywaved` reaps its own agents but not the orphans reparented to PID 1.
+`skywaved` reaps its own agents but not the orphans reparented to PID 1
+(without one, every shell command that left a background child also waits
+out a 5 s grace before it is reported finished).
+
+> **Shell commands run as the daemon's user.** With `[shell] enabled`, any
+> paired device can run arbitrary commands on the server, and the `roots`
+> do not confine `cd`. That is no more than an agent in bypass mode can do,
+> but it is why the shell is off by default. Each command is a one-shot
+> `sh -c` with no terminal, so a prompt for a password fails rather than
+> waits. When the shell exits, everything still in its process group
+> (`cmd &` included) is killed; a process that escaped the group (`setsid`,
+> a daemonizing tool) keeps running and is not tracked. With `program` set
+> to bash, aliases from `rc` need `shopt -s expand_aliases` in it.
 
 ### 2. Pair a device
 
@@ -263,7 +281,7 @@ proxy, and adb helpers. `run.sh` without arguments prints how to use it.
 
 | Crate | Role |
 |-------|------|
-| `skywaved` | Server daemon: agent supervisor, event log, blob store, CA, mTLS HTTPS API, admin CLI |
+| `skywaved` | Server daemon: agent supervisor, shell runner, event log, blob store, CA, mTLS HTTPS API, admin CLI |
 | `skywave-core` | All client logic: local replica, outbox, sync engine, blob downloads, view state |
 | `skywave-tui` | Terminal head built on ratatui; renders the core's view state and nothing else |
 | `skywave-proto` | Versioned, agent-agnostic wire types |

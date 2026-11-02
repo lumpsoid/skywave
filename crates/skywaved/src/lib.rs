@@ -19,6 +19,7 @@ pub mod logging;
 pub mod pairing;
 mod process;
 pub mod server;
+pub mod shell;
 pub mod supervisor;
 
 use std::io::Read;

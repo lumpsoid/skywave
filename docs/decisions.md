@@ -652,3 +652,64 @@ counts and finish notifications; subagent token usage and cost, task output
 (`output_file`, `summary`); stopping tasks nested inside a subagent beyond
 what `stop_task` does; size caps on subagent transcripts (full sync for now;
 tool outputs are already blobbed); showing a subagent's thinking.
+
+## D35. Shell commands from devices: a one-shot runner beside the agent
+A device runs a command with the server's shell in a session's workdir
+(protocol v14, spec §4 and §5). The daemon's shell runner
+(`crates/skywaved/src/shell.rs`) runs it; `[shell] enabled` turns it on.
+**Security.** With `enabled`, any paired device can run arbitrary commands
+as the daemon's user, and the session roots (D14) do not confine `cd`. That
+is no wider than an agent in bypass mode, but it is explicit, so it is off by
+default.
+**One-shot, not a PTY.** Each run is `sh -c` with no terminal: output is
+collected, previewed and kept as a blob. A live terminal would make the UI
+wait on the network for every keystroke, the one thing this product avoids.
+Only the cwd carries over between runs (written by the wrapper's `pwd -P` to
+fd 3); `exit` or `exec` in the command skips it and the session keeps the
+cwd before. The command is never parsed: it goes to the shell verbatim.
+**Unconditional by default, an explicit toggle otherwise.** A run's `when`
+(`Always`, `OnSuccess` "if ok", `OnFailure` "if failed") is a field, never
+shell syntax, matched against the session's last status like `$?`: the
+newest finished run that was not skipped, from any device (`Exited 0` is
+success; a non-zero exit, a signal, `Stopped`, `Lost` and `NotStarted` are
+failures; no run yet is success). A run that does not match is `Skipped`
+and leaves the status alone. There is no implicit safety: a simple system
+whose rules the operator can picture beats a smart one. Two devices
+interleaving see each other's runs as "previous", as two people sharing one
+terminal would; a guaranteed chain is one command (`cd build && rm -rf
+out`). "Newest" is by finish, not request: a queued run stopped while an
+earlier one runs finishes first. **Rejected:** an implicit `after` chain the
+core fills in from the device's previous run (definitive, but unpredictable
+to the operator, and it needed cascading discards when a link failed).
+**At most once.** `ShellStarted` is logged before the spawn; on start the
+runner settles a started, unfinished run as `Lost` (a crash between the
+event and the spawn reads the same: never a second run), finishes one with
+a stop as `Stopped`, and queues the rest again. No cursor is persisted: the
+log's runs and head, read in one transaction, are the starting point. A
+spawn that fails after `ShellStarted` is `NotStarted { reason }` with
+`started_at` set, since a start was logged.
+**A run ends at the shell's exit, and takes its group with it.** Waiting for
+the output's EOF would hang on any `cmd &` that keeps the pipe. So the shell
+leads its own session (`setsid`: no controlling terminal, so `ssh`, `sudo`
+or `git` prompts that open `/dev/tty` fail instead of hanging the run), and
+when it exits (or a stop arrives) the runner SIGTERMs its group, SIGKILLs
+what is left after the grace (5 s), takes what the pipe already holds
+without waiting for EOF, and logs `ShellFinished`. Nothing in the group
+outlives the run. A process that left the group (`setsid`, a daemonizing
+tool) survives it and is not waited for: the run does not stall on it, and
+it is not killed. Shutdown kills every running group and logs nothing, so
+the next start settles them `Lost`, after a crash or a clean stop alike.
+**Settled even when disabled.** The runner always starts; disabled, it
+settles what an earlier enabled daemon left (`Lost`, `Stopped`, and
+`NotStarted { "shell disabled" }` for queued runs) and ends. Otherwise every
+device would show those runs queued or running forever.
+**Progress backs off.** `ShellOutput` is logged at 2 s, 5 s, 10 s and 30 s
+after the start, then every 60 s, and only when there is new output. Each
+one is kept in the log and copied to every device forever; a 2 s tick would
+be 1800 events an hour on exactly the links this product is for.
+**The agent never sees runs.** The supervisor ignores shell events, so a run
+neither reaches the agent nor disturbs its turn, and runs go on across
+`StopSession`, context changes and idle shutdowns. Agent-agnostic (D3): the
+CLI's own `bash_command` input is not used, and the runner is a sibling of
+the supervisor, not part of it.
+**Deferred:** per-run timeouts and a concurrency cap across sessions.
