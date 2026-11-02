@@ -730,6 +730,111 @@ exit. An `agent_id` not in the last live set counts as the turn's.
 **`perTaskStopAffordance`.** `initialize` carries
 `"perTaskStopAffordance": true`: see §4.4.
 
+**Sending a subagent a message:** see §3.12.
+
+### 3.12 Sending a message to a subagent [C]
+
+In the interactive TUI a user can open a background agent and type to it,
+and the main agent can message one with its `SendMessage` tool. This
+section records whether a stream-json consumer can do the same (probed
+2026-11-02 against 2.1.310; D33 is the decision taken from it). Fixtures:
+`subagent_message_ctl`, `subagent_message_ctl_done`, `subagent_message_ptu`,
+`subagent_message_relay`, `subagent_message_relay_midrun`, recorded with
+`tests/support/probe-subagent-message.py`. In each, a background subagent is
+told to reply with the code word it was sent while it worked, or NONE.
+
+**What was tried.**
+
+| way in | result |
+|--------|--------|
+| control request `{"subtype":"send_task_message","task_id":…,"message":…}` while the subagent runs (`subagent_message_ctl`) | error `Unsupported control request subtype: send_task_message`; the subagent answers NONE |
+| the same after the subagent finished (`subagent_message_ctl_done`) | the same error |
+| a `user` line with `parent_tool_use_id` set to the `Agent` call's id (`subagent_message_ptu`) | the **main** agent gets it and runs a turn; the subagent never sees it and answers NONE |
+| a main-turn message asking the main agent to `SendMessage` the subagent (`subagent_message_relay`, `subagent_message_relay_midrun`) | delivered: the subagent answers ZEBRA |
+
+So in `-p` mode the only way in is **the relay**: a user message that asks
+the main agent to forward the text with `SendMessage`.
+
+**The relay, step by step.**
+1. The adapter writes an ordinary user message, which starts a main turn,
+   e.g. `Use SendMessage to tell the background agent <task_id> exactly:
+   '<text>' Then reply SENT.` The `task_id` is the one from
+   `background_tasks_changed` / `task_started`.
+2. The main agent loads the tool (`ToolSearch` `select:SendMessage`, since it
+   is deferred) and calls `SendMessage {to: <task_id>, message, summary}`.
+   Its `tool_result` is JSON: `{"success":true,"message":"Message queued for
+   delivery to <id> at its next tool round. If it finishes first, it is
+   resumed with the message and notifies again, so wait for that
+   notification before resending.","pin":{…}}`. This acks the **queueing**,
+   not the delivery.
+3. Delivery has two forms:
+   - **Mid-run** (`subagent_message_relay_midrun`): the subagent reads the
+     message at its next tool round. Nothing on stdout shows it: no line of
+     the subagent's carries the text (searched for it); only the subagent's
+     later behaviour does.
+   - **After it finished** (`subagent_message_relay`): the subagent is
+     resumed. A new `task_started` comes with the **same** `task_id` and
+     `tool_use_id`, a **new** `run_id`, and `prompt` equal to the text,
+     with the task back in the level set. That line is the one definitive
+     delivery signal.
+4. The subagent sees the text as from the main agent ("the coordinator's
+   message"), not from a human. The model passed the text on verbatim in
+   every run; nothing guarantees it.
+
+**One `Agent` call, several runs.** A background subagent is resumed not
+only by a message: when one of its own background shells ends, it gets a
+fresh `task_started` (same `task_id` and `tool_use_id`, new `run_id`) whose
+`prompt` is a `<task-notification>` block, works, and sends another
+`task_notification` (`completed`). Each run ends with its own
+notification, and the main agent runs a turn after each. The level set
+drops and re-adds the task, so D31's fold needs nothing new.
+
+**Why `send_task_message` fails (reading the binary).** The CLI is a Bun
+binary with its minified JavaScript embedded; `strings -n 6
+~/.local/share/claude/versions/2.1.310` gives the source text. The
+minified names below hold for 2.1.310 only.
+- The print-mode loop (it logs as `[print.ts]`) sends each control request
+  whose subtype is in a handler table to that table's dispatcher:
+  `if (Ols(j.request)) { … mfr(ne, {...gu, replyNow}) … }`, with
+  `function mfr(e,o){ let n = Xe[e.subtype]; … }`.
+- The table maps `stop_task`, `background_tasks` and `get_task_output` to
+  real handlers, and `send_task_message` to a stub that only throws:
+  `zt = (e,o) => { throw new UW(`${xX}: send_task_message`) }`, with
+  `xX = "Unsupported control request subtype"`. That is the error above.
+- A side branch (`Ils`) treats `send_task_message` differently only when
+  the context's `resumeUntrackedAgent` is not `null` and the task is not
+  tracked. Every context in this build sets `resumeUntrackedAgent: null`,
+  and the branch only picks when the stub runs, not which.
+- The name also appears in a list of requests a cloud-hosted session takes
+  from clients, in the set of those only the session's owners may send,
+  and in the requests refused before a spare process is claimed. So it is
+  being plumbed for remote sessions; the local host has only the stub.
+- 2.1.280 has no `send_task_message` at all; 2.1.309 and 2.1.310 have the
+  same stub.
+
+**How the TUI and `SendMessage` deliver.** Both call the same two
+in-process functions; neither goes through a control request.
+- The REPL keeps `viewingAgentTaskId` while the user views an agent; a
+  submit then goes to `submitToAgent`. For a local agent task it appends
+  the text to the agent's own transcript as a human message (origin
+  `{kind:"human"}`); then, if the task is `running`, adds it to the task's
+  `pendingMessages` (read at the next tool round), and otherwise resumes the
+  agent in the background with the text as its prompt (`userInitiated`). If
+  it loses the race to resume, it queues instead, or shows "Failed to resume
+  agent: it is no longer running; message not delivered".
+- `SendMessage` takes the same two paths: queue for an `agent-live`
+  recipient, resume for an `agent-stopped` one, with the main agent as the
+  origin.
+
+So the relay delivers the way typing in the TUI does; only the origin
+differs, and it costs a main turn.
+
+**Re-check on every CLI bump.** Run `probe-subagent-message.py ctl_live
+<out>`. While the answer is still `Unsupported control request subtype:
+send_task_message`, the relay stays (D33). A success answer, with the
+subagent replying ZEBRA, means the request is implemented: record a fixture
+and revisit D33.
+
 ## 4. Interrupt
 
 Request **[C]**:
