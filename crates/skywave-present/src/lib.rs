@@ -18,6 +18,9 @@
 //! - [`utf16`]: code-point cursors and byte ranges as UTF-16 code units.
 //! - [`policy`]: clock-free controllers for draft saves, read marks,
 //!   alerts, prompt history, workdir completion and timeline search.
+//! - [`workdir`]: a session's workdir: diff line kinds, change marks and
+//!   counts, entry order and labels, and every empty or failed read's
+//!   wording.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -27,3 +30,4 @@ pub mod policy;
 pub mod sections;
 pub mod usage;
 pub mod utf16;
+pub mod workdir;
