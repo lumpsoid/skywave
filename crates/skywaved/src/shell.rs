@@ -95,6 +95,14 @@
 //! **Shutdown** ([`ShellHandle::shutdown`]) kills every running run's group
 //! and logs nothing, so the next start settles them `Lost`, as after a
 //! crash.
+//!
+//! **Failure.** An error while following the log (the database full or
+//! gone, say) stops the runner the same way: it kills every running run's
+//! group, logs nothing and ends with the error, which it logs.
+//! [`ShellHandle::failed`] then returns, and `serve` stops the daemon on it
+//! and exits non-zero: a daemon whose runner is gone would go on accepting
+//! `RunShell` for runs nothing starts and showing killed runs `Running`.
+//! The next start settles them from the log like any other.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -204,6 +212,8 @@ impl Progress {
 pub struct ShellHandle {
     stop: Option<oneshot::Sender<()>>,
     done: oneshot::Receiver<Result<()>>,
+    /// What the runner ended with, once [`ShellHandle::failed`] has seen it.
+    ended: Option<Result<()>>,
 }
 
 impl ShellHandle {
@@ -221,8 +231,30 @@ impl ShellHandle {
         self.done().await
     }
 
+    /// Returns once the runner has stopped on an error (or panicked); never
+    /// while it runs, nor after it ended cleanly as a disabled one does. Its
+    /// running runs' groups are killed by then, logging nothing, as at a
+    /// shutdown. [`ShellHandle::shutdown`] then returns the error. Cancel
+    /// safe.
+    pub async fn failed(&mut self) {
+        if self.ended.is_none() {
+            let result = Self::outcome(&mut self.done).await;
+            self.ended = Some(result);
+        }
+        if matches!(self.ended, Some(Ok(()))) {
+            std::future::pending::<()>().await;
+        }
+    }
+
     async fn done(&mut self) -> Result<()> {
-        match (&mut self.done).await {
+        match self.ended.take() {
+            Some(result) => result,
+            None => Self::outcome(&mut self.done).await,
+        }
+    }
+
+    async fn outcome(done: &mut oneshot::Receiver<Result<()>>) -> Result<()> {
+        match done.await {
             Ok(result) => result,
             Err(_) => Err(Error::Shell("shell runner thread panicked".into())),
         }
@@ -341,6 +373,7 @@ impl ShellRunner {
             Ok(Ok(())) => Ok(ShellHandle {
                 stop: Some(stop_tx),
                 done: done_rx,
+                ended: None,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::Shell("shell runner thread panicked".into())),
@@ -372,7 +405,18 @@ impl ShellRunner {
         Ok(())
     }
 
-    async fn run(mut self, mut stop: oneshot::Receiver<()>) -> Result<()> {
+    /// Follows the log until `stop` or an error, then kills every running
+    /// run's group, as a shutdown does, and returns the error, if any.
+    async fn run(mut self, stop: oneshot::Receiver<()>) -> Result<()> {
+        let result = self.serve(stop).await;
+        for running in self.running.values() {
+            running.control.send_replace(Control::Cancel);
+        }
+        while self.tasks.join_next().await.is_some() {}
+        result
+    }
+
+    async fn serve(&mut self, mut stop: oneshot::Receiver<()>) -> Result<()> {
         let sessions: Vec<SessionId> = self.queues.keys().copied().collect();
         for session in sessions {
             self.pump(session)?;
@@ -391,16 +435,11 @@ impl ShellRunner {
                 _ = head.changed() => Wake::Log,
             };
             match wake {
-                Wake::Stop => break,
+                Wake::Stop => return Ok(()),
                 Wake::Log => {}
                 Wake::Report(report) => self.on_report(report)?,
             }
         }
-        for running in self.running.values() {
-            running.control.send_replace(Control::Cancel);
-        }
-        while self.tasks.join_next().await.is_some() {}
-        Ok(())
     }
 
     /// Handles one batch of log events after the cursor.

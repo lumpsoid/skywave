@@ -330,6 +330,28 @@ impl Fixture {
         }
         run
     }
+
+    /// Makes every append of an `event_type` event fail as a full disk would, for
+    /// every connection to the database, until [`Fixture::disk_has_room`].
+    fn disk_full_for(&self, event_type: &str) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER disk_full BEFORE INSERT ON events
+                 WHEN json_extract(NEW.kind, '$.type') = '{event_type}'
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;"
+            ))
+            .unwrap();
+    }
+
+    fn disk_has_room(&self) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch("DROP TRIGGER disk_full;")
+            .unwrap();
+    }
 }
 
 impl Drop for Fixture {
@@ -1218,5 +1240,108 @@ async fn shutdown_kills_runs_and_logs_nothing() {
     let finished = f.finished(run).await;
     assert_eq!(finished.end, ShellEnd::Lost);
     assert_eq!(finished.started_at, Some(f.started_at(run)));
+    runner.shutdown().await.unwrap();
+}
+
+// --- failure ------------------------------------------------------------
+
+#[tokio::test]
+async fn a_runner_error_kills_its_runs_and_surfaces() {
+    let mut f = Fixture::new();
+    let mut runner = f
+        .start_with(ShellConfig {
+            progress: Progress {
+                marks: vec![],
+                every: Duration::from_millis(10),
+            },
+            ..f.config()
+        })
+        .await;
+    f.disk_full_for("shell_output");
+    let gate = f.fifo("gate");
+    let pid = f.fifo("pid");
+    let run = f.run(&format!(
+        "echo $$ > '{}'; echo out; cat '{}'",
+        pid.display(),
+        gate.display()
+    ));
+    let pgid: i32 = read_fifo(&pid).await.trim().parse().unwrap();
+    // The first progress report cannot be logged: the runner stops on it.
+    tokio::time::timeout(WAIT, runner.failed())
+        .await
+        .expect("the runner's failure surfaces");
+    assert!(group_gone(pgid), "the run's group was killed");
+    assert!(f.has_started(run));
+    assert_eq!(f.end(run), None, "a failed runner logs nothing more");
+    let error = runner.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("disk is full"), "{error}");
+
+    // The next start settles the run from the log.
+    f.disk_has_room();
+    let runner = f.start().await;
+    assert_eq!(f.finished(run).await.end, ShellEnd::Lost);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_runner_that_ends_cleanly_never_reports_a_failure() {
+    let f = Fixture::new();
+    let mut runner = f
+        .start_with(ShellConfig {
+            enabled: false,
+            ..f.config()
+        })
+        .await;
+    // A disabled runner ends at once; `failed` must still not return.
+    let failed = tokio::time::timeout(Duration::from_millis(200), runner.failed()).await;
+    assert!(failed.is_err(), "a clean end is no failure");
+    runner.shutdown().await.unwrap();
+}
+
+/// The daemon stops, non-zero and with the error logged, when its shell
+/// runner fails, instead of accepting runs nothing would start.
+#[tokio::test]
+async fn the_daemon_stops_when_its_shell_runner_fails() {
+    let mut f = Fixture::new();
+    // Queued for the daemon's runner, whose `ShellStarted` cannot be logged.
+    let run = f.run("echo never");
+    f.disk_full_for("shell_started");
+    let log_file = f.dir().join("skywaved.log");
+    let config = f.dir().join("skywaved.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n\
+             [shell]\nenabled = true\n",
+            f.data, f.root, log_file
+        ),
+    )
+    .unwrap();
+    let daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_skywaved"))
+        .arg("--config")
+        .arg(&config)
+        .arg("serve")
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(WAIT, daemon)
+        .await
+        .expect("the daemon stops on its own")
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("disk is full"), "{stderr}");
+    let logged = std::fs::read_to_string(&log_file).unwrap();
+    assert!(logged.contains("listening"), "{logged}");
+    assert!(logged.contains("shell runner failed"), "{logged}");
+    // The daemon's process had a log of its own: take up where it ended.
+    f.log = EventLog::open(&f.storage.db, vec![f.root.clone()])
+        .unwrap()
+        .with_shell(true);
+    assert!(!f.has_started(run));
+
+    // Kept queued, not lost: the next start runs it.
+    f.disk_has_room();
+    let runner = f.start().await;
+    assert_eq!(f.finished(run).await.end, exited(0));
     runner.shutdown().await.unwrap();
 }

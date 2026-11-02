@@ -169,7 +169,7 @@ async fn serve(
     .await?;
     // Always started: disabled, it still settles runs an enabled daemon
     // left, then ends.
-    let shell =
+    let mut shell =
         ShellRunner::start(config.data_dir.clone(), log.clone(), config.shell.clone()).await?;
     let server = Server::bind(config.listen, &storage.dir, Arc::new(identity), log).await?;
     tracing::info!(
@@ -177,7 +177,16 @@ async fn serve(
         protocol_version = skywave_proto::PROTOCOL_VERSION,
         "listening"
     );
-    let served = server.serve(shutdown_signal()).await;
+    // A failed shell runner stops the daemon: running on without it would
+    // accept runs nothing starts. Its error is what `shutdown` returns, so
+    // the daemon exits non-zero; the next start settles its runs `Lost`.
+    let stop = async {
+        tokio::select! {
+            () = shutdown_signal() => {}
+            () = shell.failed() => tracing::error!("shell runner failed; stopping the daemon"),
+        }
+    };
+    let served = server.serve(stop).await;
     let shell_stopped = shell.shutdown().await;
     supervisor.shutdown().await?;
     shell_stopped?;
