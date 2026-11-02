@@ -349,9 +349,10 @@ class ComposerState extends State<Composer> {
   }
 }
 
-/// Over the field in shell mode: the cwd prompt, the condition chip (it
-/// steps always → if ok → if failed, and resets after each run sent) and
-/// the stop, off while there is nothing to stop.
+/// Over the field in shell mode: the prompt in the hub's order (the cwd,
+/// the condition chip, the sigil: `work [if ok ✓] $`; the chip steps
+/// always → if ok → if failed, and resets after each run sent) and the
+/// stop, off while there is nothing to stop.
 class _ShellBar extends StatelessWidget {
   const _ShellBar({
     required this.composer,
@@ -366,35 +367,41 @@ class _ShellBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final when = composer.whenLabel;
+    final prompt = composer.prompt;
+    final mono = theme.textTheme.labelLarge?.copyWith(
+      fontFamily: monoFamily,
+      fontFamilyFallback: monoFallback,
+    );
     return Padding(
       padding: const EdgeInsets.only(left: 12, bottom: 4),
       child: Row(
         children: [
-          if (composer.promptLabel case final prompt?)
+          if (prompt?.cwd case final cwd?) ...[
             Flexible(
               child: Text(
-                prompt,
-                key: const Key('shell-prompt'),
+                cwd,
+                key: const Key('shell-cwd'),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelLarge?.copyWith(
-                  fontFamily: monoFamily,
-                  fontFamilyFallback: monoFallback,
-                ),
+                style: mono,
               ),
             ),
-          const SizedBox(width: 8),
+            const SizedBox(width: 8),
+          ],
           ActionChip(
             key: const Key('shell-condition'),
             tooltip:
                 'When it runs: always, if the last run succeeded, or '
                 'if it failed',
             avatar: const Icon(Icons.rule, size: 16),
-            label: Text(when ?? 'always'),
+            label: Text(prompt?.whenLabel ?? 'always'),
             onPressed: onCondition,
             visualDensity: VisualDensity.compact,
           ),
+          if (prompt != null) ...[
+            const SizedBox(width: 8),
+            Text(prompt.sigil, key: const Key('shell-sigil'), style: mono),
+          ],
           const Spacer(),
           IconButton(
             key: const Key('shell-stop'),

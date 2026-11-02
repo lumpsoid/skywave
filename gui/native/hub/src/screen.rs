@@ -383,8 +383,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             to_label: None,
             mode: ComposerModeView::Agent,
             shell_enabled: false,
-            prompt_label: None,
-            when_label: None,
+            prompt: None,
             can_stop: false,
         }),
         // The composer's kind only: saved prompts in agent mode, saved

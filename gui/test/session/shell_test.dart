@@ -20,8 +20,9 @@ ComposerView shellComposer({
   rev: rev,
   mode: mode,
   shellEnabled: shellEnabled,
-  promptLabel: mode == ComposerModeView.shell ? r'work $' : null,
-  whenLabel: whenLabel,
+  prompt: mode == ComposerModeView.shell
+      ? ShellPromptView(cwd: 'work', whenLabel: whenLabel, sigil: r'$')
+      : null,
   canStop: canStop,
 );
 
@@ -147,8 +148,19 @@ void main() {
     expect(find.text('cargo test'), findsOneWidget);
     expect(find.text('running 3 tests'), findsOneWidget);
     expect(find.text('queued 2s'), findsOneWidget);
-    expect(find.byKey(const Key('shell-prompt')), findsOneWidget);
-    expect(find.text(r'work $'), findsOneWidget);
+    // The prompt reads cwd, condition, sigil, left to right.
+    final cwd = tester.getTopLeft(find.byKey(const Key('shell-cwd')));
+    final chip = tester.getTopLeft(find.byKey(const Key('shell-condition')));
+    final sigil = tester.getTopLeft(find.byKey(const Key('shell-sigil')));
+    expect(
+      tester.widget<Text>(find.byKey(const Key('shell-cwd'))).data,
+      'work',
+    );
+    expect(
+      tester.widget<Text>(find.byKey(const Key('shell-sigil'))).data,
+      r'$',
+    );
+    expect(cwd.dx < chip.dx && chip.dx < sigil.dx, isTrue);
 
     // Each run's own stop names it.
     await tester.tap(find.byTooltip('Stop this run').last);

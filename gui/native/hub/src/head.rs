@@ -131,8 +131,7 @@ impl Composer {
                 // published.
                 mode: ComposerModeView::Agent,
                 shell_enabled: false,
-                prompt_label: None,
-                when_label: None,
+                prompt: None,
                 can_stop: false,
             },
             text,
@@ -1168,8 +1167,7 @@ impl Head {
                     ComposerMode::Shell => ComposerModeView::Shell,
                 },
                 shell_enabled: open.is_some_and(|v| v.shell.enabled),
-                prompt_label: shell.map(shell::prompt_label),
-                when_label: shell.and_then(|_| shell::when_label(s.when)),
+                prompt: shell.map(|view| shell::prompt(view, s.when)),
                 can_stop: shell.and_then(shell_stop).is_some(),
                 ..s.composer.shown.clone()
             }
