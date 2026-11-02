@@ -12,7 +12,8 @@ use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision,
     DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolResult,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
+    ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
@@ -39,6 +40,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Fixture {
+        Fixture::created(None)
+    }
+
+    /// A fixture whose session adopts the outside agent conversation `id`.
+    fn adopting(id: &str) -> Fixture {
+        Fixture::created(Some(id.into()))
+    }
+
+    /// A fixture with one session, adopting `conversation` if any.
+    fn created(conversation: Option<String>) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let workdir = root.join("project");
@@ -58,6 +69,7 @@ impl Fixture {
             DeviceId::new(),
             CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
+                conversation,
             },
         ));
         f.session_id = f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0].session_id;
@@ -279,6 +291,7 @@ impl Fixture {
             DeviceId::new(),
             CommandKind::CreateSession {
                 workdir: workdir.to_str().unwrap().to_owned(),
+                conversation: None,
             },
         ));
         self.log
@@ -2584,7 +2597,7 @@ async fn a_context_moved_mid_turn_is_stopped_and_forked_by_its_new_session() {
         matches!(
             &kinds[..],
             [
-                (EventKind::SessionCreated { from: Some(from), .. }, _),
+                (EventKind::SessionCreated { from: Some(SessionOrigin::Context(from)), .. }, _),
                 (EventKind::UserMessage { .. }, _),
                 (EventKind::SessionStateChanged(SessionState::AgentWorking), _),
                 (EventKind::AgentMessage { text }, _),
@@ -2840,4 +2853,129 @@ async fn grants_never_cross_sessions() {
     );
     assert_eq!(grants_of(&f, first), Some(granted));
     assert_eq!(grants_of(&f, second), None);
+}
+
+// ---------------------------------------------------------------------------
+// Adopted sessions: the first context forks the outside conversation
+
+/// Waits until the fake has recorded a shutdown for the session.
+async fn wait_shutdown(agent: &FakeAgent, f: &Fixture, n: usize) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while agent
+        .inputs(f.session_id)
+        .iter()
+        .filter(|i| **i == FakeInput::Shutdown)
+        .count()
+        < n
+    {
+        assert!(tokio::time::Instant::now() < deadline, "not shut down");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn adopt(id: &str) -> FakeConversation {
+    FakeConversation::Adopt(id.into())
+}
+
+#[tokio::test]
+async fn an_adopted_session_adopts_for_its_first_message_and_resumes_after() {
+    let mut f = Fixture::adopting("ext-1");
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("the reply", 1, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [started_as(a, adopt("ext-1")), message("one")]
+    );
+    // The copy is the context's own conversation.
+    assert_eq!(handle_of(&f, a), Some(FakeAgent::resume_handle(a)));
+
+    // Once it has a handle, a restart resumes the copy, not the outside
+    // conversation again.
+    accepted(f.stop());
+    wait_shutdown(&agent, &f, 1).await;
+    f.send("two");
+    f.wait_count("the second reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [
+            started_as(a, adopt("ext-1")),
+            started_as(a, FakeConversation::Resume),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_session_started_for_a_setting_adopts_again_for_its_message() {
+    let mut f = Fixture::adopting("ext-1");
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+
+    // A setting request starts the agent with no message; the idle agent is
+    // stopped at once, before its copy has a handle.
+    f.set_mode(PermissionMode::Plan);
+    wait_shutdown(&agent, &f, 1).await;
+    assert_eq!(handle_of(&f, a), None, "no handle before a message");
+
+    f.send("one");
+    f.wait_count("the reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        starts(&agent, &f),
+        [started_as(a, adopt("ext-1")), started_as(a, adopt("ext-1"))]
+    );
+    assert_eq!(handle_of(&f, a), Some(FakeAgent::resume_handle(a)));
+}
+
+#[tokio::test]
+async fn an_adoption_the_agent_cannot_make_errors_each_message() {
+    let mut f = Fixture::adopting("ext-unknown");
+    let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    let kinds = f.wait_count("errored", 1, is_errored).await;
+    assert_eq!(
+        kinds.last(),
+        Some(&state(SessionState::Errored {
+            message: "cannot resume agent session: ext-unknown names no outside conversation"
+                .into()
+        }))
+    );
+    assert_eq!(handle_of(&f, f.first()), None);
+
+    // The session stays; the next message tries again and fails again.
+    f.send("two");
+    f.wait_count("errored again", 2, is_errored).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(starts(&agent, &f), [], "no start, adopted or fresh");
+    assert_eq!(handle_of(&f, f.first()), None);
+}
+
+#[tokio::test]
+async fn a_context_moved_out_of_an_adopted_session_forks_its_copy() {
+    let mut f = Fixture::adopting("ext-1");
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("the reply", 1, is_idle).await;
+    f.clear(ContextId::new());
+    let (_, new) = move_context(&mut f, a);
+    let forked = ContextId::first_of(new);
+    send_in(&mut f, new, "in new");
+    wait_idle_in(&f, new, 1).await;
+    supervisor.shutdown().await.unwrap();
+
+    assert_eq!(starts(&agent, &f), [started_as(a, adopt("ext-1"))]);
+    assert_eq!(
+        starts_in(&agent, new),
+        [started_as(forked, FakeConversation::Fork(a))]
+    );
 }

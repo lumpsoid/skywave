@@ -18,12 +18,15 @@
 //! with `--resume`. A context forked from another's conversation resumes the
 //! parent with `--fork-session` under a new UUID: the CLI runs the fork as
 //! that id, reported like a fresh context's; one stopped before any message
-//! reports none, so its next start forks again. Rules granted for the
-//! Skywave session that the CLI keeps only in its process are the session's
-//! [`Grants`](super::Grants) `{"rules": [...]}`, reported apart from the
-//! handle and passed to every later process of the session, fresh or
-//! resumed, as flags
-//! ([`rules::cli_args`]), so they survive a restart and a new context.
+//! reports none, so its next start forks again. A conversation the user had in
+//! the CLI outside Skywave is adopted the same way, as a fork of the CLI's
+//! session id (so the outside transcript is never written); an id that is not
+//! a UUID is a resume error before any process is spawned. Rules granted for
+//! the Skywave session that the CLI keeps only in its process are the
+//! session's [`Grants`](super::Grants) `{"rules": [...]}`, reported apart from
+//! the handle and passed to every later process of the session, fresh or
+//! resumed, as flags ([`rules::cli_args`]), so they survive a restart and a
+//! new context.
 //!
 //! [`AgentAdapter::start`] returns after the CLI answers the initialize
 //! handshake; a CLI that fails before that is a start error, or a resume
@@ -259,8 +262,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &self,
         spec: StartSpec,
     ) -> Result<(ClaudeCodeSession, AdapterEvents), AgentError> {
-        // A fork gets a new id as a fresh start does: its first turn reports
-        // it, and a fork stopped before any message forks again.
+        // A fork (or an adoption) gets a new id as a fresh start does: its
+        // first turn reports it, and one stopped before any message forks
+        // again.
         let session = match &spec.conversation {
             Conversation::Fresh => CliSession::New(Uuid::new_v4()),
             Conversation::Resume(handle) => CliSession::Resume(
@@ -268,6 +272,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
             ),
             Conversation::Fork(parent) => CliSession::Fork {
                 parent: protocol::parse_resume_handle(parent).map_err(AgentError::Resume)?,
+                id: Uuid::new_v4(),
+            },
+            // `parse_str` also accepts the simple, braced and urn forms; the
+            // argv writes the parent hyphenated (the transcript's file
+            // name), so all of them work.
+            Conversation::Adopt(id) => CliSession::Fork {
+                parent: Uuid::parse_str(id).map_err(|_| {
+                    AgentError::Resume(format!("not a Claude Code session id: {id}"))
+                })?,
                 id: Uuid::new_v4(),
             },
         };

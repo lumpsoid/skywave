@@ -144,6 +144,13 @@ first line of its first message until you name it: `r` on the session list
 (or `R` on the timeline) renames it on every device, and an empty name brings
 the default title back.
 
+`c` on the session list continues a Claude Code conversation you started
+outside Skywave: enter the directory `claude` ran in (under your `roots`),
+then paste the session id. The GUI's New session dialog has the same as an
+optional field. The session shows none of the earlier history, but the agent
+has it; Skywave works on a copy (a fork), so the terminal's session is
+untouched and the two diverge.
+
 `a` on the session list archives the selected session on every device, and
 `A` switches between the active and the archived sessions (`a` there brings
 one back). An archived session keeps running, opens and works as usual, and
@@ -232,7 +239,7 @@ Admin commands work on the database directly, so `serve` can keep running.
    `skywave://pair` links is not supported yet.
 
 4. **Answer an approval.** Tap **New session**, enter a folder under one of
-   your `roots` and tap **Create**; open the session and send a message.
+   your `roots` and tap **Create** (to continue a Claude Code session started outside Skywave, paste its id in the optional field first); open the session and send a message.
    When the agent asks, the session shows an **Approval needed** panel with
    what it wants to do: tap **Approve** or **Deny**, or **Always allow**.
    Answers given offline are queued and go out when the phone is back

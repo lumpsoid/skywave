@@ -1082,10 +1082,12 @@ fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
                     EventKind::SessionCreated {
                         workdir: "/srv/a".into(),
                         context_name: "start".into(),
-                        from: Some(skywave_proto::ContextRef {
-                            session: sid,
-                            context: start,
-                        }),
+                        from: Some(skywave_proto::SessionOrigin::Context(
+                            skywave_proto::ContextRef {
+                                session: sid,
+                                context: start,
+                            },
+                        )),
                     },
                 )
             },

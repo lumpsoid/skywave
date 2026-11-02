@@ -12,8 +12,11 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// closes the candidate list or else the prompt. Every one is an intent;
 /// what it does is Rust's. A tap on a candidate takes it.
 ///
-/// The field is the user's; it takes Rust's input only when `input_rev`
-/// changes (a completion filled it in).
+/// The workdir field is the user's; it takes Rust's input only when
+/// `input_rev` changes (a completion filled it in). A second, optional
+/// field takes the id of a Claude Code conversation started outside
+/// Skywave, to continue it; it is wholly Dart's, only its edits are sent,
+/// and Enter in it creates the session like Enter in the workdir field.
 class CreateDialog extends StatefulWidget {
   const CreateDialog({required this.prompt, required this.send, super.key});
 
@@ -89,6 +92,20 @@ class _CreateDialogState extends State<CreateDialog> {
         const GuiIntentCompletionAccept(),
       LogicalKeyboardKey.escape when event is KeyDownEvent =>
         const GuiIntentCompletionCancel(),
+      _ => null,
+    };
+    if (intent == null) return KeyEventResult.ignored;
+    _send(intent);
+    return KeyEventResult.handled;
+  }
+
+  /// Enter and Esc in the id field, as in the workdir field.
+  KeyEventResult _idKey(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final intent = switch (event.logicalKey) {
+      LogicalKeyboardKey.enter ||
+      LogicalKeyboardKey.numpadEnter => const GuiIntentCompletionAccept(),
+      LogicalKeyboardKey.escape => const GuiIntentCompletionCancel(),
       _ => null,
     };
     if (intent == null) return KeyEventResult.ignored;
@@ -179,6 +196,23 @@ class _CreateDialogState extends State<CreateDialog> {
                   ),
                 ),
               ],
+              const SizedBox(height: 16),
+              Focus(
+                onKeyEvent: _idKey,
+                child: TextField(
+                  key: const Key('create-conversation'),
+                  autocorrect: false,
+                  style: const TextStyle(fontFamily: 'monospace'),
+                  decoration: const InputDecoration(
+                    labelText: 'Continue a Claude Code session (paste its id)',
+                    hintText: 'leave empty for a new conversation',
+                  ),
+                  onChanged: (text) => _send(
+                    GuiIntentCreateConversationTyped(conversation: text),
+                  ),
+                  onSubmitted: (_) => _send(const GuiIntentCompletionAccept()),
+                ),
+              ),
             ],
           ),
         ),

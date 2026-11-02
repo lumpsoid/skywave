@@ -478,11 +478,13 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     let mut h = Harness::paired();
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/a".into(),
         })
         .unwrap();
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/b".into(),
         })
         .unwrap();
@@ -505,6 +507,7 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     // Another snapshot in the same wait does not restart the countdown.
     h.core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/c".into(),
         })
         .unwrap();
@@ -997,6 +1000,7 @@ fn create_session_goes_from_queued_to_the_real_row() {
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/new".into()
         })
     );
@@ -1086,7 +1090,7 @@ fn esc_cancels_the_new_session_prompt() {
     assert!(h.app.ui().prompt.is_none());
     assert!(h.drain_requests().is_empty());
     assert!(h.seam.pending_outbox().unwrap().is_empty());
-    assert_contains(&h.screen(), "n new session");
+    assert_contains(&h.screen(), "n new");
     // Out of the prompt, `q` quits again.
     h.key(KeyCode::Char('q'));
     assert!(h.app.ui().quit);
@@ -1154,9 +1158,80 @@ fn tab_fills_in_the_only_directory() {
     assert_eq!(
         h.key(KeyCode::Enter),
         Some(Action::CreateSession {
+            conversation: None,
             workdir: "/srv/api/".into()
         })
     );
+}
+
+#[test]
+fn continuing_an_outside_conversation_asks_the_workdir_then_the_id() {
+    let mut h = Harness::paired();
+    assert_eq!(h.key(KeyCode::Char('c')), None);
+    assert!(h.app.typing());
+    assert_contains(
+        &h.screen(),
+        "Continue an outside conversation · workdir on the server",
+    );
+    let hint = h.screen();
+    assert_contains(&hint, "Enter next: the id");
+    assert!(!hint.contains("Enter create"), "{hint}");
+    h.type_text("/srv/a");
+    // Positive control: step one completes like the create prompt.
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/a".into()
+        })
+    );
+    let (req, _) = list_dirs_request(&h);
+    answer_listing(&mut h, req, "/srv", &["api"]);
+    assert_eq!(workdir_input(&h), "/srv/api/");
+
+    // Enter moves to the id; nothing is dispatched and the prompt stays.
+    assert!(!matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession { .. })
+    ));
+    assert!(h.app.ui().prompt.is_some());
+    assert_eq!(workdir_input(&h), "");
+    assert_contains(&h.screen(), "agent session id (paste it)");
+
+    // Tab is not completion here; the text is untouched.
+    h.type_text("ab");
+    assert_eq!(h.key(KeyCode::Tab), None);
+    assert_eq!(workdir_input(&h), "ab");
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Backspace);
+
+    // A pasted id, with its trailing newline, is the whole input.
+    h.app.on_paste(" 0b6c1a2e-1111-4222-8333-444455556666\n");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            workdir: "/srv/api/".into(),
+            conversation: Some("0b6c1a2e-1111-4222-8333-444455556666".into()),
+        })
+    );
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    assert!(!h.app.typing());
+}
+
+#[test]
+fn escape_at_the_id_step_cancels_without_creating() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('c'));
+    h.type_text("/srv/x");
+    h.key(KeyCode::Enter);
+    h.type_text("some-id");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().prompt.is_none());
+    assert!(!h.app.typing());
+    assert!(!h.screen().contains("Continue an outside conversation"));
+    // The session list takes keys again, and nothing was queued.
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert_contains(&h.screen(), "New session");
 }
 
 #[test]
@@ -1853,7 +1928,7 @@ fn context_dividers_show_where_the_context_changed() {
 
 #[test]
 fn a_moved_context_is_a_divider_in_both_sessions() {
-    use skywave_proto::{ContextId, ContextRef};
+    use skywave_proto::{ContextId, ContextRef, SessionOrigin};
     let (mut h, id, me) = open_session();
     let (walrus, new) = (ContextId::new(), SessionId::new());
     // As the server logs moving the current context: the clear, then the
@@ -1878,10 +1953,10 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
                 EventKind::SessionCreated {
                     workdir: "/srv/work".into(),
                     context_name: "start".into(),
-                    from: Some(ContextRef {
+                    from: Some(SessionOrigin::Context(ContextRef {
                         session: id,
                         context: ContextId::first_of(id),
-                    }),
+                    })),
                 },
             ),
             event(
@@ -1909,6 +1984,32 @@ fn a_moved_context_is_a_divider_in_both_sessions() {
     h.key(KeyCode::Up);
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
     assert_contains(&h.screen(), "── Continues start from “work” ──");
+}
+
+#[test]
+fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
+    use skywave_proto::SessionOrigin;
+    let mut h = Harness::paired();
+    let new = SessionId::new();
+    pull(
+        &mut h,
+        vec![event(
+            new,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/work".into(),
+                context_name: "start".into(),
+                from: Some(SessionOrigin::Agent {
+                    conversation: "3f2a-91bc".into(),
+                }),
+            },
+        )],
+    );
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
+    assert_contains(
+        &h.screen(),
+        "Continues agent conversation 3f2a-91bc from outside Skywave",
+    );
 }
 
 /// A session whose first context ("start") holds "alpha question" and
@@ -2086,7 +2187,7 @@ fn moving_a_context_the_core_does_not_offer_says_why_and_sends_nothing() {
 
 #[test]
 fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
-    use skywave_proto::{ContextId, ContextRef};
+    use skywave_proto::{ContextId, ContextRef, SessionOrigin};
     let (mut h, id, me) = movable_context();
     let new = SessionId::new();
     pull(
@@ -2098,10 +2199,10 @@ fn a_moved_context_shows_where_it_went_and_enter_opens_that_session() {
                 EventKind::SessionCreated {
                     workdir: "/srv/work".into(),
                     context_name: "start".into(),
-                    from: Some(ContextRef {
+                    from: Some(SessionOrigin::Context(ContextRef {
                         session: id,
                         context: ContextId::first_of(id),
-                    }),
+                    })),
                 },
             ),
             event(

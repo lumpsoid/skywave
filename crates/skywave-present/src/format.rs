@@ -195,6 +195,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ContextMoved => "that context was moved to a session of its own",
         RejectReason::ContextCurrent => "that context is the current one",
         RejectReason::NoConversation => "the agent never ran in that context",
+        RejectReason::BadConversation => "not an agent conversation id",
         RejectReason::UnknownTask => "that background task already ended",
     }
 }
@@ -576,6 +577,14 @@ pub fn context_moved_line(name: &str, to: &SessionRef, by: &DeviceRef) -> String
 /// from “fix the flaky test”`.
 pub fn moved_from_line(name: &str, from: &SessionRef) -> String {
     format!("Continues {name} from {}", session_word(from))
+}
+
+/// An adopted session's first item: `Continues agent conversation 3f2a from
+/// outside Skywave; its earlier history is not shown here`.
+pub fn adopted_line(conversation: &str) -> String {
+    format!(
+        "Continues agent conversation {conversation} from outside Skywave; its earlier history is not shown here"
+    )
 }
 
 /// What a picker adds to a moved context's row: `moved → “fix the flaky
@@ -1008,6 +1017,10 @@ mod tests {
             moved_from_line("velvet walrus", &unknown),
             "Continues velvet walrus from another session"
         );
+        assert_eq!(
+            adopted_line("3f2a"),
+            "Continues agent conversation 3f2a from outside Skywave; its earlier history is not shown here"
+        );
 
         let mut view = SessionView {
             id: sid,
@@ -1044,6 +1057,14 @@ mod tests {
         assert_eq!(
             viewing_hint(&view).as_deref(),
             Some("Viewing start — messages go to velvet walrus")
+        );
+    }
+
+    #[test]
+    fn a_bad_conversation_id_is_named() {
+        assert_eq!(
+            reject_reason(RejectReason::BadConversation),
+            "not an agent conversation id"
         );
     }
 }

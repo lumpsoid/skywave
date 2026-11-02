@@ -1365,6 +1365,7 @@ fn withdraw_only_never_attempted_or_refused() {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
             workdir: "/etc".into(),
+            conversation: None,
         },
     };
     let interrupt = Command {
