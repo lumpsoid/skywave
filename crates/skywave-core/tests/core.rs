@@ -355,6 +355,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
     assert_eq!(
         *timeline,
         vec![TimelineItem::Logged {
+            parent: None,
             seq: Seq(2),
             at: event(sid, 1, EventKind::TurnInterrupted).at,
             context: ContextId::first_of(sid),

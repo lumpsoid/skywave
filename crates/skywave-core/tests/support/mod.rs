@@ -718,11 +718,13 @@ pub fn shared_timeline(timeline: &[TimelineItem]) -> Vec<TimelineItem> {
                 seq,
                 at,
                 context,
+                parent,
                 entry,
             } => TimelineItem::Logged {
                 seq,
                 at,
                 context,
+                parent,
                 entry: match entry {
                     Entry::UserMessage {
                         command_id,

@@ -825,6 +825,7 @@ mod tests {
 
     fn session(timeline: Vec<TimelineItem>) -> SessionView {
         SessionView {
+            subagent: None,
             id: SessionId::new(),
             title: "x".into(),
             named: false,
@@ -856,6 +857,7 @@ mod tests {
 
     fn agent(seq: u64, minute: u32, text: &str) -> TimelineItem {
         TimelineItem::Logged {
+            parent: None,
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, minute, 0).unwrap(),
             context: ContextId::new(),
@@ -876,6 +878,7 @@ mod tests {
 
     fn logged_message(seq: u64, id: CommandId, text: &str) -> TimelineItem {
         TimelineItem::Logged {
+            parent: None,
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap(),
             context: ContextId::new(),
@@ -1023,6 +1026,7 @@ mod tests {
     #[test]
     fn a_setting_change_is_a_note_and_a_refusal_a_warning() {
         let logged = |seq, setting, by, refused: Option<&str>| TimelineItem::Logged {
+            parent: None,
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
             context: ContextId::new(),

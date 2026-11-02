@@ -116,6 +116,7 @@ pub(crate) mod tests {
             .max()
             .unwrap_or(Seq(0));
         SessionView {
+            subagent: None,
             id: SessionId::new(),
             title: "x".into(),
             named: false,
@@ -147,6 +148,7 @@ pub(crate) mod tests {
 
     pub fn logged(seq: u64, entry: Entry) -> TimelineItem {
         TimelineItem::Logged {
+            parent: None,
             seq: Seq(seq),
             at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             context: ContextId::new(),

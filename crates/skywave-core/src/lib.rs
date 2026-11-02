@@ -73,6 +73,7 @@ pub use view::{
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
     PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason, RuleScope,
     RuleSuggestion, Schedule, ScheduleId, Screen, Seq, SessionId, SessionListView, SessionRef,
-    SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet, SnippetId, TaskId,
-    TaskKind, TimelineItem, ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, ViewState,
+    SessionRow, SessionState, SessionView, SettingChange, SettingsView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
+    ToolOutcome, ToolView, TurnUsage, ViewState,
 };

@@ -446,7 +446,8 @@ pub struct SessionView {
     pub state: SessionState,
     /// Log order; this device's messages not yet in the log come last.
     /// While [`viewing`](Self::viewing) a context, only that context's
-    /// items, with no context dividers.
+    /// items, with no context dividers. Only the items of the agent shown:
+    /// the main one, or the [`subagent`](Self::subagent).
     pub timeline: Vec<TimelineItem>,
     /// The contexts a picker offers, in log order: each one with a message
     /// (logged, or this device's on its way) and the current one, this
@@ -457,8 +458,14 @@ pub struct SessionView {
     /// or the one this device's clear or switch on its way makes current.
     pub context: ContextId,
     /// The context [`Action::ViewContext`](crate::Action::ViewContext)
-    /// narrowed the timeline to; `None` shows the whole session.
+    /// narrowed the timeline to; `None` shows the whole session. A
+    /// [`subagent`](Self::subagent) shown wins over it.
     pub viewing: Option<ContextId>,
+    /// The subagent [`Action::ViewSubagent`](crate::Action::ViewSubagent)
+    /// shows: the timeline holds only that subagent's own items (no
+    /// context dividers, none of this device's messages). `None` shows the
+    /// main agent's timeline, without any subagent's items.
+    pub subagent: Option<SubagentHeader>,
     /// [`Action::ClearContext`](crate::Action::ClearContext) is worth
     /// offering: the current context has a message, logged or on its way.
     pub can_clear: bool,
@@ -716,6 +723,10 @@ pub enum TimelineItem {
         /// The context the event belongs to; a context divider has the
         /// context it makes current.
         context: ContextId,
+        /// The subagent's `Agent` call the item belongs to; `None` for the
+        /// main agent's. An approval or a result standalone takes its
+        /// call's.
+        parent: Option<CallId>,
         entry: Entry,
     },
     /// A message from this device that is not in the log yet.
@@ -895,7 +906,47 @@ pub struct ToolView {
     pub input: Option<BlobView>,
     /// The approval that gated the call, if it needed one.
     pub approval: Option<ToolApproval>,
+    /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
+    /// says how its launch went (a background one is `Done` once launched);
+    /// heads show [`subagent`](Self::subagent) instead.
     pub outcome: ToolOutcome,
+    /// What the subagent a [`ToolKind::Subagent`] call runs is doing;
+    /// `None` for any other call.
+    pub subagent: Option<SubagentStatus>,
+}
+
+/// How the subagent an `Agent` call runs stands, from its own items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentStatus {
+    /// The background task that runs it while that task is listed in
+    /// [`SessionView::work`]; `None` for a foreground subagent, and once
+    /// the task left.
+    pub task: Option<TaskId>,
+    /// Still working: its task is listed, or (with no task) its call is
+    /// still running.
+    pub live: bool,
+    /// The tool calls it made.
+    pub steps: u32,
+    /// What it did last: its newest tool call's title, or its newest
+    /// message's first line, whichever came later.
+    pub last: Option<String>,
+}
+
+/// The subagent a [`SessionView`] shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentHeader {
+    /// Its `Agent` call.
+    pub call: CallId,
+    /// As the call's [`ToolView::title`].
+    pub title: String,
+    /// As the call's [`ToolView::detail`] (e.g. the kind of subagent).
+    pub detail: Option<String>,
+    /// What it was asked: the call's [`ToolView::body`].
+    pub prompt: Option<BodyView>,
+    pub status: SubagentStatus,
+    /// The subagents it runs under, outermost first, each `Agent` call with
+    /// its title; empty for one the main agent launched.
+    pub trail: Vec<(CallId, String)>,
 }
 
 /// A bounded preview of some content, with the whole of it as a blob.
@@ -944,7 +995,8 @@ pub enum ToolOutcome {
     Denied { by: DeviceRef },
     /// Its approval was cancelled before anyone answered.
     Cancelled { reason: String },
-    /// The turn ended without a result.
+    /// The server logged that it will never get a result
+    /// ([`EventKind::CallsUnanswered`](skywave_proto::EventKind::CallsUnanswered)).
     NoResult,
 }
 
@@ -970,6 +1022,10 @@ pub struct ApprovalPrompt {
     /// The tool call the approval gates, an [`Entry::Tool`] in the timeline;
     /// `None` for an approval with no logged call.
     pub call: Option<CallId>,
+    /// The title of the subagent whose call it gates; `None` for the main
+    /// agent's (or a call not logged). Its item shows only in that
+    /// subagent's view.
+    pub from: Option<String>,
     pub tool: String,
     pub summary: String,
     pub input: Option<BlobView>,
@@ -1013,6 +1069,7 @@ mod tests {
 
     fn logged(seq: u64, entry: Entry) -> TimelineItem {
         TimelineItem::Logged {
+            parent: None,
             seq: Seq(seq),
             at: DateTime::UNIX_EPOCH,
             context: ContextId::new(),
@@ -1051,6 +1108,7 @@ mod tests {
     #[test]
     fn prompts_are_newest_first_without_repeats() {
         let view = SessionView {
+            subagent: None,
             id: SessionId::new(),
             title: "x".into(),
             named: false,

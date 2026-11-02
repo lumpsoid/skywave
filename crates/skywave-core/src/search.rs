@@ -317,6 +317,7 @@ mod tests {
 
     fn logged(entry: Entry) -> TimelineItem {
         TimelineItem::Logged {
+            parent: None,
             seq: Seq(1),
             at: DateTime::UNIX_EPOCH,
             context: ContextId::first_of(crate::view::SessionId::new()),
@@ -326,6 +327,7 @@ mod tests {
 
     fn tool(outcome: ToolOutcome) -> ToolView {
         ToolView {
+            subagent: None,
             call: CallId::new(),
             name: "Bash".into(),
             kind: ToolKind::Shell,

@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
-    BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionOrigin, SessionState as LogState,
-    TaskId, ToolCall,
+    BackgroundTask, BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event,
+    EventBatch, EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionOrigin,
+    SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult,
 };
 
 use crate::action::{Action, Route};
@@ -35,8 +35,8 @@ use crate::view::{
     DeviceId, DeviceRef, Draft, Entry, ErrorInfo, FailReason, Link, LinkRejection, ListKind,
     ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
     PendingSession, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, Snippet, SnippetId, TimelineItem, ToolApproval,
-    ToolOutcome, ToolView, ViewState,
+    SessionView, SettingChange, SettingsView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -161,6 +161,10 @@ pub(crate) struct Model {
     /// The context [`Action::ViewContext`] narrowed the session on screen
     /// to; gone once another screen shows. In memory only.
     viewing: Option<(SessionId, ContextId)>,
+    /// The `Agent` call whose subagent [`Action::ViewSubagent`] shows in
+    /// the session on screen; gone once another screen shows. In memory
+    /// only: [`Action::Back`] reads where to step out to from the log.
+    subagent: Option<(SessionId, CallId)>,
     /// Pending approvals the user was alerted to, or that needed no alert
     /// (answered here), in this process or an earlier one: as stored, plus
     /// what [`Model::apply_batch`] and [`Model::set_link`] hand out to
@@ -213,6 +217,7 @@ impl Model {
             deleted: HashSet::new(),
             open: None,
             viewing: None,
+            subagent: None,
             alerted: HashSet::new(),
             alerts: 0,
             alerted_at: HashMap::new(),
@@ -454,6 +459,19 @@ impl Model {
                 }
                 Vec::new()
             }
+            Action::ViewSubagent { session_id, call } => {
+                if self.place != Place::Session(session_id) {
+                    return Vec::new();
+                }
+                match call {
+                    None => self.subagent = None,
+                    Some(call) if self.subagent_header(session_id, call).is_some() => {
+                        self.subagent = Some((session_id, call));
+                    }
+                    Some(_) => {}
+                }
+                Vec::new()
+            }
             Action::RenameSession { session_id, name } => {
                 if self.summary(session_id).is_none() {
                     return Vec::new();
@@ -515,6 +533,7 @@ impl Model {
                 self.place = Place::Session(id);
                 self.open = None;
                 self.viewing = None;
+                self.subagent = None;
                 self.completer.end();
                 vec![Effect::LoadSession(id)]
             }
@@ -560,14 +579,44 @@ impl Model {
                 self.place = route.into();
                 self.open = None;
                 self.viewing = None;
+                self.subagent = None;
                 self.completer.end();
                 Vec::new()
             }
-            Action::Back => match self.back() {
-                Some(route) => self.dispatch(Action::Navigate(route)),
-                None => Vec::new(),
-            },
+            Action::Back => {
+                // A subagent shown steps out to the one it runs under, then
+                // to the main timeline.
+                if let Some((session_id, call)) = self.shown_subagent() {
+                    self.subagent = self
+                        .subagent_header(session_id, call)
+                        .and_then(|header| header.trail.last().map(|(outer, _)| *outer))
+                        .map(|outer| (session_id, outer));
+                    return Vec::new();
+                }
+                match self.back() {
+                    Some(route) => self.dispatch(Action::Navigate(route)),
+                    None => Vec::new(),
+                }
+            }
         }
+    }
+
+    /// The subagent [`Action::ViewSubagent`] shows, if its session is on
+    /// screen.
+    fn shown_subagent(&self) -> Option<(SessionId, CallId)> {
+        self.subagent.filter(|(id, _)| {
+            self.device().is_some()
+                && self.place == Place::Session(*id)
+                && self.summary(*id).is_some()
+        })
+    }
+
+    /// The subagent `Agent` call `call` of the open session `id` runs, as
+    /// the timeline folds it; `None` for any other call.
+    fn subagent_header(&self, id: SessionId, call: CallId) -> Option<SubagentHeader> {
+        let open = self.open.as_ref().filter(|open| open.id == id)?;
+        let (items, _) = self.timeline(id, &open.events);
+        subagent_header(&items, call)
     }
 
     /// Where [`Action::Back`] goes from the screen shown; `None` where back
@@ -594,6 +643,7 @@ impl Model {
         }
         self.place = Place::Pairing;
         self.viewing = None;
+        self.subagent = None;
         let (address, code, fingerprint) = (
             address.trim().to_owned(),
             code.trim().to_owned(),
@@ -942,6 +992,7 @@ impl Model {
                     self.place = Place::Session(to);
                     self.open = None;
                     self.viewing = None;
+                    self.subagent = None;
                 }
             }
         }
@@ -1055,6 +1106,7 @@ impl Model {
             self.place = Place::Archived;
             self.open = None;
             self.viewing = None;
+            self.subagent = None;
         }
     }
 
@@ -1123,6 +1175,7 @@ impl Model {
         self.place = Place::SessionList;
         self.open = None;
         self.viewing = None;
+        self.subagent = None;
         self.link = Link::Connecting;
     }
 
@@ -1164,7 +1217,7 @@ impl Model {
             queued: self.outbox.iter().filter(|e| e.status.is_pending()).count(),
             attention: self.attention(),
             screen: self.screen(),
-            can_go_back: self.back().is_some(),
+            can_go_back: self.shown_subagent().is_some() || self.back().is_some(),
             snippets: self.snippets.list().to_vec(),
         }
     }
@@ -1293,6 +1346,7 @@ impl Model {
         let summary = self.summary(id)?;
         let open = self.open.as_ref().filter(|open| open.id == id);
         let events = open.map_or(&[][..], |open| open.events.as_slice());
+        let (mut timeline, rules) = self.timeline(id, events);
         let pending_approval = summary.pending_approval().and_then(|approval| {
             events.iter().find_map(|(_, event)| match &event.kind {
                 EventKind::ApprovalRequested {
@@ -1305,6 +1359,10 @@ impl Model {
                 } if *id == approval => Some(ApprovalPrompt {
                     id: *id,
                     call: *call,
+                    from: call
+                        .and_then(|call| tool_item(&timeline, call)?.0)
+                        .and_then(|outer| subagent_item(&timeline, outer))
+                        .map(|(_, view)| view.title.clone()),
                     tool: tool.clone(),
                     summary: summary.clone(),
                     input: input.as_ref().map(|b| self.blob_view(b)),
@@ -1335,8 +1393,29 @@ impl Model {
             .filter(|(session, _)| *session == id)
             .map(|(_, context)| context);
         let title = self.title(summary);
-        let (mut timeline, rules) = self.timeline(id, events);
-        if let Some(viewing) = viewing {
+        let subagent = self
+            .subagent
+            .filter(|(session, _)| *session == id)
+            .and_then(|(_, call)| subagent_header(&timeline, call));
+        // Folded whole first: results, approvals and unanswered calls
+        // settle earlier items by index.
+        if let Some(header) = &subagent {
+            // Shown whole, whatever context `viewing` narrows to.
+            timeline.retain(|item| {
+                matches!(item, TimelineItem::Logged { parent: Some(call), .. } if *call == header.call)
+            });
+        } else {
+            timeline.retain(|item| {
+                !matches!(
+                    item,
+                    TimelineItem::Logged {
+                        parent: Some(_),
+                        ..
+                    }
+                )
+            });
+        }
+        if let Some(viewing) = viewing.filter(|_| subagent.is_none()) {
             timeline.retain(|item| match item {
                 TimelineItem::Logged {
                     entry:
@@ -1374,6 +1453,7 @@ impl Model {
             contexts,
             context,
             viewing,
+            subagent,
             can_clear,
             clear,
             switch,
@@ -1785,6 +1865,16 @@ impl Model {
         let mut names: HashMap<ContextId, &str> = HashMap::new();
         let mut current = None;
         for (seq, event) in events {
+            // Whose item it is: a subagent's events name its call; a
+            // result or an approval standing alone goes with its call.
+            let parent = match &event.kind {
+                EventKind::AgentMessage { parent, .. }
+                | EventKind::ToolCall(ToolCall { parent, .. }) => *parent,
+                EventKind::ToolResult(ToolResult { call, .. })
+                | EventKind::ApprovalRequested { call, .. } => tools.parent(&items, *call),
+                _ => None,
+            };
+            tools.step(&event.kind);
             let entry = match &event.kind {
                 // The server logs every message with its command id, the
                 // entry's key; one without would have none to show under.
@@ -1813,7 +1903,6 @@ impl Model {
                     ..
                 }) if !tools.calls.contains_key(call) => {
                     tools.calls.insert(*call, (items.len(), event.at));
-                    tools.open.push(items.len());
                     Some(Entry::Tool(Box::new(ToolView {
                         call: *call,
                         name: name.clone(),
@@ -1829,6 +1918,7 @@ impl Model {
                         input: input.as_ref().map(|b| self.blob_view(b)),
                         approval: None,
                         outcome: ToolOutcome::Running { since: event.at },
+                        subagent: None,
                     })))
                 }
                 // No call id (v1), or one already taken.
@@ -1937,17 +2027,15 @@ impl Model {
                     archived: *archived,
                     by: self.device_ref(*by),
                 }),
-                EventKind::SessionStateChanged(state) => {
-                    // Every state change ends a turn or starts the next.
-                    tools.end_turn(&mut items);
-                    match state {
-                        LogState::Errored { message } => Some(Entry::AgentErrored {
-                            message: message.clone(),
-                        }),
-                        // Shown in the header.
-                        LogState::Idle | LogState::AgentWorking => None,
-                    }
-                }
+                // Calls a turn leaves open stay running until the server
+                // logs them unanswered.
+                EventKind::SessionStateChanged(state) => match state {
+                    LogState::Errored { message } => Some(Entry::AgentErrored {
+                        message: message.clone(),
+                    }),
+                    // Shown in the header.
+                    LogState::Idle | LogState::AgentWorking => None,
+                },
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
                 // Folded into the session summary; nothing in the timeline.
                 EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
@@ -2069,10 +2157,15 @@ impl Model {
                     seq: *seq,
                     at: event.at,
                     context: event.context,
+                    parent,
                     entry,
                 });
             }
         }
+        let tasks = self
+            .summary(id)
+            .map_or(&[][..], |s| s.work.tasks.as_slice());
+        tools.subagents(&mut items, tasks);
 
         // This device's answers, on the items of the approvals they answer:
         // one that came too late stays in sight once its prompt is gone.
@@ -2189,8 +2282,8 @@ struct ToolIndex {
     /// Each approval's item: its call's [`Entry::Tool`] or its own
     /// [`Entry::Approval`].
     approvals: HashMap<ApprovalId, usize>,
-    /// Items of the calls made since the last turn boundary.
-    open: Vec<usize>,
+    /// What each subagent did, by its `Agent` call.
+    steps: HashMap<CallId, Steps>,
     /// The rules each approval offers.
     offered: HashMap<ApprovalId, Vec<RuleSuggestion>>,
     /// The rules granted so far, in log order.
@@ -2278,17 +2371,112 @@ impl ToolIndex {
         }
     }
 
-    /// The turn ended or the next one started: calls still running never
-    /// got a result.
-    fn end_turn(&mut self, items: &mut [TimelineItem]) {
-        for item in self.open.drain(..) {
-            if let Some(view) = tool_at(items, item)
-                && matches!(view.outcome, ToolOutcome::Running { .. })
-            {
-                view.outcome = ToolOutcome::NoResult;
-            }
+    /// The subagent the linked call `call` belongs to, `None` for the main
+    /// agent's or a call not linked.
+    fn parent(&self, items: &[TimelineItem], call: Option<CallId>) -> Option<CallId> {
+        let &(item, _) = self.calls.get(&call?)?;
+        match items.get(item)? {
+            TimelineItem::Logged { parent, .. } => *parent,
+            TimelineItem::Pending { .. } => None,
         }
     }
+
+    /// Notes a subagent's tool call or message as what it did last.
+    fn step(&mut self, kind: &EventKind) {
+        match kind {
+            EventKind::ToolCall(ToolCall {
+                parent: Some(parent),
+                display,
+                ..
+            }) => {
+                let steps = self.steps.entry(*parent).or_default();
+                steps.count += 1;
+                steps.last = Some(display.title.clone());
+            }
+            EventKind::AgentMessage {
+                parent: Some(parent),
+                text,
+            } => {
+                if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    self.steps.entry(*parent).or_default().last = Some(line.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Each subagent call takes its status: its steps, and whether it is
+    /// still at work, by one of `tasks` running it or else (a foreground
+    /// one) by its call still running.
+    fn subagents(&self, items: &mut [TimelineItem], tasks: &[BackgroundTask]) {
+        for (call, &(item, _)) in &self.calls {
+            let Some(view) = tool_at(items, item).filter(|v| v.kind == ToolKind::Subagent) else {
+                continue;
+            };
+            let task = tasks
+                .iter()
+                .find(|t| t.call == Some(*call))
+                .map(|t| t.id.clone());
+            let steps = self.steps.get(call);
+            view.subagent = Some(SubagentStatus {
+                live: task.is_some() || matches!(view.outcome, ToolOutcome::Running { .. }),
+                task,
+                steps: steps.map_or(0, |s| s.count),
+                last: steps.and_then(|s| s.last.clone()),
+            });
+        }
+    }
+}
+
+/// What a subagent did so far, while a timeline is built.
+#[derive(Default)]
+struct Steps {
+    /// Its tool calls.
+    count: u32,
+    /// Its newest tool call's title or message's first line.
+    last: Option<String>,
+}
+
+/// The item of the linked call `call` in a folded timeline: the subagent it
+/// belongs to and its view.
+fn tool_item(items: &[TimelineItem], call: CallId) -> Option<(Option<CallId>, &ToolView)> {
+    items.iter().find_map(|item| match item {
+        TimelineItem::Logged {
+            parent,
+            entry: Entry::Tool(view),
+            ..
+        } if view.call == call => Some((*parent, view.as_ref())),
+        _ => None,
+    })
+}
+
+/// As [`tool_item`], for a subagent's `Agent` call only.
+fn subagent_item(items: &[TimelineItem], call: CallId) -> Option<(Option<CallId>, &ToolView)> {
+    tool_item(items, call).filter(|(_, view)| view.kind == ToolKind::Subagent)
+}
+
+/// The subagent the `Agent` call `call` runs, from a folded timeline: its
+/// trail follows the calls it runs under while they are subagents' too.
+fn subagent_header(items: &[TimelineItem], call: CallId) -> Option<SubagentHeader> {
+    let (mut parent, view) = subagent_item(items, call)?;
+    let mut trail = Vec::new();
+    let mut seen = HashSet::from([call]);
+    while let Some(outer) = parent
+        && seen.insert(outer)
+        && let Some((up, outer_view)) = subagent_item(items, outer)
+    {
+        trail.push((outer, outer_view.title.clone()));
+        parent = up;
+    }
+    trail.reverse();
+    Some(SubagentHeader {
+        call,
+        title: view.title.clone(),
+        detail: view.detail.clone(),
+        prompt: view.body.clone(),
+        status: view.subagent.clone()?,
+        trail,
+    })
 }
 
 fn tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
@@ -2941,6 +3129,7 @@ mod tests {
         assert_eq!(
             view.pending_approval,
             Some(ApprovalPrompt {
+                from: None,
                 id: approval,
                 call: None,
                 tool: "bash".into(),
@@ -3014,6 +3203,7 @@ mod tests {
         assert_eq!(view.pending_approval, None);
         // The settled item keeps this device's refused answer in sight.
         assert!(view.timeline.contains(&TimelineItem::Logged {
+            parent: None,
             seq: Seq(3),
             at: f.events[2].at,
             context: skywave_proto::ContextId::first_of(sid),
@@ -5172,6 +5362,7 @@ mod tests {
             state: BlobState::NotDownloaded { size: b.size },
         };
         let waiting = ToolView {
+            subagent: None,
             call,
             name: "Write".into(),
             kind: ToolKind::FileWrite,
@@ -5386,10 +5577,10 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_ending_without_a_result_leaves_no_result() {
+    fn a_turn_ending_leaves_its_calls_running_until_logged_unanswered() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
-        let (a, b, c) = (CallId::new(), CallId::new(), CallId::new());
+        let (a, b) = (CallId::new(), CallId::new());
         f.log(
             sid,
             vec![
@@ -5397,21 +5588,32 @@ mod tests {
                 tool_call(Some(a), ToolKind::Shell, "sleep 1"),
                 EventKind::TurnInterrupted,
                 EventKind::SessionStateChanged(LogState::Idle),
-                // A later turn starting also ends what the last one left.
                 EventKind::SessionStateChanged(LogState::AgentWorking),
                 tool_call(Some(b), ToolKind::Fetch, "https://example.com"),
-                EventKind::SessionStateChanged(LogState::AgentWorking),
-                tool_call(Some(c), ToolKind::Subagent, "explore"),
+                EventKind::SessionStateChanged(LogState::Errored {
+                    message: "gone".into(),
+                }),
+                EventKind::SessionStateChanged(LogState::Idle),
             ],
         );
         f.open(sid);
-        let outcomes: Vec<ToolOutcome> = tools(&f).into_iter().map(|v| v.outcome).collect();
+        let outcomes =
+            |f: &Fixture| -> Vec<ToolOutcome> { tools(f).into_iter().map(|v| v.outcome).collect() };
+        // No state change settles a call: a background subagent's may
+        // still be at work.
         assert_eq!(
-            outcomes,
+            outcomes(&f),
+            vec![
+                ToolOutcome::Running { since: minute(2) },
+                ToolOutcome::Running { since: minute(6) },
+            ]
+        );
+        f.log(sid, vec![EventKind::CallsUnanswered { calls: vec![a] }]);
+        assert_eq!(
+            outcomes(&f),
             vec![
                 ToolOutcome::NoResult,
-                ToolOutcome::NoResult,
-                ToolOutcome::Running { since: minute(8) },
+                ToolOutcome::Running { since: minute(6) },
             ]
         );
     }
@@ -5421,8 +5623,6 @@ mod tests {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
         let (named, done, other) = (CallId::new(), CallId::new(), CallId::new());
-        // Logged before any later state change, so the turn-end rule has not
-        // settled the calls: only `CallsUnanswered` can.
         f.log(
             sid,
             vec![
@@ -7018,5 +7218,374 @@ mod tests {
         );
         let row = context_row(&f, start);
         assert_eq!((row.outgoing, row.discard_move), (None, None));
+    }
+
+    /// A tool call of the subagent `parent` runs.
+    fn sub_call(call: Option<CallId>, parent: CallId, kind: ToolKind, title: &str) -> EventKind {
+        match tool_call(call, kind, title) {
+            EventKind::ToolCall(c) => EventKind::ToolCall(ToolCall {
+                parent: Some(parent),
+                ..c
+            }),
+            _ => unreachable!("a tool call"),
+        }
+    }
+
+    fn sub_agent(parent: CallId, text: &str) -> EventKind {
+        EventKind::AgentMessage {
+            parent: Some(parent),
+            text: text.into(),
+        }
+    }
+
+    fn view_subagent(session_id: SessionId, call: Option<CallId>) -> Action {
+        Action::ViewSubagent { session_id, call }
+    }
+
+    /// The shown timeline's logged items, one word each: a tool call's
+    /// title, a message's text, a standalone result's summary.
+    fn shown_items(f: &Fixture) -> Vec<String> {
+        entries(f)
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Tool(view) => view.title,
+                Entry::AgentMessage { text } => text,
+                Entry::ToolResult { summary, .. } => format!("result {summary}"),
+                Entry::Approval { summary, .. } => format!("approval {summary}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Outer subagent `a` (the main agent's) runs inner `b`, which runs
+    /// shell call `c`, gated by approval `ap`; `m` is the main agent's own.
+    struct Nested {
+        sid: SessionId,
+        a: CallId,
+        b: CallId,
+        c: CallId,
+        m: CallId,
+        ap: ApprovalId,
+    }
+
+    fn nested(f: &mut Fixture) -> Nested {
+        let sid = f.session("/srv/a");
+        let (a, b, c, m, ap) = (
+            CallId::new(),
+            CallId::new(),
+            CallId::new(),
+            CallId::new(),
+            ApprovalId::new(),
+        );
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                agent("main says"),
+                tool_call(Some(a), ToolKind::Subagent, "outer"),
+                sub_call(Some(b), a, ToolKind::Subagent, "inner"),
+                sub_agent(a, "outer says"),
+                sub_call(Some(c), b, ToolKind::Shell, "ls"),
+                approval_requested(ap, Some(c)),
+                EventKind::ApprovalResolved {
+                    id: ap,
+                    decision: Decision::Approve,
+                    by: f.me,
+                    rule: None,
+                },
+                tool_result(Some(c), false, "listing"),
+                // A second result of a subagent's call stands alone, with it.
+                tool_result(Some(c), false, "again"),
+                tool_call(Some(m), ToolKind::Shell, "pwd"),
+            ],
+        );
+        f.open(sid);
+        Nested {
+            sid,
+            a,
+            b,
+            c,
+            m,
+            ap,
+        }
+    }
+
+    #[test]
+    fn each_agent_shows_only_its_own_items() {
+        let mut f = Fixture::paired();
+        let n = nested(&mut f);
+        let view = f.session_view();
+        assert_eq!(view.subagent, None);
+        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+
+        f.dispatch(view_subagent(n.sid, Some(n.a)));
+        assert_eq!(shown_items(&f), ["inner", "outer says"]);
+        let header = f.session_view().subagent.expect("outer shown");
+        assert_eq!((header.call, header.title.as_str()), (n.a, "outer"));
+        assert_eq!(header.trail, []);
+
+        f.dispatch(view_subagent(n.sid, Some(n.b)));
+        // The approval and both results go where their call is.
+        assert_eq!(shown_items(&f), ["ls", "result again"]);
+        let c = &tools(&f)[0];
+        assert_eq!(c.call, n.c);
+        assert_eq!(c.approval.as_ref().map(|a| a.id), Some(n.ap));
+        assert!(matches!(&c.outcome, ToolOutcome::Done { preview, .. } if preview == "listing"));
+        let header = f.session_view().subagent.expect("inner shown");
+        assert_eq!(header.trail, [(n.a, "outer".to_owned())]);
+
+        // Back to the main view.
+        f.dispatch(view_subagent(n.sid, None));
+        assert_eq!(f.session_view().subagent, None);
+        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+    }
+
+    #[test]
+    fn back_steps_out_through_the_subagents_to_the_session_list() {
+        let mut f = Fixture::paired();
+        let n = nested(&mut f);
+        f.dispatch(view_subagent(n.sid, Some(n.b)));
+        let shown = |f: &Fixture| f.session_view().subagent.map(|h| h.call);
+        assert_eq!(shown(&f), Some(n.b));
+        for to in [Some(n.a), None] {
+            assert!(f.model.view().can_go_back);
+            assert!(f.dispatch(Action::Back).is_empty());
+            assert_eq!(shown(&f), to);
+        }
+        assert!(f.model.view().can_go_back);
+        f.list_view_after_back();
+    }
+
+    #[test]
+    fn viewing_a_subagent_needs_its_call_in_the_open_session() {
+        let mut f = Fixture::paired();
+        let n = nested(&mut f);
+        let other = f.session("/srv/b");
+        let shown = |f: &Fixture| f.session_view().subagent.map(|h| h.call);
+        // Not a subagent's call, or not one logged.
+        for call in [n.m, n.c, CallId::new()] {
+            f.dispatch(view_subagent(n.sid, Some(call)));
+            assert_eq!(shown(&f), None);
+        }
+        // Another session than the one open.
+        f.dispatch(view_subagent(other, Some(n.a)));
+        assert_eq!(shown(&f), None);
+        // The control: the same call in the open session shows; an ignored
+        // action then leaves it shown.
+        f.dispatch(view_subagent(n.sid, Some(n.a)));
+        assert_eq!(shown(&f), Some(n.a));
+        f.dispatch(view_subagent(n.sid, Some(n.m)));
+        assert_eq!(shown(&f), Some(n.a));
+
+        // Opening the session again, or leaving it, shows the main view.
+        f.open(n.sid);
+        assert_eq!(shown(&f), None);
+        f.dispatch(view_subagent(n.sid, Some(n.a)));
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.open(n.sid);
+        assert_eq!(shown(&f), None);
+        assert_eq!(shown_items(&f), ["main says", "outer", "pwd"]);
+    }
+
+    #[test]
+    fn search_finds_only_the_shown_agents_items() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let a = CallId::new();
+        f.log(
+            sid,
+            vec![
+                agent("needle in main"),
+                tool_call(Some(a), ToolKind::Subagent, "explore"),
+                sub_agent(a, "needle in subagent"),
+            ],
+        );
+        f.open(sid);
+        let found = |f: &Fixture| -> Vec<String> {
+            let view = f.session_view();
+            let query = crate::search::Query::new("needle");
+            crate::search::find(&view.timeline, &query, &mut |_| None)
+                .hits
+                .into_iter()
+                .map(|hit| match &view.timeline[hit.index] {
+                    TimelineItem::Logged {
+                        entry: Entry::AgentMessage { text },
+                        ..
+                    } => text.clone(),
+                    other => panic!("hit {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(found(&f), ["needle in main"]);
+        f.dispatch(view_subagent(sid, Some(a)));
+        assert_eq!(found(&f), ["needle in subagent"]);
+    }
+
+    #[test]
+    fn a_subagents_messages_are_not_news_but_its_approvals_are() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (a, c) = (CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(a), ToolKind::Subagent, "explore"),
+                sub_agent(a, "looking"),
+                sub_agent(a, "found it"),
+            ],
+        );
+        assert_eq!(unread(&f, sid), 0);
+        // The control: the main agent's message counts.
+        f.log(sid, vec![agent("done")]);
+        assert_eq!(unread(&f, sid), 1);
+        f.log(
+            sid,
+            vec![
+                sub_call(Some(c), a, ToolKind::Shell, "ls"),
+                approval_requested(ApprovalId::new(), Some(c)),
+            ],
+        );
+        assert_eq!(unread(&f, sid), 2);
+        // Marking read recounts the same way.
+        f.open(sid);
+        let last = f.session_view().last_seq;
+        f.dispatch(mark_read(sid, last.0));
+        f.dispatch(Action::Back);
+        assert_eq!(unread(&f, sid), 0);
+        f.log(sid, vec![sub_agent(a, "more")]);
+        assert_eq!(unread(&f, sid), 0);
+    }
+
+    fn subagent_task(id: &str, call: CallId) -> skywave_proto::BackgroundTask {
+        skywave_proto::BackgroundTask {
+            call: Some(call),
+            kind: skywave_proto::TaskKind::Subagent,
+            ..work_task(id)
+        }
+    }
+
+    fn status_of(f: &Fixture, call: CallId) -> SubagentStatus {
+        f.session_view()
+            .timeline
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::Logged {
+                    entry: Entry::Tool(view),
+                    ..
+                } if view.call == call => view.subagent.clone(),
+                _ => None,
+            })
+            .expect("a subagent's call")
+    }
+
+    #[test]
+    fn a_subagents_status_counts_its_steps_and_follows_its_task() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (bg, fg, step, own) = (CallId::new(), CallId::new(), CallId::new(), CallId::new());
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(bg), ToolKind::Subagent, "background"),
+                tool_result(Some(bg), false, "Async agent launched"),
+                EventKind::BackgroundTasksChanged {
+                    tasks: vec![subagent_task("t1", bg)],
+                },
+                sub_call(Some(step), bg, ToolKind::Shell, "ls"),
+                sub_call(None, bg, ToolKind::Shell, "unlinked"),
+                sub_agent(bg, "\n  found it  \nand more"),
+                tool_call(Some(own), ToolKind::Shell, "pwd"),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        f.open(sid);
+        assert_eq!(
+            status_of(&f, bg),
+            SubagentStatus {
+                task: Some(TaskId("t1".into())),
+                live: true,
+                steps: 2,
+                last: Some("found it".into()),
+            }
+        );
+        // Its own outcome is how its launch went.
+        assert!(matches!(tools(&f)[0].outcome, ToolOutcome::Done { .. }));
+        assert_eq!(tools(&f)[1].subagent, None, "not a subagent's call");
+        // Its task leaving ends it.
+        f.log(
+            sid,
+            vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
+        );
+        assert_eq!(
+            status_of(&f, bg),
+            SubagentStatus {
+                task: None,
+                live: false,
+                steps: 2,
+                last: Some("found it".into()),
+            }
+        );
+
+        // A foreground one works while its call runs.
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(fg), ToolKind::Subagent, "foreground"),
+            ],
+        );
+        let idle = SubagentStatus {
+            task: None,
+            live: true,
+            steps: 0,
+            last: None,
+        };
+        assert_eq!(status_of(&f, fg), idle);
+        f.log(sid, vec![tool_result(Some(fg), false, "report")]);
+        assert_eq!(
+            status_of(&f, fg),
+            SubagentStatus {
+                live: false,
+                ..idle
+            }
+        );
+    }
+
+    #[test]
+    fn a_subagents_approval_names_it_and_shows_its_item_in_its_view() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (a, c, main) = (CallId::new(), CallId::new(), CallId::new());
+        let (sub_ap, main_ap) = (ApprovalId::new(), ApprovalId::new());
+        f.log(
+            sid,
+            vec![
+                tool_call(Some(a), ToolKind::Subagent, "explore"),
+                sub_call(Some(c), a, ToolKind::Shell, "rm -rf target"),
+                approval_requested(sub_ap, Some(c)),
+            ],
+        );
+        f.open(sid);
+        let prompt = f.session_view().pending_approval.expect("pending");
+        assert_eq!((prompt.id, prompt.call), (sub_ap, Some(c)));
+        assert_eq!(prompt.from.as_deref(), Some("explore"));
+        // The main view shows the prompt without its item; the subagent's
+        // view shows both.
+        assert!(tools(&f).iter().all(|v| v.call != c));
+        f.dispatch(view_subagent(sid, Some(a)));
+        assert_eq!(f.session_view().pending_approval, Some(prompt));
+        assert!(tools(&f).iter().any(|v| v.call == c));
+
+        f.log(
+            sid,
+            vec![
+                resolved(sub_ap),
+                tool_call(Some(main), ToolKind::Shell, "ls"),
+                approval_requested(main_ap, Some(main)),
+            ],
+        );
+        let prompt = f.session_view().pending_approval.expect("pending");
+        assert_eq!((prompt.id, prompt.from), (main_ap, None));
     }
 }
