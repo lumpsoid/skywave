@@ -82,6 +82,11 @@ cargo test --workspace
   `for` loops, shell variables, `$(...)` and paths outside the worktree. It
   accounted for 216 refused calls. Read with Read, search with Grep, and run
   any multi-step script from a file inside the worktree.
+- **Map Rust before reading it.** Your first call in a Rust module is
+  `rust_index <dir>` (the `rust-index` skill), before any grep or Read. It
+  lists every item and signature with line numbers in milliseconds. Don't
+  grep for definitions (`fn foo`, `enum Bar`); find them in the index, then
+  Read just those lines instead of paging with `sed -n` or offset reads.
 - **Keep scratch files in `$WORKTREE/.scratch/`** (it is git-ignored), not
   `/tmp`.
 - **Run one plain command per Bash call** from the worktree root. Don't `cd`
