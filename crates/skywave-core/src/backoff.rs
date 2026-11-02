@@ -20,7 +20,7 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// The spec's ceiling for any reconnect delay (§7).
+    /// The ceiling for any reconnect delay (architecture.md "Client core").
     pub const MAX: Duration = Duration::from_secs(30);
 
     /// The shortest wait a manual retry (`RetryNow`) may cut a delay down

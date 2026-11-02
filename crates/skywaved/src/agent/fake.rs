@@ -1,4 +1,4 @@
-//! A scripted agent for deterministic server and sync tests (spec §9).
+//! A scripted agent for deterministic server and sync tests (architecture.md "Testing").
 //!
 //! [`FakeAgent`] implements [`AgentAdapter`] without any process. Its
 //! [`FakeScript`] is a list of turns; each user message runs the next unused

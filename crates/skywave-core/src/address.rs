@@ -1,4 +1,4 @@
-//! The server address the user types or scans: `host:port` (spec §6).
+//! The server address the user types or scans: `host:port` (architecture.md "Pairing").
 
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};

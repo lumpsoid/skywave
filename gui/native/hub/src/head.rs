@@ -1153,7 +1153,7 @@ impl Head {
 
     /// The end of every step: what is due unforced, then what changed for
     /// Dart.
-    /// Expanding downloads what is not here yet (spec §8), including what
+    /// Expanding downloads what is not here yet, including what
     /// arrives while the item is open: an edit expanded from the approval
     /// panel before its result logged gets the result's output once it does.
     /// Each blob is asked for once per expansion.

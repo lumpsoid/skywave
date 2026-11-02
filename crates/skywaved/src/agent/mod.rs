@@ -1,4 +1,4 @@
-//! The seam between `skywaved` and a coding agent (spec §5, D3, D4).
+//! The seam between `skywaved` and a coding agent (architecture.md "Server", D3, D4).
 //!
 //! An [`AgentAdapter`] starts or resumes one [`AgentSession`] per Skywave
 //! session. The session takes the supervisor's requests (send a message,

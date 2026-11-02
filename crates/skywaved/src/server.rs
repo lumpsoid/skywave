@@ -1,5 +1,5 @@
-//! The HTTPS server (spec §4, §6): TLS with optional client certificates,
-//! HTTP/1.1, and the routes of [`crate::pairing`] and [`crate::api`].
+//! The HTTPS server (architecture.md "Protocol" and "Pairing"): TLS with
+//! optional client certificates, HTTP/1.1, and the routes of [`crate::pairing`] and [`crate::api`].
 //!
 //! TLS accepts a connection with no client certificate, or with one that
 //! chains to the server's CA (anything else fails the handshake). Only

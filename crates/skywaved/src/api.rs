@@ -1,4 +1,4 @@
-//! The authenticated part of the HTTPS API (spec §4): hello, commands,
+//! The authenticated part of the HTTPS API (architecture.md "Protocol"): hello, commands,
 //! events and blobs. `POST /v1/pair` lives in [`crate::pairing`]; the
 //! [`crate::server`] assembles both behind TLS.
 //!

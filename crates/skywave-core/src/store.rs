@@ -1,5 +1,5 @@
 //! The local replica: one SQLite database in the core's data directory
-//! (spec §7, D6).
+//! (architecture.md "Client core", D6).
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
 //! the pull cursor, blob rows, settings, the server's device names (from

@@ -1,5 +1,5 @@
 //! What heads render: immutable, fully owned per-screen snapshots
-//! (spec §7 ViewState, architecture.md "Render states").
+//! (architecture.md "Render states").
 //!
 //! Heads depend on `skywave-core` only, so every type a head needs is defined
 //! or re-exported here. Every value is owned, `Clone` and `Send`, so a
@@ -989,7 +989,7 @@ pub enum Entry {
         text: String,
     },
     /// One tool call with its approval and result folded in, placed at the
-    /// call's seq (spec §7 "Tool timeline").
+    /// call's seq.
     Tool(Box<ToolView>),
     /// A tool call no [`CallId`] links to anything (v1 logs); its result and
     /// approval, if any, are entries of their own.
@@ -1164,7 +1164,7 @@ pub struct ToolApproval {
     pub answer: Option<Answer>,
 }
 
-/// How a tool call stands (spec §7 "Tool timeline").
+/// How a tool call stands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolOutcome {
     /// No result yet, possibly waiting on its approval; `since` is the

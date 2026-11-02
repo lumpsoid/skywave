@@ -1,4 +1,4 @@
-//! Certificate fingerprints (D9, spec §6): what `skywaved pair` prints for
+//! Certificate fingerprints (D9, architecture.md "Pairing"): what `skywaved pair` prints for
 //! the CA, what a device pins, and the daemon's device registry key.
 
 use std::fmt;

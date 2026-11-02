@@ -270,7 +270,7 @@ impl EventLog {
     ///
     /// The event is stamped with `context`: the context of the agent
     /// process that produced it, or of the command the supervisor answers
-    /// with no process (spec §5). Nothing defaults to the current context.
+    /// with no process (architecture.md "Server"). Nothing defaults to the current context.
     pub fn append(
         &self,
         db: &mut Db,
@@ -502,7 +502,7 @@ impl EventLog {
     }
 
     /// Every approval still waiting for an answer, oldest first. On daemon
-    /// start the supervisor cancels each one (spec §5).
+    /// start the supervisor cancels each one (architecture.md "Server").
     pub fn pending_approvals(&self, db: &Db) -> Result<Vec<PendingApproval>> {
         let mut stmt = db.conn().prepare_cached(
             "SELECT id, session_id FROM approvals WHERE closed_seq IS NULL ORDER BY rowid",
@@ -555,7 +555,7 @@ impl EventLog {
     /// each was logged in, in log order (contexts by their first open call).
     /// A logged `ToolCall` is open until a `ToolResult` links to it or a
     /// `CallsUnanswered` names it, the mapper's definition of answered. On
-    /// daemon start the supervisor names them (spec §5).
+    /// daemon start the supervisor names them (architecture.md "Server").
     pub fn open_calls(&self, db: &Db, id: SessionId) -> Result<Vec<(ContextId, Vec<CallId>)>> {
         let mut stmt = db.conn().prepare_cached(
             "WITH answered (call) AS (

@@ -1,5 +1,5 @@
 //! The Claude Code adapter: drives the `claude` CLI in stream-json mode
-//! (docs/agents/claude-code.md, spec §5).
+//! (docs/agents/claude-code.md, architecture.md "Server").
 //!
 //! This module is the only place that names the agent (D3). One CLI process
 //! runs per agent session, in the session's workdir (D14), started as

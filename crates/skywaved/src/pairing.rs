@@ -1,4 +1,4 @@
-//! Pairing (spec §6, D9): `skywaved pair` issues a one-time code, and
+//! Pairing (architecture.md "Pairing", D9): `skywaved pair` issues a one-time code, and
 //! `POST /v1/pair` trades a valid code plus a CSR for a device certificate.
 //!
 //! **Codes** are 10 symbols of Crockford base32 (50 bits from the OS CSPRNG),
@@ -20,7 +20,7 @@
 //! 7 200 guesses a day against 2^50 codes.
 //!
 //! **HTTP** ([`router`]): the only route is `POST /v1/pair`; errors are bare
-//! status codes (spec §4): 400 malformed request or CSR, 401 wrong, used or
+//! status codes (architecture.md "Protocol"): 400 malformed request or CSR, 401 wrong, used or
 //! expired code, 429 rate limited with `Retry-After`, 500 server fault.
 
 use std::collections::VecDeque;
@@ -45,7 +45,7 @@ use crate::devices;
 use crate::error::{Error, Result};
 use crate::identity::ServerIdentity;
 
-/// `skywaved pair` default code lifetime (spec §5).
+/// `skywaved pair` default code lifetime (architecture.md "Pairing").
 pub const DEFAULT_TTL: Duration = Duration::minutes(10);
 /// Longest lifetime `--ttl` accepts.
 pub const MAX_TTL: Duration = Duration::hours(24);
@@ -196,7 +196,7 @@ pub fn pair_address(listen: SocketAddr, hostname: Option<&str>, extra: &[String]
 }
 
 /// `skywave://pair?addr=<host:port>&code=<code>&fp=<sha256 hex>`: what the
-/// pairing QR code encodes (spec §6). `code` is canonical (no `-`), `fp` is
+/// pairing QR code encodes (architecture.md "Pairing"). `code` is canonical (no `-`), `fp` is
 /// 64 lowercase hex digits, values are percent-encoded (RFC 3986).
 pub fn pair_uri(addr: &str, code: &PairCode, ca_fingerprint: Fingerprint) -> String {
     format!(

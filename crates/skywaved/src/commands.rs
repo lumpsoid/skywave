@@ -1,4 +1,4 @@
-//! Command handling (spec §5): dedup, validation and append in one
+//! Command handling (architecture.md "Server"): dedup, validation and append in one
 //! transaction, so a [`CommandId`] has exactly one outcome however often it
 //! is resent (D7).
 //!

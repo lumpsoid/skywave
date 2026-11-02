@@ -1,4 +1,4 @@
-//! TLS client configurations (spec §6, D9): mTLS with the pinned CA for a
+//! TLS client configurations (architecture.md "Pairing", D9): mTLS with the pinned CA for a
 //! paired device, and the fingerprint-pinned anonymous config for pairing.
 //! Both use the ring provider, like the server.
 
@@ -103,7 +103,7 @@ pub(crate) fn pairing_config(
 }
 
 /// Trust on first use, anchored by the fingerprint: the server sends its
-/// certificate followed by the CA (spec §6). The last certificate of the
+/// certificate followed by the CA (architecture.md "Pairing"). The last certificate of the
 /// chain must have the expected fingerprint; it then becomes the only
 /// trust anchor for an ordinary WebPKI check of the leaf — signature,
 /// validity period and the server name the user typed.

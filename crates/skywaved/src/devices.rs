@@ -1,4 +1,4 @@
-//! The device registry (`devices` table, spec §6): who may connect.
+//! The device registry (`devices` table, architecture.md "Pairing"): who may connect.
 //!
 //! Pairing inserts a device; every connection looks its certificate up by
 //! fingerprint and refuses revoked devices. Admin commands (`devices list`,

@@ -1,4 +1,4 @@
-//! The sync engine (spec §7, D7): the single consumer of the core's
+//! The sync engine (architecture.md "Client core", D7): the single consumer of the core's
 //! [`Request`]s, and the loops that keep the replica in step with the
 //! server.
 //!
