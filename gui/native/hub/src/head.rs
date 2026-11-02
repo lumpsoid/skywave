@@ -629,6 +629,12 @@ impl Head {
                     self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
+            GuiIntent::CreateConversationTyped { conversation } => {
+                if let Some(create) = &mut self.create {
+                    create.conversation =
+                        conversation.chars().filter(|c| !c.is_control()).collect();
+                }
+            }
             GuiIntent::CompletionComplete => {
                 let candidates = self.candidates();
                 let Some(create) = &mut self.create else {
@@ -665,7 +671,7 @@ impl Head {
                     // Blank or unacceptable paths are refused by the core
                     // or the server, not here.
                     let action = Action::CreateSession {
-                        conversation: None,
+                        conversation: Some(create.conversation.clone()),
                         workdir: create.input.clone(),
                     };
                     let tag = self.dispatch_user(action, Purpose::Create, clock, out);
