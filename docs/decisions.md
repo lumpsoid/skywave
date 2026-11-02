@@ -447,3 +447,58 @@ own, true because both heads render a per-task stop.
   refused stop silently; `TaskStopRefused` has no timeline entry);
 - GUI sheet polish: the Stop button is not disabled while a stop is pending,
   and the contexts dialog's confirm uses the warning as of when it opened.
+
+## D32. Adopting an outside agent conversation
+`CreateSession { workdir, conversation: Some(id) }` creates a session that
+continues a conversation the agent had outside Skywave, in `workdir`. The
+server logs one `SessionCreated { workdir, from: Some(Agent { conversation
+}) }` (named by the command, settled at its own `Accepted { seq }`) and
+stores the id as the first context's `adopted`. On that context's first
+start the supervisor passes `Conversation::Adopt(id)`; the Claude adapter
+forks it (`--resume <id> --fork-session --session-id <new>`), so the
+outside transcript is never written. Precedence at a start: the context's
+own handle (`Resume`), else origin (`Fork`), else adopted (`Adopt`), else
+`Fresh`. The own handle stays first, or every restart would re-fork and
+lose Skywave's turns; until the copy reports a handle (its first message)
+every start adopts again under a new id.
+**Why fork, not resume** (confirmed by the user 2026-11-02): a terminal
+`claude` may still be running the session, two CLI writers on one
+transcript is untested, and nothing tells skywaved whether it is alive. A
+fork keeps every stored handle one skywaved minted and reuses the move
+path. The cost: the terminal and Skywave diverge, and handing back needs the
+fork's id, which nothing shows yet. The fork reads the outside conversation
+as saved at fork time.
+**Why no existence check:** the log's transaction is synchronous, the
+EventLog has no adapter, and the transcript is the CLI's internal storage.
+The agent settles it at first start: an unknown id errors each message
+(`Errored`) and leaves the session in place for the user to archive. The
+server checks only the shape (`BadConversation`: blank, over 128 chars,
+whitespace or control characters) and never cuts or rewrites the id. Core
+does not check it either: `dispatch` has no failure channel and the GUI
+closes its dialog on any accepted dispatch, so a silent drop would lose the
+input; a refused id is a failed, discardable pending creation.
+**Rejected:** adopt by resume (a nicer hand-back, but concurrent writers and
+a server-written, adapter-shaped handle breaking D3: only the adapter knows
+a handle's shape); a new `AdoptSession` command (extending `CreateSession`
+fits instead: D30 rejected `CreateSession { workdir, from }` for moves
+because a move has another command's validation and two events, and
+adoption has neither); a second optional field next to `from`, since a
+session continues at most one thing, so one `SessionOrigin` enum
+(`Context` | `Agent`; `logged_by_command()` is true for `None` and `Agent`).
+Both heads adopt by pasting the id (decided by the user 2026-11-02): TUI
+`c`, the GUI dialog's second field. An adopted session's first timeline
+item is a divider, `Entry::Adopted`.
+**Not carried:** mode, model, effort and grants (as D30). The outside
+conversation's cumulative spend shows in the fork's `total_cost_usd`;
+per-turn cost is unaffected. An adopted first context that never ran
+(cleared before its first message) cannot be moved (`NoConversation`).
+**Deferred:** showing the outside history (a best-effort parse of
+`~/.claude/projects/*.jsonl`); listing adoptable conversations on the server
+or picking from a list in a head; handing a conversation back to the
+terminal (showing the fork's CLI id); adopt by resume; checking existence at
+command time; adopting into an existing session as a new context; carrying
+mode, model, effort or grants; an agent capability that lets clients hide
+adoption for agents that cannot fork (today such an adapter must fail
+`Adopt` with `AgentError::Start`); unifying `contexts.origin` and `adopted`
+into one fork-source column; migrating old stored `from` events (alpha: such
+databases are deleted).
