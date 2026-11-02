@@ -1,5 +1,5 @@
 //! The device's pairing identity: device key, signed certificate and the
-//! pinned server CA (spec §6, D9).
+//! pinned server CA (architecture.md "Pairing", D9).
 //!
 //! The rest of the core sees only the [`Identity`] trait, so a
 //! Keystore-backed signer can replace the file-backed key later without

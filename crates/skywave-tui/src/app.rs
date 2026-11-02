@@ -2847,7 +2847,7 @@ impl SessionUi {
     }
 
     /// Expands or collapses the selected item. Expanding a blob that is not
-    /// here yet asks for it (spec §8: expanding downloads if needed).
+    /// here yet asks for it.
     fn toggle(&mut self, view: &SessionView) -> Option<Action> {
         let Some(ItemKey::Logged(seq)) = self.shown.selected else {
             return None;

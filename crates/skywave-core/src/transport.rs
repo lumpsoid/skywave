@@ -1,4 +1,4 @@
-//! How the core talks to the server (spec §4, D15): the [`Transport`]
+//! How the core talks to the server (architecture.md "Protocol", D15): the [`Transport`]
 //! trait and its typed errors. [`HttpsTransport`](crate::HttpsTransport) is
 //! the MVP implementation; QUIC or SSE can replace it behind this trait.
 //!

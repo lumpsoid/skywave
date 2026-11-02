@@ -1,4 +1,4 @@
-//! The server's TLS identity (D9, spec §6): a CA it owns, a server
+//! The server's TLS identity (D9, architecture.md "Pairing"): a CA it owns, a server
 //! certificate signed by that CA, and a stable [`ServerId`].
 //!
 //! ```text

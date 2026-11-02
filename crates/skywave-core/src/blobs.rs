@@ -1,4 +1,4 @@
-//! The blob downloader (spec §7 Blobs, D6): fetches blob content into the
+//! The blob downloader (architecture.md "Client core", D6): fetches blob content into the
 //! core's data directory, apart from event sync.
 //!
 //! **What gets downloaded.** [`BlobQueue`] holds the blobs waiting for a

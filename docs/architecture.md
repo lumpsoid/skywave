@@ -88,7 +88,168 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   acceptance.
 - **Payloads:** event metadata is small; large content (tool outputs, file
   contents, logs) is a blob referenced by id and fetched separately.
-- **Transport** sits behind a `Transport` trait: HTTPS for MVP, QUIC later.
+- **Transport** sits behind a `Transport` trait: HTTPS today, QUIC later.
+
+## Protocol
+
+`skywave-proto`: JSON over HTTPS, every endpoint under `/v1`, every request
+but pairing authenticated by the device's client certificate. The types'
+doc comments are the reference; `PROTOCOL_VERSION`'s lists what each
+version changed. Client and server must match it exactly (checked at
+`hello`); there is no compatibility layer.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the log head, every paired device with its name, and whether the server runs shell commands. |
+| `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
+| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). |
+| `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
+| `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
+
+- **Seqs** are global and contiguous: the first event is 1, 0 is "before
+  everything". Events carry no seq on the wire; the batch carries `from`.
+- **Every accepted command logs exactly one event naming it**
+  (`Event.command_id`), the last it appends, at the seq of its `Accepted`;
+  a rejected one logs nothing. So the log acknowledges a command as its
+  reply does (`MoveContext` also logs the new session's `SessionCreated`
+  first).
+- **Every event carries its context** (`Event.context`), stamped by the
+  server, never derived from position (D29). Session-level state (name,
+  archived, mode, model, effort) folds per session regardless.
+- **Agent-agnostic** (D3): tool events carry a bounded display (`ToolKind`,
+  title, detail, a preview body) and clients branch on `kind`, never on the
+  agent's tool name. `CallId`s are minted by the server; the agent's own ids
+  and resume handles never leave `skywaved`. Size caps live in
+  `skywave_proto::limits`; content past them is a blob.
+- **Errors are plain HTTP statuses** with no typed body. Pairing: 400
+  malformed, 401 wrong, used or expired code (indistinguishable), 429 too
+  many failures (`Retry-After`). Elsewhere: 401 no client certificate, 403 a
+  device unknown or revoked (checked on every request, so a revocation
+  applies to an open connection's next request), 400 malformed, 404 unknown
+  blob, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
+  `Accepted` and `Rejected` alike, and `/v1/dirs` 200 for every result
+  (never 401/403 beyond authentication, which clients read as revoked).
+
+## Server
+
+`skywaved`. Its config keys are in the README; its data directory holds
+`skywave.db` (SQLite, WAL), `blobs/`, `ca/` and `server/` (ECDSA P-256 keys,
+mode 0600), `server_id`, and `shell/` (running shell output until it becomes
+a blob). `serve` creates the CA, certificate and id on first run and
+reissues the certificate (same CA) when its names change. Admin commands
+(`pair`, `devices list`, `devices revoke`) work on the database directly,
+beside a running `serve`.
+
+- **Commands** are deduplicated, validated and appended in one transaction;
+  rejected ones are stored too, so their answer stays stable. Validation
+  reads projections of the log (`sessions`, `contexts`, `approvals`,
+  `shell_runs`) updated in the transaction that appends the event.
+- **Agent supervisor** (D3, D4, D8): at most one agent process per session,
+  started lazily for the context a message or setting request is stamped
+  with: resumed from that context's opaque handle, else forked from the
+  context it continues (D30) or the outside conversation it adopts (D32),
+  else fresh. A clear or switch stops a running agent like `StopSession`.
+  The session's grants pass to every start of its contexts, never to
+  another session. An approval waits with no timeout but ends with the agent
+  process. On daemon start every pending approval gets
+  `ApprovalCancelled { reason: "daemon restarted" }` and every call left
+  without a result is named in a `CallsUnanswered`.
+- **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
+  cuts every text to the limits on char boundaries, and makes a blob only for
+  content that was cut, so a large payload costs a bounded event plus a blob
+  fetched on demand (D11).
+- **Shell runner** (D35): a sibling of the supervisor that follows the log on
+  its own thread and connection. One FIFO per session, one run at a time,
+  sessions in parallel. A run is `<program> -c <wrapper>` in the session's
+  last cwd (a `cd` sticks), with no controlling terminal, stdin
+  `/dev/null`, and `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `CI=1`. Its
+  `when` is matched against the session's last end (`Exited { code: 0 }`
+  is success). A run ends when the shell exits; its process group is then
+  killed, and on Linux a subreaper host reaps orphans. Output streams to a
+  file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s and
+  then every 60 s, and becomes a blob unless the preview holds all of it.
+  On start, runs left running are finished `Lost` and queued ones run; if
+  the runner fails, `serve` stops rather than accept runs nothing would
+  start.
+
+## Pairing
+
+D9. The server owns a CA; every device holds a certificate it signed.
+
+1. `skywaved pair` stores the SHA-256 of a one-time code and prints the
+   code, the server address and the CA fingerprint (SHA-256 of the CA
+   certificate's DER, colon-separated hex), also as a QR code.
+2. The device makes a keypair and CSR and calls `POST /v1/pair`, accepting
+   the server only if the last certificate of the chain it presents has the
+   entered fingerprint and the leaf is valid for the typed address under
+   that CA. A mismatch fails the handshake, so the code is never sent.
+3. The server checks the code (single use, `--ttl` default 10 min, at most
+   24 h), signs the CSR, records the device and returns its certificate and
+   the CA.
+4. Every later connection is mTLS: chain **and** registry (not revoked).
+
+- **Codes:** 10 Crockford base32 symbols (50 bits), shown `XXXXX-XXXXX`;
+  input ignores case, `-` and spaces, and reads `O` as `0`, `I`/`L` as `1`.
+- **Rate limit:** at most 5 failed attempts per sliding minute, server-wide,
+  in memory; a full window answers 429 even to the right code. The pairing
+  endpoint is the only one without a client certificate and exposes
+  nothing else.
+- **Pairing URI** (the QR code):
+  `skywave://pair?addr=<host:port>&code=<code>&fp=<fingerprint>`, `addr`
+  percent-encoded, `code` without `-`, `fp` as 64 lowercase hex digits.
+  The core parses it (`parse_pair_uri`) so heads don't. An address without
+  a port means 7443.
+- The device key and certificate live in the core's data directory behind
+  the `Identity` trait, so a platform keystore can replace it.
+
+## Client core
+
+`skywave-core`. `Core::open(data_dir)`, `dispatch(Action)`,
+`subscribe(ViewState)`, on its own tokio runtime. The state machine
+(`Model`) does no I/O: the network tasks reach it through `core.seam()`,
+receiving `Request`s and reporting results, and every report is persisted,
+then pushed as a new `ViewState`.
+
+- **Replica** (SQLite, `core.db`): the replicated `events`, projections
+  folded in the transaction that stores them (`sessions`, and `turns`, each
+  `TurnUsage` by seq for the usage screen), the `outbox`, the `cursor`,
+  `blobs`, `settings`, and what is this device's alone (D5: drafts per
+  session and composer mode, composer modes, snippets, read marks, local
+  deletes, alerted approvals). A schema migration backfills a new
+  projection from the stored events.
+- **Sync engine** (D7): the pull loop long-polls from the cursor and applies
+  each batch and the new cursor in one transaction. The outbox sends oldest
+  first, one command in flight, so the server sees commands in the order
+  they were made. A pulled event naming an unanswered command settles it as
+  `Accepted` at its seq; a reply that stays unreadable is settled from the
+  log, or failed as undeliverable once the replica has passed the log head
+  read after it, so it is never resent into a duplicate. Reconnects back off
+  exponentially with jitter to 30 s, and the wait ends by whichever of the
+  monotonic and wall clocks says first, so a device that slept retries when
+  the head says. A revoked device or protocol mismatch is `Rejected`, and
+  retries stop until re-pairing. `suspend()` / `resume()` pause the network
+  for heads that background.
+- **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
+  link, two at a time, into `blobs/<id>.part`, resumed with `Range`,
+  verified by size and renamed when complete; `Link` ignores them (synced
+  metadata counts as synced).
+- **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
+  the sessions they ran in; heads total them with `skywave_present::usage`
+  by local day, session, workdir or model. A turn with no cost is unpriced,
+  never $0. Archived sessions count; a session deleted from this device took
+  its turns with it, and the screen says so.
+
+## Testing
+
+- Tests are deterministic: a scripted fake agent (`skywaved/src/agent/fake.rs`,
+  `tests/support/fake-claude.sh`) and recorded CLI fixtures. Only fixture
+  recording and `skywave-claude-compat` run the real CLI.
+- **Link harness** (`skywave-testkit`, D11): an in-process TCP proxy that
+  injects latency, jitter, bandwidth caps and drops between real cores and a
+  real `skywaved`. It asserts no lost commands, no duplicated events, cursor
+  convergence, and two devices converging on the same state.
+- `tracing` logs on both sides; the daemon logs to stderr or `log_file`.
 
 ## Render states (owned by core, drawn by heads)
 

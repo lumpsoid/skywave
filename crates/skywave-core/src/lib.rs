@@ -1,7 +1,7 @@
 //! Skywave client core: all client logic lives here; heads only render.
 //!
 //! Heads use [`Core::open`], [`Core::dispatch`] with an [`Action`], and
-//! [`Core::subscribe`] to receive [`ViewState`] snapshots (spec §7). They
+//! [`Core::subscribe`] to receive [`ViewState`] snapshots (architecture.md "Client core"). They
 //! depend on this crate only, never on `skywave-proto`. `Core::open` also
 //! starts the sync engine ([`EngineConfig`]), which pairs, pulls the log,
 //! drains the outbox and reconnects; heads that background call

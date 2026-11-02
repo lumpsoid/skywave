@@ -2601,7 +2601,7 @@ impl Model {
 }
 
 /// Where the linked tool calls sit while a timeline is built, so their
-/// approvals and results fold into them (spec §7 "Tool timeline").
+/// approvals and results fold into them.
 #[derive(Default)]
 struct ToolIndex {
     /// Each linked call's item and the call's time.
@@ -5676,7 +5676,7 @@ mod tests {
         assert_eq!(f.model.view().link, Link::Connecting);
     }
 
-    // Tool timeline (spec §7): calls group their approval and result.
+    // Tool timeline: calls group their approval and result.
 
     fn tool_call(call: Option<CallId>, kind: ToolKind, title: &str) -> EventKind {
         EventKind::ToolCall(ToolCall {

@@ -1,4 +1,4 @@
-//! `tracing` setup: stderr by default, or append to a file (spec §9).
+//! `tracing` setup: stderr by default, or append to a file (architecture.md "Testing").
 //!
 //! The filter comes from `RUST_LOG` (e.g. `skywaved=debug`), defaulting to
 //! `info`.

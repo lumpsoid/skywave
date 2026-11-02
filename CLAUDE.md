@@ -17,8 +17,9 @@ below before designing anything.
   real CLI against the adapter (`--quick`, then `--full`).
 - `gui/`: Flutter head. `gui/native/hub` is the rinf bridge (crate name `hub`)
   and a member of the Cargo workspace.
-- `docs/`: `mvp-spec.md` (the spec), `decisions.md` (D-numbered and settled),
-  `architecture.md`, `agents/claude-code.md` (the stream-json protocol notes).
+- `docs/`: `architecture.md` (how the system works: protocol, server,
+  pairing, core, testing), `decisions.md` (D-numbered and settled),
+  `agents/claude-code.md` (the stream-json protocol notes).
 
 ## Gates
 
@@ -58,8 +59,8 @@ cargo test --workspace
 
 - Alpha, with no release. Nothing earlier is supported: no old clients, data or
   protocol versions. Don't add compatibility layers.
-- If code has to depart from the spec, update `docs/mvp-spec.md` (or the
-  relevant doc) in the same commit and say so in the report.
+- If code changes what `docs/architecture.md` (or another doc) says, update
+  it in the same commit and say so in the report.
 - Agent-agnostic naming outside `src/agent/claude_code/` (D3).
 - Decide outcomes from definitive signals (command ids, log position), not
   timeouts or guesses.

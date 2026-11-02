@@ -103,10 +103,17 @@ cargo build --release
 ### 1. Start the server
 
 ```toml
-# ~/.config/skywave/skywaved.toml (every key is optional)
-listen = "0.0.0.0:7443"
+# ~/.config/skywave/skywaved.toml, or --config (every key is optional;
+# relative paths resolve against this file's directory)
+listen = "0.0.0.0:7443"              # default 127.0.0.1:7443
 roots = ["/home/me/code"]            # where sessions may run
 server_names = ["devbox.example.net"] # names in the server certificate
+# data_dir = "/srv/skywave"          # default $XDG_DATA_HOME/skywave
+# log_file = "/var/log/skywaved.log" # default stderr
+
+[agent]
+command = "claude"                   # default: claude on PATH
+args = []
 
 [shell]                 # shell commands from devices; off by default
 enabled = true
@@ -317,8 +324,7 @@ A few design choices that make it hold up:
   duplicated events, cursor convergence and two devices converging on the
   same state.
 
-More detail in [`docs/architecture.md`](docs/architecture.md),
-[`docs/mvp-spec.md`](docs/mvp-spec.md) and
+More detail in [`docs/architecture.md`](docs/architecture.md) and
 [`docs/decisions.md`](docs/decisions.md).
 
 ### GUI build

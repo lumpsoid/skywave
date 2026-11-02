@@ -1,5 +1,5 @@
 //! The shell runner: runs the shell commands devices send (`RunShell`) in
-//! the daemon, one at a time per session (D35, spec §5).
+//! the daemon, one at a time per session (D35, architecture.md "Server").
 //!
 //! A sibling of the agent supervisor, not part of it: shell runs share
 //! nothing with agent sessions and keep running across `StopSession`,

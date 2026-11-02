@@ -1,4 +1,4 @@
-//! The agent supervisor (spec §5): runs one agent session per Skywave
+//! The agent supervisor (architecture.md "Server"): runs one agent session per Skywave
 //! session that has work, generic over the [`AgentAdapter`].
 //!
 //! **Contexts.** A Skywave session holds an ordered list of contexts, each
@@ -188,7 +188,7 @@ use crate::error::{Error, Result};
 use crate::event_log::parse_id;
 use crate::{EventLog, Storage};
 
-/// Reason of the `ApprovalCancelled` appended on daemon start (spec §5).
+/// Reason of the `ApprovalCancelled` appended on daemon start (architecture.md "Server").
 pub const DAEMON_RESTARTED: &str = "daemon restarted";
 /// `Errored` message for a session whose turn was running when the daemon
 /// stopped.

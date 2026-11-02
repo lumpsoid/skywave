@@ -1,4 +1,4 @@
-//! The pairing client (spec §6, D9): turns what `skywaved pair` printed —
+//! The pairing client (architecture.md "Pairing", D9): turns what `skywaved pair` printed —
 //! address, code, CA fingerprint — into stored credentials.
 //!
 //! [`pair`] generates an ECDSA P-256 key and CSR, connects without a client
@@ -78,7 +78,7 @@ fn retry_text(secs: &Option<u64>) -> String {
 
 /// The canonical form of a typed pairing code: 10 Crockford base32 symbols,
 /// uppercase, without `-`. Input is case-insensitive, ignores `-` and
-/// spaces, and reads `O` as `0` and `I`/`L` as `1` (spec §6).
+/// spaces, and reads `O` as `0` and `I`/`L` as `1` (architecture.md "Pairing").
 pub fn normalize_code(input: &str) -> Result<String, PairError> {
     let mut code = String::with_capacity(CODE_LEN);
     for c in input.chars() {
@@ -118,7 +118,7 @@ pub struct PairUri {
 }
 
 /// Parses `skywave://pair?addr=<host:port>&code=<code>&fp=<fingerprint>`
-/// (spec §6). Values are percent-decoded; unknown parameters are ignored.
+/// (architecture.md "Pairing"). Values are percent-decoded; unknown parameters are ignored.
 pub fn parse_pair_uri(uri: &str) -> Result<PairUri, PairError> {
     let uri = uri.trim();
     let bad = |why: &str| PairError::InvalidUri(why.to_owned());

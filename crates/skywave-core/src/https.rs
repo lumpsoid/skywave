@@ -228,7 +228,7 @@ fn into_head(resp: hyper::Response<Incoming>, sender: Sender) -> Head {
     }
 }
 
-/// The error for a non-2xx status on the authenticated endpoints (spec §4).
+/// The error for a non-2xx status on the authenticated endpoints (architecture.md "Protocol").
 fn status_error(status: StatusCode, headers: &HeaderMap) -> TransportError {
     match status {
         StatusCode::UNAUTHORIZED => TransportError::Unauthorized,

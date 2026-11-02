@@ -1,4 +1,4 @@
-//! The link harness (T16, spec §9, D11): real cores against a real
+//! The link harness (architecture.md "Testing", D11): real cores against a real
 //! `skywaved` (HTTPS/mTLS, supervisor with the fake agent) through
 //! [`LinkProxy`]s that add latency, jitter, bandwidth caps and connection
 //! drops. Ground truth is the server's own database: its log and its
@@ -232,7 +232,7 @@ async fn long_lossy_link_many_commands() {
 
 // ---- 2. events --------------------------------------------------------------
 
-/// Spec §7 pull loop under a bad link: the link dies mid-long-poll (the
+/// The pull loop under a bad link: the link dies mid-long-poll (the
 /// agent is quiet behind a gate) and mid-batch (large events, big
 /// batches), and the replica still ends equal to the server log — seq
 /// 1..=head, no gap, no duplicate — with the cursor at the head.
@@ -325,7 +325,7 @@ async fn lossy_link_delivers_every_event_once() {
 
 // ---- 3. two devices ---------------------------------------------------------
 
-/// Spec §9: two devices, each behind its own bad link with a different
+/// Two devices, each behind its own bad link with a different
 /// profile, both creating sessions and talking in each other's sessions,
 /// converge on the same replica, session list and timelines.
 #[tokio::test(flavor = "multi_thread")]

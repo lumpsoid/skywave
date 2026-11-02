@@ -1,4 +1,4 @@
-//! Layout of the daemon's data directory (spec §5).
+//! Layout of the daemon's data directory (architecture.md "Server").
 //!
 //! ```text
 //! <data_dir>/

@@ -63,7 +63,7 @@ pub fn stop_needs_confirmation(work: &AgentWork) -> bool {
     work.tasks.iter().any(|task| !task.ambient) || !work.schedules.is_empty()
 }
 
-/// Whether `text` is meant as a pairing URI (spec §6), so a malformed one
+/// Whether `text` is meant as a pairing URI (architecture.md "Pairing"), so a malformed one
 /// is reported rather than typed into a field.
 pub fn looks_like_pair_uri(text: &str) -> bool {
     let scheme = "skywave://";

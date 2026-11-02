@@ -1,4 +1,4 @@
-//! The Skywave server daemon (spec §5).
+//! The Skywave server daemon (architecture.md "Server").
 //!
 //! The binary is a thin CLI over this library so later server pieces and
 //! integration tests share one implementation.

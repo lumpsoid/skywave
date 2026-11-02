@@ -2,7 +2,8 @@
 //! scripted fake agent) in-process on 127.0.0.1 over real TLS, real cores
 //! with their sync engines, and the TUI's `App` driven by key events, with
 //! every check made on rendered frames (ratatui's `TestBackend`). Covers
-//! flows F5–F9 and F11 (spec §3). The link runs through
+//! conversing, approving, interrupting, composing offline, a drop while the
+//! agent works, and a blob opened on demand. The link runs through
 //! `skywave_testkit::LinkProxy` where a test takes it down.
 //!
 //! Waits are bounded and driven by the core's snapshots; nothing relies on a

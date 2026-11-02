@@ -1,7 +1,7 @@
 //! The SQLite database (`skywave.db`) and its schema migrations.
 //!
 //! `serve` and the admin commands open the same database concurrently
-//! (spec §5), so connections use WAL mode and a busy timeout.
+//! (architecture.md "Server"), so connections use WAL mode and a busy timeout.
 //!
 //! Migrations are versioned by `PRAGMA user_version`: migration `i` (0-based)
 //! moves the schema from version `i` to `i + 1`. Append new migrations; never
@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATIONS: &[&str] = &[
-    // v1: initial schema (spec §5).
+    // v1: initial schema (architecture.md "Server").
     r#"
     -- Global event log (D12). seq is assigned by the single writer: the first
     -- event is 1 and each later event is exactly one more.

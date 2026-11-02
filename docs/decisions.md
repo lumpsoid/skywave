@@ -656,7 +656,7 @@ tool outputs are already blobbed); showing a subagent's thinking.
 
 ## D35. Shell commands from devices: a one-shot runner beside the agent
 A device runs a command with the server's shell in a session's workdir
-(protocol v14, spec §4 and §5). The daemon's shell runner
+(protocol v14, architecture.md "Protocol" and "Server"). The daemon's shell runner
 (`crates/skywaved/src/shell.rs`) runs it; `[shell] enabled` turns it on.
 **Security.** With `enabled`, any paired device can run arbitrary commands
 as the daemon's user, and the session roots (D14) do not confine `cd`. That
