@@ -6,8 +6,8 @@ use std::time::Duration;
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
     ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
-    TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult,
+    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
+    ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -1305,6 +1305,85 @@ fn the_agent_side_logs_calls_unanswered() {
     assert_eq!(f.all_events().len(), before + 1);
     assert_eq!(event.kind, EventKind::CallsUnanswered { calls });
     assert_eq!(event.command_id, None);
+}
+
+#[test]
+fn shell_commands_are_refused_while_shell_is_off() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let head = f.log.head();
+    let commands = [
+        CommandKind::RunShell {
+            session_id: session,
+            command: "make".into(),
+            when: RunWhen::Always,
+        },
+        CommandKind::StopShell {
+            session_id: session,
+            run: CommandId::new(),
+        },
+        // Refused before the session is looked up.
+        CommandKind::RunShell {
+            session_id: SessionId::new(),
+            command: "make".into(),
+            when: RunWhen::OnFailure,
+        },
+    ];
+    for kind in commands {
+        assert_eq!(f.handle(kind), rejected(RejectReason::ShellDisabled));
+    }
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+    // Positive control: a command that is not a shell command still logs.
+    accepted(f.handle(CommandKind::StopSession {
+        session_id: session,
+    }));
+    assert_eq!(f.log.head(), head.next());
+}
+
+#[test]
+fn shell_events_are_not_agent_appends() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let context = ContextId::first_of(session);
+    let (by, run) = (DeviceId::new(), CommandId::new());
+    let head = f.log.head();
+    for kind in [
+        EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::Always,
+            by,
+        },
+        EventKind::ShellStopRequested { run, by },
+        EventKind::ShellStarted {
+            run,
+            cwd: "/".into(),
+        },
+        EventKind::ShellOutput {
+            run,
+            tail: "x".into(),
+            lines: 1,
+            bytes: 1,
+        },
+        EventKind::ShellFinished {
+            run,
+            by,
+            started_at: None,
+            command_line: "make".into(),
+            end: ShellEnd::Exited { code: 0 },
+            cwd: None,
+            preview: String::new(),
+            lines: 0,
+            output: None,
+            truncated: false,
+        },
+    ] {
+        let appended = f.log.append(&mut f.storage.db, session, context, kind);
+        assert!(
+            matches!(appended, Err(Error::InvalidAppend(_))),
+            "{appended:?}"
+        );
+    }
+    assert_eq!(f.log.head(), head, "refused appends leave no trace");
 }
 
 #[test]

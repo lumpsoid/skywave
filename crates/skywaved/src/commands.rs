@@ -23,6 +23,9 @@
 //!   for the new session, naming no command, then `ContextMoved` in the
 //!   source.
 //!
+//! `RunShell` and `StopShell` are refused `ShellDisabled`, appending
+//! nothing, until the shell runner lands.
+//!
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
 //! appends, and nothing else but the new session's `SessionCreated` a
@@ -453,6 +456,10 @@ impl EventLog {
                     by: device,
                 };
                 (*session_id, session.context, kind)
+            }
+            // No shell runner yet: refused before anything else is checked.
+            CommandKind::RunShell { .. } | CommandKind::StopShell { .. } => {
+                return Ok(Err(RejectReason::ShellDisabled));
             }
         };
         Ok(Ok(event_log::append_in(

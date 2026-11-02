@@ -76,7 +76,14 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `EventKind::CallsUnanswered`, calls that will never get a result. v1 tool
 /// shapes no longer decode, superseding the v2 note above. v12 databases are
 /// deleted, not migrated.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// v14: shell commands. `CommandKind::{RunShell, StopShell}` with
+/// [`RunWhen`]; `EventKind::{ShellRequested, ShellStopRequested,
+/// ShellStarted, ShellOutput, ShellFinished}` and [`ShellEnd`];
+/// `RejectReason::{ShellDisabled, UnknownRun, RunFinished,
+/// BadShellCommand}`; [`limits::SHELL_COMMAND_MAX_BYTES`]; and `shell` on
+/// [`HelloResponse`].
+pub const PROTOCOL_VERSION: u32 = 14;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -433,6 +440,98 @@ pub enum EventKind {
     CallsUnanswered {
         calls: Vec<CallId>,
     },
+    /// A `RunShell` command asked the server to run `command` in the
+    /// session's workdir, once `when` matches the session's last status.
+    /// The command's own id names the run in every later shell event.
+    /// Activity, not notable; brings an archived session back.
+    ShellRequested {
+        command: String,
+        when: RunWhen,
+        by: DeviceId,
+    },
+    /// A `StopShell` command asked the server to stop the shell `run` (the
+    /// `RunShell` command's id). Its `ShellFinished` answers it. Not
+    /// notable, not activity.
+    ShellStopRequested {
+        run: CommandId,
+        by: DeviceId,
+    },
+    /// The daemon started the shell `run` in `cwd`, the directory it
+    /// really starts in. Not notable, not activity.
+    ShellStarted {
+        run: CommandId,
+        cwd: String,
+    },
+    /// Progress of the shell `run`, logged by the daemon: `tail` is the
+    /// last lines within [`limits::PREVIEW_MAX_LINES`] and
+    /// [`limits::PREVIEW_MAX_BYTES`], ANSI stripped ([`strip_ansi`]);
+    /// `lines` and `bytes` are the totals so far. Not notable, not
+    /// activity.
+    ShellOutput {
+        run: CommandId,
+        tail: String,
+        lines: u32,
+        bytes: u64,
+    },
+    /// The shell `run` is over, logged by the daemon. `preview` is the
+    /// output's tail within the preview caps, ANSI stripped, invalid UTF-8
+    /// decoded lossily and cut on a char boundary; `output` holds the whole
+    /// raw output when the preview does not (`truncated`). `lines` is the
+    /// total line count. `cwd` is where the shell ended, `None` when not
+    /// known. `by` (the requester), `started_at` (the `at` of the run's
+    /// `ShellStarted`, `None` when it never started) and `command_line`
+    /// (the command's first line, cut to [`limits::FIRST_PROMPT_MAX_CHARS`])
+    /// are copied from earlier events so a device can alert from this one.
+    /// Not notable, not activity.
+    ShellFinished {
+        run: CommandId,
+        by: DeviceId,
+        started_at: Option<DateTime<Utc>>,
+        command_line: String,
+        end: ShellEnd,
+        cwd: Option<String>,
+        preview: String,
+        lines: u32,
+        output: Option<BlobRef>,
+        truncated: bool,
+    },
+}
+
+/// When a shell run starts, matched against the session's last status
+/// (`RunShell::when`). Absent on the wire means [`RunWhen::Always`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunWhen {
+    #[default]
+    Always,
+    OnSuccess,
+    OnFailure,
+}
+
+/// How a shell run ended (`ShellFinished::end`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShellEnd {
+    /// The shell exited with `code`; only `0` is success.
+    Exited { code: i32 },
+    /// The shell was killed by `signal`.
+    Signalled { signal: i32 },
+    /// A `StopShell` stopped it.
+    Stopped,
+    /// The run's `when` did not match the session's last status; it never
+    /// started.
+    Skipped,
+    /// The daemon lost track of it (e.g. it restarted mid-run).
+    Lost,
+    /// It could not be started, for `reason`.
+    NotStarted { reason: String },
+}
+
+impl ShellEnd {
+    /// Whether the run succeeded: only `Exited { code: 0 }` does.
+    pub fn is_success(&self) -> bool {
+        matches!(self, ShellEnd::Exited { code: 0 })
+    }
 }
 
 impl EventKind {
@@ -449,7 +548,12 @@ impl EventKind {
             | EventKind::ContextStarted { by, .. }
             | EventKind::ContextSwitched { by }
             | EventKind::ContextMoved { by, .. }
-            | EventKind::TaskStopRequested { by, .. } => Some(*by),
+            | EventKind::TaskStopRequested { by, .. }
+            | EventKind::ShellRequested { by, .. }
+            | EventKind::ShellStopRequested { by, .. } => Some(*by),
+            // The daemon logs it, but copies the requester's device so a
+            // device can tell its own runs apart from this one event.
+            EventKind::ShellFinished { by, .. } => Some(*by),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -470,7 +574,9 @@ impl EventKind {
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => None,
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. } => None,
         }
     }
 
@@ -498,7 +604,9 @@ impl EventKind {
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
-            | EventKind::TaskStopRequested { .. } => true,
+            | EventKind::TaskStopRequested { .. }
+            | EventKind::ShellRequested { .. }
+            | EventKind::ShellStopRequested { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -516,18 +624,21 @@ impl EventKind {
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => false,
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ShellFinished { .. } => false,
         }
     }
 
     /// What the event does to its session's archived flag, the one rule the
     /// server and every client fold: `SessionArchived` sets it, a
-    /// `UserMessage` from any device brings the session back, anything else
-    /// leaves it alone (`None`).
+    /// `UserMessage` or `ShellRequested` from any device brings the session
+    /// back, anything else leaves it alone (`None`).
     pub fn archived_effect(&self) -> Option<bool> {
         match self {
             EventKind::SessionArchived { archived, .. } => Some(*archived),
-            EventKind::UserMessage { .. } => Some(false),
+            EventKind::UserMessage { .. } | EventKind::ShellRequested { .. } => Some(false),
             EventKind::SessionCreated { .. }
             | EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
@@ -557,7 +668,11 @@ impl EventKind {
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRequested { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => None,
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ShellFinished { .. } => None,
         }
     }
 }
@@ -620,6 +735,13 @@ pub mod limits {
     /// the server refuses a longer one rather than cut it, as a cut id
     /// would name a different conversation.
     pub const CONVERSATION_ID_MAX_CHARS: usize = 128;
+    /// Longest first line of a session's first message kept for its title,
+    /// and of a shell command in `ShellFinished::command_line`, in chars.
+    pub const FIRST_PROMPT_MAX_CHARS: usize = 200;
+    /// Longest `RunShell::command`, in UTF-8 bytes; the server refuses a
+    /// longer one as `BadShellCommand` rather than cut it, as a cut command
+    /// would run something else.
+    pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -1257,6 +1379,25 @@ pub enum CommandKind {
     /// success shows as the task leaving the set, a refusal as a
     /// `TaskStopRefused` naming this command.
     StopTask { session_id: SessionId, task: TaskId },
+    /// Run `command` with the server's shell in the session's workdir, once
+    /// `when` matches the session's last status (absent: `Always`). This
+    /// command's id is the run's id: every later shell event names the run
+    /// by it. Logged as a `ShellRequested`. `BadShellCommand` when blank
+    /// after trimming or over [`limits::SHELL_COMMAND_MAX_BYTES`];
+    /// `ShellDisabled` when the server has shell commands off.
+    RunShell {
+        session_id: SessionId,
+        command: String,
+        #[serde(default)]
+        when: RunWhen,
+    },
+    /// Stop the shell `run` (its `RunShell` command's id). Logged as a
+    /// `ShellStopRequested`; its `ShellFinished` answers it. `UnknownRun`
+    /// when the session has no such run, `RunFinished` when it is over.
+    StopShell {
+        session_id: SessionId,
+        run: CommandId,
+    },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1298,6 +1439,82 @@ pub fn normalise_model(model: &str) -> Option<String> {
     let model: String = clean.trim().chars().take(limits::MODEL_MAX_CHARS).collect();
     let model = model.trim_end();
     (!model.is_empty()).then(|| model.to_owned())
+}
+
+/// Terminal output as shell previews carry it (`ShellOutput::tail`,
+/// `ShellFinished::preview`): escape sequences removed (CSI such as colours
+/// and cursor moves; OSC such as titles and `OSC 8` links, whose text
+/// stays; the DCS, SOS, PM and APC strings, such as inline images; and any
+/// other `ESC` sequence or lone `ESC`). A sequence cut short by a char it
+/// cannot hold (a CSI by a newline or text, a string by an `ESC` other than
+/// `ESC \`) ends there and that char is kept or parsed anew. 8-bit C1
+/// controls are not recognised. Then carriage-return
+/// overwrites collapsed: a line rewritten with `\r` keeps only its last
+/// non-empty write, the way a progress bar ends on screen. A `\r\n` is a
+/// plain newline. Everything else, UTF-8 included, is kept as is.
+pub fn strip_ansi(text: &str) -> String {
+    const ESC: char = '\u{1b}';
+    const BEL: char = '\u{7}';
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC {
+            plain.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: parameter and intermediate bytes (0x20-0x3F), then one
+            // final byte (0x40-0x7E). Anything else cuts it short and is
+            // left for the outer loop: a new ESC, a newline, text.
+            Some('[') => {
+                chars.next();
+                while chars
+                    .next_if(|c| ('\u{20}'..='\u{3f}').contains(c))
+                    .is_some()
+                {}
+                chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+            }
+            // String sequences: OSC `]`, DCS `P`, SOS `X`, PM `^` and APC
+            // `_` run to BEL or the string terminator `ESC \`. Any other ESC
+            // cuts the string short and starts a sequence of its own.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                chars.next();
+                let mut belled = false;
+                while let Some(c) = chars.next_if(|c| *c != ESC) {
+                    if c == BEL {
+                        belled = true;
+                        break;
+                    }
+                }
+                if !belled {
+                    let mut ahead = chars.clone();
+                    if ahead.next() == Some(ESC) && ahead.next() == Some('\\') {
+                        chars.next();
+                        chars.next();
+                    }
+                }
+            }
+            // Any other sequence: intermediate bytes, then one final byte.
+            // An ESC followed by neither is dropped alone.
+            _ => {
+                while chars
+                    .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+                    .is_some()
+                {}
+                chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+            }
+        }
+    }
+    let mut out = String::with_capacity(plain.len());
+    for (i, line) in plain.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let last = line.rsplit('\r').find(|write| !write.is_empty());
+        out.push_str(last.unwrap_or(""));
+    }
+    out
 }
 
 /// An agent conversation id as [`SessionOrigin::Agent`] carries it: trimmed,
@@ -1373,6 +1590,16 @@ pub enum RejectReason {
     /// `StopTask.task` is not among the session's live background tasks:
     /// it already ended, or never ran.
     UnknownTask,
+    /// A `RunShell` or `StopShell` while the server has shell commands off
+    /// ([`HelloResponse::shell`]).
+    ShellDisabled,
+    /// `StopShell.run` names no shell run of the session.
+    UnknownRun,
+    /// `StopShell.run` is already over.
+    RunFinished,
+    /// `RunShell.command` is blank after trimming, or longer than
+    /// [`limits::SHELL_COMMAND_MAX_BYTES`].
+    BadShellCommand,
 }
 
 impl RejectReason {
@@ -1425,6 +1652,9 @@ pub struct HelloResponse {
     /// the log names devices by id only, and its old events still name
     /// the revoked.
     pub devices: Vec<DeviceInfo>,
+    /// Whether the server runs shell commands (`RunShell`); when off it
+    /// refuses them as `ShellDisabled`.
+    pub shell: bool,
 }
 
 /// A paired device as other devices show it.
@@ -1540,6 +1770,131 @@ mod tests {
         assert_eq!(kind.device(), None);
         assert!(!kind.logged_by_command());
         assert_eq!(kind.archived_effect(), None);
+    }
+
+    #[test]
+    fn shell_events_name_their_device_and_who_logs_them() {
+        let by = DeviceId::new();
+        let run = CommandId::new();
+        let requested = EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::Always,
+            by,
+        };
+        let stop = EventKind::ShellStopRequested { run, by };
+        let started = EventKind::ShellStarted {
+            run,
+            cwd: "/w".into(),
+        };
+        let output = EventKind::ShellOutput {
+            run,
+            tail: "x".into(),
+            lines: 1,
+            bytes: 1,
+        };
+        let finished = EventKind::ShellFinished {
+            run,
+            by,
+            started_at: None,
+            command_line: "make".into(),
+            end: ShellEnd::Exited { code: 0 },
+            cwd: None,
+            preview: String::new(),
+            lines: 0,
+            output: None,
+            truncated: false,
+        };
+        // (kind, device, logged by a command, archived effect)
+        let cases = [
+            (&requested, Some(by), true, Some(false)),
+            (&stop, Some(by), true, None),
+            (&started, None, false, None),
+            (&output, None, false, None),
+            (&finished, Some(by), false, None),
+        ];
+        for (kind, device, by_command, archived) in cases {
+            assert_eq!(kind.device(), device, "{kind:?}");
+            assert_eq!(kind.logged_by_command(), by_command, "{kind:?}");
+            assert_eq!(kind.archived_effect(), archived, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_zero_exit_is_success() {
+        assert!(ShellEnd::Exited { code: 0 }.is_success());
+        for end in [
+            ShellEnd::Exited { code: 1 },
+            ShellEnd::Signalled { signal: 9 },
+            ShellEnd::Stopped,
+            ShellEnd::Skipped,
+            ShellEnd::Lost,
+            ShellEnd::NotStarted { reason: "x".into() },
+        ] {
+            assert!(!end.is_success(), "{end:?}");
+        }
+    }
+
+    #[test]
+    fn strip_ansi_drops_colours_and_cursor_moves() {
+        assert_eq!(strip_ansi("\x1b[1;31merror\x1b[0m: bad"), "error: bad");
+        assert_eq!(strip_ansi("a\x1b[2K\x1b[1Ab\x1b[10;20Hc"), "abc");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_the_text_of_an_osc_8_link() {
+        let link = "see \x1b]8;;https://x.test/\x1b\\the docs\x1b]8;;\x1b\\ now";
+        assert_eq!(strip_ansi(link), "see the docs now");
+        assert_eq!(strip_ansi("\x1b]0;title\x07done"), "done");
+    }
+
+    #[test]
+    fn strip_ansi_drops_the_payload_of_string_sequences() {
+        // APC (a kitty inline image), DCS, SOS and PM, by `ESC \` or BEL.
+        assert_eq!(strip_ansi("a\x1b_Ga=T,f=100;iVBORw0K\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1bP1$r0m\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1bXsos\x07b"), "ab");
+        assert_eq!(strip_ansi("a\x1b^pm\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_parses_the_escape_that_cuts_a_string_short() {
+        assert_eq!(strip_ansi("\x1b]0;title\x1b[31mred"), "red");
+        assert_eq!(strip_ansi("\x1b_payload\x1b[0mok"), "ok");
+        // After a BEL, a following `ESC \` is a sequence of its own.
+        assert_eq!(strip_ansi("\x1b]0;t\x07\x1b\\x"), "x");
+    }
+
+    #[test]
+    fn strip_ansi_ends_a_csi_at_a_char_it_cannot_hold() {
+        assert_eq!(strip_ansi("\x1b[31\x1b[0mx"), "x");
+        assert_eq!(strip_ansi("\x1b[1\nfoo"), "\nfoo");
+        assert_eq!(strip_ansi("\x1b[1世界"), "世界");
+    }
+
+    #[test]
+    fn strip_ansi_drops_a_lone_escape() {
+        assert_eq!(strip_ansi("a\x1b"), "a");
+        assert_eq!(strip_ansi("a\x1b7b\x1b(Bc"), "abc");
+        // An ESC before a char that starts no sequence goes alone.
+        assert_eq!(strip_ansi("a\x1b\nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_ansi_collapses_carriage_return_overwrites() {
+        assert_eq!(
+            strip_ansi("start\n 10%\r 50%\r100%\ndone\r\n"),
+            "start\n100%\ndone\n"
+        );
+        // A trailing `\r` leaves the last write on screen.
+        assert_eq!(strip_ansi("\r 10%\r 99%\r"), " 99%");
+        assert_eq!(strip_ansi("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_utf8_intact() {
+        let text = "héllo → 世界 🚀";
+        assert_eq!(strip_ansi(text), text);
+        assert_eq!(strip_ansi("\x1b[32m✓\x1b[0m 世界"), "✓ 世界");
     }
 
     #[test]

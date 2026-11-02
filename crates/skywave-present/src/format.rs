@@ -197,6 +197,10 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::NoConversation => "the agent never ran in that context",
         RejectReason::BadConversation => "not an agent conversation id",
         RejectReason::UnknownTask => "that background task already ended",
+        RejectReason::ShellDisabled => "shell commands are off on the server",
+        RejectReason::UnknownRun => "the session has no such shell run",
+        RejectReason::RunFinished => "that shell run already finished",
+        RejectReason::BadShellCommand => "empty or too long shell command",
     }
 }
 

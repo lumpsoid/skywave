@@ -2050,6 +2050,12 @@ impl Model {
                     tools.unanswered(&mut items, calls);
                     None
                 }
+                // Not shown yet: the shell timeline entry comes later.
+                EventKind::ShellRequested { .. }
+                | EventKind::ShellStopRequested { .. }
+                | EventKind::ShellStarted { .. }
+                | EventKind::ShellOutput { .. }
+                | EventKind::ShellFinished { .. } => None,
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
@@ -2530,7 +2536,9 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::ClearContext { session_id, .. }
         | CommandKind::SwitchContext { session_id, .. }
         | CommandKind::MoveContext { session_id, .. }
-        | CommandKind::StopTask { session_id, .. } => Some(*session_id),
+        | CommandKind::StopTask { session_id, .. }
+        | CommandKind::RunShell { session_id, .. }
+        | CommandKind::StopShell { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. } | CommandKind::ResolveApproval { .. } => None,
     }
 }

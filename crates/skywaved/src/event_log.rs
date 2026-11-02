@@ -172,7 +172,7 @@ impl EventLog {
     /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id),
     /// `SessionStateChanged`, `TurnUsage`, the agent's answers about its
     /// mode, model and effort, and `ModelsOffered`. Kinds that only
-    /// commands produce, and `ApprovalCancelled` (use
+    /// commands produce, the shell events, and `ApprovalCancelled` (use
     /// [`EventLog::cancel_approval`]), are refused with
     /// [`Error::InvalidAppend`], as is an unknown session or a `context`
     /// that is not one of the session's.
@@ -219,7 +219,14 @@ impl EventLog {
             | EventKind::ContextStarted { .. }
             | EventKind::ContextSwitched { .. }
             | EventKind::ContextMoved { .. }
-            | EventKind::TaskStopRequested { .. } => {
+            | EventKind::TaskStopRequested { .. }
+            // The shell runner, not the agent, logs the daemon's shell
+            // events.
+            | EventKind::ShellRequested { .. }
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ShellFinished { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -560,7 +567,12 @@ pub(crate) fn append_in(
         | EventKind::ModelsOffered { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
-        | EventKind::CallsUnanswered { .. } => {}
+        | EventKind::CallsUnanswered { .. }
+        | EventKind::ShellRequested { .. }
+        | EventKind::ShellStopRequested { .. }
+        | EventKind::ShellStarted { .. }
+        | EventKind::ShellOutput { .. }
+        | EventKind::ShellFinished { .. } => {}
     }
     Ok(seq)
 }
@@ -765,6 +777,11 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::TaskStopRequested { .. } => "TaskStopRequested",
         EventKind::TaskStopRefused { .. } => "TaskStopRefused",
         EventKind::CallsUnanswered { .. } => "CallsUnanswered",
+        EventKind::ShellRequested { .. } => "ShellRequested",
+        EventKind::ShellStopRequested { .. } => "ShellStopRequested",
+        EventKind::ShellStarted { .. } => "ShellStarted",
+        EventKind::ShellOutput { .. } => "ShellOutput",
+        EventKind::ShellFinished { .. } => "ShellFinished",
     }
 }
 

@@ -202,6 +202,8 @@ async fn hello(
             device_id: device,
             head: api.log.head(),
             devices,
+            // No shell runner yet; commands refuse `ShellDisabled`.
+            shell: false,
         })
         .into_response(),
         Err(status) => status.into_response(),
