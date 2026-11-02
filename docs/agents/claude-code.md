@@ -835,6 +835,50 @@ send_task_message`, the relay stays (D33). A success answer, with the
 subagent replying ZEBRA, means the request is implemented: record a fixture
 and revisit D33.
 
+### 3.13 Foreground subagents [C]
+
+The `Agent` tool takes `run_in_background`; with `false` the subagent is
+**foreground** ("synchronous"): the main agent's `Agent` call blocks until
+it ends. The model chooses: asked to wait ("I'll wait for its answer") it
+picked foreground, asked for a chore with "no rush" it picked background,
+and the same ask went either way across runs. Fixtures:
+`subagent_foreground`, `subagent_foreground_backgrounded`,
+`subagent_foreground_stop`, recorded 2026-11-02 with
+`tests/support/probe-foreground-subagent.py`, which asks the way a user
+would over a small folder of recipes and lets the agent pick its tools.
+
+**What a foreground subagent looks like** (`subagent_foreground`):
+- `task_started` with a `task_id`, the `Agent` call's `tool_use_id` and
+  `is_backgrounded: false`. It never enters `background_tasks_changed`,
+  which lists background tasks only.
+- Its prompt is streamed as a `user` line whose content is a text block,
+  with `parent_tool_use_id`. A background subagent's prompt is not
+  streamed (`subagent*` fixtures).
+- Its `assistant`/`user` lines carry `parent_tool_use_id` = the `Agent`
+  call, as a background subagent's do, and arrive inside the main turn.
+- Its `can_use_tool` carries `agent_id` = its task id, which is not in the
+  live set, so the approval counts as the turn's (§3.11).
+- It ends with `task_updated` (`status: completed`) and `task_notification`;
+  only then does the `Agent` call get its `tool_result` (the subagent's
+  report) and the main turn go on.
+
+**Moving it to the background** (`subagent_foreground_backgrounded`). The
+control request `{"subtype":"background_tasks","tool_use_id":"<Agent
+call>"}` is Ctrl+B for one task (without `tool_use_id`, every foreground
+task). Its answer is `{"backgrounded": true}` (`false` when nothing was
+moved, e.g. the subagent already runs in the background). Before the
+answer: `background_tasks_changed` lists the task under the **same**
+`task_id`, and `task_updated` patches `is_backgrounded: true`. Then the
+blocked `Agent` call gets "Async agent launched successfully…" and the main
+turn ends, while the subagent's lines go on with the same
+`parent_tool_use_id` and end as a background subagent's do.
+
+**Stopping it** (`subagent_foreground_stop`). `stop_task` with its task id
+works though the task was never in the level set: `task_updated`
+(`killed`), `task_notification` (`stopped`), then success `{}`. The `Agent`
+call's `tool_result` is an error, "[Request interrupted by user for tool
+use]", and the main turn ends normally (`result/success`).
+
 ## 4. Interrupt
 
 Request **[C]**:
