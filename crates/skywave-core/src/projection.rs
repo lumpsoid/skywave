@@ -272,7 +272,9 @@ pub(crate) fn first_line(text: &str, max: usize) -> Option<String> {
 
 /// Whether an event is news for whoever was away: the agent's output (a
 /// message, an approval request, an error). Messages from any device never
-/// are. The store's backfill migration counts the same kinds.
+/// are, nor a subagent's messages: they show only in its own view. An
+/// approval counts whoever asks, as it blocks the agent. The store's
+/// backfill migration counts the same kinds (its rows had no subagents).
 pub fn is_notable(kind: &EventKind) -> bool {
     match kind {
         EventKind::AgentMessage { parent: None, .. } | EventKind::ApprovalRequested { .. } => true,

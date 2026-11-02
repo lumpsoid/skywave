@@ -742,6 +742,7 @@ mod tests {
 
     fn session_screen(work: AgentWork, task_stops: Vec<(TaskId, Outgoing)>) -> SessionScreen {
         let session = SessionView {
+            subagent: None,
             id: skywave_core::SessionId::new(),
             title: "x".into(),
             named: false,

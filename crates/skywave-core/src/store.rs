@@ -106,6 +106,8 @@ CREATE TABLE drafts (
     r#"
 -- `SessionSummary::notable`, backfilled from the stored log with the kinds
 -- `projection::is_notable` counts: agent messages, approval requests, errors.
+-- It ran on rows from before subagent events: none has a `parent`, so every
+-- agent message there is the main agent's and counts.
 ALTER TABLE sessions ADD COLUMN notable INTEGER NOT NULL DEFAULT 0;
 UPDATE sessions SET notable = (SELECT COUNT(*) FROM events
     WHERE session_id = sessions.id

@@ -1024,6 +1024,7 @@ mod tests {
         );
 
         let mut view = SessionView {
+            subagent: None,
             id: sid,
             title: "x".into(),
             named: false,

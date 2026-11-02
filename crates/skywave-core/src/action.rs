@@ -2,8 +2,8 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CommandId, ContextId, Decision, Effort, PermissionMode, Seq, SessionId,
-    SnippetId, TaskId,
+    ApprovalId, BlobId, CallId, CommandId, ContextId, Decision, Effort, PermissionMode, Seq,
+    SessionId, SnippetId, TaskId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +140,16 @@ pub enum Action {
         session_id: SessionId,
         context: Option<ContextId>,
     },
+    /// Show the timeline of the subagent an `Agent` call of the open
+    /// session runs (`None`: back to the main agent's). This device only,
+    /// kept until another screen shows; messages still go to the main
+    /// agent. Ignored for a call that is not a subagent's in that session.
+    /// [`Action::Back`] steps out to the subagent it runs under, then to
+    /// the main timeline.
+    ViewSubagent {
+        session_id: SessionId,
+        call: Option<CallId>,
+    },
     /// Name the session, or with a blank `name` restore its default title.
     /// The core normalises the name as the server will (control characters
     /// stripped, trimmed, cut to 80 chars). It shows at once, marked by the
@@ -224,7 +234,8 @@ pub enum Action {
     /// have been updated since.
     RetryNow,
     Navigate(Route),
-    /// Go back from the screen shown: a session to the list it is on, the
+    /// Go back from the screen shown: a subagent's timeline to the one of
+    /// the agent that launched it, a session to the list it is on, the
     /// archived list, settings and re-pairing to the active list. A no-op
     /// where [`ViewState::can_go_back`](crate::ViewState::can_go_back) is
     /// false (the active list, pairing an unpaired device): there back
