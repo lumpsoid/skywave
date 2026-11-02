@@ -149,6 +149,7 @@ impl Daemon {
         client
             .core
             .dispatch(Action::CreateSession {
+                conversation: None,
                 workdir: self.tmp.path().join("root/project").display().to_string(),
             })
             .unwrap();

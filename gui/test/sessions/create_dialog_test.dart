@@ -43,6 +43,22 @@ void main() {
     ]);
   });
 
+  testWidgets('the id field sends its edits; Enter in it creates', (
+    tester,
+  ) async {
+    await pump(tester, const CreatePrompt(input: '', inputRev: 0));
+    expect(
+      find.text('Continue a Claude Code session (paste its id)'),
+      findsOneWidget,
+    );
+    await tester.enterText(find.byKey(const Key('create-conversation')), 'abc');
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    expect(sent, [
+      const GuiIntentCreateConversationTyped(conversation: 'abc'),
+      const GuiIntentCompletionAccept(),
+    ]);
+  });
+
   testWidgets('the popup lists candidates; arrows move, a tap takes one', (
     tester,
   ) async {

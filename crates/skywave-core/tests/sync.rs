@@ -111,6 +111,7 @@ async fn offline_queue_drains_exactly_once() {
     client
         .core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         })
         .unwrap();
@@ -333,6 +334,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
     client
         .core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         })
         .unwrap();
@@ -347,6 +349,7 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
     client
         .core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         })
         .unwrap();
@@ -478,6 +481,7 @@ async fn suspend_pauses_and_resume_syncs() {
     client
         .core
         .dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         })
         .unwrap();

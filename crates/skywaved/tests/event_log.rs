@@ -6,7 +6,8 @@ use std::time::Duration;
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, Command, CommandId, CommandKind, CommandResult,
     ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind,
+    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
+    TaskKind,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -52,7 +53,10 @@ impl Fixture {
 
     fn create_session(&mut self) -> SessionId {
         let workdir = self.root.join("project").to_str().unwrap().to_owned();
-        let seq = accepted(self.handle(CommandKind::CreateSession { workdir }));
+        let seq = accepted(self.handle(CommandKind::CreateSession {
+            workdir,
+            conversation: None,
+        }));
         let batch = self.log.read(&self.storage.db, Seq(seq.0 - 1), 1).unwrap();
         assert!(matches!(
             batch.events[0].kind,
@@ -281,7 +285,13 @@ fn each_accepted_command_logs_one_event_naming_it() {
         (command.id, result, before)
     };
     let workdir = workdir(&f.root.join("project"));
-    let (id, result, before) = send(&mut f, CommandKind::CreateSession { workdir });
+    let (id, result, before) = send(
+        &mut f,
+        CommandKind::CreateSession {
+            workdir,
+            conversation: None,
+        },
+    );
     let seq = accepted(result);
     assert_eq!(seq, before.next(), "one event, nothing else");
     let session = f.all_events()[(seq.0 - 1) as usize].session_id;
@@ -419,7 +429,10 @@ fn concurrent_resends_of_one_command_append_once() {
     let workdir = workdir(&f.root.join("project"));
     let create = Command {
         id: CommandId::new(),
-        kind: CommandKind::CreateSession { workdir },
+        kind: CommandKind::CreateSession {
+            workdir,
+            conversation: None,
+        },
     };
     let device = DeviceId::new();
     let results: Vec<CommandResult> = std::thread::scope(|s| {
@@ -520,6 +533,7 @@ fn create_session_records_the_canonical_workdir() {
     let dotted = f.root.join("project").join("..").join("project");
     let seq = accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&dotted),
+        conversation: None,
     }));
     let batch = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let canonical = workdir(&std::fs::canonicalize(f.root.join("project")).unwrap());
@@ -548,6 +562,7 @@ fn create_session_records_the_canonical_workdir() {
     // The root itself is allowed too.
     accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&f.root),
+        conversation: None,
     }));
 }
 
@@ -579,7 +594,8 @@ fn create_session_rejects_workdirs_outside_roots() {
     for (dir, reason) in cases {
         assert_eq!(
             f.handle(CommandKind::CreateSession {
-                workdir: dir.clone()
+                workdir: dir.clone(),
+                conversation: None,
             }),
             rejected(reason),
             "{dir}"
@@ -598,7 +614,8 @@ fn create_session_follows_symlinks_before_checking_roots() {
     std::os::unix::fs::symlink(&outside, f.root.join("escape")).unwrap();
     assert_eq!(
         f.handle(CommandKind::CreateSession {
-            workdir: workdir(&f.root.join("escape"))
+            workdir: workdir(&f.root.join("escape")),
+            conversation: None,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
@@ -608,6 +625,7 @@ fn create_session_follows_symlinks_before_checking_roots() {
     std::os::unix::fs::symlink(f.root.join("project"), &link_in).unwrap();
     accepted(f.handle(CommandKind::CreateSession {
         workdir: workdir(&link_in),
+        conversation: None,
     }));
 }
 
@@ -617,10 +635,121 @@ fn no_roots_allow_nothing() {
     f.log = EventLog::open(&f.storage.db, vec![]).unwrap();
     assert_eq!(
         f.handle(CommandKind::CreateSession {
-            workdir: workdir(&f.root.join("project"))
+            workdir: workdir(&f.root.join("project")),
+            conversation: None,
         }),
         rejected(RejectReason::WorkdirNotAllowed)
     );
+}
+
+// --- CreateSession adopting an outside conversation ------------------------
+
+const CONVERSATION: &str = "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8";
+
+fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
+    CommandKind::CreateSession {
+        workdir,
+        conversation: Some(conversation.to_owned()),
+    }
+}
+
+/// An adoption is one `SessionCreated` naming its command at the command's
+/// seq, with the id trimmed and otherwise as sent; its first context
+/// records that as its origin. A resend gives the same answer and appends
+/// nothing.
+#[test]
+fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
+    let mut f = Fixture::new();
+    let device = DeviceId::new();
+    let command = Command {
+        id: CommandId::new(),
+        kind: adopt_kind(
+            workdir(&f.root.join("project")),
+            &format!("  {CONVERSATION}  "),
+        ),
+    };
+    let result = f.log.handle(&mut f.storage.db, device, &command).unwrap();
+    let seq = accepted(result.clone());
+    assert_eq!(seq, Seq(1), "one event, nothing else");
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(command.id));
+    let session = event.session_id;
+    assert_eq!(event.context, ContextId::first_of(session));
+    let EventKind::SessionCreated {
+        workdir: dir, from, ..
+    } = &event.kind
+    else {
+        panic!("not SessionCreated: {event:?}");
+    };
+    assert_eq!(dir, &workdir(&f.root.join("project")));
+    assert_eq!(
+        from,
+        &Some(SessionOrigin::Agent {
+            conversation: CONVERSATION.to_owned(),
+        })
+    );
+    let first = ContextId::first_of(session);
+    let adopted = SessionOrigin::Agent {
+        conversation: CONVERSATION.to_owned(),
+    };
+    assert_eq!(f.moves(first), (Some(adopted), None));
+
+    let mut other = f.connection();
+    assert_eq!(
+        f.log.handle(&mut other.db, device, &command).unwrap(),
+        result
+    );
+    assert_eq!(f.log.head(), seq, "a resend appends nothing");
+
+    // Positive control: a fresh session adopts nothing.
+    let fresh = f.create_session();
+    assert_eq!(f.moves(ContextId::first_of(fresh)), (None, None));
+}
+
+/// Only the id's syntax is checked, and an id outside it is refused rather
+/// than cut; the workdir is checked first. A refusal appends nothing, and a
+/// resend is refused again.
+#[test]
+fn a_bad_conversation_id_is_refused_after_the_workdir() {
+    let mut f = Fixture::new();
+    let project = workdir(&f.root.join("project"));
+    let too_long = "a".repeat(skywave_proto::limits::CONVERSATION_ID_MAX_CHARS + 1);
+    for id in ["", "  ", "ab cd", "ab\ncd", too_long.as_str()] {
+        assert_eq!(
+            f.handle(adopt_kind(project.clone(), id)),
+            rejected(RejectReason::BadConversation),
+            "{id:?}"
+        );
+    }
+    let outside = f.tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let outside = workdir(&outside);
+    assert_eq!(
+        f.handle(adopt_kind(outside, "ab cd")),
+        rejected(RejectReason::WorkdirNotAllowed),
+        "the workdir first"
+    );
+    assert_eq!(
+        f.handle(adopt_kind(workdir(&f.root.join("missing")), "ab cd")),
+        rejected(RejectReason::WorkdirNotFound),
+        "the workdir first"
+    );
+    let command = Command {
+        id: CommandId::new(),
+        kind: adopt_kind(project.clone(), "ab cd"),
+    };
+    let device = DeviceId::new();
+    for _ in 0..2 {
+        assert_eq!(
+            f.log.handle(&mut f.storage.db, device, &command).unwrap(),
+            rejected(RejectReason::BadConversation)
+        );
+    }
+    assert_eq!(f.log.head(), Seq::ZERO);
+    assert!(f.log.sessions(&f.storage.db).unwrap().is_empty());
+    // Positive control: the longest id is accepted, whole.
+    let longest = "a".repeat(skywave_proto::limits::CONVERSATION_ID_MAX_CHARS);
+    accepted(f.handle(adopt_kind(project, &longest)));
 }
 
 // --- SendMessage, ResolveApproval, Interrupt -------------------------------
@@ -1264,7 +1393,14 @@ fn agent_appends_are_checked() {
         EventKind::SessionCreated {
             workdir: "/".into(),
             context_name: "moved".into(),
-            from: Some(ContextRef { session, context }),
+            from: Some(SessionOrigin::Context(ContextRef { session, context })),
+        },
+        EventKind::SessionCreated {
+            workdir: "/".into(),
+            context_name: "adopted".into(),
+            from: Some(SessionOrigin::Agent {
+                conversation: "abc".into(),
+            }),
         },
         EventKind::ApprovalCancelled {
             id: ApprovalId::new(),
@@ -1348,9 +1484,10 @@ impl Fixture {
         store_resume_handle(&self.storage.db, context, &handle).unwrap();
     }
 
-    /// `contexts.origin` and `contexts.moved_to` of `context`.
-    fn moves(&self, context: ContextId) -> (Option<String>, Option<String>) {
-        self.storage
+    /// `contexts.origin`, decoded, and `contexts.moved_to` of `context`.
+    fn moves(&self, context: ContextId) -> (Option<SessionOrigin>, Option<String>) {
+        let (origin, moved_to): (Option<String>, Option<String>) = self
+            .storage
             .db
             .conn()
             .query_row(
@@ -1358,7 +1495,9 @@ impl Fixture {
                 [context.0.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap()
+            .unwrap();
+        let origin = origin.map(|json| serde_json::from_str(&json).unwrap());
+        (origin, moved_to)
     }
 }
 
@@ -1669,7 +1808,10 @@ async fn waiters_wake_on_append() {
         tokio::task::spawn_blocking(move || {
             let command = Command {
                 id: CommandId::new(),
-                kind: CommandKind::CreateSession { workdir },
+                kind: CommandKind::CreateSession {
+                    workdir,
+                    conversation: None,
+                },
             };
             log.handle(&mut conn.db, DeviceId::new(), &command).unwrap()
         })
@@ -1731,6 +1873,7 @@ impl Fixture {
     fn movable_in(&mut self, dir: &Path) -> (SessionId, ContextId) {
         let seq = accepted(self.handle(CommandKind::CreateSession {
             workdir: workdir(dir),
+            conversation: None,
         }));
         let session = self.all_events()[(seq.0 - 1) as usize].session_id;
         let first = ContextId::first_of(session);
@@ -1781,10 +1924,10 @@ fn a_move_logs_the_new_session_then_the_move_naming_the_command() {
         EventKind::SessionCreated {
             workdir: f.workdir_of(session),
             context_name: "amber otter".into(),
-            from: Some(ContextRef {
+            from: Some(SessionOrigin::Context(ContextRef {
                 session,
                 context: first,
-            }),
+            })),
         }
     );
     // Then the move itself, at the command's seq, stamped with the moved
@@ -1799,10 +1942,13 @@ fn a_move_logs_the_new_session_then_the_move_naming_the_command() {
     assert_eq!(f.workdir_of(to), f.workdir_of(session));
     assert_eq!(f.current_context(to), ContextId::first_of(to));
     assert_eq!(f.current_context(session), current, "the source goes on");
-    let id = |context: ContextId| Some(context.0.to_string());
     let to_id = Some(to.0.to_string());
     assert_eq!(f.moves(first), (None, to_id));
-    assert_eq!(f.moves(ContextId::first_of(to)), (id(first), None));
+    let origin = SessionOrigin::Context(ContextRef {
+        session,
+        context: first,
+    });
+    assert_eq!(f.moves(ContextId::first_of(to)), (Some(origin), None));
     assert_eq!(f.moves(current), (None, None));
     assert_eq!(
         f.storage.db.context_stamp_violations().unwrap(),
@@ -1952,7 +2098,15 @@ fn a_resent_move_gets_the_same_answer_and_one_new_session() {
     let moved_sessions = f
         .all_kinds()
         .into_iter()
-        .filter(|kind| matches!(kind, EventKind::SessionCreated { from: Some(_), .. }))
+        .filter(|kind| {
+            matches!(
+                kind,
+                EventKind::SessionCreated {
+                    from: Some(SessionOrigin::Context(_)),
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(moved_sessions, 1);
 }

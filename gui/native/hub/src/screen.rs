@@ -52,6 +52,9 @@ pub struct CreateUi {
     /// Bumped whenever the hub rewrites `input`.
     pub rev: u32,
     pub settle: CompletionSettle,
+    /// The optional outside agent conversation id the user typed. The
+    /// user's alone: the hub never rewrites it, so it needs no rev.
+    pub conversation: String,
 }
 
 /// The screen for `view` with the head's `ui`.

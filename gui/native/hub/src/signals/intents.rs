@@ -96,6 +96,10 @@ pub enum GuiIntent {
     CompletionTyped {
         input: String,
     },
+    /// The outside conversation id field changed.
+    CreateConversationTyped {
+        conversation: String,
+    },
     /// Tab: take the highlighted candidate, or ask for candidates.
     CompletionComplete,
     /// Move the highlight.

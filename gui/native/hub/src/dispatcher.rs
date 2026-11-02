@@ -116,6 +116,7 @@ mod tests {
             dispatcher.send(
                 tag as Tag,
                 Action::CreateSession {
+                    conversation: None,
                     workdir: workdir.clone(),
                 },
             );
@@ -127,7 +128,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|entry| match entry.command.kind {
-                CommandKind::CreateSession { workdir } => Some(workdir),
+                CommandKind::CreateSession { workdir, .. } => Some(workdir),
                 _ => None,
             })
             .collect();

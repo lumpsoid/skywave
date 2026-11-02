@@ -132,6 +132,13 @@ pub enum PromptKind {
     /// completion. Whether the path is acceptable is the server's call
     /// (D14).
     Create,
+    /// "Continue an outside conversation", on the session list, in two
+    /// steps: the server workdir (Tab completion, like [`Create`]), then
+    /// the agent's own id of the conversation to fork, which the server
+    /// checks. The step is [`Prompt::workdir`].
+    ///
+    /// [`Create`]: PromptKind::Create
+    Adopt,
     /// A new name for the session, on the session list or the session
     /// itself; blank restores the default title (the core decides).
     Rename(SessionId),
@@ -148,6 +155,10 @@ pub struct Prompt {
     /// [`PromptKind::Create`]: Tab completion of the workdir; its popup
     /// shows the core's [`Completion`].
     completion: CompletionSettle,
+    /// [`PromptKind::Adopt`]: the workdir chosen in the first step, once
+    /// the prompt asks for the conversation id; `None` while it still asks
+    /// for the workdir.
+    workdir: Option<String>,
 }
 
 impl Prompt {
@@ -157,6 +168,17 @@ impl Prompt {
             text,
             submitted: false,
             completion: CompletionSettle::new(),
+            workdir: None,
+        }
+    }
+
+    /// The prompt asks for the workdir (a new session, or the first step of
+    /// an adopting one), so it completes it.
+    pub(crate) fn asks_workdir(&self) -> bool {
+        match self.kind {
+            PromptKind::Create => true,
+            PromptKind::Adopt => self.workdir.is_none(),
+            PromptKind::Rename(_) => false,
         }
     }
 
@@ -1135,7 +1157,7 @@ impl App {
             .and_then(|(view, ui)| find(view, ui.search.as_ref()?.current?));
         self.view = view;
         if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.prompt, &self.view.screen)
-            && create.kind == PromptKind::Create
+            && create.asks_workdir()
             && let Some(completion) = &list.completion
         {
             create.completion.settle(&mut create.text, completion);
@@ -1573,6 +1595,12 @@ impl App {
         }
         match self.ui.prompt.as_ref().map(|p| p.kind) {
             Some(PromptKind::Create) => return self.create_key(key, ctrl),
+            Some(PromptKind::Adopt)
+                if self.ui.prompt.as_ref().is_some_and(|p| p.asks_workdir()) =>
+            {
+                return self.create_key(key, ctrl);
+            }
+            Some(PromptKind::Adopt) => return self.adopt_id_key(key, ctrl),
             Some(PromptKind::Rename(id)) => return self.rename_key(id, key, ctrl),
             None => {}
         }
@@ -1594,6 +1622,12 @@ impl App {
                 // A new session is active: created from the active list.
                 KeyCode::Char('n') if list.kind == ListKind::Active => {
                     self.ui.prompt = Some(Prompt::new(PromptKind::Create, String::new()));
+                    None
+                }
+                // A conversation started outside Skywave continues in a new
+                // session, so also from the active list.
+                KeyCode::Char('c') if list.kind == ListKind::Active => {
+                    self.ui.prompt = Some(Prompt::new(PromptKind::Adopt, String::new()));
                     None
                 }
                 // The row leaves the list; the selection moves to its
@@ -1726,9 +1760,16 @@ impl App {
             KeyCode::Tab => return Some(create.completion.complete(&create.text)),
             // Blank or unacceptable paths are refused by the core or the
             // server, not here.
+            // Adopting: the workdir is settled, the conversation id is next.
+            KeyCode::Enter if create.kind == PromptKind::Adopt => {
+                create.workdir = Some(create.text.trim().to_owned());
+                create.text.clear();
+                return create.completion.cancel(completing);
+            }
             KeyCode::Enter => {
                 create.submitted = true;
                 return Some(Action::CreateSession {
+                    conversation: None,
                     workdir: create.text.clone(),
                 });
             }
@@ -1744,6 +1785,30 @@ impl App {
                 create.insert(c.encode_utf8(&mut [0; 4]));
                 return create.edited();
             }
+            _ => {}
+        }
+        None
+    }
+
+    /// Keys while the adopt prompt asks for the conversation id: plain text
+    /// input. Enter creates the session forking that conversation (the
+    /// server says whether it is one), Esc cancels, Tab does nothing.
+    fn adopt_id_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
+        let prompt = self.ui.prompt.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.ui.prompt = None,
+            KeyCode::Enter => {
+                prompt.submitted = true;
+                return Some(Action::CreateSession {
+                    workdir: prompt.workdir.clone().unwrap_or_default(),
+                    conversation: Some(prompt.text.clone()),
+                });
+            }
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => prompt.text.clear(),
+            KeyCode::Char(c) if !ctrl => prompt.insert(c.encode_utf8(&mut [0; 4])),
             _ => {}
         }
         None

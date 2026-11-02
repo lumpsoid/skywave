@@ -2074,6 +2074,89 @@ async fn forking_an_unknown_parent_is_a_resume_error() {
 }
 
 #[tokio::test]
+async fn adopting_an_outside_conversation_forks_it_under_a_new_session_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = Uuid::new_v4();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Adopt(outside.to_string())))
+        .await
+        .unwrap();
+    let adopted = session_id_arg(tmp.path());
+    assert_ne!(adopted, outside);
+    let mut expected: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
+    expected.extend(
+        [
+            "--resume",
+            &outside.to_string(),
+            "--fork-session",
+            "--session-id",
+            &adopted.to_string(),
+            "--model",
+            "haiku",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(argv(tmp.path()), expected);
+
+    // The adopting context's handle is the fork's id, never the outside one.
+    session.send_message("hello".to_owned()).await.unwrap();
+    assert_eq!(handle_then_turn(&mut events).await, adopted);
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[tokio::test]
+async fn adopting_something_that_is_not_a_session_id_spawns_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let error = adapter()
+        .start(spec(tmp.path(), Conversation::Adopt("not-a-uuid".into())))
+        .await
+        .unwrap_err();
+    match error {
+        AgentError::Resume(message) => assert!(message.contains("not-a-uuid"), "{message}"),
+        other => panic!("expected a resume error, got {other:?}"),
+    }
+    assert!(
+        !tmp.path().join("argv.txt").exists(),
+        "a process was spawned"
+    );
+
+    // Positive control: a well-formed id does spawn the CLI in this setup.
+    let tmp = tempfile::tempdir().unwrap();
+    adapter()
+        .start(spec(
+            tmp.path(),
+            Conversation::Adopt(Uuid::new_v4().to_string()),
+        ))
+        .await
+        .unwrap();
+    assert!(tmp.path().join("argv.txt").exists());
+}
+
+#[tokio::test]
+async fn adopting_an_unknown_conversation_is_a_resume_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let error = adapter()
+        .start(spec(
+            tmp.path(),
+            Conversation::Adopt(Uuid::nil().to_string()),
+        ))
+        .await
+        .unwrap_err();
+    assert!(argv(tmp.path()).contains(&"--fork-session".to_owned()));
+    match error {
+        AgentError::Resume(message) => {
+            assert!(message.contains("No conversation found"), "{message}")
+        }
+        other => panic!("expected a resume error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_foreign_resume_handle_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let handle = ResumeHandle(json!({ "fake_session": "x" }));

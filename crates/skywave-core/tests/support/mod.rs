@@ -23,6 +23,7 @@ use skywave_core::{
 };
 use skywave_proto::{
     CommandId, CommandKind, CommandResult, ContextRef, Event, EventKind, Seq, SessionId,
+    SessionOrigin,
 };
 use skywaved::agent::fake::FakeAgent;
 use skywaved::identity::ServerIdentity;
@@ -359,6 +360,7 @@ impl Client {
     /// command has its result.
     pub async fn create_session(&self, daemon: &Daemon) -> SessionId {
         self.dispatch(Action::CreateSession {
+            conversation: None,
             workdir: daemon.workdir(),
         });
         let command = self.outbox().last().unwrap().command.id;
@@ -635,7 +637,7 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                         context: *context,
                     };
                     assert!(
-                        matches!(&created.kind, EventKind::SessionCreated { from: Some(r), .. } if *r == from),
+                        matches!(&created.kind, EventKind::SessionCreated { from: Some(SessionOrigin::Context(r)), .. } if *r == from),
                         "seq {} holds {created:?}, not the moved context's session",
                         seq.0 - 1
                     );
@@ -651,8 +653,15 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     let logged = |name: &str| {
         count(&events, |k| {
             name == match k {
-                EventKind::SessionCreated { from: None, .. } => "SessionCreated",
-                EventKind::SessionCreated { from: Some(_), .. } => "MovedSessionCreated",
+                // A fresh or adopting one is its `CreateSession`'s own event.
+                EventKind::SessionCreated {
+                    from: None | Some(SessionOrigin::Agent { .. }),
+                    ..
+                } => "SessionCreated",
+                EventKind::SessionCreated {
+                    from: Some(SessionOrigin::Context(_)),
+                    ..
+                } => "MovedSessionCreated",
                 EventKind::UserMessage { .. } => "UserMessage",
                 EventKind::ApprovalResolved { .. } => "ApprovalResolved",
                 EventKind::TurnInterrupted => "TurnInterrupted",

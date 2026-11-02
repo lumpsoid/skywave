@@ -141,7 +141,9 @@ pub struct CreatingView {
     pub discardable: bool,
 }
 
-/// The new-session prompt: a server workdir with completion.
+/// The new-session prompt: a server workdir with completion. The
+/// optional outside conversation id is not echoed: it is the user's
+/// alone, so Dart owns its field and only sends edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
 pub struct CreatePrompt {
     /// The input as the hub last set it; Dart overwrites its field only

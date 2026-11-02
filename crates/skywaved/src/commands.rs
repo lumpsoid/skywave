@@ -4,7 +4,9 @@
 //!
 //! What each command appends, and the seq its `Accepted` names:
 //! - `CreateSession` → `SessionCreated` with the canonical workdir, a new
-//!   [`SessionId`] and a generated name for its first context;
+//!   [`SessionId`], a generated name for its first context and, when it
+//!   adopts an outside conversation, `from` = [`SessionOrigin::Agent`] with
+//!   the checked id;
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`, echoing the granted `rule`;
 //! - `Interrupt` → `TurnInterrupted`;
@@ -17,8 +19,9 @@
 //! - `ClearContext` → `ContextStarted` with the normalised name;
 //! - `SwitchContext` → `ContextSwitched`;
 //! - `StopTask` → `TaskStopRequested`;
-//! - `MoveContext` → `SessionCreated { from }` for the new session, naming
-//!   no command, then `ContextMoved` in the source.
+//! - `MoveContext` → `SessionCreated { from }` ([`SessionOrigin::Context`])
+//!   for the new session, naming no command, then `ContextMoved` in the
+//!   source.
 //!
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
@@ -38,6 +41,16 @@
 //! switch is the old context until its agent reports the turn over;
 //! `ContextMoved` with the context it moves; every other event with the
 //! session's current context.
+//!
+//! **CreateSession.** Refused, in this order: the workdir must canonicalise
+//! under a root (`WorkdirNotAllowed`, `WorkdirNotFound`); then a
+//! `conversation` must pass [`skywave_proto::check_conversation_id`], else
+//! `BadConversation`. That is a syntax check only, and the id is logged
+//! trimmed, never cut. Whether the agent has such a conversation in the
+//! workdir is not checked here, and cannot be: the log has no agent
+//! adapter, the transaction is synchronous, and the conversation lives in
+//! the agent's own storage. The agent settles it when the session first
+//! starts.
 //!
 //! **SendMessage.** `ContextChanged` when its `context` is no longer the
 //! session's current one: the message was written for a conversation the
@@ -125,7 +138,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
-    EventKind, RejectReason, Seq, SessionId, context_name, normalise_context_name,
+    EventKind, RejectReason, Seq, SessionId, SessionOrigin, check_conversation_id, context_name,
+    normalise_context_name,
 };
 
 use crate::db::Db;
@@ -187,19 +201,28 @@ impl EventLog {
     ) -> Result<Result<Seq, RejectReason>> {
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
-            CommandKind::CreateSession { workdir } => {
-                match dirs::canonical_under_roots(self.roots(), workdir) {
-                    Ok(workdir) => {
-                        let session = SessionId::new();
-                        let kind = EventKind::SessionCreated {
-                            workdir,
-                            context_name: context_name::random(),
-                            from: None,
-                        };
-                        (session, ContextId::first_of(session), kind)
-                    }
+            CommandKind::CreateSession {
+                workdir,
+                conversation,
+            } => {
+                let workdir = match dirs::canonical_under_roots(self.roots(), workdir) {
+                    Ok(workdir) => workdir,
                     Err(reason) => return Ok(Err(reason)),
-                }
+                };
+                let from = match conversation.as_deref().map(check_conversation_id) {
+                    None => None,
+                    Some(Some(id)) => Some(SessionOrigin::Agent {
+                        conversation: id.to_owned(),
+                    }),
+                    Some(None) => return Ok(Err(RejectReason::BadConversation)),
+                };
+                let session = SessionId::new();
+                let kind = EventKind::SessionCreated {
+                    workdir,
+                    context_name: context_name::random(),
+                    from,
+                };
+                (session, ContextId::first_of(session), kind)
             }
             CommandKind::SendMessage {
                 session_id,
@@ -338,10 +361,10 @@ impl EventLog {
                         workdir: session.workdir,
                         context_name: normalise_context_name(name)
                             .unwrap_or_else(context_name::random),
-                        from: Some(ContextRef {
+                        from: Some(SessionOrigin::Context(ContextRef {
                             session: *session_id,
                             context: *context,
-                        }),
+                        })),
                     },
                 )?;
                 (

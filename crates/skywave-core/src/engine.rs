@@ -1107,6 +1107,7 @@ mod tests {
         let published = links.lock().unwrap().len();
         seam.core
             .dispatch(crate::Action::CreateSession {
+                conversation: None,
                 workdir: "/srv".into(),
             })
             .unwrap();
@@ -1445,7 +1446,7 @@ mod tests {
             command: &'a Command,
         ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
             Box::pin(async move {
-                let CommandKind::CreateSession { workdir } = &command.kind else {
+                let CommandKind::CreateSession { workdir, .. } = &command.kind else {
                     panic!("only creations are sent here");
                 };
                 let mut seen = self.seen.lock().unwrap();
@@ -1475,6 +1476,7 @@ mod tests {
     fn create(seam: &Seam, workdir: &str) {
         seam.core
             .dispatch(crate::Action::CreateSession {
+                conversation: None,
                 workdir: workdir.into(),
             })
             .unwrap();

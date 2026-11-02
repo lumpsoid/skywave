@@ -59,9 +59,16 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::SessionCreated {
             workdir: "/srv/code/skywave".into(),
             context_name: "amber otter".into(),
-            from: Some(ContextRef {
+            from: Some(SessionOrigin::Context(ContextRef {
                 session: session(),
                 context: context(),
+            })),
+        },
+        EventKind::SessionCreated {
+            workdir: "/srv/code/skywave".into(),
+            context_name: "copper heron".into(),
+            from: Some(SessionOrigin::Agent {
+                conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
             }),
         },
         EventKind::ContextStarted {
@@ -348,6 +355,11 @@ fn all_command_kinds() -> Vec<CommandKind> {
     vec![
         CommandKind::CreateSession {
             workdir: "/srv/code/skywave".into(),
+            conversation: None,
+        },
+        CommandKind::CreateSession {
+            workdir: "/srv/code/skywave".into(),
+            conversation: Some("9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into()),
         },
         CommandKind::SendMessage {
             session_id: session(),
@@ -443,6 +455,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ContextMoved,
             RejectReason::ContextCurrent,
             RejectReason::NoConversation,
+            RejectReason::BadConversation,
             RejectReason::UnknownTask,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
@@ -704,18 +717,92 @@ fn v9_session_created_decodes_without_from() {
     assert!(kind.logged_by_command());
     // Positive control: a `from` on the wire is read, not dropped.
     let kind = decode(
-        r#"{"type":"session_created","workdir":"/w","context_name":"velvet walrus","from":{"session":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008"}}"#,
+        r#"{"type":"session_created","workdir":"/w","context_name":"velvet walrus","from":{"kind":"context","session":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008"}}"#,
     );
     let EventKind::SessionCreated { from, .. } = kind else {
         panic!("not SessionCreated: {kind:?}");
     };
     assert_eq!(
         from,
-        Some(ContextRef {
+        Some(SessionOrigin::Context(ContextRef {
             session: session(),
             context: context(),
+        }))
+    );
+}
+
+/// The v10/v11 `from`, a bare [`ContextRef`], no longer decodes: v12 tags
+/// it with what the session continues. Accepted break (alpha): databases
+/// holding a moved session from before v12 are deleted, not migrated.
+#[test]
+fn a_bare_context_ref_from_is_refused() {
+    let json = r#"{"type":"session_created","workdir":"/w","context_name":"velvet walrus","from":{"session":"01920000-0000-7000-8000-000000000001","context":"01920000-0000-7000-8000-000000000008"}}"#;
+    assert!(serde_json::from_str::<EventKind>(json).is_err());
+}
+
+#[test]
+fn session_origin_is_tagged_by_kind() {
+    let moved = SessionOrigin::Context(ContextRef {
+        session: session(),
+        context: context(),
+    });
+    assert_eq!(
+        serde_json::to_value(&moved).unwrap(),
+        serde_json::json!({
+            "kind": "context",
+            "session": "01920000-0000-7000-8000-000000000001",
+            "context": "01920000-0000-7000-8000-000000000008",
         })
     );
+    let adopted = SessionOrigin::Agent {
+        conversation: "abc".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&adopted).unwrap(),
+        serde_json::json!({ "kind": "agent", "conversation": "abc" })
+    );
+    round_trip(&moved);
+    round_trip(&adopted);
+}
+
+/// Only a moved context's `SessionCreated` is the daemon's: a fresh or an
+/// adopting one is its `CreateSession`'s own event, so a device whose reply
+/// was lost settles the command from it.
+#[test]
+fn session_created_is_logged_by_command_unless_moved() {
+    let created = |from| EventKind::SessionCreated {
+        workdir: "/w".into(),
+        context_name: "start".into(),
+        from,
+    };
+    assert!(created(None).logged_by_command());
+    assert!(
+        created(Some(SessionOrigin::Agent {
+            conversation: "abc".into(),
+        }))
+        .logged_by_command()
+    );
+    assert!(
+        !created(Some(SessionOrigin::Context(ContextRef {
+            session: session(),
+            context: context(),
+        })))
+        .logged_by_command()
+    );
+}
+
+#[test]
+fn a_conversation_id_is_trimmed_and_otherwise_kept_or_refused() {
+    let uuid = "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8";
+    assert_eq!(check_conversation_id(uuid), Some(uuid));
+    assert_eq!(check_conversation_id(&format!("  {uuid}\t ")), Some(uuid));
+    let longest = "a".repeat(limits::CONVERSATION_ID_MAX_CHARS);
+    assert_eq!(check_conversation_id(&longest), Some(longest.as_str()));
+    // Refused, never cut or cleaned: a changed id names another conversation.
+    let too_long = "a".repeat(limits::CONVERSATION_ID_MAX_CHARS + 1);
+    for id in ["", "   ", "ab cd", "ab\ncd", "ab\u{7}cd", too_long.as_str()] {
+        assert_eq!(check_conversation_id(id), None, "{id:?}");
+    }
 }
 
 #[test]
@@ -730,9 +817,10 @@ fn tool_events_without_display_or_summary_are_rejected() {
 }
 
 #[test]
-fn protocol_is_v11() {
-    assert_eq!(PROTOCOL_VERSION, 11);
+fn protocol_is_v12() {
+    assert_eq!(PROTOCOL_VERSION, 12);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
+    assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);
 }

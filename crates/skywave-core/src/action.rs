@@ -16,8 +16,13 @@ pub enum Action {
         fingerprint: String,
     },
     /// Start a session in a server directory under a configured root (D14).
+    ///
+    /// `conversation` is the agent's own id of a conversation it had
+    /// outside Skywave, which the session continues; blank is `None`.
+    /// Whether it is usable is the server's and the agent's call.
     CreateSession {
         workdir: String,
+        conversation: Option<String>,
     },
     /// Start a session in the open session's workdir, and open it once its
     /// `SessionCreated` reaches the replica, unless the user went elsewhere
