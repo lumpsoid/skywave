@@ -831,6 +831,33 @@ waiting on stays pending.
   start and reports `{"session_id":"B"}` with the first turn, so a fork
   stopped before any message reports no handle and its next start forks
   again under another new id.
+- Adopting a conversation the user had in the CLI outside Skywave
+  (`Conversation::Adopt`, D32) is the same fork argv with the outside id as
+  parent: `--resume <outside> --fork-session --session-id <new>`; the
+  outside transcript is never written. The id must be a session id the CLI
+  keeps under the session's workdir (the lookup is per cwd, below): a
+  symlinked or different cwd is "No conversation found". The adapter
+  rejects an id that is not a UUID before spawning. **[U]** §5's
+  unknown-parent probe ran with stdin closed; with stream-json stdin open
+  the CLI might report "No conversation found" only after the initialize
+  reply, surfacing as `Exited { error }` rather than a resume error (either
+  way the message errors).
+  Manual checks for the user, with the real CLI (none confirmed yet):
+  1. In a dir under the roots, run `claude`, say "remember the word
+     PELICAN", quit; note the id (`/status`, or the newest
+     `~/.claude/projects/<dir>/*.jsonl`).
+  2. Adopt it (TUI `c`, or the GUI dialog's id field). The window shows
+     only the `Adopted` divider. Ask "what word did I ask you to
+     remember?": expect PELICAN.
+  3. The outside transcript's line count is unchanged afterwards.
+  4. Restart skywaved and send another message: the log shows `resumed`,
+     not `adopted`.
+  5. Adopt a random UUID: the first message is `Errored` with "No
+     conversation found", and no new `.jsonl` appears. Note whether it
+     failed at start (`agent not started`) or as an exit after the
+     handshake, and replace the **[U]** above.
+  6. Adopt with the terminal `claude` still open on that session: it
+     should work, and the terminal continues independently.
 - Forking an unknown parent fails like resuming one. **[C]** (probe,
   CLI 2.1.310, 2026-11-01: `--resume 00000000-0000-0000-0000-000000000000
   --fork-session --session-id <B>`, stdin closed, in an empty scratch dir.)

@@ -19,14 +19,14 @@
 //! parent with `--fork-session` under a new UUID: the CLI runs the fork as
 //! that id, reported like a fresh context's; one stopped before any message
 //! reports none, so its next start forks again. A conversation the user had in
-//! the CLI outside Skywave is adopted the same way, as a fork of the
-//! CLI's session id (so the outside transcript is never written); an id
-//! that is not a UUID is a resume error before any process is spawned. Rules granted for the
-//! Skywave session that the CLI keeps only in its process are the session's
-//! [`Grants`](super::Grants) `{"rules": [...]}`, reported apart from the
-//! handle and passed to every later process of the session, fresh or
-//! resumed, as flags
-//! ([`rules::cli_args`]), so they survive a restart and a new context.
+//! the CLI outside Skywave is adopted the same way, as a fork of the CLI's
+//! session id (so the outside transcript is never written); an id that is not
+//! a UUID is a resume error before any process is spawned. Rules granted for
+//! the Skywave session that the CLI keeps only in its process are the
+//! session's [`Grants`](super::Grants) `{"rules": [...]}`, reported apart from
+//! the handle and passed to every later process of the session, fresh or
+//! resumed, as flags ([`rules::cli_args`]), so they survive a restart and a
+//! new context.
 //!
 //! [`AgentAdapter::start`] returns after the CLI answers the initialize
 //! handshake; a CLI that fails before that is a start error, or a resume
