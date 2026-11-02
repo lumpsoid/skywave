@@ -10,8 +10,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobId, BlobState, CallId, ComposerMode, Entry, PairUri, PairingView, RunWhen, Screen,
-    Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
+    Action, BlobId, BlobState, CallId, CommandId, ComposerMode, Entry, PairUri, PairingView,
+    RunWhen, Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState,
+    parse_pair_uri,
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall,
@@ -20,7 +21,7 @@ use skywave_present::policy::{
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
-use crate::clip::{COPY_MAX, Copied, copy};
+use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::{self, Call, Moved, Target};
 use crate::screen::{CreateUi, Ui, rename_initial, revoked};
@@ -181,6 +182,9 @@ struct SessionHead {
     fetched: HashSet<BlobId>,
     search: Option<TimelineSearch>,
     heads: BlobHeads,
+    /// The shell runs whose rows carry their whole output.
+    shell_expanded: HashSet<CommandId>,
+    outputs: shell::Outputs,
     /// The composer's message waiting for its result.
     sending: Option<Tag>,
 }
@@ -202,6 +206,8 @@ impl SessionHead {
             fetched: HashSet::new(),
             search: None,
             heads: BlobHeads::default(),
+            shell_expanded: HashSet::new(),
+            outputs: shell::Outputs::default(),
             sending: None,
         }
     }
@@ -594,6 +600,36 @@ impl Head {
                     self.dispatch_user(action, Purpose::Plain, clock, out);
                 }
             }
+            GuiIntent::ExpandShellRun { session_id, run_id } => {
+                let run: CommandId = intents::id("run", &run_id)?;
+                let Some(view) = open_session(&self.view) else {
+                    return Ok(());
+                };
+                let fetch = shell::output_fetch(view, run);
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                session.shell_expanded.insert(run);
+                if let Some(fetch) = fetch {
+                    self.dispatch_user(fetch, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::CollapseShellRun { session_id, run_id } => {
+                let run: CommandId = intents::id("run", &run_id)?;
+                if let Some(session) = self.open_head(&session_id) {
+                    session.shell_expanded.remove(&run);
+                }
+            }
+            GuiIntent::CopyShellOutput { session_id, run_id } => {
+                let run: CommandId = intents::id("run", &run_id)?;
+                let copied = open_session(&self.view)
+                    .filter(|view| view.id.0.to_string() == session_id)
+                    .and_then(|view| view.shell.runs.iter().find(|r| r.run == run))
+                    .map(|run| copy_output(run, COPY_MAX));
+                if let Some(copied) = copied {
+                    self.copied(copied, clock, out)?;
+                }
+            }
             GuiIntent::RunSnippet {
                 session_id,
                 snippet_id,
@@ -715,23 +751,15 @@ impl Head {
             }
             GuiIntent::OpenFull { blob_id } => {
                 let id = intents::id("blob", &blob_id)?;
+                // A shell run's output shows in the app (`ExpandShellRun`).
                 let state = open_session(&self.view).and_then(|view| {
-                    let in_timeline = view.timeline.iter().find_map(|item| match item {
+                    view.timeline.iter().find_map(|item| match item {
                         TimelineItem::Logged { entry, .. } => sections(entry)
                             .into_iter()
                             .filter_map(|s| s.blob)
                             .find(|b| b.id == id)
                             .map(|b| b.state.clone()),
                         TimelineItem::Pending { .. } => None,
-                    });
-                    // A shell run's whole output.
-                    in_timeline.or_else(|| {
-                        view.shell
-                            .runs
-                            .iter()
-                            .filter_map(|run| run.output.as_ref())
-                            .find(|b| b.id == id)
-                            .map(|b| b.state.clone())
                     })
                 });
                 out.push(Out::Effect(match state {
@@ -752,27 +780,8 @@ impl Head {
                         CopyWhat::Call => call_content(item),
                     }
                 });
-                let Some(content) = content else {
-                    return Ok(());
-                };
-                match copy(content, COPY_MAX) {
-                    Copied::Text { text, notice } => {
-                        out.push(Out::Effect(PlatformEffect::CopyToClipboard { text }));
-                        out.push(Out::Effect(PlatformEffect::Notice { text: notice }));
-                    }
-                    Copied::Fetch { fetch, notice } => {
-                        if let Some(id) = fetch {
-                            self.dispatch_user(
-                                Action::DownloadBlob(id),
-                                Purpose::Plain,
-                                clock,
-                                out,
-                            );
-                        }
-                        out.push(Out::Effect(PlatformEffect::Notice { text: notice }));
-                    }
-                    Copied::Refused(text) => out.push(Out::Effect(PlatformEffect::Notice { text })),
-                    Copied::Failed(text) => return Err(text),
+                if let Some(content) = content {
+                    self.copied(copy(content, COPY_MAX), clock, out)?;
                 }
             }
             GuiIntent::SearchTyped { query } => {
@@ -991,6 +1000,26 @@ impl Head {
             GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
+        }
+        Ok(())
+    }
+
+    /// Carries out what a copy came to: the clipboard and a notice, or the
+    /// download it needs first; an unreadable file is the error returned.
+    fn copied(&mut self, copied: Copied, clock: Clock, out: &mut Vec<Out>) -> Result<(), String> {
+        match copied {
+            Copied::Text { text, notice } => {
+                out.push(Out::Effect(PlatformEffect::CopyToClipboard { text }));
+                out.push(Out::Effect(PlatformEffect::Notice { text: notice }));
+            }
+            Copied::Fetch { fetch, notice } => {
+                if let Some(id) = fetch {
+                    self.dispatch_user(Action::DownloadBlob(id), Purpose::Plain, clock, out);
+                }
+                out.push(Out::Effect(PlatformEffect::Notice { text: notice }));
+            }
+            Copied::Refused(text) => out.push(Out::Effect(PlatformEffect::Notice { text })),
+            Copied::Failed(text) => return Err(text),
         }
         Ok(())
     }
@@ -1221,9 +1250,15 @@ impl Head {
         }
 
         // The runs are the session's whichever view of it shows.
-        let runs = open
-            .map(|view| shell::rows(view, clock.wall_ms))
-            .unwrap_or_default();
+        let runs = match (open, &mut self.session) {
+            (Some(view), Some(session)) => shell::rows(
+                view,
+                &session.shell_expanded,
+                &mut session.outputs,
+                clock.wall_ms,
+            ),
+            _ => Vec::new(),
+        };
         let updates = match &self.sent.shell {
             Some((sent_id, old)) if *sent_id == id => shell::diff(old, &runs),
             _ => None,

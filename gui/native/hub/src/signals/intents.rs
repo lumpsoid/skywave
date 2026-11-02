@@ -59,6 +59,24 @@ pub enum GuiIntent {
         session_id: String,
         run_id: String,
     },
+    /// Show a run's whole output in its row (`whole`), downloading its
+    /// output blob if needed; `CollapseShellRun` stops sending it.
+    ExpandShellRun {
+        session_id: String,
+        run_id: String,
+    },
+    CollapseShellRun {
+        session_id: String,
+        run_id: String,
+    },
+    /// Copy a run's whole output, ANSI stripped: its downloaded blob, else
+    /// the run's own text (all of it when it has no blob, a running run's
+    /// tail so far); a blob not here is downloaded first and the notice
+    /// says to copy again.
+    CopyShellOutput {
+        session_id: String,
+        run_id: String,
+    },
     /// Run a shell snippet's text as a command at once, on no condition;
     /// the composer keeps what it holds.
     RunSnippet {

@@ -2316,3 +2316,165 @@ fn shell_mode_lists_and_saves_shell_snippets_and_a_long_press_runs_one() {
         ["an agent prompt"]
     );
 }
+
+impl Rig {
+    /// Logs run `run` of `command` by this device as started at `at`.
+    fn started_run(&mut self, run: CommandId, command: &str, at: chrono::DateTime<Utc>) {
+        let me = self.me;
+        self.log_shell(
+            run,
+            at,
+            EventKind::ShellRequested {
+                command: command.into(),
+                when: RunWhen::Always,
+                by: me,
+            },
+        );
+        self.log_shell(
+            run,
+            at,
+            EventKind::ShellStarted {
+                run,
+                cwd: "/srv/work".into(),
+            },
+        );
+    }
+
+    /// A finished run of `command` by this device, with `preview` of its
+    /// `lines` lines and, when the preview does not hold them, `output`.
+    fn finished_run(
+        &mut self,
+        command: &str,
+        preview: &str,
+        lines: u32,
+        output: Option<skywave_proto::BlobRef>,
+    ) -> CommandId {
+        let run = CommandId::new();
+        let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+        self.started_run(run, command, at);
+        let me = self.me;
+        self.log_shell(
+            run,
+            at + chrono::Duration::seconds(2),
+            EventKind::ShellFinished {
+                run,
+                by: me,
+                started_at: Some(at),
+                command_line: command.into(),
+                end: skywave_proto::ShellEnd::Exited { code: 0 },
+                cwd: None,
+                preview: preview.into(),
+                lines,
+                truncated: output.is_some(),
+                output,
+            },
+        );
+        run
+    }
+
+    fn expand_run(&mut self, run: CommandId) -> Vec<Out> {
+        self.intent(GuiIntent::ExpandShellRun {
+            session_id: self.session.0.to_string(),
+            run_id: run.0.to_string(),
+        })
+    }
+
+    fn copy_run(&mut self, run: CommandId) -> Vec<Out> {
+        self.intent(GuiIntent::CopyShellOutput {
+            session_id: self.session.0.to_string(),
+            run_id: run.0.to_string(),
+        })
+    }
+}
+
+fn copied(outs: &[Out]) -> Vec<String> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Effect(PlatformEffect::CopyToClipboard { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_expanded_run_carries_its_whole_downloaded_output_stripped() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let blob = skywave_proto::BlobId::new();
+    let output = skywave_proto::BlobRef { id: blob, size: 40 };
+    let run = rig.finished_run("make test", "line 3\nline 4", 4, Some(output));
+    let row = rig.runs()[0].clone();
+    assert!(!row.expanded && row.whole.is_none(), "{row:?}");
+
+    // Expanding downloads it; until it is here there is nothing whole.
+    rig.expand_run(run);
+    assert_eq!(rig.actions, [Action::DownloadBlob(blob)]);
+    let row = rig.runs()[0].clone();
+    assert!(row.expanded, "{row:?}");
+    assert_eq!(row.whole, None);
+    // Copying before it is here copies nothing, not the preview.
+    assert!(copied(&rig.copy_run(run)).is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"\x1b[1mline 1\x1b[0m\nline\t2\nline 3\nline 4\n").unwrap();
+    rig.seam
+        .blob_status(blob, skywave_core::BlobStatus::Available { path })
+        .unwrap();
+    rig.view();
+    let row = rig.runs()[0].clone();
+    assert_eq!(
+        row.whole.as_deref(),
+        Some("line 1\nline    2\nline 3\nline 4\n")
+    );
+    assert_eq!(row.whole_note, None, "all of it shows");
+    assert_eq!(
+        copied(&rig.copy_run(run)),
+        ["line 1\nline\t2\nline 3\nline 4\n"]
+    );
+
+    // Collapsed, the row sends only its tail again.
+    rig.intent(GuiIntent::CollapseShellRun {
+        session_id: rig.session.0.to_string(),
+        run_id: run.0.to_string(),
+    });
+    let row = rig.runs()[0].clone();
+    assert!(!row.expanded && row.whole.is_none(), "{row:?}");
+    assert_eq!(row.tail, "line 3\nline 4");
+}
+
+#[test]
+fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let whole = rig.finished_run("ls", "a\nb", 2, None);
+    rig.expand_run(whole);
+    assert!(rig.actions.is_empty(), "nothing to download");
+    let row = rig.runs()[0].clone();
+    assert_eq!((row.whole.as_deref(), row.whole_note), (Some("a\nb"), None));
+    assert_eq!(copied(&rig.copy_run(whole)), ["a\nb"]);
+
+    // A run still going has only its newest lines so far.
+    let run = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 5, 0).unwrap();
+    rig.started_run(run, "make", at);
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellOutput {
+            run,
+            tail: "y\nz".into(),
+            lines: 30,
+            bytes: 300,
+        },
+    );
+    rig.expand_run(run);
+    let row = rig.runs()[1].clone();
+    assert_eq!(row.whole.as_deref(), Some("y\nz"));
+    assert_eq!(
+        row.whole_note.as_deref(),
+        Some(
+            "… 28 earlier lines not shown · the newest lines so far; the whole output once it finishes"
+        )
+    );
+}

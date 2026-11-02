@@ -7382,6 +7382,76 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
 }
 
 #[test]
+fn a_long_expanded_output_pages_to_its_end_and_back() {
+    let (mut h, id, me) = shell_session();
+    let run = CommandId::new();
+    let (blob_id, output) = blob(8000);
+    // More lines than the timeline's expanded cap (400), coloured.
+    let raw: String = (1..=600)
+        .map(|n| format!("\x1b[32mout {n:03}\x1b[0m\n"))
+        .collect();
+    let mut end = finished(
+        id,
+        at_s(1, 5),
+        run,
+        me,
+        at(1),
+        "out 599\nout 600\n",
+        Some(output),
+    );
+    if let EventKind::ShellFinished { lines, .. } = &mut end.kind {
+        *lines = 600;
+    }
+    pull(
+        &mut h,
+        vec![
+            requested(id, 1, run, me, "make test"),
+            started(id, at(1), run),
+            end,
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, raw).unwrap();
+    h.seam
+        .blob_status(blob_id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    h.key_with(ctrl('t'));
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Char('k'));
+    assert_contains(&footer(&h), "PgUp/PgDn");
+    h.key(KeyCode::Enter);
+
+    // Expanded, it shows from its top: every line, the first included.
+    let screen = h.screen();
+    assert_contains(&screen, "$ make test");
+    assert_contains(&screen, "out 001");
+    assert!(!screen.contains("out 600"), "{screen}");
+    assert!(!screen.contains("[32m"), "{screen}");
+
+    // PgDn pages down to its last line and stops there.
+    let mut pages = 0;
+    while !h.screen().contains("out 600") {
+        h.key(KeyCode::PageDown);
+        pages += 1;
+        assert!(pages < 100, "never reached the end:\n{}", h.screen());
+    }
+    assert!(pages > 1, "a long output takes more than a page");
+    let last = h.screen();
+    assert!(!last.contains("$ make test"), "{last}");
+    h.key(KeyCode::PageDown);
+    assert_eq!(h.screen(), last, "no further than its end");
+
+    // And PgUp as far back up, to the command.
+    for _ in 0..pages {
+        h.key(KeyCode::PageUp);
+    }
+    assert_contains(&h.screen(), "$ make test");
+    assert_contains(&h.screen(), "out 001");
+}
+
+#[test]
 fn the_clock_ticks_while_a_run_runs() {
     let (mut h, id, me) = shell_session();
     let run = CommandId::new();

@@ -709,10 +709,10 @@ fn footer_keys(app: &App) -> &'static str {
             Some((view, ui, Focus::Timeline)) if ui.shell() => {
                 match ui.selected_run(view).filter(|run| run.discardable) {
                     Some(_) => {
-                        "e edit · Del take back · ↑↓ select · Enter expand · y copy · Ctrl-X stop · Tab write · Esc back · ? help"
+                        "e edit · Del take back · ↑↓ select · Enter expand · y copy · PgUp/PgDn · Ctrl-X stop · Tab write · Esc back · ? help"
                     }
                     None => {
-                        "↑↓ select · Enter expand · d download · y copy · Ctrl-X stop · Ctrl-T agent · Tab write · ? help"
+                        "↑↓ select · Enter expand · PgUp/PgDn · d download · y copy · Ctrl-X stop · Ctrl-T agent · Tab write · ? help"
                     }
                 }
             }
@@ -933,6 +933,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                         "Enter / Space",
                         "show its whole output; downloads it if needed",
                     ),
+                    key("PgUp / PgDn", "page through a run taller than the list"),
                     key("d", "download its whole output"),
                     key("y", "copy its output, colours stripped (the whole"),
                     key("", "output once downloaded, else what shows)"),
