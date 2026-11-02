@@ -433,7 +433,7 @@ own, true because both heads render a per-task stop.
   a control request);
 - an always-on indicator;
 - a subagent transcript view (needs `parent` on `ToolCall` / `AgentMessage`
-  and `forwardSubagentText`);
+  and `forwardSubagentText`; writing to a subagent goes by D33's relay);
 - task output (`output_file`, `summary`, `usage`);
 - backgrounding a foreground task (`background_tasks` control request,
   Ctrl+B);
@@ -503,3 +503,35 @@ mode, model, effort or grants; an agent capability that lets clients hide
 adoption for agents that cannot fork (today such an adapter must fail
 `Adopt` with `AgentError::Start`); migrating old stored `from` events
 (alpha: such databases are deleted).
+
+## D33. Messaging a subagent: relay through the main agent
+Decided by the user 2026-11-02, from the probe and binary reading in
+docs/agents/claude-code.md §3.12. When a user writes to a subagent, the
+adapter will send the main agent a user message asking it to forward the
+text with its `SendMessage` tool: "the relay". Nothing is implemented yet;
+this fixes the route for the subagent transcript feature (D31, deferred).
+**Why the relay:** in `-p` mode it is the only way in. The control request
+meant for this, `send_task_message`, is a stub in CLI 2.1.310 that answers
+`Unsupported control request subtype`. A `user` line with
+`parent_tool_use_id` reaches the main agent, not the subagent. The TUI
+messages agents through in-process functions no stdin line reaches.
+`SendMessage` calls the same functions as the TUI, so delivery is the same:
+at the subagent's next tool round, or by resuming it if it finished.
+**Costs accepted:** a main turn per message, which waits behind a running
+turn; the text passes through the model, which is told to forward it
+verbatim; the subagent sees it as the main agent's, not the user's; the
+relay exchange shows in the main timeline, so heads should present it as
+sent to the subagent.
+**Acks**, settled only by what the CLI says: queued by the
+`SendMessage` result (`success: true`); delivered only by the resume
+`task_started` (same `task_id`, new `run_id`, `prompt` equal to the text).
+Mid-run delivery leaves no line on stdout, so such a message stays queued in
+the heads, never guessed delivered.
+**`send_task_message` is not sent** (user decision): no try-then-fall-back
+in the adapter while every known CLI answers `Unsupported`. Each CLI bump
+re-runs `tests/support/probe-subagent-message.py ctl_live`; once it
+succeeds, record a fixture and revisit this decision.
+**Rejected:** sending `send_task_message` speculatively on every process;
+writing a subagent's `pendingMessages` or task state from outside (internal
+to the CLI process); the agent-team mailbox route seen in the TUI's submit
+path (for teammates, not subagents; not traced).
