@@ -1090,7 +1090,7 @@ fn esc_cancels_the_new_session_prompt() {
     assert!(h.app.ui().prompt.is_none());
     assert!(h.drain_requests().is_empty());
     assert!(h.seam.pending_outbox().unwrap().is_empty());
-    assert_contains(&h.screen(), "n new session");
+    assert_contains(&h.screen(), "n new");
     // Out of the prompt, `q` quits again.
     h.key(KeyCode::Char('q'));
     assert!(h.app.ui().quit);
@@ -1162,6 +1162,76 @@ fn tab_fills_in_the_only_directory() {
             workdir: "/srv/api/".into()
         })
     );
+}
+
+#[test]
+fn continuing_an_outside_conversation_asks_the_workdir_then_the_id() {
+    let mut h = Harness::paired();
+    assert_eq!(h.key(KeyCode::Char('c')), None);
+    assert!(h.app.typing());
+    assert_contains(
+        &h.screen(),
+        "Continue an outside conversation · workdir on the server",
+    );
+    let hint = h.screen();
+    assert_contains(&hint, "Enter next: the id");
+    assert!(!hint.contains("Enter create"), "{hint}");
+    h.type_text("/srv/a");
+    // Positive control: step one completes like the create prompt.
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::CompleteWorkdir {
+            input: "/srv/a".into()
+        })
+    );
+    let (req, _) = list_dirs_request(&h);
+    answer_listing(&mut h, req, "/srv", &["api"]);
+    assert_eq!(workdir_input(&h), "/srv/api/");
+
+    // Enter moves to the id; nothing is dispatched and the prompt stays.
+    assert!(!matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession { .. })
+    ));
+    assert!(h.app.ui().prompt.is_some());
+    assert_eq!(workdir_input(&h), "");
+    assert_contains(&h.screen(), "agent session id (paste it)");
+
+    // Tab is not completion here; the text is untouched.
+    h.type_text("ab");
+    assert_eq!(h.key(KeyCode::Tab), None);
+    assert_eq!(workdir_input(&h), "ab");
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Backspace);
+
+    // A pasted id, with its trailing newline, is the whole input.
+    h.app.on_paste(" 0b6c1a2e-1111-4222-8333-444455556666\n");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            workdir: "/srv/api/".into(),
+            conversation: Some("0b6c1a2e-1111-4222-8333-444455556666".into()),
+        })
+    );
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    assert!(!h.app.typing());
+}
+
+#[test]
+fn escape_at_the_id_step_cancels_without_creating() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('c'));
+    h.type_text("/srv/x");
+    h.key(KeyCode::Enter);
+    h.type_text("some-id");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().prompt.is_none());
+    assert!(!h.app.typing());
+    assert!(!h.screen().contains("Continue an outside conversation"));
+    // The session list takes keys again, and nothing was queued.
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    assert_contains(&h.screen(), "New session");
 }
 
 #[test]
