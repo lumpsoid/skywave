@@ -18,7 +18,7 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
-    AgentSession, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
+    AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
     PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay,
     ToolKind, TurnOutcome, TurnUsage,
 };
@@ -341,7 +341,7 @@ fn timeline(events: &[AdapterEvent]) -> Vec<String> {
                             .map(|p| format!("<{p}"))
                             .unwrap_or_default();
                         let ambient = if t.ambient { "~" } else { "" };
-                        format!("{}:{:?}{parent}{ambient}", t.id, t.kind)
+                        format!("{}:{:?}{}{parent}{ambient}", t.id, t.kind, call_tag(t))
                     })
                     .collect();
                 Some(format!("tasks: [{}]", tasks.join(", ")))
@@ -353,6 +353,15 @@ fn timeline(events: &[AdapterEvent]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// `@` and the last six characters of the call a subagent task runs, when
+/// the task names it; nothing otherwise.
+fn call_tag(task: &AgentTask) -> String {
+    task.call
+        .as_ref()
+        .map(|call| format!("@{}", &call.0[call.0.len().saturating_sub(6)..]))
+        .unwrap_or_default()
 }
 
 /// What the agent reports unasked about its mode and model, and the empty
@@ -3082,7 +3091,10 @@ fn replay_stop_task_answers_each_stop_after_the_task_leaves() {
                 Some(format!("stop refused {task}: {reason}"))
             }
             AdapterEvent::BackgroundTasks(tasks) => {
-                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                let ids: Vec<String> = tasks
+                    .iter()
+                    .map(|t| format!("{}{}", t.id, call_tag(t)))
+                    .collect();
                 Some(format!("tasks: [{}]", ids.join(", ")))
             }
             _ => None,
@@ -3094,8 +3106,10 @@ fn replay_stop_task_answers_each_stop_after_the_task_leaves() {
             "tasks: []",
             "tasks: [b1wyh3vwb]",
             "tasks: [b1wyh3vwb, ad1d67e1d863e85eb]",
+            // The subagent's call, from its `task_started`.
+            "tasks: [b1wyh3vwb, ad1d67e1d863e85eb@7b9HWB]",
             // The CLI drops the task from its set before it acks the stop.
-            "tasks: [ad1d67e1d863e85eb]",
+            "tasks: [ad1d67e1d863e85eb@7b9HWB]",
             "stop answered: b1wyh3vwb",
             "tasks: []",
             "stop answered: ad1d67e1d863e85eb",
@@ -3138,56 +3152,168 @@ fn stop_task_error_answer_is_a_refusal_with_the_cli_text() {
     assert_eq!(protocol.on_line(&answer.to_string()).events, []);
 }
 
-#[test]
-fn replay_subagent_messages_stay_off_the_main_timeline() {
-    // Positive control: the recording holds a subagent message that says
-    // PONG, so the absence below is the protocol's doing.
-    let from_subagent = fixture("subagent")
+/// The last six characters of `id`, enough to tell the recordings' ids apart.
+fn short(id: &str) -> &str {
+    &id[id.len().saturating_sub(6)..]
+}
+
+/// The turns, texts, tool calls and results of `events`, one line each; a
+/// call or result reads its call's [`short`] id, and a subagent's step ends
+/// in `@` and its `parent`'s.
+fn steps(events: &[AdapterEvent]) -> Vec<String> {
+    fn tag(parent: Option<&skywaved::agent::AgentCallId>) -> String {
+        parent
+            .map(|p| format!(" @{}", short(&p.0)))
+            .unwrap_or_default()
+    }
+    fn id(call: Option<&skywaved::agent::AgentCallId>) -> &str {
+        call.map_or("-", |c| short(&c.0))
+    }
+    events
         .iter()
-        .filter(|r| r["dir"] == "out")
-        .filter(|r| !r["msg"]["parent_tool_use_id"].is_null())
-        .filter(|r| r["msg"].to_string().contains("PONG"))
-        .count();
-    assert!(from_subagent > 0);
-    let events = replay("subagent", Uuid::new_v4(), false, &[]);
-    let texts: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            AdapterEvent::Text { text, .. } => Some(text.as_str()),
+        .filter_map(|event| match event {
+            AdapterEvent::TurnStarted => Some("turn started".to_owned()),
+            AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
+            AdapterEvent::Text { text, parent } => Some(format!(
+                "text: {}{}",
+                text.lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(32)
+                    .collect::<String>(),
+                tag(parent.as_ref())
+            )),
+            AdapterEvent::ToolCall {
+                call, parent, name, ..
+            } => Some(format!(
+                "call {} {name}{}",
+                id(call.as_ref()),
+                tag(parent.as_ref())
+            )),
+            AdapterEvent::ToolResult { call, result } => {
+                let kind = if result.is_error { "error" } else { "ok" };
+                Some(format!("result {} {kind}", id(call.as_ref())))
+            }
             _ => None,
         })
+        .collect()
+}
+
+/// Fixture `name` without the stdin lines the recording driver wrote on
+/// its own (a `send_task_message` or `background_tasks` control request, a
+/// user message to a subagent) and the CLI's answers to them: the adapter
+/// writes none of those.
+fn without_probe_writes(name: &str) -> Vec<Value> {
+    let records = fixture(name);
+    let probe: Vec<Value> = records
+        .iter()
+        .filter(|r| r["dir"] == "in")
+        .filter(|r| {
+            matches!(
+                r["msg"]["request"]["subtype"].as_str(),
+                Some("send_task_message" | "background_tasks")
+            ) || (r["msg"]["type"] == "user" && !r["msg"]["parent_tool_use_id"].is_null())
+        })
+        .map(|r| r["msg"]["request_id"].clone())
         .collect();
-    assert!(
-        texts.contains(&"The subagent replied: **PONG**"),
-        "the main agent's own text is reported: {texts:?}"
+    records
+        .into_iter()
+        .filter(|r| {
+            let request = &r["msg"]["request"]["subtype"];
+            let probe_request = r["dir"] == "in"
+                && (matches!(
+                    request.as_str(),
+                    Some("send_task_message" | "background_tasks")
+                ) || (r["msg"]["type"] == "user" && !r["msg"]["parent_tool_use_id"].is_null()));
+            let probe_answer = r["dir"] == "out"
+                && r["msg"]["type"] == "control_response"
+                && probe
+                    .iter()
+                    .any(|id| !id.is_null() && r["msg"]["response"]["request_id"] == *id);
+            !probe_request && !probe_answer
+        })
+        .collect()
+}
+
+/// [`replay`] of [`without_probe_writes`].
+fn replay_subagent(name: &str) -> Vec<AdapterEvent> {
+    let (events, version) = replay_records(
+        name,
+        without_probe_writes(name),
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
     );
-    assert!(!texts.contains(&"PONG"), "{texts:?}");
-    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert_eq!(version.as_deref(), Some(PINNED_VERSION));
+    events
+}
+
+/// The task sets of `events`, as [`timeline`] puts them.
+fn task_sets(events: &[AdapterEvent]) -> Vec<String> {
+    timeline(events)
+        .into_iter()
+        .filter(|l| l.starts_with("tasks: "))
+        .collect()
+}
+
+#[test]
+fn replay_subagent_reports_its_text_under_its_agent_call() {
+    let events = replay("subagent", Uuid::new_v4(), false, &[]);
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call GKDTUq Agent",
+            "result GKDTUq ok",
+            "text: The subagent is running in the b",
+            "turn ended",
+            // After the main turn, outside any.
+            "text: PONG @GKDTUq",
+            "turn started",
+            // The main agent's own text has no parent.
+            "text: The subagent replied: **PONG**",
+            "turn ended",
+        ]
+    );
+    // The set listing the task comes before `task_started`, so before its
+    // call is known; the set is reported again once it is.
+    let sub = "adf7c47cbdbddd347";
+    assert_eq!(
+        task_sets(&events),
+        [
+            "tasks: []".to_owned(),
+            format!("tasks: [{sub}:Subagent]"),
+            format!("tasks: [{sub}:Subagent@GKDTUq]"),
+            "tasks: []".to_owned(),
+        ]
+    );
 }
 
 #[test]
 fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
     let events = replay("subagent_background_bash", Uuid::new_v4(), false, &[]);
     let sub = "ad175146a4bfec159";
-    let sets: Vec<String> = timeline(&events)
-        .into_iter()
-        .filter(|l| l.starts_with("tasks: "))
-        .collect();
+    let sets = task_sets(&events);
     assert_eq!(
         sets,
         [
             "tasks: []".to_owned(),
             format!("tasks: [{sub}:Subagent]"),
-            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}]"),
-            format!("tasks: [{sub}:Subagent, bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent@XRGPjR]"),
+            format!("tasks: [{sub}:Subagent@XRGPjR, bq0uy05dr:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent@XRGPjR, bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
             format!("tasks: [bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
             format!("tasks: [b0mpthszv:Shell<{sub}]"),
             // The re-woken subagent comes first, though it started first
-            // only by luck of the list: the CLI's order is kept.
-            format!("tasks: [{sub}:Subagent, b0mpthszv:Shell<{sub}]"),
+            // only by luck of the list: the CLI's order is kept. Its call is
+            // known from the first `task_started`, so no set is reported
+            // again for the wake's.
+            format!("tasks: [{sub}:Subagent@XRGPjR, b0mpthszv:Shell<{sub}]"),
             format!("tasks: [b0mpthszv:Shell<{sub}]"),
             "tasks: []".to_owned(),
-            format!("tasks: [{sub}:Subagent]"),
+            format!("tasks: [{sub}:Subagent@XRGPjR]"),
             "tasks: []".to_owned(),
         ]
     );
@@ -3200,6 +3326,373 @@ fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
             .skip(1)
             .all(|l| l != "tasks: []")
     );
+    // A shell's own `task_started` names the subagent's Bash call, not an
+    // `Agent` call: the steps after each wake keep the original call.
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call XRGPjR Agent",
+            "result XRGPjR ok",
+            "text: LAUNCHED",
+            "turn ended",
+            "call DJDG2s Bash @XRGPjR",
+            "result DJDG2s ok",
+            "call XmkipX ToolSearch @XRGPjR",
+            "result XmkipX ok",
+            "call 9VhgWa Monitor @XRGPjR",
+            "result 9VhgWa ok",
+            "text: The background `sleep 120 && ech @XRGPjR",
+            "turn started",
+            "text: The subagent is not finished yet",
+            "turn ended",
+            // Woken by the first shell's end.
+            "text: SLEPT @XRGPjR",
+            "turn started",
+            // Woken by the monitor, inside the turn the CLI started.
+            "text: SLEPT @XRGPjR",
+            "text: DONE",
+            "turn ended",
+            "turn started",
+            "text: DONE",
+            "turn ended",
+        ]
+    );
+}
+
+/// The `parent` of each subagent text and call `events` report, in order.
+fn parents(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::Text {
+                parent: Some(p), ..
+            }
+            | AdapterEvent::ToolCall {
+                parent: Some(p), ..
+            } => Some(p.0.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `parent_tool_use_id` of each text (not empty) and tool use in the
+/// subagent `assistant` lines of `records`, in order.
+fn recorded_parents(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r["dir"] == "out" && r["msg"]["type"] == "assistant")
+        .filter_map(|r| {
+            let parent = r["msg"]["parent_tool_use_id"].as_str()?;
+            let blocks = r["msg"]["message"]["content"].as_array()?;
+            let reported = blocks
+                .iter()
+                .filter(|b| {
+                    b["type"] == "tool_use"
+                        || (b["type"] == "text"
+                            && b["text"].as_str().is_some_and(|t| !t.is_empty()))
+                })
+                .count();
+            Some(vec![parent.to_owned(); reported])
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn replay_every_subagent_step_is_reported_under_its_agent_call() {
+    for name in [
+        "subagent",
+        "subagent_approval",
+        "subagent_background_bash",
+        "subagent_foreground",
+        "subagent_foreground_backgrounded",
+        "subagent_foreground_stop",
+        "subagent_message_ctl",
+        "subagent_message_ctl_done",
+        "subagent_message_ptu",
+        "subagent_message_relay",
+        "subagent_message_relay_midrun",
+    ] {
+        let events = replay_subagent(name);
+        let expected = recorded_parents(&without_probe_writes(name));
+        // Positive control: every recording has subagent steps.
+        assert!(!expected.is_empty(), "{name}");
+        assert_eq!(parents(&events), expected, "{name}");
+        // The calls the main agent made itself have no parent.
+        let main_calls = events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::ToolCall { parent: None, .. }))
+            .count();
+        assert!(main_calls > 0, "{name}");
+    }
+}
+
+#[test]
+fn replay_subagent_message_ctl_pairs_each_call_after_the_turn_with_its_result() {
+    let events = replay_subagent("subagent_message_ctl");
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call y3gna1 Agent",
+            "result y3gna1 ok",
+            "text: STARTED",
+            "turn ended",
+            // All after the main turn's `result`.
+            "call 2KBExm Bash @y3gna1",
+            "result 2KBExm error",
+            "call C6aquz Bash @y3gna1",
+            "result C6aquz error",
+            "text: The harness blocked both foregro @y3gna1",
+            "call u9eSqe Bash @y3gna1",
+            "result u9eSqe ok",
+            "text: I could not complete the two `sl @y3gna1",
+            "turn started",
+            "text: The background agent finished, b",
+            "turn ended",
+            "call 1TR1XM Bash @y3gna1",
+            "result 1TR1XM ok",
+            "text: The first background `sleep 25`  @y3gna1",
+            "turn started",
+            "text: The agent sent an update that co",
+            "turn ended",
+            "text: Both background `sleep 25` runs  @y3gna1",
+            "turn started",
+            "text: The agent has now finished. It r",
+            "turn ended",
+        ]
+    );
+}
+
+/// A subagent's `assistant` line under `Agent` call `parent` calling
+/// `tool` as `id`; the main agent's for no `parent`.
+fn tool_use_line(id: &str, tool: &str, parent: Option<&str>) -> String {
+    json!({
+        "type": "assistant",
+        "parent_tool_use_id": parent,
+        "message": { "content": [{ "type": "tool_use", "id": id, "name": tool, "input": {} }] },
+    })
+    .to_string()
+}
+
+/// The result line for call `id` under `parent`, with the structured
+/// result of a three-line `Read`.
+fn read_result_line(id: &str, parent: Option<&str>) -> String {
+    json!({
+        "type": "user",
+        "parent_tool_use_id": parent,
+        "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": "a\nb\nc" }] },
+        "tool_use_result": { "file": { "numLines": 3, "content": "a\nb\nc" } },
+    })
+    .to_string()
+}
+
+fn result_status(out: &protocol::Output) -> Option<String> {
+    match &out.events[..] {
+        [AdapterEvent::ToolResult { result, .. }] => result.status.clone(),
+        other => panic!("expected one result, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_subagent_result_after_the_turn_is_still_read_by_its_tool() {
+    // The recordings' subagent results carry no structured result, so a
+    // tool's own reading is shown here.
+    let mut protocol = running_protocol();
+    protocol.send_message("go".to_owned());
+    protocol.on_line(&tool_use_line("sub-read", "Read", Some("agent-1")));
+    protocol.on_line(&tool_use_line("main-read", "Read", None));
+    let asked = protocol.on_line(&can_use_tool("p1", None));
+    assert!(matches!(
+        &asked.events[..],
+        [AdapterEvent::ApprovalRequested { task: None, .. }]
+    ));
+    // A subagent's result inside the turn leaves the turn's approval be.
+    protocol.on_line(&tool_use_line("sub-other", "Bash", Some("agent-1")));
+    let other = protocol.on_line(
+        &json!({
+            "type": "user",
+            "parent_tool_use_id": "agent-1",
+            "message": { "content": [{ "type": "tool_result", "tool_use_id": "sub-other", "content": "ok" }] },
+        })
+        .to_string(),
+    );
+    assert!(matches!(
+        &other.events[..],
+        [AdapterEvent::ToolResult { .. }]
+    ));
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(end.events[0], cancelled("p1", protocol::TURN_ENDED_REASON));
+
+    let sub = protocol.on_line(&read_result_line("sub-read", Some("agent-1")));
+    assert_eq!(result_status(&sub).as_deref(), Some("3 lines"));
+    // The contrast: a main call's names go with its turn.
+    let main = protocol.on_line(&read_result_line("main-read", None));
+    assert_eq!(result_status(&main), None);
+    // Its name is taken once: a second result reads no tool.
+    let again = protocol.on_line(&read_result_line("sub-read", Some("agent-1")));
+    assert_eq!(result_status(&again), None);
+}
+
+#[test]
+fn replay_subagent_approval_is_for_the_subagents_own_call() {
+    let events = replay("subagent_approval", Uuid::new_v4(), false, &[]);
+    let write = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ToolCall {
+                call: Some(call),
+                parent: Some(parent),
+                name,
+                ..
+            } if name == "Write" => Some((call.clone(), parent.clone())),
+            _ => None,
+        })
+        .expect("the subagent's Write call");
+    assert_eq!(short(&write.1.0), "ruuaq6");
+    let approval = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ApprovalRequested {
+                request,
+                call,
+                task,
+                ..
+            } if request.0 == SUBAGENT_APPROVAL => Some((call.clone(), task.clone())),
+            _ => None,
+        })
+        .expect("the approval");
+    assert_eq!(
+        approval,
+        (Some(write.0), Some("add5b3d5dc618eaff".to_owned()))
+    );
+}
+
+#[test]
+fn replay_subagent_foreground_runs_its_steps_inside_the_turn() {
+    let task = "a4d46d45b352d2620";
+    let mut records = without_probe_writes("subagent_foreground");
+    // Positive control: the prompt is a subagent `user` text line.
+    assert!(records.iter().any(|r| {
+        r["dir"] == "out"
+            && r["msg"]["type"] == "user"
+            && !r["msg"]["parent_tool_use_id"].is_null()
+            && r["msg"]["message"]["content"][0]["type"] == "text"
+    }));
+    // A set listing the task, as Ctrl+B would have made it: its call is
+    // known from `task_started` alone.
+    let listed: Value = serde_json::from_str(&subagent_tasks(&[task])).unwrap();
+    records.push(json!({ "dir": "out", "msg": listed }));
+    let (events, _) = replay_records(
+        "subagent_foreground",
+        records,
+        Uuid::new_v4(),
+        false,
+        &[],
+        false,
+    );
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call c3VtT8 Agent",
+            // No text: the prompt shows in the Agent call.
+            "call uo1o51 Bash @c3VtT8",
+            "result uo1o51 ok",
+            "call 51eNZd Bash @c3VtT8",
+            "result 51eNZd ok",
+            "call 58QyMG Bash @c3VtT8",
+            "result 58QyMG ok",
+            "result c3VtT8 ok",
+            "text: Three of your five recipes use g",
+            "turn ended",
+        ]
+    );
+    // No set until the one added, which names the call.
+    assert_eq!(
+        task_sets(&events),
+        [
+            "tasks: []".to_owned(),
+            format!("tasks: [{task}:Subagent@c3VtT8]")
+        ]
+    );
+    // Asked under the task's id, but no set listed it: the turn's.
+    let approval = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::ApprovalRequested { call, task, .. } => {
+                Some((call.clone(), task.clone()))
+            }
+            _ => None,
+        })
+        .expect("the approval");
+    assert_eq!(short(&approval.0.unwrap().0), "58QyMG");
+    assert_eq!(approval.1, None);
+}
+
+#[test]
+fn replay_subagent_foreground_backgrounded_enters_the_set_with_its_call() {
+    let events = replay_subagent("subagent_foreground_backgrounded");
+    let task = "ab29fccd426131025";
+    assert_eq!(
+        task_sets(&events),
+        [
+            "tasks: []".to_owned(),
+            // Its `task_started` came long before.
+            format!("tasks: [{task}:Subagent@gfrK32]"),
+            "tasks: []".to_owned(),
+        ]
+    );
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call gfrK32 Agent",
+            "call m6ypuV Bash @gfrK32",
+            "result m6ypuV ok",
+            "call bgdRAw Read @gfrK32",
+            "result bgdRAw ok",
+            // Backgrounded: the Agent call returns.
+            "result gfrK32 ok",
+            "call gpNeNx Read @gfrK32",
+            "result gpNeNx ok",
+            "text: I've started the helper agent. I",
+            "turn ended",
+            "call CeCqU2 Read @gfrK32",
+            "result CeCqU2 ok",
+            "call EQXtfq Read @gfrK32",
+            "result EQXtfq ok",
+            "call iSn3tT Read @gfrK32",
+            "result iSn3tT ok",
+            "text: 5 recipes read, in sorted path o @gfrK32",
+            "turn started",
+            "text: The helper finished and read all",
+            "turn ended",
+        ]
+    );
+}
+
+#[test]
+fn replay_subagent_foreground_stop_fails_the_agent_call() {
+    let events = replay_subagent("subagent_foreground_stop");
+    // The stop came between the subagent's steps: none of its calls is
+    // left open in the recording, and the adapter makes up no result.
+    assert_eq!(
+        steps(&events),
+        [
+            "turn started",
+            "call tfMpmg Agent",
+            "call WyAM99 Bash @tfMpmg",
+            "result WyAM99 ok",
+            "call 3aSzeM Read @tfMpmg",
+            "result 3aSzeM ok",
+            "result tfMpmg error",
+            "text: The helper agent didn't run. You",
+            "turn ended",
+        ]
+    );
+    assert_eq!(task_sets(&events), ["tasks: []"]);
 }
 
 #[test]
@@ -3243,7 +3736,10 @@ fn task_sets_and_interrupts(events: &[AdapterEvent]) -> Vec<String> {
         .iter()
         .filter_map(|event| match event {
             AdapterEvent::BackgroundTasks(tasks) => {
-                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                let ids: Vec<String> = tasks
+                    .iter()
+                    .map(|t| format!("{}{}", t.id, call_tag(t)))
+                    .collect();
                 Some(format!("tasks: [{}]", ids.join(", ")))
             }
             AdapterEvent::TurnEnded(TurnOutcome::Interrupted) => Some("interrupted".to_owned()),
@@ -3260,6 +3756,8 @@ fn replay_an_interrupt_spares_the_background_agent() {
         [
             "tasks: []",
             "tasks: [a2384c814f3a1cabf]",
+            // Again, once `task_started` names its call.
+            "tasks: [a2384c814f3a1cabf@tmkcrx]",
             // The interrupt ends the turn; the agent stays in the set.
             "interrupted",
             // It leaves only when it completes.
@@ -3279,6 +3777,7 @@ fn replay_an_interrupt_without_the_flag_kills_the_background_agent() {
         [
             "tasks: []",
             "tasks: [ade77bae3441b384c]",
+            "tasks: [ade77bae3441b384c@uRKL6V]",
             // The task is gone before the interrupt's turn ends.
             "tasks: []",
             "interrupted",
