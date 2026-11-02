@@ -222,6 +222,30 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE contexts_v10 RENAME TO contexts;
     CREATE INDEX contexts_session ON contexts (session_id);
     "#,
+    // v11: shell commands (protocol v14). Additive: no run exists before it.
+    r#"
+    -- One row per accepted RunShell, keyed by its command id (the run id),
+    -- folded from the five shell events in their append. `when` and `end`
+    -- are SQL keywords, hence `run_when` and `run_end`.
+    CREATE TABLE shell_runs (
+        command_id   TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL REFERENCES sessions (id),
+        -- Seq of the run's ShellRequested.
+        seq          INTEGER NOT NULL,
+        run_when     TEXT NOT NULL
+                     CHECK (run_when IN ('always', 'on_success', 'on_failure')), -- RunWhen
+        -- Seq of the first ShellStopRequested naming the run.
+        stop_seq     INTEGER,
+        -- Seq of its ShellStarted; NULL when it never started.
+        started_seq  INTEGER,
+        -- Seq of its ShellFinished; set, the run is over and logs nothing more.
+        finished_seq INTEGER,
+        run_end      TEXT CHECK (run_end IS NULL OR json_valid(run_end)), -- ShellEnd
+        -- ShellFinished.cwd: where the shell ended, when known.
+        cwd          TEXT
+    ) STRICT;
+    CREATE INDEX shell_runs_session ON shell_runs (session_id, finished_seq);
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -350,7 +374,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 9] = [
+    const TABLES: [&str; 10] = [
         "approvals",
         "blobs",
         "commands",
@@ -359,6 +383,7 @@ mod tests {
         "events",
         "pair_codes",
         "sessions",
+        "shell_runs",
         "supervisor_cursor",
     ];
 
@@ -799,6 +824,49 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(violations, 0);
+    }
+
+    /// A v10 database, from before shell commands, gains an empty
+    /// `shell_runs`; what it had stays, and the new table's checks hold.
+    #[test]
+    fn v11_adds_an_empty_shell_runs_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let a = "01920000-0000-7000-8000-00000000000a";
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..10] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 10).unwrap();
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO sessions (id, workdir, current_context) VALUES ('{a}', '/w/a', '{a}');
+                INSERT INTO contexts (id, session_id) VALUES ('{a}', '{a}');
+                "#
+            ))
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = db.conn();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("sessions"), 1);
+        assert_eq!(count("shell_runs"), 0);
+        let insert = |when: &str, end: &str| {
+            conn.execute(
+                "INSERT INTO shell_runs (command_id, session_id, seq, run_when, run_end)
+                 VALUES ('r', ?1, 1, ?2, ?3)",
+                [a, when, end],
+            )
+        };
+        assert!(insert("sometimes", r#"{"kind":"stopped"}"#).is_err());
+        assert!(insert("always", "not json").is_err());
+        // Positive control: a row that breaks nothing goes in.
+        assert!(insert("on_failure", r#"{"kind":"stopped"}"#).is_ok());
     }
 
     #[test]

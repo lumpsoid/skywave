@@ -7,10 +7,12 @@ use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
     ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
     RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
-    ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult,
+    ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
-use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
+use skywaved::event_log::{
+    DEFAULT_BATCH_LIMIT, PendingApproval, ShellAppended, ShellRun, ShellStatus,
+};
 use skywaved::{Error, EventLog, Storage};
 use tempfile::TempDir;
 
@@ -22,6 +24,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A fixture whose log accepts shell commands.
+    fn with_shell() -> Fixture {
+        let mut f = Fixture::new();
+        f.log = f.log.clone().with_shell(true);
+        f
+    }
+
     fn new() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
@@ -1384,6 +1393,561 @@ fn shell_events_are_not_agent_appends() {
         );
     }
     assert_eq!(f.log.head(), head, "refused appends leave no trace");
+}
+
+// --- shell commands ----------------------------------------------------------
+
+fn run_kind(session: SessionId, command: &str) -> CommandKind {
+    CommandKind::RunShell {
+        session_id: session,
+        command: command.into(),
+        when: RunWhen::Always,
+    }
+}
+
+fn stop_shell_kind(session: SessionId, run: CommandId) -> CommandKind {
+    CommandKind::StopShell {
+        session_id: session,
+        run,
+    }
+}
+
+fn finished(run: CommandId, by: DeviceId, end: ShellEnd, cwd: Option<&str>) -> EventKind {
+    EventKind::ShellFinished {
+        run,
+        by,
+        started_at: None,
+        command_line: "make".into(),
+        end,
+        cwd: cwd.map(Into::into),
+        preview: "ok".into(),
+        lines: 1,
+        output: None,
+        truncated: false,
+    }
+}
+
+fn started(run: CommandId) -> EventKind {
+    EventKind::ShellStarted {
+        run,
+        cwd: "/w".into(),
+    }
+}
+
+fn output(run: CommandId) -> EventKind {
+    EventKind::ShellOutput {
+        run,
+        tail: "x".into(),
+        lines: 1,
+        bytes: 1,
+    }
+}
+
+/// A `shell_runs` row: session, seq, when, stop, started, finished, end, cwd.
+type RunRow = (
+    String,
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+impl Fixture {
+    /// Sends `kind` as `device` under the command id `id`.
+    fn handle_as(&mut self, device: DeviceId, id: CommandId, kind: CommandKind) -> CommandResult {
+        self.log
+            .handle(&mut self.storage.db, device, &Command { id, kind })
+            .unwrap()
+    }
+
+    /// Runs `command` in `session` as `device`; returns the run's id.
+    fn run_shell(&mut self, device: DeviceId, session: SessionId, command: &str) -> CommandId {
+        let run = CommandId::new();
+        accepted(self.handle_as(device, run, run_kind(session, command)));
+        run
+    }
+
+    fn shell(&mut self, kind: EventKind) -> Result<ShellAppended, Error> {
+        self.log.shell_event(&mut self.storage.db, kind)
+    }
+
+    fn run_row(&self, run: CommandId) -> Option<RunRow> {
+        self.storage
+            .db
+            .conn()
+            .query_row(
+                "SELECT session_id, seq, run_when, stop_seq, started_seq, finished_seq,
+                        run_end, cwd
+                 FROM shell_runs WHERE command_id = ?1",
+                [run.0.to_string()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .ok()
+    }
+}
+
+fn sql_seq(seq: Seq) -> i64 {
+    i64::try_from(seq.0).unwrap()
+}
+
+fn appended(result: Result<ShellAppended, Error>) -> Seq {
+    match result {
+        Ok(ShellAppended::Appended(seq)) => seq,
+        other => panic!("expected Appended, got {other:?}"),
+    }
+}
+
+#[test]
+fn run_shell_is_checked_in_order_and_logged_verbatim() {
+    let mut f = Fixture::with_shell();
+    assert!(f.log.shell_enabled());
+    let session = f.create_session();
+    let head = f.log.head();
+    // The session is looked up before the command is checked.
+    assert_eq!(
+        f.handle(run_kind(SessionId::new(), " ")),
+        rejected(RejectReason::UnknownSession)
+    );
+    let too_long = "x".repeat(limits::SHELL_COMMAND_MAX_BYTES + 1);
+    for bad in [too_long.as_str(), "", " \n\t "] {
+        assert_eq!(
+            f.handle(run_kind(session, bad)),
+            rejected(RejectReason::BadShellCommand),
+            "{bad:?}"
+        );
+    }
+    // Bytes, not chars: 4097 two-byte chars are over the limit.
+    let wide = "é".repeat(limits::SHELL_COMMAND_MAX_BYTES / 2 + 1);
+    assert_eq!(
+        f.handle(run_kind(session, &wide)),
+        rejected(RejectReason::BadShellCommand)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    // Positive controls: the longest command goes in, and one with spaces
+    // and lines around it is logged as sent.
+    let longest = "x".repeat(limits::SHELL_COMMAND_MAX_BYTES);
+    accepted(f.handle(run_kind(session, &longest)));
+    let device = DeviceId::new();
+    let id = CommandId::new();
+    let command = "  make test \n  echo done\n";
+    let seq = accepted(f.handle_as(
+        device,
+        id,
+        CommandKind::RunShell {
+            session_id: session,
+            command: command.into(),
+            when: RunWhen::OnFailure,
+        },
+    ));
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(f.log.head(), seq);
+    assert_eq!(event.command_id, Some(id));
+    assert_eq!(event.context, ContextId::first_of(session));
+    assert_eq!(
+        event.kind,
+        EventKind::ShellRequested {
+            command: command.into(),
+            when: RunWhen::OnFailure,
+            by: device,
+        }
+    );
+}
+
+#[test]
+fn stop_shell_needs_a_live_run_of_the_session() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let other = f.create_session();
+    let by = DeviceId::new();
+    let run = f.run_shell(by, session, "make");
+    let foreign = f.run_shell(by, other, "make");
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(stop_shell_kind(SessionId::new(), run)),
+        rejected(RejectReason::UnknownSession)
+    );
+    assert_eq!(
+        f.handle(stop_shell_kind(session, CommandId::new())),
+        rejected(RejectReason::UnknownRun)
+    );
+    // A run of another session is not one of this session's.
+    assert_eq!(
+        f.handle(stop_shell_kind(session, foreign)),
+        rejected(RejectReason::UnknownRun)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+
+    // Positive control, twice: the second is logged too, and the first
+    // stays the run's stop.
+    let device = DeviceId::new();
+    let id = CommandId::new();
+    let first = accepted(f.handle_as(device, id, stop_shell_kind(session, run)));
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, Some(id));
+    assert_eq!(event.context, ContextId::first_of(session));
+    assert_eq!(
+        event.kind,
+        EventKind::ShellStopRequested { run, by: device }
+    );
+    let second = accepted(f.handle(stop_shell_kind(session, run)));
+    assert_eq!(second, first.next());
+    assert_eq!(f.run_row(run).unwrap().3, Some(sql_seq(first)));
+
+    // Once over, the run is `RunFinished`.
+    appended(f.shell(finished(run, by, ShellEnd::Exited { code: 0 }, None)));
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(stop_shell_kind(session, run)),
+        rejected(RejectReason::RunFinished)
+    );
+    assert_eq!(f.log.head(), head);
+    // The other session's run is still stoppable from its own session.
+    accepted(f.handle(stop_shell_kind(other, foreign)));
+}
+
+#[test]
+fn resent_shell_commands_return_their_stored_result() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let device = DeviceId::new();
+    let (run, stop, bad) = (CommandId::new(), CommandId::new(), CommandId::new());
+    let ran = f.handle_as(device, run, run_kind(session, "make"));
+    let refused = f.handle_as(device, bad, run_kind(session, " "));
+    assert_eq!(refused, rejected(RejectReason::BadShellCommand));
+    let stopped = f.handle_as(device, stop, stop_shell_kind(session, run));
+    accepted(stopped.clone());
+    appended(f.shell(finished(run, device, ShellEnd::Stopped, None)));
+    let head = f.log.head();
+    // A resend of the stop after the run is over is still accepted: the
+    // stored result answers, not a fresh check.
+    assert_eq!(
+        f.handle_as(device, stop, stop_shell_kind(session, run)),
+        stopped
+    );
+    assert_eq!(f.handle_as(device, run, run_kind(session, "make")), ran);
+    assert_eq!(f.handle_as(device, bad, run_kind(session, " ")), refused);
+    assert_eq!(f.log.head(), head, "a resend appends nothing");
+    // Positive control: a fresh stop of the finished run is refused.
+    assert_eq!(
+        f.handle(stop_shell_kind(session, run)),
+        rejected(RejectReason::RunFinished)
+    );
+}
+
+#[test]
+fn shell_runs_follows_every_shell_event() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let by = DeviceId::new();
+    let s = session.0.to_string();
+    let run = CommandId::new();
+    let requested = accepted(f.handle_as(
+        by,
+        run,
+        CommandKind::RunShell {
+            session_id: session,
+            command: "make".into(),
+            when: RunWhen::OnSuccess,
+        },
+    ));
+    let rq = sql_seq(requested);
+    let row = |when: &str, stop, start, fin, end: Option<&str>, cwd: Option<&str>| {
+        Some((
+            s.clone(),
+            rq,
+            when.to_owned(),
+            stop,
+            start,
+            fin,
+            end.map(Into::into),
+            cwd.map(Into::into),
+        ))
+    };
+    assert_eq!(
+        f.run_row(run),
+        row("on_success", None, None, None, None, None)
+    );
+    let start = sql_seq(appended(f.shell(started(run))));
+    assert_eq!(
+        f.run_row(run),
+        row("on_success", None, Some(start), None, None, None)
+    );
+    appended(f.shell(output(run)));
+    assert_eq!(
+        f.run_row(run),
+        row("on_success", None, Some(start), None, None, None)
+    );
+    let stop = sql_seq(accepted(f.handle(stop_shell_kind(session, run))));
+    accepted(f.handle(stop_shell_kind(session, run)));
+    assert_eq!(
+        f.run_row(run),
+        row("on_success", Some(stop), Some(start), None, None, None)
+    );
+    let fin = sql_seq(appended(f.shell(finished(
+        run,
+        by,
+        ShellEnd::Signalled { signal: 15 },
+        Some("/w/sub"),
+    ))));
+    assert_eq!(
+        f.run_row(run),
+        row(
+            "on_success",
+            Some(stop),
+            Some(start),
+            Some(fin),
+            Some(r#"{"kind":"signalled","signal":15}"#),
+            Some("/w/sub"),
+        )
+    );
+    // A rejected command leaves no row.
+    let bad = CommandId::new();
+    f.handle_as(by, bad, run_kind(session, ""));
+    assert_eq!(f.run_row(bad), None);
+}
+
+#[test]
+fn a_start_after_a_stop_is_logged_as_stopped() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let requester = DeviceId::new();
+    let long = "y".repeat(300);
+    let run = f.run_shell(requester, session, &format!("\n  {long}  \nsecond line"));
+    accepted(f.handle_as(
+        DeviceId::new(),
+        CommandId::new(),
+        stop_shell_kind(session, run),
+    ));
+    let head = f.log.head();
+    let seq = match f.shell(started(run)).unwrap() {
+        ShellAppended::StoppedInstead(seq) => seq,
+        other => panic!("expected StoppedInstead, got {other:?}"),
+    };
+    assert_eq!(
+        seq,
+        head.next(),
+        "one event, the ShellStarted not among them"
+    );
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(event.command_id, None);
+    assert_eq!(event.context, ContextId::first_of(session));
+    assert_eq!(
+        event.kind,
+        EventKind::ShellFinished {
+            run,
+            by: requester,
+            started_at: None,
+            command_line: "y".repeat(limits::FIRST_PROMPT_MAX_CHARS),
+            end: ShellEnd::Stopped,
+            cwd: None,
+            preview: String::new(),
+            lines: 0,
+            output: None,
+            truncated: false,
+        }
+    );
+    let row = f.run_row(run).unwrap();
+    assert_eq!((row.4, row.5), (None, Some(sql_seq(seq))));
+
+    // Positive control: with no stop logged, the start is logged as given.
+    let other = f.run_shell(requester, session, "make");
+    let seq = appended(f.shell(started(other)));
+    assert_eq!(f.all_events().pop().unwrap().kind, started(other));
+    assert_eq!(f.run_row(other).unwrap().4, Some(sql_seq(seq)));
+}
+
+#[test]
+fn shell_event_refuses_what_no_live_run_asked_for() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let by = DeviceId::new();
+    let run = f.run_shell(by, session, "make");
+    let refused = |f: &mut Fixture, kind: EventKind| {
+        let head = f.log.head();
+        let result = f.shell(kind.clone());
+        assert!(
+            matches!(result, Err(Error::InvalidAppend(_))),
+            "{kind:?}: {result:?}"
+        );
+        assert_eq!(f.log.head(), head, "{kind:?} left a trace");
+    };
+    // Command-logged kinds and other events are not the runner's.
+    refused(
+        &mut f,
+        EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::Always,
+            by,
+        },
+    );
+    refused(&mut f, EventKind::ShellStopRequested { run, by });
+    refused(&mut f, EventKind::SessionStopped);
+    // An unknown run.
+    let unknown = CommandId::new();
+    refused(&mut f, started(unknown));
+    refused(&mut f, output(unknown));
+    refused(&mut f, finished(unknown, by, ShellEnd::Lost, None));
+    // Started once only.
+    appended(f.shell(started(run)));
+    refused(&mut f, started(run));
+    // Positive control: a live run takes output and its end.
+    appended(f.shell(output(run)));
+    appended(f.shell(finished(run, by, ShellEnd::Exited { code: 2 }, None)));
+    // Nothing after the end.
+    refused(&mut f, started(run));
+    refused(&mut f, output(run));
+    refused(&mut f, finished(run, by, ShellEnd::Lost, None));
+    // Nor after a stop that ended it before it started.
+    let stopped = f.run_shell(by, session, "make");
+    accepted(f.handle(stop_shell_kind(session, stopped)));
+    f.shell(started(stopped)).unwrap();
+    refused(&mut f, started(stopped));
+    refused(&mut f, output(stopped));
+    refused(&mut f, finished(stopped, by, ShellEnd::Lost, None));
+}
+
+#[test]
+fn shell_events_carry_the_current_context() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let by = DeviceId::new();
+    let run = f.run_shell(by, session, "make");
+    let clear = clear_kind(session, "fresh");
+    let CommandKind::ClearContext { context, .. } = clear else {
+        unreachable!()
+    };
+    accepted(f.handle(clear));
+    appended(f.shell(started(run)));
+    let started_event = f.all_events().pop().unwrap();
+    assert_eq!(started_event.context, context);
+    // A switch back between two runner events moves the next stamp too.
+    accepted(f.handle(CommandKind::SwitchContext {
+        session_id: session,
+        context: ContextId::first_of(session),
+    }));
+    appended(f.shell(finished(run, by, ShellEnd::Exited { code: 0 }, None)));
+    assert_eq!(
+        f.all_events().pop().unwrap().context,
+        ContextId::first_of(session)
+    );
+    assert_eq!(
+        f.storage.db.context_stamp_violations().unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn recovery_reads_every_unfinished_run_with_the_head() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let other = f.create_session();
+    let by = DeviceId::new();
+    let done = f.run_shell(by, session, "true");
+    let waiting = CommandId::new();
+    let waiting_seq = accepted(f.handle_as(
+        by,
+        waiting,
+        CommandKind::RunShell {
+            session_id: other,
+            command: "make\nmore".into(),
+            when: RunWhen::OnFailure,
+        },
+    ));
+    let running = f.run_shell(by, session, "sleep 9");
+    let running_seq = f.log.head();
+    let start = appended(f.shell(started(running)));
+    let stop = accepted(f.handle(stop_shell_kind(session, running)));
+    appended(f.shell(finished(done, by, ShellEnd::Exited { code: 0 }, None)));
+
+    let recovery = f.log.unfinished_shell_runs(&f.storage.db).unwrap();
+    assert_eq!(recovery.head, f.log.head());
+    assert_eq!(
+        recovery.runs,
+        [
+            ShellRun {
+                run: waiting,
+                session_id: other,
+                seq: waiting_seq,
+                when: RunWhen::OnFailure,
+                command: "make\nmore".into(),
+                by,
+                stop_seq: None,
+                started_seq: None,
+            },
+            ShellRun {
+                run: running,
+                session_id: session,
+                seq: running_seq,
+                when: RunWhen::Always,
+                command: "sleep 9".into(),
+                by,
+                stop_seq: Some(stop),
+                started_seq: Some(start),
+            },
+        ]
+    );
+}
+
+#[test]
+fn shell_status_is_the_newest_unskipped_end_and_known_cwd() {
+    let mut f = Fixture::with_shell();
+    let session = f.create_session();
+    let other = f.create_session();
+    let by = DeviceId::new();
+    let status = |f: &Fixture, id| f.log.shell_status(&f.storage.db, id).unwrap();
+    assert_eq!(status(&f, session), ShellStatus::default());
+    assert!(status(&f, session).succeeded(), "no run counts as success");
+
+    let failed = f.run_shell(by, session, "false");
+    appended(f.shell(finished(
+        failed,
+        by,
+        ShellEnd::Exited { code: 1 },
+        Some("/a"),
+    )));
+    let skipped = f.run_shell(by, session, "make");
+    appended(f.shell(finished(skipped, by, ShellEnd::Skipped, None)));
+    // An unfinished run and another session's run change nothing.
+    f.run_shell(by, session, "sleep 9");
+    let elsewhere = f.run_shell(by, other, "true");
+    appended(f.shell(finished(
+        elsewhere,
+        by,
+        ShellEnd::Exited { code: 0 },
+        Some("/b"),
+    )));
+
+    let now = status(&f, session);
+    assert_eq!(
+        now,
+        ShellStatus {
+            last: Some(ShellEnd::Exited { code: 1 }),
+            cwd: Some("/a".into()),
+        }
+    );
+    assert!(!now.succeeded());
+    // A newer run that knows no cwd keeps the older one's.
+    let ok = f.run_shell(by, session, "true");
+    appended(f.shell(finished(ok, by, ShellEnd::Exited { code: 0 }, None)));
+    let now = status(&f, session);
+    assert_eq!(now.last, Some(ShellEnd::Exited { code: 0 }));
+    assert_eq!(now.cwd.as_deref(), Some("/a"));
+    assert!(now.succeeded());
 }
 
 #[test]
