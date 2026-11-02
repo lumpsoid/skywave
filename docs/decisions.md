@@ -452,14 +452,16 @@ own, true because both heads render a per-task stop.
 `CreateSession { workdir, conversation: Some(id) }` creates a session that
 continues a conversation the agent had outside Skywave, in `workdir`. The
 server logs one `SessionCreated { workdir, from: Some(Agent { conversation
-}) }` (named by the command, settled at its own `Accepted { seq }`) and
-stores the id as the first context's `adopted`. On that context's first
-start the supervisor passes `Conversation::Adopt(id)`; the Claude adapter
-forks it (`--resume <id> --fork-session --session-id <new>`), so the
-outside transcript is never written. Precedence at a start: the context's
-own handle (`Resume`), else origin (`Fork`), else adopted (`Adopt`), else
-`Fresh`. The own handle stays first, or every restart would re-fork and
-lose Skywave's turns; until the copy reports a handle (its first message)
+}) }` (named by the command, settled at its own `Accepted { seq }`). The
+first context stores `from` as its `origin`: one JSON `SessionOrigin`
+column for a move and an adoption alike, so a context cannot continue both.
+On that context's first start the supervisor passes
+`Conversation::Adopt(id)`; the Claude adapter forks it (`--resume <id>
+--fork-session --session-id <new>`), so the outside transcript is never
+written. Precedence at a start: the context's own handle (`Resume`), else
+its origin (`Fork` for a moved context, `Adopt` for an outside
+conversation), else `Fresh`. The own handle stays first, or every restart
+would re-fork and lose Skywave's turns; until the copy reports a handle (its first message)
 every start adopts again under a new id.
 **Why fork, not resume** (confirmed by the user 2026-11-02): a terminal
 `claude` may still be running the session, two CLI writers on one
@@ -499,6 +501,5 @@ terminal (showing the fork's CLI id); adopt by resume; checking existence at
 command time; adopting into an existing session as a new context; carrying
 mode, model, effort or grants; an agent capability that lets clients hide
 adoption for agents that cannot fork (today such an adapter must fail
-`Adopt` with `AgentError::Start`); unifying `contexts.origin` and `adopted`
-into one fork-source column; migrating old stored `from` events (alpha: such
-databases are deleted).
+`Adopt` with `AgentError::Start`); migrating old stored `from` events
+(alpha: such databases are deleted).

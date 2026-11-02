@@ -655,8 +655,8 @@ fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
 
 /// An adoption is one `SessionCreated` naming its command at the command's
 /// seq, with the id trimmed and otherwise as sent; its first context
-/// records the id as `adopted`, not as an `origin`. A resend gives the same
-/// answer and appends nothing.
+/// records that as its origin. A resend gives the same answer and appends
+/// nothing.
 #[test]
 fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
     let mut f = Fixture::new();
@@ -689,8 +689,10 @@ fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
         })
     );
     let first = ContextId::first_of(session);
-    assert_eq!(f.adopted(first), Some(CONVERSATION.to_owned()));
-    assert_eq!(f.moves(first), (None, None));
+    let adopted = SessionOrigin::Agent {
+        conversation: CONVERSATION.to_owned(),
+    };
+    assert_eq!(f.moves(first), (Some(adopted), None));
 
     let mut other = f.connection();
     assert_eq!(
@@ -701,7 +703,7 @@ fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
 
     // Positive control: a fresh session adopts nothing.
     let fresh = f.create_session();
-    assert_eq!(f.adopted(ContextId::first_of(fresh)), None);
+    assert_eq!(f.moves(ContextId::first_of(fresh)), (None, None));
 }
 
 /// Only the id's syntax is checked, and an id outside it is refused rather
@@ -1482,9 +1484,10 @@ impl Fixture {
         store_resume_handle(&self.storage.db, context, &handle).unwrap();
     }
 
-    /// `contexts.origin` and `contexts.moved_to` of `context`.
-    fn moves(&self, context: ContextId) -> (Option<String>, Option<String>) {
-        self.storage
+    /// `contexts.origin`, decoded, and `contexts.moved_to` of `context`.
+    fn moves(&self, context: ContextId) -> (Option<SessionOrigin>, Option<String>) {
+        let (origin, moved_to): (Option<String>, Option<String>) = self
+            .storage
             .db
             .conn()
             .query_row(
@@ -1492,20 +1495,9 @@ impl Fixture {
                 [context.0.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap()
-    }
-
-    /// `contexts.adopted` of `context`.
-    fn adopted(&self, context: ContextId) -> Option<String> {
-        self.storage
-            .db
-            .conn()
-            .query_row(
-                "SELECT adopted FROM contexts WHERE id = ?1",
-                [context.0.to_string()],
-                |r| r.get(0),
-            )
-            .unwrap()
+            .unwrap();
+        let origin = origin.map(|json| serde_json::from_str(&json).unwrap());
+        (origin, moved_to)
     }
 }
 
@@ -1950,15 +1942,13 @@ fn a_move_logs_the_new_session_then_the_move_naming_the_command() {
     assert_eq!(f.workdir_of(to), f.workdir_of(session));
     assert_eq!(f.current_context(to), ContextId::first_of(to));
     assert_eq!(f.current_context(session), current, "the source goes on");
-    let id = |context: ContextId| Some(context.0.to_string());
     let to_id = Some(to.0.to_string());
     assert_eq!(f.moves(first), (None, to_id));
-    assert_eq!(f.moves(ContextId::first_of(to)), (id(first), None));
-    assert_eq!(
-        f.adopted(ContextId::first_of(to)),
-        None,
-        "a move adopts nothing"
-    );
+    let origin = SessionOrigin::Context(ContextRef {
+        session,
+        context: first,
+    });
+    assert_eq!(f.moves(ContextId::first_of(to)), (Some(origin), None));
     assert_eq!(f.moves(current), (None, None));
     assert_eq!(
         f.storage.db.context_stamp_violations().unwrap(),

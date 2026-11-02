@@ -182,15 +182,45 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN
         agent_work TEXT CHECK (agent_work IS NULL OR json_valid(agent_work));
     "#,
-    // v10: adopting an outside agent conversation (protocol v12). NULL for
-    // every context that exists before it.
+    // v10: adopting an outside agent conversation (protocol v12). A session's
+    // first context continues either a context moved here or an outside
+    // conversation, so v8's `origin` (a context id) becomes one JSON
+    // SessionOrigin. SQLite can't drop or retype a column a foreign key
+    // uses, so `contexts` is rebuilt (create, copy, drop, rename): rowids
+    // are copied so the log order holds, and the index is made again. With
+    // foreign keys on, DROP TABLE deletes every row first; only the old
+    // table's own `origin` refers to it, so that delete breaks nothing.
     r#"
-    -- The agent's own id of an outside conversation this context continues
-    -- (SessionCreated.from = Agent): it is forked on the context's first start,
-    -- until the context has a handle of its own. NULL for every other context.
-    -- Not a reference to anything here, and not a ResumeHandle: only the
-    -- adapter knows a handle's shape (D3).
-    ALTER TABLE contexts ADD COLUMN adopted TEXT;
+    CREATE TABLE contexts_v10 (
+        id          TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL REFERENCES sessions (id),
+        -- The agent's opaque resume handle for this context; NULL until the
+        -- agent reports one.
+        agent_state TEXT CHECK (agent_state IS NULL OR json_valid(agent_state)),
+        -- What this context continues (SessionCreated.from, a SessionOrigin
+        -- as JSON): a context moved here, or the agent's own id of an outside
+        -- conversation (not a ResumeHandle: only the adapter knows a handle's
+        -- shape, D3). Its conversation is forked on the context's first
+        -- start, until the context has a handle of its own. NULL for every
+        -- other context. JSON, so no foreign key: the context a move continues
+        -- exists because command validation moves only an existing context.
+        origin      TEXT CHECK (origin IS NULL OR json_valid(origin)),
+        -- The session a ContextMoved sent the context to; set, it is never
+        -- current or started again.
+        moved_to    TEXT REFERENCES sessions (id)
+    ) STRICT;
+    INSERT INTO contexts_v10 (rowid, id, session_id, agent_state, origin, moved_to)
+        SELECT c.rowid, c.id, c.session_id, c.agent_state,
+               CASE WHEN c.origin IS NULL THEN NULL ELSE json_object(
+                   'kind', 'context',
+                   'session', (SELECT o.session_id FROM contexts o WHERE o.id = c.origin),
+                   'context', c.origin)
+               END,
+               c.moved_to
+        FROM contexts c ORDER BY c.rowid;
+    DROP TABLE contexts;
+    ALTER TABLE contexts_v10 RENAME TO contexts;
+    CREATE INDEX contexts_session ON contexts (session_id);
     "#,
 ];
 
@@ -315,7 +345,10 @@ fn check_supported(found: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use skywave_proto::{ContextRef, SessionOrigin};
+
     use super::*;
+    use crate::event_log::parse_id;
 
     const TABLES: [&str; 9] = [
         "approvals",
@@ -603,53 +636,169 @@ mod tests {
         assert!(set("not json").is_err());
     }
 
-    /// A v9 database, from before adopting outside conversations, gains
-    /// `contexts.adopted`, NULL for every context it has; what the rows had
-    /// is kept.
+    /// A v9 database, from before adopting outside conversations, has
+    /// `contexts` rebuilt around one JSON `origin`: every row, in its order,
+    /// keeps what it had; a moved session's first context's origin becomes
+    /// that context as a `SessionOrigin`; the table stays STRICT with its
+    /// checks, references and index.
     #[test]
-    fn v10_adds_adopted_to_every_context() {
+    fn v10_keeps_every_context_and_makes_origin_a_session_origin() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skywave.db");
-        let (a, b) = (
+        let (a, b, c) = (
             "01920000-0000-7000-8000-00000000000a",
             "01920000-0000-7000-8000-00000000000b",
+            "01920000-0000-7000-8000-00000000000c",
         );
         {
             let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
             for sql in &MIGRATIONS[..9] {
                 conn.execute_batch(sql).unwrap();
             }
             conn.pragma_update(None, "user_version", 9).unwrap();
+            // Inserted out of id order, so rowid order is not id order: c
+            // (plain, of a, moved on to b), b (a's handle), a (continues c).
             conn.execute_batch(&format!(
                 r#"
                 INSERT INTO sessions (id, workdir, current_context)
-                    VALUES ('{a}', '/w/a', '{a}'), ('{b}', '/w/a', '{b}');
-                INSERT INTO contexts (id, session_id, agent_state, origin)
-                    VALUES ('{a}', '{a}', '{{"session":"agent-a"}}', NULL),
-                           ('{b}', '{b}', NULL, '{a}');
+                    VALUES ('{a}', '/w/a', '{b}'), ('{b}', '/w/a', '{a}');
+                INSERT INTO contexts (id, session_id, agent_state, origin, moved_to)
+                    VALUES ('{c}', '{a}', NULL, NULL, '{b}'),
+                           ('{b}', '{a}', '{{"session":"agent-b"}}', NULL, NULL),
+                           ('{a}', '{b}', NULL, '{c}', NULL);
                 "#
             ))
             .unwrap();
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
-        let mut stmt = db
-            .conn()
-            .prepare("SELECT id, agent_state, origin, adopted FROM contexts ORDER BY rowid")
+        let conn = db.conn();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, id, session_id, agent_state, origin, moved_to
+                 FROM contexts ORDER BY rowid",
+            )
             .unwrap();
-        let rows: Vec<[Option<String>; 4]> = stmt
-            .query_map([], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]))
+        type Row = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let s = |v: &str| Some(v.to_owned());
+        let s = |v: &str| v.to_owned();
+        let handle = Some(s(r#"{"session":"agent-b"}"#));
+        let origin = rows[2].4.clone().expect("the moved session's origin");
         assert_eq!(
             rows,
             [
-                [s(a), s(r#"{"session":"agent-a"}"#), None, None],
-                [s(b), None, s(a), None],
+                (1, s(c), s(a), None, None, Some(s(b))),
+                (2, s(b), s(a), handle, None, None),
+                (3, s(a), s(b), None, Some(origin.clone()), None),
             ]
         );
+        // The context it continues, with that context's session.
+        let origin: SessionOrigin = serde_json::from_str(&origin).unwrap();
+        assert_eq!(
+            origin,
+            SessionOrigin::Context(ContextRef {
+                session: parse_id(a).unwrap(),
+                context: parse_id(c).unwrap(),
+            })
+        );
+
+        // No `adopted` column; the index, STRICT and every check stay.
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('contexts')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            ["id", "session_id", "agent_state", "origin", "moved_to"]
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT tbl_name || ':' || sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'contexts_session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index,
+            "contexts:CREATE INDEX contexts_session ON contexts (session_id)"
+        );
+        let strict: bool = conn
+            .query_row(
+                "SELECT strict FROM pragma_table_list('contexts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(strict);
+        let insert = |sql: &str| conn.execute(sql, []);
+        // A blob, as STRICT turns an integer into TEXT; a non-STRICT
+        // table would take the blob.
+        assert!(
+            insert(&format!(
+                "INSERT INTO contexts (id, session_id) VALUES (X'00', '{a}')"
+            ))
+            .is_err()
+        );
+        assert!(
+            insert(&format!(
+                "INSERT INTO contexts (id, session_id, agent_state) VALUES ('d', '{a}', 'not json')"
+            ))
+            .is_err()
+        );
+        assert!(
+            insert(&format!(
+                "INSERT INTO contexts (id, session_id, origin) VALUES ('d', '{a}', 'not json')"
+            ))
+            .is_err()
+        );
+        assert!(
+            insert(&format!(
+                "INSERT INTO contexts (id, session_id, moved_to) VALUES ('d', '{a}', 'nowhere')"
+            ))
+            .is_err()
+        );
+        assert!(insert("INSERT INTO contexts (id, session_id) VALUES ('d', 'nowhere')").is_err());
+        // Positive control: a row that breaks nothing goes in.
+        assert!(
+            insert(&format!(
+                r#"INSERT INTO contexts (id, session_id, origin, moved_to)
+                   VALUES ('d', '{a}', '{{"kind":"agent","conversation":"x"}}', '{b}')"#
+            ))
+            .is_ok()
+        );
+        let violations = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count();
+        assert_eq!(violations, 0);
     }
 
     #[test]
