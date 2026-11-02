@@ -11,6 +11,24 @@ This protocol is what the Agent SDKs use internally. It is **not** a
 documented stable API (see spec §11). T09 must check `claude_code_version`
 at startup and log a warning when it differs from the pinned version.
 
+**Checking a new CLI.** After every CLI upgrade, run
+`cargo run -p skywave-claude-compat` (`--quick`, the default: control
+requests only, seconds, no tokens), then `-- --full` (real turns on haiku in
+a scratch dir, a few minutes, including a `/loop` tick and a background
+shell). It drives the real CLI through the adapter's own `Protocol`, so it
+writes exactly what skywaved writes, and checks every stdout line against
+the fields the adapter reads. Each scenario reports **pass**, **BROKEN**
+(a contract check failed: the upgrade breaks skywaved) or **NEWLY
+AVAILABLE** (a watch check changed: something we wait for, such as
+`send_task_message`, now behaves differently; the report names the decision
+to revisit). **inconclusive** means the model did not do what the prompt
+asked, so run that scenario again (`--only <name>`). The prompts are a
+small play, a user running a bakery in the scratch folder, but each still
+names the exact tool and command a check needs. `--list` names the
+scenarios. `--record <dir>` writes each scenario's scrubbed recording in
+the fixture format. Once every scenario passes, move `PINNED_VERSION` and
+the pin above to the new version.
+
 Legend: **[C]** means confirmed, i.e. seen in a fixture or a probe run against
 2.1.310. **[U]** means unconfirmed: inferred from SDK behaviour or the help
 text, and not seen.
@@ -315,6 +333,12 @@ checks two things. (a) Each allow that grants a rule carries the suggestion
 unchanged as `updatedPermissions`, byte for byte what the adapter writes.
 (b) After each grant, the next call of the same tool gets no `can_use_tool`.
 The test is `#[ignore]`d until the fixture exists.
+
+`skywave-claude-compat --only permissions` checks a quicker version
+automatically. It grants a `Bash(…)` rule through the adapter, then runs the
+same command again. If the call is asked again, the scenario is BROKEN. If
+it is not asked, it reports the grant as newly available: the reply shape
+works, and this runbook is worth running to record the fixture.
 
 The recorder is `crates/skywaved/tests/support/record-claude.sh`. You set it
 as skywaved's agent command. It runs the real CLI and writes every stdin and
@@ -747,7 +771,8 @@ section records whether a stream-json consumer can do the same (probed
 2026-11-02 against 2.1.310; D33 is the decision taken from it). Fixtures:
 `subagent_message_ctl`, `subagent_message_ctl_done`, `subagent_message_ptu`,
 `subagent_message_relay`, `subagent_message_relay_midrun`, recorded with
-`tests/support/probe-subagent-message.py`. In each, a background subagent is
+the Python probe `tests/support/probe-subagent-message.py` (retired for
+`skywave-claude-compat`; git history keeps it). In each, a background subagent is
 told to reply with the code word it was sent while it worked, or NONE.
 
 **What was tried.**
@@ -855,14 +880,16 @@ definitive marker of which turn is the line's. Unverified: whether an input
 **`sleep` is blocked.** This CLI refuses a standalone `sleep 25` in a
 subagent ("use Monitor"), so the `relay_live` and `relay_midrun` prompts need
 changing before they are re-recorded. The raw `relay_race` recordings
-(`/tmp/skywave-race/`) are not fixtures; nothing replays them.
+(`/tmp/skywave-race/`) are not fixtures; nothing replays them. The relay
+scenarios were not carried into `skywave-claude-compat`: D34 deferred the
+relay, so nothing relies on them. Revive them from the retired probe if a
+relay is ever reconsidered.
 
-**Re-check on every CLI bump.** Run `probe-subagent-message.py ctl_live
-<out>`; `relay_race` and `relay_race_echo` regenerate the race findings above.
-While the answer is still `Unsupported control request subtype:
-send_task_message`, the relay stays (D33). A success answer, with the
-subagent replying ZEBRA, means the request is implemented: record a fixture
-and revisit D33.
+**Re-check on every CLI bump.** `skywave-claude-compat` (quick tier) sends
+`send_task_message` and watches the answer. While it is still
+`Unsupported control request subtype: send_task_message`, the scenario
+passes. Any other answer reports it as newly available: record a fixture
+of the request reaching a live subagent and revisit D33 and D34.
 
 ### 3.13 Foreground subagents [C]
 
@@ -872,9 +899,13 @@ it ends. The model chooses: asked to wait ("I'll wait for its answer") it
 picked foreground, asked for a chore with "no rush" it picked background,
 and the same ask went either way across runs. Fixtures:
 `subagent_foreground`, `subagent_foreground_backgrounded`,
-`subagent_foreground_stop`, recorded 2026-11-02 with
-`tests/support/probe-foreground-subagent.py`, which asks the way a user
-would over a small folder of recipes and lets the agent pick its tools.
+`subagent_foreground_stop`, recorded 2026-11-02 with the Python probe
+`tests/support/probe-foreground-subagent.py` (retired; git history keeps
+it), which asks the way a user would over a small folder of recipes and
+lets the agent pick its tools. `skywave-claude-compat`'s
+`subagent_foreground` re-checks the first of them; backgrounding
+(Ctrl+B) and stopping a foreground subagent are deferred (D31, D34), so
+it does not check them.
 
 **What a foreground subagent looks like** (`subagent_foreground`):
 - `task_started` with a `task_id`, the `Agent` call's `tool_use_id` and
