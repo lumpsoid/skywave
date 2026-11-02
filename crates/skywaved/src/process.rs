@@ -88,6 +88,13 @@ impl Group {
         Group { pgid }
     }
 
+    /// The group `pgid` names, for a leader the daemon did not spawn itself
+    /// (a shell under its run host).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn led_by(pgid: i32) -> Group {
+        Group { pgid: Some(pgid) }
+    }
+
     /// SIGTERMs every process in the group; false when there is no group
     /// to signal (killed already, or groups are not used).
     pub(crate) fn terminate(&self) -> bool {
