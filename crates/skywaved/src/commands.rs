@@ -21,10 +21,9 @@
 //! - `StopTask` → `TaskStopRequested`;
 //! - `MoveContext` → `SessionCreated { from }` ([`SessionOrigin::Context`])
 //!   for the new session, naming no command, then `ContextMoved` in the
-//!   source.
-//!
-//! `RunShell` and `StopShell` are refused `ShellDisabled`, appending
-//! nothing, until the shell runner lands.
+//!   source;
+//! - `RunShell` → `ShellRequested` with the command verbatim;
+//! - `StopShell` → `ShellStopRequested`.
 //!
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
@@ -137,12 +136,22 @@
 //! leaving the next `BackgroundTasksChanged` is the success, a
 //! `TaskStopRefused` naming the command the failure, `"agent not running"`
 //! among them.
+//!
+//! **RunShell, StopShell.** Both are `ShellDisabled` while the log has shell
+//! commands off ([`EventLog::with_shell`]), before anything else is
+//! checked; then `UnknownSession`. A `RunShell` command blank after
+//! trimming or over [`limits::SHELL_COMMAND_MAX_BYTES`] bytes is
+//! `BadShellCommand`; it is logged verbatim, never trimmed or cut, and its
+//! command id is the run's id. A `StopShell` naming no run of the session
+//! (one of another session included) is `UnknownRun`, one whose run has its
+//! `ShellFinished` is `RunFinished`. A second stop of a running run is
+//! accepted and logged; the first is the one the runner acts on.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
     EventKind, RejectReason, Seq, SessionId, SessionOrigin, check_conversation_id, context_name,
-    normalise_context_name,
+    limits, normalise_context_name,
 };
 
 use crate::db::Db;
@@ -457,9 +466,47 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
-            // No shell runner yet: refused before anything else is checked.
-            CommandKind::RunShell { .. } | CommandKind::StopShell { .. } => {
-                return Ok(Err(RejectReason::ShellDisabled));
+            CommandKind::RunShell {
+                session_id,
+                command: shell,
+                when,
+            } => {
+                if !self.shell_enabled() {
+                    return Ok(Err(RejectReason::ShellDisabled));
+                }
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                if shell.trim().is_empty() || shell.len() > limits::SHELL_COMMAND_MAX_BYTES {
+                    return Ok(Err(RejectReason::BadShellCommand));
+                }
+                let kind = EventKind::ShellRequested {
+                    command: shell.clone(),
+                    when: *when,
+                    by: device,
+                };
+                (*session_id, session.context, kind)
+            }
+            CommandKind::StopShell { session_id, run } => {
+                if !self.shell_enabled() {
+                    return Ok(Err(RejectReason::ShellDisabled));
+                }
+                let Some(session) = known(*session_id)? else {
+                    return Ok(Err(RejectReason::UnknownSession));
+                };
+                let Some(row) = event_log::shell_run_in(tx, *run)?
+                    .filter(|row| row.run.session_id == *session_id)
+                else {
+                    return Ok(Err(RejectReason::UnknownRun));
+                };
+                if row.finished_seq.is_some() {
+                    return Ok(Err(RejectReason::RunFinished));
+                }
+                let kind = EventKind::ShellStopRequested {
+                    run: *run,
+                    by: device,
+                };
+                (*session_id, session.context, kind)
             }
         };
         Ok(Ok(event_log::append_in(

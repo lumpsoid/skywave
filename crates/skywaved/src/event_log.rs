@@ -21,6 +21,12 @@
 //!   event), so it follows the log with [`EventLog::subscribe`] and
 //!   [`EventLog::read`] like any other reader.
 //!
+//! The shell runner appends the daemon's shell events with
+//! [`EventLog::shell_event`] only, and follows `ShellRequested` /
+//! `ShellStopRequested` in the log the same way. The `shell_runs`
+//! projection tracks each run from its `ShellRequested` to its
+//! `ShellFinished`.
+//!
 //! The wake-up notifier is in-process: only writers holding this
 //! [`EventLog`] wake waiters. Admin commands never append events.
 
@@ -31,8 +37,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, Event, EventBatch,
-    EventKind, ModelChoice, Seq, SessionId, SessionState,
+    AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, DeviceId, Event,
+    EventBatch, EventKind, ModelChoice, RunWhen, Seq, SessionId, SessionState, ShellEnd, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -49,6 +55,9 @@ pub const MAX_BATCH_LIMIT: u32 = 5000;
 #[derive(Debug, Clone)]
 pub struct EventLog {
     inner: Arc<Inner>,
+    /// Whether `RunShell` and `StopShell` are accepted ([`EventLog::with_shell`]).
+    /// Beside `inner`, not in it, so the builder needs no unique `Arc`.
+    shell_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -93,6 +102,68 @@ pub struct PendingApproval {
     pub session_id: SessionId,
 }
 
+/// What [`EventLog::shell_event`] logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellAppended {
+    /// The event as given, at this seq.
+    Appended(Seq),
+    /// A `ShellFinished { end: Stopped }` instead of the `ShellStarted`
+    /// given, at this seq: a stop was requested before the run started.
+    StoppedInstead(Seq),
+}
+
+/// A shell run as the log has it, before its `ShellFinished`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRun {
+    /// The `RunShell` command's id.
+    pub run: CommandId,
+    pub session_id: SessionId,
+    /// Seq of its `ShellRequested`.
+    pub seq: Seq,
+    pub when: RunWhen,
+    /// The command, verbatim.
+    pub command: String,
+    /// The device that asked for it.
+    pub by: DeviceId,
+    /// Seq of the first `ShellStopRequested` naming it.
+    pub stop_seq: Option<Seq>,
+    /// Seq of its `ShellStarted`; `None` when it never started.
+    pub started_seq: Option<Seq>,
+}
+
+/// The shell runner's starting point ([`EventLog::unfinished_shell_runs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRecovery {
+    /// The head the runs were read at.
+    pub head: Seq,
+    /// Every run with no `ShellFinished`, in seq order.
+    pub runs: Vec<ShellRun>,
+}
+
+/// A session's shell history as a new run needs it ([`EventLog::shell_status`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShellStatus {
+    /// The end of the newest finished run that was not `Skipped`.
+    pub last: Option<ShellEnd>,
+    /// The `cwd` of the newest finished run that knew one.
+    pub cwd: Option<String>,
+}
+
+impl ShellStatus {
+    /// Whether the last status is success, which a session with no such run
+    /// counts as.
+    pub fn succeeded(&self) -> bool {
+        self.last.as_ref().is_none_or(ShellEnd::is_success)
+    }
+}
+
+/// `ShellFinished::command_line` for `command`: its first line, cut to
+/// [`limits::FIRST_PROMPT_MAX_CHARS`] chars.
+pub fn shell_command_line(command: &str) -> String {
+    let line = command.trim_start().lines().next().unwrap_or("").trim_end();
+    line.chars().take(limits::FIRST_PROMPT_MAX_CHARS).collect()
+}
+
 impl EventLog {
     /// A log over the database `db` belongs to; `roots` are the configured
     /// session roots (`Config::roots`).
@@ -100,7 +171,23 @@ impl EventLog {
         let (head, _) = watch::channel(head_in(db.conn())?);
         Ok(EventLog {
             inner: Arc::new(Inner { head, roots }),
+            shell_enabled: false,
         })
+    }
+
+    /// This log with shell commands on or off; [`EventLog::open`] has them
+    /// off, and `RunShell` / `StopShell` are then refused `ShellDisabled`.
+    /// Set it before cloning: clones made earlier keep their own flag.
+    pub fn with_shell(self, enabled: bool) -> EventLog {
+        EventLog {
+            shell_enabled: enabled,
+            ..self
+        }
+    }
+
+    /// Whether this log accepts shell commands.
+    pub fn shell_enabled(&self) -> bool {
+        self.shell_enabled
     }
 
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
@@ -172,8 +259,9 @@ impl EventLog {
     /// `ToolCall`, `ToolResult`, `ApprovalRequested` (with a new id),
     /// `SessionStateChanged`, `TurnUsage`, the agent's answers about its
     /// mode, model and effort, and `ModelsOffered`. Kinds that only
-    /// commands produce, the shell events, and `ApprovalCancelled` (use
-    /// [`EventLog::cancel_approval`]), are refused with
+    /// commands produce, the shell events (use [`EventLog::shell_event`]),
+    /// and `ApprovalCancelled` (use [`EventLog::cancel_approval`]), are
+    /// refused with
     /// [`Error::InvalidAppend`], as is an unknown session or a `context`
     /// that is not one of the session's.
     ///
@@ -289,6 +377,125 @@ impl EventLog {
         tx.commit()?;
         self.published(seq);
         Ok(Some(seq))
+    }
+
+    /// Appends a daemon shell event (`ShellStarted`, `ShellOutput`,
+    /// `ShellFinished`) for the run it names, the shell runner's only way
+    /// into the log. One transaction reads the run's session and that
+    /// session's current context, which stamps the event, checks the run and
+    /// appends, so no `ClearContext` can slip in between.
+    ///
+    /// A `ShellStarted` for a run a `ShellStopRequested` already names is
+    /// not logged: its `ShellFinished { end: Stopped }` is, and the return
+    /// says so; the runner must then not start (or must kill) the shell.
+    ///
+    /// Refused with [`Error::InvalidAppend`]: any other kind, a run no
+    /// `RunShell` logged, a run that is over (has its `ShellFinished`), and a
+    /// second `ShellStarted`.
+    pub fn shell_event(&self, db: &mut Db, kind: EventKind) -> Result<ShellAppended> {
+        let run = match &kind {
+            EventKind::ShellStarted { run, .. }
+            | EventKind::ShellOutput { run, .. }
+            | EventKind::ShellFinished { run, .. } => *run,
+            _ => {
+                return Err(Error::InvalidAppend(format!(
+                    "{} is not a daemon shell event",
+                    kind_name(&kind)
+                )));
+            }
+        };
+        let tx = begin(db)?;
+        let Some(row) = shell_run_in(&tx, run)? else {
+            return Err(Error::InvalidAppend(format!("unknown shell run {}", run.0)));
+        };
+        if row.finished_seq.is_some() {
+            return Err(Error::InvalidAppend(format!("shell run {} is over", run.0)));
+        }
+        let started = matches!(kind, EventKind::ShellStarted { .. });
+        if started && row.run.started_seq.is_some() {
+            return Err(Error::InvalidAppend(format!(
+                "shell run {} already started",
+                run.0
+            )));
+        }
+        let Some(session) = session_in(&tx, row.run.session_id)? else {
+            return Err(Error::Corrupt(format!(
+                "shell run {} of unknown session {}",
+                run.0, row.run.session_id.0
+            )));
+        };
+        let stopped = started && row.run.stop_seq.is_some();
+        let kind = if stopped {
+            EventKind::ShellFinished {
+                run,
+                by: row.run.by,
+                started_at: None,
+                command_line: shell_command_line(&row.run.command),
+                end: ShellEnd::Stopped,
+                cwd: None,
+                preview: String::new(),
+                lines: 0,
+                output: None,
+                truncated: false,
+            }
+        } else {
+            kind
+        };
+        let seq = append_in(&tx, row.run.session_id, session.context, None, &kind)?;
+        tx.commit()?;
+        self.published(seq);
+        Ok(if stopped {
+            ShellAppended::StoppedInstead(seq)
+        } else {
+            ShellAppended::Appended(seq)
+        })
+    }
+
+    /// Every shell run not yet over, oldest first, and the head, read in one
+    /// transaction: the shell runner's starting point after a daemon start.
+    /// It follows the log from `head` on.
+    pub fn unfinished_shell_runs(&self, db: &Db) -> Result<ShellRecovery> {
+        let tx = db.conn().unchecked_transaction()?;
+        let head = head_in(&tx)?;
+        let mut stmt = tx.prepare_cached(&format!(
+            "{SHELL_RUN_SELECT} WHERE r.finished_seq IS NULL ORDER BY r.seq"
+        ))?;
+        let runs = stmt
+            .query_map([], ShellRunSql::from_row)?
+            .map(|row| Ok(row?.parse()?.run))
+            .collect::<Result<Vec<_>>>()?;
+        drop(stmt);
+        tx.finish()?;
+        Ok(ShellRecovery { head, runs })
+    }
+
+    /// Session `id`'s last shell status and last known cwd as its finished
+    /// runs have them; nothing for an unknown session or one with none.
+    pub fn shell_status(&self, db: &Db, id: SessionId) -> Result<ShellStatus> {
+        let tx = db.conn().unchecked_transaction()?;
+        let session = id.0.to_string();
+        let last: Option<String> = tx
+            .prepare_cached(
+                "SELECT run_end FROM shell_runs
+                 WHERE session_id = ?1 AND finished_seq IS NOT NULL
+                   AND json_extract(run_end, '$.kind') <> 'skipped'
+                 ORDER BY finished_seq DESC LIMIT 1",
+            )?
+            .query_row([&session], |r| r.get(0))
+            .optional()?;
+        let cwd: Option<String> = tx
+            .prepare_cached(
+                "SELECT cwd FROM shell_runs
+                 WHERE session_id = ?1 AND finished_seq IS NOT NULL AND cwd IS NOT NULL
+                 ORDER BY finished_seq DESC LIMIT 1",
+            )?
+            .query_row([&session], |r| r.get(0))
+            .optional()?;
+        tx.finish()?;
+        Ok(ShellStatus {
+            last: last.as_deref().map(serde_json::from_str).transpose()?,
+            cwd,
+        })
     }
 
     /// Every approval still waiting for an answer, oldest first. On daemon
@@ -568,13 +775,137 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
         | EventKind::CallsUnanswered { .. }
-        | EventKind::ShellRequested { .. }
-        | EventKind::ShellStopRequested { .. }
-        | EventKind::ShellStarted { .. }
-        | EventKind::ShellOutput { .. }
-        | EventKind::ShellFinished { .. } => {}
+        | EventKind::ShellOutput { .. } => {}
+        // The run's id is the command's: a `ShellRequested` naming none
+        // has no run to track.
+        EventKind::ShellRequested { when, .. } => {
+            let Some(run) = command else {
+                return Err(Error::InvalidAppend(
+                    "ShellRequested names no command".to_owned(),
+                ));
+            };
+            conn.prepare_cached(
+                "INSERT INTO shell_runs (command_id, session_id, seq, run_when)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                run.0.to_string(),
+                session,
+                sql_seq,
+                when_to_sql(*when)
+            ])?;
+        }
+        // The first stop is the one that counts; a later one changes nothing.
+        EventKind::ShellStopRequested { run, .. } => {
+            conn.prepare_cached(
+                "UPDATE shell_runs SET stop_seq = COALESCE(stop_seq, ?2) WHERE command_id = ?1",
+            )?
+            .execute(params![run.0.to_string(), sql_seq])?;
+        }
+        EventKind::ShellStarted { run, .. } => {
+            conn.prepare_cached("UPDATE shell_runs SET started_seq = ?2 WHERE command_id = ?1")?
+                .execute(params![run.0.to_string(), sql_seq])?;
+        }
+        EventKind::ShellFinished { run, end, cwd, .. } => {
+            conn.prepare_cached(
+                "UPDATE shell_runs SET finished_seq = ?2, run_end = ?3, cwd = ?4
+                 WHERE command_id = ?1",
+            )?
+            .execute(params![
+                run.0.to_string(),
+                sql_seq,
+                serde_json::to_string(end)?,
+                cwd
+            ])?;
+        }
     }
     Ok(seq)
+}
+
+fn when_to_sql(when: RunWhen) -> &'static str {
+    match when {
+        RunWhen::Always => "always",
+        RunWhen::OnSuccess => "on_success",
+        RunWhen::OnFailure => "on_failure",
+    }
+}
+
+fn when_from_sql(text: &str) -> Result<RunWhen> {
+    match text {
+        "always" => Ok(RunWhen::Always),
+        "on_success" => Ok(RunWhen::OnSuccess),
+        "on_failure" => Ok(RunWhen::OnFailure),
+        other => Err(Error::Corrupt(format!("shell run when {other:?}"))),
+    }
+}
+
+/// A `shell_runs` row with what its `ShellRequested` asked, as
+/// [`ShellRunSql::from_row`] reads it.
+const SHELL_RUN_SELECT: &str = "SELECT r.command_id, r.session_id, r.seq, r.run_when,
+        json_extract(e.kind, '$.command'), json_extract(e.kind, '$.by'),
+        r.stop_seq, r.started_seq, r.finished_seq
+     FROM shell_runs r JOIN events e ON e.seq = r.seq";
+
+/// A `shell_runs` row's columns before its ids are parsed.
+struct ShellRunSql {
+    run: String,
+    session_id: String,
+    seq: i64,
+    when: String,
+    command: String,
+    by: String,
+    stop_seq: Option<i64>,
+    started_seq: Option<i64>,
+    finished_seq: Option<i64>,
+}
+
+impl ShellRunSql {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShellRunSql> {
+        Ok(ShellRunSql {
+            run: r.get(0)?,
+            session_id: r.get(1)?,
+            seq: r.get(2)?,
+            when: r.get(3)?,
+            command: r.get(4)?,
+            by: r.get(5)?,
+            stop_seq: r.get(6)?,
+            started_seq: r.get(7)?,
+            finished_seq: r.get(8)?,
+        })
+    }
+
+    fn parse(self) -> Result<ShellRunRow> {
+        Ok(ShellRunRow {
+            run: ShellRun {
+                run: parse_id(&self.run)?,
+                session_id: parse_id(&self.session_id)?,
+                seq: seq_from_sql(self.seq)?,
+                when: when_from_sql(&self.when)?,
+                command: self.command,
+                by: parse_id(&self.by)?,
+                stop_seq: self.stop_seq.map(seq_from_sql).transpose()?,
+                started_seq: self.started_seq.map(seq_from_sql).transpose()?,
+            },
+            finished_seq: self.finished_seq.map(seq_from_sql).transpose()?,
+        })
+    }
+}
+
+/// A shell run as `shell_runs` has it, finished or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellRunRow {
+    pub run: ShellRun,
+    /// Seq of its `ShellFinished`; set, the run is over.
+    pub finished_seq: Option<Seq>,
+}
+
+/// Shell run `id` as the log has it; `None` if no `RunShell` logged it.
+pub(crate) fn shell_run_in(conn: &Connection, id: CommandId) -> Result<Option<ShellRunRow>> {
+    conn.prepare_cached(&format!("{SHELL_RUN_SELECT} WHERE r.command_id = ?1"))?
+        .query_row([id.0.to_string()], ShellRunSql::from_row)
+        .optional()?
+        .map(ShellRunSql::parse)
+        .transpose()
 }
 
 fn agent_settings_in(conn: &Connection, id: SessionId) -> Result<AgentSettings> {
