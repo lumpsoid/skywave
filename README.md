@@ -197,12 +197,25 @@ session's cost and the model, and the session list shows each session's cost.
 | `y` / `Y` | Copy the selected output, diff, file or message / its command |
 | `a` / `x` | Approve / deny a pending request |
 | `A` | Approve and always allow a rule the agent offers (timeline); with several, pick one with `↑↓` `Enter` |
-| `Ctrl-X` | Interrupt the agent's turn |
+| `Ctrl-X` | Interrupt the agent's turn; in shell mode, stop the running shell command (else the newest waiting one) |
+| `Ctrl-T` | Switch the composer between the agent and shell commands (only when the server runs them) |
+| `Ctrl-O` | Shell mode: run the command only if the previous run succeeded, then only if it failed, then always |
 | `S` | Stop the agent (timeline); the next message restarts it |
 | `R` | Rename the session (timeline); empty restores the default title |
 | `Ctrl-R` | Retry the connection now while offline (any screen) |
 | `Ctrl-G` | Open the next session waiting for an approval (any screen) |
 | `?` / `F1` | Help |
+
+In shell mode (`Ctrl-T`, when the server's `[shell] enabled` is on) the
+composer writes shell commands for the server, prompted `<dir> $` in its own
+colour, and the session's runs stand in for the timeline. `Enter` runs the
+command in the session's workdir; `↑` / `Ctrl-P` recall earlier commands.
+`Ctrl-O`'s condition shows beside the prompt (`work [if ok ✓] $`), never in
+the text: `&&` is just text, passed to the shell. On the runs, `j` / `k`
+select, `Enter` shows a run's whole output, `d` downloads it, `y` copies it
+with colours stripped, and `e` / `Del` edit or take back a command not sent
+yet. A run of yours that took ten seconds or more alerts when it finishes
+while you are not watching it.
 
 Copies go to your local clipboard through the terminal (OSC 52), so they work
 over SSH. Inside tmux, enable `set -g set-clipboard on`. Content over 74 KiB is

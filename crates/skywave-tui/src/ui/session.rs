@@ -12,15 +12,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use skywave_core::{
     ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, PermissionMode,
-    RuleSuggestion, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
+    RuleSuggestion, RunWhen, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
     TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, agent_refusal,
     answer_words, approval_origin, background_rows, blob_size, bytes, context_moved_label,
     context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, outgoing_label,
-    repeat_word, stop_heading, stop_warning, subagent_status, task_kind_word, tokens, trail,
-    turn_time, viewing_hint, work_summary,
+    repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status, task_kind_word, tokens,
+    trail, turn_time, viewing_hint, when_marker, work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -94,8 +94,12 @@ pub(super) fn render(
     .areas(inner);
 
     // The timeline first: the status line reads the scroll state its
-    // layout settles.
-    render_timeline(frame, timeline, session, ui, wall);
+    // layout settles. Writing shell commands, the runs stand in for it.
+    if ui.shell() {
+        super::shell::render(frame, timeline, session, ui, wall);
+    } else {
+        render_timeline(frame, timeline, session, ui, wall);
+    }
     frame.render_widget(
         Paragraph::new(status_line(session, ui, status.width as usize)),
         status,
@@ -132,6 +136,8 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
     }
     spans.push(match &session.state {
         SessionState::Idle => Span::raw("agent idle").green(),
+        // Ctrl-X stops a shell run in shell mode.
+        SessionState::AgentWorking if ui.shell() => Span::raw("agent working").cyan(),
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
         SessionState::AwaitingApproval(_) => Span::raw("agent waiting for an approval").yellow(),
         SessionState::Errored(info) => Span::raw(format!("agent error: {}", info.message)).red(),
@@ -820,32 +826,57 @@ fn capitalised(text: &str) -> String {
     })
 }
 
+/// The shell composer's prompt, in its border: the cwd's last part, the
+/// condition picked with Ctrl-O, then `$`, e.g. `skywave [if ok ✓] $`.
+/// The condition is never part of the text written.
+fn shell_prompt_line(session: Option<&SessionView>, when: RunWhen) -> String {
+    let prompt = shell_prompt(session.and_then(|s| s.shell.cwd.as_deref()));
+    let cwd = prompt.strip_suffix('$').unwrap_or(&prompt).trim_end();
+    let mut parts = Vec::new();
+    if !cwd.is_empty() {
+        parts.push(clean(cwd));
+    }
+    if let Some(marker) = when_marker(when) {
+        parts.push(format!("[{marker}]"));
+    }
+    parts.push("$".to_owned());
+    parts.join(" ")
+}
+
 fn render_composer(frame: &mut Frame, area: Rect, app: &App, ui: &SessionUi) {
     let focused = ui.focus == Focus::Composer;
-    let mut title = " Message ".to_owned();
-    if app
-        .session()
-        .is_some_and(|(view, _)| view.subagent.is_some())
-    {
+    let session = app.session().map(|(view, _)| view);
+    let shell = ui.shell();
+    let mut title = if shell {
+        format!(" {} ", shell_prompt_line(session, ui.when))
+    } else {
+        " Message ".to_owned()
+    };
+    if !shell && session.is_some_and(|view| view.subagent.is_some()) {
         title.push_str("· to the main agent ");
     }
     if matches!(app.view().link, Link::Reconnecting { .. }) {
         title.push_str("· offline, sends when back online ");
     }
-    let block = Block::bordered().title(title).border_style(if focused {
-        Style::new().cyan()
-    } else {
-        Style::new().dark_gray()
-    });
+    // Shell mode in its own colour, so a command is not sent as a message.
+    let border = match (shell, focused) {
+        (true, true) => Style::new().magenta(),
+        (true, false) => Style::new().magenta().dim(),
+        (false, true) => Style::new().cyan(),
+        (false, false) => Style::new().dark_gray(),
+    };
+    let block = Block::bordered().title(title).border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let draft = &ui.composer;
     if draft.text().is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from("Write to the agent…").dark_gray()),
-            inner,
-        );
+        let placeholder = if shell {
+            "Type a shell command for the server…"
+        } else {
+            "Write to the agent…"
+        };
+        frame.render_widget(Paragraph::new(Line::from(placeholder).dark_gray()), inner);
         if focused && !app.ui().help {
             frame.set_cursor_position(Position::new(inner.x, inner.y));
         }
