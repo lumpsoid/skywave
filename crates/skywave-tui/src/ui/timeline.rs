@@ -523,45 +523,8 @@ impl Layout<'_> {
                         }
                     }
                 }
-                Some((_, BlobState::NotDownloaded { size })) => {
-                    note = Some(
-                        Span::raw(format!(
-                            "not downloaded · {} · press d to download",
-                            bytes(*size)
-                        ))
-                        .dark_gray(),
-                    );
-                    preview.into_iter().map(clean).collect()
-                }
-                Some((_, BlobState::Requested { size })) => {
-                    note = Some(
-                        Span::raw(format!("requested · waiting for a slot · {}", bytes(*size)))
-                            .cyan(),
-                    );
-                    preview.into_iter().map(clean).collect()
-                }
-                Some((_, BlobState::Downloading { got, size, paused })) => {
-                    let progress = format!(
-                        "downloading · {} of {} ({}%)",
-                        bytes(*got),
-                        bytes(*size),
-                        percent(*got, *size)
-                    );
-                    note = Some(if *paused {
-                        Span::raw(format!("{progress} · paused, offline")).yellow()
-                    } else {
-                        Span::raw(progress).cyan()
-                    });
-                    preview.into_iter().map(clean).collect()
-                }
-                Some((_, BlobState::Failed { size, reason })) => {
-                    note = Some(
-                        Span::raw(format!(
-                            "download failed: {reason} · {} · d retries",
-                            bytes(*size)
-                        ))
-                        .red(),
-                    );
+                Some((_, state)) => {
+                    note = blob_note(state);
                     preview.into_iter().map(clean).collect()
                 }
                 None => preview.into_iter().map(clean).collect(),
@@ -711,6 +674,41 @@ struct BlobPart {
     from: usize,
     /// What was left out below, if anything.
     cut: Option<String>,
+}
+
+/// Where a blob that is not here yet stands, in place of its content:
+/// not downloaded (`d` downloads it), waiting, how far its download got,
+/// or why it failed (`d` retries). `None` once it is here.
+pub(super) fn blob_note(state: &BlobState) -> Option<Span<'static>> {
+    Some(match state {
+        BlobState::Available { .. } => return None,
+        BlobState::NotDownloaded { size } => Span::raw(format!(
+            "not downloaded · {} · press d to download",
+            bytes(*size)
+        ))
+        .dark_gray(),
+        BlobState::Requested { size } => {
+            Span::raw(format!("requested · waiting for a slot · {}", bytes(*size))).cyan()
+        }
+        BlobState::Downloading { got, size, paused } => {
+            let progress = format!(
+                "downloading · {} of {} ({}%)",
+                bytes(*got),
+                bytes(*size),
+                percent(*got, *size)
+            );
+            if *paused {
+                Span::raw(format!("{progress} · paused, offline")).yellow()
+            } else {
+                Span::raw(progress).cyan()
+            }
+        }
+        BlobState::Failed { size, reason } => Span::raw(format!(
+            "download failed: {reason} · {} · d retries",
+            bytes(*size)
+        ))
+        .red(),
+    })
 }
 
 /// The first `max` bytes of `text`, cut back to a char boundary.
@@ -865,7 +863,7 @@ fn line_style(section: &Section, line: &str) -> Style {
 
 /// The lines of some content; a final line break ends the last line, it
 /// does not start one. Nothing for empty content.
-fn content_lines(text: &str) -> Vec<&str> {
+pub(super) fn content_lines(text: &str) -> Vec<&str> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     if text.is_empty() {
         return Vec::new();
