@@ -75,8 +75,19 @@
 //! would without the hook (others can hold the stop and run another turn).
 //! Whether a job outlives the process is read from its `CronCreate`
 //! result's structured `durable`, kept by job id for the whole process.
+//!
+//! **Subagents** (docs/agents/claude-code.md §3.11–3.13). A subagent's own
+//! `assistant` and `user` lines carry `parent_tool_use_id`, the id of the
+//! `Agent` call that runs it; they are translated like the main agent's,
+//! with that id as each text's and call's `parent`, inside a turn or not
+//! (a background subagent runs on after the turn's `result`). Its tool
+//! names are kept apart from the turn's, so a result after the turn ends
+//! is still read by its tool. A subagent task's call comes from its
+//! `system/task_started` (`background_tasks_changed` does not name it),
+//! which often comes after the set listing the task: a mapping new to a
+//! task in the last reported set reports the set again with it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 use skywave_proto::Decision;
@@ -387,12 +398,20 @@ pub struct Protocol {
     /// Tool name of each call this turn that has no result yet, by
     /// tool-use id: a structured result is read by its tool.
     tools: HashMap<String, String>,
+    /// Tool name of each subagent call that has no result yet, by tool-use
+    /// id. Not cleared at a turn's end: a background subagent's results
+    /// come after it.
+    sub_tools: HashMap<String, String>,
     /// Whether each scheduled job created in this process outlives it, by
     /// job id, as its `CronCreate` result said. Kept across turns: a job
     /// is listed long after the turn that made it.
     durable: HashMap<String, bool>,
-    /// The ids of the live background tasks, as last reported.
-    tasks: HashSet<String>,
+    /// The live background tasks, as last reported.
+    tasks: Vec<AgentTask>,
+    /// The tool-use id of the `Agent` call each subagent task runs, by task
+    /// id, from its `task_started`. Kept for the process: a task leaves the
+    /// set and comes back under the same id and call.
+    task_calls: HashMap<String, String>,
     shutting_down: bool,
     /// Mode, model and effort requests, effort reads and task stops the
     /// CLI has not answered, by request id.
@@ -446,8 +465,10 @@ impl Protocol {
             queued: VecDeque::new(),
             pending: Vec::new(),
             tools: HashMap::new(),
+            sub_tools: HashMap::new(),
             durable: HashMap::new(),
-            tasks: HashSet::new(),
+            tasks: Vec::new(),
+            task_calls: HashMap::new(),
             shutting_down: false,
             settings: HashMap::new(),
             efforts: VecDeque::new(),
@@ -649,6 +670,9 @@ impl Protocol {
             "system" if str_field(message, "subtype") == "background_tasks_changed" => {
                 self.on_background_tasks(message, &mut out);
             }
+            "system" if str_field(message, "subtype") == "task_started" => {
+                self.on_task_started(message, &mut out);
+            }
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
@@ -656,9 +680,10 @@ impl Protocol {
             "control_response" => self.on_control_response(message, &mut out),
             "result" => self.on_result(message, &mut out),
             // rate_limit_event, stream_event, other system subtypes: progress
-            // signals only. That includes the edge events of tasks
-            // (task_started, task_updated, task_progress, task_notification):
-            // the task set comes from background_tasks_changed alone.
+            // signals only. That includes the other edge events of tasks
+            // (task_updated, task_progress, task_notification): the task set
+            // comes from background_tasks_changed alone, task_started only
+            // names a subagent task's call.
             _ => {}
         }
         out
@@ -817,20 +842,56 @@ impl Protocol {
                 })
             })
             .collect();
-        let live: HashSet<String> = tasks.iter().map(|task| task.id.clone()).collect();
         self.cancel_pending(
-            |p| p.task.as_ref().is_some_and(|task| !live.contains(task)),
+            |p| {
+                p.task
+                    .as_ref()
+                    .is_some_and(|task| !tasks.iter().any(|t| t.id == *task))
+            },
             TASK_ENDED_REASON,
             out,
         );
-        self.tasks = live;
-        out.events.push(AdapterEvent::BackgroundTasks(tasks));
+        self.tasks = tasks;
+        self.report_tasks(out);
+    }
+
+    /// `system/task_started`: a subagent task (`local_agent`; a shell's
+    /// names the call that started the shell) runs the `Agent` call
+    /// `tool_use_id`. The CLI lists a task before this line, so a call new
+    /// to a task in the last reported set reports the set again.
+    fn on_task_started(&mut self, message: &Value, out: &mut Output) {
+        if str_field(message, "task_type") != "local_agent" {
+            return;
+        }
+        let (Some(task), Some(call)) = (
+            message.get("task_id").and_then(Value::as_str),
+            message.get("tool_use_id").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let known = self.task_calls.insert(task.to_owned(), call.to_owned());
+        if known.as_deref() != Some(call) && self.tasks.iter().any(|t| t.id == task) {
+            self.report_tasks(out);
+        }
+    }
+
+    /// Reports the last task set, each subagent task with its call as far
+    /// as known.
+    fn report_tasks(&mut self, out: &mut Output) {
+        for task in &mut self.tasks {
+            if task.kind == TaskKind::Subagent {
+                task.call = self
+                    .task_calls
+                    .get(&task.id)
+                    .map(|call| AgentCallId::from(call.as_str()));
+            }
+        }
+        out.events
+            .push(AdapterEvent::BackgroundTasks(self.tasks.clone()));
     }
 
     fn on_assistant(&mut self, message: &Value, out: &mut Output) {
-        if is_subagent_message(message) {
-            return;
-        }
+        let parent = subagent_parent(message);
         let Some(blocks) = content_blocks(message) else {
             return;
         };
@@ -841,7 +902,7 @@ impl Protocol {
                     if !text.is_empty() {
                         out.events.push(AdapterEvent::Text {
                             text: text.to_owned(),
-                            parent: None,
+                            parent: parent.clone(),
                         });
                     }
                 }
@@ -850,11 +911,16 @@ impl Protocol {
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     let id = block.get("id").and_then(Value::as_str);
                     if let Some(id) = id {
-                        self.tools.insert(id.to_owned(), name.clone());
+                        let tools = if parent.is_some() {
+                            &mut self.sub_tools
+                        } else {
+                            &mut self.tools
+                        };
+                        tools.insert(id.to_owned(), name.clone());
                     }
                     out.events.push(AdapterEvent::ToolCall {
                         call: id.map(AgentCallId::from),
-                        parent: None,
+                        parent: parent.clone(),
                         display: display::call_display(&name, &input),
                         name,
                         input,
@@ -867,11 +933,10 @@ impl Protocol {
     }
 
     fn on_user(&mut self, message: &Value, out: &mut Output) {
-        if is_subagent_message(message) {
-            return;
-        }
+        let subagent = subagent_parent(message).is_some();
         // Text blocks here are the CLI's own markers ("[Request interrupted
-        // by user]"); only tool results matter.
+        // by user]"), or a foreground subagent's prompt, which its `Agent`
+        // call already shows; only tool results matter.
         let Some(blocks) = content_blocks(message) else {
             return;
         };
@@ -893,7 +958,8 @@ impl Protocol {
                 .unwrap_or(false);
             let tool_use_id = block.get("tool_use_id").and_then(Value::as_str);
             // A result for a call still awaiting approval: the CLI gave up on
-            // the approval (stdin closed, or a timeout of its own).
+            // the approval (stdin closed, or a timeout of its own). Only that
+            // call's: a subagent's result leaves the turn's approvals be.
             if let Some(tool_use_id) = tool_use_id
                 && let Some(index) = self
                     .pending
@@ -912,7 +978,12 @@ impl Protocol {
                     reason,
                 });
             }
-            let tool = tool_use_id.and_then(|id| self.tools.remove(id));
+            let tools = if subagent {
+                &mut self.sub_tools
+            } else {
+                &mut self.tools
+            };
+            let tool = tool_use_id.and_then(|id| tools.remove(id));
             if tool.as_deref() == Some("CronCreate") && !is_error {
                 self.note_durable(structured);
             }
@@ -956,7 +1027,7 @@ impl Protocol {
         let task = request
             .get("agent_id")
             .and_then(Value::as_str)
-            .filter(|id| self.tasks.contains(*id))
+            .filter(|id| self.tasks.iter().any(|t| t.id == *id))
             .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
@@ -1352,11 +1423,13 @@ fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// A subagent's own message, which comes after the main turn's `result` and
-/// outside any turn. Not reported: the main agent's turn quotes what the
-/// subagent found.
-fn is_subagent_message(message: &Value) -> bool {
+/// For a subagent's own message, the `Agent` call that runs the subagent
+/// (for a nested one, the inner call): its steps' `parent`. A foreground
+/// subagent's come inside the main turn, a background one's mostly after
+/// its `result`.
+fn subagent_parent(message: &Value) -> Option<AgentCallId> {
     message
         .get("parent_tool_use_id")
-        .is_some_and(|id| !id.is_null())
+        .and_then(Value::as_str)
+        .map(AgentCallId::from)
 }

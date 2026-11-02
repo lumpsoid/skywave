@@ -1163,3 +1163,140 @@ fn a_moved_context_opens_its_new_session_once_the_move_is_pulled() {
         view.timeline
     );
 }
+
+/// The messages of `timeline`, with the `Agent` call each belongs to.
+fn messages(timeline: &[TimelineItem]) -> Vec<(Option<skywave_proto::CallId>, String)> {
+    timeline
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Logged {
+                parent,
+                entry: Entry::AgentMessage { text },
+                ..
+            } => Some((*parent, text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_timeline() {
+    use skywave_proto::{AgentSettings, AgentWork, Command, CommandId, CommandResult};
+    use skywaved::agent::EventMapper;
+    use skywaved::agent::claude_code::protocol::Protocol;
+    use skywaved::{EventLog, Storage};
+
+    // The daemon: the `subagent` recording through the Claude Code
+    // protocol and the event mapper into a log.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let workdir = root.join("project");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let mut storage = Storage::open(tmp.path().join("data")).unwrap();
+    let log = EventLog::open(&storage.db, vec![root]).unwrap();
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: workdir.to_str().unwrap().to_owned(),
+            conversation: None,
+        },
+    };
+    let CommandResult::Accepted { .. } = log
+        .handle(&mut storage.db, DeviceId::new(), &create)
+        .unwrap()
+    else {
+        panic!("session not created");
+    };
+    let sid = log.read(&storage.db, Seq::ZERO, 1).unwrap().events[0].session_id;
+    let mut mapper = EventMapper::new(
+        sid,
+        ContextId::first_of(sid),
+        AgentSettings::default(),
+        AgentWork::default(),
+    );
+    let recording = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../skywaved/tests/fixtures/claude-code/subagent.ndjson"),
+    )
+    .unwrap();
+    let mut protocol = Protocol::new(uuid::Uuid::new_v4(), false);
+    let mut events = protocol.start().events;
+    let initialize = protocol_initialize_id(&recording);
+    for line in recording.lines().filter(|l| !l.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut msg = record["msg"].clone();
+        match record["dir"].as_str().unwrap() {
+            "in" if msg["type"] == "user" => {
+                let text = msg["message"]["content"].as_str().unwrap().to_owned();
+                events.extend(protocol.send_message(text).events);
+            }
+            "out" => {
+                // The CLI answers `initialize` under the id the protocol chose.
+                if msg["response"]["request_id"] == initialize {
+                    msg["response"]["request_id"] = "skywave_1".into();
+                }
+                events.extend(protocol.on_line(&msg.to_string()).events);
+            }
+            // The protocol answers the CLI's hook calls itself.
+            _ => {}
+        }
+    }
+    for event in events {
+        mapper.apply(&log, &mut storage, event).unwrap();
+    }
+    let batch = log.read(&storage.db, Seq::ZERO, 1000).unwrap();
+    let logged: Vec<(Option<skywave_proto::CallId>, String)> = batch
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::AgentMessage { parent, text } => Some((*parent, text.clone())),
+            _ => None,
+        })
+        .collect();
+    let agent_call = batch
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolCall(call) if call.name == "Agent" => call.call,
+            _ => None,
+        })
+        .expect("the Agent call");
+    assert!(
+        logged.contains(&(Some(agent_call), "PONG".to_owned())),
+        "{logged:?}"
+    );
+
+    // The client: the log through the core.
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, _) = paired_core(dir.path());
+    seam.apply_events(&batch).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    let main = messages(&session_view(&core.view()).timeline);
+    // Positive control: the main agent's own text is on the main timeline.
+    assert!(
+        main.contains(&(None, "The subagent replied: **PONG**".to_owned())),
+        "{main:?}"
+    );
+    assert!(main.iter().all(|(parent, _)| parent.is_none()), "{main:?}");
+    assert!(!main.iter().any(|(_, text)| text == "PONG"), "{main:?}");
+    // The subagent's own view has it.
+    core.dispatch(Action::ViewSubagent {
+        session_id: sid,
+        call: Some(agent_call),
+    })
+    .unwrap();
+    assert_eq!(
+        messages(&session_view(&core.view()).timeline),
+        [(Some(agent_call), "PONG".to_owned())]
+    );
+}
+
+/// The request id of the `initialize` the recording's driver wrote.
+fn protocol_initialize_id(recording: &str) -> serde_json::Value {
+    recording
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|r| r["dir"] == "in" && r["msg"]["request"]["subtype"] == "initialize")
+        .map(|r| r["msg"]["request_id"].clone())
+        .unwrap()
+}
