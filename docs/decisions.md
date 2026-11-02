@@ -432,8 +432,8 @@ own, true because both heads render a per-task stop.
 - cancelling a schedule from Skywave by any means (revisit only if a CLI adds
   a control request);
 - an always-on indicator;
-- a subagent transcript view (needs `parent` on `ToolCall` / `AgentMessage`
-  and `forwardSubagentText`; writing to a subagent goes by D33's relay);
+- ~~a subagent transcript view~~ done, read side only (D34); writing to a
+  subagent is deferred there too;
 - task output (`output_file`, `summary`, `usage`);
 - backgrounding a foreground task (`background_tasks` control request,
   Ctrl+B);
@@ -535,3 +535,120 @@ succeeds, record a fixture and revisit this decision.
 writing a subagent's `pendingMessages` or task state from outside (internal
 to the CLI process); the agent-team mailbox route seen in the TUI's submit
 path (for teammates, not subagents; not traced).
+
+**Update (D34, 2026-11-02):** the relay is not built. D34 defers messaging a
+subagent until the CLI offers a native way in.
+
+## D34. The subagent view: tags, fold-then-filter, logged call endings
+Read-only view of a subagent's own transcript (protocol v13). Commits
+faa75f2, 974081c, 39d9328, 602ce3a, ffc221e, 191b3ed, 73af6ee carry the
+detail.
+**Tags.** `AgentMessage.parent` and `ToolCall.parent: Option<CallId>` name
+the `Agent` call that started the subagent that produced the event; `None`
+is the main agent. A nested subagent chains through its own `Agent` call's
+`parent`; there is no depth field. `ToolResult` has no `parent` (user
+decision): a result is placed through its call, and a second tag could
+disagree with it. `ApprovalRequested` has none either; its call places it.
+`BackgroundTask.call` links a subagent's task to its `Agent` call. The v1
+tool-event compat decoders are gone (every pre-v12 database was already
+undecodable).
+**Call endings are logged, never inferred.** `CallsUnanswered { calls }`
+says these calls will never get a result. The mapper emits it at turn end
+(main and foreground-subagent calls, just before the closing state event),
+when a background subagent's task leaves the set, and on agent exit.
+`Supervisor::recover` emits it on daemon start for calls a crash left open
+(a raw log scan: 46 ms for 20k tool calls in 38k events; it grows with the
+whole log, and no index would narrow it). The core marks the named `Running`
+calls `NoResult` and no longer sweeps running calls at every
+`SessionStateChanged`.
+**Why:** the sweep derived an outcome from turn framing, which is wrong once
+calls outlive turns (background subagents), and it guessed where the server
+knows. One batch event rather than a `ToolResult` with a flag, because a
+result claims an answer (preview, lines, output) and an unanswered call has
+none. **Rejected:** patching the sweep with "unless its root task is live"
+(keeps the guess and adds a second rule that must agree with the server).
+**Mapper roots.** An `Agent` call named by any task reported in the process
+is kept until exit: a subagent is woken again under the same call, possibly
+after it finished inside a turn while its shell kept running. A subagent's
+calls are kept until its task leaves the set, not until their result: a
+nested subagent's inner `Agent` call is answered "Async agent launched"
+before any task names it. An unknown parent becomes `None`, so the event
+shows on the main timeline (a bounded failure).
+**Adapter.** `task_started` (`local_agent` only) maps task id to `Agent`
+call; when that changes a task in the last reported set, the set is reported
+again with `call` filled (the level event comes first). Subagent tool names
+live in a map `on_result` does not clear. Text in subagent `user` lines
+(including a foreground subagent's prompt) and thinking stay dropped; the
+prompt shows from the `Agent` call's display.
+**Core: fold once, then narrow.** Every timeline item records `parent`. The
+main view keeps `parent: None`; a subagent view keeps `parent == Some(call)`
+(dividers dropped). **Why:** results, approvals and `CallsUnanswered` mutate
+earlier items by index, so filtering events first would orphan them (the
+reason `ViewContext` works the same way). `Action::ViewSubagent`; `Back`
+steps to the shown call's parent (outer subagent, main, list) with no
+navigation stack, since the parent chain is in the data. It lives in the core
+because the core owns screens and Back; a head-side stack would be built
+twice. With a subagent shown, the `viewing` context filter is skipped.
+`ToolView.subagent: SubagentStatus { task, live, steps, last }` sits on
+`Agent` rows and heads show it instead of the outcome. Subagent messages are
+not notable (no unread bump); a subagent's approval is, since it blocks work,
+and shows in every view as "from subagent: ...". Nothing is marked read while
+a subagent view is shown. The composer always messages the main agent and
+says so.
+**Heads.** TUI: `o` opens (timeline row, Background picker), Esc leaves;
+per-view state resets while composer, draft, history and read marker
+survive. In a subagent view `S` stops that subagent's task, through a confirm
+(`S` already meant stop the agent; inside a subagent view it targets the
+subagent, and only when it has a live task: a foreground subagent has none
+the server will stop, and Interrupt ends it with the turn). GUI: the session
+page stays under the subagent page in the Navigator, so the main composer's
+text survives; Open on rows and in the background sheet; AppBar trail and
+Stop.
+**Messaging a subagent is deferred** (user decision 2026-11-02; supersedes
+D33's plan to build the relay). Writing to a subagent (a `MessageSubagent`
+command, the relay, a subagent composer) waits for a native way in:
+`send_task_message` implemented by the CLI (D33: not sent until then) or an
+equivalent. Until then the user asks the main agent. **Why:** the relay's
+outcome could only be judged by inferring which main turn carried it, and a
+probe showed that inference fails. Findings (CLI 2.1.310, details in
+docs/agents/claude-code.md §3.12):
+- The CLI opens main turns on its own when a background task ends, and a
+  user line written just then runs as a separate, later turn. `relay_race`
+  wrote the relay with no turn open; the CLI first ran its notification turn
+  (no `SendMessage`), then the relay's turn. "The next `result` after
+  writing is the line's turn" is false.
+- `--replay-user-messages` echoes each stdin `user` line as
+  `{"type":"user","isReplay":true,"uuid",...}` right after the `init` of the
+  turn that takes it up, before any `assistant` line: a definitive marker of
+  the line's turn if a relay is ever revived. Unverified: whether an input
+  `uuid` is echoed back.
+- This CLI blocks a standalone `sleep 25` in a subagent ("use Monitor"), so
+  the `relay_live` / `relay_midrun` prompts need changing before re-recording.
+- The raw recordings in `/tmp/skywave-race/` are not fixtures; nothing
+  replays them. The probe's `relay_race` / `relay_race_echo` regenerate them.
+**Known debt:**
+- GUI: a nested subagent replaces the top page instead of getting a page per
+  level (the header signal has no trail call ids); stepping out of a nested
+  one animates as a push; the page underneath rebuilds with the subagent's
+  rows while the new page animates in, and its scroll position is not kept
+  on return.
+- `recover`'s open-call scan grows with total tool events (about 1.2 us per
+  event; millions of events cost about a second per daemon start). The fix is
+  persisting the open set or a high-water mark.
+- `ViewSubagent` and `Back` each re-run the session fold (one `view()`'s cost
+  per action).
+- In the main view a subagent's pending approval shows without its gated call
+  (the label says where to look).
+- Not covered by fixtures: nested subagents (`spawn_depth` > 1); a foreground
+  subagent stopped with a call in flight; a live CLI attaching
+  `tool_use_result` to a subagent's result (no recording has one; the
+  `sub_tools` path is proven by a synthetic test).
+**Deferred:** stopping a foreground subagent on its own (it has a task id and
+`stop_task` works on it per §3.13, but `StopTask` is validated against the
+level set, which never lists it); moving a foreground subagent to the
+background from Skywave (`background_tasks`, see D31); run dividers in the
+subagent view ("woken: shell finished", `run_id`s); per-subagent unread
+counts and finish notifications; subagent token usage and cost, task output
+(`output_file`, `summary`); stopping tasks nested inside a subagent beyond
+what `stop_task` does; size caps on subagent transcripts (full sync for now;
+tool outputs are already blobbed); showing a subagent's thinking.

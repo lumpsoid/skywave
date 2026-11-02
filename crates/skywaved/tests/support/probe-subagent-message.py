@@ -14,6 +14,13 @@ usage: probe-subagent-message.py <scenario> <out.ndjson>
                 first and is resumed by the message)
   relay_midrun  the same, to a subagent busy with ten quick tool calls, so
                 the message lands mid-run
+  relay_race    two background subagents, a quick one and a long one; the
+                relay to the long one is written the moment the quick one's
+                `task_notification` arrives, before the CLI opens the turn it
+                starts on its own for it: does the CLI fold the line into
+                that turn or run it as the next?
+  relay_race_echo  the same with `--replay-user-messages`, to see where the
+                CLI echoes the relay line relative to those turns
 
 It writes what skywaved writes (`initialize` with `hooks: null`, one `user`
 message), allows every `can_use_tool`, answers other control requests with
@@ -31,7 +38,8 @@ import threading
 import time
 import uuid
 
-SCENARIOS = ("ctl_live", "ctl_done", "ptu_live", "relay_live", "relay_midrun")
+SCENARIOS = ("ctl_live", "ctl_done", "ptu_live", "relay_live", "relay_midrun",
+             "relay_race", "relay_race_echo")
 WORD = "The code word is ZEBRA."
 ANSWER = ("Then reply with exactly the code word somebody sent you while you "
           "worked, or NONE if nobody did.")
@@ -51,11 +59,20 @@ else:
 prompt = (f"Use the Agent tool (subagent_type general-purpose, in the "
           f"background) with this exact prompt: '{work}' Do not wait for it. "
           f"Reply STARTED.")
+RACE = scenario.startswith("relay_race")
+QUICK = "Run the Bash command `sleep 8`. Then reply with exactly the word PONG."
+if RACE:
+    prompt = (f"Use the Agent tool twice, in one message, both with "
+              f"subagent_type general-purpose and in the background. The first "
+              f"with this exact prompt: '{QUICK}' The second with this exact "
+              f"prompt: '{work}' Do not wait for them. Reply STARTED.")
 
 argv = ["claude", "-p", "--input-format", "stream-json", "--output-format",
         "stream-json", "--verbose", "--permission-prompt-tool", "stdio",
         "--model", "haiku", "--setting-sources", "project",
         "--strict-mcp-config", "--session-id", str(uuid.uuid4())]
+if scenario == "relay_race_echo":
+    argv.append("--replay-user-messages")
 out = open(out_path, "w")
 lock = threading.Lock()
 t0 = time.time()
@@ -99,7 +116,7 @@ def user(text, parent=None):
           "parent_tool_use_id": parent, "session_id": ""})
 
 
-state = {"task": None, "call": None, "turn_open": False,
+state = {"task": None, "call": None, "turn_open": False, "quick": None,
          "last_out": time.time(), "task_done": False, "acted": False}
 
 
@@ -120,7 +137,17 @@ def reader():
             note("result")
         elif (kind == "system" and subtype == "task_started"
               and msg.get("task_type") == "local_agent"):
-            state["task"], state["call"] = msg["task_id"], msg.get("tool_use_id")
+            if RACE and "PONG" in (msg.get("prompt") or ""):
+                state["quick"] = msg["task_id"]
+            elif state["task"] is None:
+                state["task"], state["call"] = msg["task_id"], msg.get("tool_use_id")
+        elif (RACE and kind == "system" and subtype == "task_notification"
+              and msg.get("task_id") == state["quick"] and not state["acted"]):
+            # Written from the reader, at once: the window is the time
+            # until the CLI's own `system/init` for the turn it starts.
+            state["acted"] = True
+            note(f"quick task ended; turn open: {state['turn_open']}")
+            act()
         elif (kind == "system" and subtype == "task_notification"
               and msg.get("task_id") == state["task"]):
             state["task_done"] = True
@@ -165,7 +192,7 @@ delay = 0.2 if scenario == "relay_midrun" else 3
 deadline = t0 + 300
 while time.time() < deadline and p.poll() is None:
     time.sleep(0.5)
-    ready = state["task"] and not state["turn_open"]
+    ready = state["task"] and not state["turn_open"] and not RACE
     if scenario == "ctl_done":
         ready = ready and state["task_done"]
     if not state["acted"] and ready:
