@@ -716,7 +716,7 @@ the supervisor, not part of it.
 **Deferred:** per-run timeouts and a concurrency cap across sessions.
 
 ## D36. Reading a session's workdir: read-only, confined, on by default
-A device lists a session's workdir and reads its files (protocol v15,
+A device sees a session's git changes, lists its workdir and reads its files (protocol v15,
 architecture.md "Protocol" and "Server"; `crates/skywaved/src/workdir.rs`).
 A request names a session, never a raw server path, so a device reads only
 workdirs sessions run in.
@@ -745,7 +745,37 @@ database connection behind a mutex, never the API's. An outer timeout only
 drops the request's future, not its blocking work, so each request carries
 a deadline from its handler's start: a request that gets the lock past it
 does nothing, and work in progress stops at it. Otherwise N presses of
-refresh would run N snapshots back to back.
+refresh would run N snapshots back to back. Each git child leads its own
+process group, SIGKILLed at the deadline, so a filter's own children die
+too; the changes answer is then `Failed { "timed out" }`, a 200 like every
+other way git can fail, rather than list and file's 503.
+**Repository config cannot run code through the changes view.** It runs
+the `git` CLI (what the user's own tooling sees, honouring `.gitignore`,
+attributes and `safe.directory`), and a repository's config is the agent's
+to write. So every call sets `core.fsmonitor=false` and passes
+`--no-ext-diff --no-textconv`, and there is no pager. Submodules are
+always shown `--submodule=short` (and `diff.submodule=short`): the repo's
+`diff.submodule=diff` makes git run an inner diff inside the submodule
+without `--no-ext-diff`, so the submodule's own `diff.<driver>.command`
+would run. `--no-ext-diff` and
+friends do not cover filter drivers: `git diff HEAD` runs a driver's
+`clean` on every stat-dirty file. Before the first diff, `git config
+--show-scope --get-regexp '^filter\.'` (a config read runs nothing) lists
+them, and each driver with a `clean` or `process` in `local` or `worktree`
+scope (an `include.path` counts as the scope including it, so an outside
+file included from `.git/config` is `local`) is emptied, with `required`
+off, on every later call. Drivers from global or system config, such as
+git-lfs, do run, as they would for `git status`, so LFS files don't all
+show as modified. Hooks never run on these read commands. Inherited `GIT_*`
+variables, other than where the global and system config and git's own
+programs live, are removed from each child (a daemon started from a git
+hook would otherwise read another repository), and lazy fetches in a
+partial clone are off (`GIT_NO_LAZY_FETCH`). git does follow the
+repository's own pointers (a `.git` gitfile, `objects/info/alternates`),
+so a diff, a "Deleted" one say, can show content from a repository the
+workdir's `.git` names outside the workdir. That is the same class as the
+check-then-open race: the agent that wrote those pointers can read the
+content anyway, so it is accepted.
 **Content-deduplicated blobs.** File contents are blobs looked up by
 `(sha256, size)` in `workdir_blobs`: unchanged content keeps its `BlobId`,
 so a refresh costs no server disk and no device fetch. Only workdir content

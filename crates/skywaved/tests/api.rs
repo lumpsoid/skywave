@@ -18,14 +18,15 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId, DeviceInfo,
-    DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileResult, HelloResponse,
-    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId,
-    SessionOrigin, path,
+    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
+    DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody,
+    FileChange, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse,
+    RejectReason, Seq, SessionId, SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
 use skywaved::server::Server;
+use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, devices, pairing};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -61,6 +62,15 @@ impl Fixture {
 
     /// [`Fixture::start`] with shell commands on or off.
     async fn start_with_shell(shell: bool) -> Fixture {
+        Fixture::start_with(shell, isolated_git()).await
+    }
+
+    /// [`Fixture::start`] with workdir changes running git as `git` says.
+    async fn start_with_git(git: Git) -> Fixture {
+        Fixture::start_with(false, git).await
+    }
+
+    async fn start_with(shell: bool, git: Git) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
@@ -70,11 +80,12 @@ impl Fixture {
         let log = EventLog::open(&storage.db, vec![root.clone()])
             .unwrap()
             .with_shell(shell);
-        let server = Server::bind(
+        let server = Server::bind_with_git(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log.clone(),
+            git,
         )
         .await
         .unwrap();
@@ -955,4 +966,124 @@ async fn workdir_list_and_file_answer_every_outcome_with_200() {
             "{route}"
         );
     }
+}
+
+/// The daemon's git, immune to the user's config.
+fn isolated_git() -> Git {
+    Git::default()
+        .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .with_env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+/// Runs the real git for test setup in `dir`, immune to the user's config.
+fn setup_git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs `git` on PATH: {e}"));
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_changes_answer_with_200_and_a_diff_blob() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    setup_git(&workdir, &["init", "-q"]);
+    std::fs::write(workdir.join("a.txt"), "one\n").unwrap();
+    setup_git(&workdir, &["add", "a.txt"]);
+    setup_git(&workdir, &["commit", "-q", "-m", "first"]);
+    std::fs::write(workdir.join("a.txt"), "two\n").unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let changes = |session: SessionId| format!("{}?session={}", path::WORKDIR_CHANGES, session.0);
+
+    let reply = device.get(&changes(session)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let ChangesResult::Changes(set) = reply.json::<ChangesResult>() else {
+        panic!("expected changes: {:?}", reply.body);
+    };
+    assert_eq!((set.branch.as_deref(), set.total), (Some("main"), 1));
+    let file = &set.files[0];
+    assert_eq!(
+        (file.path.as_str(), file.change),
+        ("a.txt", FileChange::Modified)
+    );
+    let DiffBody::Blob(blob) = &file.diff else {
+        panic!("expected a diff blob: {file:?}");
+    };
+    let diff = device.get(&path::blob(blob.id)).await;
+    assert_eq!(diff.status, StatusCode::OK);
+    let diff = String::from_utf8(diff.body.to_vec()).unwrap();
+    assert!(diff.contains("-one\n+two\n"), "{diff}");
+
+    let reply = device.get(&changes(SessionId::new())).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<ChangesResult>(), ChangesResult::UnknownSession);
+    let mut anon = f.anonymous().await;
+    assert_eq!(
+        anon.get(&changes(session)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_workdir_changes_does_not_block_hello() {
+    let fake = tempfile::tempdir().unwrap();
+    let script = fake.path().join("slow-git");
+    let count = fake.path().join("slow-git.count");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho started >> '{}'\nsleep 5\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let f = Fixture::start_with_git(Git::new(&script)).await;
+    let creds = f.pair().await;
+    let mut slow = f.client(&creds).await;
+    let created = slow.command(&f.create_session_command()).await;
+    let session = session_of(&created, &slow.events(Seq::ZERO, 0).await);
+    let uri = format!("{}?session={}", path::WORKDIR_CHANGES, session.0);
+    let pending = tokio::spawn(async move { slow.get(&uri).await });
+
+    // Once its git is running, another connection still gets answered.
+    let started = Instant::now();
+    while !count.exists() {
+        assert!(started.elapsed() < SOON, "the fake git never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut device = f.client(&creds).await;
+    let hello = tokio::time::timeout(SOON, device.get(path::HELLO))
+        .await
+        .expect("hello answers while changes run");
+    assert_eq!(hello.status, StatusCode::OK);
+    assert!(!pending.is_finished(), "the changes request ended early");
+
+    let reply = tokio::time::timeout(SOON, pending).await.unwrap().unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        matches!(reply.json::<ChangesResult>(), ChangesResult::Failed { .. }),
+        "{:?}",
+        reply.body
+    );
 }

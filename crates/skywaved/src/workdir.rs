@@ -1,6 +1,6 @@
-//! Read-only views of a session's workdir (`GET /v1/workdir/list` and
-//! `/v1/workdir/file`, D36): listings, file contents, and the
-//! content-deduplicated store their blobs go to.
+//! Read-only views of a session's workdir (`GET /v1/workdir/changes`,
+//! `/v1/workdir/list` and `/v1/workdir/file`, D36): git changes, listings,
+//! file contents, and the content-deduplicated store their blobs go to.
 //!
 //! **One snapshot at a time.** [`WorkdirReader`] owns its own database
 //! connection behind a mutex, apart from the API's, and a whole snapshot
@@ -61,6 +61,88 @@
 //! swap a symlink between them. That is the agent, which can read the target
 //! itself, so it is accepted (D36).
 //!
+//! **Changes** ([`Snapshot::changes`]) resolve the workdir by steps 1 and 2
+//! (there is no `path`), then run the `git` CLI there. Every child is
+//! `git -C <workdir> -c core.quotePath=false -c core.fsmonitor=false
+//! -c diff.external= -c diff.submodule=short --no-optional-locks --no-pager
+//! <sub> ...`, with stdin
+//! null, `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`,
+//! `GIT_NO_LAZY_FETCH=1`, `LC_ALL=C`, and every inherited `GIT_*` variable
+//! removed except `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+//! `GIT_CONFIG_NOSYSTEM` and `GIT_EXEC_PATH` (a daemon started from a git
+//! hook would otherwise read another repository, index or config). It leads
+//! its own process group, SIGKILLed at the snapshot's deadline. Any deadline
+//! reached inside `changes` (a killed child, or a check between steps)
+//! answers `Failed { "timed out" }`, a 200 like git's other failures; only a
+//! request that gets the lock too late is a 503, as for list and file.
+//! 1. `rev-parse --is-inside-work-tree`, decided by its output: `true` goes
+//!    on, `false` (inside a git dir, or a bare repo) is `NotGit`, a fatal
+//!    starting `fatal: not a git repository` is `NotGit`, and anything else
+//!    `Failed` with git's first stderr line (so a `safe.directory` refusal
+//!    says so). A missing `git` is `Failed { "git is not installed" }`.
+//! 2. **Filters**: `config --show-scope -z --get-regexp '^filter\.'` (exit
+//!    1: none). Every driver with a `clean` or `process` in `local` or
+//!    `worktree` scope gets `clean`, `process` emptied and `required` off on
+//!    every later call, through `GIT_CONFIG_COUNT` (command scope like `-c`,
+//!    but any name fits). Global and system drivers (git-lfs) run.
+//! 3. Branch (`symbolic-ref`, `None` when detached), head (`rev-parse
+//!    --verify`, `None` when unborn); the base is `HEAD`, or the empty tree
+//!    by `hash-object -t tree /dev/null` (so a sha256 repo works).
+//! 4. Entries from `diff <base> -z --raw --numstat` (raw records, then
+//!    numstat records in the same order, checked to name the same paths),
+//!    with the shared diff flags: `--relative` (the workdir's subtree, in its
+//!    own terms), `-M`, `--no-ext-diff --no-textconv --no-color
+//!    --ignore-submodules=dirty --submodule=short`, `-O/dev/null` and
+//!    explicit `a/` `b/` prefixes (so the repo's config cannot reorder or
+//!    reprefix headers). `--submodule=short` matters most: the repo's
+//!    `diff.submodule=diff` would run an inner diff inside the submodule,
+//!    without `--no-ext-diff`, so the submodule's own diff driver would run;
+//!    and `log` prints lines with no `diff --git` header, which would land in
+//!    the previous file's section. `short` prints a submodule as an ordinary
+//!    section of `Subproject commit` lines.
+//!    Paths in `ls-files --unmerged` are `Conflicted` (`git diff HEAD` says
+//!    `M`). One that no raw record lists (its worktree equals `HEAD`: a
+//!    modify/delete conflict with ours kept, or `checkout --ours` without
+//!    `add`) is still a `Conflicted` entry, counted `0`/`0`, with the
+//!    per-file diff (normally empty, so an empty blob). Untracked ones come from `ls-files --others --exclude-standard`,
+//!    `lstat`ed: a symlink or a regular file, anything else skipped. Paths
+//!    that are not UTF-8 are left out (and not counted).
+//! 5. Sorted by path (tracked before untracked on a tie: `git rm --cached f`
+//!    with `f` on disk is both), capped at [`limits::WORKDIR_CHANGES_MAX`];
+//!    `total` counts all.
+//! 6. **Patches**: one streamed `diff <base>`, split at lines starting
+//!    `diff --git ` (a body line starts with ` `, `+`, `-`, `\` or `@@`, and
+//!    a path holding a newline is quoted). A section goes to the entry whose
+//!    exact expected header `diff --git a/<from or path> b/<path>` it
+//!    carries, never by position; consecutive sections with one header are a
+//!    type change and concatenate. An entry with a path git quotes, a header
+//!    shared with any other entry, a header seen again non-consecutively, or
+//!    no section takes its own `diff <base> -- :(literal)<from>
+//!    :(literal)<path>`, keeping only the sections whose header is the
+//!    entry's own as git prints it (quoted or not): `:(literal)p` also
+//!    matches everything under a directory `p/`. A section keeps at most
+//!    [`limits::WORKDIR_DIFF_MAX_BYTES`] (past it only counted:
+//!    `TooLarge`), and nothing once [`limits::WORKDIR_DIFFS_MAX_BYTES`] are
+//!    held (`Omitted`), so the patch is never in memory whole. A diff past
+//!    the per-file cap is `TooLarge { bytes }` even when the budget was
+//!    spent before it streamed. Binary (by
+//!    numstat) has no blob.
+//! 7. **Untracked diffs** are synthesised as new-file patches, git's
+//!    format: a symlink's is its link text (`read_link`, never followed),
+//!    a regular file over the per-diff cap by `lstat` is `TooLarge` (its
+//!    size) unread, else it is opened `O_NOFOLLOW`, read through `take`, and
+//!    a NUL in the first [`BINARY_SNIFF_BYTES`] is `Binary`. Only entries
+//!    inside the cap are read; their counts are `None` when unread.
+//! 8. In path order, diffs are stored until the snapshot total would pass
+//!    [`limits::WORKDIR_DIFFS_MAX_BYTES`]; from there on every text diff is
+//!    `Omitted`.
+//!
+//! The snapshot is not atomic (the agent may edit between git calls). The
+//! header pairing keeps each diff its own file's for edits made in passing.
+//! An agent that swaps renames between the raw call and the patch call on
+//! purpose can mispair two files it created itself, both inside the
+//! workdir. That is accepted, like the check-then-open race (D36).
+//!
 //! **Blobs, deduplicated by content** ([`Snapshot::store`]): the content is
 //! hashed in memory (it is capped) and `(sha256, size)` looked up in
 //! `workdir_blobs`. A hit reuses that blob, so an unchanged file keeps its
@@ -92,6 +174,11 @@ use crate::dirs;
 use crate::error::{Error, IoContext, Result};
 use crate::event_log::{self, parse_id};
 
+mod changes;
+mod git;
+
+pub use git::Git;
+
 /// How long one snapshot may run, counted from when its handler started
 /// (queueing for the lock included). Shorter than the API's outer
 /// `WORKDIR_TIMEOUT`, so a snapshot normally stops before its client is
@@ -110,17 +197,25 @@ pub struct WorkdirReader {
     db: Mutex<Db>,
     blobs: BlobStore,
     roots: Vec<PathBuf>,
+    git: Git,
 }
 
 impl WorkdirReader {
     /// A reader over `db`, a connection of its own; `roots` are the
-    /// configured session roots.
+    /// configured session roots. It runs `git` from `PATH`.
     pub fn new(db: Db, blobs: BlobStore, roots: Vec<PathBuf>) -> WorkdirReader {
         WorkdirReader {
             db: Mutex::new(db),
             blobs,
             roots,
+            git: Git::default(),
         }
+    }
+
+    /// This reader running git as `git` says.
+    pub fn with_git(mut self, git: Git) -> WorkdirReader {
+        self.git = git;
+        self
     }
 
     /// Runs `f` as one snapshot, holding the workdir connection. Blocking.
@@ -137,6 +232,7 @@ impl WorkdirReader {
             db: &mut db,
             blobs: &self.blobs,
             roots: &self.roots,
+            git: &self.git,
             deadline,
         };
         snapshot.check_deadline()?;
@@ -150,6 +246,7 @@ pub struct Snapshot<'a> {
     db: &'a mut Db,
     blobs: &'a BlobStore,
     roots: &'a [PathBuf],
+    git: &'a Git,
     deadline: Instant,
 }
 
@@ -297,7 +394,7 @@ impl Snapshot<'_> {
         if !file.metadata().is_ok_and(|m| m.is_file()) {
             return Ok(FileResult::NotAFile);
         }
-        let content = self.read_capped(&mut file, &target)?;
+        let content = self.read_capped(&mut file, &target, limits::WORKDIR_FILE_MAX_BYTES)?;
         if content.len() as u64 > limits::WORKDIR_FILE_MAX_BYTES {
             let size = file
                 .metadata()
@@ -313,10 +410,10 @@ impl Snapshot<'_> {
         Ok(file_answer(size, FileBody::Blob(blob)))
     }
 
-    /// At most `WORKDIR_FILE_MAX_BYTES + 1` bytes of `file`, checking the
-    /// deadline between chunks.
-    fn read_capped(&self, file: &mut File, path: &Path) -> Result<Vec<u8>> {
-        let mut capped = file.take(limits::WORKDIR_FILE_MAX_BYTES + 1);
+    /// At most `cap + 1` bytes of `file`, checking the deadline between
+    /// chunks.
+    fn read_capped(&self, file: &mut File, path: &Path, cap: u64) -> Result<Vec<u8>> {
+        let mut capped = file.take(cap + 1);
         let mut content = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         loop {
@@ -465,18 +562,18 @@ mod tests {
 
     /// A temp dir holding `root/` (the only root), `root/project/` (the
     /// session's workdir) and `outside/`, with a data dir and a session.
-    struct Tree {
+    pub(super) struct Tree {
         _tmp: tempfile::TempDir,
-        root: PathBuf,
-        workdir: PathBuf,
-        outside: PathBuf,
-        storage: Storage,
+        pub(super) root: PathBuf,
+        pub(super) workdir: PathBuf,
+        pub(super) outside: PathBuf,
+        pub(super) storage: Storage,
         reader: WorkdirReader,
         session: SessionId,
     }
 
     impl Tree {
-        fn new() -> Tree {
+        pub(super) fn new() -> Tree {
             let tmp = tempfile::tempdir().unwrap();
             let base = std::fs::canonicalize(tmp.path()).unwrap();
             let root = base.join("root");
@@ -512,14 +609,14 @@ mod tests {
             }
         }
 
-        fn query(&self, path: &str) -> WorkdirQuery {
+        pub(super) fn query(&self, path: &str) -> WorkdirQuery {
             WorkdirQuery {
                 session: self.session,
                 path: path.to_owned(),
             }
         }
 
-        fn later() -> Instant {
+        pub(super) fn later() -> Instant {
             Instant::now() + SNAPSHOT_DEADLINE
         }
 
@@ -570,7 +667,7 @@ mod tests {
                 .unwrap()
         }
 
-        fn blob_content(&self, blob: &BlobRef) -> Vec<u8> {
+        pub(super) fn blob_content(&self, blob: &BlobRef) -> Vec<u8> {
             let mut file = self
                 .storage
                 .open_blob(blob.id)
