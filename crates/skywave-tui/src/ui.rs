@@ -319,6 +319,10 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
 pub(crate) fn render_prompt(frame: &mut Frame, area: Rect, app: &App, prompt: &Prompt) {
     let title = match prompt.kind {
         PromptKind::Create => " New session · workdir on the server ",
+        PromptKind::Adopt if prompt.asks_workdir() => {
+            " Continue an outside conversation · workdir on the server "
+        }
+        PromptKind::Adopt => " Continue an outside conversation · agent session id (paste it) ",
         PromptKind::Rename(_) => " Rename session · empty restores the default title ",
     };
     let block = Block::bordered().title(title).cyan();
@@ -614,6 +618,24 @@ fn footer_keys(app: &App) -> &'static str {
         {
             "Enter rename (empty: default title) · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
+        Screen::SessionList(_)
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Adopt && !p.asks_workdir()) =>
+        {
+            "Enter create (the server checks the id) · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        Screen::SessionList(_)
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Adopt) =>
+        {
+            "Tab complete · Enter next: the id · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
         Screen::SessionList(_) if app.ui().prompt.is_some() => {
             "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
         }
@@ -622,8 +644,9 @@ fn footer_keys(app: &App) -> &'static str {
             "Enter open · a unarchive · D delete here · r rename · A/Esc active sessions · ? help · q quit"
         }
         Screen::SessionList(_) => {
-            // `↑↓ select` makes way for the archive keys in 100 columns.
-            "Enter open · n new session · r rename · a archive · A archived · s settings · ? help · q quit"
+            // `↑↓ select` makes way for the archive and continue keys in 100
+            // columns.
+            "Enter open · n new · c continue · r rename · a archive · A archived · s settings · ? help · q quit"
         }
         Screen::Session(_) => match app.session().map(|(view, ui)| (view, ui, ui.focus)) {
             Some((_, ui, _)) if ui.picker.is_some() => match ui.picker {
@@ -736,12 +759,48 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                 key("Esc", "cancel"),
             ])
         }
+        Screen::SessionList(_)
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Adopt && !p.asks_workdir()) =>
+        {
+            lines.extend([
+                section("Continue an outside conversation"),
+                key("type / paste", "the agent's id of the conversation"),
+                key("Enter", "create the session; the server checks the id"),
+                key("Backspace", "delete a character"),
+                key("Ctrl-U", "clear"),
+                key("Esc", "cancel"),
+            ])
+        }
         Screen::SessionList(_) if app.ui().prompt.is_some() => lines.extend([
-            section("New session"),
+            section(
+                if app
+                    .ui()
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|p| p.kind == PromptKind::Adopt)
+                {
+                    "Continue an outside conversation: workdir"
+                } else {
+                    "New session"
+                },
+            ),
             key("type / paste", "the session's directory on the server"),
             key("Tab", "complete the directory under the roots"),
             key("↑↓ Tab/Enter", "pick from the list"),
-            key("Enter", "create the session"),
+            if app
+                .ui()
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == PromptKind::Adopt)
+            {
+                key("Enter", "next: the conversation id")
+            } else {
+                key("Enter", "create the session")
+            },
             key("Backspace", "delete a character"),
             key("Ctrl-U", "clear"),
             key("Esc", "close the list, then cancel"),
@@ -751,6 +810,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("↑↓ / k j", "select"),
             key("Enter", "open session"),
             key("n", "new session in a server directory"),
+            key(
+                "c",
+                "continue an agent conversation started outside Skywave (its id)",
+            ),
             key("r", "rename the selected session"),
             key("a", "archive it (on the archived list: bring it back)"),
             key("A", "switch between active and archived sessions"),
