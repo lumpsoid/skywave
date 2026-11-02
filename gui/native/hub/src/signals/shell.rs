@@ -62,6 +62,18 @@ pub struct ShellRunRow {
     /// it (`truncated`).
     pub output: Option<BlobFacts>,
     pub truncated: bool,
+    /// `ExpandShellRun` asked for its whole output, until `CollapseShellRun`.
+    pub expanded: bool,
+    /// While `expanded`: the whole output, ANSI stripped, tabs as spaces
+    /// and other control characters dropped; of a huge one, its newest
+    /// 512 KiB (`whole_note` counts the lines before). `None` while the
+    /// `output` blob is not here, or could not be read (`whole_note` says
+    /// why). Never sent for a run not expanded.
+    pub whole: Option<String>,
+    /// What `whole` leaves out and why, e.g. `… 1200 earlier lines not
+    /// shown`, or that a running run's whole output comes once it
+    /// finishes.
+    pub whole_note: Option<String>,
     /// This device's run while it is in the outbox.
     pub outgoing: Option<OutgoingView>,
     /// A stop of it is on its way or logged; it may still run a while.

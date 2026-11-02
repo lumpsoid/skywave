@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
+import 'package:skywave_gui/session/shell_output.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -34,14 +35,23 @@ ShellRunRow shellRun(
   bool canStop = true,
   bool discardable = false,
   String tail = '',
+  int? lines,
+  BlobFacts? output,
+  bool expanded = false,
+  String? whole,
+  String? wholeNote,
 }) => ShellRunRow(
   key: key,
   command: command,
   state: state,
   stateLabel: stateLabel,
   tail: tail,
-  lines: tail.isEmpty ? 0 : tail.split('\n').length,
-  truncated: false,
+  lines: lines ?? (tail.isEmpty ? 0 : tail.split('\n').length),
+  output: output,
+  truncated: output != null,
+  expanded: expanded,
+  whole: whole,
+  wholeNote: wholeNote,
   stopping: false,
   discardable: discardable,
   canStop: canStop,
@@ -179,6 +189,100 @@ void main() {
     );
     expect(find.text('from the agent'), findsOneWidget);
     expect(find.text('cargo test'), findsNothing);
+  });
+
+  testWidgets('Show all opens the whole output in the app, with a copy, '
+      'and closing it collapses the run', (tester) async {
+    final sent = <GuiIntent>[];
+    const blob = BlobFacts(
+      blobId: 'b1',
+      state: BlobStateKind.notDownloaded,
+      label: 'not downloaded · 4.0 KiB',
+      canDownload: true,
+    );
+    final shell = ShellHolder()
+      ..apply(
+        ShellUpdateSnapshot(
+          sessionId: 's1',
+          runs: [
+            shellRun(
+              'r1',
+              'cargo test',
+              state: ShellRunKind.succeeded,
+              stateLabel: 'exit 0 · 2s',
+              canStop: false,
+              tail: 'line 11\nline 12',
+              lines: 12,
+              output: blob,
+            ),
+          ],
+        ),
+      );
+    await pumpSession(
+      tester,
+      screen: screenWith(composer: shellComposer()),
+      timeline: timelineOf('hello'),
+      shell: shell,
+      sent: sent,
+    );
+    // The card holds the tail only, and opens nothing outside the app.
+    expect(find.text('line 1'), findsNothing);
+    expect(find.text('Open'), findsNothing);
+    await tester.tap(find.byKey(const Key('shell-show-r1')));
+    await tester.pumpAndSettle();
+    final expand = sent.whereType<GuiIntentExpandShellRun>().single;
+    expect((expand.sessionId, expand.runId), ('s1', 'r1'));
+
+    // Not here yet: where the download stands, and its button.
+    final view = find.byType(ShellOutputView);
+    expect(
+      find.descendant(of: view, matching: find.text(blob.label)),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('shell-output-lines')), findsNothing);
+
+    // Rust sends the whole output in the expanded row.
+    final whole = [for (var n = 1; n <= 12; n++) 'line $n'].join('\n');
+    shell.apply(
+      ShellUpdateUpserted(
+        key: 'r1',
+        index: 0,
+        run: shellRun(
+          'r1',
+          'cargo test',
+          state: ShellRunKind.succeeded,
+          stateLabel: 'exit 0 · 2s',
+          canStop: false,
+          tail: 'line 11\nline 12',
+          lines: 12,
+          output: blob,
+          expanded: true,
+          whole: '$whole\n',
+          wholeNote: '… 3 earlier lines not shown',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final lines = find.byKey(const Key('shell-output-lines'));
+    expect(
+      find.descendant(of: lines, matching: find.text('line 1')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: lines, matching: find.text('line 12')),
+      findsOneWidget,
+    );
+    expect(find.text('… 3 earlier lines not shown'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('shell-output-copy')));
+    final copy = sent.whereType<GuiIntentCopyShellOutput>().single;
+    expect((copy.sessionId, copy.runId), ('s1', 'r1'));
+    expect(sent.whereType<GuiIntentCollapseShellRun>(), isEmpty);
+
+    await tester.tap(find.byType(CloseButton));
+    await tester.pumpAndSettle();
+    expect(view, findsNothing);
+    expect(sent.whereType<GuiIntentCollapseShellRun>().single.runId, 'r1');
   });
 
   testWidgets('the condition chip steps, and resets once a run is sent', (

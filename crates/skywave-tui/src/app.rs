@@ -4,7 +4,7 @@
 //! this module decides anything about pairing, sync or delivery (D2).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, BlobView, CallId, CommandId, Completion,
-    ComposerMode, ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri,
-    PairingView, PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId,
+    Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
+    Completion, ComposerMode, ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind,
+    PairUri, PairingView, PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId,
     SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId, TimelineItem,
     ToolOutcome, ViewState, parse_pair_uri,
 };
@@ -367,6 +367,18 @@ pub struct SessionUi {
     pub shell_selected: Option<CommandId>,
     /// The runs whose whole output the run list shows.
     pub shell_expanded: HashSet<CommandId>,
+    /// How many lines the selected run is scrolled past its top, when it
+    /// is taller than the run list (PgUp/PgDn); 0 with each new selection.
+    pub shell_scroll: usize,
+    /// The run list's height and the selected run's, in lines, as last
+    /// drawn: what [`SessionUi::page_run`] pages through.
+    pub shell_room: Cell<(usize, usize)>,
+    /// The downloaded outputs the run list shows expanded, as read once
+    /// ([`OUTPUT_SHOW_BYTES`] of each): a downloaded blob's file does not
+    /// change. `None` for one that could not be read.
+    ///
+    /// [`OUTPUT_SHOW_BYTES`]: skywave_present::output::OUTPUT_SHOW_BYTES
+    pub shell_outputs: RefCell<HashMap<BlobId, Option<String>>>,
     /// When what is seen is marked read ([`App::read_mark`]).
     marker: ReadMarker,
     /// The list of rules `A` opened in the approval prompt; see
@@ -914,6 +926,9 @@ impl SessionUi {
             shell_history: PromptHistory::new(),
             shell_selected: None,
             shell_expanded: HashSet::new(),
+            shell_scroll: 0,
+            shell_room: Cell::new((0, 0)),
+            shell_outputs: RefCell::default(),
             marker: ReadMarker::new(view.id),
             rule_pick: None,
             picker: None,
@@ -1186,13 +1201,33 @@ impl SessionUi {
             Some(i) if up => i.saturating_sub(1),
             Some(i) => (i + 1).min(last),
         };
-        self.shell_selected = Some(runs[index].run);
+        self.pick_run(Some(runs[index].run));
+    }
+
+    /// Selects `run`, from its top.
+    fn pick_run(&mut self, run: Option<CommandId>) {
+        self.shell_selected = run;
+        self.shell_scroll = 0;
+    }
+
+    /// PgUp/PgDn on the run list: pages through the selected run while it
+    /// is taller than the list, to its first or last line and no further.
+    fn page_run(&mut self, up: bool) {
+        let (height, lines) = self.shell_room.get();
+        let step = height.saturating_sub(1).max(1);
+        let most = lines.saturating_sub(height);
+        self.shell_scroll = if up {
+            self.shell_scroll.min(most).saturating_sub(step)
+        } else {
+            (self.shell_scroll + step).min(most)
+        };
     }
 
     /// Enter/Space on a run: shows its whole output, or only the tail
     /// again. Expanding a cut preview downloads the output if needed.
     fn toggle_run(&mut self, view: &SessionView) -> Option<Action> {
         let run = self.selected_run(view)?;
+        self.shell_scroll = 0;
         if !self.shell_expanded.insert(run.run) {
             self.shell_expanded.remove(&run.run);
             return None;
@@ -2142,8 +2177,9 @@ impl App {
     }
 
     /// Keys on the session view. An open search prompt takes every key;
-    /// otherwise Ctrl-F, Ctrl-X, PgUp/PgDn and Tab work in both focuses and
-    /// the rest depends on [`Focus`].
+    /// otherwise Ctrl-F, Ctrl-X, PgUp/PgDn (the timeline's; in shell mode
+    /// the run list's, only while it has the focus) and Tab work in both
+    /// focuses and the rest depends on [`Focus`].
     fn session_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Action> {
         let Screen::Session(view) = &self.view.screen else {
             return None;
@@ -2197,18 +2233,21 @@ impl App {
                     session_id: view.id,
                 });
             }
-            // The timeline's: the run list has neither search nor pages.
+            // The timeline's: the run list has no search, and its pages
+            // are the selected run's, while it has the focus.
             KeyCode::Char('f') if ctrl && shell => return None,
-            KeyCode::PageUp | KeyCode::PageDown if shell => return None,
+            KeyCode::PageUp | KeyCode::PageDown if shell && session.focus == Focus::Composer => {
+                return None;
+            }
             KeyCode::Char('f') if ctrl => {
                 session.open_search();
                 return None;
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp if !shell => {
                 session.page(true);
                 return None;
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown if !shell => {
                 session.page(false);
                 return None;
             }
@@ -2300,11 +2339,15 @@ impl App {
                     None
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    session.shell_selected = view.shell.runs.first().map(|r| r.run);
+                    session.pick_run(view.shell.runs.first().map(|r| r.run));
                     None
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    session.shell_selected = view.shell.runs.last().map(|r| r.run);
+                    session.pick_run(view.shell.runs.last().map(|r| r.run));
+                    None
+                }
+                KeyCode::PageUp | KeyCode::PageDown => {
+                    session.page_run(key.code == KeyCode::PageUp);
                     None
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => session.toggle_run(view),

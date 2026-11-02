@@ -2,20 +2,117 @@
 //! run list words them, and the keyed diff that keeps Dart's list in step.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use skywave_core::{Action, RunWhen, SessionView, ShellEnd, ShellRun, ShellRunState};
+use skywave_core::{
+    Action, BlobId, BlobState, CommandId, RunWhen, SessionView, ShellEnd, ShellRun, ShellRunState,
+};
 use skywave_present::format::{
     outgoing_label, queued_age, shell_end_label, shell_prompt, shell_took, when_marker,
+};
+use skywave_present::output::{
+    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
 };
 
 use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
 use crate::timeline::{blob_facts, clean_line, clean_text, outgoing_view};
 
-/// Every run of `view`'s, oldest first, at `wall_ms`.
-pub fn rows(view: &SessionView, wall_ms: i64) -> Vec<ShellRunRow> {
+/// The downloaded outputs expanded rows showed, by blob, as `whole` holds
+/// them: a file is read once, not on every snapshot or tick. A downloaded
+/// blob's file does not change.
+#[derive(Debug, Default)]
+pub struct Outputs {
+    read: HashMap<BlobId, Result<String, String>>,
+}
+
+impl Outputs {
+    fn get(&mut self, id: BlobId, path: &Path) -> &Result<String, String> {
+        self.read.entry(id).or_insert_with(|| {
+            read_output(path)
+                .map(|text| clean_text(&text))
+                .map_err(|err| format!("cannot read {}: {err}", path.display()))
+        })
+    }
+}
+
+/// The output at `path` as it shows whole: its last [`OUTPUT_SHOW_BYTES`],
+/// through [`output_text`].
+fn read_output(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let cut = size > OUTPUT_SHOW_BYTES;
+    if cut {
+        file.seek(SeekFrom::Start(size - OUTPUT_SHOW_BYTES))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(output_text(&bytes, cut))
+}
+
+/// Every run of `view`'s, oldest first, at `wall_ms`; the `expanded` ones
+/// with their whole output.
+pub fn rows(
+    view: &SessionView,
+    expanded: &HashSet<CommandId>,
+    outputs: &mut Outputs,
+    wall_ms: i64,
+) -> Vec<ShellRunRow> {
     let now = DateTime::<Utc>::from_timestamp_millis(wall_ms).unwrap_or_default();
-    view.shell.runs.iter().map(|run| row(run, now)).collect()
+    view.shell
+        .runs
+        .iter()
+        .map(|run| {
+            let mut row = row(run, now);
+            if expanded.contains(&run.run) {
+                row.expanded = true;
+                (row.whole, row.whole_note) = whole(run, outputs);
+            }
+            row
+        })
+        .collect()
+}
+
+/// An expanded run's `whole` and `whole_note`.
+fn whole(run: &ShellRun, outputs: &mut Outputs) -> (Option<String>, Option<String>) {
+    let earlier = |text: &str, why: Option<&str>| {
+        let n = lines_before(run, text);
+        let why = why.map(|why| format!(" · {why}")).unwrap_or_default();
+        (n > 0).then(|| format!("… {n} earlier lines not shown{why}"))
+    };
+    match whole_output(run) {
+        WholeOutput::Here(text) => (Some(clean_text(text)), None),
+        WholeOutput::Partial { text, note } => (
+            Some(clean_text(text)),
+            Some(earlier(text, Some(note)).unwrap_or_else(|| note.to_owned())),
+        ),
+        WholeOutput::Blob(blob) => match &blob.state {
+            BlobState::Available { path } => match outputs.get(blob.id, path) {
+                Ok(text) => (Some(text.clone()), earlier(text, None)),
+                Err(err) => (None, Some(err.clone())),
+            },
+            _ => (None, None),
+        },
+    }
+}
+
+/// The download an expanded run's output needs: none while it is here or
+/// on its way, or for a run without one.
+pub fn output_fetch(view: &SessionView, run: CommandId) -> Option<Action> {
+    let blob = view
+        .shell
+        .runs
+        .iter()
+        .find(|r| r.run == run)?
+        .output
+        .as_ref()?;
+    matches!(
+        blob.state,
+        BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
+    )
+    .then_some(Action::DownloadBlob(blob.id))
 }
 
 fn row(run: &ShellRun, now: DateTime<Utc>) -> ShellRunRow {
@@ -36,6 +133,9 @@ fn row(run: &ShellRun, now: DateTime<Utc>) -> ShellRunRow {
         lines: run.lines,
         output: run.output.as_ref().map(blob_facts),
         truncated: run.truncated,
+        expanded: false,
+        whole: None,
+        whole_note: None,
         outgoing: run.outgoing.as_ref().map(outgoing_view),
         stopping: run.stopping,
         discardable: run.discardable,
@@ -200,6 +300,9 @@ mod tests {
             lines: 0,
             output: None,
             truncated: false,
+            expanded: false,
+            whole: None,
+            whole_note: None,
             outgoing: None,
             stopping: false,
             discardable: false,

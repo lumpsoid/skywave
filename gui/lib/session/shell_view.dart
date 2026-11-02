@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
+import 'package:skywave_gui/session/shell_output.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -63,6 +64,7 @@ class ShellView extends StatelessWidget {
                   key: ValueKey(run.key),
                   sessionId: sessionId,
                   run: run,
+                  shell: shell,
                   send: send,
                 );
               },
@@ -75,17 +77,22 @@ class ShellView extends StatelessWidget {
 }
 
 /// One run: its command and condition, how it stands, its output's tail,
-/// and what can be done with it.
+/// and what can be done with it. "Show all" opens its whole output in the
+/// app ([showShellOutput]).
 class ShellRunTile extends StatelessWidget {
   const ShellRunTile({
     required this.sessionId,
     required this.run,
+    required this.shell,
     required this.send,
     super.key,
   });
 
   final String sessionId;
   final ShellRunRow run;
+
+  /// Where the open output view reads the run from.
+  final ShellHolder shell;
   final SendIntent send;
 
   @override
@@ -172,32 +179,39 @@ class ShellRunTile extends StatelessWidget {
                 padding: const EdgeInsets.only(top: 4, right: 8),
                 child: SelectableText(shown.join('\n'), style: mono),
               ),
-            if (output != null)
+            if (output != null || tail.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 4),
                 child: Row(
                   children: [
                     Expanded(
-                      child: Text(
-                        'whole output · ${output.label}',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: colors.muted,
-                        ),
-                      ),
+                      child: output == null
+                          ? const SizedBox.shrink()
+                          : Text(
+                              'whole output · ${output.label}',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: colors.muted,
+                              ),
+                            ),
                     ),
-                    if (output.canDownload)
+                    if (output != null && output.canDownload)
                       TextButton(
                         onPressed: () => send.act(
                           ActionIntentDownloadBlob(blobId: output.blobId),
                         ),
                         child: const Text('Download'),
                       ),
-                    if (output.state == BlobStateKind.available)
-                      TextButton(
-                        onPressed: () =>
-                            send(GuiIntentOpenFull(blobId: output.blobId)),
-                        child: const Text('Open'),
+                    TextButton(
+                      key: Key('shell-show-${run.key}'),
+                      onPressed: () => showShellOutput(
+                        context,
+                        sessionId: sessionId,
+                        runKey: run.key,
+                        shell: shell,
+                        send: send,
                       ),
+                      child: const Text('Show all'),
+                    ),
                   ],
                 ),
               ),

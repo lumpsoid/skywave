@@ -1,8 +1,10 @@
 //! The session's shell runs, which stand in for the timeline while the
 //! composer writes shell commands: per run its `$ command` line with its
 //! condition, how it stands, and the output's tail. An expanded run shows
-//! the whole output, read from its downloaded blob, the only I/O here.
+//! the whole output ([`whole_output`]), read once from its downloaded blob,
+//! the only I/O here; a run taller than the list pages with PgUp/PgDn.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -14,14 +16,16 @@ use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use skywave_core::{BlobState, SessionView, ShellEnd, ShellRun, ShellRunState};
+use skywave_core::{BlobId, BlobState, SessionView, ShellEnd, ShellRun, ShellRunState};
 use skywave_present::format::{
     blob_size, bytes, outgoing_label, queued_age, shell_end_label, shell_took, when_marker,
 };
-use skywave_proto::strip_ansi;
+use skywave_present::output::{
+    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
+};
 
 use super::outgoing_badge;
-use super::timeline::{SHOW_BYTES, SHOW_LINES, clean, device_label, wrap};
+use super::timeline::{clean, device_label, wrap};
 use crate::app::{Focus, SessionUi};
 
 /// Output lines a run not expanded shows: the newest.
@@ -50,6 +54,7 @@ pub(super) fn render(
     let now = DateTime::<Utc>::from(wall);
     let width = area.width as usize;
     let focused = ui.focus == Focus::Timeline;
+    let mut outputs = ui.shell_outputs.borrow_mut();
     let mut lines = Vec::new();
     let mut shown = None;
     for (i, run) in runs.iter().enumerate() {
@@ -58,20 +63,27 @@ pub(super) fn render(
         }
         let selected = focused && ui.shell_selected == Some(run.run);
         let start = lines.len();
-        let expanded = ui.shell_expanded.contains(&run.run);
-        lines.extend(run_lines(run, selected, expanded, now, width));
+        let output = if ui.shell_expanded.contains(&run.run) {
+            Shown::Whole(whole_text(run, &mut outputs))
+        } else {
+            Shown::Tail
+        };
+        lines.extend(run_lines(run, selected, output, now, width));
         if selected {
             shown = Some((start, lines.len()));
         }
     }
-    // The selected run in sight, whole when it fits; else the newest.
+    // The selected run in sight, whole when it fits, else from where it
+    // is scrolled to (PgUp/PgDn); with none selected, the newest.
     let height = area.height as usize;
     let top = match shown {
         Some((start, end)) if end - start <= height => end.saturating_sub(height),
-        Some((start, _)) => start,
+        Some((start, end)) => start + ui.shell_scroll.min(end - start - height),
         None => lines.len(),
     }
     .min(lines.len().saturating_sub(height));
+    ui.shell_room
+        .set((height, shown.map_or(0, |(start, end)| end - start)));
     let lines: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -80,10 +92,11 @@ pub(super) fn render(
 fn run_lines(
     run: &ShellRun,
     selected: bool,
-    expanded: bool,
+    output: Shown,
     now: DateTime<Utc>,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let expanded = matches!(output, Shown::Whole(_));
     let lead = if selected {
         Span::raw("▶ ").cyan().bold()
     } else {
@@ -124,8 +137,7 @@ fn run_lines(
     }
     lines.extend(wrap(rest(), rest(), state, width));
 
-    let output = output_lines(run, expanded);
-    for line in output {
+    for line in output_lines(run, output) {
         lines.extend(wrap(rest(), rest(), vec![line], width));
     }
     lines
@@ -164,55 +176,85 @@ fn state_spans(run: &ShellRun, now: DateTime<Utc>) -> Vec<Span<'static>> {
     }
 }
 
+/// What of a run's output shows.
+#[derive(Clone, Copy)]
+enum Shown<'a> {
+    /// The newest [`TAIL_LINES`] lines.
+    Tail,
+    /// All of it ([`whole_output`]): the downloaded output when it was read
+    /// (this text), else the run's own.
+    Whole(Option<&'a str>),
+}
+
+/// `run`'s downloaded output, read once into `outputs`: `None` while there
+/// is none here, or it cannot be read.
+fn whole_text<'a>(
+    run: &ShellRun,
+    outputs: &'a mut HashMap<BlobId, Option<String>>,
+) -> Option<&'a str> {
+    let WholeOutput::Blob(blob) = whole_output(run) else {
+        return None;
+    };
+    let BlobState::Available { path } = &blob.state else {
+        return None;
+    };
+    outputs
+        .entry(blob.id)
+        .or_insert_with(|| read_output(path).ok())
+        .as_deref()
+}
+
 /// The output shown: the newest [`TAIL_LINES`] lines, or expanded all of
-/// the preview, or of the downloaded output once it is here; with a note
-/// of what is left out.
-fn output_lines(run: &ShellRun, expanded: bool) -> Vec<Span<'static>> {
-    let blob = run.output.as_ref().filter(|_| expanded);
-    let downloaded = blob.and_then(|blob| match &blob.state {
-        BlobState::Available { path } => read_tail(path).ok(),
-        _ => None,
-    });
-    let text = match &downloaded {
-        Some(text) => text.as_str(),
-        None => run.tail_or_preview.as_str(),
+/// it, from the downloaded output once it is here; with a note of what is
+/// left out.
+fn output_lines(run: &ShellRun, shown: Shown) -> Vec<Span<'static>> {
+    let (text, all_shown, hint) = match (shown, whole_output(run)) {
+        (Shown::Tail, _) => (
+            run.tail_or_preview.as_str(),
+            false,
+            " · Enter shows more".to_owned(),
+        ),
+        (Shown::Whole(_), WholeOutput::Here(text)) => (text, true, String::new()),
+        (Shown::Whole(_), WholeOutput::Partial { text, note }) => {
+            (text, true, format!(" · {note}"))
+        }
+        (Shown::Whole(Some(read)), WholeOutput::Blob(_)) => {
+            (read, true, " · y copies them all".to_owned())
+        }
+        (Shown::Whole(None), WholeOutput::Blob(blob)) => {
+            let hint = match &blob.state {
+                BlobState::Available { .. } => " · y copies them all".to_owned(),
+                state @ (BlobState::Requested { .. } | BlobState::Downloading { .. }) => {
+                    let size = blob_size(state).map(bytes).unwrap_or_default();
+                    format!(" · downloading {size}")
+                }
+                _ => " · d downloads them".to_owned(),
+            };
+            (run.tail_or_preview.as_str(), true, hint)
+        }
     };
     let all: Vec<&str> = text.lines().collect();
-    let keep = if expanded { SHOW_LINES } else { TAIL_LINES };
+    let keep = if all_shown { all.len() } else { TAIL_LINES };
     let shown = &all[all.len().saturating_sub(keep)..];
     let mut spans = Vec::new();
-    let hidden = (run.lines as usize).max(all.len()) - shown.len();
+    let hidden = lines_before(run, text) + (all.len() - shown.len());
     if hidden > 0 {
-        let hint = match blob.map(|blob| &blob.state) {
-            _ if !expanded => " · Enter shows more".to_owned(),
-            Some(BlobState::Available { .. }) => " · y copies them all".to_owned(),
-            Some(state @ (BlobState::Requested { .. } | BlobState::Downloading { .. })) => {
-                let size = blob_size(state).map(bytes).unwrap_or_default();
-                format!(" · downloading {size}")
-            }
-            Some(_) => " · d downloads them".to_owned(),
-            None => String::new(),
-        };
         spans.push(Span::raw(format!("… {hidden} earlier lines{hint}")).dark_gray());
     }
     spans.extend(shown.iter().map(|line| Span::raw(clean(line))));
     spans
 }
 
-/// The last [`SHOW_BYTES`] of the output at `path`, ANSI stripped.
-fn read_tail(path: &Path) -> io::Result<String> {
+/// The output at `path` as it shows whole: its last [`OUTPUT_SHOW_BYTES`],
+/// through [`output_text`].
+fn read_output(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
-    let cut = size > SHOW_BYTES;
+    let cut = size > OUTPUT_SHOW_BYTES;
     if cut {
-        file.seek(SeekFrom::Start(size - SHOW_BYTES))?;
+        file.seek(SeekFrom::Start(size - OUTPUT_SHOW_BYTES))?;
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let text = strip_ansi(&String::from_utf8_lossy(&bytes));
-    // A cut lands mid-line: that line goes.
-    Ok(match text.split_once('\n') {
-        Some((_, rest)) if cut => rest.to_owned(),
-        _ => text,
-    })
+    Ok(output_text(&bytes, cut))
 }

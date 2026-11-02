@@ -11,6 +11,8 @@
 //!   shows beneath its title, and what a copy takes.
 //! - [`format`](mod@format): sizes, durations, token counts, costs, delivery and
 //!   failure wording.
+//! - [`output`]: where a shell run's whole output is, and how a head reads
+//!   a downloaded one.
 //! - [`utf16`]: code-point cursors and byte ranges as UTF-16 code units.
 //! - [`policy`]: clock-free controllers for draft saves, read marks,
 //!   alerts, prompt history, workdir completion and timeline search.
@@ -18,6 +20,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod format;
+pub mod output;
 pub mod policy;
 pub mod sections;
 pub mod utf16;
