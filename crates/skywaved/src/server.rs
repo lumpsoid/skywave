@@ -54,6 +54,7 @@ use crate::db::Db;
 use crate::error::{Error, IoContext, Result};
 use crate::identity::ServerIdentity;
 use crate::pairing::{self, PairService, RateLimit, SystemClock};
+use crate::workdir::Git;
 
 /// A client gets this long to finish the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,11 +86,24 @@ impl Server {
         identity: Arc<ServerIdentity>,
         log: EventLog,
     ) -> Result<Server> {
+        Server::bind_with_git(addr, dir, identity, log, Git::default()).await
+    }
+
+    /// [`Server::bind`], with workdir changes running git as `git` says
+    /// (tests point it at a fake).
+    pub async fn bind_with_git(
+        addr: SocketAddr,
+        dir: &DataDir,
+        identity: Arc<ServerIdentity>,
+        log: EventLog,
+        git: Git,
+    ) -> Result<Server> {
         let tls = TlsAcceptor::from(tls_config(&identity)?);
         let (stop, stopped) = watch::channel(false);
         let api = Api::new(
             Db::open(&dir.db_path())?,
             Db::open(&dir.db_path())?,
+            git,
             log,
             BlobStore::new(dir.blobs_dir()),
             identity.server_id(),

@@ -28,14 +28,17 @@
 //! [`DIRS_TIMEOUT`] gets a 503, and the scan, bounded by its cap, finishes
 //! unobserved.
 //!
-//! **Workdir** (`GET /v1/workdir/list` and `/v1/workdir/file`, D36): reads
-//! of a session's workdir, every outcome a 200
+//! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/list` and
+//! `/v1/workdir/file`, D36): reads of a session's workdir, every outcome a
+//! 200 [`ChangesResult`](skywave_proto::ChangesResult),
 //! [`ListResult`](skywave_proto::ListResult) or
 //! [`FileResult`](skywave_proto::FileResult). They run on a blocking thread
 //! through [`crate::workdir::WorkdirReader`], on its own database connection
 //! and one snapshot at a time. Each request takes its deadline
 //! ([`workdir::SNAPSHOT_DEADLINE`]) when the handler starts; a snapshot that
-//! reaches it, or gets the lock only after it, stops and the reply is a 503.
+//! gets the lock only after it does nothing and the reply is a 503. One that
+//! reaches it while running stops: a 503 for list and file, and the 200
+//! `Failed { "timed out" }` for changes, whose git children are killed then.
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
 //! future, and the deadline is what stops the abandoned work.
 //!
@@ -71,7 +74,7 @@ use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
 use crate::event_log::DEFAULT_BATCH_LIMIT;
-use crate::workdir::{self, Snapshot, WorkdirReader};
+use crate::workdir::{self, Git, Snapshot, WorkdirReader};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -111,10 +114,12 @@ pub(crate) struct Api {
 }
 
 impl Api {
-    /// `db` and `workdir_db` are two connections to the same database.
+    /// `db` and `workdir_db` are two connections to the same database;
+    /// workdir changes run git as `git` says.
     pub(crate) fn new(
         db: Db,
         workdir_db: Db,
+        git: Git,
         log: EventLog,
         blobs: BlobStore,
         server_id: ServerId,
@@ -122,7 +127,8 @@ impl Api {
     ) -> Api {
         Api {
             db: Mutex::new(db),
-            workdir: WorkdirReader::new(workdir_db, blobs.clone(), log.roots().to_vec()),
+            workdir: WorkdirReader::new(workdir_db, blobs.clone(), log.roots().to_vec())
+                .with_git(git),
             log,
             blobs,
             server_id,
@@ -163,6 +169,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::COMMANDS, post(commands))
         .route(path::EVENTS, get(events))
         .route(path::DIRS, get(list_dirs))
+        .route(path::WORKDIR_CHANGES, get(workdir_changes))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::BLOB_ROUTE, get(blob))
@@ -303,6 +310,17 @@ async fn list_dirs(
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
+}
+
+async fn workdir_changes(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_snapshot(&api, deadline, move |s| s.changes(&query)).await
 }
 
 async fn workdir_list(

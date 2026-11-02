@@ -106,6 +106,7 @@ version changed. Client and server must match it exactly (checked at
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
+| `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
 
@@ -184,11 +185,30 @@ beside a running `serve`.
   connection, one snapshot at a time behind a mutex, so they never hold the
   API's connection and a refresh storm costs one snapshot at a time. Each
   request's deadline (15 s) starts with its handler: a request that gets the
-  lock past it does nothing, work in progress stops at it, and either way
-  the reply is a 503 (the outer timeout is 20 s). Content blobs are
+  lock past it does nothing (a 503), and work in progress stops at it (a
+  503 for list and file; changes answers `Failed { "timed out" }`, its git
+  children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
   keeps its blob across refreshes; event blobs are never reused for them.
   Nothing deletes blobs yet (no GC).
+  Changes run the `git` CLI in the workdir (no git library): `rev-parse`
+  decides `NotGit` from its output, then one `git diff <HEAD or the empty
+  tree> --relative -M -z --raw --numstat` gives the entries (so a workdir
+  below a repo's top shows its own subtree, in its own terms),
+  `ls-files --unmerged` marks `Conflicted`, and `ls-files --others
+  --exclude-standard` the untracked ones. One streamed `git diff` gives the
+  patches, split at `diff --git ` lines and paired with entries by their
+  exact expected header, never by position; an entry with a quoted path, a
+  header shared with another entry, or no section gets its own `git diff --
+  :(literal)<path>`, of which it keeps only sections with its own header.
+  An unmerged path whose worktree equals `HEAD` is still a `Conflicted`
+  entry. Untracked diffs are synthesised from `lstat` (a
+  symlink's diff is its link text). At most 500 entries (`total` counts
+  all), 1 MiB per diff and 8 MiB per snapshot are kept. Every child runs
+  with fixed flags (`core.fsmonitor=false`, no external diff, no textconv,
+  no pager, `--submodule=short`), the repository's own filter drivers emptied, inherited `GIT_*`
+  variables removed, stdin closed, and leads a process group killed at the
+  deadline.
 
 ## Pairing
 
