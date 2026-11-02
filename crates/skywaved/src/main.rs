@@ -53,6 +53,18 @@ enum DevicesCommand {
 }
 
 fn main() -> ExitCode {
+    // A shell run's host (see `skywaved::shell`): before clap, so no help
+    // lists it and nothing of the daemon starts.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args
+            .next()
+            .is_some_and(|arg| arg == skywaved::shell::RUN_HOST)
+        {
+            return skywaved::shell::host::run(args);
+        }
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,

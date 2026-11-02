@@ -111,6 +111,8 @@ impl Fixture {
                 marks: vec![],
                 every: Duration::from_secs(3600),
             },
+            // This test binary is not `skywaved`; runs need it as their host.
+            host: Some(PathBuf::from(env!("CARGO_BIN_EXE_skywaved"))),
             ..ShellConfig::default()
         }
     }
@@ -404,6 +406,15 @@ fn process_gone(pid: i32) -> bool {
     failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// The parent of live process `pid`, from `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parent_of(pid: i32) -> i32 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
+    let (_, rest) = stat.rsplit_once(')').unwrap();
+    rest.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
 fn exited(code: i32) -> ShellEnd {
     ShellEnd::Exited { code }
 }
@@ -515,6 +526,21 @@ async fn the_command_does_not_see_itself_as_an_argument() {
     let runner = f.start().await;
     let run = f.run(r#"echo "[$1][$#]""#);
     assert_eq!(f.finished(run).await.preview, "[][0]");
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_shell_killed_by_a_signal_is_signalled() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let run = f.run("kill -USR1 $$");
+    let finished = f.finished(run).await;
+    assert_eq!(
+        finished.end,
+        ShellEnd::Signalled {
+            signal: libc::SIGUSR1
+        }
+    );
     runner.shutdown().await.unwrap();
 }
 
@@ -811,6 +837,122 @@ async fn a_process_that_left_the_group_does_not_hold_the_run() {
     unsafe { libc::kill(pid, libc::SIGKILL) };
     assert!(alive, "a process that left the group survives the run");
     runner.shutdown().await.unwrap();
+}
+
+/// A run's orphans go to its host, a subreaper, whatever the host's init
+/// does; the host must reap them, or their zombies hold the group, and the
+/// run, for the whole 5 s grace. The daemon (this test process) is no
+/// subreaper and reaps none of them.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn the_runs_orphans_are_reaped_by_its_host() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let mut subreaper: libc::c_int = -1;
+    // SAFETY: PR_GET_CHILD_SUBREAPER writes one c_int to `subreaper`.
+    let asked = unsafe {
+        libc::prctl(
+            libc::PR_GET_CHILD_SUBREAPER,
+            std::ptr::from_mut(&mut subreaper),
+        )
+    };
+    assert_eq!((asked, subreaper), (0, 0), "the daemon is no subreaper");
+    let within = chrono::Duration::milliseconds(2500);
+
+    // Stopped: the sleep is orphaned while the shell runs (its subshell has
+    // exited by `ready`), then the SIGTERM ends the shell, the `cat` and it.
+    let gate = f.fifo("gate");
+    let pid = f.fifo("pid");
+    let ready = f.fifo("ready");
+    let stopped = f.run(&format!(
+        "(sleep 1000 & echo $! > '{}'); echo > '{}'; cat '{}'",
+        pid.display(),
+        ready.display(),
+        gate.display()
+    ));
+    let sleep: i32 = read_fifo(&pid).await.trim().parse().unwrap();
+    read_fifo(&ready).await;
+    // The positive control: the orphan went to the run's host, a child of
+    // this process, not to whatever reaper the test runs under.
+    let host = parent_of(sleep);
+    assert_eq!(parent_of(host), i32::try_from(std::process::id()).unwrap());
+    let cmdline = std::fs::read(format!("/proc/{host}/cmdline")).unwrap();
+    assert_eq!(
+        cmdline.split(|&byte| byte == 0).nth(1),
+        Some(skywaved::shell::RUN_HOST.as_bytes()),
+        "the orphan's parent is the run's host"
+    );
+    f.stop(f.session, stopped);
+    assert_eq!(f.finished(stopped).await.end, ShellEnd::Stopped);
+    // A zombie still answers `kill(pid, 0)`: gone means reaped.
+    assert!(process_gone(sleep), "the orphaned sleep was reaped");
+    let took = f.finished_at(stopped) - f.started_at(stopped);
+    assert!(took < within, "stopped run took {took}");
+
+    // Finished: the shell exits first, so its children are orphans before
+    // the SIGTERM reaches them.
+    let finished = f.run("sleep 0.2 & sleep 1000 & echo $!");
+    let end = f.finished(finished).await;
+    assert_eq!(end.end, exited(0));
+    let sleep: i32 = end.preview.parse().unwrap();
+    assert!(process_gone(sleep), "the orphaned sleep was reaped");
+    let took = f.finished_at(finished) - f.started_at(finished);
+    assert!(took < within, "finished run took {took}");
+    runner.shutdown().await.unwrap();
+}
+
+/// A host that dies mid-run closes its report pipe without a status, and
+/// with the group still full: the run is `Lost`, and the runner ends the
+/// group itself, giving a member its grace, and reports only after it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn a_run_whose_host_dies_is_lost_and_its_group_ended() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let gate = f.fifo("gate");
+    let pid = f.fifo("pid");
+    let member = f.fifo("member");
+    let bye = f.dir().join("bye");
+    // The member takes a moment over its SIGTERM, then leaves a mark.
+    let run = f.run(&format!(
+        "sh -c 'trap \"sleep 0.3; echo bye > \\\"$1\\\"; exit\" TERM; \
+         echo $$ > \"$2\"; while :; do sleep 0.05; done' sh '{}' '{}' & \
+         echo $$ > '{}'; cat '{}'",
+        bye.display(),
+        member.display(),
+        pid.display(),
+        gate.display()
+    ));
+    let shell: i32 = read_fifo(&pid).await.trim().parse().unwrap();
+    let member: i32 = read_fifo(&member).await.trim().parse().unwrap();
+    let host = parent_of(shell);
+    let cmdline = std::fs::read(format!("/proc/{host}/cmdline")).unwrap();
+    assert_eq!(
+        cmdline.split(|&byte| byte == 0).nth(1),
+        Some(skywaved::shell::RUN_HOST.as_bytes()),
+        "the shell's parent is its host"
+    );
+    // SAFETY: kills the test's own run host.
+    assert_eq!(unsafe { libc::kill(host, libc::SIGKILL) }, 0);
+    let finished = f.finished(run).await;
+    assert_eq!(finished.end, ShellEnd::Lost, "{finished:?}");
+    // Reported only after the member ended on its own, not killed at once.
+    assert_eq!(std::fs::read_to_string(&bye).unwrap(), "bye\n");
+    assert!(ended(member), "the member is gone");
+    assert!(ended(shell), "the shell is gone");
+    runner.shutdown().await.unwrap();
+}
+
+/// Whether process `pid` has ended: gone, or a zombie nobody reaped (the
+/// test's init may not reap).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ended(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
 }
 
 /// Kills the process whose pid is in a file when dropped, so an escaped

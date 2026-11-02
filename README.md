@@ -121,9 +121,9 @@ skywaved serve
 
 The first run creates the CA, the server certificate and the database.
 In a container, run it under an init (`docker run --init`, or `tini`):
-`skywaved` reaps its own agents but not the orphans reparented to PID 1
-(without one, every shell command that left a background child also waits
-out a 5 s grace before it is reported finished).
+`skywaved` reaps its own agents, and on Linux each shell command runs under
+a small host process that reaps that command's orphans, but nothing reaps
+the other orphans reparented to PID 1.
 
 > **Shell commands run as the daemon's user.** With `[shell] enabled`, any
 > paired device can run arbitrary commands on the server, and the `roots`

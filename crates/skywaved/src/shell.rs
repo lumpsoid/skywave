@@ -42,9 +42,11 @@
 //! status. stdin is `/dev/null`; stdout and stderr share one pipe, so the
 //! output keeps its order. The shell calls `setsid` (no controlling
 //! terminal, so a prompt that opens `/dev/tty` fails instead of hanging the
-//! run; it also leads its own process group) and takes
-//! [`die_with_daemon`](crate::process::die_with_daemon); it cannot also use
-//! `isolate`, see [`crate::process`]. A run starts in the session's last
+//! run; it also leads its own process group) and gets SIGTERM when its
+//! parent dies. Off Linux the daemon is that parent: the shell takes
+//! [`die_with_daemon`](crate::process::die_with_daemon) (it cannot also use
+//! `isolate`, see [`crate::process`]). On Linux the parent is the run's
+//! host, below. A run starts in the session's last
 //! known cwd, or its workdir when that is gone; `ShellStarted::cwd` says
 //! which. `exit` or `exec` in the command skips the `pwd`: the run's `cwd` is
 //! `None` and the session keeps the one before.
@@ -57,6 +59,29 @@
 //! `ShellFinished`. A process that left the group (`setsid`, a daemonizing
 //! tool) survives the run and is not waited for. A stop does the same kill
 //! first and ends the run `Stopped` whatever the shell's status.
+//!
+//! **The run host (Linux).** A `cmd &` child outlives its shell for a
+//! moment, and the group is empty only once it is reaped: a zombie still
+//! counts. An orphan goes to the nearest subreaper, else PID 1, which may
+//! never reap it (a container without `--init`, CI as PID 1); the run would
+//! then wait out the grace and leave the zombie. So on Linux every run's
+//! shell starts under a host of its own: `skywaved` re-executed
+//! ([`ShellConfig::host`]) with [`RUN_HOST`] as its first argument. The host
+//! makes itself a subreaper (`PR_SET_CHILD_SUBREAPER`), starts the shell and
+//! reaps every child it has with `waitpid(-1)`, which is safe because the
+//! host owns nothing else; the daemon itself is no subreaper. The host leads
+//! a group of its own (`isolate`), outside the shell's, so the runner's
+//! SIGTERM and SIGKILL of the run's group never reach it and it is still
+//! there to reap what they kill. It reports on a pipe ([`host`]): the
+//! shell's pid, which names the group the runner signals; the shell's raw
+//! wait status once it has reaped it; and, by the pipe's EOF at its exit,
+//! that the group is empty, believed only when the host's exit is clean. A
+//! host that dies (SIGKILL, OOM) leaves the run `Lost` unless stopped, and
+//! the runner waits for the group itself as off Linux. The host is the
+//! running binary through `/proc/self/exe`, which still execs after the
+//! binary is replaced on disk. The host dies with the daemon, and the shell
+//! with the host. Elsewhere the daemon spawns the shell itself and polls
+//! for the empty group.
 //!
 //! **Output.** Written as it arrives to `<data_dir>/shell/<run>.out`, at most
 //! [`ShellConfig::output_max`] bytes; the rest is discarded and the run is
@@ -97,6 +122,16 @@ const BATCH: u32 = 500;
 /// Raw output bytes kept for the tail preview.
 const TAIL_WINDOW: usize = 16 * 1024;
 
+/// How often a finished run's group is checked for stragglers during the
+/// grace.
+#[cfg(unix)]
+const GROUP_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod host;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use host::RUN_HOST;
+
 /// The `[shell]` table, resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellConfig {
@@ -110,6 +145,11 @@ pub struct ShellConfig {
     pub output_max: u64,
     /// When `ShellOutput` is logged; not in the config file.
     pub progress: Progress,
+    /// The `skywaved` executable a run's host is (Linux only); `None` is the
+    /// running one (`/proc/self/exe`, so replacing the binary on disk does
+    /// not break runs). Not in the config file: a test process is not
+    /// `skywaved`, so tests point it at the built daemon.
+    pub host: Option<PathBuf>,
 }
 
 impl Default for ShellConfig {
@@ -120,6 +160,7 @@ impl Default for ShellConfig {
             rc: None,
             output_max: DEFAULT_OUTPUT_MAX,
             progress: Progress::default(),
+            host: None,
         }
     }
 }
@@ -803,11 +844,14 @@ fn run_thread(
 /// Starting a shell and watching it until it is over.
 #[cfg(unix)]
 mod exec {
+    use std::ffi::OsString;
     use std::io;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::io::Read;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::process::{ExitStatus, Stdio};
-    use std::time::Duration;
 
     use skywave_proto::ShellEnd;
     use tokio::io::AsyncReadExt;
@@ -818,7 +862,9 @@ mod exec {
     use tokio::time::Instant;
 
     use super::{Capture, Control, Launch, Report};
-    use crate::process::{DEFAULT_TERM_GRACE, Group, die_with_daemon};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::process::isolate;
+    use crate::process::{DEFAULT_TERM_GRACE, Group};
 
     /// The script `sh -c` runs; see the module docs. `$1` is the command,
     /// `$2` the rc file if any.
@@ -850,10 +896,6 @@ exit "$__skywave_status"
         ("SKYWAVE_SHELL", "1"),
     ];
 
-    /// How often a finished run's group is checked for stragglers during
-    /// the grace.
-    const GROUP_POLL: Duration = Duration::from_millis(10);
-
     /// Spawns the shell for `launch` from the calling thread, and the task
     /// that watches it into `tasks`. Fails, with nothing left running, when
     /// the shell cannot be started.
@@ -862,58 +904,27 @@ exit "$__skywave_status"
         let (cwd, cwd_w) = io::pipe()?;
         let output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
         let cwd = pipe::Receiver::from_owned_fd(OwnedFd::from(cwd))?;
-        let mut command = Command::new(&launch.config.program);
-        command
-            .arg("-c")
-            .arg(WRAPPER)
-            .arg(NAME)
-            .arg(launch.command)
-            .args(launch.config.rc.iter())
-            .current_dir(launch.cwd)
-            .envs(ENV)
-            .stdin(Stdio::null())
-            .stdout(output_w.try_clone()?)
-            .stderr(output_w)
-            .kill_on_drop(true);
-        let cwd_fd = cwd_w.as_raw_fd();
-        // SAFETY: the closure runs in the forked child before exec and only
-        // calls setsid, dup2 and fcntl, which are async-signal-safe, and
-        // builds errors without allocating. `io::pipe` makes both ends
-        // CLOEXEC, so the child keeps none of them but its fds 1, 2 and 3.
-        unsafe {
-            command.pre_exec(move || {
-                // A new session, not just a group: no controlling terminal.
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                // dup2 onto itself would keep CLOEXEC set.
-                let moved = if cwd_fd == 3 {
-                    libc::fcntl(3, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(cwd_fd, 3)
-                };
-                if moved == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        die_with_daemon(&mut command);
+        let args = shell_args(launch.command, launch.config.rc.as_deref());
         let capture = Capture::create(launch.output, launch.config.output_max)?;
-        let child = match command.spawn() {
-            Ok(child) => child,
+        // The write ends go in: kept here, EOF would never come.
+        let spawned = Shell::spawn(
+            launch.config,
+            &args,
+            launch.cwd,
+            OwnedFd::from(output_w),
+            OwnedFd::from(cwd_w),
+        );
+        let shell = match spawned {
+            Ok(shell) => shell,
             Err(error) => {
                 super::remove_file(&capture.path);
                 return Err(error);
             }
         };
-        // The parent's write ends go, or EOF never comes.
-        drop(command);
-        drop(cwd_w);
         tasks.spawn(watch_run(
             Watched {
                 run: launch.run,
-                child,
+                shell,
                 output,
                 cwd,
                 capture,
@@ -925,9 +936,260 @@ exit "$__skywave_status"
         Ok(())
     }
 
+    /// The arguments `<program>` gets; see the module docs.
+    fn shell_args(command: &str, rc: Option<&Path>) -> Vec<OsString> {
+        let mut args: Vec<OsString> =
+            vec!["-c".into(), WRAPPER.into(), NAME.into(), command.into()];
+        args.extend(rc.map(OsString::from));
+        args
+    }
+
+    /// A run's shell as the runner sees it, started under its host
+    /// ([`super::host`]): it learns the shell's end and the group's from the
+    /// host's report pipe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct Shell {
+        /// Not killed on drop: the host must outlive what the runner kills
+        /// to reap it, and exits by itself once the group is empty.
+        host: Child,
+        report: pipe::Receiver,
+        /// Read from `report` and not yet parsed.
+        pending: Vec<u8>,
+        pgid: i32,
+        /// The shell's status once known; `None` inside when the host ended
+        /// without one.
+        ended: Option<Option<ExitStatus>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Shell {
+        /// Starts the host, which starts the shell, and waits for its first
+        /// report line: the shell's pid, or why it cannot start. It takes a
+        /// few milliseconds, and an error comes back as a spawn error does.
+        fn spawn(
+            config: &super::ShellConfig,
+            args: &[OsString],
+            cwd: &Path,
+            output: OwnedFd,
+            cwd_pipe: OwnedFd,
+        ) -> io::Result<Shell> {
+            let program = match &config.host {
+                Some(host) => host.clone(),
+                // Not `current_exe`, which reads this link: once the binary
+                // is replaced on disk it names "<path> (deleted)". The link
+                // itself still execs the running binary.
+                None => std::path::PathBuf::from("/proc/self/exe"),
+            };
+            let (report, report_w) = io::pipe()?;
+            let fds = [output.as_raw_fd(), cwd_pipe.as_raw_fd()];
+            let mut command = Command::new(program);
+            command
+                .arg(super::RUN_HOST)
+                .arg(fds[0].to_string())
+                .arg(fds[1].to_string())
+                .arg(&config.program)
+                .args(args)
+                .current_dir(cwd)
+                .envs(ENV)
+                .stdin(Stdio::null())
+                .stdout(report_w)
+                .stderr(Stdio::null())
+                .kill_on_drop(false);
+            // SAFETY: the closure runs in the forked child before exec and
+            // only calls fcntl, which is async-signal-safe, and builds errors
+            // without allocating. `io::pipe` makes every end CLOEXEC; the
+            // host keeps the two its arguments name.
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in fds {
+                        if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            // A group of its own, outside the shell's session, so no signal
+            // to the run's group reaches the host.
+            isolate(&mut command);
+            let host = command.spawn()?;
+            drop(command);
+            drop(output);
+            drop(cwd_pipe);
+            let mut report = report;
+            let mut pending = Vec::new();
+            let line = loop {
+                if let Some(line) = take_line(&mut pending) {
+                    break line;
+                }
+                let mut chunk = [0; 256];
+                match report.read(&mut chunk)? {
+                    0 => return Err(io::Error::other("the run host ended at its start")),
+                    n => pending.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let line = String::from_utf8_lossy(&line);
+            if let Some(error) = line.strip_prefix("error ") {
+                return Err(io::Error::other(error.to_owned()));
+            }
+            let pgid = line
+                .strip_prefix("pid ")
+                .and_then(|pid| pid.parse().ok())
+                .ok_or_else(|| io::Error::other(format!("bad run host report: {line}")))?;
+            Ok(Shell {
+                host,
+                report: pipe::Receiver::from_owned_fd(OwnedFd::from(report))?,
+                pending,
+                pgid,
+                ended: None,
+            })
+        }
+
+        /// The group the shell leads (`setsid`): its pid is the group's id.
+        fn pgid(&self) -> Option<i32> {
+            Some(self.pgid)
+        }
+
+        fn group(&self) -> Group {
+            Group::led_by(self.pgid)
+        }
+
+        /// The shell's status, once the host has reaped it. Cancel-safe, and
+        /// answers again once known.
+        async fn exited(&mut self) -> io::Result<ExitStatus> {
+            loop {
+                if let Some(ended) = self.ended {
+                    return ended.ok_or_else(|| io::Error::other("the run host ended early"));
+                }
+                if let Some(line) = take_line(&mut self.pending) {
+                    let status = String::from_utf8_lossy(&line)
+                        .strip_prefix("status ")
+                        .and_then(|raw| raw.parse().ok())
+                        .map(ExitStatus::from_raw);
+                    self.ended = Some(status);
+                    continue;
+                }
+                let mut chunk = [0; 256];
+                match self.report.read(&mut chunk).await {
+                    Ok(0) | Err(_) => self.ended = Some(None),
+                    Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                }
+            }
+        }
+
+        /// Returns once the group is empty. Call it after [`Shell::exited`].
+        /// The host exits cleanly only then, which closes its report pipe.
+        /// But a host that dies (SIGKILL, OOM) closes it too, with the group
+        /// maybe still full and nobody to reap it: only its clean exit is
+        /// believed, otherwise `group` is polled like off Linux.
+        async fn emptied(&mut self, group: &Group) {
+            let mut chunk = [0; 256];
+            while let Ok(1..) = self.report.read(&mut chunk).await {}
+            match self.host.wait().await {
+                Ok(status) if status.success() => {}
+                ended => {
+                    tracing::warn!(?ended, "a shell run's host died");
+                    poll_empty(group).await;
+                }
+            }
+        }
+    }
+
+    /// A run's shell spawned by the runner itself, off Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    struct Shell {
+        child: Child,
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    impl Shell {
+        fn spawn(
+            config: &super::ShellConfig,
+            args: &[OsString],
+            cwd: &Path,
+            output: OwnedFd,
+            cwd_pipe: OwnedFd,
+        ) -> io::Result<Shell> {
+            let mut command = Command::new(&config.program);
+            command
+                .args(args)
+                .current_dir(cwd)
+                .envs(ENV)
+                .stdin(Stdio::null())
+                .stdout(output.try_clone()?)
+                .stderr(output)
+                .kill_on_drop(true);
+            let cwd_fd = cwd_pipe.as_raw_fd();
+            // SAFETY: the closure runs in the forked child before exec and
+            // only calls setsid, dup2 and fcntl, which are async-signal-safe,
+            // and builds errors without allocating. `io::pipe` makes both
+            // ends CLOEXEC, so the child keeps none of them but its fds 1, 2
+            // and 3.
+            unsafe {
+                command.pre_exec(move || {
+                    // A new session, not just a group: no controlling terminal.
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // dup2 onto itself would keep CLOEXEC set.
+                    let moved = if cwd_fd == 3 {
+                        libc::fcntl(3, libc::F_SETFD, 0)
+                    } else {
+                        libc::dup2(cwd_fd, 3)
+                    };
+                    if moved == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            crate::process::die_with_daemon(&mut command);
+            let child = command.spawn()?;
+            drop(command);
+            drop(cwd_pipe);
+            Ok(Shell { child })
+        }
+
+        /// The group the shell leads (`setsid`): its pid is the group's id.
+        fn pgid(&self) -> Option<i32> {
+            self.child.id().and_then(|id| i32::try_from(id).ok())
+        }
+
+        fn group(&self) -> Group {
+            Group::of(&self.child)
+        }
+
+        /// The shell's status. Cancel-safe, and answers again once known.
+        async fn exited(&mut self) -> io::Result<ExitStatus> {
+            self.child.wait().await
+        }
+
+        /// Returns once `group` is empty. Call it after [`Shell::exited`]:
+        /// until then the shell itself holds the group.
+        async fn emptied(&mut self, group: &Group) {
+            poll_empty(group).await;
+        }
+    }
+
+    /// Returns once nothing is left in `group`; the shell must be reaped.
+    async fn poll_empty(group: &Group) {
+        while !group.is_empty() {
+            tokio::time::sleep(super::GROUP_POLL).await;
+        }
+    }
+
+    /// Takes the first whole line out of `buf`, without its newline.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn take_line(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let end = buf.iter().position(|&byte| byte == b'\n')?;
+        let line = buf[..end].to_vec();
+        buf.drain(..=end);
+        Some(line)
+    }
+
     struct Watched {
         run: skywave_proto::CommandId,
-        child: Child,
+        shell: Shell,
         output: pipe::Receiver,
         cwd: pipe::Receiver,
         capture: Capture,
@@ -949,9 +1211,8 @@ exit "$__skywave_status"
         mut control: watch::Receiver<Control>,
         reports: tokio::sync::mpsc::UnboundedSender<Report>,
     ) {
-        let mut group = Group::of(&w.child);
-        // The shell leads its group (`setsid`), so its pid is the group's id.
-        let pgid = w.child.id().and_then(|id| i32::try_from(id).ok());
+        let mut group = w.shell.group();
+        let pgid = w.shell.pgid();
         let start = Instant::now();
         let mut ticks = 0;
         let mut reported = 0;
@@ -965,20 +1226,20 @@ exit "$__skywave_status"
                     Ok(()) => *control.borrow_and_update(),
                     Err(_) => Control::Cancel,
                 }),
-                _ = w.child.wait() => Wake::Exited,
+                _ = w.shell.exited() => Wake::Exited,
                 read = w.output.read(&mut buf), if output_open => Wake::Read(read),
                 () = tokio::time::sleep_until(due) => Wake::Tick,
             };
             match wake {
                 Wake::Control(Control::Run) => {}
                 Wake::Control(Control::Stop) => {
-                    break (end_group(&mut group, &mut w.child).await, true);
+                    break (end_group(&mut w.shell, &mut group).await, true);
                 }
                 Wake::Control(Control::Cancel) => {
-                    kill_group(pgid, &mut group, &mut w.child).await;
+                    kill_group(pgid, &mut w.shell, &mut group).await;
                     return;
                 }
-                Wake::Exited => break (end_group(&mut group, &mut w.child).await, false),
+                Wake::Exited => break (end_group(&mut w.shell, &mut group).await, false),
                 Wake::Read(Ok(0) | Err(_)) => output_open = false,
                 Wake::Read(Ok(n)) => w.capture.push(&buf[..n]),
                 Wake::Tick => {
@@ -1031,41 +1292,33 @@ exit "$__skywave_status"
 
     /// SIGTERMs the group, waits for the shell, and SIGKILLs whatever is
     /// left in the group after the grace.
-    async fn end_group(group: &mut Group, child: &mut Child) -> io::Result<ExitStatus> {
+    async fn end_group(shell: &mut Shell, group: &mut Group) -> io::Result<ExitStatus> {
         group.terminate();
         let deadline = Instant::now() + DEFAULT_TERM_GRACE;
-        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+        let status = match tokio::time::timeout_at(deadline, shell.exited()).await {
             Ok(status) => status,
             Err(_) => {
                 group.kill();
-                child.wait().await
+                shell.exited().await
             }
         };
-        wait_empty(group, deadline).await;
+        let _ = tokio::time::timeout_at(deadline, shell.emptied(group)).await;
         group.kill();
         status
     }
 
-    /// For a shutdown: SIGKILLs the group at once, reaps the shell, and
+    /// For a shutdown: SIGKILLs the group at once, waits for the shell, and
     /// waits until the group is empty, up to the grace, so nothing of the
     /// run is left when the runner has stopped.
-    async fn kill_group(pgid: Option<i32>, group: &mut Group, child: &mut Child) {
+    async fn kill_group(pgid: Option<i32>, shell: &mut Shell, group: &mut Group) {
         let deadline = Instant::now() + DEFAULT_TERM_GRACE;
         // Not `Group::kill`, which forgets the group: it is polled below.
         if let Some(pgid) = pgid {
             crate::process::signal(pgid, libc::SIGKILL);
         }
-        let _ = child.wait().await;
-        wait_empty(group, deadline).await;
+        let _ = shell.exited().await;
+        let _ = tokio::time::timeout_at(deadline, shell.emptied(group)).await;
         group.kill();
-    }
-
-    /// Waits until nothing is left in `group` or `deadline` passes. Call it
-    /// after reaping the shell: until then the shell itself holds the group.
-    async fn wait_empty(group: &Group, deadline: Instant) {
-        while !group.is_empty() && Instant::now() < deadline {
-            tokio::time::sleep(GROUP_POLL).await;
-        }
     }
 
     /// Reads what `fd` (non-blocking) holds at entry, into `sink`: at most
