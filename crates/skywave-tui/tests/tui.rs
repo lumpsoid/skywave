@@ -463,7 +463,7 @@ fn banner_shows_every_link_state() {
                 client: 1,
                 server: 2,
             }),
-            "protocol mismatch · client v1, server v2 · update to reconnect",
+            "protocol mismatch · client v1, server v2 · update, then Ctrl-R",
         ),
     ];
     for (link, text) in cases {

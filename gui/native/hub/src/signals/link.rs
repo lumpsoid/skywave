@@ -20,7 +20,8 @@ pub struct LinkUpdate {
     /// While reconnecting: whole seconds until the next attempt, rounded
     /// up; 0 once it is due. `None` in every other state.
     pub retry_in_s: Option<u32>,
-    /// `RetryNow` would skip the wait: only while reconnecting.
+    /// `RetryNow` would do something: skip the wait while reconnecting, or
+    /// ask the server again after a protocol mismatch.
     pub can_retry_now: bool,
     /// The server refused this device for good (revoked, or a protocol
     /// mismatch): retries have stopped.

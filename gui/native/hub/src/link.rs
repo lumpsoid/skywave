@@ -50,7 +50,7 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => (
             LinkState::ProtocolMismatch,
             format!(
-                "protocol mismatch · client v{client}, server v{server} · update to reconnect{queued_part}"
+                "protocol mismatch · client v{client}, server v{server} · update, then retry{queued_part}"
             ),
         ),
     };
@@ -59,7 +59,10 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
         label,
         connection_label: connection_label(link, &retry),
         retry_in_s,
-        can_retry_now: matches!(link, Link::Reconnecting { .. }),
+        can_retry_now: matches!(
+            link,
+            Link::Reconnecting { .. } | Link::Rejected(LinkRejection::ProtocolMismatch { .. })
+        ),
         rejected: matches!(link, Link::Rejected(_)),
         queued: count(queued),
         approvals_elsewhere: count(elsewhere),
@@ -204,6 +207,8 @@ mod tests {
             ),
         ];
         for (link, label) in cases {
+            let retry = matches!(link, Link::Rejected(LinkRejection::ProtocolMismatch { .. }));
+            assert_eq!(update(&link, 0, 0, 0).can_retry_now, retry, "{link:?}");
             // Said whatever is queued, and even while the banner hides.
             assert_eq!(update(&link, 0, 0, 0).connection_label, label, "{link:?}");
             assert_eq!(update(&link, 2, 1, 0).connection_label, label, "{link:?}");
