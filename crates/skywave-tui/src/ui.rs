@@ -10,9 +10,11 @@ mod session;
 mod shell;
 mod timeline;
 mod usage;
+mod workdir;
 
 use timeline::wall_ms;
 pub use timeline::{SHOW_BYTES, SHOW_LINES};
+pub use workdir::WORKDIR_SHOW_BYTES;
 
 use std::borrow::Cow;
 use std::time::SystemTime;
@@ -27,7 +29,7 @@ use ratatui::widgets::{
 use skywave_core::{
     BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, Link, LinkRejection,
     ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen,
-    SessionListView, SessionRow, SessionState, SettingsView,
+    SessionListView, SessionRow, SessionState, SettingsView, WorkdirPane,
 };
 use skywave_present::format::{blob_size, bytes, dollars, fail_reason, scope_label};
 use skywave_present::sections::{discardable, wanted_blob};
@@ -75,14 +77,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             }
             Screen::Settings(settings) => render_settings(frame, body, app, settings),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
-            // Placeholder until this head shows workdirs; nothing opens one.
-            Screen::Workdir(workdir) => frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(notify::sanitise(&workdir.title)).bold(),
-                    Line::from("Workdir: not shown in this head yet.").dark_gray(),
-                ]),
-                body,
-            ),
+            Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
         }
     }
 
@@ -511,7 +506,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
     ])
     .areas(area);
     let policy = match settings.blob_policy {
-        BlobPolicy::Eager => "eager (download every blob)",
+        BlobPolicy::Eager => "eager (download every tool blob)",
         BlobPolicy::OnDemand => "on demand (download when opened)",
     };
     let mark = |policy: BlobPolicy| {
@@ -531,10 +526,11 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
             mark(BlobPolicy::OnDemand)
         )),
         Line::from(format!(
-            "  {} Eager      every blob downloads as soon as it is synced",
+            "  {} Eager      every tool blob downloads as soon as it is synced",
             mark(BlobPolicy::Eager)
         )),
         Line::from("  Press b to switch. Eager uses more data and disk.").dark_gray(),
+        Line::from("  Workdir diffs and files download only when opened, either way.").dark_gray(),
         Line::from(""),
         Line::from(format!(
             "Server:      {}",
@@ -753,7 +749,7 @@ fn footer_keys(app: &App) -> &'static str {
                     "↑↓ select · Enter expand · o open subagent · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · w workdir · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
             // The toggle only where the server runs shell commands.
@@ -771,7 +767,14 @@ fn footer_keys(app: &App) -> &'static str {
             "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
         }
         Screen::Usage(_) => "r range · Tab group · ↑↓ scroll · Esc back · ? help · q quit",
-        Screen::Workdir(_) => "Esc back · ? help · q quit",
+        Screen::Workdir(view) => match view.pane {
+            WorkdirPane::Changes | WorkdirPane::Dir { .. } => {
+                "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
+            }
+            WorkdirPane::Diff { .. } | WorkdirPane::File { .. } => {
+                "↑↓ PgUp/PgDn scroll · d download · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
+            }
+        },
     }
 }
 
@@ -954,6 +957,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("Del", "take back your never-sent command, or dismiss"),
                     key("", "a refused one"),
                     key("a / x", "approve / deny the pending approval"),
+                    key("w", "the session's workdir: git changes and files"),
                     key("Esc", "back to sessions"),
                 ]),
                 _ if shell => lines.extend([
@@ -1005,6 +1009,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("", "(M moves it to a new session, y confirms;"),
                     key("", "x drops a refused move; Enter on a moved one opens it)"),
                     key("R", "rename the session"),
+                    key("w", "the session's workdir: git changes and files"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),
                     key("n / N", "older / newer match, round the ends"),
@@ -1054,7 +1059,25 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  A turn whose agent reported no cost is unpriced, not free."),
             Line::from("  Archived sessions count; sessions deleted here do not."),
         ]),
-        Screen::Workdir(_) => lines.extend([section("Workdir"), key("Esc", "back")]),
+        Screen::Workdir(_) => lines.extend([
+            section("Workdir (w on a session's timeline)"),
+            key("Tab", "switch between changes and files"),
+            key("↑↓ / k j", "select a row; in a diff or file, scroll"),
+            key("PgUp / PgDn", "a page up / down"),
+            key("Home g/End G", "first / last"),
+            key(
+                "Enter",
+                "open the changed file's diff, the directory or file",
+            ),
+            key("", "(.. goes up; on a diff or file: download it)"),
+            key("d", "download the diff or file; retries a failed one"),
+            key("r", "read it again from the server"),
+            key("y", "copy the diff or file, else the list"),
+            key("Esc", "back: up a directory, to the changes, the session"),
+            Line::from(""),
+            Line::from("  Read on request only and kept here, so what was read shows"),
+            Line::from("  offline, with when it was taken. Nothing here changes files."),
+        ]),
     }
     lines
 }

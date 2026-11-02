@@ -36,6 +36,11 @@ use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
 use crate::notify;
 
+mod workdir;
+
+pub(crate) use workdir::{BlobLines, ReadLines};
+pub use workdir::{WorkdirPick, WorkdirRow, WorkdirUi, shown_blob, workdir_rows};
+
 pub use skywave_present::policy::{DRAFT_SAVE_AFTER, READ_MARK_EVERY, dismissable};
 
 /// One of the pairing form's fields, in tab order.
@@ -1309,6 +1314,8 @@ pub struct UiState {
     pub session: Option<SessionUi>,
     /// The usage screen's span, grouping and scroll; kept while away.
     pub usage: UsageUi,
+    /// The workdir screen's selection, scroll and read blob text.
+    pub workdir: WorkdirUi,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
     /// The last failed dispatch, shown in the footer until the next key.
@@ -1356,6 +1363,7 @@ impl App {
                 delete: None,
                 session: None,
                 usage: UsageUi::default(),
+                workdir: WorkdirUi::default(),
                 revoked_dismissed: false,
                 error: None,
                 notice: None,
@@ -1371,6 +1379,7 @@ impl App {
         app.prefill(&view);
         app.keep_selection(None);
         app.follow_session();
+        app.follow_workdir();
         app
     }
 
@@ -1434,6 +1443,7 @@ impl App {
         }
         self.keep_selection(old_index);
         self.follow_session();
+        self.follow_workdir();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
             session.keep_scroll(view);
@@ -1999,12 +2009,7 @@ impl App {
                 _ => None,
             },
             Screen::Session(_) => self.session_key(key, ctrl),
-            // Placeholder until this head shows workdirs.
-            Screen::Workdir(_) => match key.code {
-                KeyCode::Char('q') => self.quit(),
-                KeyCode::Esc => Some(Action::Back),
-                _ => None,
-            },
+            Screen::Workdir(_) => self.workdir_key(key),
             Screen::Usage(_) => {
                 let usage = &mut self.ui.usage;
                 match key.code {
@@ -2418,6 +2423,9 @@ impl App {
                     .map(|run| Action::Discard(run.run)),
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
+                KeyCode::Char('w') => Some(Action::OpenWorkdir {
+                    session_id: view.id,
+                }),
                 _ => None,
             },
             Focus::Timeline => match key.code {
@@ -2504,6 +2512,9 @@ impl App {
                     session.reveal_gated(view);
                     None
                 }
+                KeyCode::Char('w') => Some(Action::OpenWorkdir {
+                    session_id: view.id,
+                }),
                 // Shifted, so a stray key does not end the agent's run.
                 // In a subagent's view it stops that subagent's task instead,
                 // always asking: it ends one thing, not the run. A foreground

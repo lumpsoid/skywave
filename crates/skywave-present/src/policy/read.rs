@@ -77,7 +77,11 @@ impl ReadMarker {
     pub fn marks_before(action: &Action) -> bool {
         matches!(
             action,
-            Action::Navigate(_) | Action::Back | Action::OpenSession(_) | Action::OpenNextApproval
+            Action::Navigate(_)
+                | Action::Back
+                | Action::OpenSession(_)
+                | Action::OpenNextApproval
+                | Action::OpenWorkdir { .. }
         )
     }
 }
@@ -138,6 +142,9 @@ mod tests {
 
         assert!(ReadMarker::marks_before(&Action::Back));
         assert!(ReadMarker::marks_before(&Action::OpenNextApproval));
+        assert!(ReadMarker::marks_before(&Action::OpenWorkdir {
+            session_id: SessionId::new()
+        }));
         assert!(!ReadMarker::marks_before(&Action::RetryNow));
     }
 }

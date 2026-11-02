@@ -12,17 +12,20 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
+use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, ComposerMode, Core, Decision,
     Delivery, DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request,
-    Route, RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
+    Route, RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState, WorkdirPane,
 };
 use skywave_present::format::took_label;
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
-    BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, HelloResponse, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
-    SessionState as LogState, ShellEnd, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
+    BlobRef, Body, BodyFormat, CallId, ChangeSet, ChangedFile, ChangesResult, CommandResult,
+    DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, Event, EventBatch, EventKind, FileBody,
+    FileChange, FileResult, HelloResponse, LinkTarget, ListResult, ModelChoice, PermissionMode,
+    RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ShellEnd, ToolCall,
+    ToolDisplay, ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -3300,7 +3303,8 @@ fn settings_explain_the_blob_policy() {
     h.key(KeyCode::Char('s'));
     let screen = h.screen();
     assert_contains(&screen, "(•) On demand  a blob downloads when you expand");
-    assert_contains(&screen, "( ) Eager      every blob downloads as soon");
+    assert_contains(&screen, "( ) Eager      every tool blob downloads as soon");
+    assert_contains(&screen, "Workdir diffs and files download only when opened");
     h.key(KeyCode::Char('b'));
     let screen = h.screen();
     assert_contains(&screen, "( ) On demand");
@@ -7558,4 +7562,315 @@ fn a_long_run_alerts_when_it_finishes_out_of_sight() {
     let mut out = Vec::new();
     skywave_tui::alert(&mut h.app, &mut out, notify, false);
     assert!(out.is_empty());
+}
+
+// ---- workdir ----------------------------------------------------------------
+
+/// The one workdir read the core asked the engine for since the last drain.
+fn workdir_asked(h: &Harness) -> (u64, WorkdirAsk) {
+    let asks: Vec<(u64, WorkdirAsk)> = h
+        .drain_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            Request::Workdir { req, ask } => Some((req, ask)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    asks.into_iter().next().unwrap()
+}
+
+/// The session open on its timeline, then `w`: on its changes, asked for.
+fn open_workdir() -> (Harness, SessionId, u64, WorkdirAsk) {
+    let (mut h, id, _) = open_session();
+    // In the composer, `w` is text.
+    assert_eq!(h.key(KeyCode::Char('w')), None);
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+    h.key(KeyCode::Backspace);
+    h.key(KeyCode::Esc);
+    h.drain_requests();
+    assert_eq!(
+        h.key(KeyCode::Char('w')),
+        Some(Action::OpenWorkdir { session_id: id })
+    );
+    assert!(matches!(h.app.view().screen, Screen::Workdir(_)));
+    let (req, ask) = workdir_asked(&h);
+    assert_eq!(ask, WorkdirAsk::Changes { session: id });
+    (h, id, req, ask)
+}
+
+/// A modified file with its diff in `diff`, and an untracked one.
+fn change_set(diff: BlobRef) -> ChangeSet {
+    ChangeSet {
+        at: at(5),
+        branch: Some("main".into()),
+        head: Some("1a2b3c4".into()),
+        files: vec![
+            ChangedFile {
+                path: "src/main.rs".into(),
+                from: None,
+                change: FileChange::Modified,
+                added: Some(3),
+                removed: Some(1),
+                diff: DiffBody::Blob(diff),
+            },
+            ChangedFile {
+                path: "notes.txt".into(),
+                from: None,
+                change: FileChange::Untracked,
+                added: Some(2),
+                removed: Some(0),
+                diff: DiffBody::Omitted,
+            },
+        ],
+        total: 2,
+    }
+}
+
+fn answered(h: &mut Harness, req: u64, ask: WorkdirAsk, answer: WorkdirAnswer) {
+    h.seam.workdir_answered(req, ask, Ok(answer)).unwrap();
+    h.sync();
+}
+
+/// Writes `content` as blob `id`'s file and reports it downloaded.
+fn arrived(h: &mut Harness, id: BlobId, content: &str) {
+    let path = h.dir.path().join(format!("arrived-{id:?}"));
+    std::fs::write(&path, content).unwrap();
+    h.seam
+        .blob_status(id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+}
+
+#[test]
+fn workdir_w_opens_the_changes_and_renders_them() {
+    let (mut h, _, req, ask) = open_workdir();
+    let screen = h.screen();
+    assert_contains(&screen, " Changes  Files ");
+    assert_contains(&screen, "Loading…");
+    assert!(!screen.contains("Not fetched yet"), "{screen}");
+
+    let (_, diff_ref) = blob(300);
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::Changes(ChangesResult::Changes(change_set(diff_ref))),
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "main @ 1a2b3c4 · taken 12:05:00");
+    assert!(!screen.contains("Loading"), "{screen}");
+    assert_contains(&line_with(&screen, "src/main.rs"), "> M src/main.rs  +3 −1");
+    assert_contains(&screen, "  ? notes.txt  +2 −0");
+    assert_contains(&screen, "Enter open · Tab changes/files");
+}
+
+#[test]
+fn workdir_not_git_says_so() {
+    let (mut h, _, req, ask) = open_workdir();
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::Changes(ChangesResult::NotGit),
+    );
+    assert_contains(
+        &h.screen(),
+        "Not a git repository. Browse the files under Files.",
+    );
+    // Nothing to open.
+    assert_eq!(h.key(KeyCode::Enter), None);
+}
+
+#[test]
+fn workdir_enter_shows_a_diff_coloured_by_line_kind() {
+    let (mut h, id, req, ask) = open_workdir();
+    let (diff, diff_ref) = blob(300);
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::Changes(ChangesResult::Changes(change_set(diff_ref))),
+    );
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::ShowWorkdir(WorkdirPane::Diff {
+            path: "src/main.rs".into(),
+            untracked: false,
+        }))
+    );
+    // Not here yet: where it stands, as the timeline words it.
+    assert_contains(&h.screen(), "src/main.rs  +3 −1");
+    assert!(
+        h.screen().contains("requested") || h.screen().contains("downloading"),
+        "{}",
+        h.screen()
+    );
+
+    arrived(
+        &mut h,
+        diff,
+        "diff --git a/src/main.rs b/src/main.rs\n\
+         --- a/src/main.rs\n\
+         +++ b/src/main.rs\n\
+         @@ -1,2 +1,4 @@\n\
+         \x20fn main() {\n\
+         -    old();\n\
+         ---- dashes removed\n\
+         +    new();\n\
+         +\x1b[31mevil\n",
+    );
+    let frame = h.frame(100, 24, mockup_now());
+    let screen = text(&frame);
+    assert_contains(&screen, "@@ -1,2 +1,4 @@");
+    assert_eq!(colour_of(&frame, "+    new();"), Color::Green);
+    assert_eq!(colour_of(&frame, "-    old();"), Color::Red);
+    assert_eq!(colour_of(&frame, "@@ -1,2"), Color::Cyan);
+    assert_eq!(colour_of(&frame, " fn main() {"), Color::Reset);
+    // Inside a hunk a line is what its sign says, even `---…`.
+    assert_eq!(colour_of(&frame, "---- dashes removed"), Color::Red);
+    // Server text never reaches the terminal raw.
+    assert_contains(&screen, "+[31mevil");
+    assert!(!screen.contains('\x1b'), "{screen:?}");
+
+    // Esc: back to the changes, on the file come from.
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    let screen = h.screen();
+    assert_contains(&screen, "main @ 1a2b3c4");
+    assert_contains(&line_with(&screen, "src/main.rs"), "> M src/main.rs");
+    assert_eq!(h.key(KeyCode::Char('j')), None);
+    assert_contains(&line_with(&h.screen(), "notes.txt"), "> ? notes.txt");
+
+    // Esc again: the session.
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    match &h.app.view().screen {
+        Screen::Session(view) => assert_eq!(view.id, id),
+        other => panic!("expected the session, got {other:?}"),
+    }
+}
+
+#[test]
+fn workdir_tab_to_files_and_into_a_directory_and_a_file() {
+    let (mut h, id, req, ask) = open_workdir();
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::Changes(ChangesResult::NotGit),
+    );
+
+    assert_eq!(
+        h.key(KeyCode::Tab),
+        Some(Action::ShowWorkdir(WorkdirPane::Dir {
+            path: String::new()
+        }))
+    );
+    let (req, ask) = workdir_asked(&h);
+    assert_eq!(
+        ask,
+        WorkdirAsk::List {
+            session: id,
+            path: String::new()
+        }
+    );
+    let entry = |name: &str, kind, size| DirEntry {
+        name: name.into(),
+        kind,
+        size,
+    };
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::List(ListResult::Listed {
+            at: at(6),
+            path: String::new(),
+            entries: vec![
+                entry("b.txt", EntryKind::File, Some(812)),
+                entry("src", EntryKind::Dir, None),
+                entry(
+                    "docs",
+                    EntryKind::Link {
+                        to: LinkTarget::Dir,
+                    },
+                    None,
+                ),
+            ],
+            truncated: false,
+        }),
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "./ · taken 12:06:00");
+    assert!(
+        !screen.contains("../"),
+        "no way up from the workdir:\n{screen}"
+    );
+    // Directories first, a link to one among them.
+    let docs = screen.find("docs  → directory").expect(&screen);
+    let src = screen.find("src/").expect(&screen);
+    let file = screen.find("b.txt  812 B").expect(&screen);
+    assert!(docs < src && src < file, "{screen}");
+
+    h.key(KeyCode::Char('j'));
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() }))
+    );
+    let (req, ask) = workdir_asked(&h);
+    let (content, content_ref) = blob(14);
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::List(ListResult::Listed {
+            at: at(7),
+            path: "src".into(),
+            entries: vec![entry("main.rs", EntryKind::File, Some(14))],
+            truncated: false,
+        }),
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "./src · taken 12:07:00");
+    assert_contains(&line_with(&screen, "../"), "> ../");
+
+    // Into the file: its content with line numbers.
+    h.key(KeyCode::Char('j'));
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::ShowWorkdir(WorkdirPane::File {
+            path: "src/main.rs".into()
+        }))
+    );
+    let (req, ask) = workdir_asked(&h);
+    answered(
+        &mut h,
+        req,
+        ask,
+        WorkdirAnswer::File(FileResult::File {
+            at: at(8),
+            path: "src/main.rs".into(),
+            size: 14,
+            content: FileBody::Blob(content_ref),
+        }),
+    );
+    arrived(&mut h, content, "fn main() {}\n\tx\n");
+    let screen = h.screen();
+    assert_contains(&screen, "src/main.rs  14 B · taken 12:08:00");
+    assert_contains(&screen, "1 │ fn main() {}");
+    assert_contains(&screen, "2 │     x");
+
+    // Esc: up to the directory, on the file; again: up to the workdir, on
+    // `src/`, from what is stored (no new read); again: the session.
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert_contains(&line_with(&h.screen(), "main.rs"), "> main.rs");
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert_contains(&line_with(&h.screen(), "src/"), "> src/");
+    assert!(
+        !h.drain_requests()
+            .iter()
+            .any(|r| matches!(r, Request::Workdir { .. })),
+        "stored reads show without asking again"
+    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
 }
