@@ -764,27 +764,20 @@ pub fn shell_took(run: &ShellRun, now: DateTime<Utc>) -> Option<String> {
     Some(took_label((end - started).to_std().unwrap_or_default()))
 }
 
-/// How long a run not started yet has waited, coarse: `queued 40s`,
-/// `queued 12m`, `queued 2h`, `queued 3d`. From its logged request (the
-/// server's clock), or for this device's run not in the log yet from when
-/// it was queued here. `None` once started, for a
+/// When a run not started yet was queued: `queued 14:02:11`. From its
+/// logged request (the server's clock), or for this device's run not in
+/// the log yet from when it was queued here. No running count, as
+/// [`delivery_label`]. `None` once started, for a
 /// [`refused`](ShellRun::refused) run (it is not queued: it will never
 /// run), or for a run whose id carries no time.
-pub fn queued_age(run: &ShellRun, now: DateTime<Utc>) -> Option<String> {
+pub fn queued_label(run: &ShellRun) -> Option<String> {
     if !matches!(run.state, ShellRunState::Pending | ShellRunState::Queued) || run.refused() {
         return None;
     }
     let since = run
         .requested_at
         .or(run.delivery.map(|delivery| delivery.queued_at))?;
-    let s = (now - since).to_std().unwrap_or_default().as_secs();
-    let age = match s {
-        0..60 => format!("{s}s"),
-        60..3600 => format!("{}m", s / 60),
-        3600..86_400 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86_400),
-    };
-    Some(format!("queued {age}"))
+    Some(format!("queued {}", since.format("%H:%M:%S")))
 }
 
 #[cfg(test)]
@@ -912,36 +905,30 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_run_says_how_long_it_has_been_queued() {
+    fn a_waiting_run_says_when_it_was_queued() {
         use chrono::TimeZone;
+        // 2023-11-14 22:13:20 UTC.
         let at = |s: i64| Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap();
         let mut run = shell_run(ShellRunState::Queued);
-        assert_eq!(queued_age(&run, at(0)), None, "no time known");
+        assert_eq!(queued_label(&run), None, "no time known");
         run.requested_at = Some(at(0));
-        for (now, text) in [
-            (40, "queued 40s"),
-            (12 * 60 + 5, "queued 12m"),
-            (2 * 3600 + 59, "queued 2h"),
-            (3 * 86_400, "queued 3d"),
-        ] {
-            assert_eq!(queued_age(&run, at(now)).as_deref(), Some(text));
-        }
+        assert_eq!(queued_label(&run).as_deref(), Some("queued 22:13:20"));
         // This device's run not logged yet goes by when it was queued here.
         let mut pending = shell_run(ShellRunState::Pending);
         pending.delivery = Some(Delivery {
-            queued_at: at(0),
+            queued_at: at(90),
             first_sent_at: None,
             answered_at: None,
             tries: 0,
         });
-        assert_eq!(queued_age(&pending, at(90)).as_deref(), Some("queued 1m"));
-        // Refused, it is not queued at all, however long ago it was sent.
+        assert_eq!(queued_label(&pending).as_deref(), Some("queued 22:14:50"));
+        // Refused, it is not queued at all.
         pending.outgoing = Some(Outgoing::Failed(FailReason::Rejected(
             RejectReason::BadShellCommand,
         )));
-        assert_eq!(queued_age(&pending, at(3 * 86_400)), None, "refused");
+        assert_eq!(queued_label(&pending), None, "refused");
         run.state = ShellRunState::Running;
-        assert_eq!(queued_age(&run, at(40)), None, "started");
+        assert_eq!(queued_label(&run), None, "started");
     }
 
     fn task(ambient: bool) -> BackgroundTask {

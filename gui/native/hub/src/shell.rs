@@ -11,7 +11,7 @@ use skywave_core::{
     Action, BlobId, BlobState, CommandId, RunWhen, SessionView, ShellEnd, ShellRun, ShellRunState,
 };
 use skywave_present::format::{
-    outgoing_label, queued_age, shell_end_label, shell_prompt, shell_took, when_marker,
+    outgoing_label, queued_label, shell_end_label, shell_prompt, shell_took, when_marker,
 };
 use skywave_present::output::{
     OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
@@ -160,7 +160,7 @@ fn state(run: &ShellRun, now: DateTime<Utc>) -> (ShellRunKind, String) {
             };
             (
                 kind,
-                queued_age(run, now).unwrap_or_else(|| "queued".to_owned()),
+                queued_label(run).unwrap_or_else(|| "queued".to_owned()),
             )
         }
         ShellRunState::Running => {
@@ -183,15 +183,12 @@ fn state(run: &ShellRun, now: DateTime<Utc>) -> (ShellRunKind, String) {
     }
 }
 
-/// Whether the rows show a clock that runs: a run's time running, or how
-/// long one has waited.
+/// Whether the rows show a clock that runs: a run's time running.
 pub fn live(view: &SessionView) -> bool {
-    view.shell.runs.iter().any(|run| {
-        matches!(
-            run.state,
-            ShellRunState::Pending | ShellRunState::Queued | ShellRunState::Running
-        ) && !run.refused()
-    })
+    view.shell
+        .runs
+        .iter()
+        .any(|run| run.state == ShellRunState::Running)
 }
 
 /// The shell composer's prompt for `view`, the next command running on

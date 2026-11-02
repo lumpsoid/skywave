@@ -22,7 +22,7 @@ unicode-width = "0.2"
 # `strip_ansi` only: a shell run's output blob is raw, and `y` copies it
 # stripped, as every head shows it.
 skywave-proto.workspace = true
-# The wall clock as the shell runs' times (`shell_took`, `queued_age`).
+# The wall clock as the shell runs' times (`shell_took`).
 chrono.workspace = true
 
 [dev-dependencies]
