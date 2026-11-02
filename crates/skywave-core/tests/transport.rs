@@ -11,8 +11,9 @@ use skywave_core::{
     Request, Screen, Transport, TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DirsResult, EventKind,
-    EventsQuery, HelloResponse, PROTOCOL_VERSION, Seq,
+    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId, DirEntry,
+    DirsResult, EntryKind, EventKind, EventsQuery, FileBody, FileResult, HelloResponse, ListResult,
+    PROTOCOL_VERSION, Seq, SessionId, WorkdirQuery,
 };
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing::{self, IssuedCode};
@@ -312,38 +313,161 @@ async fn pair_then_talk_to_the_server_until_revoked() {
     );
 }
 
+/// A transport implementing only the required calls, as one for an older
+/// server would.
+struct Old;
+
+impl Transport for Old {
+    fn hello(&self) -> skywave_core::BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        unimplemented!()
+    }
+    fn send_command<'a>(
+        &'a self,
+        _: &'a Command,
+    ) -> skywave_core::BoxFuture<'a, Result<CommandResult, TransportError>> {
+        unimplemented!()
+    }
+    fn events(
+        &self,
+        _: EventsQuery,
+    ) -> skywave_core::BoxFuture<'_, Result<skywave_proto::EventBatch, TransportError>> {
+        unimplemented!()
+    }
+    fn blob(
+        &self,
+        _: BlobId,
+        _: u64,
+    ) -> skywave_core::BoxFuture<'_, Result<BlobDownload, TransportError>> {
+        unimplemented!()
+    }
+}
+
 /// A transport that cannot list directories, like an older server without
 /// `GET /v1/dirs` (404), answers `NotFound`: completion falls back to
 /// recent workdirs.
 #[tokio::test]
 async fn list_dirs_defaults_to_not_found() {
-    struct Old;
-    impl Transport for Old {
-        fn hello(&self) -> skywave_core::BoxFuture<'_, Result<HelloResponse, TransportError>> {
-            unimplemented!()
-        }
-        fn send_command<'a>(
-            &'a self,
-            _: &'a Command,
-        ) -> skywave_core::BoxFuture<'a, Result<CommandResult, TransportError>> {
-            unimplemented!()
-        }
-        fn events(
-            &self,
-            _: EventsQuery,
-        ) -> skywave_core::BoxFuture<'_, Result<skywave_proto::EventBatch, TransportError>>
-        {
-            unimplemented!()
-        }
-        fn blob(
-            &self,
-            _: BlobId,
-            _: u64,
-        ) -> skywave_core::BoxFuture<'_, Result<BlobDownload, TransportError>> {
-            unimplemented!()
-        }
-    }
     assert_eq!(Old.list_dirs("/").await, Err(TransportError::NotFound));
+}
+
+/// A transport that cannot read workdirs answers `NotFound`, as a server
+/// without the endpoints would.
+#[tokio::test]
+async fn workdir_reads_default_to_not_found() {
+    let query = WorkdirQuery {
+        session: SessionId::new(),
+        path: "src".into(),
+    };
+    assert_eq!(
+        Old.workdir_changes(&query).await,
+        Err(TransportError::NotFound)
+    );
+    assert_eq!(
+        Old.workdir_list(&query).await,
+        Err(TransportError::NotFound)
+    );
+    assert_eq!(
+        Old.workdir_file(&query).await,
+        Err(TransportError::NotFound)
+    );
+}
+
+/// The three workdir reads against a real server with a paired device,
+/// paths that need escaping in the query included.
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_reads_reach_a_real_server() {
+    let fx = Fixture::start().await;
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
+    let transport = HttpsTransport::new(&paired.address, &identity, config()).unwrap();
+
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+        },
+    };
+    let accepted = transport.send_command(&create).await.unwrap();
+    assert!(matches!(accepted, CommandResult::Accepted { .. }));
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let session = batch.events[0].session_id;
+    let dir = std::path::Path::new(&fx.workdir()).join("my dir %&#");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("a #1.txt"), "hello").unwrap();
+    let query = |path: &str| WorkdirQuery {
+        session,
+        path: path.into(),
+    };
+
+    // `root/project` is in no git work tree.
+    assert_eq!(
+        transport.workdir_changes(&query("")).await.unwrap(),
+        ChangesResult::NotGit
+    );
+    let ListResult::Listed {
+        path,
+        entries,
+        truncated,
+        ..
+    } = transport.workdir_list(&query("my dir %&#")).await.unwrap()
+    else {
+        panic!("expected a listing");
+    };
+    assert_eq!(path, "my dir %&#");
+    assert!(!truncated);
+    assert_eq!(
+        entries,
+        [DirEntry {
+            name: "a #1.txt".into(),
+            kind: EntryKind::File,
+            size: Some(5),
+        }]
+    );
+    let FileResult::File {
+        path,
+        size,
+        content: FileBody::Blob(blob),
+        ..
+    } = transport
+        .workdir_file(&query("my dir %&#/a #1.txt"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected a file");
+    };
+    assert_eq!((path.as_str(), size), ("my dir %&#/a #1.txt", 5));
+    let content = transport.blob(blob.id, 0).await.unwrap();
+    assert_eq!(read_all(content).await, b"hello");
+
+    // A session the server does not know is an answer, not an error.
+    let unknown = WorkdirQuery {
+        session: SessionId::new(),
+        path: String::new(),
+    };
+    assert_eq!(
+        transport.workdir_changes(&unknown).await.unwrap(),
+        ChangesResult::UnknownSession
+    );
+    assert_eq!(
+        transport.workdir_list(&unknown).await.unwrap(),
+        ListResult::UnknownSession
+    );
+    assert_eq!(
+        transport.workdir_file(&unknown).await.unwrap(),
+        FileResult::UnknownSession
+    );
 }
 
 /// A wrong fingerprint fails the TLS handshake, so the code never reaches

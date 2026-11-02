@@ -254,7 +254,13 @@ then pushed as a new `ViewState`.
   `blobs`, `settings`, and what is this device's alone (D5: drafts per
   session and composer mode, composer modes, snippets, read marks, local
   deletes, alerted approvals). A schema migration backfills a new
-  projection from the stored events.
+  projection from the stored events. `workdir_snapshots` keeps the latest
+  stored answer per workdir read (session, kind, requested path), so a
+  workdir already browsed reads offline; `workdir_blob_refs` names the
+  blobs each answer holds. A refresh replaces the answer, and a blob row
+  goes once no answer of any session names it (the server deduplicates
+  workdir content across sessions). An answer for a session not in the
+  replica (unknown, deleted here, or from before a re-pair) is dropped.
 - **Sync engine** (D7): the pull loop long-polls from the cursor and applies
   each batch and the new cursor in one transaction. The outbox sends oldest
   first, one command in flight, so the server sees commands in the order
@@ -270,7 +276,9 @@ then pushed as a new `ViewState`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
   link, two at a time, into `blobs/<id>.part`, resumed with `Range`,
   verified by size and renamed when complete; `Link` ignores them (synced
-  metadata counts as synced).
+  metadata counts as synced). Workdir blobs (diffs and file contents a
+  stored workdir answer names) are never fetched eagerly, whatever the
+  policy: only asking for one downloads it.
 - **Usage screen**: every `TurnUsage` in the replica as a `TurnRecord` with
   the sessions they ran in; heads total them with `skywave_present::usage`
   by local day, session, workdir or model. A turn with no cost is unpriced,

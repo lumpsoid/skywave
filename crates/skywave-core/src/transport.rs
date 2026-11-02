@@ -10,7 +10,8 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use skywave_proto::{
-    BlobId, Command, CommandResult, DirsResult, EventBatch, EventsQuery, HelloResponse,
+    BlobId, ChangesResult, Command, CommandResult, DirsResult, EventBatch, EventsQuery, FileResult,
+    HelloResponse, ListResult, WorkdirQuery,
 };
 
 use crate::view::LinkRejection;
@@ -46,6 +47,41 @@ pub trait Transport: Send + Sync {
     /// transport that cannot list returns by default.
     fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
         let _ = dir;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/workdir/changes?session=`: what changed in the session's
+    /// workdir. Every domain outcome is an answer; a server without the
+    /// endpoint answers [`TransportError::NotFound`], as does a transport
+    /// that cannot read workdirs by default.
+    fn workdir_changes<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<ChangesResult, TransportError>> {
+        let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/workdir/list?session=&path=`: one directory of the
+    /// session's workdir. Defaults to [`TransportError::NotFound`] like
+    /// [`workdir_changes`](Transport::workdir_changes).
+    fn workdir_list<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<ListResult, TransportError>> {
+        let _ = query;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/workdir/file?session=&path=`: one file of the session's
+    /// workdir, its content as a blob. Defaults to
+    /// [`TransportError::NotFound`] like
+    /// [`workdir_changes`](Transport::workdir_changes).
+    fn workdir_file<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        let _ = query;
         Box::pin(async { Err(TransportError::NotFound) })
     }
 }

@@ -1072,6 +1072,7 @@ impl Model {
                     id: blob.id,
                     size: blob.size,
                     status: BlobStatus::NotDownloaded,
+                    workdir: false,
                 });
             }
             if let Some(open) = self.open.as_mut().filter(|o| o.id == event.session_id) {
@@ -3063,6 +3064,7 @@ mod tests {
             models: Vec::new(),
             snippets: Vec::new(),
             turns: Vec::new(),
+            workdirs: HashMap::new(),
         }
     }
 
@@ -6358,6 +6360,8 @@ mod tests {
             models: model.models.clone(),
             snippets: model.snippets.list().to_vec(),
             turns: model.turns.clone(),
+            // The model keeps no workdir answers yet.
+            workdirs: HashMap::new(),
         }
     }
 

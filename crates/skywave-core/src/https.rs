@@ -19,8 +19,8 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, Command, CommandResult, DirsResult, EventBatch, EventsQuery, HelloResponse,
-    PROTOCOL_VERSION, path,
+    BlobId, ChangesResult, Command, CommandResult, DirsResult, EventBatch, EventsQuery, FileResult,
+    HelloResponse, ListResult, PROTOCOL_VERSION, WorkdirQuery, path,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -29,6 +29,7 @@ use crate::address::ServerAddress;
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
+use crate::workdir::WORKDIR_TIMEOUT;
 
 /// Timeouts and pool size of an [`HttpsTransport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +339,26 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `GET <endpoint>?session=<id>&path=<path>`, bounded by
+    /// [`WORKDIR_TIMEOUT`] rather than the request timeout: the server may
+    /// take its full 20 s.
+    async fn workdir<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        query: &WorkdirQuery,
+    ) -> Result<T, TransportError> {
+        let uri = format!(
+            "{endpoint}?session={}&path={}",
+            query.session.0,
+            query_escape(&query.path)
+        );
+        let reply = self
+            .http
+            .request(Method::GET, &uri, Bytes::new(), WORKDIR_TIMEOUT)
+            .await?;
+        ok_json(reply)
+    }
+
     async fn blob(&self, id: BlobId, from: u64) -> Result<BlobDownload, TransportError> {
         let range;
         let headers: &[(header::HeaderName, HeaderValue)] = if from > 0 {
@@ -460,6 +481,27 @@ impl Transport for HttpsTransport {
 
     fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
         Box::pin(HttpsTransport::list_dirs(self, dir))
+    }
+
+    fn workdir_changes<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<ChangesResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_CHANGES, query))
+    }
+
+    fn workdir_list<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<ListResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_LIST, query))
+    }
+
+    fn workdir_file<'a>(
+        &'a self,
+        query: &'a WorkdirQuery,
+    ) -> BoxFuture<'a, Result<FileResult, TransportError>> {
+        Box::pin(self.workdir(path::WORKDIR_FILE, query))
     }
 }
 

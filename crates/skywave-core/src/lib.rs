@@ -18,6 +18,8 @@
 //!   errors; [`HttpsTransport`] is the mTLS implementation.
 //! - blob downloads ([`blob_dir`]) follow the [`BlobPolicy`] apart from
 //!   event sync.
+//! - [`workdir`]: reads of a session's workdir and the answers the replica
+//!   keeps.
 //! - [`search`]: what a search of the open session's timeline matches.
 //! - [`pairing`]: the pairing client, plus code, fingerprint and pairing
 //!   URI parsing for heads.
@@ -41,6 +43,7 @@ pub mod store;
 mod tls;
 pub mod transport;
 pub mod view;
+pub mod workdir;
 
 pub use action::{Action, Route};
 pub use address::{AddressError, DEFAULT_PORT, ServerAddress};

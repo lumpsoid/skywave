@@ -8,6 +8,9 @@
 //! switches to `Eager`; switching back to `OnDemand` drops the waiting
 //! blobs nobody asked for (a download in progress finishes). On startup a
 //! blob left `Downloading` is queued again, under either policy.
+//! Workdir blobs (named by a stored workdir answer, `BlobRecord::workdir`)
+//! are never fetched eagerly, whatever the policy: only a request for one
+//! queues it, so a Changes refresh never starts megabytes of diffs.
 //!
 //! **How.** The downloader runs on its own task beside the link, with its
 //! own [`Transport`] (built by the engine's connector on first use), so
@@ -117,8 +120,9 @@ pub(crate) struct BlobQueue {
 }
 
 impl BlobQueue {
-    /// The queue as the replica leaves it: blobs left `Downloading` first,
-    /// then, with `Eager`, every blob not downloaded yet.
+    /// The queue as the replica leaves it: blobs left `Downloading` first
+    /// (workdir ones too: the user asked for them), then, with `Eager`,
+    /// every event blob not downloaded yet.
     pub(crate) fn restore(seam: &Seam) -> BlobQueue {
         let this = BlobQueue::default();
         let (settings, blobs) = match seam.settings().and_then(|s| Ok((s, seam.blobs()?))) {
@@ -162,9 +166,10 @@ impl BlobQueue {
         match policy {
             BlobPolicy::OnDemand => queue.waiting.retain(|q| q.wanted),
             BlobPolicy::Eager => {
-                // Newest first: ids are time-ordered.
+                // Newest first: ids are time-ordered. Workdir blobs only
+                // download when asked for.
                 for blob in blobs.iter().rev() {
-                    if !matches!(blob.status, BlobStatus::Available { .. }) {
+                    if !blob.workdir && !matches!(blob.status, BlobStatus::Available { .. }) {
                         queue.push_back(blob.id);
                     }
                 }
@@ -175,6 +180,8 @@ impl BlobQueue {
     }
 
     /// A pulled batch registered these blobs; with `Eager` they are queued.
+    /// Only for event blobs: the blobs a stored workdir answer registers
+    /// never come here, as they download only when asked for.
     pub(crate) fn registered(&self, ids: &[BlobId]) {
         let mut queue = lock(&self.queue);
         if queue.policy != BlobPolicy::Eager || ids.is_empty() {
@@ -997,17 +1004,11 @@ mod tests {
             id: ProtoBlobId::new(),
             size: 1,
             status,
+            workdir: false,
         };
         let a = record(BlobStatus::NotDownloaded);
         let b = record(BlobStatus::Available { path: "/x".into() });
         let c = record(BlobStatus::NotDownloaded);
-        let waiting = |q: &BlobQueue| -> Vec<(BlobId, bool)> {
-            lock(&q.queue)
-                .waiting
-                .iter()
-                .map(|q| (q.id, q.wanted))
-                .collect()
-        };
 
         // OnDemand: registered blobs wait for the user.
         queue.registered(&[a.id]);
@@ -1032,5 +1033,139 @@ mod tests {
         // A purged blob waits no longer, asked for or not.
         queue.purged(&[d, c.id]);
         assert_eq!(waiting(&queue), [(a.id, true)]);
+    }
+
+    fn waiting(queue: &BlobQueue) -> Vec<(BlobId, bool)> {
+        lock(&queue.queue)
+            .waiting
+            .iter()
+            .map(|q| (q.id, q.wanted))
+            .collect()
+    }
+
+    #[test]
+    fn switching_to_eager_queues_no_workdir_blob() {
+        let queue = BlobQueue::default();
+        let record = |workdir| BlobRecord {
+            id: ProtoBlobId::new(),
+            size: 1,
+            status: BlobStatus::NotDownloaded,
+            workdir,
+        };
+        let event = record(false);
+        let workdir = record(true);
+        queue.set_policy(BlobPolicy::Eager, &[event.clone(), workdir.clone()]);
+        assert_eq!(waiting(&queue), [(event.id, false)]);
+        // Asked for, a workdir blob downloads like any other.
+        queue.want(workdir.id);
+        assert_eq!(waiting(&queue), [(workdir.id, true), (event.id, false)]);
+    }
+
+    #[test]
+    fn restore_under_eager_queues_no_workdir_blob_but_resumes_one() {
+        use crate::store::Store;
+        use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+        use skywave_proto::{ChangeSet, ChangedFile, DiffBody, FileBody, FileChange, FileResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new();
+        let event_blob = BlobRef {
+            id: ProtoBlobId::new(),
+            size: 3,
+        };
+        let file_blob = BlobRef {
+            id: ProtoBlobId::new(),
+            size: 4,
+        };
+        let diff_blob = BlobRef {
+            id: ProtoBlobId::new(),
+            size: 5,
+        };
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            let event = |kind: EventKind| Event {
+                session_id,
+                at: Utc::now(),
+                command_id: None,
+                context: skywave_proto::ContextId::first_of(session_id),
+                kind,
+            };
+            store
+                .apply_batch(
+                    &EventBatch {
+                        from: Seq(1),
+                        events: vec![
+                            event(EventKind::SessionCreated {
+                                workdir: "/srv".into(),
+                                context_name: "start".into(),
+                                from: None,
+                            }),
+                            event(EventKind::ToolResult(ToolResult {
+                                call: None,
+                                is_error: false,
+                                status: None,
+                                preview: "big".into(),
+                                lines: 1,
+                                output: Some(event_blob.clone()),
+                            })),
+                        ],
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            let file = FileResult::File {
+                at: Utc::now(),
+                path: "a.txt".into(),
+                size: 4,
+                content: FileBody::Blob(file_blob.clone()),
+            };
+            let ask = WorkdirAsk::File {
+                session: session_id,
+                path: "a.txt".into(),
+            };
+            assert!(
+                store
+                    .put_workdir(&ask, &WorkdirAnswer::File(file))
+                    .unwrap()
+                    .is_some()
+            );
+            let changes = skywave_proto::ChangesResult::Changes(ChangeSet {
+                at: Utc::now(),
+                branch: None,
+                head: None,
+                files: vec![ChangedFile {
+                    path: "b.txt".into(),
+                    from: None,
+                    change: FileChange::Modified,
+                    added: Some(1),
+                    removed: Some(0),
+                    diff: DiffBody::Blob(diff_blob.clone()),
+                }],
+                total: 1,
+            });
+            let ask = WorkdirAsk::Changes {
+                session: session_id,
+            };
+            store
+                .put_workdir(&ask, &WorkdirAnswer::Changes(changes))
+                .unwrap();
+            // The user opened the diff and the app stopped mid-download.
+            store
+                .set_blob_status(
+                    diff_blob.id,
+                    &BlobStatus::Downloading {
+                        got: 1,
+                        path: "/x.part".into(),
+                    },
+                )
+                .unwrap();
+            store.set_blob_policy(BlobPolicy::Eager).unwrap();
+        }
+        let core = Core::open_detached(dir.path()).unwrap();
+        let queue = BlobQueue::restore(&core.seam());
+        assert_eq!(
+            waiting(&queue),
+            [(diff_blob.id, true), (event_blob.id, false)]
+        );
     }
 }
