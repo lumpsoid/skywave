@@ -3,7 +3,8 @@
 //!
 //! Holds the replicated event log, projected session summaries, the outbox,
 //! the pull cursor, blob rows, settings, the server's device names (from
-//! `hello`) and this device's drafts, read
+//! `hello`), the latest answer to each workdir read, and this device's
+//! drafts, read
 //! marks, locally deleted sessions and alerted approvals (D5: never
 //! synced). Startup always reads everything back from here
 //! ([`Store::load`]), so a cold start is the normal start.
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 use crate::projection::{SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
+use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -267,6 +269,28 @@ INSERT INTO turns (seq, session_id, at, usage)
         json_remove(json_extract(event, '$.kind'), '$.type')
     FROM events WHERE json_extract(event, '$.kind.type') = 'turn_usage';
 "#,
+    r#"
+-- The latest answer to each workdir read (`Store::put_workdir`): `path` as
+-- requested, '' for changes; `result` the `ChangesResult`, `ListResult` or
+-- `FileResult` as JSON.
+CREATE TABLE workdir_snapshots (
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('changes', 'list', 'file')),
+    path TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (json_valid(result)),
+    PRIMARY KEY (session_id, kind, path)
+);
+-- The blobs each stored answer names. A blob row goes once no ref names it,
+-- whatever session or read: workdir blob ids are shared across sessions.
+CREATE TABLE workdir_blob_refs (
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    blob_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, kind, path, blob_id)
+);
+CREATE INDEX workdir_blob_refs_by_blob ON workdir_blob_refs (blob_id);
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -303,6 +327,9 @@ pub enum StoreError {
     UnknownBlob(BlobId),
     #[error("path {0} is not valid UTF-8")]
     NonUtf8Path(PathBuf),
+    /// [`Store::put_workdir`] was given an answer of another kind than its ask.
+    #[error("a workdir answer of another kind than its ask")]
+    WorkdirMismatch,
 }
 
 /// Whether blobs download alongside metadata or on explicit intent (D6).
@@ -414,12 +441,27 @@ pub enum BlobStatus {
     },
 }
 
-/// A blob the replica knows of, registered when an event references it.
+/// A blob the replica knows of, registered when an event or a stored
+/// workdir answer ([`Store::put_workdir`]) references it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlobRecord {
     pub id: BlobId,
     pub size: u64,
     pub status: BlobStatus,
+    /// A stored workdir answer names it: it downloads only when asked for,
+    /// whatever the [`BlobPolicy`].
+    pub workdir: bool,
+}
+
+/// Result of a [`Store::put_workdir`] that wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkdirStored {
+    /// Blobs the answer names that the replica did not know, now registered
+    /// as [`BlobStatus::NotDownloaded`].
+    pub registered: Vec<BlobId>,
+    /// Blobs the previous answer named that nothing names any more, whose
+    /// rows are gone and whose files the caller removes.
+    pub purged: Vec<BlobId>,
 }
 
 /// Result of [`Store::apply_batch`].
@@ -477,6 +519,9 @@ pub struct Snapshot {
     pub snippets: Vec<Snippet>,
     /// Every stored turn's usage, in log order ([`Store::turns`]).
     pub turns: Vec<TurnRecord>,
+    /// The latest stored answer to each workdir read
+    /// ([`Store::put_workdir`]).
+    pub workdirs: HashMap<WorkdirAsk, WorkdirAnswer>,
 }
 
 /// Handle to the replica database.
@@ -532,6 +577,7 @@ impl Store {
             models: self.offered_models()?,
             snippets: self.snippets()?,
             turns: self.turns()?,
+            workdirs: self.workdirs()?,
         })
     }
 
@@ -707,11 +753,13 @@ impl Store {
 
     /// Deletes a session from this device only, in one transaction: its
     /// events, summary, blob rows, draft, read mark and alerted approvals,
-    /// and the answered
+    /// its stored workdir answers, and the answered
     /// commands naming it. A tombstone keeps it out of the replica for good
-    /// ([`apply_batch`](Store::apply_batch)). Returns the blobs its events
-    /// referenced, whose files the caller removes. Whether the session may
-    /// go (archived, nothing pending) is the caller's rule.
+    /// ([`apply_batch`](Store::apply_batch), [`put_workdir`](Store::put_workdir)).
+    /// Returns the blobs its events referenced and the workdir blobs no
+    /// other session's answer still names, whose files the caller removes.
+    /// Whether the session may go (archived, nothing pending) is the
+    /// caller's rule.
     pub fn delete_session_locally(
         &mut self,
         id: SessionId,
@@ -729,11 +777,27 @@ impl Store {
                 blobs.extend(blob_refs(&event.kind).map(|blob| blob.id));
             }
         }
-        blobs.sort();
-        blobs.dedup();
         for blob in &blobs {
             tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
         }
+        // Its workdir answers' blobs go only if no other session's names them.
+        let workdir_blobs = {
+            let mut stmt =
+                tx.prepare("SELECT DISTINCT blob_id FROM workdir_blob_refs WHERE session_id = ?1")?;
+            let rows = stmt.query_map([&session], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM workdir_blob_refs WHERE session_id = ?1",
+            [&session],
+        )?;
+        tx.execute(
+            "DELETE FROM workdir_snapshots WHERE session_id = ?1",
+            [&session],
+        )?;
+        blobs.extend(purge_workdir_blobs(&tx, &workdir_blobs)?);
+        blobs.sort();
+        blobs.dedup();
         tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
         tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
@@ -762,8 +826,9 @@ impl Store {
     }
 
     /// Makes the replica a fresh one for the server at `address`, in one
-    /// transaction: the event log, session summaries, cursor, outbox and
-    /// blob rows the old server's log produced go, as do its device names,
+    /// transaction: the event log, session summaries, cursor, outbox,
+    /// stored workdir answers and
+    /// blob rows the old server produced go, as do its device names,
     /// and so does what this
     /// device kept beside them — drafts, composer modes, read marks, locally
     /// deleted sessions and alerted approvals. Of the settings, the server
@@ -790,7 +855,9 @@ impl Store {
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;
-             DELETE FROM devices;",
+             DELETE FROM devices;
+             DELETE FROM workdir_snapshots;
+             DELETE FROM workdir_blob_refs;",
         )?;
         // The old server's word on shell commands says nothing of the new.
         tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_SHELL_ENABLED])?;
@@ -994,10 +1061,12 @@ impl Store {
 
     // ---- blobs ------------------------------------------------------------
 
+    /// Every blob the replica knows of, event and workdir ones alike: this
+    /// is the model's blob map, so nothing is left out.
     pub fn blobs(&self) -> Result<Vec<BlobRecord>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, size, state, got, path FROM blobs ORDER BY id")?;
+            .prepare(&format!("SELECT {BLOB_COLUMNS} FROM blobs ORDER BY id"))?;
         let rows = stmt.query_map([], blob_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1006,7 +1075,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, size, state, got, path FROM blobs WHERE id = ?1",
+                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE id = ?1"),
                 [id.0.to_string()],
                 blob_from_row,
             )
@@ -1029,6 +1098,115 @@ impl Store {
             return Err(StoreError::UnknownBlob(id));
         }
         Ok(())
+    }
+
+    // ---- workdir answers ------------------------------------------------------
+
+    /// Keeps `answer` as the latest to `ask`, in one transaction: it replaces
+    /// the stored answer and the blobs it names, registers the blobs the
+    /// replica did not know as [`BlobStatus::NotDownloaded`], and deletes
+    /// the rows of the blobs the replaced answer named that no stored answer
+    /// (any session, any read) names any more.
+    ///
+    /// Stores whatever it is given; which answers are worth keeping (not a
+    /// `ChangesResult::Failed`) is the caller's rule. Writes nothing and
+    /// returns `None` when `ask`'s session is not in the replica: no
+    /// summary, or deleted from this device (an answer that was in flight
+    /// across [`delete_session_locally`](Store::delete_session_locally) or
+    /// [`reset_for_server`](Store::reset_for_server)).
+    ///
+    /// The registered blobs are not event blobs: they must not go through
+    /// the blob queue's `registered`, which downloads eagerly.
+    pub fn put_workdir(
+        &mut self,
+        ask: &WorkdirAsk,
+        answer: &WorkdirAnswer,
+    ) -> Result<Option<WorkdirStored>, StoreError> {
+        if !answer.answers(ask) {
+            return Err(StoreError::WorkdirMismatch);
+        }
+        let tx = self.conn.transaction()?;
+        let session = ask.session().0.to_string();
+        let known: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1)
+                AND NOT EXISTS (SELECT 1 FROM deleted_sessions WHERE session_id = ?1)",
+            [&session],
+            |row| row.get(0),
+        )?;
+        if !known {
+            return Ok(None);
+        }
+        let key = params![session, ask.kind(), ask.path()];
+        let result = match answer {
+            WorkdirAnswer::Changes(result) => to_json(result)?,
+            WorkdirAnswer::List(result) => to_json(result)?,
+            WorkdirAnswer::File(result) => to_json(result)?,
+        };
+        tx.execute(
+            "INSERT INTO workdir_snapshots (session_id, kind, path, result)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (session_id, kind, path) DO UPDATE SET result = excluded.result",
+            params![session, ask.kind(), ask.path(), result],
+        )?;
+        let before: HashSet<BlobId> = {
+            let mut stmt = tx.prepare(
+                "SELECT blob_id FROM workdir_blob_refs
+                 WHERE session_id = ?1 AND kind = ?2 AND path = ?3",
+            )?;
+            let rows = stmt.query_map(key, |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM workdir_blob_refs WHERE session_id = ?1 AND kind = ?2 AND path = ?3",
+            key,
+        )?;
+        let refs = answer.blob_refs();
+        let mut stored = WorkdirStored::default();
+        for blob in &refs {
+            let id = blob.id.0.to_string();
+            tx.execute(
+                "INSERT INTO workdir_blob_refs (session_id, kind, path, blob_id)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                params![session, ask.kind(), ask.path(), id],
+            )?;
+            let inserted = tx.execute(
+                "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
+                 ON CONFLICT (id) DO NOTHING",
+                params![id, u64_sql(blob.size)?],
+            )?;
+            if inserted > 0 && !stored.registered.contains(&blob.id) {
+                stored.registered.push(blob.id);
+            }
+        }
+        let mut dropped: Vec<BlobId> = before
+            .into_iter()
+            .filter(|id| !refs.iter().any(|blob| blob.id == *id))
+            .collect();
+        dropped.sort();
+        stored.purged = purge_workdir_blobs(&tx, &dropped)?;
+        tx.commit()?;
+        Ok(Some(stored))
+    }
+
+    /// The latest stored answer to each workdir read.
+    pub fn workdirs(&self) -> Result<HashMap<WorkdirAsk, WorkdirAnswer>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, kind, path, result FROM workdir_snapshots")?;
+        let rows = stmt.query_map([], |row| {
+            let session = SessionId(uuid_col(row, 0)?);
+            let kind: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            let ask = WorkdirAsk::from_parts(session, &kind, path)
+                .ok_or_else(|| bad_value(1, Type::Text, format!("workdir kind {kind:?}")))?;
+            let answer = match ask {
+                WorkdirAsk::Changes { .. } => WorkdirAnswer::Changes(json_col(row, 3)?),
+                WorkdirAsk::List { .. } => WorkdirAnswer::List(json_col(row, 3)?),
+                WorkdirAsk::File { .. } => WorkdirAnswer::File(json_col(row, 3)?),
+            };
+            Ok((ask, answer))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ---- drafts -------------------------------------------------------------
@@ -1504,6 +1682,32 @@ fn opt_time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<U
     .transpose()
 }
 
+/// Deletes the rows of the `candidates` no workdir answer names any more and
+/// returns their ids. Not checked against the events: workdir blob ids are
+/// content ids the server mints apart from event blobs' random ones (D36),
+/// so no event names one.
+fn purge_workdir_blobs(
+    tx: &Transaction<'_>,
+    candidates: &[BlobId],
+) -> Result<Vec<BlobId>, StoreError> {
+    let mut purged = Vec::new();
+    for blob in candidates {
+        let deleted = tx.execute(
+            "DELETE FROM blobs WHERE id = ?1
+                AND NOT EXISTS (SELECT 1 FROM workdir_blob_refs WHERE blob_id = ?1)",
+            [blob.0.to_string()],
+        )?;
+        if deleted > 0 {
+            purged.push(*blob);
+        }
+    }
+    Ok(purged)
+}
+
+/// Columns [`blob_from_row`] reads, from `blobs`.
+const BLOB_COLUMNS: &str = "id, size, state, got, path,
+    EXISTS (SELECT 1 FROM workdir_blob_refs r WHERE r.blob_id = blobs.id)";
+
 fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
     let state: String = row.get(2)?;
     let got: Option<i64> = row.get(3)?;
@@ -1528,6 +1732,7 @@ fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
         id: BlobId(uuid_col(row, 0)?),
         size: u64::try_from(size).map_err(|e| bad_value(1, Type::Integer, e))?,
         status,
+        workdir: row.get(5)?,
     })
 }
 

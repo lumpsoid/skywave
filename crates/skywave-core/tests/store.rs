@@ -4,15 +4,16 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
+use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     BlobPolicy, BlobStatus, ComposerMode, Core, Draft, OutboxStatus, PairedCredentials, ReadMark,
     RunWhen, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
-    AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, Command, CommandId, CommandKind,
-    CommandResult, ContextId, Decision, DeviceId, DeviceInfo, Event, EventBatch, EventKind,
-    RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind, ToolResult,
-    TurnUsage,
+    AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
+    Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId, DeviceInfo,
+    DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, RejectReason,
+    Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -547,6 +548,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -684,6 +686,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
@@ -746,7 +749,8 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
 
     // A replica from before the table backfills it from the stored log.
     drop_turns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    drop_workdir(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -873,7 +877,8 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_shell(&dir);
     drop_work(&dir);
     drop_turns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    drop_workdir(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -945,6 +950,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
     assert!(!summary(&store, a).archived);
@@ -1032,6 +1038,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
     for expected in before {
@@ -1137,6 +1144,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
@@ -1310,6 +1318,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -2031,6 +2040,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop_contexts(&dir);
     drop_agent(&dir);
     drop_turns(&dir);
+    drop_workdir(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
@@ -2121,7 +2131,8 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_turns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    drop_workdir(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2165,6 +2176,16 @@ fn drop_contexts(dir: &Path) {
 fn drop_turns(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE turns;").unwrap();
+}
+
+/// Undoes the workdir snapshots migration.
+fn drop_workdir(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE workdir_snapshots;
+         DROP TABLE workdir_blob_refs;",
+    )
+    .unwrap();
 }
 
 fn drop_shell(dir: &Path) {
@@ -2583,7 +2604,8 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
         .unwrap();
     }
     drop_turns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    drop_workdir(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -2626,4 +2648,251 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
         "keyed by session and mode"
     );
     assert_eq!(fresh, expected, "as a fresh replica has it");
+}
+
+// ---- workdir answers --------------------------------------------------------
+
+fn diff_blob(size: u64) -> BlobRef {
+    BlobRef {
+        id: BlobId::new(),
+        size,
+    }
+}
+
+fn changes_ask(session: SessionId) -> WorkdirAsk {
+    WorkdirAsk::Changes { session }
+}
+
+fn file_ask(session: SessionId, path: &str) -> WorkdirAsk {
+    WorkdirAsk::File {
+        session,
+        path: path.into(),
+    }
+}
+
+/// A change set with one modified file per blob, each diff that blob.
+fn changes(blobs: &[&BlobRef]) -> WorkdirAnswer {
+    let files = blobs
+        .iter()
+        .enumerate()
+        .map(|(i, blob)| ChangedFile {
+            path: format!("f{i}"),
+            from: None,
+            change: FileChange::Modified,
+            added: Some(1),
+            removed: Some(1),
+            diff: DiffBody::Blob((*blob).clone()),
+        })
+        .collect::<Vec<_>>();
+    WorkdirAnswer::Changes(ChangesResult::Changes(ChangeSet {
+        at: Utc.with_ymd_and_hms(2026, 11, 3, 9, 0, 0).unwrap(),
+        branch: Some("main".into()),
+        head: Some("abc1234".into()),
+        total: u32::try_from(files.len()).unwrap(),
+        files,
+    }))
+}
+
+fn file(path: &str, blob: &BlobRef) -> WorkdirAnswer {
+    WorkdirAnswer::File(FileResult::File {
+        at: Utc.with_ymd_and_hms(2026, 11, 3, 9, 0, 0).unwrap(),
+        path: path.into(),
+        size: blob.size,
+        content: FileBody::Blob(blob.clone()),
+    })
+}
+
+fn put(store: &mut Store, ask: &WorkdirAsk, answer: &WorkdirAnswer) -> (Vec<BlobId>, Vec<BlobId>) {
+    let stored = store
+        .put_workdir(ask, answer)
+        .unwrap()
+        .expect("the session is in the replica");
+    (stored.registered, stored.purged)
+}
+
+#[test]
+fn a_workdir_refresh_replaces_the_answer_and_purges_only_blobs_nothing_names() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let (d1, d2, d3) = (diff_blob(1), diff_blob(2), diff_blob(3));
+
+    let (registered, purged) = put(&mut store, &changes_ask(log.a), &changes(&[&d1, &d2]));
+    assert_eq!(registered, [d1.id, d2.id]);
+    assert!(purged.is_empty());
+    // A file whose content is d2 names it too: known, so not registered.
+    let (registered, _) = put(&mut store, &file_ask(log.a, "f1"), &file("f1", &d2));
+    assert!(
+        registered.is_empty(),
+        "an id already known is not registered"
+    );
+    store
+        .set_blob_status(
+            d2.id,
+            &BlobStatus::Available {
+                path: "/b/d2".into(),
+            },
+        )
+        .unwrap();
+
+    // The refresh drops d1, keeps d2, adds d3.
+    let refreshed = changes(&[&d2, &d3]);
+    let (registered, purged) = put(&mut store, &changes_ask(log.a), &refreshed);
+    assert_eq!(registered, [d3.id]);
+    assert_eq!(purged, [d1.id]);
+    assert_eq!(store.blob(d1.id).unwrap(), None);
+    assert_eq!(
+        store.blob(d2.id).unwrap().unwrap().status,
+        BlobStatus::Available {
+            path: "/b/d2".into()
+        },
+        "a blob the refresh still names stays downloaded"
+    );
+
+    // Dropping d2 from the changes keeps it: the file answer names it.
+    let (_, purged) = put(&mut store, &changes_ask(log.a), &changes(&[&d3]));
+    assert!(purged.is_empty());
+    assert!(store.blob(d2.id).unwrap().is_some());
+    drop(store);
+
+    // Only the latest answer per key, kept over a reopen; workdir blobs are
+    // marked, the event blob is not.
+    let store = Store::open(&dir).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.workdirs.len(), 2);
+    assert_eq!(snapshot.workdirs[&changes_ask(log.a)], changes(&[&d3]));
+    assert_eq!(snapshot.workdirs[&file_ask(log.a, "f1")], file("f1", &d2));
+    let marks: Vec<(BlobId, bool)> = snapshot.blobs.iter().map(|b| (b.id, b.workdir)).collect();
+    let mut expected = vec![(log.blob.id, false), (d2.id, true), (d3.id, true)];
+    expected.sort();
+    assert_eq!(marks, expected, "every blob is listed, workdir ones marked");
+}
+
+#[test]
+fn a_workdir_answer_without_blobs_purges_the_ones_it_replaced() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let d1 = diff_blob(1);
+    put(&mut store, &file_ask(log.a, "x"), &file("x", &d1));
+
+    let gone = WorkdirAnswer::File(FileResult::NotFound);
+    let (registered, purged) = put(&mut store, &file_ask(log.a, "x"), &gone);
+    assert!(registered.is_empty());
+    assert_eq!(purged, [d1.id]);
+    assert_eq!(store.load().unwrap().workdirs[&file_ask(log.a, "x")], gone);
+
+    assert!(matches!(
+        store.put_workdir(&file_ask(log.a, "x"), &changes(&[])),
+        Err(StoreError::WorkdirMismatch)
+    ));
+}
+
+#[test]
+fn two_sessions_on_one_workdir_share_a_blob_and_deleting_one_keeps_it() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let shared = diff_blob(7);
+    let (registered, _) = put(&mut store, &changes_ask(log.a), &changes(&[&shared]));
+    assert_eq!(registered, [shared.id]);
+    let (registered, _) = put(&mut store, &changes_ask(log.b), &changes(&[&shared]));
+    assert!(registered.is_empty(), "the server named the same blob");
+
+    let blobs = store.delete_session_locally(log.a, Utc::now()).unwrap();
+    assert_eq!(
+        blobs,
+        [log.blob.id],
+        "the shared blob is not the caller's to remove"
+    );
+    assert!(store.blob(shared.id).unwrap().unwrap().workdir);
+    let workdirs = store.load().unwrap().workdirs;
+    assert_eq!(workdirs.keys().collect::<Vec<_>>(), [&changes_ask(log.b)]);
+
+    let blobs = store.delete_session_locally(log.b, Utc::now()).unwrap();
+    assert_eq!(blobs, [shared.id]);
+    assert_eq!(store.blob(shared.id).unwrap(), None);
+    assert!(store.load().unwrap().workdirs.is_empty());
+}
+
+#[test]
+fn reset_for_server_clears_workdir_answers() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let d1 = diff_blob(1);
+    put(&mut store, &file_ask(log.b, "x"), &file("x", &d1));
+
+    let mut blobs = store.reset_for_server("other:7443").unwrap();
+    let mut expected = vec![log.blob.id, d1.id];
+    blobs.sort();
+    expected.sort();
+    assert_eq!(blobs, expected);
+    let snapshot = store.load().unwrap();
+    assert!(snapshot.workdirs.is_empty());
+    assert!(snapshot.blobs.is_empty());
+    // No ref is left to mark a later blob of the same id as a workdir one.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let refs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM workdir_blob_refs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(refs, 0);
+}
+
+#[test]
+fn a_workdir_answer_for_a_deleted_or_unknown_session_writes_nothing() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    store.delete_session_locally(log.a, Utc::now()).unwrap();
+    let blob = diff_blob(1);
+
+    for session in [log.a, SessionId::new()] {
+        let written = store
+            .put_workdir(&file_ask(session, "x"), &file("x", &blob))
+            .unwrap();
+        assert_eq!(written, None);
+    }
+    assert!(store.load().unwrap().workdirs.is_empty());
+    assert_eq!(store.blob(blob.id).unwrap(), None, "no blob row either");
+
+    // The same answer for a session still here is written.
+    put(&mut store, &file_ask(log.b, "x"), &file("x", &blob));
+    assert_eq!(store.load().unwrap().workdirs.len(), 1);
+    assert!(store.blob(blob.id).unwrap().unwrap().workdir);
+
+    // After a re-pair, an old server's answer finds no session.
+    store.reset_for_server("other:7443").unwrap();
+    let written = store
+        .put_workdir(&file_ask(log.b, "x"), &file("x", &blob))
+        .unwrap();
+    assert_eq!(written, None);
+    assert!(store.load().unwrap().workdirs.is_empty());
+}
+
+#[test]
+fn the_workdir_migration_keeps_a_populated_replica() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let before = store.load().unwrap();
+    drop(store);
+
+    drop_workdir(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    let mut store = Store::open(&dir).unwrap();
+    let after = store.load().unwrap();
+    assert_eq!(after, before, "nothing else changes");
+    assert!(after.workdirs.is_empty());
+    assert!(after.blobs.iter().all(|b| !b.workdir));
+
+    let d1 = diff_blob(1);
+    let (registered, _) = put(&mut store, &changes_ask(log.a), &changes(&[&d1]));
+    assert_eq!(registered, [d1.id]);
 }
