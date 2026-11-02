@@ -1871,6 +1871,12 @@ fn recovery_reads_every_unfinished_run_with_the_head() {
     let running = f.run_shell(by, session, "sleep 9");
     let running_seq = f.log.head();
     let start = appended(f.shell(started(running)));
+    let start_at = f
+        .log
+        .read(&f.storage.db, Seq(start.0 - 1), 1)
+        .unwrap()
+        .events[0]
+        .at;
     let stop = accepted(f.handle(stop_shell_kind(session, running)));
     appended(f.shell(finished(done, by, ShellEnd::Exited { code: 0 }, None)));
 
@@ -1888,6 +1894,7 @@ fn recovery_reads_every_unfinished_run_with_the_head() {
                 by,
                 stop_seq: None,
                 started_seq: None,
+                started_at: None,
             },
             ShellRun {
                 run: running,
@@ -1898,6 +1905,7 @@ fn recovery_reads_every_unfinished_run_with_the_head() {
                 by,
                 stop_seq: Some(stop),
                 started_seq: Some(start),
+                started_at: Some(start_at),
             },
         ]
     );

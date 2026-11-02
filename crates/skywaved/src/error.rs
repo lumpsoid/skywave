@@ -63,6 +63,8 @@ pub enum Error {
     UnknownSession(skywave_proto::SessionId),
     #[error("agent supervisor: {0}")]
     Supervisor(String),
+    #[error("shell runner: {0}")]
+    Shell(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

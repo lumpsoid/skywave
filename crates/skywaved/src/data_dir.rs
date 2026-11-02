@@ -7,6 +7,7 @@
 //!   ca/          CA key and certificate (see `identity`)
 //!   server/      server key and certificate (see `identity`)
 //!   server_id    the stable ServerId (see `identity`)
+//!   shell/       output of running shell commands (see `shell`)
 //! ```
 //!
 //! Directories are created with mode 0700 on Unix: `ca/` and `server/` hold
@@ -31,6 +32,7 @@ impl DataDir {
             dir.blobs_dir(),
             dir.ca_dir(),
             dir.server_dir(),
+            dir.shell_dir(),
         ] {
             create_private_dir(&path)?;
         }
@@ -56,6 +58,12 @@ impl DataDir {
     pub fn server_dir(&self) -> PathBuf {
         self.root.join("server")
     }
+
+    /// Where a running shell command's output is written until it becomes a
+    /// blob. Private: output can hold secrets.
+    pub fn shell_dir(&self) -> PathBuf {
+        self.root.join("shell")
+    }
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -77,7 +85,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("nested/data");
         let dir = DataDir::create(&root).unwrap();
-        for sub in ["blobs", "ca", "server"] {
+        for sub in ["blobs", "ca", "server", "shell"] {
             assert!(root.join(sub).is_dir(), "{sub} missing");
         }
         assert_eq!(dir.db_path(), root.join("skywave.db"));

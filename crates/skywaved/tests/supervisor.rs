@@ -3156,3 +3156,110 @@ async fn a_context_moved_out_of_an_adopted_session_forks_its_copy() {
         [started_as(forked, FakeConversation::Fork(a))]
     );
 }
+
+/// Shell runs are the shell runner's: the agent never sees one, and a turn
+/// running alongside goes on as if there were none.
+#[tokio::test]
+async fn shell_events_never_reach_the_agent() {
+    let mut f = Fixture::new();
+    f.log = f.log.clone().with_shell(true);
+    let gate = Gate::new();
+    let agent =
+        FakeAgent::new(FakeScript::new().turn([Step::Wait(gate.clone()), Step::text("done")]));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    let working = |k: &EventKind| *k == state(SessionState::AgentWorking);
+    f.wait_count("the turn", 1, working).await;
+
+    // Every shell event, logged mid-turn as the API and the runner would.
+    let by = DeviceId::new();
+    let shell = |f: &mut Fixture, kind| {
+        f.log.shell_event(&mut f.storage.db, kind).unwrap();
+    };
+    let run = CommandId::new();
+    let session_id = f.session_id;
+    accepted(
+        f.log
+            .handle(
+                &mut f.storage.db,
+                by,
+                &Command {
+                    id: run,
+                    kind: CommandKind::RunShell {
+                        session_id,
+                        command: "make".into(),
+                        when: Default::default(),
+                    },
+                },
+            )
+            .unwrap(),
+    );
+    shell(
+        &mut f,
+        EventKind::ShellStarted {
+            run,
+            cwd: "/w".into(),
+        },
+    );
+    shell(
+        &mut f,
+        EventKind::ShellOutput {
+            run,
+            tail: "building".into(),
+            lines: 1,
+            bytes: 9,
+        },
+    );
+    accepted(f.handle(by, CommandKind::StopShell { session_id, run }));
+    shell(
+        &mut f,
+        EventKind::ShellFinished {
+            run,
+            by,
+            started_at: None,
+            command_line: "make".into(),
+            end: skywave_proto::ShellEnd::Stopped,
+            cwd: None,
+            preview: String::new(),
+            lines: 0,
+            output: None,
+            truncated: false,
+        },
+    );
+
+    gate.open();
+    let kinds = f.wait_count("the turn's end", 1, is_idle).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [f.started(false), message("work")]
+    );
+    supervisor.shutdown().await.unwrap();
+    let is_shell = |k: &EventKind| {
+        matches!(
+            k,
+            EventKind::ShellRequested { .. }
+                | EventKind::ShellStarted { .. }
+                | EventKind::ShellOutput { .. }
+                | EventKind::ShellStopRequested { .. }
+                | EventKind::ShellFinished { .. }
+        )
+    };
+    assert_eq!(
+        kinds.iter().filter(|k| is_shell(k)).count(),
+        5,
+        "{kinds:#?}"
+    );
+    let rest: Vec<_> = kinds.iter().filter(|k| !is_shell(k)).collect();
+    assert!(
+        matches!(
+            &rest[..],
+            [
+                EventKind::UserMessage { text, .. },
+                EventKind::SessionStateChanged(SessionState::AgentWorking),
+                EventKind::AgentMessage { text: done, .. },
+                EventKind::SessionStateChanged(SessionState::Idle),
+            ] if text == "work" && done == "done"
+        ),
+        "{rest:#?}"
+    );
+}

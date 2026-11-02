@@ -141,7 +141,7 @@ pub(crate) fn signal(pgid: i32, signal: libc::c_int) {
         let error = std::io::Error::last_os_error();
         // ESRCH: nothing was left in the group.
         if error.raw_os_error() != Some(libc::ESRCH) {
-            tracing::debug!("cannot signal the agent's process group: {error}");
+            tracing::debug!("cannot signal process group {pgid}: {error}");
         }
     }
 }

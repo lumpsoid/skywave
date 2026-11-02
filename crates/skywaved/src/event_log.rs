@@ -129,6 +129,9 @@ pub struct ShellRun {
     pub stop_seq: Option<Seq>,
     /// Seq of its `ShellStarted`; `None` when it never started.
     pub started_seq: Option<Seq>,
+    /// The `at` of its `ShellStarted`, which its `ShellFinished::started_at`
+    /// copies; set exactly when `started_seq` is.
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// The shell runner's starting point ([`EventLog::unfinished_shell_runs`]).
@@ -843,8 +846,9 @@ fn when_from_sql(text: &str) -> Result<RunWhen> {
 /// [`ShellRunSql::from_row`] reads it.
 const SHELL_RUN_SELECT: &str = "SELECT r.command_id, r.session_id, r.seq, r.run_when,
         json_extract(e.kind, '$.command'), json_extract(e.kind, '$.by'),
-        r.stop_seq, r.started_seq, r.finished_seq
-     FROM shell_runs r JOIN events e ON e.seq = r.seq";
+        r.stop_seq, r.started_seq, r.finished_seq, s.at
+     FROM shell_runs r JOIN events e ON e.seq = r.seq
+     LEFT JOIN events s ON s.seq = r.started_seq";
 
 /// A `shell_runs` row's columns before its ids are parsed.
 struct ShellRunSql {
@@ -857,6 +861,7 @@ struct ShellRunSql {
     stop_seq: Option<i64>,
     started_seq: Option<i64>,
     finished_seq: Option<i64>,
+    started_at: Option<String>,
 }
 
 impl ShellRunSql {
@@ -871,6 +876,7 @@ impl ShellRunSql {
             stop_seq: r.get(6)?,
             started_seq: r.get(7)?,
             finished_seq: r.get(8)?,
+            started_at: r.get(9)?,
         })
     }
 
@@ -885,6 +891,7 @@ impl ShellRunSql {
                 by: parse_id(&self.by)?,
                 stop_seq: self.stop_seq.map(seq_from_sql).transpose()?,
                 started_seq: self.started_seq.map(seq_from_sql).transpose()?,
+                started_at: self.started_at.as_deref().map(parse_time).transpose()?,
             },
             finished_seq: self.finished_seq.map(seq_from_sql).transpose()?,
         })

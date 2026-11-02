@@ -15,8 +15,9 @@ server; nothing else names a concrete agent.
  │      ▲ agent adapter           │          │ (ratatui)     (Flutter: desktop,     │
  │ skywaved                       │          │    ▲           Android)              │
  │  - agent supervisor            │◄────────►│    │            ▲ rinf               │
- │  - event log (SQLite)          │ mTLS +   │    │          hub                    │
- │  - device registry / CA        │ own proto│    │            ▲                    │
+ │  - shell runner (sh -c)        │ mTLS +   │    │          hub                    │
+ │  - event log (SQLite)          │ own proto│    │            ▲                    │
+ │  - device registry / CA        │          │    │            │                    │
  └────────────────────────────────┘          │ present: sections, wording, policies │
                                              │    ▲                                 │
                                              │ core: state, sync, outbox, replica   │
@@ -24,6 +25,12 @@ server; nothing else names a concrete agent.
 ```
 
 One server = one account. Many devices = many views of the same data.
+
+The shell runner sits beside the agent supervisor, not under it: each has
+its own thread and database connection and follows the event log. The
+supervisor drives the agent; the runner runs the one-shot shell commands
+devices send (`RunShell`), one at a time per session, and logs their start,
+progress and end (D35). Neither sees the other's events.
 
 Each head is its own device. The head-side logic the TUI and the GUI share
 (timeline sections, neutral wording, draft, read-mark and alert policies)

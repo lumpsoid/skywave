@@ -55,13 +55,20 @@ struct Credentials {
 
 impl Fixture {
     async fn start() -> Fixture {
+        Fixture::start_with_shell(false).await
+    }
+
+    /// [`Fixture::start`] with shell commands on or off.
+    async fn start_with_shell(shell: bool) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
         let storage = Storage::open(tmp.path().join("data")).unwrap();
         let identity =
             Arc::new(ServerIdentity::bootstrap(&storage.dir, &["localhost".into()]).unwrap());
-        let log = EventLog::open(&storage.db, vec![root.clone()]).unwrap();
+        let log = EventLog::open(&storage.db, vec![root.clone()])
+            .unwrap()
+            .with_shell(shell);
         let server = Server::bind(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
@@ -383,6 +390,16 @@ async fn hello_names_the_caller_and_records_last_seen() {
         .unwrap()
         .unwrap();
     assert!(device.last_seen.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_reports_whether_shell_commands_are_on() {
+    for shell in [false, true] {
+        let f = Fixture::start_with_shell(shell).await;
+        let creds = f.pair().await;
+        let hello: HelloResponse = f.client(&creds).await.get(path::HELLO).await.json();
+        assert_eq!(hello.shell, shell);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

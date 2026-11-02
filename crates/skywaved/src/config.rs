@@ -8,9 +8,10 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::error::{Error, IoContext, Result};
+use crate::shell::{DEFAULT_OUTPUT_MAX, DEFAULT_PROGRAM, ShellConfig};
 
 /// Default `listen` address.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
@@ -32,6 +33,8 @@ pub struct Config {
     /// Extra DNS names or IP addresses for the server certificate, on top of
     /// the derived ones (see [`crate::identity::server_names`]).
     pub server_names: Vec<String>,
+    /// Shell commands from devices (`[shell]`); off by default.
+    pub shell: ShellConfig,
 }
 
 /// How to start the agent process.
@@ -55,6 +58,8 @@ struct RawConfig {
     log_file: Option<PathBuf>,
     #[serde(default)]
     server_names: Vec<String>,
+    #[serde(default)]
+    shell: RawShell,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -63,6 +68,60 @@ struct RawAgent {
     command: Option<PathBuf>,
     #[serde(default)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShell {
+    #[serde(default)]
+    enabled: bool,
+    program: Option<PathBuf>,
+    rc: Option<PathBuf>,
+    #[serde(default, deserialize_with = "size")]
+    output_max: Option<u64>,
+}
+
+/// A size as `parse_size` reads it, or a bare integer of bytes.
+fn size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bytes(u64),
+        Text(String),
+    }
+    match Raw::deserialize(deserializer)? {
+        Raw::Bytes(bytes) => Ok(Some(bytes)),
+        Raw::Text(text) => parse_size(&text)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Parses a size such as `"64MiB"`: a whole number, optionally followed by
+/// `B`, `KiB`, `MiB` or `GiB` (binary multiples), spaces allowed between.
+pub fn parse_size(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("size {text:?}: expected a number of bytes, e.g. \"64MiB\""))?;
+    let shift = match unit.trim_start() {
+        "" | "B" => 0,
+        "KiB" => 10,
+        "MiB" => 20,
+        "GiB" => 30,
+        other => {
+            return Err(format!(
+                "size {text:?}: unknown unit {other:?} (use B, KiB, MiB or GiB)"
+            ));
+        }
+    };
+    number
+        .checked_mul(1 << shift)
+        .ok_or_else(|| format!("size {text:?} is too large"))
 }
 
 /// Environment lookups the config depends on; injectable for tests.
@@ -141,6 +200,14 @@ impl Config {
             Some(base) if p.is_relative() => base.join(p),
             _ => p,
         };
+        // A bare name stays bare so it is looked up on PATH.
+        let program = |c: PathBuf| {
+            if c.components().count() > 1 {
+                abs(c)
+            } else {
+                c
+            }
+        };
         let data_dir = match raw.data_dir {
             Some(dir) => abs(dir),
             None => default_data_dir(env)?,
@@ -152,22 +219,26 @@ impl Config {
             data_dir,
             roots: raw.roots.into_iter().map(abs).collect(),
             agent: AgentConfig {
-                // A bare name stays bare so it is looked up on PATH.
                 command: raw
                     .agent
                     .command
-                    .map(|c| {
-                        if c.components().count() > 1 {
-                            abs(c)
-                        } else {
-                            c
-                        }
-                    })
+                    .map(program)
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMMAND)),
                 args: raw.agent.args,
             },
             log_file: raw.log_file.map(abs),
             server_names: raw.server_names,
+            shell: ShellConfig {
+                enabled: raw.shell.enabled,
+                program: raw
+                    .shell
+                    .program
+                    .map(program)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM)),
+                rc: raw.shell.rc.map(abs),
+                output_max: raw.shell.output_max.unwrap_or(DEFAULT_OUTPUT_MAX),
+                ..ShellConfig::default()
+            },
         })
     }
 }
@@ -237,6 +308,12 @@ mod tests {
             [agent]
             command = "bin/claude"
             args = ["--verbose"]
+
+            [shell]
+            enabled = true
+            program = "bin/bash"
+            rc = "shellrc"
+            output_max = "8 KiB"
         "#;
         let c = Config::parse(text, Path::new("/etc/skywave/skywaved.toml"), &env(&[])).unwrap();
         assert_eq!(c.listen, "0.0.0.0:9000".parse().unwrap());
@@ -252,6 +329,48 @@ mod tests {
             Some(Path::new("/var/log/skywaved.log"))
         );
         assert_eq!(c.server_names, ["skywave.example", "10.0.0.7"]);
+        assert!(c.shell.enabled);
+        assert_eq!(c.shell.program, Path::new("/etc/skywave/bin/bash"));
+        assert_eq!(
+            c.shell.rc.as_deref(),
+            Some(Path::new("/etc/skywave/shellrc"))
+        );
+        assert_eq!(c.shell.output_max, 8 * 1024);
+    }
+
+    #[test]
+    fn shell_takes_a_bare_program_and_a_byte_count() {
+        let text = "[shell]\nprogram = \"bash\"\noutput_max = 4096";
+        let e = env(&[("HOME", "/home/u")]);
+        let c = Config::parse(text, Path::new("/etc/skywaved.toml"), &e).unwrap();
+        assert!(!c.shell.enabled);
+        assert_eq!(c.shell.program, Path::new("bash"), "looked up on PATH");
+        assert_eq!(c.shell.output_max, 4096);
+        for bad in [
+            "[shell]\noutput_max = \"64MB\"",
+            "[shell]\noutput_max = \"lots\"",
+            "[shell]\nshell = true",
+        ] {
+            let err = Config::parse(bad, Path::new("/c.toml"), &env(&[])).unwrap_err();
+            assert!(matches!(err, Error::ConfigParse { .. }), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sizes_take_binary_units() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("17"), Ok(17));
+        assert_eq!(parse_size("17B"), Ok(17));
+        assert_eq!(parse_size("2KiB"), Ok(2048));
+        assert_eq!(parse_size(" 64MiB "), Ok(64 << 20));
+        assert_eq!(parse_size("64 MiB"), Ok(64 << 20));
+        assert_eq!(parse_size("3GiB"), Ok(3 << 30));
+        for bad in [
+            "", "MiB", "1.5MiB", "-1", "64MB", "64mib", "1KB", "64 MiB x",
+        ] {
+            assert!(parse_size(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_size("18446744073709551615GiB").is_err(), "overflow");
     }
 
     #[test]
@@ -265,6 +384,11 @@ mod tests {
         assert!(c.agent.args.is_empty());
         assert_eq!(c.log_file, None);
         assert!(c.server_names.is_empty());
+        assert_eq!(c.shell, ShellConfig::default());
+        assert!(!c.shell.enabled);
+        assert_eq!(c.shell.program, Path::new("/bin/sh"));
+        assert_eq!(c.shell.rc, None);
+        assert_eq!(c.shell.output_max, 64 << 20);
     }
 
     #[test]

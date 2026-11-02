@@ -10,6 +10,7 @@ use skywaved::devices::{self, Revoke};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::pairing;
 use skywaved::server::Server;
+use skywaved::shell::ShellRunner;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig};
 
 #[derive(Parser)]
@@ -143,8 +144,9 @@ async fn serve(
     identity: ServerIdentity,
 ) -> skywaved::Result<()> {
     // The one event log of the process: every writer shares it so appends
-    // wake the API's long-polls.
-    let log = EventLog::open(&storage.db, config.roots.clone())?;
+    // wake the API's long-polls. The shell flag is set before any clone:
+    // each clone keeps its own.
+    let log = EventLog::open(&storage.db, config.roots.clone())?.with_shell(config.shell.enabled);
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
     let supervisor = Supervisor::start(
         adapter,
@@ -153,6 +155,10 @@ async fn serve(
         SupervisorConfig::default(),
     )
     .await?;
+    // Always started: disabled, it still settles runs an enabled daemon
+    // left, then ends.
+    let shell =
+        ShellRunner::start(config.data_dir.clone(), log.clone(), config.shell.clone()).await?;
     let server = Server::bind(config.listen, &storage.dir, Arc::new(identity), log).await?;
     tracing::info!(
         addr = %server.local_addr(),
@@ -160,7 +166,9 @@ async fn serve(
         "listening"
     );
     let served = server.serve(shutdown_signal()).await;
+    let shell_stopped = shell.shutdown().await;
     supervisor.shutdown().await?;
+    shell_stopped?;
     served?;
     tracing::info!("stopped");
     Ok(())
