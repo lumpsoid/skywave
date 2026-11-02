@@ -300,7 +300,8 @@ impl<S> Running<S> {
 enum Wake {
     Stop,
     Log,
-    Agent(SessionId, Option<AdapterEvent>),
+    /// Boxed: an event is far larger than the other wakes.
+    Agent(SessionId, Option<Box<AdapterEvent>>),
     Idle,
 }
 
@@ -456,14 +457,14 @@ impl<A: AgentAdapter> Supervisor<A> {
             let wake = tokio::select! {
                 biased;
                 _ = &mut stop => Wake::Stop,
-                (id, event) = next_event(&mut self.running) => Wake::Agent(id, event),
+                (id, event) = next_event(&mut self.running) => Wake::Agent(id, event.map(Box::new)),
                 _ = head.changed() => Wake::Log,
                 () = sleep_until(deadline) => Wake::Idle,
             };
             match wake {
                 Wake::Stop => break,
                 Wake::Log => {}
-                Wake::Agent(id, event) => self.on_agent_event(id, event).await?,
+                Wake::Agent(id, event) => self.on_agent_event(id, event.map(|e| *e)).await?,
                 Wake::Idle => self.stop_idle().await?,
             }
         }

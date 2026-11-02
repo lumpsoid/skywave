@@ -813,6 +813,7 @@ impl Protocol {
                         .get("ambient")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    call: None,
                 })
             })
             .collect();
@@ -838,7 +839,10 @@ impl Protocol {
                 "text" => {
                     let text = str_field(block, "text");
                     if !text.is_empty() {
-                        out.events.push(AdapterEvent::Text(text.to_owned()));
+                        out.events.push(AdapterEvent::Text {
+                            text: text.to_owned(),
+                            parent: None,
+                        });
                     }
                 }
                 "tool_use" => {
@@ -850,6 +854,7 @@ impl Protocol {
                     }
                     out.events.push(AdapterEvent::ToolCall {
                         call: id.map(AgentCallId::from),
+                        parent: None,
                         display: display::call_display(&name, &input),
                         name,
                         input,

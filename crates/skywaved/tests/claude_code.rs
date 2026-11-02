@@ -270,7 +270,7 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
         })
         .map(|event| match event {
             AdapterEvent::TurnStarted => "turn started".to_owned(),
-            AdapterEvent::Text(text) => format!("text: {}", cut(text)),
+            AdapterEvent::Text { text, .. } => format!("text: {}", cut(text)),
             AdapterEvent::ToolCall { name, .. } => format!("tool call: {name}"),
             AdapterEvent::ToolResult { result, .. } => {
                 let kind = if result.is_error { "error" } else { "ok" };
@@ -328,7 +328,7 @@ fn timeline(events: &[AdapterEvent]) -> Vec<String> {
         .filter_map(|event| match event {
             AdapterEvent::TurnStarted => Some("turn started".to_owned()),
             AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
-            AdapterEvent::Text(text) => {
+            AdapterEvent::Text { text, .. } => {
                 Some(format!("text: {}", text.lines().next().unwrap_or("")))
             }
             AdapterEvent::BackgroundTasks(tasks) => {
@@ -1674,7 +1674,10 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn text(text: &str) -> AdapterEvent {
-    AdapterEvent::Text(text.to_owned())
+    AdapterEvent::Text {
+        text: text.to_owned(),
+        parent: None,
+    }
 }
 
 /// The fake CLI's one tool call id.
@@ -1697,6 +1700,7 @@ fn tool_result(output: &str, is_error: bool, status: Option<&str>) -> AdapterEve
 fn write_call() -> AdapterEvent {
     AdapterEvent::ToolCall {
         call: Some(CALL.into()),
+        parent: None,
         name: "Write".to_owned(),
         input: json!({ "file_path": "a.txt", "content": "hi" }),
         display: Some(ToolDisplay {
@@ -3149,7 +3153,7 @@ fn replay_subagent_messages_stay_off_the_main_timeline() {
     let texts: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
-            AdapterEvent::Text(text) => Some(text.as_str()),
+            AdapterEvent::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
