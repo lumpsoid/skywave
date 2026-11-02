@@ -217,6 +217,9 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
         ..
     } = &view.outcome
         && (!preview.is_empty() || output.is_some())
+        // A subagent's row says how it stands (`format::subagent_status`);
+        // its launch result ("Async agent launched") says nothing of that.
+        && (*is_error || view.subagent.is_none())
     {
         out.push(Section {
             text: preview,

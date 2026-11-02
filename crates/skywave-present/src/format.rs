@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use skywave_core::{
-    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, ContextView, Decision, Delivery,
-    DeviceRef, Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, SessionRef, SessionView, TaskId, TaskKind,
+    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView, Decision,
+    Delivery, DeviceRef, Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope,
+    RuleSuggestion, Schedule, SessionRef, SessionView, SubagentStatus, TaskId, TaskKind,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -387,6 +387,8 @@ pub enum StopAction {
     SwitchContext,
     /// Move the current context to a session of its own.
     MoveContext,
+    /// Stop the task a subagent runs.
+    Task,
 }
 
 /// The question a confirmation of `action` asks.
@@ -396,6 +398,7 @@ pub fn stop_heading(action: StopAction) -> &'static str {
         StopAction::NewContext => "Start a new context?",
         StopAction::SwitchContext => "Switch context?",
         StopAction::MoveContext => "Move this context to a new session?",
+        StopAction::Task => "Stop this subagent?",
     }
 }
 
@@ -635,6 +638,39 @@ pub fn viewing_hint(view: &SessionView) -> Option<String> {
     })
 }
 
+/// How a subagent stands, for the row of its `Agent` call and the header of
+/// its view: `running · 14 steps · Write src/sync.rs`, then `finished · 14
+/// steps`. What it did last is said only while it runs.
+pub fn subagent_status(status: &SubagentStatus) -> String {
+    let steps = count(status.steps as usize, "step", "steps");
+    match (&status.last, status.live) {
+        (Some(last), true) => format!("running · {steps} · {last}"),
+        (None, true) => format!("running · {steps}"),
+        (_, false) => format!("finished · {steps}"),
+    }
+}
+
+/// The subagents a view is inside, outermost first, as a breadcrumb:
+/// `outer › inner`. Empty for a subagent the main agent started.
+pub fn trail(trail: &[(CallId, String)]) -> String {
+    let titles: Vec<&str> = trail.iter().map(|(_, title)| title.as_str()).collect();
+    titles.join(TRAIL_SEPARATOR)
+}
+
+/// Between the names of a breadcrumb.
+pub const TRAIL_SEPARATOR: &str = " › ";
+
+/// Where an approval comes from when a subagent asked for it: `from
+/// subagent: Explore`. `shown` is whether the view has the gated call; in
+/// the main view it has not, and the label says where to look.
+pub fn approval_origin(from: &str, shown: bool) -> String {
+    if shown {
+        format!("from subagent: {from}")
+    } else {
+        format!("from subagent: {from} · open it to see the call")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use skywave_core::{
@@ -652,6 +688,55 @@ mod tests {
             parent: None,
             ambient,
         }
+    }
+
+    fn status(live: bool, steps: u32, last: Option<&str>) -> SubagentStatus {
+        SubagentStatus {
+            task: None,
+            live,
+            steps,
+            last: last.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_subagent_status_says_running_with_what_it_did_last_then_finished() {
+        assert_eq!(
+            subagent_status(&status(true, 14, Some("Write src/sync.rs"))),
+            "running · 14 steps · Write src/sync.rs"
+        );
+        assert_eq!(
+            subagent_status(&status(true, 3, Some("Read a.rs"))),
+            "running · 3 steps · Read a.rs"
+        );
+        assert_eq!(subagent_status(&status(true, 1, None)), "running · 1 step");
+        assert_eq!(subagent_status(&status(true, 0, None)), "running · 0 steps");
+        assert_eq!(
+            subagent_status(&status(false, 14, Some("Write src/sync.rs"))),
+            "finished · 14 steps"
+        );
+        assert_eq!(
+            subagent_status(&status(false, 3, None)),
+            "finished · 3 steps"
+        );
+    }
+
+    #[test]
+    fn a_trail_joins_the_outer_subagents_and_is_empty_for_a_direct_one() {
+        assert_eq!(trail(&[]), "");
+        let outer = (CallId::new(), "Explore".to_owned());
+        let middle = (CallId::new(), "Plan".to_owned());
+        assert_eq!(trail(std::slice::from_ref(&outer)), "Explore");
+        assert_eq!(trail(&[outer, middle]), "Explore › Plan");
+    }
+
+    #[test]
+    fn an_approval_from_a_subagent_says_where_to_look_when_its_call_is_not_shown() {
+        assert_eq!(approval_origin("Explore", true), "from subagent: Explore");
+        assert_eq!(
+            approval_origin("Explore", false),
+            "from subagent: Explore · open it to see the call"
+        );
     }
 
     fn schedule(outlives_agent: Option<bool>) -> Schedule {

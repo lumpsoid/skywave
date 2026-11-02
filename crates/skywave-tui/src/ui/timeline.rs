@@ -24,7 +24,8 @@ use skywave_core::{
 use skywave_present::format::{
     adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes, context_moved_line,
     context_started_line, context_switched_line, decision_label, delivery_label, dollars,
-    fail_reason, moved_from_line, outgoing_label, percent, seconds, took_label, turn_time,
+    fail_reason, moved_from_line, outgoing_label, percent, seconds, subagent_status, took_label,
+    turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -62,6 +63,7 @@ pub(super) fn item_lines(
     wall: SystemTime,
 ) -> (Vec<Vec<Line<'static>>>, Option<(usize, usize)>) {
     let current_line = ui
+        .shown
         .search
         .as_ref()
         .and_then(|search| search.current_line(session));
@@ -71,8 +73,9 @@ pub(super) fn item_lines(
         width: width.max(TITLE + MIN_TITLE),
         wall_ms: wall_ms(wall),
         rule: rule_index(session),
-        search: ui.search.as_ref(),
+        search: ui.shown.search.as_ref(),
         current: ui
+            .shown
             .search
             .as_ref()
             .and_then(|search| find(session, search.current?)),
@@ -199,14 +202,15 @@ impl Layout<'_> {
             out.push(Line::from("─".repeat(self.width)).dark_gray());
         }
         let key = selectable(item);
-        let selected = self.focused && key.is_some() && key == self.ui.selected;
+        let selected = self.focused && key.is_some() && key == self.ui.shown.selected;
         let mark = self.search.and_then(|search| {
             search.hit(index).map(|_| Mark {
                 query: &search.query,
                 current: self.current == Some(index),
             })
         });
-        let expanded = matches!(key, Some(ItemKey::Logged(seq)) if self.ui.expanded.contains(&seq));
+        let expanded =
+            matches!(key, Some(ItemKey::Logged(seq)) if self.ui.shown.expanded.contains(&seq));
         let marker = if selected {
             Span::raw("> ").bold().reversed()
         } else {
@@ -964,6 +968,26 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
+    // The subagent's own state, not the launch's: a background subagent's
+    // call is done long before it ends.
+    if let Some(status) = &view.subagent
+        && matches!(
+            view.outcome,
+            ToolOutcome::Running { .. }
+                | ToolOutcome::Done {
+                    is_error: false,
+                    ..
+                }
+        )
+        && approval != Some(&ApprovalStatus::Pending)
+    {
+        let style = if status.live {
+            Style::new().cyan()
+        } else {
+            Style::new().green()
+        };
+        return (subagent_status(status), style);
+    }
     match &view.outcome {
         ToolOutcome::Running { .. } if approval == Some(&ApprovalStatus::Pending) => {
             ("needs approval".to_owned(), Style::new().yellow().bold())

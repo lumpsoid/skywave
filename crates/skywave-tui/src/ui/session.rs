@@ -15,10 +15,11 @@ use skywave_core::{
     RuleSuggestion, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
-    AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, agent_effort_label,
-    agent_mode_label, agent_model_label, agent_refusal, answer_words, background_rows, blob_size,
-    bytes, context_moved_label, context_row, delivery_label, dollars, effort_label, mode_detail,
-    mode_label, outgoing_label, repeat_word, stop_heading, stop_warning, task_kind_word, tokens,
+    AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
+    TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, agent_refusal,
+    answer_words, approval_origin, background_rows, blob_size, bytes, context_moved_label,
+    context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, outgoing_label,
+    repeat_word, stop_heading, stop_warning, subagent_status, task_kind_word, tokens, trail,
     turn_time, viewing_hint, work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -28,7 +29,7 @@ use super::timeline::{
     title_spans,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
-use crate::app::{App, Focus, Geometry, Picker, SessionUi};
+use crate::app::{App, Focus, Geometry, Picker, SessionUi, StopKind};
 
 /// Most composer rows on screen; longer drafts scroll.
 const COMPOSER_ROWS: usize = 6;
@@ -45,6 +46,18 @@ pub(super) fn render(
     wall: SystemTime,
 ) {
     let mut title = vec![Span::raw(format!(" {}", clean(&session.title))).bold()];
+    if let Some(subagent) = &session.subagent {
+        let path = [trail(&subagent.trail), subagent.title.clone()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(TRAIL_SEPARATOR);
+        title.push(
+            Span::raw(format!("{TRAIL_SEPARATOR}{} ", clean(&path)))
+                .cyan()
+                .bold(),
+        );
+    }
     title.extend(rename_badge(session.rename.as_ref()));
     if let Some(workdir) = &session.workdir {
         title.push(Span::raw(format!(" · {}", clean(workdir))).dark_gray());
@@ -106,13 +119,24 @@ pub(super) fn render(
 /// The agent's state and what is on its way, then what the session takes,
 /// right-aligned in `width` columns.
 fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'static> {
-    let mut spans = vec![match &session.state {
+    let mut spans = Vec::new();
+    // In a subagent's view, how it stands comes first, then what its keys do.
+    if let Some(subagent) = &session.subagent {
+        spans.push(Span::raw(clean(&subagent_status(&subagent.status))).cyan());
+        let stop = if subagent.status.task.is_some() && subagent.status.live {
+            " · S stops it"
+        } else {
+            ""
+        };
+        spans.push(Span::raw(format!("{stop} · Esc leaves · ")).dark_gray());
+    }
+    spans.push(match &session.state {
         SessionState::Idle => Span::raw("agent idle").green(),
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
         SessionState::AwaitingApproval(_) => Span::raw("agent waiting for an approval").yellow(),
         SessionState::Errored(info) => Span::raw(format!("agent error: {}", info.message)).red(),
         SessionState::Stopped => Span::raw("agent stopped · a message restarts it").dark_gray(),
-    }];
+    });
     // The mode and model once the agent said them or one was asked for,
     // then what it refused, until the next switch.
     let agent = &session.agent;
@@ -170,7 +194,7 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         spans.push(Span::raw(" · scrolled back, End follows").dark_gray());
     }
     // While the prompt is open, the footer shows it instead.
-    if let Some(search) = ui.search.as_ref().filter(|s| !s.editing) {
+    if let Some(search) = ui.shown.search.as_ref().filter(|s| !s.editing) {
         spans.push(Span::raw(format!(" · {}", search.status(session))).yellow());
         if search.wrapped {
             spans.push(Span::raw(" · search wrapped").yellow().bold());
@@ -252,26 +276,27 @@ fn render_timeline(
         starts,
         total,
         height: area.height as usize,
-        top: ui.geometry.borrow().top,
+        top: ui.shown.geometry.borrow().top,
         rule,
         matched,
-        reveal: ui.reveal,
+        reveal: ui.shown.reveal,
     };
     // While the opening is not settled, show the scroll state it will
     // settle on, from this frame's layout; likewise the one that shows a
     // search match in a blob, while that waits; and following, while the
     // item `v` revealed waits, if it fits at the bottom.
     let pinned = ui
+        .shown
         .search
         .as_ref()
         .filter(|search| search.pin)
         .and_then(|search| geometry.match_scroll(search.current?));
-    let scroll = if ui.opening {
+    let scroll = if ui.shown.opening {
         geometry.opening()
-    } else if ui.reveal.is_some() {
-        pinned.unwrap_or(geometry.follow_at_bottom(ui.scroll))
+    } else if ui.shown.reveal.is_some() {
+        pinned.unwrap_or(geometry.follow_at_bottom(ui.shown.scroll))
     } else {
-        pinned.unwrap_or(ui.scroll)
+        pinned.unwrap_or(ui.shown.scroll)
     };
     let top = geometry.top(scroll);
     geometry.top = top;
@@ -290,7 +315,7 @@ fn render_timeline(
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
-    *ui.geometry.borrow_mut() = geometry;
+    *ui.shown.geometry.borrow_mut() = geometry;
 }
 
 /// The prompt above the composer while the agent is blocked: the call it
@@ -306,6 +331,7 @@ fn approval_lines(
     width: usize,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
+    let shown = gated_item(session).is_some();
     let (mut lines, content) = match gated_item(session) {
         Some((
             _,
@@ -340,6 +366,9 @@ fn approval_lines(
             (lines, content)
         }
     };
+    if let Some(from) = &prompt.from {
+        lines.insert(0, Line::from(clean(&approval_origin(from, shown))).yellow());
+    }
     if let Some(selected) = pick {
         lines.extend(rule_list(&prompt.suggestions, selected, max_rows));
         lines.push(
@@ -620,6 +649,22 @@ fn render_picker(
                 None,
             )
         }
+        Picker::Stop(StopKind::Task(id)) => {
+            let title = session
+                .subagent
+                .as_ref()
+                .filter(|s| s.status.task.as_ref() == Some(id))
+                .map(|s| clean(&s.title))
+                .unwrap_or_default();
+            let lines = vec![
+                Line::from(format!("{} {title}", stop_heading(StopAction::Task))).bold(),
+                Line::from("Its work ends; the main agent goes on.").yellow(),
+                Line::from("y stops it · any other key back")
+                    .yellow()
+                    .bold(),
+            ];
+            (" Subagent ".to_owned(), lines, None)
+        }
         Picker::Stop(kind) => {
             let mut lines = vec![Line::from(stop_heading(kind.stop_action())).bold()];
             if let Some(warning) = stop_warning(&session.work) {
@@ -778,6 +823,12 @@ fn capitalised(text: &str) -> String {
 fn render_composer(frame: &mut Frame, area: Rect, app: &App, ui: &SessionUi) {
     let focused = ui.focus == Focus::Composer;
     let mut title = " Message ".to_owned();
+    if app
+        .session()
+        .is_some_and(|(view, _)| view.subagent.is_some())
+    {
+        title.push_str("· to the main agent ");
+    }
     if matches!(app.view().link, Link::Reconnecting { .. }) {
         title.push_str("· offline, sends when back online ");
     }

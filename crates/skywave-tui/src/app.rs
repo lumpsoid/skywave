@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, Completion, ContextId, CoreError,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, CallId, Completion, ContextId, CoreError,
     Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
     Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView, TaskId,
     TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
@@ -335,14 +335,12 @@ impl Geometry {
 pub struct SessionUi {
     pub id: SessionId,
     pub focus: Focus,
-    /// Where the user scrolled back to; `None` follows the newest item. New
-    /// items never move a pinned view.
-    pub scroll: Option<Anchor>,
-    /// The selected item, by key so it stays put as items arrive.
-    pub selected: Option<ItemKey>,
-    /// Items whose full content is shown; only logged items expand.
-    pub expanded: HashSet<Seq>,
-    pub geometry: RefCell<Geometry>,
+    /// What the timeline shows and where the user is in it; fresh whenever
+    /// the shown subagent changes ([`SessionUi::show`]).
+    pub shown: ViewUi,
+    /// The Agent call of the subagent [`SessionUi::shown`] belongs to;
+    /// `None` for the main view.
+    subagent: Option<CallId>,
     /// The message being written. Filled from the core's draft (D5: per
     /// device) when the session opens, and again only when the core
     /// rewrites the draft itself (`draft_rev`, e.g. a queued message taken
@@ -352,23 +350,55 @@ pub struct SessionUi {
     saver: DraftSaver,
     /// Earlier prompts being recalled into the composer; any edit ends it.
     history: PromptHistory<Composer>,
+    /// When what is seen is marked read ([`App::read_mark`]).
+    marker: ReadMarker,
+    /// The list of rules `A` opened in the approval prompt; see
+    /// [`SessionUi::rule_pick`].
+    rule_pick: Option<RulePick>,
+    /// The mode or model list `p`/`m` opened, while it is up.
+    pub picker: Option<Picker>,
+}
+
+/// The presentation state that belongs to one view of the session, the main
+/// one or a subagent's: [`SessionUi`] starts it afresh when the view changes,
+/// and keeps what belongs to the session (composer, draft, history, read
+/// mark, pickers).
+#[derive(Debug, Clone)]
+pub struct ViewUi {
+    /// Where the user scrolled back to; `None` follows the newest item. New
+    /// items never move a pinned view.
+    pub scroll: Option<Anchor>,
+    /// The selected item, by key so it stays put as items arrive.
+    pub selected: Option<ItemKey>,
+    /// Items whose full content is shown; only logged items expand.
+    pub expanded: HashSet<Seq>,
+    pub geometry: RefCell<Geometry>,
     /// The session opened with news and where to scroll is not settled: it
     /// needs the first frame's geometry ([`Geometry::opening`]). Until then
     /// the renderer shows that scroll state itself and nothing is read.
     pub opening: bool,
-    /// When what is seen is marked read ([`App::read_mark`]).
-    marker: ReadMarker,
     /// The search through the timeline (`/`), while one is open or kept.
     pub search: Option<Search>,
     /// The item `v` revealed, scrolled to its top, while that waits for a
     /// frame to lay it out expanded: if it then fits at the bottom, the
     /// timeline keeps following ([`Geometry::follow_at_bottom`]).
     pub reveal: Option<ItemKey>,
-    /// The list of rules `A` opened in the approval prompt; see
-    /// [`SessionUi::rule_pick`].
-    rule_pick: Option<RulePick>,
-    /// The mode or model list `p`/`m` opened, while it is up.
-    pub picker: Option<Picker>,
+}
+
+impl ViewUi {
+    /// `opening`: the session opened with news ([`SessionView::unread_from`])
+    /// and shows the main view.
+    fn new(opening: bool) -> ViewUi {
+        ViewUi {
+            scroll: None,
+            selected: None,
+            expanded: HashSet::new(),
+            geometry: RefCell::default(),
+            opening,
+            search: None,
+            reveal: None,
+        }
+    }
 }
 
 /// The rules an approval offers, listed to grant one: which approval, and
@@ -418,7 +448,7 @@ pub enum Picker {
 }
 
 /// What waits for `y` in [`Picker::Stop`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKind {
     /// Stop agent.
     Session,
@@ -428,16 +458,19 @@ pub enum StopKind {
     Switch(ContextId),
     /// Move this context, the current one, to a session of its own.
     Move(ContextId),
+    /// End the task a subagent runs, from its view.
+    Task(TaskId),
 }
 
 impl StopKind {
     /// Which action this is, for the wording shared with the other head.
-    pub fn stop_action(self) -> StopAction {
+    pub fn stop_action(&self) -> StopAction {
         match self {
             StopKind::Session => StopAction::Agent,
             StopKind::Clear => StopAction::NewContext,
             StopKind::Switch(_) => StopAction::SwitchContext,
             StopKind::Move(_) => StopAction::MoveContext,
+            StopKind::Task(_) => StopAction::Task,
         }
     }
 
@@ -453,6 +486,7 @@ impl StopKind {
                 session_id,
                 context,
             },
+            StopKind::Task(task) => Action::StopTask { session_id, task },
         }
     }
 }
@@ -642,7 +676,9 @@ impl Picker {
             },
             // y/N, as the mode picker asks: only `y` stops.
             Picker::Stop(kind) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => (true, Some(kind.action(session_id))),
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    (true, Some(kind.clone().action(session_id)))
+                }
                 _ => (true, None),
             },
             Picker::Background {
@@ -668,6 +704,17 @@ impl Picker {
                         *selected = (*selected + 1).min(last);
                         (false, None)
                     }
+                    // A subagent's task opens its timeline.
+                    KeyCode::Char('o') => match rows.get(*selected) {
+                        Some(BackgroundRow::Task(task, _)) if task.call.is_some() => (
+                            true,
+                            Some(Action::ViewSubagent {
+                                session_id,
+                                call: task.call,
+                            }),
+                        ),
+                        _ => (false, None),
+                    },
                     // A loop only informs; the agent ends it when asked.
                     KeyCode::Enter => {
                         if let Some(BackgroundRow::Task(task, _)) = rows.get(*selected) {
@@ -840,19 +887,39 @@ impl SessionUi {
         SessionUi {
             id: view.id,
             focus: Focus::Composer,
-            scroll: None,
-            selected: None,
-            expanded: HashSet::new(),
-            geometry: RefCell::default(),
+            shown: ViewUi::new(view.unread_from.is_some() && view.subagent.is_none()),
+            subagent: view.subagent.as_ref().map(|s| s.call),
             composer: composer_of(view),
             saver: DraftSaver::new(view),
             history: PromptHistory::new(),
-            opening: view.unread_from.is_some(),
             marker: ReadMarker::new(view.id),
-            search: None,
-            reveal: None,
             rule_pick: None,
             picker: None,
+        }
+    }
+
+    /// Starts the view state afresh when `view` shows another subagent than
+    /// before; the rest of the session's state stays. Stepping out to the
+    /// view the `Agent` call is in selects that row and scrolls to it.
+    fn show(&mut self, view: &SessionView) {
+        let call = view.subagent.as_ref().map(|s| s.call);
+        if call == self.subagent {
+            return;
+        }
+        let left = std::mem::replace(&mut self.subagent, call);
+        self.shown = ViewUi::new(false);
+        let row = left.and_then(|left| {
+            view.timeline.iter().find(|item| {
+                matches!(item, TimelineItem::Logged { entry: Entry::Tool(tool), .. } if tool.call == left)
+            })
+        });
+        if let Some(item) = row {
+            self.shown.selected = selectable(item);
+            self.shown.scroll = Some(Anchor {
+                key: ItemKey::of(item),
+                offset: 0,
+            });
+            self.shown.reveal = Some(ItemKey::of(item));
         }
     }
 
@@ -929,8 +996,8 @@ impl SessionUi {
     /// opening will settle on; while a search match waits to be scrolled
     /// to ([`Search::pin`]), the one that shows it.
     pub fn shown_scroll(&self) -> Option<Anchor> {
-        if self.opening {
-            self.geometry.borrow().opening()
+        if self.shown.opening {
+            self.shown.geometry.borrow().opening()
         } else {
             self.pinned_scroll()
                 .unwrap_or_else(|| self.revealed_scroll())
@@ -940,51 +1007,51 @@ impl SessionUi {
     /// The scroll state, settled to following if the last frame laid out
     /// the item `v` revealed and it fits at the bottom.
     fn revealed_scroll(&self) -> Option<Anchor> {
-        let geometry = self.geometry.borrow();
-        if self.reveal.is_some() && geometry.reveal == self.reveal {
-            geometry.follow_at_bottom(self.scroll)
+        let geometry = self.shown.geometry.borrow();
+        if self.shown.reveal.is_some() && geometry.reveal == self.shown.reveal {
+            geometry.follow_at_bottom(self.shown.scroll)
         } else {
-            self.scroll
+            self.shown.scroll
         }
     }
 
     /// While [`Search::pin`]: the scroll state that shows the current
     /// match's line in its blob, if the last frame laid it out.
     pub fn pinned_scroll(&self) -> Option<Option<Anchor>> {
-        let search = self.search.as_ref().filter(|s| s.pin)?;
-        self.geometry.borrow().match_scroll(search.current?)
+        let search = self.shown.search.as_ref().filter(|s| s.pin)?;
+        self.shown.geometry.borrow().match_scroll(search.current?)
     }
 
     /// Applies the opening scroll, or the one showing a search match in a
     /// blob, once a frame has laid the timeline out.
     fn settle(&mut self) {
-        if self.geometry.borrow().height == 0 {
+        if self.shown.geometry.borrow().height == 0 {
             return;
         }
-        if self.opening {
-            self.scroll = self.geometry.borrow().opening();
-            self.opening = false;
+        if self.shown.opening {
+            self.shown.scroll = self.shown.geometry.borrow().opening();
+            self.shown.opening = false;
         }
-        if self.search.as_ref().is_some_and(|s| s.pin) {
+        if self.shown.search.as_ref().is_some_and(|s| s.pin) {
             // Not laid out (cut by the file's end, say): the item's top.
             if let Some(scroll) = self.pinned_scroll() {
-                self.scroll = scroll;
+                self.shown.scroll = scroll;
             }
-            if let Some(search) = &mut self.search {
+            if let Some(search) = &mut self.shown.search {
                 search.pin = false;
             }
         }
-        if self.reveal.is_some() && self.geometry.borrow().reveal == self.reveal {
-            self.scroll = self.revealed_scroll();
-            self.reveal = None;
-            self.geometry.borrow_mut().reveal = None;
+        if self.shown.reveal.is_some() && self.shown.geometry.borrow().reveal == self.shown.reveal {
+            self.shown.scroll = self.revealed_scroll();
+            self.shown.reveal = None;
+            self.shown.geometry.borrow_mut().reveal = None;
         }
     }
 
     /// The newest item is on screen and the opening scroll settled: what
     /// reaches the session is seen.
     fn following(&self) -> bool {
-        !self.opening && self.scroll.is_none()
+        !self.shown.opening && self.shown.scroll.is_none()
     }
 
     /// While browsing earlier prompts: the shown one's place, 1 the newest,
@@ -1156,10 +1223,10 @@ impl App {
             .and_then(|list| self.selected_index(list));
         let old_item = self
             .session()
-            .and_then(|(view, ui)| find(view, ui.selected?));
+            .and_then(|(view, ui)| find(view, ui.shown.selected?));
         let old_match = self
             .session()
-            .and_then(|(view, ui)| find(view, ui.search.as_ref()?.current?));
+            .and_then(|(view, ui)| find(view, ui.shown.search.as_ref()?.current?));
         self.view = view;
         if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.prompt, &self.view.screen)
             && create.asks_workdir()
@@ -1178,7 +1245,7 @@ impl App {
             session.keep_selection(view, old_item);
             session.keep_scroll(view);
             session.follow_draft(view);
-            if let Some(search) = &mut session.search {
+            if let Some(search) = &mut session.shown.search {
                 search.refresh(view, old_match);
             }
         }
@@ -1195,6 +1262,8 @@ impl App {
                         ui.focus = Focus::Timeline;
                     }
                     self.ui.session = Some(ui);
+                } else if let Some(ui) = &mut self.ui.session {
+                    ui.show(session);
                 }
             }
             _ => self.ui.session = None,
@@ -1371,7 +1440,8 @@ impl App {
         };
         let session = self.ui.session.as_mut().filter(|s| s.id == view.id)?;
         session.settle();
-        let following = session.following();
+        // The main view's news is not read from a subagent's.
+        let following = session.following() && view.subagent.is_none();
         session.marker.mark(now, view.last_seq, following, force)
     }
 
@@ -1379,11 +1449,12 @@ impl App {
     /// unforced; `None` while there is nothing to mark.
     pub fn read_mark_due_in(&self, now: Instant) -> Option<Duration> {
         let (view, ui) = self.session()?;
-        if ui.opening {
+        if ui.shown.opening {
             // Settles as soon as a frame was drawn.
-            return (ui.geometry.borrow().height > 0).then_some(Duration::ZERO);
+            return (ui.shown.geometry.borrow().height > 0).then_some(Duration::ZERO);
         }
-        let wake = ui.marker.next_wake(now, view.last_seq, ui.following())?;
+        let following = ui.following() && view.subagent.is_none();
+        let wake = ui.marker.next_wake(now, view.last_seq, following)?;
         Some(wake.saturating_duration_since(now))
     }
 
@@ -1466,7 +1537,8 @@ impl App {
                 Screen::Session(_) => self.ui.session.as_ref().is_some_and(|s| match &s.picker {
                     Some(picker) => matches!(picker, Picker::Model { .. }),
                     None => {
-                        s.focus == Focus::Composer || s.search.as_ref().is_some_and(|s| s.editing)
+                        s.focus == Focus::Composer
+                            || s.shown.search.as_ref().is_some_and(|s| s.editing)
                     }
                 }),
                 _ => false,
@@ -1496,7 +1568,7 @@ impl App {
             return;
         }
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session)
-            && let Some(search) = session.search.as_mut().filter(|s| s.editing)
+            && let Some(search) = session.shown.search.as_mut().filter(|s| s.editing)
         {
             search.edit(view, |query| {
                 query.extend(text.chars().map(|c| if c == '\n' { ' ' } else { c }));
@@ -1884,7 +1956,7 @@ impl App {
         // Keys move from where the opening scrolled to.
         session.settle();
         // Not laid out yet: the revealed item stays at the top.
-        session.reveal = None;
+        session.shown.reveal = None;
         if let Some(picker) = &mut session.picker {
             let (close, action) = picker.key(view, key, ctrl);
             if close {
@@ -1892,7 +1964,7 @@ impl App {
             }
             return action;
         }
-        if let Some(search) = &mut session.search {
+        if let Some(search) = &mut session.shown.search {
             search.search.wrapped = false;
             if search.editing {
                 session.search_key(view, key, ctrl);
@@ -1976,8 +2048,8 @@ impl App {
             }
             Focus::Timeline => match key.code {
                 // A kept search goes first; the next Esc leaves.
-                KeyCode::Esc if session.search.is_some() => {
-                    session.search = None;
+                KeyCode::Esc if session.shown.search.is_some() => {
+                    session.shown.search = None;
                     None
                 }
                 // Back to the list the session is on (the core knows which).
@@ -2011,7 +2083,7 @@ impl App {
                     None
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
-                    session.scroll = session.geometry.borrow().pin(0);
+                    session.shown.scroll = session.shown.geometry.borrow().pin(0);
                     None
                 }
                 KeyCode::Char('[') => {
@@ -2023,16 +2095,17 @@ impl App {
                     None
                 }
                 KeyCode::End | KeyCode::Char('G') => {
-                    session.scroll = None;
+                    session.shown.scroll = None;
                     None
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => session.toggle(view),
+                KeyCode::Char('o') => session.open_subagent(view),
                 KeyCode::Char('d') => session
                     .selected_entry(view)
                     .and_then(wanted_blob)
                     .map(|blob| Action::DownloadBlob(blob.id)),
                 KeyCode::Char(c @ ('y' | 'Y')) => {
-                    let item = session.selected.and_then(|key| find(view, key));
+                    let item = session.shown.selected.and_then(|key| find(view, key));
                     let item = item.map(|index| &view.timeline[index]);
                     let content = if c == 'y' {
                         item.and_then(main_content)
@@ -2044,10 +2117,10 @@ impl App {
                 // Only what the core marks discardable; anything else (it
                 // may have reached the server) is left alone.
                 KeyCode::Char('e') => {
-                    discardable(view, session.selected).map(|(id, _)| Action::EditQueued(id))
+                    discardable(view, session.shown.selected).map(|(id, _)| Action::EditQueued(id))
                 }
                 KeyCode::Delete => {
-                    discardable(view, session.selected).map(|(id, _)| Action::Discard(id))
+                    discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))
                 }
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
@@ -2058,6 +2131,17 @@ impl App {
                     None
                 }
                 // Shifted, so a stray key does not end the agent's run.
+                // In a subagent's view it stops that subagent's task instead,
+                // always asking: it ends one thing, not the run. A foreground
+                // subagent has no task to stop; Ctrl-X ends it with the turn.
+                KeyCode::Char('S') if view.subagent.is_some() => {
+                    let task = view
+                        .subagent
+                        .as_ref()
+                        .and_then(|s| s.status.task.clone().filter(|_| s.status.live));
+                    session.picker = task.map(|task| Picker::Stop(StopKind::Task(task)));
+                    None
+                }
                 KeyCode::Char('S') => {
                     if stop_needs_confirmation(&view.work) {
                         session.picker = Some(Picker::Stop(StopKind::Session));
@@ -2132,9 +2216,9 @@ impl SessionUi {
     /// Scrolls a page back (`up`) or forward; reaching the bottom follows
     /// again.
     fn page(&mut self, up: bool) {
-        let geometry = self.geometry.borrow();
+        let geometry = self.shown.geometry.borrow();
         let page = geometry.height.saturating_sub(1).max(1);
-        let top = geometry.top(self.scroll);
+        let top = geometry.top(self.shown.scroll);
         let top = if up {
             top.saturating_sub(page)
         } else {
@@ -2142,7 +2226,7 @@ impl SessionUi {
         };
         let scroll = geometry.pin(top);
         drop(geometry);
-        self.scroll = scroll;
+        self.shown.scroll = scroll;
     }
 
     /// Moves the selection to the previous (`up`) or next selectable item
@@ -2158,6 +2242,7 @@ impl SessionUi {
             return;
         };
         let current = self
+            .shown
             .selected
             .and_then(|key| items.iter().position(|(_, k)| *k == key));
         let (index, key) = match (current, up) {
@@ -2165,7 +2250,7 @@ impl SessionUi {
             (Some(i), true) => items[i.saturating_sub(1)],
             (Some(i), false) => items[(i + 1).min(items.len() - 1)],
         };
-        self.selected = Some(key);
+        self.shown.selected = Some(key);
         self.reveal(index);
     }
 
@@ -2174,7 +2259,7 @@ impl SessionUi {
     /// selectable item at its old index `old`, else the one before, so the
     /// cursor does not jump.
     fn keep_selection(&mut self, view: &SessionView, old: Option<usize>) {
-        let Some(key) = self.selected else {
+        let Some(key) = self.shown.selected else {
             return;
         };
         let index = find(view, key).or_else(|| {
@@ -2183,7 +2268,7 @@ impl SessionUi {
                 (old..view.timeline.len()).find(|&i| selectable(&view.timeline[i]).is_some());
             after.or_else(|| (0..old).rfind(|&i| selectable(&view.timeline[i]).is_some()))
         });
-        self.selected = index.and_then(|i| selectable(&view.timeline[i]));
+        self.shown.selected = index.and_then(|i| selectable(&view.timeline[i]));
     }
 
     /// Keeps the scroll anchor on its item as the timeline changes: on a
@@ -2191,7 +2276,7 @@ impl SessionUi {
     /// at the same offset, so the view stays put. An anchor whose item is
     /// gone stays, for the renderer to fall back from.
     fn keep_scroll(&mut self, view: &SessionView) {
-        if let Some(anchor) = &mut self.scroll
+        if let Some(anchor) = &mut self.shown.scroll
             && let Some(index) = find(view, anchor.key)
         {
             anchor.key = ItemKey::of(&view.timeline[index]);
@@ -2201,11 +2286,11 @@ impl SessionUi {
     /// Scrolls so the timeline item at `index` is on screen, its top first
     /// if it does not fit.
     fn reveal(&mut self, index: usize) {
-        let geometry = self.geometry.borrow();
+        let geometry = self.shown.geometry.borrow();
         let Some((start, end)) = geometry.item(index) else {
             return;
         };
-        let top = geometry.top(self.scroll);
+        let top = geometry.top(self.shown.scroll);
         let top = if start < top || end - start > geometry.height {
             start
         } else if end > top + geometry.height {
@@ -2215,15 +2300,16 @@ impl SessionUi {
         };
         let scroll = geometry.pin(top);
         drop(geometry);
-        self.scroll = scroll;
+        self.shown.scroll = scroll;
     }
 
     /// Moves to the start of the previous (`back`) or next turn: its first
     /// line goes to the top and its first selectable item is selected.
     /// Steps from the selected item, else from the top of the screen.
     fn step_turn(&mut self, view: &SessionView, back: bool) {
-        let geometry = self.geometry.borrow();
+        let geometry = self.shown.geometry.borrow();
         let current = self
+            .shown
             .selected
             .and_then(|key| {
                 view.timeline
@@ -2266,9 +2352,9 @@ impl SessionUi {
         };
         let scroll = geometry.pin(line);
         drop(geometry);
-        self.scroll = scroll;
+        self.shown.scroll = scroll;
         if let Some(first) = first_selectable(target) {
-            self.selected = selectable(&view.timeline[first]);
+            self.shown.selected = selectable(&view.timeline[first]);
         }
     }
 
@@ -2282,20 +2368,20 @@ impl SessionUi {
         let Some(key @ ItemKey::Logged(seq)) = selectable(item) else {
             return;
         };
-        self.selected = Some(key);
-        self.expanded.insert(seq);
+        self.shown.selected = Some(key);
+        self.shown.expanded.insert(seq);
         // Anchored to the item, not to a line: it grows by expanding, and the
         // renderer clamps the anchor to the bottom.
-        self.scroll = Some(Anchor {
+        self.shown.scroll = Some(Anchor {
             key: ItemKey::of(item),
             offset: 0,
         });
-        self.reveal = Some(ItemKey::of(item));
+        self.shown.reveal = Some(ItemKey::of(item));
     }
 
     /// Opens an empty search prompt; `n`/`N` then work on the timeline.
     fn open_search(&mut self) {
-        self.search = Some(Search::new());
+        self.shown.search = Some(Search::new());
         self.focus = Focus::Timeline;
     }
 
@@ -2303,12 +2389,12 @@ impl SessionUi {
     /// Enter keeps the search and jumps to the nearest match; with nothing
     /// typed it closes the prompt, like Esc.
     fn search_key(&mut self, view: &SessionView, key: KeyEvent, ctrl: bool) {
-        let Some(search) = &mut self.search else {
+        let Some(search) = &mut self.shown.search else {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.search = None,
-            KeyCode::Enter if search.query.is_empty() => self.search = None,
+            KeyCode::Esc => self.shown.search = None,
+            KeyCode::Enter if search.query.is_empty() => self.shown.search = None,
             KeyCode::Enter => {
                 search.editing = false;
                 self.jump(view, None);
@@ -2330,24 +2416,24 @@ impl SessionUi {
     /// a blob's content.
     fn jump(&mut self, view: &SessionView, older: Option<bool>) {
         let from = self.search_from(view);
-        let Some(search) = &mut self.search else {
+        let Some(search) = &mut self.shown.search else {
             return;
         };
         let Some(jump) = search.search.jump(view, older, from) else {
             return;
         };
-        let hidden = jump.expand.map(|seq| self.expanded.insert(seq));
+        let hidden = jump.expand.map(|seq| self.shown.expanded.insert(seq));
         // A match deep in a blob is scrolled to by the next frame, which
         // lays its line out.
         search.pin = hidden.is_some() && jump.in_blob;
         // Items that cannot be selected (an agent error) only scroll.
         if let Some(key) = selectable(&view.timeline[jump.index]) {
-            self.selected = Some(key);
+            self.shown.selected = Some(key);
         }
         if hidden == Some(true) || (hidden.is_some() && jump.in_blob) {
             // It grows by expanding: anchored to its top, as `v` does,
             // until the match's line is laid out.
-            self.scroll = Some(Anchor {
+            self.shown.scroll = Some(Anchor {
                 key: jump.key,
                 offset: 0,
             });
@@ -2359,11 +2445,12 @@ impl SessionUi {
     /// Where a search starts from: the selected item, else the last item
     /// on screen, so matches already in view come first.
     fn search_from(&self, view: &SessionView) -> usize {
-        self.selected
+        self.shown
+            .selected
             .and_then(|key| find(view, key))
             .or_else(|| {
-                let geometry = self.geometry.borrow();
-                let bottom = geometry.top(self.scroll) + geometry.height;
+                let geometry = self.shown.geometry.borrow();
+                let bottom = geometry.top(self.shown.scroll) + geometry.height;
                 geometry.index_at(bottom.min(geometry.total).checked_sub(1)?)
             })
             .unwrap_or(view.timeline.len().saturating_sub(1))
@@ -2371,7 +2458,7 @@ impl SessionUi {
 
     /// The selected logged item's entry; a pending message has none.
     pub(crate) fn selected_entry<'a>(&self, view: &'a SessionView) -> Option<&'a Entry> {
-        let Some(ItemKey::Logged(seq)) = self.selected else {
+        let Some(ItemKey::Logged(seq)) = self.shown.selected else {
             return None;
         };
         view.timeline.iter().find_map(|item| match item {
@@ -2380,20 +2467,31 @@ impl SessionUi {
         })
     }
 
+    /// Opens the subagent the selected `Agent` call runs.
+    pub(crate) fn open_subagent(&self, view: &SessionView) -> Option<Action> {
+        match self.selected_entry(view)? {
+            Entry::Tool(tool) if tool.subagent.is_some() => Some(Action::ViewSubagent {
+                session_id: view.id,
+                call: Some(tool.call),
+            }),
+            _ => None,
+        }
+    }
+
     /// Expands or collapses the selected item. Expanding a blob that is not
     /// here yet asks for it (spec §8: expanding downloads if needed).
     fn toggle(&mut self, view: &SessionView) -> Option<Action> {
-        let Some(ItemKey::Logged(seq)) = self.selected else {
+        let Some(ItemKey::Logged(seq)) = self.shown.selected else {
             return None;
         };
-        if self.expanded.remove(&seq) {
+        if self.shown.expanded.remove(&seq) {
             return None;
         }
         let entry = self.selected_entry(view)?;
         if sections(entry).is_empty() {
             return None;
         }
-        self.expanded.insert(seq);
+        self.shown.expanded.insert(seq);
         let blob = wanted_blob(entry)?;
         matches!(blob.state, BlobState::NotDownloaded { .. })
             .then_some(Action::DownloadBlob(blob.id))
