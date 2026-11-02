@@ -362,7 +362,78 @@ fn all_event_kinds() -> Vec<EventKind> {
         EventKind::CallsUnanswered {
             calls: vec![call()],
         },
+        EventKind::ShellRequested {
+            command: "cargo test".into(),
+            when: RunWhen::Always,
+            by: device(),
+        },
+        EventKind::ShellRequested {
+            command: "git push".into(),
+            when: RunWhen::OnSuccess,
+            by: device(),
+        },
+        EventKind::ShellRequested {
+            command: "git stash".into(),
+            when: RunWhen::OnFailure,
+            by: device(),
+        },
+        EventKind::ShellStopRequested {
+            run: command(),
+            by: device(),
+        },
+        EventKind::ShellStarted {
+            run: command(),
+            cwd: "/srv/code/skywave".into(),
+        },
+        EventKind::ShellOutput {
+            run: command(),
+            tail: "running 12 tests".into(),
+            lines: 40,
+            bytes: 2_048,
+        },
     ]
+    .into_iter()
+    .chain(all_shell_ends().into_iter().map(shell_finished))
+    .collect()
+}
+
+fn all_shell_ends() -> Vec<ShellEnd> {
+    vec![
+        ShellEnd::Exited { code: 0 },
+        ShellEnd::Exited { code: 101 },
+        ShellEnd::Signalled { signal: 9 },
+        ShellEnd::Stopped,
+        ShellEnd::Skipped,
+        ShellEnd::Lost,
+        ShellEnd::NotStarted {
+            reason: "no such directory".into(),
+        },
+    ]
+}
+
+/// A `ShellFinished` ending in `end`; one that ran has a start, a cwd and
+/// output, one that never started has none.
+fn shell_finished(end: ShellEnd) -> EventKind {
+    let ran = matches!(
+        end,
+        ShellEnd::Exited { .. } | ShellEnd::Signalled { .. } | ShellEnd::Stopped
+    );
+    EventKind::ShellFinished {
+        run: command(),
+        by: device(),
+        started_at: ran.then(at),
+        command_line: "cargo test".into(),
+        end,
+        cwd: ran.then(|| "/srv/code/skywave".into()),
+        preview: if ran {
+            "test result: ok".into()
+        } else {
+            String::new()
+        },
+        lines: if ran { 40 } else { 0 },
+        output: ran.then(blob),
+        truncated: ran,
+    }
 }
 
 fn all_command_kinds() -> Vec<CommandKind> {
@@ -447,6 +518,25 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             task: TaskId("a1b2c3".into()),
         },
+        CommandKind::RunShell {
+            session_id: session(),
+            command: "cargo test".into(),
+            when: RunWhen::Always,
+        },
+        CommandKind::RunShell {
+            session_id: session(),
+            command: "git push".into(),
+            when: RunWhen::OnSuccess,
+        },
+        CommandKind::RunShell {
+            session_id: session(),
+            command: "git stash".into(),
+            when: RunWhen::OnFailure,
+        },
+        CommandKind::StopShell {
+            session_id: session(),
+            run: command(),
+        },
     ]
 }
 
@@ -471,6 +561,10 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::NoConversation,
             RejectReason::BadConversation,
             RejectReason::UnknownTask,
+            RejectReason::ShellDisabled,
+            RejectReason::UnknownRun,
+            RejectReason::RunFinished,
+            RejectReason::BadShellCommand,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -511,6 +605,7 @@ fn hello() -> HelloResponse {
             id: device(),
             name: "phone".into(),
         }],
+        shell: true,
     }
 }
 
@@ -768,10 +863,51 @@ fn a_conversation_id_is_trimmed_and_otherwise_kept_or_refused() {
 }
 
 #[test]
-fn protocol_is_v13() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn run_shell_decodes_without_when_as_always() {
+    let command: CommandKind = serde_json::from_str(
+        r#"{"type":"run_shell","session_id":"01920000-0000-7000-8000-000000000001","command":"make"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        command,
+        CommandKind::RunShell {
+            session_id: session(),
+            command: "make".into(),
+            when: RunWhen::Always,
+        }
+    );
+    // The default is `Always`, not whatever comes first.
+    assert_eq!(RunWhen::default(), RunWhen::Always);
+    let on_failure: CommandKind = serde_json::from_str(
+        r#"{"type":"run_shell","session_id":"01920000-0000-7000-8000-000000000001","command":"make","when":"on_failure"}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            on_failure,
+            CommandKind::RunShell {
+                when: RunWhen::OnFailure,
+                ..
+            }
+        ),
+        "{on_failure:?}"
+    );
+}
+
+#[test]
+fn every_shell_end_round_trips() {
+    for end in all_shell_ends() {
+        round_trip(&end);
+    }
+}
+
+#[test]
+fn protocol_is_v14() {
+    assert_eq!(PROTOCOL_VERSION, 14);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
+    assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
+    assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);
 }

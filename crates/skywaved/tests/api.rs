@@ -376,6 +376,7 @@ async fn hello_names_the_caller_and_records_last_seen() {
                 id: creds.id,
                 name: "laptop".into(),
             }],
+            shell: false,
         }
     );
     let device = devices::get(f.storage.db.conn(), creds.id)

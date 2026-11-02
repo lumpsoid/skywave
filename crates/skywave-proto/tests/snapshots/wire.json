@@ -1,7 +1,7 @@
 {
-  "protocol_version": 13,
+  "protocol_version": 14,
   "hello": {
-    "protocol_version": 13,
+    "protocol_version": 14,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -10,7 +10,8 @@
         "id": "01920000-0000-7000-8000-000000000003",
         "name": "phone"
       }
-    ]
+    ],
+    "shell": true
   },
   "pair_request": {
     "code": "K7Q4-9M2X",
@@ -726,6 +727,240 @@
             "01920000-0000-7000-8000-000000000007"
           ]
         }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_requested",
+          "command": "cargo test",
+          "when": "always",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_requested",
+          "command": "git push",
+          "when": "on_success",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_requested",
+          "command": "git stash",
+          "when": "on_failure",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_stop_requested",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_started",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "cwd": "/srv/code/skywave"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_output",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "tail": "running 12 tests",
+          "lines": 40,
+          "bytes": 2048
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": "2026-10-29T12:00:00Z",
+          "command_line": "cargo test",
+          "end": {
+            "kind": "exited",
+            "code": 0
+          },
+          "cwd": "/srv/code/skywave",
+          "preview": "test result: ok",
+          "lines": 40,
+          "output": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          },
+          "truncated": true
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": "2026-10-29T12:00:00Z",
+          "command_line": "cargo test",
+          "end": {
+            "kind": "exited",
+            "code": 101
+          },
+          "cwd": "/srv/code/skywave",
+          "preview": "test result: ok",
+          "lines": 40,
+          "output": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          },
+          "truncated": true
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": "2026-10-29T12:00:00Z",
+          "command_line": "cargo test",
+          "end": {
+            "kind": "signalled",
+            "signal": 9
+          },
+          "cwd": "/srv/code/skywave",
+          "preview": "test result: ok",
+          "lines": 40,
+          "output": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          },
+          "truncated": true
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": "2026-10-29T12:00:00Z",
+          "command_line": "cargo test",
+          "end": {
+            "kind": "stopped"
+          },
+          "cwd": "/srv/code/skywave",
+          "preview": "test result: ok",
+          "lines": 40,
+          "output": {
+            "id": "01920000-0000-7000-8000-000000000005",
+            "size": 48213
+          },
+          "truncated": true
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": null,
+          "command_line": "cargo test",
+          "end": {
+            "kind": "skipped"
+          },
+          "cwd": null,
+          "preview": "",
+          "lines": 0,
+          "output": null,
+          "truncated": false
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": null,
+          "command_line": "cargo test",
+          "end": {
+            "kind": "lost"
+          },
+          "cwd": null,
+          "preview": "",
+          "lines": 0,
+          "output": null,
+          "truncated": false
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "shell_finished",
+          "run": "01920000-0000-7000-8000-000000000002",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "started_at": null,
+          "command_line": "cargo test",
+          "end": {
+            "kind": "not_started",
+            "reason": "no such directory"
+          },
+          "cwd": null,
+          "preview": "",
+          "lines": 0,
+          "output": null,
+          "truncated": false
+        }
       }
     ]
   },
@@ -885,6 +1120,41 @@
         "session_id": "01920000-0000-7000-8000-000000000001",
         "task": "a1b2c3"
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "run_shell",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "command": "cargo test",
+        "when": "always"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "run_shell",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "command": "git push",
+        "when": "on_success"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "run_shell",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "command": "git stash",
+        "when": "on_failure"
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "stop_shell",
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "run": "01920000-0000-7000-8000-000000000002"
+      }
     }
   ],
   "command_results": [
@@ -959,6 +1229,22 @@
     {
       "result": "rejected",
       "reason": "unknown_task"
+    },
+    {
+      "result": "rejected",
+      "reason": "shell_disabled"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_run"
+    },
+    {
+      "result": "rejected",
+      "reason": "run_finished"
+    },
+    {
+      "result": "rejected",
+      "reason": "bad_shell_command"
     }
   ]
 }

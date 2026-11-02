@@ -101,8 +101,9 @@ impl SessionUsage {
 }
 
 /// Longest [`SessionSummary::first_prompt`] kept, in chars. The store's
-/// backfill migration cuts at the same length.
-pub const FIRST_PROMPT_MAX_CHARS: usize = 200;
+/// backfill migration cuts at the same length, and the server cuts a shell
+/// run's `command_line` to it.
+pub const FIRST_PROMPT_MAX_CHARS: usize = skywave_proto::limits::FIRST_PROMPT_MAX_CHARS;
 /// Longest first prompt shown as a title, in chars, before an ellipsis.
 pub const TITLE_PROMPT_MAX_CHARS: usize = 48;
 
@@ -166,7 +167,11 @@ impl SessionSummary {
             | EventKind::ContextMoved { .. }
             | EventKind::TaskStopRequested { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => return,
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ShellFinished { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -223,7 +228,12 @@ impl SessionSummary {
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRequested { .. }
             | EventKind::TaskStopRefused { .. }
-            | EventKind::CallsUnanswered { .. } => {}
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellRequested { .. }
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ShellFinished { .. } => {}
         }
     }
 
@@ -310,12 +320,18 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::AgentMessage {
             parent: Some(_), ..
         }
-        | EventKind::CallsUnanswered { .. } => false,
+        | EventKind::CallsUnanswered { .. }
+        | EventKind::ShellRequested { .. }
+        | EventKind::ShellStopRequested { .. }
+        | EventKind::ShellStarted { .. }
+        | EventKind::ShellOutput { .. }
+        | EventKind::ShellFinished { .. } => false,
     }
 }
 
 /// The blobs an event references: a tool call's input and the whole of its
-/// display body, a result's output, an approval's input.
+/// display body, a result's output, an approval's input, a finished shell
+/// run's whole output.
 pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
     let (first, second) = match kind {
         EventKind::ToolCall(ToolCall { input, display, .. }) => (
@@ -323,7 +339,8 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
             display.body.as_ref().and_then(|body| body.full.as_ref()),
         ),
         EventKind::ApprovalRequested { input, .. } => (input.as_ref(), None),
-        EventKind::ToolResult(ToolResult { output, .. }) => (output.as_ref(), None),
+        EventKind::ToolResult(ToolResult { output, .. })
+        | EventKind::ShellFinished { output, .. } => (output.as_ref(), None),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
@@ -352,7 +369,11 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::SchedulesChanged { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
-        | EventKind::CallsUnanswered { .. } => (None, None),
+        | EventKind::CallsUnanswered { .. }
+        | EventKind::ShellRequested { .. }
+        | EventKind::ShellStopRequested { .. }
+        | EventKind::ShellStarted { .. }
+        | EventKind::ShellOutput { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -735,6 +756,87 @@ mod tests {
         let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
         summary.apply(Seq(2), &event(sid, 1, unanswered));
         assert_eq!((summary.last_seq, summary.notable), (Seq(1), 0));
+    }
+
+    #[test]
+    fn only_a_shell_request_is_activity_and_no_shell_event_is_notable() {
+        use skywave_proto::{CommandId, RunWhen, ShellEnd};
+        let sid = SessionId::new();
+        let (by, run) = (DeviceId::new(), CommandId::new());
+        let output = BlobRef {
+            id: skywave_proto::BlobId::new(),
+            size: 9_000,
+        };
+        let daemon = [
+            EventKind::ShellStopRequested { run, by },
+            EventKind::ShellStarted {
+                run,
+                cwd: "/srv/app".into(),
+            },
+            EventKind::ShellOutput {
+                run,
+                tail: "x".into(),
+                lines: 1,
+                bytes: 2,
+            },
+            EventKind::ShellFinished {
+                run,
+                by,
+                started_at: None,
+                command_line: "make".into(),
+                end: ShellEnd::Exited { code: 2 },
+                cwd: None,
+                preview: "error".into(),
+                lines: 1,
+                output: Some(output.clone()),
+                truncated: true,
+            },
+        ];
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+            from: None,
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let archive = EventKind::SessionArchived { archived: true, by };
+        summary.apply(Seq(2), &event(sid, 1, archive));
+        let start = summary.last_activity;
+        for (i, kind) in daemon.into_iter().enumerate() {
+            assert!(!is_notable(&kind), "{kind:?}");
+            summary.apply(Seq(3 + i as u64), &event(sid, 2 + i as u32, kind));
+            assert_eq!((summary.last_seq, summary.last_activity), (Seq(1), start));
+        }
+        assert!(summary.archived, "no daemon shell event unarchives");
+        assert_eq!(summary.notable, 0);
+        // The finished run's whole output is a blob to fetch.
+        let finished = EventKind::ShellFinished {
+            run,
+            by,
+            started_at: None,
+            command_line: "make".into(),
+            end: ShellEnd::Lost,
+            cwd: None,
+            preview: String::new(),
+            lines: 0,
+            output: Some(output.clone()),
+            truncated: true,
+        };
+        assert_eq!(blob_refs(&finished).collect::<Vec<_>>(), vec![&output]);
+
+        let requested = EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::OnSuccess,
+            by,
+        };
+        assert!(!is_notable(&requested));
+        summary.apply(Seq(9), &event(sid, 30, requested));
+        assert_eq!(summary.last_seq, Seq(9));
+        assert_eq!(
+            summary.last_activity,
+            event(sid, 30, EventKind::TurnInterrupted).at
+        );
+        assert!(!summary.archived, "a shell request brings the session back");
+        assert_eq!(summary.notable, 0);
     }
 
     #[test]

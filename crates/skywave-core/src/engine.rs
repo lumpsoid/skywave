@@ -786,6 +786,7 @@ mod tests {
                     device_id: DeviceId::new(),
                     head: Seq::ZERO,
                     devices: Vec::new(),
+                    shell: false,
                 })
             })
         }
@@ -1617,6 +1618,7 @@ mod tests {
                         id: self.device,
                         name: "phone".into(),
                     }],
+                    shell: false,
                 })
             })
         }
