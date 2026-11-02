@@ -1,7 +1,9 @@
 //! Plain intents as core [`Action`]s: ids parsed from the strings Dart
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
-use skywave_core::{Action, BlobPolicy, Decision, Effort, PermissionMode, Route, TaskId};
+use skywave_core::{
+    Action, BlobPolicy, Decision, Effort, PermissionMode, Route, ServerAddress, TaskId,
+};
 use uuid::Uuid;
 
 use crate::signals::{
@@ -120,6 +122,11 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             BlobPolicyChoice::OnDemand => BlobPolicy::OnDemand,
         }),
         ActionIntent::RetryNow => Action::RetryNow,
+        // Checked here too so a typo is shown, not silently dropped.
+        ActionIntent::SetServerAddress { address } => {
+            ServerAddress::parse(&address).map_err(|err| err.to_string())?;
+            Action::SetServerAddress { address }
+        }
         ActionIntent::Navigate { route } => Action::Navigate(match route {
             RouteView::SessionList => Route::SessionList,
             RouteView::ArchivedSessions => Route::ArchivedSessions,
@@ -244,6 +251,21 @@ mod tests {
                 task_id: String::new(),
             }),
             Err("no task id".to_owned())
+        );
+        assert_eq!(
+            action(ActionIntent::SetServerAddress {
+                address: "10.0.0.7:7443".into(),
+            }),
+            Ok(Action::SetServerAddress {
+                address: "10.0.0.7:7443".into(),
+            })
+        );
+        assert!(
+            action(ActionIntent::SetServerAddress {
+                address: "host:port".into(),
+            })
+            .unwrap_err()
+            .contains("invalid server address")
         );
         assert_eq!(
             action(ActionIntent::ViewContext {

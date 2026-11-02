@@ -272,6 +272,9 @@ impl Core {
                 let done = match effect {
                     Effect::Enqueue(command) => state.store.enqueue(&command),
                     Effect::SaveBlobPolicy(policy) => state.store.set_blob_policy(policy),
+                    Effect::SaveServerAddress(address) => {
+                        state.store.set_server_address(Some(&address))
+                    }
                     Effect::SaveDraft(id, draft) => state.store.set_draft(id, draft.as_ref()),
                     Effect::SaveReadMark(id, mark) => state.store.set_read_mark(id, mark),
                     Effect::SaveSnippet(snippet) => state.store.set_snippet(&snippet),

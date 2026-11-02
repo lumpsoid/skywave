@@ -6,7 +6,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Settings: the blob policy, and the server and device this one is
 /// paired as, the link to it with its round trip, the fingerprint to
-/// compare with what `skywaved` prints, and Re-pair.
+/// compare with what `skywaved` prints, and Re-pair. A paired server's
+/// address can be changed in place, without re-pairing.
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
     required this.screen,
@@ -94,6 +95,23 @@ class SettingsPage extends StatelessWidget {
               leading: const Icon(Icons.dns),
               title: const Text('Server'),
               subtitle: SelectableText(screen.server),
+              trailing: switch (screen.editableAddress) {
+                final address? => IconButton(
+                  key: const Key('edit-server-address'),
+                  icon: const Icon(Icons.edit),
+                  tooltip: 'Change address',
+                  onPressed: () async {
+                    final changed = await showDialog<String>(
+                      context: context,
+                      builder: (context) => _AddressDialog(initial: address),
+                    );
+                    if (changed != null) {
+                      send.act(ActionIntentSetServerAddress(address: changed));
+                    }
+                  },
+                ),
+                null => null,
+              },
             ),
             ConnectionTile(holder: link),
             ListTile(
@@ -151,6 +169,62 @@ class ConnectionTile extends StatelessWidget {
           key: const Key('connection-label'),
         ),
       ),
+    );
+  }
+}
+
+/// Asks where the paired server is now, e.g. after its IP changed: pops
+/// the address, or `null` when cancelled. Only the address changes; the
+/// pairing stays.
+class _AddressDialog extends StatefulWidget {
+  const _AddressDialog({required this.initial});
+
+  final String initial;
+
+  @override
+  State<_AddressDialog> createState() => _AddressDialogState();
+}
+
+class _AddressDialogState extends State<_AddressDialog> {
+  late final _address = TextEditingController(text: widget.initial)
+    ..selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: widget.initial.length,
+    );
+
+  @override
+  void dispose() {
+    _address.dispose();
+    super.dispose();
+  }
+
+  void _submit() => Navigator.of(context).pop(_address.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Server address'),
+      content: SizedBox(
+        width: 420,
+        child: TextField(
+          key: const Key('server-address-field'),
+          controller: _address,
+          autofocus: true,
+          keyboardType: TextInputType.url,
+          decoration: const InputDecoration(
+            labelText: 'host:port',
+            helperText: 'The same server at a new address; no re-pairing.',
+          ),
+          onSubmitted: (_) => _submit(),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(onPressed: _submit, child: const Text('Save')),
+      ],
     );
   }
 }

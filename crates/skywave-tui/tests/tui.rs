@@ -548,6 +548,44 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
 }
 
 #[test]
+fn settings_change_the_server_address_without_re_pairing() {
+    let mut h = Harness::paired();
+    h.key(KeyCode::Char('s'));
+    assert_contains(&h.screen(), "Press a to change the server address");
+
+    // The prompt starts from the known address; Esc leaves it as it was.
+    assert_eq!(h.key(KeyCode::Char('a')), None);
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "srv:7443");
+    assert_contains(&h.screen(), "Server address");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(h.app.ui().prompt.is_none());
+
+    // Not an address: shown, and the text stays to fix.
+    h.key(KeyCode::Char('a'));
+    h.key_with(ctrl('u'));
+    h.type_text("host:port");
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_contains(&h.screen(), "invalid server address");
+    assert_eq!(h.app.ui().prompt.as_ref().unwrap().text, "host:port");
+
+    // A new one reconnects there; the device stays paired.
+    h.key_with(ctrl('u'));
+    h.drain_requests();
+    h.type_text("10.0.0.7:7443");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetServerAddress {
+            address: "10.0.0.7:7443".into(),
+        })
+    );
+    assert!(h.app.ui().prompt.is_none(), "the prompt closes");
+    assert_eq!(h.drain_requests(), vec![Request::Connect]);
+    let screen = h.screen();
+    assert_contains(&screen, "Server:      10.0.0.7:7443");
+    assert!(matches!(h.app.view().screen, Screen::Settings(_)));
+}
+
+#[test]
 fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     let mut h = Harness::paired();
     h.seam.set_link(Link::Rejected(LinkRejection::Revoked));
