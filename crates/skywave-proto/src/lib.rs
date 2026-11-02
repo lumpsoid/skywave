@@ -83,7 +83,16 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `RejectReason::{ShellDisabled, UnknownRun, RunFinished,
 /// BadShellCommand}`; [`limits::SHELL_COMMAND_MAX_BYTES`]; and `shell` on
 /// [`HelloResponse`].
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// v15: reading a session's workdir. `GET` [`path::WORKDIR_CHANGES`],
+/// [`path::WORKDIR_LIST`] and [`path::WORKDIR_FILE`], each taking a
+/// [`WorkdirQuery`] and answering [`ChangesResult`] (with [`ChangeSet`],
+/// [`ChangedFile`], [`FileChange`], [`DiffBody`]), [`ListResult`] (with
+/// [`DirEntry`], [`EntryKind`], [`LinkTarget`]) or [`FileResult`] (with
+/// [`FileBody`]); and [`limits::WORKDIR_CHANGES_MAX`],
+/// [`limits::WORKDIR_DIFF_MAX_BYTES`], [`limits::WORKDIR_DIFFS_MAX_BYTES`],
+/// [`limits::WORKDIR_FILE_MAX_BYTES`] and [`limits::WORKDIR_LIST_MAX`].
+pub const PROTOCOL_VERSION: u32 = 15;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -742,6 +751,25 @@ pub mod limits {
     /// longer one as `BadShellCommand` rather than cut it, as a cut command
     /// would run something else.
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
+    /// Most [`ChangedFile`](crate::ChangedFile)s in one
+    /// [`ChangeSet`](crate::ChangeSet); the rest are only counted in
+    /// [`ChangeSet::total`](crate::ChangeSet::total).
+    pub const WORKDIR_CHANGES_MAX: usize = 500;
+    /// Largest diff of one changed file, in bytes; past it the file's diff
+    /// is [`DiffBody::TooLarge`](crate::DiffBody::TooLarge).
+    pub const WORKDIR_DIFF_MAX_BYTES: u64 = 1024 * 1024;
+    /// Most diff bytes in one [`ChangeSet`](crate::ChangeSet); files past it
+    /// get [`DiffBody::Omitted`](crate::DiffBody::Omitted). Bounds the
+    /// server's disk and memory per snapshot, not the link: diffs travel as
+    /// blobs fetched on opening.
+    pub const WORKDIR_DIFFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+    /// Largest file served by `GET /v1/workdir/file`, in bytes; past it the
+    /// content is [`FileBody::TooLarge`](crate::FileBody::TooLarge).
+    pub const WORKDIR_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+    /// Most [`DirEntry`](crate::DirEntry)s in one
+    /// [`ListResult::Listed`](crate::ListResult::Listed); past it the
+    /// listing is `truncated`.
+    pub const WORKDIR_LIST_MAX: usize = 1000;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -1710,6 +1738,193 @@ pub enum DirsResult {
     NotFound,
 }
 
+/// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,
+/// not a raw path: the server resolves the root from the session's workdir,
+/// so a device reads only workdirs that sessions run in.
+///
+/// Outcomes every workdir request shares, folded into each result enum:
+/// `UnknownSession` (no such session on the server), `WorkdirGone` (the
+/// workdir no longer exists, no longer canonicalises to the stored path, or
+/// left the roots), `NotAllowed` (`path` is absolute, or its canonical target
+/// is not under the canonical workdir) and `NotFound` (`path` does not
+/// exist; list and file only).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkdirQuery {
+    pub session: SessionId,
+    /// Relative to the session's workdir, `/` separated, empty for the
+    /// workdir itself; ignored by `changes`.
+    #[serde(default)]
+    pub path: String,
+}
+
+/// Response to `GET /v1/workdir/changes`, always 200: every outcome is a
+/// domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ChangesResult {
+    /// The work tree's changes against `HEAD`, plus untracked files.
+    Changes(ChangeSet),
+    /// The workdir is in no git work tree.
+    NotGit,
+    /// git is missing or exited unexpectedly; `reason` is bounded text.
+    Failed {
+        reason: String,
+    },
+    UnknownSession,
+    WorkdirGone,
+}
+
+/// One snapshot of what changed in a workdir.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChangeSet {
+    /// Server clock when the snapshot was taken.
+    pub at: DateTime<Utc>,
+    /// The checked-out branch; `None` when `HEAD` is detached.
+    pub branch: Option<String>,
+    /// Short commit of `HEAD`; `None` on an unborn branch.
+    pub head: Option<String>,
+    /// Sorted by path, at most [`limits::WORKDIR_CHANGES_MAX`].
+    ///
+    /// `path` alone is not unique here: `git rm --cached f` with `f` still on
+    /// disk gives a `Deleted` `f` and an `Untracked` `f`. An entry is
+    /// identified by its path and whether it is `Untracked`.
+    pub files: Vec<ChangedFile>,
+    /// Files changed in all; more than `files.len()` when capped.
+    pub total: u32,
+}
+
+/// One changed file in a [`ChangeSet`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChangedFile {
+    /// Relative to the workdir.
+    pub path: String,
+    /// Old path of a rename.
+    pub from: Option<String>,
+    pub change: FileChange,
+    /// Lines added; `None` for a binary file.
+    pub added: Option<u32>,
+    /// Lines removed; `None` for a binary file.
+    pub removed: Option<u32>,
+    pub diff: DiffBody,
+}
+
+/// How a [`ChangedFile`] changed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    TypeChanged,
+    Untracked,
+    Conflicted,
+}
+
+/// Where a [`ChangedFile`]'s diff is.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "diff", rename_all = "snake_case")]
+pub enum DiffBody {
+    /// The unified diff, fetched as a blob.
+    Blob(BlobRef),
+    /// git found the file binary; there is no text diff.
+    Binary,
+    /// The diff is `bytes` long, past [`limits::WORKDIR_DIFF_MAX_BYTES`].
+    TooLarge { bytes: u64 },
+    /// Left out: the snapshot reached [`limits::WORKDIR_DIFFS_MAX_BYTES`].
+    Omitted,
+}
+
+/// Response to `GET /v1/workdir/list`, always 200: every outcome is a domain
+/// answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ListResult {
+    /// The entries of the directory at `path`, the canonical path relative
+    /// to the workdir. `truncated` when [`limits::WORKDIR_LIST_MAX`] cut the
+    /// listing short.
+    Listed {
+        at: DateTime<Utc>,
+        path: String,
+        entries: Vec<DirEntry>,
+        truncated: bool,
+    },
+    NotADirectory,
+    UnknownSession,
+    WorkdirGone,
+    NotAllowed,
+    NotFound,
+}
+
+/// One entry of a [`ListResult::Listed`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    /// Size in bytes, for a file.
+    pub size: Option<u64>,
+}
+
+/// What a [`DirEntry`] is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntryKind {
+    Dir,
+    File,
+    /// A FIFO, socket or device.
+    Other,
+    /// A symlink, and what it leads to.
+    Link {
+        to: LinkTarget,
+    },
+}
+
+/// Where a symlink in a workdir leads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkTarget {
+    Dir,
+    File,
+    /// The target is not under the workdir.
+    Outside,
+    /// The target does not exist.
+    Dangling,
+}
+
+/// Response to `GET /v1/workdir/file`, always 200: every outcome is a domain
+/// answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FileResult {
+    /// The file at `path`, the canonical path relative to the workdir.
+    File {
+        at: DateTime<Utc>,
+        path: String,
+        size: u64,
+        content: FileBody,
+    },
+    IsADirectory,
+    /// A FIFO, socket or device: never opened, as a FIFO read blocks
+    /// forever.
+    NotAFile,
+    UnknownSession,
+    WorkdirGone,
+    NotAllowed,
+    NotFound,
+}
+
+/// Where a [`FileResult::File`]'s content is.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "content", rename_all = "snake_case")]
+pub enum FileBody {
+    /// The bytes, fetched as a blob.
+    Blob(BlobRef),
+    /// Not text; not served.
+    Binary,
+    /// Past [`limits::WORKDIR_FILE_MAX_BYTES`].
+    TooLarge,
+}
+
 /// HTTP paths of the v1 API.
 pub mod path {
     use crate::BlobId;
@@ -1719,6 +1934,12 @@ pub mod path {
     pub const COMMANDS: &str = "/v1/commands";
     pub const EVENTS: &str = "/v1/events";
     pub const DIRS: &str = "/v1/dirs";
+    /// What changed in a session's workdir: [`crate::ChangesResult`].
+    pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
+    /// One directory of a session's workdir: [`crate::ListResult`].
+    pub const WORKDIR_LIST: &str = "/v1/workdir/list";
+    /// One file of a session's workdir: [`crate::FileResult`].
+    pub const WORKDIR_FILE: &str = "/v1/workdir/file";
     /// Route template for blob downloads; `{id}` is a [`BlobId`].
     pub const BLOB_ROUTE: &str = "/v1/blobs/{id}";
 

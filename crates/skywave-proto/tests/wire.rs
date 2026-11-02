@@ -609,6 +609,131 @@ fn hello() -> HelloResponse {
     }
 }
 
+fn workdir_query() -> WorkdirQuery {
+    WorkdirQuery {
+        session: session(),
+        path: "src/agent".into(),
+    }
+}
+
+fn changed_file(path: &str, change: FileChange, diff: DiffBody) -> ChangedFile {
+    let text = !matches!(diff, DiffBody::Binary);
+    ChangedFile {
+        path: path.into(),
+        from: (change == FileChange::Renamed).then(|| "old/name.rs".into()),
+        change,
+        added: text.then_some(12),
+        removed: text.then_some(3),
+        diff,
+    }
+}
+
+fn all_changes_results() -> Vec<ChangesResult> {
+    vec![
+        ChangesResult::Changes(ChangeSet {
+            at: at(),
+            branch: Some("main".into()),
+            head: Some("e3c8849".into()),
+            files: vec![
+                changed_file("a.rs", FileChange::Added, DiffBody::Blob(blob())),
+                changed_file("b.rs", FileChange::Modified, DiffBody::Omitted),
+                changed_file("c.rs", FileChange::Deleted, DiffBody::Blob(blob())),
+                changed_file("d.rs", FileChange::Renamed, DiffBody::Blob(blob())),
+                changed_file("e.png", FileChange::TypeChanged, DiffBody::Binary),
+                changed_file(
+                    "f.log",
+                    FileChange::Untracked,
+                    DiffBody::TooLarge { bytes: 2_097_152 },
+                ),
+                changed_file("g.rs", FileChange::Conflicted, DiffBody::Blob(blob())),
+            ],
+            total: 9,
+        }),
+        ChangesResult::Changes(ChangeSet {
+            at: at(),
+            branch: None,
+            head: None,
+            files: vec![],
+            total: 0,
+        }),
+        ChangesResult::NotGit,
+        ChangesResult::Failed {
+            reason: "git: command not found".into(),
+        },
+        ChangesResult::UnknownSession,
+        ChangesResult::WorkdirGone,
+    ]
+}
+
+fn all_list_results() -> Vec<ListResult> {
+    let entry = |name: &str, kind: EntryKind| DirEntry {
+        name: name.into(),
+        kind,
+        size: (kind == EntryKind::File).then_some(1_234),
+    };
+    vec![
+        ListResult::Listed {
+            at: at(),
+            path: "src".into(),
+            entries: vec![
+                entry("agent", EntryKind::Dir),
+                entry("lib.rs", EntryKind::File),
+                entry("pipe", EntryKind::Other),
+                entry(
+                    "to_dir",
+                    EntryKind::Link {
+                        to: LinkTarget::Dir,
+                    },
+                ),
+                entry(
+                    "to_file",
+                    EntryKind::Link {
+                        to: LinkTarget::File,
+                    },
+                ),
+                entry(
+                    "to_etc",
+                    EntryKind::Link {
+                        to: LinkTarget::Outside,
+                    },
+                ),
+                entry(
+                    "broken",
+                    EntryKind::Link {
+                        to: LinkTarget::Dangling,
+                    },
+                ),
+            ],
+            truncated: true,
+        },
+        ListResult::NotADirectory,
+        ListResult::UnknownSession,
+        ListResult::WorkdirGone,
+        ListResult::NotAllowed,
+        ListResult::NotFound,
+    ]
+}
+
+fn all_file_results() -> Vec<FileResult> {
+    let file = |content: FileBody| FileResult::File {
+        at: at(),
+        path: "src/lib.rs".into(),
+        size: 48_213,
+        content,
+    };
+    vec![
+        file(FileBody::Blob(blob())),
+        file(FileBody::Binary),
+        file(FileBody::TooLarge),
+        FileResult::IsADirectory,
+        FileResult::NotAFile,
+        FileResult::UnknownSession,
+        FileResult::WorkdirGone,
+        FileResult::NotAllowed,
+        FileResult::NotFound,
+    ]
+}
+
 fn round_trip<T>(value: &T)
 where
     T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -902,8 +1027,139 @@ fn every_shell_end_round_trips() {
 }
 
 #[test]
-fn protocol_is_v14() {
-    assert_eq!(PROTOCOL_VERSION, 14);
+fn every_workdir_body_round_trips() {
+    round_trip(&workdir_query());
+    for result in all_changes_results() {
+        round_trip(&result);
+    }
+    for result in all_list_results() {
+        round_trip(&result);
+    }
+    for result in all_file_results() {
+        round_trip(&result);
+    }
+}
+
+/// `path` may be left out of the query string (`changes` ignores it).
+#[test]
+fn a_workdir_query_without_a_path_names_the_workdir() {
+    let json = serde_json::json!({ "session": session() });
+    let query: WorkdirQuery = serde_json::from_value(json).unwrap();
+    assert_eq!(query.path, "");
+}
+
+/// The workdir fixtures hold every variant of every workdir enum. The
+/// matches are exhaustive, so a new variant fails to compile here until it
+/// is named, and the counts fail until a fixture carries it.
+#[test]
+fn workdir_fixtures_cover_every_variant() {
+    use std::collections::BTreeSet;
+    fn diff(d: &DiffBody) -> &'static str {
+        match d {
+            DiffBody::Blob(_) => "blob",
+            DiffBody::Binary => "binary",
+            DiffBody::TooLarge { .. } => "too_large",
+            DiffBody::Omitted => "omitted",
+        }
+    }
+    fn change(c: FileChange) -> &'static str {
+        match c {
+            FileChange::Added => "added",
+            FileChange::Modified => "modified",
+            FileChange::Deleted => "deleted",
+            FileChange::Renamed => "renamed",
+            FileChange::TypeChanged => "type_changed",
+            FileChange::Untracked => "untracked",
+            FileChange::Conflicted => "conflicted",
+        }
+    }
+    fn kind(k: EntryKind) -> &'static str {
+        match k {
+            EntryKind::Dir => "dir",
+            EntryKind::File => "file",
+            EntryKind::Other => "other",
+            EntryKind::Link { to } => match to {
+                LinkTarget::Dir => "link_dir",
+                LinkTarget::File => "link_file",
+                LinkTarget::Outside => "link_outside",
+                LinkTarget::Dangling => "link_dangling",
+            },
+        }
+    }
+    let mut changes = BTreeSet::new();
+    let mut diffs = BTreeSet::new();
+    let mut file_changes = BTreeSet::new();
+    for result in all_changes_results() {
+        changes.insert(match &result {
+            ChangesResult::Changes(set) => {
+                for file in &set.files {
+                    diffs.insert(diff(&file.diff));
+                    file_changes.insert(change(file.change));
+                }
+                "changes"
+            }
+            ChangesResult::NotGit => "not_git",
+            ChangesResult::Failed { .. } => "failed",
+            ChangesResult::UnknownSession => "unknown_session",
+            ChangesResult::WorkdirGone => "workdir_gone",
+        });
+    }
+    let mut lists = BTreeSet::new();
+    let mut kinds = BTreeSet::new();
+    for result in all_list_results() {
+        lists.insert(match &result {
+            ListResult::Listed { entries, .. } => {
+                kinds.extend(entries.iter().map(|e| kind(e.kind)));
+                "listed"
+            }
+            ListResult::NotADirectory => "not_a_directory",
+            ListResult::UnknownSession => "unknown_session",
+            ListResult::WorkdirGone => "workdir_gone",
+            ListResult::NotAllowed => "not_allowed",
+            ListResult::NotFound => "not_found",
+        });
+    }
+    let mut files = BTreeSet::new();
+    let mut bodies = BTreeSet::new();
+    for result in all_file_results() {
+        files.insert(match &result {
+            FileResult::File { content, .. } => {
+                bodies.insert(match content {
+                    FileBody::Blob(_) => "blob",
+                    FileBody::Binary => "binary",
+                    FileBody::TooLarge => "too_large",
+                });
+                "file"
+            }
+            FileResult::IsADirectory => "is_a_directory",
+            FileResult::NotAFile => "not_a_file",
+            FileResult::UnknownSession => "unknown_session",
+            FileResult::WorkdirGone => "workdir_gone",
+            FileResult::NotAllowed => "not_allowed",
+            FileResult::NotFound => "not_found",
+        });
+    }
+    assert_eq!(changes.len(), 5, "{changes:?}");
+    assert_eq!(diffs.len(), 4, "{diffs:?}");
+    assert_eq!(file_changes.len(), 7, "{file_changes:?}");
+    assert_eq!(lists.len(), 6, "{lists:?}");
+    assert_eq!(kinds.len(), 7, "{kinds:?}");
+    assert_eq!(files.len(), 7, "{files:?}");
+    assert_eq!(bodies.len(), 3, "{bodies:?}");
+}
+
+#[test]
+fn workdir_caps() {
+    assert_eq!(limits::WORKDIR_CHANGES_MAX, 500);
+    assert_eq!(limits::WORKDIR_DIFF_MAX_BYTES, 1024 * 1024);
+    assert_eq!(limits::WORKDIR_DIFFS_MAX_BYTES, 8 * 1024 * 1024);
+    assert_eq!(limits::WORKDIR_FILE_MAX_BYTES, 4 * 1024 * 1024);
+    assert_eq!(limits::WORKDIR_LIST_MAX, 1000);
+}
+
+#[test]
+fn protocol_is_v15() {
+    assert_eq!(PROTOCOL_VERSION, 15);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1065,6 +1321,9 @@ fn api_paths() {
     assert_eq!(path::HELLO, "/v1/hello");
     assert_eq!(path::COMMANDS, "/v1/commands");
     assert_eq!(path::EVENTS, "/v1/events");
+    assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
+    assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
+    assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
     assert_eq!(path::BLOB_ROUTE, "/v1/blobs/{id}");
     assert_eq!(
         path::blob(blob_id()),
@@ -1101,6 +1360,10 @@ fn wire_format_snapshot() {
         event_batch: EventBatch,
         commands: Vec<Command>,
         command_results: Vec<CommandResult>,
+        workdir_query: WorkdirQuery,
+        workdir_changes: Vec<ChangesResult>,
+        workdir_list: Vec<ListResult>,
+        workdir_file: Vec<FileResult>,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1115,6 +1378,10 @@ fn wire_format_snapshot() {
         event_batch: batch(),
         commands,
         command_results: all_command_results(),
+        workdir_query: workdir_query(),
+        workdir_changes: all_changes_results(),
+        workdir_list: all_list_results(),
+        workdir_file: all_file_results(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");
