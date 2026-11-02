@@ -180,6 +180,7 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
         let seq = f.agent(
             session,
             EventKind::AgentMessage {
+                parent: None,
                 text: i.to_string(),
             },
         );
@@ -192,7 +193,10 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
     assert_eq!(page.last(), Some(Seq(3)));
     assert_eq!(
         page.events[1].kind,
-        EventKind::AgentMessage { text: "1".into() }
+        EventKind::AgentMessage {
+            parent: None,
+            text: "1".into()
+        }
     );
     let rest = f
         .log
@@ -214,7 +218,13 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
 fn events_round_trip_unchanged() {
     let mut f = Fixture::new();
     let session = f.create_session();
-    f.agent(session, EventKind::AgentMessage { text: "hi".into() });
+    f.agent(
+        session,
+        EventKind::AgentMessage {
+            parent: None,
+            text: "hi".into(),
+        },
+    );
     let first = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
     let again = f.log.read(&f.connection().db, Seq::ZERO, 10).unwrap();
     assert_eq!(first, again);
@@ -494,7 +504,7 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
                             &mut conn.db,
                             session,
                             context,
-                            EventKind::AgentMessage { text },
+                            EventKind::AgentMessage { parent: None, text },
                         )
                         .unwrap()
                     };
@@ -514,7 +524,7 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
     let mut next = [0usize; WRITERS];
     for event in &batch.events[1..] {
         let text = match &event.kind {
-            EventKind::UserMessage { text, .. } | EventKind::AgentMessage { text } => text,
+            EventKind::UserMessage { text, .. } | EventKind::AgentMessage { text, .. } => text,
             other => panic!("unexpected {other:?}"),
         };
         let (writer, i) = text.split_once(':').unwrap();
@@ -1167,6 +1177,7 @@ fn set_effort_logs_one_request_the_agent_answers() {
 
 fn shell(id: &str) -> BackgroundTask {
     BackgroundTask {
+        call: None,
         id: TaskId(id.into()),
         kind: TaskKind::Shell,
         title: "sleep 60".into(),
@@ -1279,6 +1290,24 @@ fn stop_task_logs_one_request_naming_the_command() {
 }
 
 #[test]
+fn the_agent_side_logs_calls_unanswered() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let calls = vec![skywave_proto::CallId::new()];
+    let before = f.all_events().len();
+    f.agent(
+        session,
+        EventKind::CallsUnanswered {
+            calls: calls.clone(),
+        },
+    );
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(f.all_events().len(), before + 1);
+    assert_eq!(event.kind, EventKind::CallsUnanswered { calls });
+    assert_eq!(event.command_id, None);
+}
+
+#[test]
 fn background_work_folds_each_set_on_its_own() {
     let mut f = Fixture::new();
     let session = f.create_session();
@@ -1288,6 +1317,7 @@ fn background_work_folds_each_set_on_its_own() {
 
     let tasks = vec![
         BackgroundTask {
+            call: None,
             id: TaskId("a1".into()),
             kind: TaskKind::Subagent,
             title: "Explore the repo".into(),
@@ -1295,6 +1325,7 @@ fn background_work_folds_each_set_on_its_own() {
             ambient: false,
         },
         BackgroundTask {
+            call: None,
             id: TaskId("b2".into()),
             kind: TaskKind::Shell,
             title: "cargo test".into(),
@@ -1355,7 +1386,10 @@ fn agent_appends_are_checked() {
         &mut f.storage.db,
         nobody,
         ContextId::first_of(nobody),
-        EventKind::AgentMessage { text: "x".into() },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "x".into(),
+        },
     );
     assert!(matches!(unknown, Err(Error::InvalidAppend(_))));
 
@@ -1368,7 +1402,10 @@ fn agent_appends_are_checked() {
             &mut f.storage.db,
             session,
             wrong,
-            EventKind::AgentMessage { text: "x".into() },
+            EventKind::AgentMessage {
+                parent: None,
+                text: "x".into(),
+            },
         );
         assert!(matches!(appended, Err(Error::InvalidAppend(_))));
     }
@@ -1448,7 +1485,10 @@ fn agent_appends_are_checked() {
     f.agent_in(
         session,
         context,
-        EventKind::AgentMessage { text: "x".into() },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "x".into(),
+        },
     );
     assert_eq!(f.log.head(), Seq(4));
 }
@@ -1710,12 +1750,22 @@ fn session_wide_events_are_stamped_with_the_current_context() {
     // What the agent logs carries the context it is given, the context of
     // the process that produced it, current or not.
     let first = ContextId::first_of(session);
-    f.agent_in(session, first, EventKind::AgentMessage { text: "x".into() });
+    f.agent_in(
+        session,
+        first,
+        EventKind::AgentMessage {
+            parent: None,
+            text: "x".into(),
+        },
+    );
     assert_eq!(f.last_event().context, first);
     f.agent_in(
         session,
         second,
-        EventKind::AgentMessage { text: "y".into() },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "y".into(),
+        },
     );
     assert_eq!(f.last_event().context, second);
 }

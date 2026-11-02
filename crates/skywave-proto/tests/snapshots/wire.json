@@ -1,7 +1,7 @@
 {
-  "protocol_version": 12,
+  "protocol_version": 13,
   "hello": {
-    "protocol_version": 12,
+    "protocol_version": 13,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -123,7 +123,19 @@
         "context": "01920000-0000-7000-8000-000000000008",
         "kind": {
           "type": "agent_message",
-          "text": "Running cargo test."
+          "text": "Running cargo test.",
+          "parent": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "agent_message",
+          "text": "Found three call sites.",
+          "parent": "01920000-0000-7000-8000-000000000007"
         }
       },
       {
@@ -134,6 +146,7 @@
         "kind": {
           "type": "tool_call",
           "call": "01920000-0000-7000-8000-000000000007",
+          "parent": null,
           "name": "exec",
           "display": {
             "kind": "shell",
@@ -152,6 +165,7 @@
         "kind": {
           "type": "tool_call",
           "call": "01920000-0000-7000-8000-000000000007",
+          "parent": "01920000-0000-7000-8000-000000000007",
           "name": "patch",
           "display": {
             "kind": "file_edit",
@@ -181,6 +195,7 @@
         "kind": {
           "type": "tool_call",
           "call": null,
+          "parent": null,
           "name": "put",
           "display": {
             "kind": "file_write",
@@ -620,6 +635,7 @@
               "kind": "subagent",
               "title": "Explore the codebase",
               "parent": null,
+              "call": "01920000-0000-7000-8000-000000000007",
               "ambient": false
             },
             {
@@ -627,6 +643,7 @@
               "kind": "shell",
               "title": "cargo test",
               "parent": "a1b2c3",
+              "call": null,
               "ambient": true
             },
             {
@@ -634,6 +651,7 @@
               "kind": "other",
               "title": "workflow",
               "parent": null,
+              "call": null,
               "ambient": false
             }
           ]
@@ -695,6 +713,18 @@
           "task": "a1b2c3",
           "reason": "agent not running",
           "answers": "01920000-0000-7000-8000-000000000002"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "calls_unanswered",
+          "calls": [
+            "01920000-0000-7000-8000-000000000007"
+          ]
         }
       }
     ]

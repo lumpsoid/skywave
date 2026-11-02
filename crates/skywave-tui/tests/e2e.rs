@@ -349,7 +349,7 @@ fn write_approval(screen: &str, state: &str) -> bool {
 fn turn_done(events: &[Event], text: &str) -> bool {
     let said = events
         .iter()
-        .any(|e| matches!(&e.kind, EventKind::AgentMessage { text: t } if t == text));
+        .any(|e| matches!(&e.kind, EventKind::AgentMessage { text: t, .. } if t == text));
     let idle = events
         .last()
         .is_some_and(|e| matches!(e.kind, EventKind::SessionStateChanged(SessionState::Idle)));

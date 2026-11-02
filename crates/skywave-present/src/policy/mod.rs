@@ -81,6 +81,7 @@ pub(crate) mod tests {
     fn a_stop_is_worth_confirming_for_activity_only() {
         use skywave_core::{BackgroundTask, Schedule, ScheduleId, TaskId, TaskKind};
         let task = |ambient| BackgroundTask {
+            call: None,
             id: TaskId("t".into()),
             kind: TaskKind::Other,
             title: "t".into(),

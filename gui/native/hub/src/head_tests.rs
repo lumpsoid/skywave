@@ -945,6 +945,7 @@ fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() 
     rig.log(vec![
         EventKind::SessionStateChanged(skywave_proto::SessionState::AgentWorking),
         EventKind::AgentMessage {
+            parent: None,
             text: "done".into(),
         },
     ]);
@@ -1058,6 +1059,7 @@ fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
     let output = BlobId::new();
     let kinds = vec![
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call: Some(call),
             name: "Edit".into(),
             display: ToolDisplay {

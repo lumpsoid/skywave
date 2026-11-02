@@ -165,7 +165,8 @@ impl SessionSummary {
             | EventKind::ModelsOffered { .. }
             | EventKind::ContextMoved { .. }
             | EventKind::TaskStopRequested { .. }
-            | EventKind::TaskStopRefused { .. } => return,
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -221,7 +222,8 @@ impl SessionSummary {
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRequested { .. }
-            | EventKind::TaskStopRefused { .. } => {}
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => {}
         }
     }
 
@@ -273,7 +275,7 @@ pub(crate) fn first_line(text: &str, max: usize) -> Option<String> {
 /// are. The store's backfill migration counts the same kinds.
 pub fn is_notable(kind: &EventKind) -> bool {
     match kind {
-        EventKind::AgentMessage { .. } | EventKind::ApprovalRequested { .. } => true,
+        EventKind::AgentMessage { parent: None, .. } | EventKind::ApprovalRequested { .. } => true,
         EventKind::SessionStateChanged(state) => matches!(state, SessionState::Errored { .. }),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
@@ -302,7 +304,11 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::BackgroundTasksChanged { .. }
         | EventKind::SchedulesChanged { .. }
         | EventKind::TaskStopRequested { .. }
-        | EventKind::TaskStopRefused { .. } => false,
+        | EventKind::TaskStopRefused { .. }
+        | EventKind::AgentMessage {
+            parent: Some(_), ..
+        }
+        | EventKind::CallsUnanswered { .. } => false,
     }
 }
 
@@ -343,7 +349,8 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::BackgroundTasksChanged { .. }
         | EventKind::SchedulesChanged { .. }
         | EventKind::TaskStopRequested { .. }
-        | EventKind::TaskStopRefused { .. } => (None, None),
+        | EventKind::TaskStopRefused { .. }
+        | EventKind::CallsUnanswered { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -401,7 +408,13 @@ mod tests {
         // Other events leave it, whatever their stamp.
         summary.apply(
             Seq(3),
-            &in_context(first, EventKind::AgentMessage { text: "x".into() }),
+            &in_context(
+                first,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "x".into(),
+                },
+            ),
         );
         assert_eq!(summary.context, fresh);
         summary.apply(
@@ -699,6 +712,30 @@ mod tests {
     }
 
     #[test]
+    fn only_the_main_agents_messages_are_notable() {
+        let message = |parent| EventKind::AgentMessage {
+            text: "done".into(),
+            parent,
+        };
+        assert!(is_notable(&message(None)));
+        assert!(!is_notable(&message(Some(skywave_proto::CallId::new()))));
+        let unanswered = EventKind::CallsUnanswered {
+            calls: vec![skywave_proto::CallId::new()],
+        };
+        assert!(!is_notable(&unanswered));
+
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+            from: None,
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        summary.apply(Seq(2), &event(sid, 1, unanswered));
+        assert_eq!((summary.last_seq, summary.notable), (Seq(1), 0));
+    }
+
+    #[test]
     fn a_tool_call_references_its_input_and_its_whole_body() {
         let blob = |size| BlobRef {
             id: skywave_proto::BlobId::new(),
@@ -706,6 +743,7 @@ mod tests {
         };
         let (input, full) = (blob(10), blob(20));
         let call = EventKind::ToolCall(ToolCall {
+            parent: None,
             call: Some(skywave_proto::CallId::new()),
             name: "Edit".into(),
             display: skywave_proto::ToolDisplay {

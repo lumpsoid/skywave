@@ -645,6 +645,7 @@ mod tests {
 
     fn task(ambient: bool) -> BackgroundTask {
         BackgroundTask {
+            call: None,
             id: TaskId("t".into()),
             kind: TaskKind::Shell,
             title: "t".into(),

@@ -486,7 +486,14 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
         from: Seq(1),
         events: vec![
             created(old, 0),
-            event(old, 1, EventKind::AgentMessage { text: "hi".into() }),
+            event(
+                old,
+                1,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "hi".into(),
+                },
+            ),
         ],
     })
     .unwrap();

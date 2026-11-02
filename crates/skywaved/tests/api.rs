@@ -150,7 +150,10 @@ impl Fixture {
                 &mut self.storage.db,
                 session,
                 ContextId::first_of(session),
-                EventKind::AgentMessage { text: text.into() },
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: text.into(),
+                },
             )
             .unwrap()
     }
@@ -629,6 +632,7 @@ async fn long_poll_returns_when_an_event_is_appended() {
     assert_eq!(
         batch.events[0].kind,
         EventKind::AgentMessage {
+            parent: None,
             text: "news".into()
         }
     );

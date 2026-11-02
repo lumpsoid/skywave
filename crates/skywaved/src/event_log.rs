@@ -203,7 +203,8 @@ impl EventLog {
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
-            | EventKind::TaskStopRefused { .. } => {}
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => {}
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
@@ -522,7 +523,8 @@ pub(crate) fn append_in(
         | EventKind::TurnUsage(_)
         | EventKind::ModelsOffered { .. }
         | EventKind::TaskStopRequested { .. }
-        | EventKind::TaskStopRefused { .. } => {}
+        | EventKind::TaskStopRefused { .. }
+        | EventKind::CallsUnanswered { .. } => {}
     }
     Ok(seq)
 }
@@ -726,6 +728,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::SchedulesChanged { .. } => "SchedulesChanged",
         EventKind::TaskStopRequested { .. } => "TaskStopRequested",
         EventKind::TaskStopRefused { .. } => "TaskStopRefused",
+        EventKind::CallsUnanswered { .. } => "CallsUnanswered",
     }
 }
 

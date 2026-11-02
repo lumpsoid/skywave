@@ -1802,7 +1802,7 @@ impl Model {
                         delivery: sent.and_then(|e| Delivery::of(e)),
                     }
                 }),
-                EventKind::AgentMessage { text } => {
+                EventKind::AgentMessage { text, .. } => {
                     Some(Entry::AgentMessage { text: text.clone() })
                 }
                 EventKind::ToolCall(ToolCall {
@@ -1810,6 +1810,7 @@ impl Model {
                     name,
                     display,
                     input,
+                    ..
                 }) if !tools.calls.contains_key(call) => {
                     tools.calls.insert(*call, (items.len(), event.at));
                     tools.open.push(items.len());
@@ -1955,6 +1956,12 @@ impl Model {
                 // A stop shows as its task leaving the set; nothing in the
                 // timeline.
                 EventKind::TaskStopRequested { .. } | EventKind::TaskStopRefused { .. } => None,
+                // The server says these calls will never get a result;
+                // nothing in the timeline but the calls' own outcome.
+                EventKind::CallsUnanswered { calls } => {
+                    tools.unanswered(&mut items, calls);
+                    None
+                }
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
@@ -2255,6 +2262,19 @@ impl ToolIndex {
             }
             Entry::Approval { status: own, .. } => *own = status,
             _ => {}
+        }
+    }
+
+    /// The server logged that `calls` will never get a result: each one
+    /// still running has none; a settled one is left alone.
+    fn unanswered(&self, items: &mut [TimelineItem], calls: &[CallId]) {
+        for call in calls {
+            if let Some(&(item, _)) = self.calls.get(call)
+                && let Some(view) = tool_at(items, item)
+                && matches!(view.outcome, ToolOutcome::Running { .. })
+            {
+                view.outcome = ToolOutcome::NoResult;
+            }
         }
     }
 
@@ -2781,7 +2801,13 @@ mod tests {
                     },
                 ),
                 (None, EventKind::SessionStateChanged(LogState::AgentWorking)),
-                (None, EventKind::AgentMessage { text: "hi".into() }),
+                (
+                    None,
+                    EventKind::AgentMessage {
+                        parent: None,
+                        text: "hi".into(),
+                    },
+                ),
             ],
         );
         let view = f.session_view();
@@ -3196,6 +3222,7 @@ mod tests {
 
     fn work_task(id: &str) -> skywave_proto::BackgroundTask {
         skywave_proto::BackgroundTask {
+            call: None,
             id: TaskId(id.into()),
             kind: skywave_proto::TaskKind::Shell,
             title: id.into(),
@@ -4326,6 +4353,7 @@ mod tests {
             sid,
             vec![
                 EventKind::ToolCall(ToolCall {
+                    parent: None,
                     call: None,
                     name: "bash".into(),
                     display: ToolDisplay {
@@ -5032,6 +5060,7 @@ mod tests {
 
     fn tool_call(call: Option<CallId>, kind: ToolKind, title: &str) -> EventKind {
         EventKind::ToolCall(ToolCall {
+            parent: None,
             call,
             name: "agent-tool".into(),
             display: ToolDisplay {
@@ -5113,6 +5142,7 @@ mod tests {
             vec![
                 EventKind::SessionStateChanged(LogState::AgentWorking),
                 EventKind::ToolCall(ToolCall {
+                    parent: None,
                     call: Some(call),
                     name: "Write".into(),
                     display: ToolDisplay {
@@ -5387,6 +5417,36 @@ mod tests {
     }
 
     #[test]
+    fn calls_unanswered_ends_exactly_the_named_running_calls() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (named, done, other) = (CallId::new(), CallId::new(), CallId::new());
+        // Logged before any later state change, so the turn-end rule has not
+        // settled the calls: only `CallsUnanswered` can.
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(named), ToolKind::Subagent, "explore"),
+                tool_call(Some(done), ToolKind::Shell, "ls"),
+                tool_call(Some(other), ToolKind::Fetch, "https://example.com"),
+                tool_result(Some(done), false, "ok"),
+                EventKind::CallsUnanswered {
+                    calls: vec![named, done, CallId::new()],
+                },
+            ],
+        );
+        f.open(sid);
+        let views = tools(&f);
+        assert_eq!(views[0].outcome, ToolOutcome::NoResult);
+        assert!(matches!(views[1].outcome, ToolOutcome::Done { .. }));
+        // The control: a running call it does not name stays running.
+        assert!(matches!(views[2].outcome, ToolOutcome::Running { .. }));
+        assert_eq!(views.len(), 3, "it adds no item");
+        assert_eq!(entries(&f).len(), 3);
+    }
+
+    #[test]
     fn events_without_a_call_stay_separate_entries() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
@@ -5447,7 +5507,10 @@ mod tests {
     }
 
     fn agent(text: &str) -> EventKind {
-        EventKind::AgentMessage { text: text.into() }
+        EventKind::AgentMessage {
+            parent: None,
+            text: text.into(),
+        }
     }
 
     fn unread(f: &Fixture, id: SessionId) -> u64 {

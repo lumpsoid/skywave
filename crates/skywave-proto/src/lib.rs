@@ -16,8 +16,7 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// Wire protocol version. Bump on any incompatible change to these types.
 ///
 /// v2: tool calls carry a [`CallId`] and a bounded [`ToolDisplay`] instead of
-/// a free-form summary; v1 log events still decode (see [`ToolCall`],
-/// [`ToolResult`]).
+/// a free-form summary.
 ///
 /// v3: `CommandKind::StopSession` and `EventKind::SessionStopped`; a v2
 /// client cannot decode the new event.
@@ -70,7 +69,14 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`SessionOrigin`] in `EventKind::SessionCreated::from`, which now names
 /// either a moved context or such a conversation; and
 /// `RejectReason::BadConversation`.
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// v13: subagent transcripts. `parent` on `EventKind::AgentMessage` and
+/// [`ToolCall`], the `Agent` call that started the subagent speaking
+/// (`None` for the main agent); [`BackgroundTask::call`]; and
+/// `EventKind::CallsUnanswered`, calls that will never get a result. v1 tool
+/// shapes no longer decode, superseding the v2 note above. v12 databases are
+/// deleted, not migrated.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -261,6 +267,9 @@ pub enum EventKind {
     },
     AgentMessage {
         text: String,
+        /// The `Agent` call that started the subagent speaking; `None` for
+        /// the main agent.
+        parent: Option<CallId>,
     },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
@@ -417,6 +426,13 @@ pub enum EventKind {
         reason: String,
         answers: Option<CommandId>,
     },
+    /// These calls will never get a result: the server logs it when it
+    /// knows (e.g. their subagent ended). Clients mark each named call
+    /// still running as having no result and leave settled ones alone. Not
+    /// notable, not activity.
+    CallsUnanswered {
+        calls: Vec<CallId>,
+    },
 }
 
 impl EventKind {
@@ -453,7 +469,8 @@ impl EventKind {
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
-            | EventKind::TaskStopRefused { .. } => None,
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => None,
         }
     }
 
@@ -498,7 +515,8 @@ impl EventKind {
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
-            | EventKind::TaskStopRefused { .. } => false,
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => false,
         }
     }
 
@@ -538,14 +556,14 @@ impl EventKind {
             | EventKind::BackgroundTasksChanged { .. }
             | EventKind::SchedulesChanged { .. }
             | EventKind::TaskStopRequested { .. }
-            | EventKind::TaskStopRefused { .. } => None,
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. } => None,
         }
     }
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
-/// enforce them; v1 events decoded for compatibility may exceed them, so
-/// renderers should still clip.
+/// enforce them; renderers should still clip.
 pub mod limits {
     /// Longest [`ToolDisplay::title`](crate::ToolDisplay::title), in chars.
     pub const TITLE_MAX_CHARS: usize = 120;
@@ -880,6 +898,9 @@ pub struct BackgroundTask {
     pub title: String,
     /// The subagent task that launched this one, if any.
     pub parent: Option<TaskId>,
+    /// The `Agent` call a [`TaskKind::Subagent`] task runs; `None` for
+    /// shells and when unknown.
+    pub call: Option<CallId>,
     /// Not activity: no busy indicator, and it does not keep the agent
     /// alive on its own.
     pub ambient: bool,
@@ -964,14 +985,13 @@ pub enum RuleScope {
 /// must not branch on it, only on [`ToolDisplay::kind`]. `input` is the full
 /// input as a blob, when it is worth fetching.
 ///
-/// **v1 compatibility.** A v1 `tool_call` has a free-form `summary` and no
-/// `call` or `display`; it decodes as `call: None` and a display of kind
-/// [`ToolKind::Other`] whose title is the summary. A v2 server always sets
-/// `call`.
+/// `parent` is the `Agent` call that started the subagent making this call;
+/// `None` for the main agent. A nested subagent chains through the inner
+/// `Agent` call's own `parent`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(try_from = "compat::ToolCallWire")]
 pub struct ToolCall {
     pub call: Option<CallId>,
+    pub parent: Option<CallId>,
     pub name: String,
     pub display: ToolDisplay,
     pub input: Option<BlobRef>,
@@ -1031,17 +1051,10 @@ pub enum BodyFormat {
 }
 
 /// A tool finished.
-///
-/// **v1 compatibility.** A v1 `tool_result` has only `summary` and `output`;
-/// it decodes as `call: None`, `is_error: false`, `status: None`, the summary
-/// verbatim as `preview` and its line count as `lines`. (A v1 server marked
-/// failures with a `[error] ` summary prefix; it stays in the preview rather
-/// than being guessed into `is_error`.)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(try_from = "compat::ToolResultWire")]
 pub struct ToolResult {
-    /// The [`ToolCall`] this answers; `None` in v1 events or when the agent
-    /// reported a result for no logged call.
+    /// The [`ToolCall`] this answers; `None` when the agent reported a
+    /// result for no logged call.
     pub call: Option<CallId>,
     pub is_error: bool,
     /// Short outcome, at most [`limits::STATUS_MAX_CHARS`], e.g. `created`,
@@ -1054,94 +1067,6 @@ pub struct ToolResult {
     pub lines: u32,
     /// The whole output, when `preview` does not hold all of it.
     pub output: Option<BlobRef>,
-}
-
-/// Decoders that accept both v1 and v2 tool events.
-mod compat {
-    use serde::Deserialize;
-
-    use crate::{BlobRef, CallId, ToolCall, ToolDisplay, ToolKind, ToolResult};
-
-    /// A `tool_call` as v1 (`summary`) or v2 (`call`, `display`) wrote it.
-    #[derive(Deserialize)]
-    pub(crate) struct ToolCallWire {
-        #[serde(default)]
-        call: Option<CallId>,
-        name: String,
-        #[serde(default)]
-        display: Option<ToolDisplay>,
-        /// v1 only.
-        #[serde(default)]
-        summary: Option<String>,
-        #[serde(default)]
-        input: Option<BlobRef>,
-    }
-
-    impl TryFrom<ToolCallWire> for ToolCall {
-        type Error = &'static str;
-
-        fn try_from(wire: ToolCallWire) -> Result<Self, Self::Error> {
-            let display = match (wire.display, wire.summary) {
-                (Some(display), _) => display,
-                (None, Some(summary)) => ToolDisplay {
-                    kind: ToolKind::Other,
-                    title: summary,
-                    detail: None,
-                    body: None,
-                },
-                (None, None) => return Err("tool_call needs `display` (v2) or `summary` (v1)"),
-            };
-            Ok(ToolCall {
-                call: wire.call,
-                name: wire.name,
-                display,
-                input: wire.input,
-            })
-        }
-    }
-
-    /// A `tool_result` as v1 (`summary`) or v2 (`preview`, `lines`) wrote it.
-    #[derive(Deserialize)]
-    pub(crate) struct ToolResultWire {
-        #[serde(default)]
-        call: Option<CallId>,
-        #[serde(default)]
-        is_error: bool,
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        preview: Option<String>,
-        #[serde(default)]
-        lines: Option<u32>,
-        /// v1 only.
-        #[serde(default)]
-        summary: Option<String>,
-        #[serde(default)]
-        output: Option<BlobRef>,
-    }
-
-    impl TryFrom<ToolResultWire> for ToolResult {
-        type Error = &'static str;
-
-        fn try_from(wire: ToolResultWire) -> Result<Self, Self::Error> {
-            let (preview, lines) = match (wire.preview, wire.lines, wire.summary) {
-                (Some(preview), Some(lines), _) => (preview, lines),
-                (None, None, Some(summary)) => {
-                    let lines = u32::try_from(summary.lines().count()).unwrap_or(u32::MAX);
-                    (summary, lines)
-                }
-                _ => return Err("tool_result needs `preview` and `lines` (v2) or `summary` (v1)"),
-            };
-            Ok(ToolResult {
-                call: wire.call,
-                is_error: wire.is_error,
-                status: wire.status,
-                preview,
-                lines,
-                output: wire.output,
-            })
-        }
-    }
 }
 
 /// What one turn took, as the agent reported it when the turn ended.
@@ -1592,7 +1517,10 @@ mod tests {
         };
         assert_eq!(message.archived_effect(), Some(false));
         for kind in [
-            EventKind::AgentMessage { text: "x".into() },
+            EventKind::AgentMessage {
+                parent: None,
+                text: "x".into(),
+            },
             EventKind::SessionStopped,
             EventKind::SessionRenamed {
                 name: Some("x".into()),
@@ -1602,6 +1530,16 @@ mod tests {
         ] {
             assert_eq!(kind.archived_effect(), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn calls_unanswered_is_an_agent_event_with_no_device_or_archived_effect() {
+        let kind = EventKind::CallsUnanswered {
+            calls: vec![CallId::new()],
+        };
+        assert_eq!(kind.device(), None);
+        assert!(!kind.logged_by_command());
+        assert_eq!(kind.archived_effect(), None);
     }
 
     #[test]
@@ -1772,7 +1710,13 @@ mod tests {
         };
         assert_eq!(created.device(), None);
         assert!(created.logged_by_command());
-        assert!(!EventKind::AgentMessage { text: "x".into() }.logged_by_command());
+        assert!(
+            !EventKind::AgentMessage {
+                parent: None,
+                text: "x".into()
+            }
+            .logged_by_command()
+        );
     }
 
     #[test]

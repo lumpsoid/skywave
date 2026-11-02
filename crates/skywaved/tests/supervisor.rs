@@ -401,6 +401,7 @@ async fn full_turn_through_commands() {
     assert_eq!(
         kinds[2],
         EventKind::AgentMessage {
+            parent: None,
             text: "Writing a file.".into()
         }
     );
@@ -418,6 +419,7 @@ async fn full_turn_through_commands() {
     assert_eq!(
         kinds[6],
         EventKind::AgentMessage {
+            parent: None,
             text: "Done.".into()
         }
     );
@@ -534,6 +536,7 @@ async fn first_of_two_devices_answering_wins() {
         }]
     );
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "Not writing it.".into()
     }));
     let answers: Vec<_> = agent
@@ -590,6 +593,7 @@ async fn interrupt_with_pending_approval_returns_to_idle() {
     f.send("again");
     let kinds = f.wait_count("second idle", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "echo: again".into()
     }));
     assert_eq!(
@@ -624,6 +628,7 @@ async fn crash_mid_turn_then_next_message_resumes() {
     f.send("second");
     let kinds = f.wait_count("idle", 1, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "echo: second".into()
     }));
     assert_eq!(
@@ -702,6 +707,7 @@ async fn daemon_restart_cancels_pending_approvals_and_resumes() {
     f.send("again");
     let kinds = f.wait_count("idle", 1, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "echo: again".into()
     }));
     assert_eq!(
@@ -733,6 +739,7 @@ async fn daemon_restart_delivers_pending_messages_once() {
     let supervisor = f.start(&agent).await;
     let kinds = f.wait_count("second reply", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "echo: two".into()
     }));
     supervisor.shutdown().await.unwrap();
@@ -863,6 +870,7 @@ async fn a_turn_the_agent_starts_itself_is_not_cut_by_the_idle_timer() {
     let kinds = f.kinds();
     assert!(!kinds.iter().any(is_errored), "log: {kinds:#?}");
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "tick".into()
     }));
     assert_eq!(
@@ -1211,6 +1219,7 @@ async fn a_stop_with_no_agent_running_is_refused_without_starting_one() {
             first,
             EventKind::BackgroundTasksChanged {
                 tasks: vec![skywave_proto::BackgroundTask {
+                    call: None,
                     id: TaskId("job".into()),
                     kind: skywave_proto::TaskKind::Shell,
                     title: "sleep 60".into(),
@@ -1268,6 +1277,7 @@ async fn a_stop_ends_the_live_tasks_and_the_next_start_has_none() {
     f.wait_count("second idle", 2, is_idle).await;
     supervisor.shutdown().await.unwrap();
     assert!(f.kinds().contains(&EventKind::AgentMessage {
+        parent: None,
         text: "fresh".into()
     }));
     // The set, its end at the stop, and nothing for the empty report.
@@ -1305,6 +1315,7 @@ async fn stop_mid_turn_interrupts_shuts_down_and_resumes() {
     f.send("again");
     let kinds = f.wait_count("second idle", 2, is_idle).await;
     assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
         text: "echo: again".into()
     }));
     supervisor.shutdown().await.unwrap();
@@ -2053,6 +2064,7 @@ fn handle_of(f: &Fixture, context: ContextId) -> Option<skywaved::agent::ResumeH
 
 fn reply(text: &str) -> EventKind {
     EventKind::AgentMessage {
+        parent: None,
         text: format!("echo: {text}"),
     }
 }
@@ -2600,7 +2612,7 @@ async fn a_context_moved_mid_turn_is_stopped_and_forked_by_its_new_session() {
                 (EventKind::SessionCreated { from: Some(SessionOrigin::Context(from)), .. }, _),
                 (EventKind::UserMessage { .. }, _),
                 (EventKind::SessionStateChanged(SessionState::AgentWorking), _),
-                (EventKind::AgentMessage { text }, _),
+                (EventKind::AgentMessage { text, .. }, _),
                 (EventKind::SessionStateChanged(SessionState::Idle), _),
             ] if from.session == f.session_id && from.context == a && text == "first"
         ),
