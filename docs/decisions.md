@@ -714,3 +714,41 @@ neither reaches the agent nor disturbs its turn, and runs go on across
 CLI's own `bash_command` input is not used, and the runner is a sibling of
 the supervisor, not part of it.
 **Deferred:** per-run timeouts and a concurrency cap across sessions.
+
+## D36. Reading a session's workdir: read-only, confined, on by default
+A device lists a session's workdir and reads its files (protocol v15,
+architecture.md "Protocol" and "Server"; `crates/skywaved/src/workdir.rs`).
+A request names a session, never a raw server path, so a device reads only
+workdirs sessions run in.
+**Security.** Any paired device can read any file under a session's
+workdir, `.env` included. That is no wider than what the agent there can
+already read for it, and narrower than the shell runner (D35), so it is
+**on by default with no config switch**.
+**Confined to the canonical workdir.** The stored workdir must still
+canonicalise to itself under the roots, else the answer is `WorkdirGone`. A
+requested path must be relative, must not climb out with `..` (decided
+lexically, so an escape is `NotAllowed` even when its target is missing),
+and must canonicalise under the canonical workdir, so a symlink inside that
+leads out is `NotAllowed`. Answers name the canonical path. A file is opened
+only if it is a regular file: a FIFO read would block forever while holding
+the workdir lock. The git changes view (next) never follows an untracked
+symlink: its "diff" is the link text, as git shows a tracked one, so
+`x -> ~/.ssh/id_ed25519` cannot publish a file outside the workdir.
+**The check-then-open race is accepted.** Canonicalising and opening are not
+atomic: whoever can write the workdir can swap a symlink between them. That
+is the agent, which can already read the target itself, so the race is
+written down, not defended. (The open is non-blocking and the opened handle
+is checked to be a regular file again, so a FIFO swapped in is still
+refused.)
+**One snapshot at a time, with one deadline.** Reads run on their own
+database connection behind a mutex, never the API's. An outer timeout only
+drops the request's future, not its blocking work, so each request carries
+a deadline from its handler's start: a request that gets the lock past it
+does nothing, and work in progress stops at it. Otherwise N presses of
+refresh would run N snapshots back to back.
+**Content-deduplicated blobs.** File contents are blobs looked up by
+`(sha256, size)` in `workdir_blobs`: unchanged content keeps its `BlobId`,
+so a refresh costs no server disk and no device fetch. Only workdir content
+is looked up, so a snapshot never shares a blob with an event, whose
+per-session deletion on the device could then remove it.
+**Deferred:** blob GC (workdir and event blobs alike grow without bound).

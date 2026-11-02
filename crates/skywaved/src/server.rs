@@ -73,8 +73,9 @@ pub struct Server {
 }
 
 impl Server {
-    /// Builds the TLS config from `identity`, opens the API's and pairing's
-    /// own connections to the database in `dir`, and binds `addr`.
+    /// Builds the TLS config from `identity`, opens the API's, workdir
+    /// reads' and pairing's own connections to the database in `dir`, and
+    /// binds `addr`.
     ///
     /// `log` is the process's one [`EventLog`]; other writers (the agent
     /// supervisor) share it so their appends wake long-polls.
@@ -87,6 +88,7 @@ impl Server {
         let tls = TlsAcceptor::from(tls_config(&identity)?);
         let (stop, stopped) = watch::channel(false);
         let api = Api::new(
+            Db::open(&dir.db_path())?,
             Db::open(&dir.db_path())?,
             log,
             BlobStore::new(dir.blobs_dir()),

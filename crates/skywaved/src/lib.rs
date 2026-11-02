@@ -21,6 +21,7 @@ mod process;
 pub mod server;
 pub mod shell;
 pub mod supervisor;
+pub mod workdir;
 
 use std::io::Read;
 use std::path::PathBuf;

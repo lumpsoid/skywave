@@ -65,6 +65,10 @@ pub enum Error {
     Supervisor(String),
     #[error("shell runner: {0}")]
     Shell(String),
+    /// A workdir snapshot reached its request's deadline (`crate::workdir`);
+    /// the API answers 503.
+    #[error("workdir snapshot passed its deadline")]
+    WorkdirDeadline,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
