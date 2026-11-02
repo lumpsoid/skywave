@@ -569,7 +569,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
 fn footer_hint(app: &App) -> Cow<'static, str> {
     if !app.ui().help
         && let Some((view, ui)) = app.session()
-        && let Some(search) = &ui.search
+        && let Some(search) = &ui.shown.search
     {
         if search.editing {
             let partial = search
@@ -685,7 +685,7 @@ fn footer_keys(app: &App) -> &'static str {
                     stopping: Some(_), ..
                 }) => "y stops the task · any other key back · ? help",
                 Some(Picker::Background { .. }) => {
-                    "↑↓ choose · Enter on a task stops it · Esc close · ? help"
+                    "↑↓ choose · Enter on a task stops it · o open a subagent · Esc close · ? help"
                 }
                 Some(Picker::Effort { .. }) => "↑↓ choose · Enter switch · Esc back · ? help",
                 _ => {
@@ -697,7 +697,7 @@ fn footer_keys(app: &App) -> &'static str {
             Some((view, ui, Focus::Timeline)) if ui.rule_pick(view).is_some() => {
                 "↑↓ choose · Enter approve and always allow · Esc back to a/x · ? help"
             }
-            Some((view, ui, Focus::Timeline)) => match discardable(view, ui.selected) {
+            Some((view, ui, Focus::Timeline)) => match discardable(view, ui.shown.selected) {
                 Some((_, Outgoing::Failed(_))) => {
                     "e edit · Del dismiss · ↑↓ select · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
@@ -713,6 +713,12 @@ fn footer_keys(app: &App) -> &'static str {
                 }
                 None if view.pending_approval.is_some() => {
                     "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
+                }
+                None if view.subagent.is_some() => {
+                    "↑↓ select · Enter expand · o open · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · S stop subagent · Tab write · Esc back out · ? help"
+                }
+                None if ui.open_subagent(view).is_some() => {
+                    "↑↓ select · Enter expand · o open subagent · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
                     "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
@@ -894,7 +900,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("v", "select and expand the call it gates"),
                     key("S", "stop the agent; a message restarts it"),
                     key("", "(with background work, y confirms)"),
+                    key("", "(in a subagent's view: stop its task, y confirms)"),
                     key("B", "list background work; Enter on a task stops it"),
+                    key("o", "open the selected subagent (also o in B's list)"),
+                    key("", "(Esc leaves it; messages still go to the main agent)"),
                     key("p", "switch the agent's permission mode"),
                     key("", "(bypass lets every tool run: y confirms it)"),
                     key("m", "switch the agent's model or effort: m or e"),

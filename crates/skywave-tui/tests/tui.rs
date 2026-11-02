@@ -3727,7 +3727,16 @@ fn turns_step_and_agent_messages_select() {
     h.key(KeyCode::Up);
     assert_contains(&h.screen(), ">       agent: Done:");
     assert_eq!(h.key(KeyCode::Enter), None);
-    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    assert!(
+        h.app
+            .ui()
+            .session
+            .as_ref()
+            .unwrap()
+            .shown
+            .expanded
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3765,10 +3774,28 @@ fn expanding_above_the_screen_keeps_the_view_still() {
     let before = h.screen();
     assert!(!before.contains("✎ Write src/bin/hello.rs"), "{before}");
     assert_contains(&before, "scrolled back");
-    let total = h.app.ui().session.as_ref().unwrap().geometry.borrow().total;
+    let total = h
+        .app
+        .ui()
+        .session
+        .as_ref()
+        .unwrap()
+        .shown
+        .geometry
+        .borrow()
+        .total;
     h.key(KeyCode::Enter);
     let after = h.screen();
-    let grown = h.app.ui().session.as_ref().unwrap().geometry.borrow().total;
+    let grown = h
+        .app
+        .ui()
+        .session
+        .as_ref()
+        .unwrap()
+        .shown
+        .geometry
+        .borrow()
+        .total;
     assert!(grown > total, "the Write grew: {total} → {grown}");
     // The Write's last line is cut by the top edge: that row now shows its
     // new end; everything from the next item down stays where it was.
@@ -3992,7 +4019,7 @@ fn shift_a_lists_several_rules_to_pick_one() {
     let (mut h, _, approval, _) = gated_offering(before, bash, offered);
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
-    let selected = h.app.ui().session.as_ref().unwrap().selected;
+    let selected = h.app.ui().session.as_ref().unwrap().shown.selected;
     assert!(selected.is_some());
     assert_contains(
         &panel(&h.screen())[1],
@@ -4027,7 +4054,10 @@ fn shift_a_lists_several_rules_to_pick_one() {
     for code in [KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Up] {
         assert_eq!(h.key(code), None);
     }
-    assert_eq!(h.app.ui().session.as_ref().unwrap().selected, selected);
+    assert_eq!(
+        h.app.ui().session.as_ref().unwrap().shown.selected,
+        selected
+    );
     assert_contains(&panel(&h.screen())[2], "› all edits (this session)");
     assert_eq!(
         h.key(KeyCode::Enter),
@@ -4091,8 +4121,8 @@ fn v_reveals_gated_call() {
     h.key(KeyCode::Esc);
     assert_eq!(h.key(KeyCode::Char('v')), None, "nothing is downloaded");
     let ui = h.app.ui().session.as_ref().unwrap();
-    assert_eq!(ui.selected, Some(ItemKey::Logged(seq)));
-    assert!(ui.expanded.contains(&seq));
+    assert_eq!(ui.shown.selected, Some(ItemKey::Logged(seq)));
+    assert!(ui.shown.expanded.contains(&seq));
     // Taller than the timeline: its top is the first row.
     let screen = h.screen();
     assert_contains(screen.lines().nth(3).unwrap(), ">       ± Edit src/lib.rs");
@@ -4119,7 +4149,7 @@ fn v_reveals_gated_call() {
     let screen = h.screen();
     assert!(!screen.contains("Approval needed"), "{screen}");
     assert_eq!(
-        h.app.ui().session.as_ref().unwrap().selected,
+        h.app.ui().session.as_ref().unwrap().shown.selected,
         Some(ItemKey::Logged(seq))
     );
     assert_contains(&screen, ">       ± Edit src/lib.rs");
@@ -4127,7 +4157,7 @@ fn v_reveals_gated_call() {
 
 /// The scroll state of the open session: `None` follows.
 fn scroll(h: &Harness) -> Option<Anchor> {
-    h.app.ui().session.as_ref().unwrap().scroll
+    h.app.ui().session.as_ref().unwrap().shown.scroll
 }
 
 #[test]
@@ -4210,7 +4240,7 @@ fn long_shell_output_stays_visible() {
 // ---- messages can be selected -----------------------------------------------
 
 fn selected(h: &Harness) -> Option<ItemKey> {
-    h.app.ui().session.as_ref().unwrap().selected
+    h.app.ui().session.as_ref().unwrap().shown.selected
 }
 
 #[test]
@@ -4235,7 +4265,16 @@ fn user_messages_are_selectable() {
     // A message expands to nothing and has nothing to download.
     assert_eq!(h.key(KeyCode::Enter), None);
     assert_eq!(h.key(KeyCode::Char('d')), None);
-    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    assert!(
+        h.app
+            .ui()
+            .session
+            .as_ref()
+            .unwrap()
+            .shown
+            .expanded
+            .is_empty()
+    );
     h.key(KeyCode::Up);
     assert_contains(&h.screen(), "> 12:03 you: and this");
     h.key(KeyCode::Up);
@@ -4785,7 +4824,7 @@ fn searchable() -> (Harness, SessionId, DeviceId) {
 }
 
 fn search(h: &Harness) -> Option<&skywave_tui::app::Search> {
-    h.app.ui().session.as_ref()?.search.as_ref()
+    h.app.ui().session.as_ref()?.shown.search.as_ref()
 }
 
 /// The position of the first character of `needle` on the line holding
@@ -4984,15 +5023,33 @@ fn a_match_only_in_hidden_output_expands_its_item() {
     h.key(KeyCode::Char('/'));
     h.type_text("7 bytes");
     h.key(KeyCode::Enter);
-    assert_eq!(h.app.ui().session.as_ref().unwrap().expanded.len(), 1);
+    assert_eq!(h.app.ui().session.as_ref().unwrap().shown.expanded.len(), 1);
     assert_contains(&h.screen(), "wrote 7 bytes");
     // A match in the title shows collapsed: nothing expands.
     h.key(KeyCode::Enter);
-    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    assert!(
+        h.app
+            .ui()
+            .session
+            .as_ref()
+            .unwrap()
+            .shown
+            .expanded
+            .is_empty()
+    );
     h.key(KeyCode::Char('/'));
     h.type_text("notes.md");
     h.key(KeyCode::Enter);
-    assert!(h.app.ui().session.as_ref().unwrap().expanded.is_empty());
+    assert!(
+        h.app
+            .ui()
+            .session
+            .as_ref()
+            .unwrap()
+            .shown
+            .expanded
+            .is_empty()
+    );
 }
 
 /// A shell call `command` whose output is `output`, its preview `preview`.
@@ -5029,7 +5086,7 @@ fn downloaded(h: &mut Harness, dir: &tempfile::TempDir, name: &str, id: BlobId, 
 
 /// How many of the open session's items are expanded.
 fn expanded(h: &Harness) -> usize {
-    h.app.ui().session.as_ref().unwrap().expanded.len()
+    h.app.ui().session.as_ref().unwrap().shown.expanded.len()
 }
 
 #[test]
@@ -6604,4 +6661,317 @@ fn enter_on_a_loop_sends_nothing() {
     h.key(KeyCode::Up);
     h.key(KeyCode::Enter);
     assert_contains(&h.screen(), "Stop npm run dev?");
+}
+
+/// An open session, on the timeline, whose main agent started a subagent
+/// ("Explore") that made three calls, the last `Read c.rs`. Its task runs
+/// in the background while `live`. Returns the `Agent` call.
+fn with_subagent(live: bool) -> (Harness, SessionId, skywave_proto::CallId) {
+    let (mut h, id, me) = open_session();
+    h.key(KeyCode::Esc);
+    let agent = skywave_proto::CallId::new();
+    let call = |minute: u32, call: skywave_proto::CallId, parent, kind, title: &str| {
+        event(
+            id,
+            minute,
+            EventKind::ToolCall(ToolCall {
+                call: Some(call),
+                parent,
+                name: "tool".into(),
+                display: ToolDisplay {
+                    kind,
+                    title: title.into(),
+                    detail: None,
+                    body: None,
+                },
+                input: None,
+            }),
+        )
+    };
+    let mut events = vec![
+        message(id, 1, CommandId::new(), me, "look around"),
+        call(2, agent, None, ToolKind::Subagent, "Explore"),
+        event(
+            id,
+            3,
+            EventKind::ToolResult(ToolResult {
+                call: Some(agent),
+                is_error: false,
+                status: None,
+                preview: "Async agent launched".into(),
+                lines: 1,
+                output: None,
+            }),
+        ),
+    ];
+    for (minute, name) in [(4, "a.rs"), (5, "b.rs"), (6, "c.rs")] {
+        events.push(call(
+            minute,
+            skywave_proto::CallId::new(),
+            Some(agent),
+            ToolKind::FileRead,
+            &format!("Read {name}"),
+        ));
+    }
+    if live {
+        let mut explore = task(
+            "t1",
+            skywave_proto::TaskKind::Subagent,
+            "Explore",
+            None,
+            false,
+        );
+        explore.call = Some(agent);
+        events.push(event(
+            id,
+            7,
+            EventKind::BackgroundTasksChanged {
+                tasks: vec![explore],
+            },
+        ));
+    }
+    pull(&mut h, events);
+    (h, id, agent)
+}
+
+/// Selects the `Agent` row on the timeline.
+fn select_row(h: &mut Harness, title: &str) {
+    for step in 0..8 {
+        let selected = h.app.ui().session.as_ref().unwrap().shown.selected;
+        let on_it = match (selected, h.app.session()) {
+            (Some(key), Some((view, _))) => skywave_present::sections::find(view, key)
+                .is_some_and(|i| format!("{:?}", view.timeline[i]).contains(title)),
+            _ => false,
+        };
+        if on_it {
+            return;
+        }
+        h.key(if step < 4 { KeyCode::Down } else { KeyCode::Up });
+    }
+    panic!("{title} not selectable:\n{}", h.screen());
+}
+
+#[test]
+fn a_subagent_row_shows_how_it_stands_and_o_opens_it() {
+    let (mut h, id, agent) = with_subagent(true);
+    let screen = h.screen();
+    assert_contains(
+        &line_with(&screen, "Explore"),
+        "running · 3 steps · Read c.rs",
+    );
+    // The launch's own result is not what the row says.
+    assert!(!screen.contains("Async agent launched"), "{screen}");
+    // The main view holds only the Agent row, none of its calls.
+    assert!(!screen.contains("Read a.rs"), "{screen}");
+
+    // `o` with the row not selected does nothing (positive control below).
+    h.key(KeyCode::Char('G'));
+    select_row(&mut h, "Explore");
+    assert_eq!(
+        h.key(KeyCode::Char('o')),
+        Some(Action::ViewSubagent {
+            session_id: id,
+            call: Some(agent),
+        })
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "Read a.rs");
+    // The header names the trail and the status; the composer says whom it
+    // messages.
+    assert_contains(&screen, "look around › Explore");
+    assert_contains(&screen, "running · 3 steps · Read c.rs · S stops it");
+    assert_contains(&screen, "to the main agent");
+
+    // Esc steps out.
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert_contains(&h.screen(), "look around");
+}
+
+#[test]
+fn o_does_nothing_off_a_subagent_row() {
+    let (mut h, _, _) = with_subagent(true);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Char('o')), None);
+}
+
+#[test]
+fn a_finished_subagent_row_says_finished() {
+    let (h, _, _) = with_subagent(false);
+    // No task, and its call is no longer running: it ended.
+    let screen = h.screen();
+    assert_contains(&line_with(&screen, "Explore"), "finished · 3 steps");
+}
+
+#[test]
+fn leaving_a_subagent_selects_its_agent_row_and_keeps_the_main_composer() {
+    let (mut h, id, agent) = with_subagent(true);
+    // Unsaved text in the composer: the draft saver has not run, and the
+    // save every action makes first (D5) fails, so only the live composer
+    // can still hold the text after the round trip.
+    h.fail_draft_save(true);
+    h.key(KeyCode::Char('i'));
+    h.type_text("half a thought");
+    h.key(KeyCode::Esc);
+    assert_eq!(h.core_draft(), None);
+    // The selection is elsewhere, not on the Agent row.
+    select_row(&mut h, "look around");
+    h.key(KeyCode::Char('G'));
+    let before = h.app.ui().session.as_ref().unwrap().shown.selected;
+    select_row(&mut h, "Explore");
+    assert_ne!(
+        h.app.ui().session.as_ref().unwrap().shown.selected,
+        before,
+        "the control needs the selection to move"
+    );
+    h.key(KeyCode::Char('o'));
+    h.key(KeyCode::Down);
+    let inside = h.app.ui().session.as_ref().unwrap().shown.selected;
+    assert!(inside.is_some());
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+
+    // Back in the main view the Agent row is selected, not what the
+    // subagent view had selected.
+    let (view, ui) = h.app.session().unwrap();
+    assert!(view.subagent.is_none());
+    let row = ui
+        .shown
+        .selected
+        .and_then(|key| skywave_present::sections::find(view, key).map(|i| &view.timeline[i]));
+    let Some(skywave_core::TimelineItem::Logged {
+        entry: skywave_core::Entry::Tool(tool),
+        ..
+    }) = row
+    else {
+        panic!("the selected row is not the Agent call: {row:?}");
+    };
+    assert_eq!(tool.call, agent);
+    assert_ne!(ui.shown.selected, inside);
+
+    // The main composer kept its unsaved text through both views.
+    assert_eq!(h.app.composer().unwrap().text(), "half a thought");
+    assert_eq!(h.core_draft(), None);
+    let _ = id;
+}
+
+#[test]
+fn s_in_a_subagent_view_stops_its_task_after_y() {
+    let (mut h, id, agent) = with_subagent(true);
+    // Positive control: in the main view S still stops the agent.
+    h.key(KeyCode::Char('G'));
+    assert_eq!(h.key(KeyCode::Char('S')), None);
+    assert_contains(&h.screen(), "Stop the agent?");
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::StopSession { session_id: id })
+    );
+
+    select_row(&mut h, "Explore");
+    h.key(KeyCode::Char('o'));
+    assert_eq!(h.key(KeyCode::Char('S')), None);
+    let screen = h.screen();
+    assert_contains(&screen, "Stop this subagent? Explore");
+    assert!(!screen.contains("Stop the agent?"), "{screen}");
+    // Anything but `y` backs off.
+    assert_eq!(h.key(KeyCode::Char('n')), None);
+    h.key(KeyCode::Char('S'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::StopTask {
+            session_id: id,
+            task: skywave_proto::TaskId("t1".into()),
+        })
+    );
+    let _ = agent;
+}
+
+#[test]
+fn s_in_a_foreground_subagent_view_has_nothing_to_stop() {
+    let (mut h, _, _) = with_subagent(false);
+    select_row(&mut h, "Explore");
+    h.key(KeyCode::Char('o'));
+    assert_eq!(h.key(KeyCode::Char('S')), None);
+    let screen = h.screen();
+    assert!(!screen.contains("Stop"), "{screen}");
+    assert!(!screen.contains("S stops it"), "{screen}");
+}
+
+#[test]
+fn o_in_the_background_picker_opens_the_subagent_and_a_shell_task_does_not() {
+    let (mut h, id, agent) = with_subagent(true);
+    h.key(KeyCode::Char('B'));
+    assert_eq!(
+        h.key(KeyCode::Char('o')),
+        Some(Action::ViewSubagent {
+            session_id: id,
+            call: Some(agent),
+        })
+    );
+    // The picker closed, the subagent shows.
+    let screen = h.screen();
+    assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
+    assert_contains(&screen, "Read a.rs");
+
+    // A task with no call has nothing to open.
+    let (mut h, _, _) = with_work(one_task(), vec![]);
+    h.key(KeyCode::Char('B'));
+    assert_eq!(h.key(KeyCode::Char('o')), None);
+    assert!(h.app.ui().session.as_ref().unwrap().picker.is_some());
+}
+
+#[test]
+fn an_approval_from_a_subagent_says_so_and_where_to_look() {
+    let (mut h, id, agent) = with_subagent(true);
+    let gated = skywave_proto::CallId::new();
+    let approval = ApprovalId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                8,
+                EventKind::ToolCall(ToolCall {
+                    call: Some(gated),
+                    parent: Some(agent),
+                    name: "Write".into(),
+                    display: ToolDisplay {
+                        kind: ToolKind::FileWrite,
+                        title: "src/sync.rs".into(),
+                        detail: None,
+                        body: None,
+                    },
+                    input: None,
+                }),
+            ),
+            event(
+                id,
+                9,
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: Some(gated),
+                    tool: "Write".into(),
+                    summary: "Write src/sync.rs".into(),
+                    input: None,
+                    suggestions: vec![],
+                },
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "from subagent: Explore · open it to see the call");
+    // In the subagent's view the call is there, so the label says only who.
+    select_row(&mut h, "Explore");
+    h.key(KeyCode::Char('o'));
+    let screen = h.screen();
+    assert_contains(&screen, "from subagent: Explore");
+    assert!(!screen.contains("open it to see the call"), "{screen}");
+}
+
+#[test]
+fn the_help_lists_o_and_the_subagent_stop() {
+    let (mut h, _, _) = with_subagent(true);
+    let help = read_help(&mut h).join("\n");
+    assert_contains(&help, "open the selected subagent");
+    assert_contains(&help, "in a subagent's view: stop its task");
 }
