@@ -301,6 +301,7 @@ proxy, and adb helpers. `run.sh` without arguments prints how to use it.
 | `skywave-present` | Head-side presentation the TUI and the GUI share: timeline sections, wording, draft, read-mark and alert policies |
 | `gui/` | Flutter GUI head (desktop and Android) over rinf; its Rust bridge `hub` is in `gui/native/hub` |
 | `skywave-testkit` | Link harness: a proxy that injects latency, jitter, bandwidth caps and drops |
+| `skywave-claude-compat` | Run after a Claude Code CLI upgrade: checks the new CLI against what the adapter relies on |
 
 A few design choices that make it hold up:
 

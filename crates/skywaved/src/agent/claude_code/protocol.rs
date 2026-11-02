@@ -766,7 +766,8 @@ impl Protocol {
             tracing::warn!(
                 version,
                 pinned = PINNED_VERSION,
-                "agent CLI version differs from the one the adapter was confirmed against"
+                "agent CLI version differs from the one the adapter was confirmed against; \
+                 run skywave-claude-compat to check it"
             );
         }
         self.version = Some(version.to_owned());

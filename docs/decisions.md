@@ -529,8 +529,8 @@ Mid-run delivery leaves no line on stdout, so such a message stays queued in
 the heads, never guessed delivered.
 **`send_task_message` is not sent** (user decision): no try-then-fall-back
 in the adapter while every known CLI answers `Unsupported`. Each CLI bump
-re-runs `tests/support/probe-subagent-message.py ctl_live`; once it
-succeeds, record a fixture and revisit this decision.
+runs `skywave-claude-compat`, which watches that answer; once it changes,
+record a fixture and revisit this decision.
 **Rejected:** sending `send_task_message` speculatively on every process;
 writing a subagent's `pendingMessages` or task state from outside (internal
 to the CLI process); the agent-team mailbox route seen in the TUI's submit
@@ -625,7 +625,8 @@ docs/agents/claude-code.md §3.12):
 - This CLI blocks a standalone `sleep 25` in a subagent ("use Monitor"), so
   the `relay_live` / `relay_midrun` prompts need changing before re-recording.
 - The raw recordings in `/tmp/skywave-race/` are not fixtures; nothing
-  replays them. The probe's `relay_race` / `relay_race_echo` regenerate them.
+  replays them. The retired probe `tests/support/probe-subagent-message.py`
+  (in git history) regenerates them with `relay_race` / `relay_race_echo`.
 **Known debt:**
 - GUI: a nested subagent replaces the top page instead of getting a page per
   level (the header signal has no trail call ids); stepping out of a nested

@@ -28,8 +28,12 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
 
 New recordings are made with `tests/support/record-claude.sh`, which sits
 between skywaved and the real CLI and writes this format; `--scrub` applies
-the scrubbing below. `rules_granted.ndjson` (rule grants, task d29758) is
-not recorded yet; the runbook is in `docs/agents/claude-code.md` §3.5.
+the scrubbing below. `skywave-claude-compat --record <dir>` writes the same
+format and scrubbing for each of its scenarios (driven through the adapter's
+`Protocol`, so the stdin is what skywaved writes). The Python probes named
+below are retired in its favour; git history keeps them.
+`rules_granted.ndjson` (rule grants, task d29758) is not recorded yet; the
+runbook is in `docs/agents/claude-code.md` §3.5.
 
 ## Scrubbing
 

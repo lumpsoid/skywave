@@ -13,6 +13,8 @@ below before designing anything.
 - `crates/skywave-core`: device side: replica, outbox, sync, link state.
 - `crates/skywave-present`: presentation decisions shared by every head.
 - `crates/skywave-tui`: terminal head. `crates/skywave-testkit`: test helpers.
+- `crates/skywave-claude-compat`: run after a `claude` upgrade. It checks the
+  real CLI against the adapter (`--quick`, then `--full`).
 - `gui/`: Flutter head. `gui/native/hub` is the rinf bridge (crate name `hub`)
   and a member of the Cargo workspace.
 - `docs/`: `mvp-spec.md` (the spec), `decisions.md` (D-numbered and settled),
@@ -48,8 +50,8 @@ cargo test --workspace
 
 - Tests are deterministic. Use the fake agent (`crates/skywaved/tests/support/fake-claude.sh`)
   and the recorded fixtures in `crates/skywaved/tests/fixtures/claude-code/`.
-- Only fixture recording (`tests/support/record-claude.sh`) and probes run the
-  real `claude` CLI, in a scratch directory with trivial prompts. Write down
+- Only fixture recording (`tests/support/record-claude.sh`,
+  `skywave-claude-compat --record`) and probes run the real `claude` CLI, in a scratch directory with trivial prompts. Write down
   the CLI version.
 
 ## Rules

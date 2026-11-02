@@ -1,0 +1,19 @@
+[package]
+name = "skywave-claude-compat"
+description = "Checks a Claude Code CLI build against what skywaved's adapter relies on"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+skywave-proto.workspace = true
+skywaved = { path = "../skywaved" }
+tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

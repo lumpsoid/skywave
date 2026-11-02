@@ -1462,6 +1462,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "skywave-claude-compat"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde_json",
+ "skywave-proto",
+ "skywaved",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "skywave-core"
 version = "0.1.0"
 dependencies = [
