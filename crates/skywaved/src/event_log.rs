@@ -31,8 +31,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, CommandId, ContextId, Event, EventBatch, EventKind,
-    ModelChoice, Seq, SessionId, SessionState,
+    AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, Event, EventBatch,
+    EventKind, ModelChoice, Seq, SessionId, SessionState,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -332,6 +332,42 @@ impl EventLog {
     /// them; empty when it has none or is unknown.
     pub fn agent_work(&self, db: &Db, id: SessionId) -> Result<AgentWork> {
         agent_work_in(db.conn(), id)
+    }
+
+    /// Session `id`'s calls still open in its log, grouped by the context
+    /// each was logged in, in log order (contexts by their first open call).
+    /// A logged `ToolCall` is open until a `ToolResult` links to it or a
+    /// `CallsUnanswered` names it, the mapper's definition of answered. On
+    /// daemon start the supervisor names them (spec §5).
+    pub fn open_calls(&self, db: &Db, id: SessionId) -> Result<Vec<(ContextId, Vec<CallId>)>> {
+        let mut stmt = db.conn().prepare_cached(
+            "WITH answered (call) AS (
+                 SELECT json_extract(kind, '$.call') FROM events
+                 WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_result'
+                 UNION
+                 SELECT calls.value FROM events, json_each(events.kind, '$.calls') AS calls
+                 WHERE session_id = ?1
+                   AND json_extract(events.kind, '$.type') = 'calls_unanswered'
+             )
+             SELECT json_extract(kind, '$.call'), context FROM events
+             WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_call'
+               AND json_extract(kind, '$.call') NOT IN
+                   (SELECT call FROM answered WHERE call IS NOT NULL)
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([id.0.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut open: Vec<(ContextId, Vec<CallId>)> = Vec::new();
+        for row in rows {
+            let (call, context) = row?;
+            let (call, context) = (parse_id(&call)?, parse_id(&context)?);
+            match open.iter_mut().find(|(c, _)| *c == context) {
+                Some((_, calls)) => calls.push(call),
+                None => open.push((context, vec![call])),
+            }
+        }
+        Ok(open)
     }
 
     /// Seq of the event command `id` logged, if it was accepted.

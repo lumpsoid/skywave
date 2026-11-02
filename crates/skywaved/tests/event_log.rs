@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use skywave_proto::{
-    AgentWork, ApprovalId, BackgroundTask, Command, CommandId, CommandKind, CommandResult,
+    AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
     ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
     RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
-    TaskKind,
+    TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{DEFAULT_BATCH_LIMIT, PendingApproval};
@@ -2180,4 +2180,59 @@ fn switching_to_a_moved_context_is_refused() {
     assert_eq!(f.current_context(session), current);
     // Positive control: a context that stayed is switched to as before.
     accepted(f.handle(switch(current)));
+}
+
+/// Times `open_calls` on a large log; run by hand
+/// (`cargo test --release -p skywaved --test event_log -- --ignored --nocapture`).
+#[test]
+#[ignore = "timing, not a check: run by hand"]
+fn open_calls_on_a_large_log() {
+    const CALLS: usize = 20_000;
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let other = f.create_session();
+    let tool_call = |call| {
+        EventKind::ToolCall(ToolCall {
+            call: Some(call),
+            parent: None,
+            name: "exec".into(),
+            display: ToolDisplay {
+                kind: ToolKind::Shell,
+                title: "$ true".into(),
+                detail: None,
+                body: None,
+            },
+            input: None,
+        })
+    };
+    let result = |call| {
+        EventKind::ToolResult(ToolResult {
+            call: Some(call),
+            is_error: false,
+            status: None,
+            preview: "ok".into(),
+            lines: 1,
+            output: None,
+        })
+    };
+    let seeding = std::time::Instant::now();
+    for i in 0..CALLS {
+        for s in [session, other] {
+            let call = CallId::new();
+            f.agent(s, tool_call(call));
+            if i % 100 == 0 {
+                f.agent(s, EventKind::CallsUnanswered { calls: vec![call] });
+            } else if i % 10 != 0 {
+                f.agent(s, result(call));
+            }
+        }
+    }
+    let events = f.log.head().0;
+    eprintln!("seeded {events} events in {:?}", seeding.elapsed());
+    let timing = std::time::Instant::now();
+    let open = f.log.open_calls(&f.storage.db, session).unwrap();
+    let elapsed = timing.elapsed();
+    let count: usize = open.iter().map(|(_, calls)| calls.len()).sum();
+    eprintln!("open_calls: {count} open of {CALLS} calls, {events} events, {elapsed:?}");
+    assert_eq!(count, CALLS / 10 - CALLS / 100);
 }

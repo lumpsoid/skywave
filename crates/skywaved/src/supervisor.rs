@@ -129,6 +129,12 @@
 //! previous run left open (F13):
 //! - every pending approval gets `ApprovalCancelled { reason: "daemon
 //!   restarted" }` ([`DAEMON_RESTARTED`]);
+//! - a session whose log has calls with neither a result nor a
+//!   `CallsUnanswered` naming them gets one `CallsUnanswered` per context
+//!   they were logged in, stamped with it, naming them in log order and
+//!   logged before the state event below. No mapper survives the daemon, so
+//!   the log is the only record of them; an idle session's background
+//!   subagent can have some too;
 //! - a session whose last state event is `SessionStateChanged(AgentWorking)`
 //!   lost its turn with the daemon and gets `SessionStateChanged(Errored)`
 //!   ([`TURN_LOST`]);
@@ -351,6 +357,17 @@ impl<A: AgentAdapter> Supervisor<A> {
                 .cancel_approval(db, approval.id, DAEMON_RESTARTED)?;
         }
         for session in self.log.sessions(db)? {
+            // Before the state event, as the mapper names them at a turn's
+            // end; an idle session's background subagent can have some too.
+            for (context, calls) in self.log.open_calls(db, session.id)? {
+                tracing::info!(session = %session.id.0, ?calls, "naming calls lost with the daemon");
+                self.log.append(
+                    db,
+                    session.id,
+                    context,
+                    EventKind::CallsUnanswered { calls },
+                )?;
+            }
             // Settled in the context of the turn it settles, which a switch
             // logged after it does not change.
             let Some((kind, context)) = last_state_event(db, session.id)? else {

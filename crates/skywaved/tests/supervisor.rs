@@ -10,10 +10,10 @@ use std::time::Duration;
 use serde_json::json;
 use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
-    AgentWork, ApprovalId, Command, CommandId, CommandKind, CommandResult, ContextId, Decision,
-    DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
-    ToolResult,
+    AgentWork, ApprovalId, CallId, Command, CommandId, CommandKind, CommandResult, ContextId,
+    Decision, DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason,
+    RuleScope, RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
+    TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
 use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
@@ -1123,6 +1123,162 @@ async fn a_daemon_restart_ends_the_work_its_agent_left() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// A tool call logged in `context`, by `parent`'s subagent if any; its id.
+fn log_call(f: &mut Fixture, context: ContextId, parent: Option<CallId>) -> CallId {
+    let call = CallId::new();
+    f.log
+        .append(
+            &mut f.storage.db,
+            f.session_id,
+            context,
+            EventKind::ToolCall(ToolCall {
+                call: Some(call),
+                parent,
+                name: "exec".into(),
+                display: ToolDisplay {
+                    kind: ToolKind::Shell,
+                    title: "$ true".into(),
+                    detail: None,
+                    body: None,
+                },
+                input: None,
+            }),
+        )
+        .unwrap();
+    call
+}
+
+/// Logs `call`'s result in `context`.
+fn log_result(f: &mut Fixture, context: ContextId, call: CallId) {
+    f.log
+        .append(
+            &mut f.storage.db,
+            f.session_id,
+            context,
+            EventKind::ToolResult(ToolResult {
+                call: Some(call),
+                is_error: false,
+                status: None,
+                preview: String::new(),
+                lines: 0,
+                output: None,
+            }),
+        )
+        .unwrap();
+}
+
+fn log_agent(f: &mut Fixture, context: ContextId, kind: EventKind) {
+    f.log
+        .append(&mut f.storage.db, f.session_id, context, kind)
+        .unwrap();
+}
+
+/// A turn the daemon died in: its open calls are named, and only those,
+/// before the state event that ends the turn.
+#[tokio::test]
+async fn a_daemon_restart_names_the_calls_its_turn_left_open() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    log_agent(&mut f, a, state(SessionState::AgentWorking));
+    let answered = log_call(&mut f, a, None);
+    log_result(&mut f, a, answered);
+    let first = log_call(&mut f, a, None);
+    let named = log_call(&mut f, a, None);
+    log_agent(&mut f, a, EventKind::CallsUnanswered { calls: vec![named] });
+    let late = log_call(&mut f, a, None);
+    log_agent(&mut f, a, EventKind::CallsUnanswered { calls: vec![late] });
+    log_result(&mut f, a, late);
+    let second = log_call(&mut f, a, None);
+    let head = f.log.head();
+
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    assert_eq!(
+        f.stamped_after(head),
+        [
+            (
+                EventKind::CallsUnanswered {
+                    calls: vec![first, second]
+                },
+                a
+            ),
+            (
+                state(SessionState::Errored {
+                    message: TURN_LOST.into()
+                }),
+                a
+            ),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+
+    // Settled once: a second restart names nothing.
+    f.reopen_log();
+    let head = f.log.head();
+    let supervisor = f.start(&agent).await;
+    assert_eq!(f.stamped_after(head), []);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// An idle session whose background subagent had a call in flight: it is
+/// named, though there is no turn to settle.
+#[tokio::test]
+async fn a_daemon_restart_names_an_idle_sessions_open_subagent_call() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    log_agent(&mut f, a, state(SessionState::AgentWorking));
+    let launch = log_call(&mut f, a, None);
+    log_result(&mut f, a, launch);
+    log_agent(&mut f, a, state(SessionState::Idle));
+    let done = log_call(&mut f, a, Some(launch));
+    log_result(&mut f, a, done);
+    let open = log_call(&mut f, a, Some(launch));
+    let head = f.log.head();
+
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    assert_eq!(
+        f.stamped_after(head),
+        [(EventKind::CallsUnanswered { calls: vec![open] }, a)]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Calls open in two contexts are named in two events, each stamped with
+/// the context its calls were logged in, in log order.
+#[tokio::test]
+async fn a_daemon_restart_names_open_calls_per_context() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let b = ContextId::new();
+    let in_a = log_call(&mut f, a, None);
+    f.clear(b);
+    let in_b = log_call(&mut f, b, None);
+    let answered = log_call(&mut f, b, None);
+    log_result(&mut f, b, answered);
+    let also_in_a = log_call(&mut f, a, Some(in_a));
+    let head = f.log.head();
+
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    assert_eq!(
+        f.stamped_after(head),
+        [
+            (
+                EventKind::CallsUnanswered {
+                    calls: vec![in_a, also_in_a]
+                },
+                a
+            ),
+            (EventKind::CallsUnanswered { calls: vec![in_b] }, b),
+        ]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Stopping one task
 
@@ -1471,13 +1627,22 @@ async fn daemon_restart_cancels_a_claude_approval_left_pending_at_shutdown() {
     f.reopen_log();
     let supervisor = start_claude(&f).await;
     let kinds = f.kinds();
+    // The call the approval gated never got its result either.
+    let gated = kinds
+        .iter()
+        .find_map(|k| match k {
+            EventKind::ApprovalRequested { call, .. } => *call,
+            _ => None,
+        })
+        .unwrap();
     assert_eq!(
-        kinds[kinds.len() - 2..],
+        kinds[kinds.len() - 3..],
         [
             EventKind::ApprovalCancelled {
                 id,
                 reason: DAEMON_RESTARTED.into()
             },
+            EventKind::CallsUnanswered { calls: vec![gated] },
             state(SessionState::Errored {
                 message: TURN_LOST.into()
             }),
