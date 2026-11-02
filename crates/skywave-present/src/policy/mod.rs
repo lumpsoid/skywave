@@ -10,13 +10,16 @@
 //! - [`ReadMarker`]: throttled read marks while the newest item is on
 //!   screen, forced on leaving.
 //! - [`AlertWatcher`]: an alert when new approvals come in.
-//! - [`PromptHistory`]: recalling earlier prompts with a stash.
+//! - [`ShellAlertWatcher`]: a notice when a long shell run of this
+//!   device's finished.
+//! - [`PromptHistory`]: recalling earlier prompts, or shell commands, with
+//!   a stash.
 //! - [`CompletionSettle`]: workdir completion.
 //! - [`TimelineSearch`]: the timeline search's query, matches and current
 //!   match.
 //!
 //! And small decisions: [`unanswered`], [`dismissable`],
-//! [`looks_like_pair_uri`].
+//! [`looks_like_pair_uri`], [`shell_stop`].
 
 mod alert;
 mod completion;
@@ -24,13 +27,15 @@ mod draft;
 mod history;
 mod read;
 mod search;
+mod shell;
 
-pub use alert::{Alert, AlertWatcher, TITLE_MAX, sanitise};
+pub use alert::{Alert, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise};
 pub use completion::CompletionSettle;
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver};
 pub use history::{PromptHistory, Recall};
 pub use read::{READ_MARK_EVERY, ReadMarker};
 pub use search::{Jump, TimelineSearch};
+pub use shell::shell_stop;
 
 use skywave_core::{AgentWork, ApprovalPrompt, Outgoing, PendingSession, SessionListView};
 
@@ -143,7 +148,7 @@ pub(crate) mod tests {
             draft: None,
             shell_draft: None,
             draft_rev: 0,
-            shell_enabled: false,
+            shell: Default::default(),
             last_seq,
             unread_from: None,
         }

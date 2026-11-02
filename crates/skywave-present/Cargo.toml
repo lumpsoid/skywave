@@ -11,9 +11,7 @@ publish.workspace = true
 # Core types only: no UI toolkit, no FFI, no serialisation, so every head
 # (terminal, UniFFI, rinf) can use it.
 skywave-core.workspace = true
-
-[dev-dependencies]
-# Timestamps for test timelines.
+# The views' timestamps, for shell run durations and ages.
 chrono.workspace = true
 
 [lints.clippy]

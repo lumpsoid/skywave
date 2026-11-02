@@ -8,13 +8,14 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef, Draft,
-    Entry, Fingerprint, Link, Outgoing, PairedCredentials, PairingStatus, Request, Route, RunWhen,
-    Screen, Seam, SessionView, SettingsView, Store, StoreError, TimelineItem, ViewState,
+    Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
+    Draft, Entry, FailReason, Fingerprint, Link, Outgoing, PairedCredentials, PairingStatus,
+    Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView, ShellAlert, ShellEnd,
+    ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
-    ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, ContextId, Decision, DeviceId, Event,
-    EventBatch, EventKind, Seq, SessionId, ToolResult,
+    ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
+    DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -1570,5 +1571,509 @@ fn snippets_of_both_kinds_with_the_same_text_coexist() {
             ("make test".to_owned(), true)
         ],
         "one per kind"
+    );
+}
+
+/// A paired core with one session `sid` in its replica, open, and a log to
+/// feed it shell events with.
+struct ShellLog {
+    core: Core,
+    seam: Seam,
+    dir: tempfile::TempDir,
+    sid: SessionId,
+    me: DeviceId,
+    next: u64,
+}
+
+impl ShellLog {
+    fn new() -> ShellLog {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, seam, _requests, me) = paired_core(dir.path());
+        let sid = SessionId::new();
+        let mut log = ShellLog {
+            core,
+            seam,
+            dir,
+            sid,
+            me,
+            next: 1,
+        };
+        log.batch(vec![(
+            0,
+            None,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        )]);
+        log.core.dispatch(Action::OpenSession(sid)).unwrap();
+        log
+    }
+
+    /// Delivers `events` as one batch: each at that many seconds past noon,
+    /// logged by the command named with it.
+    fn batch(&mut self, events: Vec<(i64, Option<CommandId>, EventKind)>) {
+        let from = Seq(self.next);
+        self.next += events.len() as u64;
+        let noon = Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+        let events = events
+            .into_iter()
+            .map(|(secs, command_id, kind)| Event {
+                session_id: self.sid,
+                at: noon + chrono::Duration::seconds(secs),
+                command_id,
+                context: ContextId::first_of(self.sid),
+                kind,
+            })
+            .collect();
+        self.seam
+            .apply_events(&EventBatch { from, events })
+            .unwrap();
+    }
+
+    /// Queues a run from this device and returns its id.
+    fn run(&self, command: &str) -> CommandId {
+        self.core
+            .dispatch(run_shell(self.sid, command, RunWhen::Always))
+            .unwrap();
+        queued_runs(self.dir.path()).last().unwrap().0
+    }
+
+    fn shell(&self) -> ShellView {
+        session_view(&self.core.view()).shell.clone()
+    }
+
+    fn attention(&self) -> Attention {
+        self.core.view().attention
+    }
+}
+
+fn requested(command: &str, by: DeviceId) -> EventKind {
+    EventKind::ShellRequested {
+        command: command.into(),
+        when: RunWhen::Always,
+        by,
+    }
+}
+
+fn started(run: CommandId, cwd: &str) -> EventKind {
+    EventKind::ShellStarted {
+        run,
+        cwd: cwd.into(),
+    }
+}
+
+/// A finish with no output that started at `started_at` seconds past noon.
+fn finished(
+    run: CommandId,
+    by: DeviceId,
+    started_at: Option<i64>,
+    command_line: &str,
+    end: ShellEnd,
+) -> EventKind {
+    let noon = Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+    EventKind::ShellFinished {
+        run,
+        by,
+        started_at: started_at.map(|s| noon + chrono::Duration::seconds(s)),
+        command_line: command_line.into(),
+        end,
+        cwd: None,
+        preview: String::new(),
+        lines: 0,
+        output: None,
+        truncated: false,
+    }
+}
+
+fn run_of(shell: &ShellView, run: CommandId) -> &ShellRun {
+    shell
+        .runs
+        .iter()
+        .find(|r| r.run == run)
+        .expect("the run is shown")
+}
+
+#[test]
+fn shell_runs_fold_from_the_log_and_this_devices_outbox() {
+    let mut log = ShellLog::new();
+    let other = DeviceId::new();
+    let me = log.me;
+    let noon = Utc.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+    let at = |s: i64| noon + chrono::Duration::seconds(s);
+    assert_eq!(log.shell(), ShellView::default(), "nothing yet");
+
+    // This device's runs: one logged, one sent without an answer, one
+    // refused and one still queued here.
+    let logged = log.run("make test");
+    let sending = log.run("cargo build");
+    let refused = log.run("bad");
+    let queued = log.run("ls");
+    log.seam.command_sending(logged).unwrap();
+    log.seam
+        .command_result(logged, &CommandResult::Accepted { seq: Seq(2) })
+        .unwrap();
+    log.batch(vec![(1, Some(logged), requested("make test", me))]);
+    log.seam.command_sending(refused).unwrap();
+    log.seam
+        .command_result(
+            refused,
+            &CommandResult::Rejected {
+                reason: RejectReason::BadShellCommand,
+            },
+        )
+        .unwrap();
+    log.seam.command_sending(sending).unwrap();
+
+    // Another device's run, started, with output coming in.
+    let theirs = CommandId::new();
+    log.batch(vec![
+        (2, Some(theirs), requested("sleep 30", other)),
+        (3, None, started(theirs, "/srv/a")),
+        (
+            4,
+            None,
+            EventKind::ShellOutput {
+                run: theirs,
+                tail: "one".into(),
+                lines: 1,
+                bytes: 4,
+            },
+        ),
+    ]);
+    let shell = log.shell();
+    let order: Vec<CommandId> = shell.runs.iter().map(|r| r.run).collect();
+    assert_eq!(
+        order,
+        [logged, theirs, sending, refused, queued],
+        "logged in log order, then this device's in send order"
+    );
+    assert_eq!(shell.cwd.as_deref(), Some("/srv/a"));
+
+    let mine = run_of(&shell, logged);
+    assert_eq!(mine.state, ShellRunState::Queued);
+    assert_eq!(mine.requested_at, Some(at(1)));
+    assert_eq!(mine.outgoing, Some(Outgoing::Accepted(Seq(2))));
+    assert!(!mine.discardable);
+    assert!(mine.by.me);
+
+    let run = run_of(&shell, theirs);
+    assert_eq!(run.state, ShellRunState::Running);
+    assert_eq!(run.started_at, Some(at(3)));
+    assert_eq!((run.tail_or_preview.as_str(), run.lines), ("one", 1));
+    assert_eq!(
+        (run.by.id, run.by.me, run.outgoing),
+        (other, false, None),
+        "another device's"
+    );
+    assert!(!run.stopping);
+
+    let run = run_of(&shell, sending);
+    assert_eq!(
+        (&run.state, run.outgoing, run.discardable),
+        (&ShellRunState::Pending, Some(Outgoing::Sending), false)
+    );
+    assert!(run.delivery.is_some());
+    let run = run_of(&shell, refused);
+    assert_eq!(
+        (&run.state, run.outgoing, run.discardable),
+        (
+            &ShellRunState::Pending,
+            Some(Outgoing::Failed(FailReason::Rejected(
+                RejectReason::BadShellCommand
+            ))),
+            true
+        ),
+        "a refused run stays in sight to take back"
+    );
+    let run = run_of(&shell, queued);
+    assert_eq!(
+        (&run.state, run.outgoing, run.discardable, run.by.me),
+        (&ShellRunState::Pending, Some(Outgoing::Queued), true, true)
+    );
+
+    // The tail follows the newest output; another device's stop is logged.
+    log.batch(vec![
+        (
+            5,
+            None,
+            EventKind::ShellOutput {
+                run: theirs,
+                tail: "one\ntwo".into(),
+                lines: 2,
+                bytes: 8,
+            },
+        ),
+        (
+            6,
+            Some(CommandId::new()),
+            EventKind::ShellStopRequested {
+                run: theirs,
+                by: other,
+            },
+        ),
+    ]);
+    let shell = log.shell();
+    let run = run_of(&shell, theirs);
+    assert_eq!((run.tail_or_preview.as_str(), run.lines), ("one\ntwo", 2));
+    assert!(run.stopping, "a logged stop");
+    assert!(!run_of(&shell, logged).stopping);
+
+    // This device's stop on its way counts; a refused one does not.
+    log.core
+        .dispatch(Action::StopShell {
+            session_id: log.sid,
+            run: logged,
+        })
+        .unwrap();
+    log.core
+        .dispatch(Action::StopShell {
+            session_id: log.sid,
+            run: sending,
+        })
+        .unwrap();
+    let stops: Vec<CommandId> = log
+        .seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e.command.kind, CommandKind::StopShell { .. }))
+        .map(|e| e.command.id)
+        .collect();
+    log.seam.command_sending(stops[1]).unwrap();
+    log.seam
+        .command_result(
+            stops[1],
+            &CommandResult::Rejected {
+                reason: RejectReason::UnknownRun,
+            },
+        )
+        .unwrap();
+    let shell = log.shell();
+    assert!(run_of(&shell, logged).stopping, "own stop queued");
+    assert!(!run_of(&shell, sending).stopping, "own stop refused");
+
+    // Finished: the preview, the blob and the cwd it ended in.
+    let blob = BlobRef {
+        id: BlobId::new(),
+        size: 9000,
+    };
+    log.batch(vec![(
+        40,
+        None,
+        EventKind::ShellFinished {
+            run: theirs,
+            by: other,
+            started_at: Some(at(3)),
+            command_line: "sleep 30".into(),
+            end: ShellEnd::Stopped,
+            cwd: Some("/srv/b".into()),
+            preview: "two".into(),
+            lines: 900,
+            output: Some(blob.clone()),
+            truncated: true,
+        },
+    )]);
+    let shell = log.shell();
+    let run = run_of(&shell, theirs);
+    assert_eq!(run.state, ShellRunState::Finished(ShellEnd::Stopped));
+    assert_eq!(run.finished_at, Some(at(40)));
+    assert_eq!((run.tail_or_preview.as_str(), run.lines), ("two", 900));
+    assert_eq!(
+        run.output.as_ref().map(|b| (b.id, b.state.clone())),
+        Some((blob.id, BlobState::NotDownloaded { size: 9000 }))
+    );
+    assert!(run.truncated);
+    assert_eq!(shell.cwd.as_deref(), Some("/srv/b"), "where it ended");
+
+    // A later start says where the next run is.
+    log.batch(vec![(41, None, started(logged, "/srv/a"))]);
+    assert_eq!(log.shell().cwd.as_deref(), Some("/srv/a"));
+
+    // The shell view is session-wide: narrowing the timeline leaves it.
+    let before = log.shell();
+    log.core
+        .dispatch(Action::ViewContext {
+            session_id: log.sid,
+            context: Some(ContextId::first_of(log.sid)),
+        })
+        .unwrap();
+    assert_eq!(log.shell(), before);
+}
+
+#[test]
+fn every_shell_end_shows_as_its_run_finished() {
+    let mut log = ShellLog::new();
+    let other = DeviceId::new();
+    let ends = [
+        ShellEnd::Exited { code: 0 },
+        ShellEnd::Exited { code: 2 },
+        ShellEnd::Signalled { signal: 9 },
+        ShellEnd::Stopped,
+        ShellEnd::Skipped,
+        ShellEnd::Lost,
+        ShellEnd::NotStarted {
+            reason: "no shell".into(),
+        },
+    ];
+    let mut runs = Vec::new();
+    for (i, end) in ends.iter().enumerate() {
+        let run = CommandId::new();
+        let s = i as i64 * 10;
+        // A skipped run never starts; the rest do.
+        let start = (*end != ShellEnd::Skipped).then_some(s + 1);
+        let mut events = vec![(s, Some(run), requested("x", other))];
+        if let Some(start) = start {
+            events.push((start, None, started(run, "/srv/a")));
+        }
+        events.push((s + 2, None, finished(run, other, start, "x", end.clone())));
+        log.batch(events);
+        runs.push(run);
+    }
+    let shell = log.shell();
+    let states: Vec<ShellRunState> = runs
+        .iter()
+        .map(|run| run_of(&shell, *run).state.clone())
+        .collect();
+    let expected: Vec<ShellRunState> = ends.into_iter().map(ShellRunState::Finished).collect();
+    assert_eq!(states, expected);
+    let skipped = run_of(&shell, runs[4]);
+    assert_eq!(skipped.started_at, None, "a skipped run never started");
+}
+
+#[test]
+fn shell_commands_are_newest_first_without_repeats() {
+    let mut log = ShellLog::new();
+    let other = DeviceId::new();
+    let me = log.me;
+    let (a, b, c) = (CommandId::new(), CommandId::new(), CommandId::new());
+    log.batch(vec![
+        (0, Some(a), requested("ls", other)),
+        (1, Some(b), requested("make", me)),
+        (2, Some(c), requested("make", other)),
+    ]);
+    log.run("ls");
+    log.run("cargo test");
+    assert_eq!(log.shell().commands(), ["cargo test", "ls", "make", "ls"]);
+}
+
+#[test]
+fn a_long_run_of_this_device_alerts_once_wherever_it_finished() {
+    let mut log = ShellLog::new();
+    let me = log.me;
+    let title = session_view(&log.core.view()).title.clone();
+    assert_eq!(log.attention().shell_alerts, 0);
+
+    // Away from the session, catching up; the request and the start come
+    // in an earlier batch than the finish.
+    log.core.dispatch(Action::Back).unwrap();
+    log.seam.set_link(Link::CatchingUp {
+        have: Seq(1),
+        server: Seq(9),
+    });
+    let run = CommandId::new();
+    log.batch(vec![
+        (0, Some(run), requested("make test\nmake lint", me)),
+        (1, None, started(run, "/srv/a")),
+    ]);
+    assert_eq!(log.attention().shell_alerts, 0, "not finished yet");
+    log.batch(vec![(
+        13,
+        None,
+        finished(run, me, Some(1), "make test", ShellEnd::Exited { code: 1 }),
+    )]);
+    let attention = log.attention();
+    assert_eq!(attention.shell_alerts, 1, "12 s");
+    assert_eq!(
+        attention.last_shell,
+        Some(ShellAlert {
+            session_id: log.sid,
+            title,
+            command_line: "make test".into(),
+            end: ShellEnd::Exited { code: 1 },
+        })
+    );
+    log.seam.set_link(Link::Online { latency_ms: 5 });
+    assert_eq!(log.attention().shell_alerts, 1, "once");
+
+    // Too short, another device's, never started: no alert.
+    let other = DeviceId::new();
+    let (short, theirs, skipped) = (CommandId::new(), CommandId::new(), CommandId::new());
+    log.batch(vec![
+        (20, Some(short), requested("ls", me)),
+        (21, None, started(short, "/srv/a")),
+        (
+            24,
+            None,
+            finished(short, me, Some(21), "ls", ShellEnd::Exited { code: 0 }),
+        ),
+        (30, Some(theirs), requested("sleep 12", other)),
+        (31, None, started(theirs, "/srv/a")),
+        (
+            43,
+            None,
+            finished(
+                theirs,
+                other,
+                Some(31),
+                "sleep 12",
+                ShellEnd::Exited { code: 0 },
+            ),
+        ),
+        (50, Some(skipped), requested("deploy", me)),
+        (
+            90,
+            None,
+            finished(skipped, me, None, "deploy", ShellEnd::Skipped),
+        ),
+    ]);
+    assert_eq!(log.attention().shell_alerts, 1);
+
+    // On screen in shell mode: no alert. In agent mode it does.
+    log.core.dispatch(Action::OpenSession(log.sid)).unwrap();
+    log.core
+        .dispatch(Action::SetComposerMode {
+            session_id: log.sid,
+            mode: ComposerMode::Shell,
+        })
+        .unwrap();
+    let watched = CommandId::new();
+    log.batch(vec![
+        (100, Some(watched), requested("make", me)),
+        (101, None, started(watched, "/srv/a")),
+        (
+            120,
+            None,
+            finished(watched, me, Some(101), "make", ShellEnd::Exited { code: 0 }),
+        ),
+    ]);
+    assert_eq!(log.attention().shell_alerts, 1, "watched in shell mode");
+    log.core
+        .dispatch(Action::SetComposerMode {
+            session_id: log.sid,
+            mode: ComposerMode::Agent,
+        })
+        .unwrap();
+    let unwatched = CommandId::new();
+    log.batch(vec![
+        (130, Some(unwatched), requested("make", me)),
+        (131, None, started(unwatched, "/srv/a")),
+        (
+            141,
+            None,
+            finished(
+                unwatched,
+                me,
+                Some(131),
+                "make",
+                ShellEnd::Exited { code: 0 },
+            ),
+        ),
+    ]);
+    assert_eq!(
+        log.attention().shell_alerts,
+        2,
+        "open in agent mode, exactly 10 s"
     );
 }
