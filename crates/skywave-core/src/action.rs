@@ -285,4 +285,6 @@ pub enum Route {
     ArchivedSessions,
     Settings,
     Pairing,
+    /// Cost and tokens totalled across sessions, from the replica alone.
+    Usage,
 }

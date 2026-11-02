@@ -23,7 +23,7 @@ use skywave_proto::{
 };
 use uuid::Uuid;
 
-use crate::projection::{SessionSummary, blob_refs};
+use crate::projection::{SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 
 /// File name of the database inside the core's data directory.
@@ -252,6 +252,21 @@ ALTER TABLE drafts_by_mode RENAME TO drafts;
 ALTER TABLE snippets ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'
     CHECK (kind IN ('agent', 'shell'));
 "#,
+    r#"
+-- `TurnRecord`s: each `TurnUsage` event's figures by seq, what the usage
+-- screen totals without replaying the log. `usage` is the `TurnUsage` as
+-- JSON. Backfilled from the stored events.
+CREATE TABLE turns (
+    seq INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    usage TEXT NOT NULL
+);
+INSERT INTO turns (seq, session_id, at, usage)
+    SELECT seq, session_id, json_extract(event, '$.at'),
+        json_remove(json_extract(event, '$.kind'), '$.type')
+    FROM events WHERE json_extract(event, '$.kind.type') = 'turn_usage';
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -460,6 +475,8 @@ pub struct Snapshot {
     pub models: Vec<ModelChoice>,
     /// This device's saved prompts, in no order ([`Store::set_snippet`]).
     pub snippets: Vec<Snippet>,
+    /// Every stored turn's usage, in log order ([`Store::turns`]).
+    pub turns: Vec<TurnRecord>,
 }
 
 /// Handle to the replica database.
@@ -514,6 +531,7 @@ impl Store {
             devices: self.devices()?,
             models: self.offered_models()?,
             snippets: self.snippets()?,
+            turns: self.turns()?,
         })
     }
 
@@ -634,6 +652,17 @@ impl Store {
                     blobs.push(blob.id);
                 }
             }
+            if let Some(turn) = TurnRecord::of(seq, event) {
+                tx.execute(
+                    "INSERT INTO turns (seq, session_id, at, usage) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        seq_sql(seq)?,
+                        turn.session_id.0.to_string(),
+                        turn.at.to_rfc3339(),
+                        to_json(&turn.usage)?
+                    ],
+                )?;
+            }
             new_events += 1;
         }
         for summary in touched.values() {
@@ -706,6 +735,7 @@ impl Store {
             tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
         }
         tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
+        tx.execute("DELETE FROM turns WHERE session_id = ?1", [&session])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
         tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
         tx.execute(
@@ -750,6 +780,7 @@ impl Store {
         };
         tx.execute_batch(
             "DELETE FROM events;
+             DELETE FROM turns;
              DELETE FROM sessions;
              UPDATE cursor SET seq = 0 WHERE id = 0;
              DELETE FROM outbox;
@@ -770,6 +801,22 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(blobs)
+    }
+
+    /// Every stored turn's usage, in log order.
+    pub fn turns(&self) -> Result<Vec<TurnRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, session_id, at, usage FROM turns ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TurnRecord {
+                seq: seq_col(row, 0)?,
+                session_id: SessionId(uuid_col(row, 1)?),
+                at: time_col(row, 2)?,
+                usage: json_col(row, 3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// The session's events in log order.
@@ -1421,16 +1468,12 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
-    let last_activity: String = row.get(4)?;
-    let last_activity = DateTime::parse_from_rfc3339(&last_activity)
-        .map_err(|e| bad_value(4, Type::Text, e))?
-        .with_timezone(&Utc);
     Ok(SessionSummary {
         id: SessionId(uuid_col(row, 0)?),
         workdir: row.get(1)?,
         state: json_col(row, 2)?,
         pending_approvals: json_col(row, 3)?,
-        last_activity,
+        last_activity: time_col(row, 4)?,
         last_seq: seq_col(row, 5)?,
         stopped: row.get(6)?,
         notable: u64_col(row, 7)?,
@@ -1442,6 +1485,13 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         context: ContextId(uuid_col(row, 13)?),
         work: opt_json_col(row, 14)?.unwrap_or_default(),
     })
+}
+
+fn time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
+    let text: String = row.get(idx)?;
+    DateTime::parse_from_rfc3339(&text)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|e| bad_value(idx, Type::Text, e))
 }
 
 fn opt_time_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {

@@ -19,6 +19,7 @@ use skywave_present::policy::{
     ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
+use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
@@ -28,7 +29,7 @@ use crate::screen::{CreateUi, Ui, rename_initial, revoked};
 use crate::signals::{
     ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, TimelineRow,
-    TimelineUpdate,
+    TimelineUpdate, UsageGroupingView, UsageSpanView,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::{intents, link, screen, search, shell, timeline};
@@ -275,6 +276,8 @@ pub struct Head {
     rename: Option<RenamePrompt>,
     rename_tag: Option<Tag>,
     revoked_dismissed: bool,
+    /// The usage screen's days and grouping (`UsageShow`).
+    usage: (Span, Grouping),
     session: Option<SessionHead>,
     sent: Sent,
 }
@@ -998,6 +1001,22 @@ impl Head {
                 self.fill(uri);
             }
             GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
+            GuiIntent::UsageShow { span, grouping } => {
+                self.usage = (
+                    match span {
+                        UsageSpanView::Today => Span::Today,
+                        UsageSpanView::Week => Span::Week,
+                        UsageSpanView::Month => Span::Month,
+                        UsageSpanView::All => Span::All,
+                    },
+                    match grouping {
+                        UsageGroupingView::Day => Grouping::Day,
+                        UsageGroupingView::Session => Grouping::Session,
+                        UsageGroupingView::Workdir => Grouping::Workdir,
+                        UsageGroupingView::Model => Grouping::Model,
+                    },
+                );
+            }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
         }
@@ -1207,6 +1226,8 @@ impl Head {
             rename: self.rename.as_ref(),
             composer: composer.as_ref(),
             revoked_dismissed: self.revoked_dismissed,
+            usage: self.usage,
+            wall_ms: clock.wall_ms,
         };
         let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {

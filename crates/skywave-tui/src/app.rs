@@ -30,6 +30,7 @@ use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
     selectable, starts_turn, wanted_blob,
 };
+use skywave_present::usage::{Grouping, Span};
 
 use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
@@ -1274,6 +1275,18 @@ fn next_when(when: RunWhen) -> RunWhen {
     }
 }
 
+/// What the usage screen shows.
+#[derive(Debug, Clone, Default)]
+pub struct UsageUi {
+    pub span: Span,
+    pub grouping: Grouping,
+    /// The first row shown; `j`/`k` scroll.
+    pub top: usize,
+    /// The highest [`top`](Self::top) the last frame could use, as
+    /// [`UiState::help_end`] is for the help.
+    pub end: Cell<usize>,
+}
+
 /// Presentation state owned by the head.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -1294,6 +1307,8 @@ pub struct UiState {
     pub delete: Option<SessionId>,
     /// The open session's focus, scroll, expanded items and composer.
     pub session: Option<SessionUi>,
+    /// The usage screen's span, grouping and scroll; kept while away.
+    pub usage: UsageUi,
     /// The user chose to browse local data behind the revoked screen.
     pub revoked_dismissed: bool,
     /// The last failed dispatch, shown in the footer until the next key.
@@ -1340,6 +1355,7 @@ impl App {
                 prompt: None,
                 delete: None,
                 session: None,
+                usage: UsageUi::default(),
                 revoked_dismissed: false,
                 error: None,
                 notice: None,
@@ -1978,10 +1994,35 @@ impl App {
                     None
                 }
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
+                KeyCode::Char('u') => Some(Action::Navigate(Route::Usage)),
                 KeyCode::Delete => dismissable(list).map(|p| Action::Discard(p.command_id)),
                 _ => None,
             },
             Screen::Session(_) => self.session_key(key, ctrl),
+            Screen::Usage(_) => {
+                let usage = &mut self.ui.usage;
+                match key.code {
+                    KeyCode::Char('q') => return self.quit(),
+                    KeyCode::Esc => return Some(Action::Back),
+                    KeyCode::Char('r') => {
+                        usage.span = usage.span.next();
+                        usage.top = 0;
+                    }
+                    KeyCode::Tab => {
+                        usage.grouping = usage.grouping.next();
+                        usage.top = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        usage.top = (usage.top + 1).min(usage.end.get());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        usage.top = usage.top.min(usage.end.get()).saturating_sub(1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => usage.top = 0,
+                    _ => {}
+                }
+                None
+            }
             Screen::Settings(settings) => match key.code {
                 KeyCode::Char('q') => self.quit(),
                 KeyCode::Esc => Some(Action::Back),

@@ -31,7 +31,8 @@ pub use screen::{
     ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
     EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
     RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    ShellPromptView, SnippetView, StopHeadings, SubagentHeaderView, TaskRow,
+    ShellPromptView, SnippetView, StopHeadings, SubagentHeaderView, TaskRow, UsageGroupingView,
+    UsageRowView, UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

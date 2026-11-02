@@ -100,6 +100,34 @@ impl SessionUsage {
     }
 }
 
+/// One turn's usage as its `TurnUsage` event logged it: what the usage
+/// screen totals across sessions. The store keeps these beside the log, so
+/// totals need no replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnRecord {
+    /// Seq of the `TurnUsage` event.
+    pub seq: Seq,
+    pub session_id: SessionId,
+    /// When the server logged it.
+    pub at: DateTime<Utc>,
+    pub usage: TurnUsage,
+}
+
+impl TurnRecord {
+    /// The record of `event` at `seq`, if it reports a turn's usage.
+    pub fn of(seq: Seq, event: &Event) -> Option<TurnRecord> {
+        match &event.kind {
+            EventKind::TurnUsage(usage) => Some(TurnRecord {
+                seq,
+                session_id: event.session_id,
+                at: event.at,
+                usage: usage.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Longest [`SessionSummary::first_prompt`] kept, in chars. The store's
 /// backfill migration cuts at the same length, and the server cuts a shell
 /// run's `command_line` to it.

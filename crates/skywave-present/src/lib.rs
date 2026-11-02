@@ -13,6 +13,8 @@
 //!   failure wording.
 //! - [`output`]: where a shell run's whole output is, and how a head reads
 //!   a downloaded one.
+//! - [`usage`]: cost and tokens totalled across sessions for the usage
+//!   screen.
 //! - [`utf16`]: code-point cursors and byte ranges as UTF-16 code units.
 //! - [`policy`]: clock-free controllers for draft saves, read marks,
 //!   alerts, prompt history, workdir completion and timeline search.
@@ -23,4 +25,5 @@ pub mod format;
 pub mod output;
 pub mod policy;
 pub mod sections;
+pub mod usage;
 pub mod utf16;

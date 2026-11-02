@@ -643,6 +643,71 @@ fn the_list_title_leaves_the_counts_to_the_toggle() {
 }
 
 #[test]
+fn the_usage_screen_totals_what_usage_show_picks() {
+    use crate::signals::{UsageGroupingView, UsageRowView, UsageSpanView};
+
+    let mut rig = Rig::new();
+    let turn = |cost| Event {
+        session_id: rig.session,
+        at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap(),
+        command_id: None,
+        context: skywave_proto::ContextId::first_of(rig.session),
+        kind: EventKind::TurnUsage(skywave_proto::TurnUsage {
+            tokens_in: Some(3_100),
+            tokens_out: Some(812),
+            cost_usd: cost,
+            model: Some("model-a".into()),
+            ..skywave_proto::TurnUsage::default()
+        }),
+    };
+    let events = vec![turn(Some(1.27)), turn(None)];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events,
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Usage,
+        },
+    });
+    rig.results();
+    rig.intent(GuiIntent::UsageShow {
+        span: UsageSpanView::All,
+        grouping: UsageGroupingView::Workdir,
+    });
+    rig.view();
+    let row = |label: &str, cost: &str| UsageRowView {
+        label: label.into(),
+        archived: false,
+        cost_label: cost.into(),
+        tokens_label: "6.2k in · 1.6k out".into(),
+        turns_label: "2 turns".into(),
+    };
+    match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Usage {
+            span,
+            grouping,
+            total,
+            rows,
+            empty_label,
+            note,
+        } => {
+            assert_eq!(
+                (*span, *grouping),
+                (UsageSpanView::All, UsageGroupingView::Workdir)
+            );
+            assert_eq!(*total, row("Total", "$1.27 + 1 unpriced"));
+            assert_eq!(*rows, [row("/srv/work", "$1.27 + 1 unpriced")]);
+            assert_eq!(*empty_label, None);
+            assert!(note.contains("deleted from this device"), "{note}");
+        }
+        other => panic!("not the usage screen: {other:?}"),
+    }
+}
+
+#[test]
 fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {

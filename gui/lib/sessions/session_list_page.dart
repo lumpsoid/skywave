@@ -35,6 +35,13 @@ class SessionListPage extends StatelessWidget {
             title: Text(screen.title),
             actions: [
               IconButton(
+                tooltip: 'Usage',
+                icon: const Icon(Icons.bar_chart),
+                onPressed: () => send.act(
+                  const ActionIntentNavigate(route: RouteView.usage),
+                ),
+              ),
+              IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings),
                 onPressed: () => send.act(

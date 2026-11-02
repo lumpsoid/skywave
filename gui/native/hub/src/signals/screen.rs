@@ -72,6 +72,53 @@ pub enum ScreenView {
         /// `skywaved` prints.
         fingerprint: Option<String>,
     },
+    /// Cost and tokens across sessions, from the replica alone.
+    Usage {
+        /// The days counted; `UsageShow` picks them.
+        span: UsageSpanView,
+        /// What the rows are; `UsageShow` picks it.
+        grouping: UsageGroupingView,
+        /// Every turn in the span.
+        total: UsageRowView,
+        /// Newest day first, else costliest first.
+        rows: Vec<UsageRowView>,
+        /// What an empty span says; `None` when it has rows.
+        empty_label: Option<String>,
+        /// What the totals leave out: sessions deleted from this device.
+        note: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum UsageSpanView {
+    Today,
+    Week,
+    Month,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum UsageGroupingView {
+    Day,
+    Session,
+    Workdir,
+    Model,
+}
+
+/// One line of the usage screen: a day, session, directory or model, or
+/// the total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct UsageRowView {
+    /// `2026-11-02 Mon`, a session's title, a directory, a model, `Total`.
+    pub label: String,
+    /// A session row whose session is archived.
+    pub archived: bool,
+    /// `$1.27`, `$1.27 + 2 unpriced`, `cost unknown`.
+    pub cost_label: String,
+    /// `3.1k in · 812 out`, `tokens unknown`.
+    pub tokens_label: String,
+    /// `7 turns`.
+    pub turns_label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]

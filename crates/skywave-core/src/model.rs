@@ -20,7 +20,7 @@ use crate::address::ServerAddress;
 use crate::completion::Completer;
 use crate::identity::Identity;
 use crate::projection::{
-    FIRST_PROMPT_MAX_CHARS, SessionSummary, blob_refs, first_line, is_notable,
+    FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
 };
 use crate::seam::Request;
 use crate::snippets::Snippets;
@@ -37,7 +37,8 @@ use crate::view::{
     PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
     SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView, ViewState,
+    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    UsageSession, UsageView, ViewState,
 };
 
 /// Work the core must do for an action, in order. Persistence effects come
@@ -84,6 +85,7 @@ enum Place {
     Archived,
     Settings,
     Pairing,
+    Usage,
     Session(SessionId),
 }
 
@@ -94,6 +96,7 @@ impl From<Route> for Place {
             Route::ArchivedSessions => Place::Archived,
             Route::Settings => Place::Settings,
             Route::Pairing => Place::Pairing,
+            Route::Usage => Place::Usage,
         }
     }
 }
@@ -194,6 +197,9 @@ pub(crate) struct Model {
     devices: HashMap<DeviceId, String>,
     /// The models of the newest `ModelsOffered`, as stored.
     models: Vec<ModelChoice>,
+    /// Every turn's usage in the replica, in log order: what the usage
+    /// screen totals.
+    turns: Vec<TurnRecord>,
 }
 
 impl Model {
@@ -237,6 +243,7 @@ impl Model {
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
+            turns: Vec::new(),
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -260,6 +267,7 @@ impl Model {
         self.deleted = snapshot.deleted;
         self.devices = snapshot.devices;
         self.models = snapshot.models;
+        self.turns = snapshot.turns;
         self.open = None;
         // Never forget what is still pending: an approval that came in
         // during a catch-up must still alert once it is over, and one
@@ -678,7 +686,9 @@ impl Model {
         self.device()?;
         match self.place {
             Place::SessionList => None,
-            Place::Archived | Place::Settings | Place::Pairing => Some(Route::SessionList),
+            Place::Archived | Place::Settings | Place::Pairing | Place::Usage => {
+                Some(Route::SessionList)
+            }
             Place::Session(id) => self.summary(id).map(|s| {
                 if self.archived(s) {
                     Route::ArchivedSessions
@@ -1056,6 +1066,7 @@ impl Model {
                 None => self.sessions.push(SessionSummary::new(seq, event)),
             }
             self.note_shell_finish(event);
+            self.turns.extend(TurnRecord::of(seq, event));
             for blob in blob_refs(&event.kind) {
                 self.blobs.entry(blob.id).or_insert_with(|| BlobRecord {
                     id: blob.id,
@@ -1222,6 +1233,7 @@ impl Model {
     pub(crate) fn session_deleted(&mut self, id: SessionId, blobs: &[BlobId]) {
         self.deleted.insert(id);
         self.sessions.retain(|s| s.id != id);
+        self.turns.retain(|t| t.session_id != id);
         self.drafts.retain(|(session, _), _| *session != id);
         self.composer_modes.remove(&id);
         self.read_marks.remove(&id);
@@ -1393,6 +1405,7 @@ impl Model {
             }),
             Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
+            Place::Usage => Screen::Usage(self.usage_view()),
             Place::Session(id) => match self.session_view(id) {
                 Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
@@ -1478,6 +1491,23 @@ impl Model {
             other_count: other.len(),
             creating,
             completion,
+        }
+    }
+
+    fn usage_view(&self) -> UsageView {
+        UsageView {
+            turns: self.turns.clone(),
+            sessions: self
+                .sessions
+                .iter()
+                .map(|s| UsageSession {
+                    id: s.id,
+                    title: self.title(s).text,
+                    workdir: s.workdir.clone(),
+                    archived: self.archived(s),
+                })
+                .collect(),
+            deleted: self.deleted.len(),
         }
     }
 
@@ -3032,6 +3062,7 @@ mod tests {
             devices: HashMap::new(),
             models: Vec::new(),
             snippets: Vec::new(),
+            turns: Vec::new(),
         }
     }
 
@@ -4760,6 +4791,49 @@ mod tests {
         assert_eq!(f.model.open_session(), Some(mid));
     }
 
+    fn usage(f: &Fixture) -> UsageView {
+        match f.model.view().screen {
+            Screen::Usage(view) => view,
+            other => panic!("expected the usage screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_usage_screen_lists_every_turn_until_its_session_is_deleted() {
+        let mut f = Fixture::paired();
+        let kept = f.session("/srv/kept");
+        let gone = f.session("/srv/gone");
+        let priced = crate::TurnUsage {
+            cost_usd: Some(0.5),
+            ..crate::TurnUsage::default()
+        };
+        f.log(kept, vec![EventKind::TurnUsage(priced.clone())]);
+        f.log(
+            gone,
+            vec![EventKind::TurnUsage(crate::TurnUsage::default())],
+        );
+        let by = f.me;
+        f.log(
+            gone,
+            vec![EventKind::SessionArchived { archived: true, by }],
+        );
+
+        f.dispatch(Action::Navigate(Route::Usage));
+        let view = usage(&f);
+        let turns: Vec<_> = view.turns.iter().map(|t| (t.seq, t.session_id)).collect();
+        assert_eq!(turns, vec![(Seq(3), kept), (Seq(4), gone)]);
+        assert_eq!(view.turns[0].usage, priced);
+        let archived: Vec<_> = view.sessions.iter().map(|s| (s.id, s.archived)).collect();
+        assert_eq!(archived, vec![(gone, true), (kept, false)]);
+        assert_eq!(view.deleted, 0);
+
+        f.model.session_deleted(gone, &[]);
+        let view = usage(&f);
+        assert_eq!(view.turns.len(), 1);
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.deleted, 1);
+    }
+
     fn delete(session_id: SessionId) -> Action {
         Action::DeleteSessionLocally { session_id }
     }
@@ -6283,6 +6357,7 @@ mod tests {
             devices: model.devices.clone(),
             models: model.models.clone(),
             snippets: model.snippets.list().to_vec(),
+            turns: model.turns.clone(),
         }
     }
 
@@ -6737,6 +6812,7 @@ mod tests {
         match &view.screen {
             Screen::Pairing(_) => "pairing",
             Screen::Settings(_) => "settings",
+            Screen::Usage(_) => "usage",
             Screen::Session(v) if v.archived => "archived session",
             Screen::Session(_) => "session",
             Screen::SessionList(l) if l.kind == ListKind::Archived => "archived list",
@@ -6776,6 +6852,7 @@ mod tests {
             "active list",
         );
         assert_back(&mut f, nav(Route::Settings), "settings", "active list");
+        assert_back(&mut f, nav(Route::Usage), "usage", "active list");
         // Re-pairing a paired device can be cancelled.
         assert_back(&mut f, nav(Route::Pairing), "pairing", "active list");
         // A session goes back to the list it is on.

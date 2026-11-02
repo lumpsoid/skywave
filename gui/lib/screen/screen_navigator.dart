@@ -9,6 +9,7 @@ import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
+import 'package:skywave_gui/usage/usage_page.dart';
 
 /// The booted app: the banner over a navigator whose one page is the
 /// screen Rust sent (D18), but in a subagent's view, which is a second
@@ -115,6 +116,11 @@ class ScreenNavigator extends StatelessWidget {
         final ScreenViewSettings screen => SettingsPage(
           screen: screen,
           link: holders.link,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewUsage screen => UsagePage(
+          screen: screen,
           canGoBack: update.canGoBack,
           send: send,
         ),
