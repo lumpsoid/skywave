@@ -168,14 +168,14 @@ use std::time::Duration;
 use rusqlite::OptionalExtension;
 use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
-    SessionState, TaskId,
+    SessionOrigin, SessionState, TaskId,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, Conversation, EventMapper, StartSpec,
-    bounded_models, load_adopted, load_grants, load_origin, load_resume_handle,
+    bounded_models, load_grants, load_origin, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -1025,12 +1025,12 @@ fn run_thread<A: AgentAdapter>(
 }
 
 /// The conversation session context `context` starts in: its own, resumed
-/// with its handle; else, for the first context of a session a context was
-/// moved into, a fork of its origin's; else, for the first context of a
-/// session created by adoption, the outside conversation adopted by the
-/// agent's id; else a fresh one. Its own handle comes first: a context that
-/// forked or adopted keeps its copy from then on, where forking again would
-/// drop every turn it took since. An origin without a handle is refused
+/// with its handle; else what its origin names, for the first context of a
+/// session a move or an adoption created: a fork of the moved context's
+/// conversation, or the outside conversation adopted by the agent's id;
+/// else a fresh one. Its own handle comes first: a context that forked or
+/// adopted keeps its copy from then on, where forking again would drop
+/// every turn it took since. A moved context without a handle is refused
 /// (`Err`, for the log) rather than started fresh, which would silently
 /// drop the conversation the context continues; command validation moves
 /// only a context with a handle, so this is a guard.
@@ -1038,18 +1038,16 @@ fn conversation(db: &Db, context: ContextId) -> Result<Result<Conversation, Stri
     if let Some(handle) = load_resume_handle(db, context)? {
         return Ok(Ok(Conversation::Resume(handle)));
     }
-    let Some(origin) = load_origin(db, context)? else {
-        return Ok(Ok(match load_adopted(db, context)? {
-            Some(id) => Conversation::Adopt(id),
-            None => Conversation::Fresh,
-        }));
-    };
-    Ok(match load_resume_handle(db, origin)? {
-        Some(handle) => Ok(Conversation::Fork(handle)),
-        None => Err(format!(
-            "context {} has no conversation to continue",
-            origin.0
-        )),
+    Ok(match load_origin(db, context)? {
+        None => Ok(Conversation::Fresh),
+        Some(SessionOrigin::Agent { conversation }) => Ok(Conversation::Adopt(conversation)),
+        Some(SessionOrigin::Context(origin)) => match load_resume_handle(db, origin.context)? {
+            Some(handle) => Ok(Conversation::Fork(handle)),
+            None => Err(format!(
+                "context {} has no conversation to continue",
+                origin.context.0
+            )),
+        },
     })
 }
 

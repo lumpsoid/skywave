@@ -21,8 +21,9 @@
 //! a new session leaves that session's first context its origin
 //! ([`load_origin`]), whose conversation the new one continues as a fork.
 //! A session may instead adopt a conversation the agent had outside
-//! Skywave, named by the agent's own id ([`Conversation::Adopt`]): a copy
-//! too, so the outside conversation is never written. What the agent was
+//! Skywave, named by the agent's own id: the origin too, continued as
+//! [`Conversation::Adopt`], a copy, so the outside conversation is never
+//! written. What the agent was
 //! granted for the whole Skywave session (for example lasting permission
 //! rules) is opaque [`Grants`], persisted per session in
 //! `sessions.agent_grants` with [`store_grants`] / [`load_grants`] and given
@@ -93,7 +94,7 @@ use std::path::PathBuf;
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use skywave_proto::{ContextId, Decision, SessionId};
+use skywave_proto::{ContextId, Decision, SessionId, SessionOrigin};
 pub use skywave_proto::{
     Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TaskKind, TurnUsage,
 };
@@ -101,7 +102,6 @@ use tokio::sync::mpsc;
 
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::event_log::parse_id;
 
 pub use mapper::EventMapper;
 pub(crate) use mapper::bounded_models;
@@ -488,10 +488,11 @@ pub fn load_resume_handle(db: &Db, context: ContextId) -> Result<Option<ResumeHa
     }
 }
 
-/// The context of another session that session context `context`
-/// continues, its origin: set on the first context of a session a context
-/// was moved into, `None` for any other.
-pub fn load_origin(db: &Db, context: ContextId) -> Result<Option<ContextId>> {
+/// What session context `context` continues, its origin: a context of
+/// another session moved here, or a conversation the agent had outside
+/// Skywave, set on the first context of a session a move or an adoption
+/// created; `None` for any other.
+pub fn load_origin(db: &Db, context: ContextId) -> Result<Option<SessionOrigin>> {
     let row: Option<Option<String>> = db
         .conn()
         .prepare_cached("SELECT origin FROM contexts WHERE id = ?1")?
@@ -499,20 +500,8 @@ pub fn load_origin(db: &Db, context: ContextId) -> Result<Option<ContextId>> {
         .optional()?;
     match row {
         None => Err(Error::UnknownContext(context)),
-        Some(id) => Ok(id.as_deref().map(parse_id).transpose()?),
+        Some(json) => Ok(json.as_deref().map(serde_json::from_str).transpose()?),
     }
-}
-
-/// The agent's own id of the outside conversation session context
-/// `context` adopts: set on the first context of a session created by
-/// adoption, `None` for any other.
-pub fn load_adopted(db: &Db, context: ContextId) -> Result<Option<String>> {
-    let row: Option<Option<String>> = db
-        .conn()
-        .prepare_cached("SELECT adopted FROM contexts WHERE id = ?1")?
-        .query_row([context.0.to_string()], |r| r.get(0))
-        .optional()?;
-    row.ok_or(Error::UnknownContext(context))
 }
 
 /// Persists `grants` as session `session`'s grants, replacing any earlier.
