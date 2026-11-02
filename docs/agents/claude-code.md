@@ -668,14 +668,21 @@ and `ambient?`. Notes:
 - Nothing is sent at process start; the adapter reports an empty set when
   the agent is ready.
 - A Monitor is a `local_bash` task. List order is not start order.
-- The edge events (`task_started`, `task_updated`, `task_progress`,
-  `task_notification`) are not used for state: a missed edge would wedge a
-  set, a missed level event cannot (the next one replaces it).
+- The edge events (`task_updated`, `task_progress`, `task_notification`) are
+  not used for state: a missed edge would wedge a set, a missed level event
+  cannot (the next one replaces it). `task_started` is used for `local_agent`
+  only, to map the task id to its `Agent` call (`tool_use_id`); the set is
+  then reported again with `call` filled. The level set stays the only source
+  of which tasks are live.
 - A foreground Bash gets edge events but never enters the level.
 
 **Subagent messages.** A subagent's `assistant` and `user` messages carry
-`parent_tool_use_id` and may arrive after the main `result`. They are not
-reported: the main timeline drops them (`subagent`).
+`parent_tool_use_id` and may arrive after the main `result`. They are
+reported with `parent` = `parent_tool_use_id` (the `Agent` call) and shown in
+that subagent's own view (D34), not on the main timeline. Tool names are kept
+per subagent call across turns. Text in subagent `user` lines (including a
+foreground subagent's prompt) and thinking stay dropped. A subagent's
+`tool_result` lines carry no `tool_use_result` in any recording.
 
 **Self-started turns.** When a task ends or a cron fires, the CLI starts a
 turn with no user message: `system/init`, a whole turn, `result` (a cron's
@@ -829,8 +836,30 @@ in-process functions; neither goes through a control request.
 So the relay delivers the way typing in the TUI does; only the origin
 differs, and it costs a main turn.
 
+**Relay race (CLI 2.1.310).** The CLI opens main turns on its own when a
+background task ends, and a `user` line written then runs as a separate,
+later turn. Probe `relay_race` (a quick and a long background subagent; the
+relay is written the moment the quick one's `task_notification` arrives)
+saw the CLI run its notification turn first (no `SendMessage`, `result`),
+then the relay's turn (`ToolSearch`, `SendMessage`, `result`). So "the next
+`result` after writing is the line's turn" is false, and a relay's outcome
+cannot be settled by turn counting; D34 therefore defers messaging a
+subagent.
+
+**`--replay-user-messages`.** With it (`relay_race_echo`) the CLI echoes each
+stdin `user` line as `{"type":"user","isReplay":true,"uuid",...}` right after
+the `init` of the turn that takes it up, before any `assistant` line: a
+definitive marker of which turn is the line's. Unverified: whether an input
+`uuid` is echoed back.
+
+**`sleep` is blocked.** This CLI refuses a standalone `sleep 25` in a
+subagent ("use Monitor"), so the `relay_live` and `relay_midrun` prompts need
+changing before they are re-recorded. The raw `relay_race` recordings
+(`/tmp/skywave-race/`) are not fixtures; nothing replays them.
+
 **Re-check on every CLI bump.** Run `probe-subagent-message.py ctl_live
-<out>`. While the answer is still `Unsupported control request subtype:
+<out>`; `relay_race` and `relay_race_echo` regenerate the race findings above.
+While the answer is still `Unsupported control request subtype:
 send_task_message`, the relay stays (D33). A success answer, with the
 subagent replying ZEBRA, means the request is implemented: record a fixture
 and revisit D33.
