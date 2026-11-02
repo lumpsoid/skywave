@@ -1,7 +1,7 @@
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
-use super::screen::{EffortView, PermissionModeView};
+use super::screen::{EffortView, PermissionModeView, UsageGroupingView, UsageSpanView};
 
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
 /// signals only within a type, and the order matters (an edit before the
@@ -195,6 +195,12 @@ pub enum GuiIntent {
     },
     /// Browse local data behind the revoked notice.
     RevokedDismiss,
+    /// What the usage screen totals: the days and the grouping. Kept
+    /// while away from it.
+    UsageShow {
+        span: UsageSpanView,
+        grouping: UsageGroupingView,
+    },
     /// The app went off screen (hidden or paused). Reported, not decided:
     /// the hub knows what that means on this platform.
     AppBackgrounded,
@@ -343,6 +349,7 @@ pub enum RouteView {
     ArchivedSessions,
     Settings,
     Pairing,
+    Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, SignalPiece)]

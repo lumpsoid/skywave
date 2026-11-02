@@ -16,6 +16,9 @@ skywave-proto.workspace = true
 # The views' timestamps, for shell run durations and ages.
 chrono.workspace = true
 
+[dev-dependencies]
+uuid.workspace = true
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

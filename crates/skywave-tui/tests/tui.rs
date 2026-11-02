@@ -3235,6 +3235,66 @@ fn offline_composer_says_messages_wait() {
 }
 
 #[test]
+fn usage_totals_turns_across_sessions_by_range_and_grouping() {
+    let mut h = Harness::paired();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let turn = |id, minute, cost| {
+        event(
+            id,
+            minute,
+            EventKind::TurnUsage(TurnUsage {
+                tokens_in: Some(3_000),
+                tokens_out: Some(500),
+                cost_usd: cost,
+                model: Some("model-a".into()),
+                ..TurnUsage::default()
+            }),
+        )
+    };
+    pull(
+        &mut h,
+        vec![
+            created(a, 0, "/srv/a"),
+            created(b, 1, "/srv/b"),
+            turn(a, 2, Some(1.25)),
+            turn(b, 3, None),
+        ],
+    );
+    assert_eq!(
+        h.key(KeyCode::Char('u')),
+        Some(Action::Navigate(Route::Usage))
+    );
+    // The turns are days old: the default week may leave them out
+    // whatever the time zone, so take every day.
+    h.key(KeyCode::Char('r'));
+    h.key(KeyCode::Char('r'));
+    let screen = h.screen();
+    assert_contains(&screen, "[all]");
+    assert_contains(
+        &screen,
+        "Total  $1.25 + 1 unpriced · 6.0k in · 1.0k out · 2 turns",
+    );
+    assert_contains(&screen, "deleted from this device");
+
+    h.key(KeyCode::Tab);
+    let screen = h.screen();
+    assert_contains(&screen, "[by session]");
+    assert!(line_with(&screen, "a  ").contains("$1.25"), "{screen}");
+    assert!(
+        line_with(&screen, "cost unknown").starts_with('b'),
+        "{screen}"
+    );
+
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Tab);
+    let screen = h.screen();
+    assert_contains(&screen, "model-a  $1.25 + 1 unpriced");
+
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
+}
+
+#[test]
 fn settings_explain_the_blob_policy() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));

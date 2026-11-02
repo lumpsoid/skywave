@@ -2,12 +2,13 @@
 //! state (the pairing form, the open prompts, the composer), every label
 //! worded here as the TUI words it without its key hints.
 
+use chrono::{DateTime, Local};
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, Effort, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
     PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView,
     SessionRow, SessionState, SessionUsage, SessionView, SettingsView, Snippet, SubagentHeader,
-    TimelineItem, ViewState,
+    TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
@@ -20,6 +21,7 @@ use skywave_present::format::{
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
+use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
 use crate::link::count;
 use crate::signals::{
@@ -27,7 +29,8 @@ use crate::signals::{
     ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
     EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
     RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    SnippetView, StopHeadings, SubagentHeaderView, TaskRow, ToolKindView,
+    SnippetView, StopHeadings, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView,
+    UsageRowView, UsageSpanView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -43,6 +46,10 @@ pub struct Ui<'a> {
     /// The open session's composer.
     pub composer: Option<&'a ComposerView>,
     pub revoked_dismissed: bool,
+    /// The usage screen's days and grouping.
+    pub usage: (Span, Grouping),
+    /// The wall clock in unix-epoch millis: the usage span ends on its day.
+    pub wall_ms: i64,
 }
 
 /// The new-session prompt: its input as the hub knows it and the
@@ -67,6 +74,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
             session: session_view(session, view, ui),
         },
         Screen::Settings(settings) => settings_view(settings),
+        Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
     };
     ScreenUpdate {
         screen,
@@ -750,6 +758,43 @@ fn settings_view(settings: &SettingsView) -> ScreenView {
     }
 }
 
+fn usage_view(view: &UsageView, (span, grouping): (Span, Grouping), wall_ms: i64) -> ScreenView {
+    let now = DateTime::from_timestamp_millis(wall_ms)
+        .unwrap_or_default()
+        .with_timezone(&Local);
+    let report = Report::new(view, span, &now);
+    let row = |label: String, archived, totals: &Totals| UsageRowView {
+        label,
+        archived,
+        cost_label: totals.cost_label(),
+        tokens_label: totals.tokens_label(),
+        turns_label: totals.turns_label(),
+    };
+    let rows: Vec<UsageRowView> = report
+        .rows(grouping)
+        .iter()
+        .map(|r| row(clean_line(&r.label), r.archived, &r.totals))
+        .collect();
+    ScreenView::Usage {
+        span: match span {
+            Span::Today => UsageSpanView::Today,
+            Span::Week => UsageSpanView::Week,
+            Span::Month => UsageSpanView::Month,
+            Span::All => UsageSpanView::All,
+        },
+        grouping: match grouping {
+            Grouping::Day => UsageGroupingView::Day,
+            Grouping::Session => UsageGroupingView::Session,
+            Grouping::Workdir => UsageGroupingView::Workdir,
+            Grouping::Model => UsageGroupingView::Model,
+        },
+        total: row("Total".to_owned(), false, &report.total),
+        empty_label: rows.is_empty().then(|| NO_TURNS.to_owned()),
+        rows,
+        note: report.note,
+    }
+}
+
 /// A rule as listed: its label, then how far it reaches.
 fn rule_text(rule: &RuleSuggestion) -> String {
     format!("{} ({})", clean_line(&rule.label), scope_label(rule.scope))
@@ -845,6 +890,8 @@ mod tests {
             rename: None,
             composer: None,
             revoked_dismissed: false,
+            usage: Default::default(),
+            wall_ms: 0,
         };
         match update(&view, ui).screen {
             ScreenView::Session { session } => session,

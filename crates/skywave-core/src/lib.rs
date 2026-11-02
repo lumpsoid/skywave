@@ -55,7 +55,7 @@ pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCrede
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };
-pub use projection::{SessionSummary, SessionUsage};
+pub use projection::{SessionSummary, SessionUsage, TurnRecord};
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::Fingerprint;
@@ -76,5 +76,5 @@ pub use view::{
     SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
     SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
-    ToolOutcome, ToolView, TurnUsage, ViewState,
+    ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState,
 };

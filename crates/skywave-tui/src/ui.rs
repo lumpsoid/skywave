@@ -9,6 +9,7 @@
 mod session;
 mod shell;
 mod timeline;
+mod usage;
 
 use timeline::wall_ms;
 pub use timeline::{SHOW_BYTES, SHOW_LINES};
@@ -73,6 +74,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
                 }
             }
             Screen::Settings(settings) => render_settings(frame, body, app, settings),
+            Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
         }
     }
 
@@ -760,6 +762,7 @@ fn footer_keys(app: &App) -> &'static str {
         Screen::Settings(_) => {
             "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
         }
+        Screen::Usage(_) => "r range · Tab group · ↑↓ scroll · Esc back · ? help · q quit",
     }
 }
 
@@ -875,6 +878,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("D", "archived list: delete here only (y/N)"),
             key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
+            key("u", "usage: cost and tokens across sessions"),
             Line::from(""),
             section("Badges"),
             key("[idle]", "agent waiting for a message"),
@@ -1029,6 +1033,17 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             ),
             key("p", "re-pair"),
             key("Esc", "back to sessions"),
+        ]),
+        Screen::Usage(_) => lines.extend([
+            section("Usage"),
+            key("r", "range: today, 7 days, 30 days, all"),
+            key("Tab", "group by day, session, directory or model"),
+            key("↑↓ / k j", "scroll"),
+            key("Esc", "back to sessions"),
+            Line::from(""),
+            Line::from("  Totals come from this device's replica, so they work offline."),
+            Line::from("  A turn whose agent reported no cost is unpriced, not free."),
+            Line::from("  Archived sessions count; sessions deleted here do not."),
         ]),
     }
     lines

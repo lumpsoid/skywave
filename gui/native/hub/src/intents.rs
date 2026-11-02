@@ -136,6 +136,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             RouteView::ArchivedSessions => Route::ArchivedSessions,
             RouteView::Settings => Route::Settings,
             RouteView::Pairing => Route::Pairing,
+            RouteView::Usage => Route::Usage,
         }),
         ActionIntent::Back => Action::Back,
     })

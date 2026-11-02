@@ -19,7 +19,7 @@ pub use skywave_proto::{
     ToolKind, TurnUsage,
 };
 
-pub use crate::projection::SessionUsage;
+pub use crate::projection::{SessionUsage, TurnRecord};
 
 use crate::store::{BlobPolicy, OutboxEntry, OutboxStatus};
 
@@ -299,6 +299,7 @@ pub enum Screen {
     SessionList(SessionListView),
     Session(Box<SessionView>),
     Settings(SettingsView),
+    Usage(UsageView),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -452,6 +453,32 @@ pub struct SessionRow {
     /// would remove it: it is archived, has no pending approval, no running
     /// turn and no command from this device still unanswered.
     pub deletable: bool,
+}
+
+/// What the usage screen totals: every turn in the replica that reported
+/// usage, with the sessions they ran in. Heads pick the dates and group
+/// the turns themselves (`skywave_present::usage`), so this holds the
+/// turns as logged rather than sums.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageView {
+    /// In log order. Archived sessions' turns are here; a session deleted
+    /// from this device took its turns with it.
+    pub turns: Vec<TurnRecord>,
+    /// Every session in the replica, archived ones included.
+    pub sessions: Vec<UsageSession>,
+    /// How many sessions were deleted from this device, whose turns no
+    /// longer count.
+    pub deleted: usize,
+}
+
+/// A session as the usage screen names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSession {
+    pub id: SessionId,
+    /// As [`SessionRow::title`]; text from the server.
+    pub title: String,
+    pub workdir: Option<String>,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

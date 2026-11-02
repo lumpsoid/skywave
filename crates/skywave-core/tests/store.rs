@@ -546,6 +546,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -682,9 +683,89 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
+}
+
+#[test]
+fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
+    let (_tmp, dir) = data_dir();
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let created = |id| {
+        event(
+            id,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/x".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        )
+    };
+    let priced = TurnUsage {
+        tokens_in: Some(3_000),
+        cost_usd: Some(0.25),
+        model: Some("model-a".into()),
+        ..TurnUsage::default()
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            created(a),
+            created(b),
+            event(a, 1, EventKind::TurnUsage(priced.clone())),
+            event(b, 2, EventKind::TurnUsage(TurnUsage::default())),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+
+    let turns = |store: &Store| -> Vec<(Seq, SessionId, TurnUsage)> {
+        store
+            .load()
+            .unwrap()
+            .turns
+            .into_iter()
+            .map(|t| (t.seq, t.session_id, t.usage))
+            .collect()
+    };
+    let store = Store::open(&dir).unwrap();
+    let both = vec![
+        (Seq(3), a, priced.clone()),
+        (Seq(4), b, TurnUsage::default()),
+    ];
+    assert_eq!(turns(&store), both, "kept over a reopen");
+    assert_eq!(
+        store.turns().unwrap()[0].at,
+        Utc.with_ymd_and_hms(2026, 10, 29, 9, 1, 0).unwrap()
+    );
+    drop(store);
+
+    // A replica from before the table backfills it from the stored log.
+    drop_turns(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(turns(&store), both);
+    assert_eq!(
+        store.turns().unwrap()[1].at,
+        Utc.with_ymd_and_hms(2026, 10, 29, 9, 2, 0).unwrap()
+    );
+
+    store.delete_session_locally(b, Utc::now()).unwrap();
+    assert_eq!(turns(&store), vec![(Seq(3), a, priced)]);
+    // A deleted session's later turns are not stored.
+    let later = EventBatch {
+        from: Seq(5),
+        events: vec![event(b, 3, EventKind::TurnUsage(TurnUsage::default()))],
+    };
+    store.apply_batch(&later, Utc::now()).unwrap();
+    assert_eq!(turns(&store).len(), 1);
+
+    store.reset_for_server("other:7443").unwrap();
+    assert!(turns(&store).is_empty());
 }
 
 #[test]
@@ -791,7 +872,8 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     // A replica from before the column holds no background work events.
     drop_shell(&dir);
     drop_work(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    drop_turns(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -862,6 +944,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
     assert!(!summary(&store, a).archived);
@@ -948,6 +1031,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
     for expected in before {
@@ -1052,6 +1136,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
@@ -1224,6 +1309,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -1944,6 +2030,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop_work(&dir);
     drop_contexts(&dir);
     drop_agent(&dir);
+    drop_turns(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
@@ -2033,7 +2120,8 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_shell(&dir);
     drop_work(&dir);
     drop_contexts(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    drop_turns(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2074,6 +2162,11 @@ fn drop_contexts(dir: &Path) {
 
 /// Undoes the shell commands migration: no composer modes, one agent
 /// draft per session, snippets without a kind.
+fn drop_turns(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE turns;").unwrap();
+}
+
 fn drop_shell(dir: &Path) {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch(
@@ -2489,7 +2582,8 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
         )
         .unwrap();
     }
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    drop_turns(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
