@@ -508,6 +508,28 @@ pub struct ComposerView {
     /// `to the main agent` in a subagent's view, which takes no message
     /// of its own.
     pub to_label: Option<String>,
+    /// What the composer writes: a message to the agent, or a shell
+    /// command (`ToggleShellMode`). Its text is that mode's draft.
+    pub mode: ComposerModeView,
+    /// The server runs shell commands: the shell toggle shows. Switching
+    /// back out of shell mode works without it.
+    pub shell_enabled: bool,
+    /// In shell mode, the prompt before the field: the last part of the
+    /// session's cwd and `$` (`work $`, or a bare `$` before any is known).
+    pub prompt_label: Option<String>,
+    /// In shell mode, the condition chip's label: `if ok ✓`, `if failed
+    /// ✗`; `None` for always. `CycleCondition` steps it; it resets after
+    /// each run sent.
+    pub when_label: Option<String>,
+    /// In shell mode, the stop button does something (`StopShell`).
+    pub can_stop: bool,
+}
+
+/// What a session's composer writes on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
+pub enum ComposerModeView {
+    Agent,
+    Shell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]

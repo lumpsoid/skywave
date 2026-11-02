@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/session/search_holder.dart';
 import 'package:skywave_gui/session/session_page.dart';
+import 'package:skywave_gui/session/shell_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -69,7 +70,14 @@ SectionView lines(
   cutShort: cutShort,
 );
 
-const composerAt1 = ComposerView(text: '', cursorUtf16: 0, rev: 1);
+const composerAt1 = ComposerView(
+  text: '',
+  cursorUtf16: 0,
+  rev: 1,
+  mode: ComposerModeView.agent,
+  shellEnabled: false,
+  canStop: false,
+);
 
 ModeOption _mode(
   PermissionModeView mode,
@@ -211,19 +219,22 @@ SessionScreen screenWith({
   archivedLabel: archivedLabel,
 );
 
-/// The session page over [timeline] and [search], recording what it sends.
+/// The session page over [timeline], [shell] and [search], recording what
+/// it sends.
 Future<void> pumpSession(
   WidgetTester tester, {
   required SessionScreen screen,
   required TimelineHolder timeline,
   required List<GuiIntent> sent,
   SearchHolder? search,
+  ShellHolder? shell,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
       home: SessionPage(
         screen: screen,
         timeline: timeline,
+        shell: shell,
         search: search,
         send: sent.add,
       ),

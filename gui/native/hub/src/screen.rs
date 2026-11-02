@@ -24,10 +24,10 @@ use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sec
 use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
-    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
-    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, SubagentHeaderView, TaskRow, ToolKindView,
+    ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
+    EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
+    RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
+    SnippetView, StopHeadings, SubagentHeaderView, TaskRow, ToolKindView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 
@@ -381,8 +381,20 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             history_label: None,
             offline_label: None,
             to_label: None,
+            mode: ComposerModeView::Agent,
+            shell_enabled: false,
+            prompt_label: None,
+            when_label: None,
+            can_stop: false,
         }),
-        snippets: view.snippets.iter().map(snippet_view).collect(),
+        // The composer's kind only: saved prompts in agent mode, saved
+        // commands in shell mode.
+        snippets: view
+            .snippets
+            .iter()
+            .filter(|s| s.kind == session.mode)
+            .map(snippet_view)
+            .collect(),
         rename_prompt: ui
             .rename
             .filter(|r| r.session_id == session.id.0.to_string())

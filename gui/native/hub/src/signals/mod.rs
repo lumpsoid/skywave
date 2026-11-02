@@ -10,6 +10,7 @@
 //! - [`screen`]: the screen and its data but the timeline (`ScreenUpdate`).
 //! - [`timeline`]: the open session's timeline, snapshot then keyed diffs.
 //! - [`search`]: the timeline search (`SearchUpdate`).
+//! - [`shell`]: the open session's shell runs, snapshot then keyed diffs.
 //! - [`effects`]: one-shot platform effects (`PlatformEffect`).
 
 mod boot;
@@ -18,6 +19,7 @@ mod intents;
 mod link;
 mod screen;
 mod search;
+mod shell;
 mod timeline;
 
 pub use boot::{Boot, BootFailed, Booted};
@@ -26,12 +28,13 @@ pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiInt
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView,
-    ModeOption, ModelOption, PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption,
-    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, SubagentHeaderView, TaskRow,
+    ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
+    EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
+    RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
+    SnippetView, StopHeadings, SubagentHeaderView, TaskRow,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
+pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
 pub use timeline::{
     BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
     SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,

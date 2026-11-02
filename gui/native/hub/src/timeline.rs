@@ -747,7 +747,7 @@ fn more_note(section: &Section, preview: usize, shown: usize) -> Option<String> 
 /// A section's blob with where its download stands, worded as the TUI
 /// words an expanded section's: `not downloaded · 4.0 KiB`, `downloading
 /// · 1.0 KiB of 4.0 KiB (25%)`.
-fn blob_facts(blob: &BlobView) -> BlobFacts {
+pub fn blob_facts(blob: &BlobView) -> BlobFacts {
     let (state, label) = match &blob.state {
         BlobState::NotDownloaded { size } => (
             BlobStateKind::NotDownloaded,
