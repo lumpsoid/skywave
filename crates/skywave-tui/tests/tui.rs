@@ -14,13 +14,13 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use skywave_core::{
     Action, ApprovalId, BlobId, BlobPolicy, BlobStatus, CommandId, Core, Decision, Delivery,
-    DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request, Route, Screen,
-    Seam, Seq, SessionId, TimelineItem, ViewState,
+    DeviceId, Draft, Effort, Entry, Link, LinkRejection, PairedCredentials, Request, Route,
+    RunWhen, Screen, Seam, Seq, SessionId, TimelineItem, ViewState,
 };
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, CommandResult, DeviceInfo, DirsResult, Event, EventBatch,
-    EventKind, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    EventKind, HelloResponse, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
     SessionState as LogState, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
 };
 use skywave_tui::App;
@@ -1424,16 +1424,23 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
 
     // Listed at `hello`; a control character in a name never reaches the grid.
     h.seam
-        .devices_listed(&[
-            DeviceInfo {
-                id: phone,
-                name: "Pixel\u{7} 8".into(),
-            },
-            DeviceInfo {
-                id: me,
-                name: "laptop".into(),
-            },
-        ])
+        .hello_received(&HelloResponse {
+            protocol_version: skywave_proto::PROTOCOL_VERSION,
+            server_id: skywave_proto::ServerId::new(),
+            device_id: me,
+            head: Seq::ZERO,
+            devices: vec![
+                DeviceInfo {
+                    id: phone,
+                    name: "Pixel\u{7} 8".into(),
+                },
+                DeviceInfo {
+                    id: me,
+                    name: "laptop".into(),
+                },
+            ],
+            shell: false,
+        })
         .unwrap();
     h.sync();
     let screen = h.screen();
@@ -2963,7 +2970,8 @@ fn idle_draft_is_saved_once() {
         h.core_draft(),
         Some(Draft {
             text: "abc".into(),
-            cursor: 3
+            cursor: 3,
+            when: RunWhen::Always,
         })
     );
     assert_eq!(h.app.draft_due_in(before), None);
@@ -3039,7 +3047,8 @@ fn failed_draft_save_is_retried_on_the_idle_cadence() {
         h.core_draft(),
         Some(Draft {
             text: "abc".into(),
-            cursor: 3
+            cursor: 3,
+            when: RunWhen::Always,
         })
     );
     assert_eq!(h.app.draft_due_in(t3), None);

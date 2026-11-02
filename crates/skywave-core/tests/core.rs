@@ -8,9 +8,9 @@ use std::thread;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobState, BlobStatus, Core, CoreError, Delivery, DeviceRef, Draft, Entry, Fingerprint,
-    Link, Outgoing, PairedCredentials, PairingStatus, Request, Route, Screen, Seam, SessionView,
-    SettingsView, Store, StoreError, TimelineItem, ViewState,
+    Action, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef, Draft,
+    Entry, Fingerprint, Link, Outgoing, PairedCredentials, PairingStatus, Request, Route, RunWhen,
+    Screen, Seam, SessionView, SettingsView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandKind, CommandResult, ContextId, Decision, DeviceId, Event,
@@ -421,8 +421,10 @@ fn draft_survives_restart() {
     .unwrap();
     core.dispatch(Action::SaveDraft {
         session_id: sid,
+        mode: ComposerMode::Agent,
         text: "half a thöught".into(),
         cursor: 6,
+        when: RunWhen::Always,
     })
     .unwrap();
     assert_eq!(drain(&requests), vec![], "drafts never reach the engine");
@@ -431,6 +433,7 @@ fn draft_survives_restart() {
     let draft = Some(Draft {
         text: "half a thöught".into(),
         cursor: 6,
+        when: RunWhen::Always,
     });
     let core = Core::open_detached(dir.path()).unwrap();
     let Screen::SessionList(list) = core.view().screen else {
@@ -500,8 +503,10 @@ fn pairing_with_another_server_drops_the_old_sessions_from_the_view() {
     .unwrap();
     core.dispatch(Action::SaveDraft {
         session_id: old,
+        mode: ComposerMode::Agent,
         text: "unsent".into(),
         cursor: 0,
+        when: RunWhen::Always,
     })
     .unwrap();
     let rows = |core: &Core| match core.view().screen {
@@ -803,8 +808,10 @@ fn deleted_session_stays_gone_after_restart() {
         .unwrap();
     core.dispatch(Action::SaveDraft {
         session_id: gone,
+        mode: ComposerMode::Agent,
         text: "unsent".into(),
         cursor: 0,
+        when: RunWhen::Always,
     })
     .unwrap();
 
@@ -844,7 +851,14 @@ fn deleted_session_stays_gone_after_restart() {
     let store = Store::open(dir.path()).unwrap();
     assert!(store.session_events(gone).unwrap().is_empty());
     assert_eq!(store.blob(blob.id).unwrap(), None);
-    assert!(!store.load().unwrap().drafts.contains_key(&gone));
+    assert!(
+        !store
+            .load()
+            .unwrap()
+            .drafts
+            .keys()
+            .any(|(id, _)| *id == gone)
+    );
 }
 
 #[test]
@@ -1299,4 +1313,262 @@ fn protocol_initialize_id(recording: &str) -> serde_json::Value {
         .find(|r| r["dir"] == "in" && r["msg"]["request"]["subtype"] == "initialize")
         .map(|r| r["msg"]["request_id"].clone())
         .unwrap()
+}
+
+/// A core over `dir` paired, with one session `sid` in its replica, open.
+fn core_with_session(dir: &Path) -> (Core, Seam, Receiver<Request>, SessionId) {
+    let (core, seam, requests, _) = paired_core(dir);
+    let sid = SessionId::new();
+    seam.apply_events(&EventBatch {
+        from: Seq(1),
+        events: vec![event(
+            sid,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        )],
+    })
+    .unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    (core, seam, requests, sid)
+}
+
+/// The shell runs queued in the replica, in send order: (id, command, when).
+fn queued_runs(dir: &Path) -> Vec<(skywave_proto::CommandId, String, RunWhen)> {
+    Store::open(dir)
+        .unwrap()
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.command.kind {
+            CommandKind::RunShell { command, when, .. } => Some((e.command.id, command, when)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn run_shell(session_id: SessionId, command: &str, when: RunWhen) -> Action {
+    Action::RunShell {
+        session_id,
+        command: command.into(),
+        when,
+    }
+}
+
+#[test]
+fn a_shell_run_is_queued_as_the_head_wrote_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, requests, sid) = core_with_session(dir.path());
+
+    // Blank, or for an unknown session: nothing is queued.
+    core.dispatch(run_shell(sid, " \n\t", RunWhen::OnSuccess))
+        .unwrap();
+    core.dispatch(run_shell(SessionId::new(), "ls", RunWhen::Always))
+        .unwrap();
+    assert_eq!(drain(&requests), vec![]);
+    assert!(queued_runs(dir.path()).is_empty());
+
+    // The text and the condition go out verbatim, untrimmed.
+    core.dispatch(run_shell(sid, "  make test \n", RunWhen::OnFailure))
+        .unwrap();
+    assert_eq!(drain(&requests), vec![Request::OutboxChanged]);
+    let runs = queued_runs(dir.path());
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        (runs[0].1.as_str(), runs[0].2),
+        ("  make test \n", RunWhen::OnFailure)
+    );
+    let stored = Store::open(dir.path()).unwrap().pending_outbox().unwrap();
+    assert!(matches!(
+        stored[0].command.kind,
+        CommandKind::RunShell { session_id, .. } if session_id == sid
+    ));
+
+    // A stop is queued as asked for, naming the run.
+    core.dispatch(Action::StopShell {
+        session_id: sid,
+        run: runs[0].0,
+    })
+    .unwrap();
+    let stored = Store::open(dir.path()).unwrap().pending_outbox().unwrap();
+    assert!(matches!(
+        stored[1].command.kind,
+        CommandKind::StopShell { session_id, run } if session_id == sid && run == runs[0].0
+    ));
+}
+
+#[test]
+fn offline_runs_keep_their_order_and_go_back_into_the_shell_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, sid) = core_with_session(dir.path());
+    let agent_draft = Draft {
+        text: "a message".into(),
+        cursor: 2,
+        when: RunWhen::Always,
+    };
+    core.dispatch(Action::SaveDraft {
+        session_id: sid,
+        mode: ComposerMode::Agent,
+        text: agent_draft.text.clone(),
+        cursor: agent_draft.cursor,
+        when: RunWhen::Always,
+    })
+    .unwrap();
+    for (command, when) in [
+        ("cargo build", RunWhen::Always),
+        ("cargo test", RunWhen::OnSuccess),
+        ("git status", RunWhen::OnFailure),
+    ] {
+        core.dispatch(run_shell(sid, command, when)).unwrap();
+    }
+    let runs = queued_runs(dir.path());
+    let texts = |runs: &[(skywave_proto::CommandId, String, RunWhen)]| {
+        runs.iter().map(|r| r.1.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(texts(&runs), ["cargo build", "cargo test", "git status"]);
+
+    core.dispatch(Action::Discard(runs[0].0)).unwrap();
+    let left = queued_runs(dir.path());
+    assert_eq!(texts(&left), ["cargo test", "git status"]);
+
+    // The shell draft gets the run's text and condition; the agent draft
+    // stays as it was.
+    core.dispatch(Action::SaveDraft {
+        session_id: sid,
+        mode: ComposerMode::Shell,
+        text: "ls".into(),
+        cursor: 2,
+        when: RunWhen::Always,
+    })
+    .unwrap();
+    let rev = session_view(&core.view()).draft_rev;
+    core.dispatch(Action::EditQueued(left[0].0)).unwrap();
+    let shell_draft = Draft {
+        text: "cargo test\nls".into(),
+        cursor: "cargo test".len(),
+        when: RunWhen::OnSuccess,
+    };
+    let view = core.view();
+    let view = session_view(&view);
+    assert_eq!(view.shell_draft, Some(shell_draft.clone()));
+    assert_eq!(view.draft, Some(agent_draft.clone()));
+    assert!(view.draft_rev > rev, "heads refill their composer");
+    assert_eq!(texts(&queued_runs(dir.path())), ["git status"]);
+
+    // On disk too.
+    drop(core);
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    let view = core.view();
+    assert_eq!(session_view(&view).shell_draft, Some(shell_draft));
+    assert_eq!(session_view(&view).draft, Some(agent_draft));
+}
+
+#[test]
+fn drafts_per_mode_and_the_composer_mode_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, requests, sid) = core_with_session(dir.path());
+    assert_eq!(session_view(&core.view()).mode, ComposerMode::Agent);
+    let save = |mode, text: &str, when| Action::SaveDraft {
+        session_id: sid,
+        mode,
+        text: text.into(),
+        cursor: 1,
+        when,
+    };
+    core.dispatch(save(ComposerMode::Agent, "hello", RunWhen::OnFailure))
+        .unwrap();
+    core.dispatch(save(ComposerMode::Shell, "ls -l", RunWhen::OnSuccess))
+        .unwrap();
+    core.dispatch(Action::SetComposerMode {
+        session_id: sid,
+        mode: ComposerMode::Shell,
+    })
+    .unwrap();
+    assert_eq!(drain(&requests), vec![], "all of it stays on this device");
+    drop((core, seam));
+
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    let view = core.view();
+    let view = session_view(&view);
+    assert_eq!(view.mode, ComposerMode::Shell);
+    let draft = |text: &str, when| {
+        Some(Draft {
+            text: text.into(),
+            cursor: 1,
+            when,
+        })
+    };
+    assert_eq!(
+        view.draft,
+        draft("hello", RunWhen::Always),
+        "an agent draft runs on no condition"
+    );
+    assert_eq!(view.shell_draft, draft("ls -l", RunWhen::OnSuccess));
+
+    // A shell draft with a condition picked before typing is kept blank;
+    // a blank one with none goes.
+    core.dispatch(save(ComposerMode::Shell, "", RunWhen::OnFailure))
+        .unwrap();
+    assert_eq!(
+        session_view(&core.view()).shell_draft,
+        Some(Draft {
+            text: String::new(),
+            cursor: 0,
+            when: RunWhen::OnFailure,
+        })
+    );
+    core.dispatch(save(ComposerMode::Shell, " ", RunWhen::Always))
+        .unwrap();
+    assert_eq!(session_view(&core.view()).shell_draft, None);
+
+    // Back to the agent, kept too.
+    core.dispatch(Action::SetComposerMode {
+        session_id: sid,
+        mode: ComposerMode::Agent,
+    })
+    .unwrap();
+    drop(core);
+    let core = Core::open_detached(dir.path()).unwrap();
+    core.dispatch(Action::OpenSession(sid)).unwrap();
+    assert_eq!(session_view(&core.view()).mode, ComposerMode::Agent);
+}
+
+#[test]
+fn snippets_of_both_kinds_with_the_same_text_coexist() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _seam, _requests, _sid) = core_with_session(dir.path());
+    for kind in [
+        ComposerMode::Agent,
+        ComposerMode::Shell,
+        ComposerMode::Shell,
+    ] {
+        core.dispatch(Action::SaveSnippet {
+            name: String::new(),
+            text: "make test".into(),
+            kind,
+        })
+        .unwrap();
+    }
+    drop(core);
+    let core = Core::open_detached(dir.path()).unwrap();
+    let mut kinds: Vec<_> = core
+        .view()
+        .snippets
+        .iter()
+        .map(|s| (s.text.clone(), s.kind == ComposerMode::Shell))
+        .collect();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        [
+            ("make test".to_owned(), false),
+            ("make test".to_owned(), true)
+        ],
+        "one per kind"
+    );
 }

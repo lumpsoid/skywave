@@ -602,7 +602,7 @@ async fn connection(
         Err(error) => return error.into(),
     };
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-    if let Err(error) = ctx.seam.devices_listed(&hello.devices) {
+    if let Err(error) = ctx.seam.hello_received(&hello) {
         return error.into();
     }
     let ended = tokio::select! {
@@ -658,7 +658,7 @@ async fn pull(
                 // again, so its name shows without waiting for a reconnect.
                 let unnamed = ctx.seam.unnamed_devices(&batch);
                 if unnamed.into_iter().filter(|id| asked.insert(*id)).count() > 0 {
-                    ctx.seam.devices_listed(&transport.hello().await?.devices)?;
+                    ctx.seam.hello_received(&transport.hello().await?)?;
                 }
             }
             Err(CoreError::Store(StoreError::Gap { cursor, from })) => {

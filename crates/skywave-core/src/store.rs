@@ -24,7 +24,7 @@ use skywave_proto::{
 use uuid::Uuid;
 
 use crate::projection::{SessionSummary, blob_refs};
-use crate::view::{Draft, Snippet, SnippetId};
+use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
@@ -222,6 +222,36 @@ UPDATE outbox SET command = json_set(command, '$.kind.context',
 -- nothing to backfill.
 ALTER TABLE sessions ADD COLUMN work TEXT;
 "#,
+    r#"
+-- Shell commands (protocol v14), all of it this device's (D5: never
+-- synced). What each session's composer writes: a session with no row
+-- writes to its agent.
+CREATE TABLE composer_modes (
+    session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL CHECK (mode IN ('agent', 'shell'))
+);
+-- A draft per session and composer mode; `when` is the condition a shell
+-- draft runs on, `always` for an agent draft. SQLite cannot change a
+-- primary key in place, so the table is rebuilt; every draft from before
+-- this was written to the agent. Nothing else indexes or references it.
+CREATE TABLE drafts_by_mode (
+    session_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('agent', 'shell')),
+    text TEXT NOT NULL,
+    cursor INTEGER NOT NULL,
+    "when" TEXT NOT NULL DEFAULT 'always'
+        CHECK ("when" IN ('always', 'on_success', 'on_failure')),
+    PRIMARY KEY (session_id, mode)
+);
+INSERT INTO drafts_by_mode (session_id, mode, text, cursor, "when")
+    SELECT session_id, 'agent', text, cursor, 'always' FROM drafts;
+DROP TABLE drafts;
+ALTER TABLE drafts_by_mode RENAME TO drafts;
+-- The composer a snippet is for; a text is saved once per kind. Every
+-- snippet from before this was a prompt.
+ALTER TABLE snippets ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'
+    CHECK (kind IN ('agent', 'shell'));
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -274,6 +304,9 @@ pub struct Settings {
     pub blob_policy: BlobPolicy,
     /// Address of the paired server, e.g. `host:port`; `None` before pairing.
     pub server_address: Option<String>,
+    /// Whether the server runs shell commands, as its last `hello` said
+    /// ([`Store::set_shell_enabled`]); `false` until one said so.
+    pub shell_enabled: bool,
 }
 
 /// Delivery state of a queued command.
@@ -331,13 +364,15 @@ pub struct OutboxEntry {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, session creation or context move the server never saw
-    /// (`tries == 0`) or refused. A command that may have reached the server and has no
-    /// answer never is: withdrawing it could not stop it.
+    /// message, shell run, session creation or context move the server
+    /// never saw (`tries == 0`) or refused. A command that may have reached
+    /// the server and has no answer never is: withdrawing it could not stop
+    /// it.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
             CommandKind::SendMessage { .. }
+                | CommandKind::RunShell { .. }
                 | CommandKind::CreateSession { .. }
                 | CommandKind::MoveContext { .. }
         );
@@ -408,7 +443,10 @@ pub struct Snapshot {
     pub outbox: Vec<OutboxEntry>,
     pub blobs: Vec<BlobRecord>,
     pub settings: Settings,
-    pub drafts: HashMap<SessionId, Draft>,
+    pub drafts: HashMap<(SessionId, ComposerMode), Draft>,
+    /// Sessions whose composer does not write to the agent
+    /// ([`Store::set_composer_mode`]).
+    pub composer_modes: HashMap<SessionId, ComposerMode>,
     pub read_marks: HashMap<SessionId, ReadMark>,
     /// Sessions deleted from this device ([`Store::delete_session_locally`]).
     pub deleted: HashSet<SessionId>,
@@ -469,6 +507,7 @@ impl Store {
             blobs: self.blobs()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
+            composer_modes: self.composer_modes()?,
             read_marks: self.read_marks()?,
             deleted: read_deleted(&self.conn)?,
             alerted: self.alerted()?,
@@ -669,6 +708,10 @@ impl Store {
         tx.execute("DELETE FROM events WHERE session_id = ?1", [&session])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [&session])?;
         tx.execute("DELETE FROM drafts WHERE session_id = ?1", [&session])?;
+        tx.execute(
+            "DELETE FROM composer_modes WHERE session_id = ?1",
+            [&session],
+        )?;
         tx.execute("DELETE FROM read_marks WHERE session_id = ?1", [&session])?;
         tx.execute(
             "DELETE FROM alerted_approvals WHERE session_id = ?1",
@@ -692,8 +735,9 @@ impl Store {
     /// transaction: the event log, session summaries, cursor, outbox and
     /// blob rows the old server's log produced go, as do its device names,
     /// and so does what this
-    /// device kept beside them — drafts, read marks, locally deleted
-    /// sessions and alerted approvals. Of the settings, the server address becomes `address`;
+    /// device kept beside them — drafts, composer modes, read marks, locally
+    /// deleted sessions and alerted approvals. Of the settings, the server
+    /// address becomes `address` and the old server's shell flag goes;
     /// the blob policy, a preference of this device, stays, as do keys a
     /// newer build wrote. Snippets, this device's too, stay. Returns the blobs that were known, whose files
     /// the caller removes.
@@ -711,11 +755,14 @@ impl Store {
              DELETE FROM outbox;
              DELETE FROM blobs;
              DELETE FROM drafts;
+             DELETE FROM composer_modes;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
              DELETE FROM alerted_approvals;
              DELETE FROM devices;",
         )?;
+        // The old server's word on shell commands says nothing of the new.
+        tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_SHELL_ENABLED])?;
         tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -741,16 +788,22 @@ impl Store {
     /// Persists a command as `Queued`. Enqueuing a [`CommandId`] that is
     /// already in the outbox changes nothing.
     ///
-    /// A message also deletes its session's draft, in the same transaction:
-    /// a crash never leaves both the queued message and the draft it was
-    /// written in, which would invite sending it twice.
+    /// A message also deletes its session's agent draft, and a shell run its
+    /// shell draft, in the same transaction: a crash never leaves both the
+    /// queued command and the draft it was written in, which would invite
+    /// sending it twice.
     pub fn enqueue(&self, command: &Command) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
-        if let CommandKind::SendMessage { session_id, .. } = &command.kind {
+        let written = match &command.kind {
+            CommandKind::SendMessage { session_id, .. } => Some((session_id, ComposerMode::Agent)),
+            CommandKind::RunShell { session_id, .. } => Some((session_id, ComposerMode::Shell)),
+            _ => None,
+        };
+        if let Some((session_id, mode)) = written {
             tx.execute(
-                "DELETE FROM drafts WHERE session_id = ?1",
-                [session_id.0.to_string()],
+                "DELETE FROM drafts WHERE session_id = ?1 AND mode = ?2",
+                params![session_id.0.to_string(), mode_sql(mode)],
             )?;
         }
         tx.execute(
@@ -853,14 +906,14 @@ impl Store {
 
     /// Takes a command back: deletes it from the outbox if it was never
     /// attempted or the server refused it (or its request), and keeps `draft` as its
-    /// session's draft, in one transaction, so a crash keeps the text in
-    /// exactly one place. Any other row stays and the call fails with
-    /// [`StoreError::NotWithdrawable`], writing nothing: it may have reached
-    /// the server, and only its answer can settle it.
+    /// session's draft in that mode, in one transaction, so a crash keeps
+    /// the text in exactly one place. Any other row stays and the call
+    /// fails with [`StoreError::NotWithdrawable`], writing nothing: it may
+    /// have reached the server, and only its answer can settle it.
     pub fn withdraw(
         &self,
         id: CommandId,
-        draft: Option<(SessionId, &Draft)>,
+        draft: Option<((SessionId, ComposerMode), &Draft)>,
     ) -> Result<(), StoreError> {
         // Unchecked only because `&self`: no other transaction is open here.
         let tx = self.conn.unchecked_transaction()?;
@@ -873,8 +926,8 @@ impl Store {
         if deleted == 0 {
             return Err(StoreError::NotWithdrawable(id));
         }
-        if let Some((session_id, draft)) = draft {
-            upsert_draft(&tx, session_id, draft)?;
+        if let Some((key, draft)) = draft {
+            upsert_draft(&tx, key, draft)?;
         }
         tx.commit()?;
         Ok(())
@@ -933,38 +986,78 @@ impl Store {
 
     // ---- drafts -------------------------------------------------------------
 
-    /// This device's unsent messages, by session.
-    pub fn drafts(&self) -> Result<HashMap<SessionId, Draft>, StoreError> {
+    /// This device's unsent messages and shell commands, by session and
+    /// composer mode.
+    pub fn drafts(&self) -> Result<HashMap<(SessionId, ComposerMode), Draft>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT session_id, text, cursor FROM drafts")?;
+            .prepare(r#"SELECT session_id, mode, text, cursor, "when" FROM drafts"#)?;
         let rows = stmt.query_map([], |row| {
-            let cursor: i64 = row.get(2)?;
+            let cursor: i64 = row.get(3)?;
             let draft = Draft {
-                text: row.get(1)?,
-                cursor: usize::try_from(cursor).map_err(|e| bad_value(2, Type::Integer, e))?,
+                text: row.get(2)?,
+                cursor: usize::try_from(cursor).map_err(|e| bad_value(3, Type::Integer, e))?,
+                when: when_col(row, 4)?,
             };
-            Ok((SessionId(uuid_col(row, 0)?), draft))
+            Ok(((SessionId(uuid_col(row, 0)?), mode_col(row, 1)?), draft))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Keeps `draft` as the session's unsent message; `None` deletes it.
+    /// Keeps `draft` as the session's unsent text in `mode`; `None` deletes
+    /// it.
     pub fn set_draft(
         &self,
         session_id: SessionId,
+        mode: ComposerMode,
         draft: Option<&Draft>,
     ) -> Result<(), StoreError> {
         match draft {
-            Some(draft) => upsert_draft(&self.conn, session_id, draft),
+            Some(draft) => upsert_draft(&self.conn, (session_id, mode), draft),
             None => {
                 self.conn.execute(
-                    "DELETE FROM drafts WHERE session_id = ?1",
-                    [session_id.0.to_string()],
+                    "DELETE FROM drafts WHERE session_id = ?1 AND mode = ?2",
+                    params![session_id.0.to_string(), mode_sql(mode)],
                 )?;
                 Ok(())
             }
         }
+    }
+
+    // ---- composer modes -------------------------------------------------------
+
+    /// What each session's composer writes, for the sessions whose is not
+    /// [`ComposerMode::Agent`].
+    pub fn composer_modes(&self) -> Result<HashMap<SessionId, ComposerMode>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, mode FROM composer_modes")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((SessionId(uuid_col(row, 0)?), mode_col(row, 1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keeps what the session's composer writes.
+    pub fn set_composer_mode(
+        &self,
+        session_id: SessionId,
+        mode: ComposerMode,
+    ) -> Result<(), StoreError> {
+        let session = session_id.0.to_string();
+        match mode {
+            // No row is the agent.
+            ComposerMode::Agent => self.conn.execute(
+                "DELETE FROM composer_modes WHERE session_id = ?1",
+                [session],
+            )?,
+            ComposerMode::Shell => self.conn.execute(
+                "INSERT INTO composer_modes (session_id, mode) VALUES (?1, ?2)
+                 ON CONFLICT (session_id) DO UPDATE SET mode = excluded.mode",
+                params![session, mode_sql(mode)],
+            )?,
+        };
+        Ok(())
     }
 
     // ---- snippets -----------------------------------------------------------
@@ -973,13 +1066,14 @@ impl Store {
     pub fn snippets(&self) -> Result<Vec<Snippet>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, text, used FROM snippets")?;
+            .prepare("SELECT id, name, text, used, kind FROM snippets")?;
         let rows = stmt.query_map([], |row| {
             Ok(Snippet {
                 id: SnippetId(uuid_col(row, 0)?),
                 name: row.get(1)?,
                 text: row.get(2)?,
                 used: u64_col(row, 3)?,
+                kind: mode_col(row, 4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -988,14 +1082,16 @@ impl Store {
     /// Keeps the snippet, replacing the one with its id.
     pub fn set_snippet(&self, snippet: &Snippet) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO snippets (id, name, text, used) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO snippets (id, name, text, used, kind) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET
-                name = excluded.name, text = excluded.text, used = excluded.used",
+                name = excluded.name, text = excluded.text, used = excluded.used,
+                kind = excluded.kind",
             params![
                 snippet.id.0.to_string(),
                 snippet.name,
                 snippet.text,
-                u64_sql(snippet.used)?
+                u64_sql(snippet.used)?,
+                mode_sql(snippet.kind)
             ],
         )?;
         Ok(())
@@ -1117,6 +1213,17 @@ impl Store {
                     }
                 }
                 KEY_SERVER_ADDRESS => settings.server_address = Some(value),
+                KEY_SHELL_ENABLED => {
+                    settings.shell_enabled = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(
+                                bad_value(1, Type::Text, format!("shell flag {value:?}")).into()
+                            );
+                        }
+                    }
+                }
                 // Keys written by a newer build are left alone.
                 _ => {}
             }
@@ -1136,6 +1243,12 @@ impl Store {
         self.put_setting(KEY_SERVER_ADDRESS, address)
     }
 
+    /// Keeps whether the server runs shell commands, as its `hello` said.
+    pub fn set_shell_enabled(&self, enabled: bool) -> Result<(), StoreError> {
+        let value = if enabled { "true" } else { "false" };
+        self.put_setting(KEY_SHELL_ENABLED, Some(value))
+    }
+
     fn put_setting(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
         match value {
             Some(value) => self.conn.execute(
@@ -1153,6 +1266,7 @@ impl Store {
 
 const KEY_BLOB_POLICY: &str = "blob_policy";
 const KEY_SERVER_ADDRESS: &str = "server_address";
+const KEY_SHELL_ENABLED: &str = "shell_enabled";
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn.transaction()?;
@@ -1205,17 +1319,66 @@ fn read_deleted(conn: &Connection) -> Result<HashSet<SessionId>, StoreError> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn upsert_draft(conn: &Connection, session_id: SessionId, draft: &Draft) -> Result<(), StoreError> {
+fn upsert_draft(
+    conn: &Connection,
+    (session_id, mode): (SessionId, ComposerMode),
+    draft: &Draft,
+) -> Result<(), StoreError> {
     conn.execute(
-        "INSERT INTO drafts (session_id, text, cursor) VALUES (?1, ?2, ?3)
-         ON CONFLICT (session_id) DO UPDATE SET text = excluded.text, cursor = excluded.cursor",
+        r#"INSERT INTO drafts (session_id, mode, text, cursor, "when") VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (session_id, mode) DO UPDATE SET
+            text = excluded.text, cursor = excluded.cursor, "when" = excluded."when""#,
         params![
             session_id.0.to_string(),
+            mode_sql(mode),
             draft.text,
-            u64_sql(draft.cursor as u64)?
+            u64_sql(draft.cursor as u64)?,
+            when_sql(draft.when)
         ],
     )?;
     Ok(())
+}
+
+fn mode_sql(mode: ComposerMode) -> &'static str {
+    match mode {
+        ComposerMode::Agent => "agent",
+        ComposerMode::Shell => "shell",
+    }
+}
+
+fn mode_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<ComposerMode> {
+    let mode: String = row.get(idx)?;
+    match mode.as_str() {
+        "agent" => Ok(ComposerMode::Agent),
+        "shell" => Ok(ComposerMode::Shell),
+        _ => Err(bad_value(
+            idx,
+            Type::Text,
+            format!("composer mode {mode:?}"),
+        )),
+    }
+}
+
+fn when_sql(when: RunWhen) -> &'static str {
+    match when {
+        RunWhen::Always => "always",
+        RunWhen::OnSuccess => "on_success",
+        RunWhen::OnFailure => "on_failure",
+    }
+}
+
+fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
+    let when: String = row.get(idx)?;
+    match when.as_str() {
+        "always" => Ok(RunWhen::Always),
+        "on_success" => Ok(RunWhen::OnSuccess),
+        "on_failure" => Ok(RunWhen::OnFailure),
+        _ => Err(bad_value(
+            idx,
+            Type::Text,
+            format!("run condition {when:?}"),
+        )),
+    }
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \

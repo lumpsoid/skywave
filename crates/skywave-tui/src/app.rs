@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, AgentView, ApprovalId, BlobPolicy, BlobState, CallId, Completion, ContextId, CoreError,
-    Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route,
-    Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView, TaskId,
-    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Action, AgentView, ApprovalId, BlobPolicy, BlobState, CallId, Completion, ComposerMode,
+    ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind, PairUri, PairingView,
+    PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId, SessionListView,
+    SessionRow, SessionView, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
@@ -1404,9 +1404,14 @@ impl App {
     pub fn draft_save(&mut self, now: Instant, force: bool) -> Option<Action> {
         let session = self.ui.session.as_mut()?;
         let composer = &session.composer;
-        session
-            .saver
-            .save(now, force, composer.text(), composer.cursor_chars())
+        session.saver.save(
+            now,
+            force,
+            ComposerMode::Agent,
+            composer.text(),
+            composer.cursor_chars(),
+            RunWhen::Always,
+        )
     }
 
     /// How long from `now` until [`App::draft_save`] has something to save

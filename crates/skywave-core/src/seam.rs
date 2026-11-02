@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
-use skywave_proto::{CommandResult, DeviceInfo, DirsResult, EventBatch};
+use skywave_proto::{CommandResult, DirsResult, EventBatch, HelloResponse};
 
 use crate::blobs::remove_all_blob_files;
 use crate::client::{Core, CoreError, State, lock};
@@ -157,12 +157,15 @@ impl Seam {
         })
     }
 
-    /// The server listed its devices (`hello`): keep their names and show
-    /// them wherever the views name a device.
-    pub fn devices_listed(&self, devices: &[DeviceInfo]) -> Result<(), CoreError> {
+    /// The server said `hello`: keep the names of its devices and whether
+    /// it runs shell commands, and show them wherever the views do, offline
+    /// too after a restart.
+    pub fn hello_received(&self, hello: &HelloResponse) -> Result<(), CoreError> {
         self.update(|state| {
-            state.store.set_devices(devices)?;
-            state.model.devices_named(devices);
+            state.store.set_devices(&hello.devices)?;
+            state.store.set_shell_enabled(hello.shell)?;
+            state.model.devices_named(&hello.devices);
+            state.model.shell_enabled(hello.shell);
             Ok(((), Vec::new()))
         })
     }

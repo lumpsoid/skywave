@@ -15,7 +15,8 @@ use uuid::Uuid;
 pub use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, CommandId, ContextId,
     Decision, DeviceId, Effort, ModelChoice, PermissionMode, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, TaskId, TaskKind, ToolKind, TurnUsage,
+    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, TaskId, TaskKind, ToolKind,
+    TurnUsage,
 };
 
 pub use crate::projection::SessionUsage;
@@ -406,7 +407,8 @@ pub struct SessionRow {
     pub state: SessionState,
     pub pending_approvals: usize,
     pub last_activity: DateTime<Utc>,
-    /// This device keeps an unsent message for the session.
+    /// This device keeps an unsent message or shell command for the
+    /// session (a shell draft holding only a condition does not count).
     pub has_draft: bool,
     /// Agent output (messages, approval requests, errors) this device has
     /// not seen yet. Messages from any device never count.
@@ -504,13 +506,25 @@ pub struct SessionView {
     /// shows as failed while its task is still listed. Accepted is not
     /// done: the agent may yet fail to stop the task.
     pub task_stops: Vec<(TaskId, Outgoing)>,
+    /// What the composer writes: messages to the agent or shell commands.
+    /// This device's choice, kept per session; [`ComposerMode::Agent`]
+    /// until [`Action::SetComposerMode`](crate::Action::SetComposerMode)
+    /// says otherwise.
+    pub mode: ComposerMode,
     /// This device's unsent message, as last saved.
     pub draft: Option<Draft>,
+    /// This device's unsent shell command, as last saved, with the
+    /// condition picked for it ([`Draft::when`]). Kept even with blank
+    /// text when a condition other than [`RunWhen::Always`] was picked.
+    pub shell_draft: Option<Draft>,
     /// Changes when the core itself rewrites a draft (e.g.
     /// [`Action::EditQueued`](crate::Action::EditQueued)): a head that
     /// keeps its own copy of the text being written replaces it with
-    /// `draft` then.
+    /// `draft` or `shell_draft` then.
     pub draft_rev: u64,
+    /// Whether the server runs shell commands, as its last `hello` said;
+    /// stored, so it shows offline too. `false` until a server said so.
+    pub shell_enabled: bool,
     /// Seq of the session's newest event: what
     /// [`Action::MarkRead`](crate::Action::MarkRead) marks through once the
     /// end of the timeline was on screen.
@@ -664,14 +678,27 @@ pub enum AgentSetting {
     Effort(Option<Effort>),
 }
 
-/// A message being written on this device, kept in the local store and never
-/// synced (D5).
+/// What a session's composer writes on this device: a message to the agent
+/// or a shell command for the server. Never synced (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ComposerMode {
+    #[default]
+    Agent,
+    Shell,
+}
+
+/// A message or shell command being written on this device, kept in the
+/// local store and never synced (D5). A session has one per
+/// [`ComposerMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub text: String,
     /// Position in `text`, counted in Unicode scalar values (`char`s), so it
     /// means the same on both sides of the FFI.
     pub cursor: usize,
+    /// The condition the shell command runs on once sent. Only a shell
+    /// draft has one; an agent draft's is always [`RunWhen::Always`].
+    pub when: RunWhen,
 }
 
 /// Identifies a [`Snippet`]; made on this device and never sent.
@@ -705,6 +732,9 @@ pub struct Snippet {
     /// What the user called it; `None` shows its text's first line.
     pub name: Option<String>,
     pub text: String,
+    /// The composer it is for: a prompt or a shell command. A text is
+    /// saved once per kind.
+    pub kind: ComposerMode,
     /// Orders snippets by when they were last saved or used: higher is
     /// later.
     pub used: u64,
@@ -1140,8 +1170,11 @@ mod tests {
             stop: None,
             work: AgentWork::default(),
             task_stops: Vec::new(),
+            mode: ComposerMode::Agent,
             draft: None,
+            shell_draft: None,
             draft_rev: 0,
+            shell_enabled: false,
             last_seq: Seq(6),
             unread_from: None,
         };

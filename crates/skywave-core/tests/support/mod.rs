@@ -54,6 +54,11 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn start(agent: FakeAgent) -> Daemon {
+        Daemon::start_with_shell(agent, false).await
+    }
+
+    /// As [`Daemon::start`], running shell commands from devices if `shell`.
+    pub async fn start_with_shell(agent: FakeAgent, shell: bool) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let data = tmp.path().join("server");
@@ -62,7 +67,9 @@ impl Daemon {
             ServerIdentity::bootstrap(&storage.dir, &["localhost".into(), "127.0.0.1".into()])
                 .unwrap(),
         );
-        let log = EventLog::open(&storage.db, vec![tmp.path().join("root")]).unwrap();
+        let log = EventLog::open(&storage.db, vec![tmp.path().join("root")])
+            .unwrap()
+            .with_shell(shell);
         let server = Server::bind(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,

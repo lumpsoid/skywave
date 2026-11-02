@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use skywave_core::{Action, SessionId, SessionView};
+use skywave_core::{Action, ComposerMode, RunWhen, SessionId, SessionView};
 
 /// How old the first unsaved composer edit gets before the draft is saved
 /// anyway: at most this much typing is lost to a crash. Saves are durable
@@ -45,8 +45,8 @@ impl DraftSaver {
 
     /// Whether the core rewrote the draft itself since the composer was
     /// filled (`draft_rev`, e.g. a queued message taken back to edit): the
-    /// head then refills its composer from [`SessionView::draft`], and
-    /// what it showed counts as saved.
+    /// head then refills its composer from [`SessionView::draft`] (or
+    /// [`SessionView::shell_draft`]), and what it showed counts as saved.
     pub fn refill(&mut self, view: &SessionView) -> bool {
         if view.draft_rev == self.draft_rev {
             return false;
@@ -56,12 +56,21 @@ impl DraftSaver {
         true
     }
 
-    /// The save to dispatch for the composer's `text` and `cursor` (in
-    /// `char`s) when it has unsaved edits: always if `force` (leaving the
-    /// session, quitting, any action but a sent message), else once the
-    /// first of them is [`DRAFT_SAVE_AFTER`] old at `now`. The edits count
-    /// as saved from here; report a failure with [`DraftSaver::failed`].
-    pub fn save(&mut self, now: Instant, force: bool, text: &str, cursor: usize) -> Option<Action> {
+    /// The save to dispatch for the composer's `text`, `cursor` (in
+    /// `char`s) and, writing in `mode` shell, the run condition `when`,
+    /// when it has unsaved edits: always if `force` (leaving the session,
+    /// quitting, any action but a sent message or run), else once the first
+    /// of them is [`DRAFT_SAVE_AFTER`] old at `now`. The edits count as
+    /// saved from here; report a failure with [`DraftSaver::failed`].
+    pub fn save(
+        &mut self,
+        now: Instant,
+        force: bool,
+        mode: ComposerMode,
+        text: &str,
+        cursor: usize,
+        when: RunWhen,
+    ) -> Option<Action> {
         let since = self.dirty_since?;
         if !force && now.saturating_duration_since(since) < DRAFT_SAVE_AFTER {
             return None;
@@ -69,8 +78,10 @@ impl DraftSaver {
         self.dirty_since = None;
         Some(Action::SaveDraft {
             session_id: self.session_id,
+            mode,
             text: text.to_owned(),
             cursor,
+            when,
         })
     }
 
@@ -89,10 +100,11 @@ impl DraftSaver {
     }
 
     /// Whether the draft is saved (forced) before dispatching `action`:
-    /// before anything but a message, whose enqueue drops the draft anyway,
-    /// so leaving the session (or anything else) keeps it.
+    /// before anything but a message or shell run, whose enqueue drops the
+    /// draft it was written in anyway, so leaving the session (or anything
+    /// else) keeps it.
     pub fn flushes_before(action: &Action) -> bool {
-        !matches!(action, Action::SendMessage { .. })
+        !matches!(action, Action::SendMessage { .. } | Action::RunShell { .. })
     }
 }
 
@@ -100,6 +112,9 @@ impl DraftSaver {
 mod tests {
     use super::*;
     use crate::policy::tests::session;
+
+    const AGENT: ComposerMode = ComposerMode::Agent;
+    const ALWAYS: RunWhen = RunWhen::Always;
 
     fn saved(action: Option<Action>) -> Option<String> {
         match action? {
@@ -119,21 +134,52 @@ mod tests {
         saver.edited(t0 + DRAFT_SAVE_AFTER / 2);
         assert_eq!(saver.next_wake(), Some(t0 + DRAFT_SAVE_AFTER));
         let just_before = t0 + DRAFT_SAVE_AFTER - Duration::from_millis(1);
-        assert_eq!(saver.save(just_before, false, "abc", 3), None);
+        assert_eq!(
+            saver.save(just_before, false, AGENT, "abc", 3, ALWAYS),
+            None
+        );
 
         let at = t0 + DRAFT_SAVE_AFTER;
         assert_eq!(
-            saver.save(at, false, "abc", 3),
+            saver.save(at, false, AGENT, "abc", 3, ALWAYS),
             Some(Action::SaveDraft {
                 session_id: view.id,
+                mode: AGENT,
                 text: "abc".into(),
                 cursor: 3,
+                when: ALWAYS,
             })
         );
         assert_eq!(saver.next_wake(), None);
         let later = at + 10 * DRAFT_SAVE_AFTER;
-        assert_eq!(saver.save(later, false, "abc", 3), None, "saved once");
-        assert_eq!(saver.save(later, true, "abc", 3), None, "even when forced");
+        assert_eq!(
+            saver.save(later, false, AGENT, "abc", 3, ALWAYS),
+            None,
+            "saved once"
+        );
+        assert_eq!(
+            saver.save(later, true, AGENT, "abc", 3, ALWAYS),
+            None,
+            "even when forced"
+        );
+    }
+
+    #[test]
+    fn a_shell_draft_is_saved_with_its_condition() {
+        let view = session(Vec::new());
+        let mut saver = DraftSaver::new(&view);
+        let t0 = Instant::now();
+        saver.edited(t0);
+        assert_eq!(
+            saver.save(t0, true, ComposerMode::Shell, "ls", 2, RunWhen::OnSuccess),
+            Some(Action::SaveDraft {
+                session_id: view.id,
+                mode: ComposerMode::Shell,
+                text: "ls".into(),
+                cursor: 2,
+                when: RunWhen::OnSuccess,
+            })
+        );
     }
 
     #[test]
@@ -142,7 +188,10 @@ mod tests {
         let mut saver = DraftSaver::new(&view);
         let t0 = Instant::now();
         saver.edited(t0);
-        assert_eq!(saved(saver.save(t0, true, "x", 1)), Some("x".into()));
+        assert_eq!(
+            saved(saver.save(t0, true, AGENT, "x", 1, ALWAYS)),
+            Some("x".into())
+        );
         assert!(!saver.unsaved());
 
         let send = Action::SendMessage {
@@ -150,6 +199,12 @@ mod tests {
             text: "x".into(),
         };
         assert!(!DraftSaver::flushes_before(&send));
+        let run = Action::RunShell {
+            session_id: view.id,
+            command: "ls".into(),
+            when: ALWAYS,
+        };
+        assert!(!DraftSaver::flushes_before(&run), "drops the shell draft");
         assert!(DraftSaver::flushes_before(&Action::Back));
         assert!(DraftSaver::flushes_before(&Action::RetryNow));
     }
@@ -161,14 +216,21 @@ mod tests {
         let t0 = Instant::now();
         saver.edited(t0);
         let t = t0 + DRAFT_SAVE_AFTER;
-        assert!(saver.save(t, false, "abc", 3).is_some());
+        assert!(saver.save(t, false, AGENT, "abc", 3, ALWAYS).is_some());
         saver.failed(t);
 
         // Still unsaved, due one cadence after the failure, not at once.
         assert_eq!(saver.next_wake(), Some(t + DRAFT_SAVE_AFTER));
-        assert_eq!(saver.save(t, false, "abc", 3), None, "no tight retry");
+        assert_eq!(
+            saver.save(t, false, AGENT, "abc", 3, ALWAYS),
+            None,
+            "no tight retry"
+        );
         let t2 = t + DRAFT_SAVE_AFTER;
-        assert_eq!(saved(saver.save(t2, false, "abc", 3)), Some("abc".into()));
+        assert_eq!(
+            saved(saver.save(t2, false, AGENT, "abc", 3, ALWAYS)),
+            Some("abc".into())
+        );
         assert_eq!(saver.next_wake(), None);
     }
 
@@ -181,7 +243,10 @@ mod tests {
         let t = t0 + DRAFT_SAVE_AFTER;
 
         // A save that works does not mark the later edit saved.
-        assert_eq!(saved(saver.save(t, false, "ab", 2)), Some("ab".into()));
+        assert_eq!(
+            saved(saver.save(t, false, AGENT, "ab", 2, ALWAYS)),
+            Some("ab".into())
+        );
         let edit = t + Duration::from_millis(10);
         saver.edited(edit);
         assert_eq!(saver.next_wake(), Some(edit + DRAFT_SAVE_AFTER));
@@ -189,13 +254,13 @@ mod tests {
         // A save that fails keeps the edit's own due time, not the
         // failure's.
         let t2 = edit + DRAFT_SAVE_AFTER;
-        assert!(saver.save(t2, false, "abc", 3).is_some());
+        assert!(saver.save(t2, false, AGENT, "abc", 3, ALWAYS).is_some());
         let edit2 = t2 + Duration::from_millis(10);
         saver.edited(edit2);
         saver.failed(t2 + Duration::from_millis(20));
         assert_eq!(saver.next_wake(), Some(edit2 + DRAFT_SAVE_AFTER));
         assert_eq!(
-            saved(saver.save(edit2 + DRAFT_SAVE_AFTER, false, "abcd", 4)),
+            saved(saver.save(edit2 + DRAFT_SAVE_AFTER, false, AGENT, "abcd", 4, ALWAYS)),
             Some("abcd".into())
         );
     }

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skywave_core::search::BlobText;
 use skywave_core::{
-    Action, BlobId, BlobState, CallId, Entry, PairUri, PairingView, Screen, Seq, SessionId,
-    SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
+    Action, BlobId, BlobState, CallId, ComposerMode, Entry, PairUri, PairingView, RunWhen, Screen,
+    Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
@@ -856,7 +856,11 @@ impl Head {
             return;
         }
         self.dispatch_user(
-            Action::SaveSnippet { name, text },
+            Action::SaveSnippet {
+                name,
+                text,
+                kind: ComposerMode::Agent,
+            },
             Purpose::Plain,
             clock,
             out,
@@ -872,10 +876,14 @@ impl Head {
             return;
         };
         let composer = &session.composer;
-        if let Some(action) = session
-            .saver
-            .save(clock.now, force, &composer.text, composer.cursor)
-        {
+        if let Some(action) = session.saver.save(
+            clock.now,
+            force,
+            ComposerMode::Agent,
+            &composer.text,
+            composer.cursor,
+            RunWhen::Always,
+        ) {
             self.dispatch(action, Purpose::Draft, out);
         }
     }
