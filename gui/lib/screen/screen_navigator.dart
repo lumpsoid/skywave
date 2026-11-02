@@ -108,6 +108,7 @@ class ScreenNavigator extends StatelessWidget {
         ScreenViewSession(:final session) => SessionPage(
           screen: session,
           timeline: holders.timeline,
+          shell: holders.shell,
           search: holders.search,
           send: send,
         ),

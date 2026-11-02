@@ -143,15 +143,24 @@ class ComposerState extends State<Composer> {
     widget.send(GuiIntentComposerSubmit(sessionId: widget.sessionId));
   }
 
-  /// Opens the snippets; one put in brings the focus back to the field.
+  bool get _shell => widget.composer.mode == ComposerModeView.shell;
+
+  /// Opens the snippets (in shell mode the saved commands); one put in
+  /// brings the focus back to the field.
   Future<void> _pickSnippet() => pickSnippet(
     context,
     sessionId: widget.sessionId,
     snippets: _snippets,
     composerBlank: _blank,
+    shell: _shell,
     send: widget.send,
     onInserted: _focus.requestFocus,
   );
+
+  void _toggleShell() {
+    widget.send(GuiIntentToggleShellMode(sessionId: widget.sessionId));
+    _focus.requestFocus();
+  }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -199,6 +208,7 @@ class ComposerState extends State<Composer> {
     final theme = Theme.of(context);
     final colors = SkyColors.of(context);
     final composer = widget.composer;
+    final shell = _shell;
     final notes = [
       ?composer.toLabel,
       ?composer.offlineLabel,
@@ -244,11 +254,21 @@ class ComposerState extends State<Composer> {
                     ],
                   ),
                 ),
+              if (shell)
+                _ShellBar(
+                  composer: composer,
+                  onCondition: () => widget.send(
+                    GuiIntentCycleCondition(sessionId: widget.sessionId),
+                  ),
+                  onStop: () => widget.send(
+                    GuiIntentStopShell(sessionId: widget.sessionId),
+                  ),
+                ),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   IconButton(
-                    tooltip: 'Snippets',
+                    tooltip: shell ? 'Saved commands' : 'Snippets',
                     onPressed: _pickSnippet,
                     icon: const Icon(Icons.bookmark_outline),
                   ),
@@ -261,9 +281,21 @@ class ComposerState extends State<Composer> {
                       maxLines: 8,
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.newline,
-                      textCapitalization: TextCapitalization.sentences,
+                      textCapitalization: shell
+                          ? TextCapitalization.none
+                          : TextCapitalization.sentences,
+                      autocorrect: !shell,
+                      enableSuggestions: !shell,
+                      style: shell
+                          ? const TextStyle(
+                              fontFamily: monoFamily,
+                              fontFamilyFallback: monoFallback,
+                            )
+                          : null,
                       decoration: InputDecoration(
-                        hintText: 'Message the agent',
+                        hintText: shell
+                            ? 'Run a shell command'
+                            : 'Message the agent',
                         filled: true,
                         fillColor: theme.colorScheme.surfaceContainerHighest,
                         isDense: true,
@@ -279,12 +311,30 @@ class ComposerState extends State<Composer> {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  // Hidden while the server runs no shell commands, unless
+                  // in shell mode: switching back out always works.
+                  if (composer.shellEnabled || shell)
+                    IconButton(
+                      key: const Key('shell-toggle'),
+                      tooltip: shell ? 'Message the agent' : 'Shell command',
+                      isSelected: shell,
+                      onPressed: _toggleShell,
+                      icon: const Text(
+                        r'$',
+                        style: TextStyle(
+                          fontFamily: monoFamily,
+                          fontFamilyFallback: monoFallback,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
                   // Follows the field: typing, the hub's text (a recalled
                   // prompt, an edited queued message) and a sent clear.
                   ValueListenableBuilder(
                     valueListenable: _field,
                     builder: (context, _, _) => IconButton.filled(
-                      tooltip: 'Send',
+                      tooltip: shell ? 'Run' : 'Send',
                       onPressed: _blank ? null : submit,
                       icon: const Icon(Icons.arrow_upward),
                     ),
@@ -294,6 +344,68 @@ class ComposerState extends State<Composer> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Over the field in shell mode: the cwd prompt, the condition chip (it
+/// steps always → if ok → if failed, and resets after each run sent) and
+/// the stop, off while there is nothing to stop.
+class _ShellBar extends StatelessWidget {
+  const _ShellBar({
+    required this.composer,
+    required this.onCondition,
+    required this.onStop,
+  });
+
+  final ComposerView composer;
+  final VoidCallback onCondition;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final when = composer.whenLabel;
+    return Padding(
+      padding: const EdgeInsets.only(left: 12, bottom: 4),
+      child: Row(
+        children: [
+          if (composer.promptLabel case final prompt?)
+            Flexible(
+              child: Text(
+                prompt,
+                key: const Key('shell-prompt'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelLarge?.copyWith(
+                  fontFamily: monoFamily,
+                  fontFamilyFallback: monoFallback,
+                ),
+              ),
+            ),
+          const SizedBox(width: 8),
+          ActionChip(
+            key: const Key('shell-condition'),
+            tooltip:
+                'When it runs: always, if the last run succeeded, or '
+                'if it failed',
+            avatar: const Icon(Icons.rule, size: 16),
+            label: Text(when ?? 'always'),
+            onPressed: onCondition,
+            visualDensity: VisualDensity.compact,
+          ),
+          const Spacer(),
+          IconButton(
+            key: const Key('shell-stop'),
+            tooltip: 'Stop the running command (Ctrl+X)',
+            onPressed: composer.canStop ? onStop : null,
+            icon: Icon(
+              Icons.stop_circle_outlined,
+              color: composer.canStop ? theme.colorScheme.error : null,
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -13,7 +13,9 @@ Future<String?> askSnippetName(BuildContext context) => showDialog<String>(
 /// Lists the snippets as `snippets` holds them now: a tap puts one into
 /// the composer at its cursor (`onInserted` follows), the pencil edits
 /// one, the bin deletes one. While the composer holds text, the first
-/// entry saves it as a snippet.
+/// entry saves it as a snippet. In `shell` mode they are the saved
+/// commands (the hub sends only those), and a long press runs one at
+/// once, leaving the composer as it is.
 Future<void> pickSnippet(
   BuildContext context, {
   required String sessionId,
@@ -21,19 +23,26 @@ Future<void> pickSnippet(
   required bool composerBlank,
   required SendIntent send,
   required VoidCallback onInserted,
+  bool shell = false,
 }) async {
   final picked = await showModalBottomSheet<_Picked>(
     context: context,
     showDragHandle: true,
     isScrollControlled: true,
-    builder: (sheet) =>
-        _SnippetSheet(snippets: snippets, canSave: !composerBlank, send: send),
+    builder: (sheet) => _SnippetSheet(
+      snippets: snippets,
+      canSave: !composerBlank,
+      shell: shell,
+      send: send,
+    ),
   );
   if (!context.mounted) return;
   switch (picked) {
     case _Insert(:final snippetId):
       send(GuiIntentInsertSnippet(sessionId: sessionId, snippetId: snippetId));
       onInserted();
+    case _Run(:final snippetId):
+      send(GuiIntentRunSnippet(sessionId: sessionId, snippetId: snippetId));
     case _SaveComposer():
       final name = await askSnippetName(context);
       if (name == null) return;
@@ -52,6 +61,12 @@ class _Insert extends _Picked {
   final String snippetId;
 }
 
+class _Run extends _Picked {
+  const _Run(this.snippetId);
+
+  final String snippetId;
+}
+
 class _SaveComposer extends _Picked {
   const _SaveComposer();
 }
@@ -60,11 +75,13 @@ class _SnippetSheet extends StatelessWidget {
   const _SnippetSheet({
     required this.snippets,
     required this.canSave,
+    required this.shell,
     required this.send,
   });
 
   final ValueNotifier<List<SnippetView>> snippets;
   final bool canSave;
+  final bool shell;
   final SendIntent send;
 
   Future<void> _edit(BuildContext context, SnippetView snippet) async {
@@ -99,20 +116,40 @@ class _SnippetSheet extends StatelessWidget {
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Text('Snippets', style: theme.textTheme.titleMedium),
+                child: Text(
+                  shell ? 'Saved commands' : 'Snippets',
+                  style: theme.textTheme.titleMedium,
+                ),
               ),
+              if (shell && shown.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Text(
+                    'Tap to put one in, long-press to run it now.',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colors.muted,
+                    ),
+                  ),
+                ),
               if (canSave)
                 ListTile(
                   leading: const Icon(Icons.bookmark_add_outlined),
-                  title: const Text('Save the message as a snippet'),
+                  title: Text(
+                    shell
+                        ? 'Save the command'
+                        : 'Save the message as a snippet',
+                  ),
                   onTap: () => Navigator.of(context).pop(const _SaveComposer()),
                 ),
               if (shown.isEmpty)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
                   child: Text(
-                    'No snippets yet. Save a message you sent from its menu, '
-                    'or what you are writing from here.',
+                    shell
+                        ? 'No saved commands yet. Save what you are writing '
+                              'from here.'
+                        : 'No snippets yet. Save a message you sent from its '
+                              'menu, or what you are writing from here.',
                     style: theme.textTheme.bodyMedium?.copyWith(
                       color: colors.muted,
                     ),
@@ -155,6 +192,9 @@ class _SnippetSheet extends StatelessWidget {
                   ),
                   onTap: () =>
                       Navigator.of(context).pop(_Insert(snippet.snippetId)),
+                  onLongPress: shell
+                      ? () => Navigator.of(context).pop(_Run(snippet.snippetId))
+                      : null,
                 ),
             ],
           ),

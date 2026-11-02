@@ -766,7 +766,14 @@ void main() {
       await pumpSession(
         tester,
         screen: screenWith(
-          composer: const ComposerView(text: '', cursorUtf16: 0, rev: 2),
+          composer: const ComposerView(
+            text: '',
+            cursorUtf16: 0,
+            rev: 2,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
+          ),
         ),
         timeline: timeline,
         sent: sent,
@@ -776,7 +783,14 @@ void main() {
       await pumpSession(
         tester,
         screen: screenWith(
-          composer: const ComposerView(text: 'queued', cursorUtf16: 6, rev: 3),
+          composer: const ComposerView(
+            text: 'queued',
+            cursorUtf16: 6,
+            rev: 3,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
+          ),
         ),
         timeline: timeline,
         sent: sent,
@@ -799,7 +813,14 @@ void main() {
       await pumpSession(
         tester,
         screen: screenWith(
-          composer: const ComposerView(text: 'old', cursorUtf16: 0, rev: 1),
+          composer: const ComposerView(
+            text: 'old',
+            cursorUtf16: 0,
+            rev: 1,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
+          ),
         ),
         timeline: timeline,
         sent: sent,
@@ -813,6 +834,9 @@ void main() {
             text: 'recalled 👋',
             cursorUtf16: 11,
             rev: 2,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
             historyLabel: '2 of 5',
           ),
         ),
@@ -2308,6 +2332,9 @@ void main() {
             text: '',
             cursorUtf16: 0,
             rev: 1,
+            mode: ComposerModeView.agent,
+            shellEnabled: false,
+            canStop: false,
             toLabel: 'to the main agent',
           ),
         ),

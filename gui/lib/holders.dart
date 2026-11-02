@@ -2,6 +2,7 @@ import 'package:skywave_gui/effects/effects.dart';
 import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
 import 'package:skywave_gui/session/search_holder.dart';
+import 'package:skywave_gui/session/shell_holder.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 
 /// One holder per Rust signal, created once at start and kept for the
@@ -13,6 +14,7 @@ class Holders {
   final link = LinkHolder();
   final screen = ScreenHolder();
   final timeline = TimelineHolder();
+  final shell = ShellHolder();
   final search = SearchHolder();
   final EffectsListener effects;
 
@@ -20,6 +22,7 @@ class Holders {
     link.connect();
     screen.connect();
     timeline.connect();
+    shell.connect();
     search.connect();
     effects.connect();
   }

@@ -23,6 +23,7 @@ mod logging;
 mod run;
 mod screen;
 mod search;
+mod shell;
 mod signals;
 mod timeline;
 

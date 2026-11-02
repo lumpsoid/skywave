@@ -66,6 +66,18 @@ class SkyColors {
     OutgoingState.failed => scheme.error,
   };
 
+  /// A shell run's state (the TUI's: grey waiting, cyan running, green
+  /// exit 0, red otherwise).
+  Color shellRun(ShellRunKind state) => switch (state) {
+    ShellRunKind.pending || ShellRunKind.queued => muted,
+    ShellRunKind.running => running,
+    ShellRunKind.succeeded => success,
+    ShellRunKind.refused ||
+    ShellRunKind.failed ||
+    ShellRunKind.stopped => scheme.error,
+    ShellRunKind.skipped => muted,
+  };
+
   /// The agent's state, for the header's dot.
   Color agent(AgentState state) => switch (state) {
     AgentState.idle => muted,

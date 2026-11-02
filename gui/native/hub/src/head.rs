@@ -14,8 +14,8 @@ use skywave_core::{
     Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall, TimelineSearch,
-    looks_like_pair_uri,
+    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
@@ -25,11 +25,12 @@ use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::{self, Call, Moved, Target};
 use crate::screen::{CreateUi, Ui, rename_initial, revoked};
 use crate::signals::{
-    ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect, RenamePrompt,
-    ScreenUpdate, SearchUpdate, TimelineRow, TimelineUpdate,
+    ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
+    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, TimelineRow,
+    TimelineUpdate,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
-use crate::{intents, link, screen, search, timeline};
+use crate::{intents, link, screen, search, shell, timeline};
 
 /// How often running clocks on screen (a tool's elapsed time, how long a
 /// message has waited) are brought up to date.
@@ -78,6 +79,7 @@ pub enum Out {
     Link(LinkUpdate),
     Screen(ScreenUpdate),
     Timeline(TimelineUpdate),
+    Shell(ShellUpdate),
     Search(SearchUpdate),
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
@@ -125,14 +127,26 @@ impl Composer {
                 history_label: None,
                 offline_label: None,
                 to_label: None,
+                // The mode's own fields are the open session's, set when
+                // published.
+                mode: ComposerModeView::Agent,
+                shell_enabled: false,
+                prompt_label: None,
+                when_label: None,
+                can_stop: false,
             },
             text,
             cursor,
         }
     }
 
+    /// The core's draft of `view`'s mode.
     fn of(view: &SessionView, rev: u32) -> Composer {
-        match &view.draft {
+        let draft = match view.mode {
+            ComposerMode::Agent => &view.draft,
+            ComposerMode::Shell => &view.shell_draft,
+        };
+        match draft {
             Some(draft) => Composer::new(draft.text.clone(), draft.cursor, rev),
             None => Composer::new(String::new(), 0, rev),
         }
@@ -146,6 +160,16 @@ struct SessionHead {
     composer: Composer,
     saver: DraftSaver,
     history: PromptHistory<(String, usize)>,
+    /// What the composer writes, as the core last said
+    /// ([`SessionView::mode`]). Followed only once the core switched, after
+    /// the old mode's draft was saved: switching on the intent would save
+    /// the new mode's text under the old mode.
+    mode: ComposerMode,
+    /// The condition the shell command being written runs on, saved with
+    /// the shell draft; back to always after each run sent.
+    when: RunWhen,
+    /// Earlier shell commands being recalled, apart from the prompts.
+    shell_history: PromptHistory<(String, usize)>,
     marker: ReadMarker,
     /// The newest row is on screen (Dart says so).
     following: bool,
@@ -169,6 +193,9 @@ impl SessionHead {
             composer: Composer::of(view, rev),
             saver: DraftSaver::new(view),
             history: PromptHistory::new(),
+            mode: view.mode,
+            when: when_of(view),
+            shell_history: PromptHistory::new(),
             marker: ReadMarker::new(view.id),
             following: false,
             subagent: view.subagent.as_ref().map(|s| s.call),
@@ -185,6 +212,31 @@ impl SessionHead {
     fn following(&self, view: &SessionView) -> bool {
         self.following && view.subagent.is_none()
     }
+
+    /// Ends browsing earlier prompts or commands: the shown one stays.
+    fn end_history(&mut self) {
+        self.history.end();
+        self.shell_history.end();
+    }
+
+    /// Loads the composer from the core's draft of `view`'s mode, with its
+    /// condition, under a new `rev`.
+    fn load(&mut self, view: &SessionView, rev: u32) {
+        self.composer = Composer::of(view, rev);
+        self.when = when_of(view);
+        self.end_history();
+    }
+
+    fn shell(&self) -> bool {
+        self.mode == ComposerMode::Shell
+    }
+}
+
+/// The condition the shell draft was saved with.
+fn when_of(view: &SessionView) -> RunWhen {
+    view.shell_draft
+        .as_ref()
+        .map_or(RunWhen::Always, |d| d.when)
 }
 
 /// What Dart was sent last, so only changes go out.
@@ -195,6 +247,8 @@ struct Sent {
     /// The session the rows are of, the subagent whose view they are
     /// (`None` for the main view), and the rows.
     timeline: Option<(Option<SessionId>, Option<CallId>, Vec<TimelineRow>)>,
+    /// The session the shell runs are of, and the runs.
+    shell: Option<(Option<SessionId>, Vec<ShellRunRow>)>,
     search: Option<SearchUpdate>,
 }
 
@@ -203,6 +257,9 @@ struct Sent {
 pub struct Head {
     view: Option<ViewState>,
     alerts: Option<AlertWatcher>,
+    /// From 0, not from the first snapshot: a run that finished in a
+    /// catch-up before it is still news.
+    shell_alerts: ShellAlertWatcher,
     next_tag: Tag,
     pending: HashMap<Tag, Purpose>,
     /// Bumped for every value the hub writes into a Dart field.
@@ -241,6 +298,17 @@ impl Head {
                     }));
                 }
             }
+        }
+        if let Some(notice) = self.shell_alerts.observe(&view.attention) {
+            out.push(Out::Effect(PlatformEffect::Notify {
+                body: notice.notice(),
+                title: notice.title,
+                session_id: view
+                    .attention
+                    .last_shell
+                    .as_ref()
+                    .map(|s| s.session_id.0.to_string()),
+            }));
         }
         if !revoked(&view) {
             self.revoked_dismissed = false;
@@ -291,11 +359,25 @@ impl Head {
             }
         }
         self.follow_session();
+        let switched = open_session(&self.view)
+            .zip(self.session.as_ref())
+            .is_some_and(|(view, session)| view.mode != session.mode);
+        if switched {
+            // What was typed while the switch was on its way is the old
+            // mode's: saved under it before the composer swaps.
+            self.save_draft(clock, true, &mut out);
+        }
         if let (Some(view), Some(session)) = (open_session(&self.view), &mut self.session) {
+            // The core switched modes: the other mode's draft shows, with
+            // its condition. Both drafts stay in the core.
+            if view.mode != session.mode {
+                session.mode = view.mode;
+                self.revs += 1;
+                session.load(view, self.revs);
+            }
             if session.saver.refill(view) {
                 self.revs += 1;
-                session.composer = Composer::of(view, self.revs);
-                session.history.end();
+                session.load(view, self.revs);
             }
             if let Some(search) = &mut session.search {
                 search.refresh(view, old_match, BlobText::read);
@@ -338,6 +420,10 @@ impl Head {
                         // message instead, the next save drops its draft.
                         self.revs += 1;
                         session.composer = Composer::new(String::new(), 0, self.revs);
+                        // A run's condition is for that run only.
+                        if session.shell() {
+                            session.when = RunWhen::Always;
+                        }
                         session.saver.edited(clock.now);
                     }
                 }
@@ -389,7 +475,8 @@ impl Head {
                 .zip(open)
                 .and_then(|(s, v)| s.marker.next_wake(clock.now, v.last_seq, s.following(v))),
             link::next_change(&view.link, clock.wall_ms).map(|d| clock.now + d),
-            open.filter(|v| timeline::live(v)).map(|_| clock.now + TICK),
+            open.filter(|v| timeline::live(v) || shell::live(v))
+                .map(|_| clock.now + TICK),
         ]
         .into_iter()
         .flatten()
@@ -423,19 +510,32 @@ impl Head {
                     composer.text = text;
                     composer.cursor = cursor;
                     session.saver.edited(clock.now);
-                    session.history.end();
+                    session.end_history();
                 }
             }
             GuiIntent::ComposerSubmit { session_id } => {
                 let Some(session) = self.open_head(&session_id) else {
                     return Ok(());
                 };
-                session.history.end();
+                session.end_history();
                 let id = session.id;
-                // A blank message is refused by the core.
-                let action = Action::SendMessage {
-                    session_id: id,
-                    text: session.composer.text.clone(),
+                let text = session.composer.text.clone();
+                let action = if session.shell() {
+                    // Nothing to run: the condition picked stays.
+                    if text.trim().is_empty() {
+                        return Ok(());
+                    }
+                    Action::RunShell {
+                        session_id: id,
+                        command: text,
+                        when: session.when,
+                    }
+                } else {
+                    // A blank message is refused by the core.
+                    Action::SendMessage {
+                        session_id: id,
+                        text,
+                    }
                 };
                 let tag = self.dispatch_user(action, Purpose::Send(id), clock, out);
                 if let Some(session) = &mut self.session {
@@ -444,21 +544,103 @@ impl Head {
             }
             GuiIntent::HistoryOlder => self.recall(true, clock),
             GuiIntent::HistoryNewer => self.recall(false, clock),
+            GuiIntent::ToggleShellMode { session_id } => {
+                let Some(session) = self.open_head(&session_id) else {
+                    return Ok(());
+                };
+                let (id, shell) = (session.id, session.shell());
+                // Into shell mode only while the server runs shell
+                // commands; back out always, should it have stopped since.
+                let enabled = open_session(&self.view).is_some_and(|v| v.shell.enabled);
+                if !shell && !enabled {
+                    out.push(Out::Effect(PlatformEffect::Notice {
+                        text: "shell commands are off on this server".to_owned(),
+                    }));
+                    return Ok(());
+                }
+                let mode = if shell {
+                    ComposerMode::Agent
+                } else {
+                    ComposerMode::Shell
+                };
+                // Saves the draft under the mode it was written in first;
+                // the composer swaps once the core switched (`on_view`).
+                let action = Action::SetComposerMode {
+                    session_id: id,
+                    mode,
+                };
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+            }
+            GuiIntent::CycleCondition { session_id } => {
+                if let Some(session) = self.open_head(&session_id).filter(|s| s.shell()) {
+                    session.when = shell::next_when(session.when);
+                    // Saved with the draft, blank or not.
+                    session.saver.edited(clock.now);
+                }
+            }
+            GuiIntent::StopShell { session_id } => {
+                let action = open_session(&self.view)
+                    .filter(|view| view.id.0.to_string() == session_id)
+                    .and_then(shell_stop);
+                if let Some(action) = action {
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::StopShellRun { session_id, run_id } => {
+                let run = intents::id("run", &run_id)?;
+                let action = open_session(&self.view)
+                    .filter(|view| view.id.0.to_string() == session_id)
+                    .and_then(|view| shell::run_stop(view, run));
+                if let Some(action) = action {
+                    self.dispatch_user(action, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::RunSnippet {
+                session_id,
+                snippet_id,
+            } => {
+                let id: SnippetId = intents::id("snippet", &snippet_id)?;
+                let Some(command) = self
+                    .view
+                    .as_ref()
+                    .and_then(|view| view.snippets.iter().find(|s| s.id == id))
+                    .filter(|s| s.kind == ComposerMode::Shell)
+                    .map(|s| s.text.clone())
+                else {
+                    return Ok(());
+                };
+                let Some(session) = self.open_head(&session_id).filter(|s| s.shell()) else {
+                    return Ok(());
+                };
+                let action = Action::RunShell {
+                    session_id: session.id,
+                    command,
+                    when: RunWhen::Always,
+                };
+                self.dispatch_user(action, Purpose::Plain, clock, out);
+                // The enqueue dropped the core's shell draft, which the
+                // composer still shows: it is unsaved again, and saved
+                // before the `UseSnippet` that follows.
+                if let Some(session) = &mut self.session {
+                    session.saver.edited(clock.now);
+                }
+                self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
+            }
             GuiIntent::SaveSnippet { key, name } => {
                 let key = parse_key(&key)?;
                 let text = open_session(&self.view)
                     .and_then(|view| prompt(&view.timeline[find(view, key)?]))
                     .map(str::to_owned);
                 if let Some(text) = text {
-                    self.save_snippet(name, text, clock, out);
+                    self.save_snippet(name, text, ComposerMode::Agent, clock, out);
                 }
             }
             GuiIntent::SaveComposerSnippet { session_id, name } => {
                 let Some(session) = self.open_head(&session_id) else {
                     return Ok(());
                 };
-                let text = session.composer.text.clone();
-                self.save_snippet(name, text, clock, out);
+                let (text, kind) = (session.composer.text.clone(), session.mode);
+                self.save_snippet(name, text, kind, clock, out);
             }
             GuiIntent::InsertSnippet {
                 session_id,
@@ -489,7 +671,7 @@ impl Head {
                 let cursor = composer.cursor + snippet.chars().count();
                 session.composer = Composer::new(text, cursor, rev);
                 session.saver.edited(clock.now);
-                session.history.end();
+                session.end_history();
                 // Saving the draft first keeps the inserted text too.
                 self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
             }
@@ -535,13 +717,22 @@ impl Head {
             GuiIntent::OpenFull { blob_id } => {
                 let id = intents::id("blob", &blob_id)?;
                 let state = open_session(&self.view).and_then(|view| {
-                    view.timeline.iter().find_map(|item| match item {
+                    let in_timeline = view.timeline.iter().find_map(|item| match item {
                         TimelineItem::Logged { entry, .. } => sections(entry)
                             .into_iter()
                             .filter_map(|s| s.blob)
                             .find(|b| b.id == id)
                             .map(|b| b.state.clone()),
                         TimelineItem::Pending { .. } => None,
+                    });
+                    // A shell run's whole output.
+                    in_timeline.or_else(|| {
+                        view.shell
+                            .runs
+                            .iter()
+                            .filter_map(|run| run.output.as_ref())
+                            .find(|b| b.id == id)
+                            .map(|b| b.state.clone())
                     })
                 });
                 out.push(Out::Effect(match state {
@@ -851,22 +1042,29 @@ impl Head {
 
     /// Keeps `text` as a snippet named `name` and says so; blank text is
     /// the core's to refuse, and not worth a word.
-    fn save_snippet(&mut self, name: String, text: String, clock: Clock, out: &mut Vec<Out>) {
+    fn save_snippet(
+        &mut self,
+        name: String,
+        text: String,
+        kind: ComposerMode,
+        clock: Clock,
+        out: &mut Vec<Out>,
+    ) {
         if text.trim().is_empty() {
             return;
         }
         self.dispatch_user(
-            Action::SaveSnippet {
-                name,
-                text,
-                kind: ComposerMode::Agent,
-            },
+            Action::SaveSnippet { name, text, kind },
             Purpose::Plain,
             clock,
             out,
         );
         out.push(Out::Effect(PlatformEffect::Notice {
-            text: "saved as a snippet".to_owned(),
+            text: match kind {
+                ComposerMode::Agent => "saved as a snippet",
+                ComposerMode::Shell => "saved as a command",
+            }
+            .to_owned(),
         }));
     }
 
@@ -876,13 +1074,17 @@ impl Head {
             return;
         };
         let composer = &session.composer;
+        let when = match session.mode {
+            ComposerMode::Agent => RunWhen::Always,
+            ComposerMode::Shell => session.when,
+        };
         if let Some(action) = session.saver.save(
             clock.now,
             force,
-            ComposerMode::Agent,
+            session.mode,
             &composer.text,
             composer.cursor,
-            RunWhen::Always,
+            when,
         ) {
             self.dispatch(action, Purpose::Draft, out);
         }
@@ -951,9 +1153,26 @@ impl Head {
             out.push(Out::Link(banner));
         }
 
-        let composer = self.session.as_ref().map(|s| ComposerView {
-            history_label: s.history.position().map(|(at, of)| format!("{at} of {of}")),
-            ..s.composer.shown.clone()
+        let open = open_session(&self.view);
+        let composer = self.session.as_ref().map(|s| {
+            let history = if s.shell() {
+                &s.shell_history
+            } else {
+                &s.history
+            };
+            let shell = open.filter(|_| s.shell());
+            ComposerView {
+                history_label: history.position().map(|(at, of)| format!("{at} of {of}")),
+                mode: match s.mode {
+                    ComposerMode::Agent => ComposerModeView::Agent,
+                    ComposerMode::Shell => ComposerModeView::Shell,
+                },
+                shell_enabled: open.is_some_and(|v| v.shell.enabled),
+                prompt_label: shell.map(shell::prompt_label),
+                when_label: shell.and_then(|_| shell::when_label(s.when)),
+                can_stop: shell.and_then(shell_stop).is_some(),
+                ..s.composer.shown.clone()
+            }
         });
         let ui = Ui {
             form: &self.form,
@@ -971,7 +1190,6 @@ impl Head {
             return;
         }
 
-        let open = open_session(&self.view);
         let (id, call, rows) = match (open, &mut self.session) {
             (Some(view), Some(session)) => (
                 Some(view.id),
@@ -1003,6 +1221,23 @@ impl Head {
             self.sent.search = Some(found.clone());
             out.push(Out::Search(found));
         }
+
+        // The runs are the session's whichever view of it shows.
+        let runs = open
+            .map(|view| shell::rows(view, clock.wall_ms))
+            .unwrap_or_default();
+        let updates = match &self.sent.shell {
+            Some((sent_id, old)) if *sent_id == id => shell::diff(old, &runs),
+            _ => None,
+        };
+        match updates {
+            Some(updates) => out.extend(updates.into_iter().map(Out::Shell)),
+            None => out.push(Out::Shell(ShellUpdate::Snapshot {
+                session_id: id.map(|id| id.0.to_string()),
+                runs: runs.clone(),
+            })),
+        }
+        self.sent.shell = Some((id, runs));
     }
 
     /// A fresh session head when another session opens; none off a session.
@@ -1044,13 +1279,26 @@ impl Head {
         };
         let composer = &session.composer;
         let stash = (composer.text.clone(), composer.cursor);
+        let shell = session.shell();
+        // Shell commands from a history of their own.
+        let history = if shell {
+            &mut session.shell_history
+        } else {
+            &mut session.history
+        };
         let next = if older {
-            session
-                .history
-                .older(|| view.prompts(), || stash)
+            let source = || {
+                if shell {
+                    view.shell.commands()
+                } else {
+                    view.prompts()
+                }
+            };
+            history
+                .older(source, || stash)
                 .map(|prompt| (prompt.to_owned(), prompt.chars().count()))
         } else {
-            session.history.newer().map(|recall| match recall {
+            history.newer().map(|recall| match recall {
                 Recall::Prompt(prompt) => (prompt.to_owned(), prompt.chars().count()),
                 Recall::Stash(stash) => stash,
             })

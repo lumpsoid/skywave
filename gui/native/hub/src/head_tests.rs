@@ -18,6 +18,8 @@ struct Rig {
     head: Head,
     clock: Clock,
     session: SessionId,
+    /// This device.
+    me: DeviceId,
     /// Every action dispatched, in order.
     actions: Vec<Action>,
     /// Results not handed to the head yet.
@@ -82,10 +84,11 @@ impl Rig {
             fingerprint: "ab:cd:ef".into(),
         })
         .unwrap();
+        let me = DeviceId::new();
         seam.pairing_succeeded(
             "srv:7443",
             PairedCredentials {
-                device_id: DeviceId::new(),
+                device_id: me,
                 device_key_pem: "KEY".into(),
                 device_cert_pem: "CERT".into(),
                 ca_cert_pem: "CA".into(),
@@ -116,6 +119,7 @@ impl Rig {
             head: Head::new(),
             clock: Clock::read(),
             session,
+            me,
             actions: Vec::new(),
             done: Vec::new(),
         };
@@ -205,6 +209,12 @@ impl Rig {
                 Action::SendMessage { .. } => "send",
                 Action::MarkRead { .. } => "mark read",
                 Action::Back => "back",
+                Action::RunShell { .. } => "run shell",
+                Action::StopShell { .. } => "stop shell",
+                Action::SetComposerMode { .. } => "set mode",
+                Action::Discard(_) => "discard",
+                Action::SaveSnippet { .. } => "save snippet",
+                Action::UseSnippet(_) => "use snippet",
                 _ => "other",
             })
             .collect()
@@ -466,7 +476,7 @@ fn snippets_are_saved_from_rows_and_the_composer_and_inserted_at_the_cursor() {
     );
     assert_eq!(
         rig.kinds(),
-        ["save draft", "other"],
+        ["save draft", "use snippet"],
         "the draft is kept first"
     );
     rig.view();
@@ -1738,4 +1748,552 @@ fn nothing_is_marked_read_from_a_subagents_view() {
     rig.view_subagent(None);
     rig.intent(GuiIntent::FollowingChanged { following: true });
     assert!(rig.kinds().contains(&"mark read"), "{:?}", rig.actions);
+}
+
+impl Rig {
+    /// The server says whether it runs shell commands, as its `hello` does.
+    fn shell_enabled(&mut self, shell: bool) {
+        self.seam
+            .hello_received(&skywave_proto::HelloResponse {
+                protocol_version: skywave_proto::PROTOCOL_VERSION,
+                server_id: skywave_proto::ServerId::new(),
+                device_id: self.me,
+                head: Seq::ZERO,
+                devices: Vec::new(),
+                shell,
+            })
+            .unwrap();
+        self.view();
+    }
+
+    /// Switches the open session's composer into shell mode, as the core
+    /// takes it.
+    fn switch_to_shell(&mut self) {
+        self.shell_enabled(true);
+        self.intent(GuiIntent::ToggleShellMode {
+            session_id: self.session.0.to_string(),
+        });
+        self.results();
+        self.view();
+        assert_eq!(self.composer().mode, ComposerModeView::Shell);
+        self.actions.clear();
+    }
+
+    /// Logs a shell event of the run `run` in the open session at `at`,
+    /// and shows the head the view that follows; what it sent Dart then.
+    fn log_shell(
+        &mut self,
+        run: CommandId,
+        at: chrono::DateTime<Utc>,
+        kind: EventKind,
+    ) -> Vec<Out> {
+        let from = Seq(self.seam.cursor().unwrap().0 + 1);
+        let event = Event {
+            session_id: self.session,
+            at,
+            command_id: kind.logged_by_command().then_some(run),
+            context: skywave_proto::ContextId::first_of(self.session),
+            kind,
+        };
+        self.seam
+            .apply_events(&EventBatch {
+                from,
+                events: vec![event],
+            })
+            .unwrap();
+        self.view()
+    }
+
+    /// The shell runs the head last sent Dart.
+    fn runs(&self) -> &[crate::signals::ShellRunRow] {
+        &self.head.sent.shell.as_ref().unwrap().1
+    }
+
+    fn last_action(&self) -> &Action {
+        self.actions.last().unwrap()
+    }
+}
+
+fn shell_updates(outs: &[Out]) -> Vec<String> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Shell(ShellUpdate::Snapshot { runs, .. }) => Some(format!(
+                "snapshot {:?}",
+                runs.iter().map(|r| r.command.as_str()).collect::<Vec<_>>()
+            )),
+            Out::Shell(ShellUpdate::Upserted { run, index, .. }) => Some(format!(
+                "upsert {}@{index} {}",
+                run.command, run.state_label
+            )),
+            Out::Shell(ShellUpdate::Removed { .. }) => Some("removed".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn shell_mode_is_refused_while_the_server_runs_no_shell_commands() {
+    let mut rig = Rig::new();
+    assert!(!rig.composer().shell_enabled, "off until a server said so");
+    let outs = rig.intent(GuiIntent::ToggleShellMode {
+        session_id: rig.session.0.to_string(),
+    });
+    assert!(rig.actions.is_empty(), "{:?}", rig.actions);
+    assert!(outs.iter().any(|o| matches!(
+        o,
+        Out::Effect(PlatformEffect::Notice { text }) if text == "shell commands are off on this server"
+    )));
+    // Positive control: on once the server says so.
+    rig.shell_enabled(true);
+    assert!(rig.composer().shell_enabled);
+    rig.intent(GuiIntent::ToggleShellMode {
+        session_id: rig.session.0.to_string(),
+    });
+    assert_eq!(rig.kinds(), ["set mode"]);
+}
+
+#[test]
+fn toggling_saves_the_agent_draft_first_and_loads_the_shell_draft_once_switched() {
+    let mut rig = Rig::new();
+    rig.shell_enabled(true);
+    rig.core
+        .dispatch(Action::SaveDraft {
+            session_id: rig.session,
+            mode: ComposerMode::Shell,
+            text: "cargo test".into(),
+            cursor: 5,
+            when: RunWhen::OnSuccess,
+        })
+        .unwrap();
+    rig.view();
+    rig.edit("half a message");
+    assert!(rig.actions.is_empty(), "still within the debounce");
+    let rev = rig.composer().rev;
+    rig.intent(GuiIntent::ToggleShellMode {
+        session_id: rig.session.0.to_string(),
+    });
+    assert_eq!(rig.kinds(), ["save draft", "set mode"]);
+    assert!(matches!(
+        &rig.actions[0],
+        Action::SaveDraft { mode: ComposerMode::Agent, text, .. } if text == "half a message"
+    ));
+    assert!(matches!(
+        &rig.actions[1],
+        Action::SetComposerMode {
+            mode: ComposerMode::Shell,
+            ..
+        }
+    ));
+    // Not swapped on the intent: the core has not switched yet.
+    assert_eq!(rig.composer().mode, ComposerModeView::Agent);
+    assert_eq!(rig.text(), "half a message");
+    // Typed while the switch is on its way: still the agent's.
+    rig.edit("half a message, more");
+
+    rig.results();
+    rig.actions.clear();
+    rig.view();
+    assert!(
+        matches!(
+            rig.actions.as_slice(),
+            [Action::SaveDraft { mode: ComposerMode::Agent, text, .. }] if text == "half a message, more"
+        ),
+        "{:?}",
+        rig.actions
+    );
+    let composer = rig.composer();
+    assert_eq!(composer.mode, ComposerModeView::Shell);
+    assert_eq!(
+        (composer.text.as_str(), composer.cursor_utf16),
+        ("cargo test", 5)
+    );
+    assert!(composer.rev > rev, "Dart's field is not reset");
+    assert_eq!(composer.when_label.as_deref(), Some("if ok ✓"));
+    assert_eq!(composer.prompt_label.as_deref(), Some("$"));
+    let Screen::Session(view) = rig.core.view().screen else {
+        panic!("left the session");
+    };
+    assert_eq!(view.draft.unwrap().text, "half a message, more");
+
+    // Back out works with the server's shell off, and swaps back.
+    rig.shell_enabled(false);
+    rig.actions.clear();
+    rig.intent(GuiIntent::ToggleShellMode {
+        session_id: rig.session.0.to_string(),
+    });
+    assert!(matches!(
+        rig.last_action(),
+        Action::SetComposerMode {
+            mode: ComposerMode::Agent,
+            ..
+        }
+    ));
+    rig.results();
+    rig.view();
+    let composer = rig.composer();
+    assert_eq!(composer.mode, ComposerModeView::Agent);
+    assert_eq!(composer.text, "half a message, more");
+    assert_eq!((composer.prompt_label, composer.when_label), (None, None));
+}
+
+#[test]
+fn a_shell_submit_runs_on_the_chip_condition_which_then_resets() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let id = rig.session.0.to_string();
+    rig.edit("make test");
+    rig.intent(GuiIntent::CycleCondition {
+        session_id: id.clone(),
+    });
+    assert_eq!(rig.composer().when_label.as_deref(), Some("if ok ✓"));
+    rig.intent(GuiIntent::CycleCondition {
+        session_id: id.clone(),
+    });
+    assert_eq!(rig.composer().when_label.as_deref(), Some("if failed ✗"));
+    // The condition is saved with the draft.
+    rig.wait(DRAFT_SAVE_AFTER + Duration::from_millis(10));
+    assert!(matches!(
+        rig.last_action(),
+        Action::SaveDraft { mode: ComposerMode::Shell, when: RunWhen::OnFailure, text, .. }
+            if text == "make test"
+    ));
+    rig.results();
+    rig.actions.clear();
+
+    rig.submit();
+    assert_eq!(rig.kinds(), ["run shell"]);
+    assert!(matches!(
+        rig.last_action(),
+        Action::RunShell { command, when: RunWhen::OnFailure, .. } if command == "make test"
+    ));
+    rig.results();
+    let composer = rig.composer();
+    assert_eq!(composer.text, "");
+    assert_eq!(composer.when_label, None, "the chip resets after a send");
+
+    // Nothing to run: no action, and a picked condition stays.
+    rig.actions.clear();
+    rig.intent(GuiIntent::CycleCondition { session_id: id });
+    rig.submit();
+    assert!(!rig.kinds().contains(&"run shell"), "{:?}", rig.actions);
+    assert_eq!(rig.composer().when_label.as_deref(), Some("if ok ✓"));
+}
+
+#[test]
+fn shell_history_recalls_commands_not_prompts() {
+    let mut rig = Rig::new();
+    rig.edit("a prompt");
+    rig.submit();
+    rig.results();
+    rig.view();
+    rig.switch_to_shell();
+    rig.edit("ls -la");
+    rig.submit();
+    rig.results();
+    rig.view();
+    rig.edit("half");
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().text, "ls -la");
+    assert_eq!(rig.composer().history_label.as_deref(), Some("1 of 1"));
+    rig.intent(GuiIntent::HistoryOlder);
+    assert_eq!(rig.composer().text, "ls -la", "no prompt among them");
+    rig.intent(GuiIntent::HistoryNewer);
+    assert_eq!(rig.composer().text, "half");
+}
+
+#[test]
+fn the_stops_take_back_a_pending_run_and_stop_a_running_one() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    assert!(!rig.composer().can_stop, "nothing to stop");
+    let id = rig.session.0.to_string();
+    rig.intent(GuiIntent::StopShell {
+        session_id: id.clone(),
+    });
+    assert!(rig.actions.is_empty(), "{:?}", rig.actions);
+
+    // This device's run, not sent yet: the stop takes it back.
+    rig.edit("sleep 60");
+    rig.submit();
+    rig.results();
+    rig.view();
+    // The sent clear is saved first, so only the stops dispatch below.
+    rig.wait(DRAFT_SAVE_AFTER + Duration::from_millis(10));
+    rig.results();
+    let row = rig.runs()[0].clone();
+    assert_eq!(row.state, crate::signals::ShellRunKind::Pending);
+    assert!(row.can_stop && row.discardable, "{row:?}");
+    assert!(rig.composer().can_stop);
+    rig.actions.clear();
+    rig.intent(GuiIntent::StopShell {
+        session_id: id.clone(),
+    });
+    assert_eq!(rig.kinds(), ["discard"]);
+    rig.actions.clear();
+    rig.intent(GuiIntent::StopShellRun {
+        session_id: id.clone(),
+        run_id: row.key.clone(),
+    });
+    assert_eq!(rig.kinds(), ["discard"], "the row's own stop too");
+    rig.results();
+    rig.view();
+    assert!(rig.runs().is_empty());
+
+    // Another device's run, running: stopped, then stopping.
+    let run = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::Always,
+            by: DeviceId::new(),
+        },
+    );
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellStarted {
+            run,
+            cwd: "/srv/work".into(),
+        },
+    );
+    let row = rig.runs()[0].clone();
+    assert_eq!(row.state, crate::signals::ShellRunKind::Running);
+    assert!(row.by_label.is_some_and(|by| by.starts_with("by device")));
+    assert_eq!(rig.composer().prompt_label.as_deref(), Some("work $"));
+    rig.actions.clear();
+    rig.intent(GuiIntent::StopShellRun {
+        session_id: id.clone(),
+        run_id: row.key.clone(),
+    });
+    assert!(matches!(
+        rig.last_action(),
+        Action::StopShell { run: r, .. } if *r == run
+    ));
+    rig.actions.clear();
+    rig.intent(GuiIntent::StopShell {
+        session_id: id.clone(),
+    });
+    assert_eq!(rig.kinds(), ["stop shell"]);
+    rig.results();
+    rig.view();
+    let row = rig.runs()[0].clone();
+    assert!(row.stopping && !row.can_stop, "{row:?}");
+    assert!(
+        row.state_label.ends_with(" · stopping"),
+        "{}",
+        row.state_label
+    );
+    assert!(!rig.composer().can_stop, "nothing left to stop");
+    rig.actions.clear();
+    rig.intent(GuiIntent::StopShellRun {
+        session_id: id,
+        run_id: row.key,
+    });
+    assert!(rig.actions.is_empty(), "stopped once: {:?}", rig.actions);
+}
+
+#[test]
+fn shell_runs_go_out_as_a_snapshot_then_keyed_diffs() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let run = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellRequested {
+            command: "make".into(),
+            when: RunWhen::OnSuccess,
+            by: DeviceId::new(),
+        },
+    );
+    let row = rig.runs()[0].clone();
+    assert_eq!(row.key, run.0.to_string(), "keyed by the run id");
+    assert_eq!(row.when_label.as_deref(), Some("if ok ✓"));
+    let outs = rig.log_shell(
+        run,
+        at + chrono::Duration::seconds(1),
+        EventKind::ShellStarted {
+            run,
+            cwd: "/srv/work".into(),
+        },
+    );
+    let outs = shell_updates(&outs);
+    assert_eq!(outs.len(), 1, "{outs:?}");
+    assert!(outs[0].starts_with("upsert make@0 running"), "{outs:?}");
+    // Nothing changed: nothing goes out.
+    let outs = rig.intent(GuiIntent::FollowingChanged { following: false });
+    assert!(shell_updates(&outs).is_empty());
+
+    // The app asks again: a snapshot.
+    let outs = rig.intent(GuiIntent::AppReady);
+    assert_eq!(shell_updates(&outs), [r#"snapshot ["make"]"#]);
+    // Another session: a snapshot of its runs.
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    let outs = rig.view();
+    assert_eq!(shell_updates(&outs), ["snapshot []"]);
+}
+
+#[test]
+fn a_long_shell_run_of_this_devices_notifies() {
+    let mut rig = Rig::new();
+    let run = CommandId::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let me = rig.me;
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellRequested {
+            command: "make test".into(),
+            when: RunWhen::Always,
+            by: me,
+        },
+    );
+    rig.log_shell(
+        run,
+        at,
+        EventKind::ShellStarted {
+            run,
+            cwd: "/srv/work".into(),
+        },
+    );
+    let from = Seq(rig.seam.cursor().unwrap().0 + 1);
+    rig.seam
+        .apply_events(&EventBatch {
+            from,
+            events: vec![Event {
+                session_id: rig.session,
+                at: at + chrono::Duration::seconds(11),
+                command_id: None,
+                context: skywave_proto::ContextId::first_of(rig.session),
+                kind: EventKind::ShellFinished {
+                    run,
+                    by: me,
+                    started_at: Some(at),
+                    command_line: "make test".into(),
+                    end: skywave_proto::ShellEnd::Exited { code: 1 },
+                    cwd: None,
+                    preview: String::new(),
+                    lines: 0,
+                    output: None,
+                    truncated: false,
+                },
+            }],
+        })
+        .unwrap();
+    let view = rig.core.view();
+    let outs = rig.head.on_view(view.clone(), rig.clock);
+    let notified: Vec<_> = outs
+        .iter()
+        .filter_map(|o| match o {
+            Out::Effect(PlatformEffect::Notify {
+                title,
+                body,
+                session_id,
+            }) => Some((title.clone(), body.clone(), session_id.clone())),
+            _ => None,
+        })
+        .collect();
+    let title = rig.open_session().title;
+    assert_eq!(
+        notified,
+        [(
+            title.clone(),
+            format!("make test · exit 1 · {title}"),
+            Some(rig.session.0.to_string())
+        )]
+    );
+    // Once only.
+    let outs = rig.head.on_view(view.clone(), rig.clock);
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
+    );
+    // A head whose first snapshot already counts it still says so.
+    let mut fresh = Head::new();
+    let outs = fresh.on_view(view, rig.clock);
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
+    );
+}
+
+#[test]
+fn shell_mode_lists_and_saves_shell_snippets_and_a_long_press_runs_one() {
+    let mut rig = Rig::new();
+    rig.edit("an agent prompt");
+    rig.intent(GuiIntent::SaveComposerSnippet {
+        session_id: rig.session.0.to_string(),
+        name: String::new(),
+    });
+    rig.switch_to_shell();
+    rig.edit("cargo build");
+    let outs = rig.intent(GuiIntent::SaveComposerSnippet {
+        session_id: rig.session.0.to_string(),
+        name: "build".into(),
+    });
+    assert!(matches!(
+        rig.last_action(),
+        Action::SaveSnippet { kind: ComposerMode::Shell, text, .. } if text == "cargo build"
+    ));
+    assert!(outs.iter().any(|o| matches!(
+        o,
+        Out::Effect(PlatformEffect::Notice { text }) if text == "saved as a command"
+    )));
+    rig.results();
+    rig.view();
+    let snippets = rig.open_session().snippets;
+    assert_eq!(
+        snippets
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>(),
+        ["build"],
+        "only the shell kind"
+    );
+
+    rig.edit("half");
+    rig.actions.clear();
+    rig.intent(GuiIntent::RunSnippet {
+        session_id: rig.session.0.to_string(),
+        snippet_id: snippets[0].snippet_id.clone(),
+    });
+    assert_eq!(rig.kinds(), ["run shell", "save draft", "use snippet"]);
+    assert!(matches!(
+        &rig.actions[0],
+        Action::RunShell { command, when: RunWhen::Always, .. } if command == "cargo build"
+    ));
+    rig.results();
+    rig.view();
+    assert_eq!(rig.text(), "half", "the composer keeps its text");
+    let Screen::Session(view) = rig.core.view().screen else {
+        panic!("left the session");
+    };
+    assert_eq!(
+        view.shell_draft.map(|d| d.text).as_deref(),
+        Some("half"),
+        "and so does the core's draft"
+    );
+
+    // Back in agent mode, the agent's.
+    rig.intent(GuiIntent::ToggleShellMode {
+        session_id: rig.session.0.to_string(),
+    });
+    rig.results();
+    rig.view();
+    let snippets = rig.open_session().snippets;
+    assert_eq!(
+        snippets
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>(),
+        ["an agent prompt"]
+    );
 }

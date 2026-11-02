@@ -63,7 +63,14 @@ TimelineRow message(String key, String text, {required bool pending}) =>
       sections: const [],
     );
 
-const _composer = ComposerView(text: '', cursorUtf16: 0, rev: 1);
+const _composer = ComposerView(
+  text: '',
+  cursorUtf16: 0,
+  rev: 1,
+  mode: ComposerModeView.agent,
+  shellEnabled: false,
+  canStop: false,
+);
 
 /// An agent that has not said its mode, model or effort yet.
 const unknownAgent = AgentSettingsView(

@@ -25,21 +25,54 @@ pub enum GuiIntent {
         text: String,
         cursor_utf16: u32,
     },
-    /// Send the composer's text. It clears once the core took it; if the
-    /// core refuses, it stays, and nothing is resent.
+    /// Send the composer's text: a message in agent mode, a shell command
+    /// on the condition shown in shell mode (blank runs nothing). It
+    /// clears once the core took it, and the condition goes back to
+    /// always; if the core refuses, it stays, and nothing is resent.
     ComposerSubmit {
         session_id: String,
     },
-    /// Recall the next older or newer earlier prompt into the composer.
+    /// Recall the next older or newer earlier prompt into the composer;
+    /// in shell mode, the earlier shell commands.
     HistoryOlder,
     HistoryNewer,
+    /// Switch the composer between agent and shell mode. The text written
+    /// so far stays as its mode's draft, and the other mode's draft shows.
+    /// Into shell mode only while the server runs shell commands.
+    ToggleShellMode {
+        session_id: String,
+    },
+    /// Step the shell command's condition: always → if ok → if failed →
+    /// always. Kept with the shell draft.
+    CycleCondition {
+        session_id: String,
+    },
+    /// The shell composer's stop: stops the running run, else takes back
+    /// or stops the newest waiting one; nothing when nothing runs or
+    /// waits.
+    StopShell {
+        session_id: String,
+    },
+    /// One run's own stop (`run_id`, a row's key): this device's run the
+    /// server never saw is taken back, any other stopped.
+    StopShellRun {
+        session_id: String,
+        run_id: String,
+    },
+    /// Run a shell snippet's text as a command at once, on no condition;
+    /// the composer keeps what it holds.
+    RunSnippet {
+        session_id: String,
+        snippet_id: String,
+    },
     /// Keep a message's text (a `UserMessage` or `PendingMessage` row's)
     /// as a snippet named `name`, blank for none.
     SaveSnippet {
         key: String,
         name: String,
     },
-    /// Keep the composer's text as a snippet, as `SaveSnippet`.
+    /// Keep the composer's text as a snippet, as `SaveSnippet`; in shell
+    /// mode as a saved shell command.
     SaveComposerSnippet {
         session_id: String,
         name: String,
@@ -154,12 +187,13 @@ pub enum GuiIntent {
 /// A core action the GUI asks for directly.
 #[derive(Debug, Clone, PartialEq, Deserialize, SignalPiece)]
 pub enum ActionIntent {
-    /// Take back a discardable message or session creation, or dismiss a
-    /// refused one.
+    /// Take back a discardable message, shell run or session creation, or
+    /// dismiss a refused one.
     Discard {
         command_id: String,
     },
-    /// Take a discardable message back into the draft.
+    /// Take a discardable message back into the draft; a shell run into
+    /// the shell draft, with its condition.
     EditQueued {
         command_id: String,
     },

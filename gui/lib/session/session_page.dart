@@ -11,6 +11,8 @@ import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/sessions/rename_dialog.dart';
 import 'package:skywave_gui/session/search_bar.dart';
 import 'package:skywave_gui/session/search_holder.dart';
+import 'package:skywave_gui/session/shell_holder.dart';
+import 'package:skywave_gui/session/shell_view.dart';
 import 'package:skywave_gui/session/status_line.dart';
 import 'package:skywave_gui/session/timeline_holder.dart';
 import 'package:skywave_gui/session/timeline_view.dart';
@@ -19,16 +21,18 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// The open session: its header and status line, a bar under them while
 /// the agent works, the search bar while a search is open, the timeline,
 /// the approval it waits on, and the composer; the rename prompt over it
-/// while open.
+/// while open. In shell mode the shell runs take the timeline's place.
 ///
 /// Desktop keys, as in the TUI: Ctrl+X interrupts (unless text is
-/// selected: then it cuts), Ctrl+F searches, PgUp/PgDn scroll, Esc closes
-/// the search, leaves the composer, or goes back.
+/// selected: then it cuts; in shell mode it stops the shell), Ctrl+F
+/// searches, PgUp/PgDn scroll, Esc closes the search, leaves the
+/// composer, or goes back.
 class SessionPage extends StatefulWidget {
   const SessionPage({
     required this.screen,
     required this.timeline,
     required this.send,
+    this.shell,
     this.search,
     super.key,
   });
@@ -36,6 +40,9 @@ class SessionPage extends StatefulWidget {
   final SessionScreen screen;
   final TimelineHolder timeline;
   final SendIntent send;
+
+  /// The app's shell holder; without one the page keeps its own.
+  final ShellHolder? shell;
 
   /// The app's search holder; without one the page has no search.
   final SearchHolder? search;
@@ -49,10 +56,15 @@ class _SessionPageState extends State<SessionPage> {
   final _composerFocus = FocusNode(debugLabel: 'composer');
   final _searchFocus = FocusNode(debugLabel: 'search');
   SearchHolder? _ownSearch;
+  ShellHolder? _ownShell;
 
   SearchHolder get _search => widget.search ?? (_ownSearch ??= SearchHolder());
 
+  ShellHolder get _shellRuns => widget.shell ?? (_ownShell ??= ShellHolder());
+
   SessionScreen get _screen => widget.screen;
+
+  bool get _shell => _screen.composer.mode == ComposerModeView.shell;
 
   /// The screen for the background work sheet, which stays open across
   /// updates.
@@ -111,6 +123,7 @@ class _SessionPageState extends State<SessionPage> {
     _composerFocus.dispose();
     _searchFocus.dispose();
     _ownSearch?.dispose();
+    _ownShell?.dispose();
     _work.dispose();
     super.dispose();
   }
@@ -194,8 +207,19 @@ class _SessionPageState extends State<SessionPage> {
     final timeline = _timelineView.currentState;
     if (ctrl && key == LogicalKeyboardKey.keyX) {
       if (_textSelected) return KeyEventResult.ignored;
-      _interrupt();
+      if (_shell) {
+        widget.send(GuiIntentStopShell(sessionId: _screen.sessionId));
+      } else {
+        _interrupt();
+      }
       return KeyEventResult.handled;
+    }
+    // The timeline's: the run list has neither search nor pages.
+    if (_shell &&
+        ((ctrl && key == LogicalKeyboardKey.keyF) ||
+            key == LogicalKeyboardKey.pageUp ||
+            key == LogicalKeyboardKey.pageDown)) {
+      return KeyEventResult.ignored;
     }
     if (ctrl && key == LogicalKeyboardKey.keyF) {
       _openSearch();
@@ -467,13 +491,19 @@ class _SessionPageState extends State<SessionPage> {
                   },
                 ),
                 Expanded(
-                  child: TimelineView(
-                    key: _timelineView,
-                    sessionId: screen.sessionId,
-                    timeline: widget.timeline,
-                    search: _search,
-                    send: widget.send,
-                  ),
+                  child: _shell
+                      ? ShellView(
+                          sessionId: screen.sessionId,
+                          shell: _shellRuns,
+                          send: widget.send,
+                        )
+                      : TimelineView(
+                          key: _timelineView,
+                          sessionId: screen.sessionId,
+                          timeline: widget.timeline,
+                          search: _search,
+                          send: widget.send,
+                        ),
                 ),
                 if (screen.approval case final approval?)
                   _Column(

@@ -94,6 +94,7 @@ fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
                 update.send_signal_to_dart();
             }
             Out::Timeline(update) => update.send_signal_to_dart(),
+            Out::Shell(update) => update.send_signal_to_dart(),
             Out::Search(update) => update.send_signal_to_dart(),
             Out::Effect(effect) => effect.send_signal_to_dart(),
             Out::Dispatch(tag, action) => {
