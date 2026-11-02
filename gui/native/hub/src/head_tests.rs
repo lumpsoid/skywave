@@ -1380,3 +1380,113 @@ fn a_model_that_takes_no_effort_reads_no_effort_with_nothing_to_pick() {
     assert_eq!(agent.effort_label, "no effort");
     assert!(agent.efforts.is_empty());
 }
+
+/// The `CreateSession` commands the core has queued, as (workdir,
+/// conversation).
+fn queued_creations(rig: &Rig) -> Vec<(String, Option<String>)> {
+    rig.seam
+        .pending_outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.command.kind {
+            CommandKind::CreateSession {
+                workdir,
+                conversation,
+                ..
+            } => Some((workdir, conversation)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_create_prompt(rig: &mut Rig) {
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    rig.intent(GuiIntent::CreateOpen);
+}
+
+#[test]
+fn accepting_with_a_conversation_id_adopts_it() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "  abc-123 ".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CreateSession {
+            workdir: "/srv/app".into(),
+            conversation: Some("  abc-123 ".into()),
+        })
+    );
+    assert_eq!(
+        queued_creations(&rig),
+        [("/srv/app".to_owned(), Some("abc-123".to_owned()))]
+    );
+}
+
+#[test]
+fn accepting_with_the_conversation_blank_starts_fresh() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "   ".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(queued_creations(&rig), [("/srv/app".to_owned(), None)]);
+}
+
+#[test]
+fn accepting_a_candidate_leaves_the_conversation_alone() {
+    let mut rig = Rig::new();
+    open_create_prompt(&mut rig);
+    rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    // The seeded session's workdir is a recent candidate.
+    rig.intent(GuiIntent::CompletionComplete);
+    rig.results();
+    rig.view();
+    let before = rig.actions.len();
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(
+        rig.actions.len(),
+        before,
+        "taking a candidate dispatches nothing"
+    );
+    assert!(queued_creations(&rig).is_empty());
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(queued_creations(&rig).len(), 1);
+    assert_eq!(queued_creations(&rig)[0].1.as_deref(), Some("abc-123"));
+}
+
+#[test]
+fn the_conversation_field_does_nothing_while_the_prompt_is_closed() {
+    let mut rig = Rig::new();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    let outs = rig.intent(GuiIntent::CreateConversationTyped {
+        conversation: "abc-123".into(),
+    });
+    assert!(outs.is_empty());
+    // A prompt opened afterwards starts blank.
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::CompletionTyped {
+        input: "/srv/app".into(),
+    });
+    rig.intent(GuiIntent::CompletionAccept);
+    assert_eq!(queued_creations(&rig), [("/srv/app".to_owned(), None)]);
+}
