@@ -28,12 +28,23 @@
 //! [`DIRS_TIMEOUT`] gets a 503, and the scan, bounded by its cap, finishes
 //! unobserved.
 //!
+//! **Workdir** (`GET /v1/workdir/list` and `/v1/workdir/file`, D36): reads
+//! of a session's workdir, every outcome a 200
+//! [`ListResult`](skywave_proto::ListResult) or
+//! [`FileResult`](skywave_proto::FileResult). They run on a blocking thread
+//! through [`crate::workdir::WorkdirReader`], on its own database connection
+//! and one snapshot at a time. Each request takes its deadline
+//! ([`workdir::SNAPSHOT_DEADLINE`]) when the handler starts; a snapshot that
+//! reaches it, or gets the lock only after it, stops and the reply is a 503.
+//! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
+//! future, and the deadline is what stops the abandoned work.
+//!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
 //! 500 server fault.
 
 use std::io::SeekFrom;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -48,7 +59,7 @@ use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, Command, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloResponse,
-    PROTOCOL_VERSION, ServerId, path,
+    PROTOCOL_VERSION, ServerId, WorkdirQuery, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
@@ -58,8 +69,9 @@ use crate::blobs::BlobStore;
 use crate::db::Db;
 use crate::devices;
 use crate::dirs;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::event_log::DEFAULT_BATCH_LIMIT;
+use crate::workdir::{self, Snapshot, WorkdirReader};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -67,6 +79,10 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 pub const TOUCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 /// Longest a `GET /v1/dirs` listing may take before the reply gives up.
 pub const DIRS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest a workdir request may take before the reply gives up with a 503.
+/// Longer than [`workdir::SNAPSHOT_DEADLINE`], which stops the snapshot
+/// itself; this only stops waiting for it.
+pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Read size when streaming a blob.
 const BLOB_CHUNK: usize = 64 * 1024;
 
@@ -84,6 +100,9 @@ pub(crate) struct Api {
     /// The API's own connection. SQLite has one writer anyway; long-poll
     /// waits happen outside the lock.
     db: Mutex<Db>,
+    /// Workdir reads, on a second connection of their own (behind its own
+    /// mutex), so file I/O never holds `db`.
+    workdir: WorkdirReader,
     log: EventLog,
     blobs: BlobStore,
     server_id: ServerId,
@@ -92,8 +111,10 @@ pub(crate) struct Api {
 }
 
 impl Api {
+    /// `db` and `workdir_db` are two connections to the same database.
     pub(crate) fn new(
         db: Db,
+        workdir_db: Db,
         log: EventLog,
         blobs: BlobStore,
         server_id: ServerId,
@@ -101,6 +122,7 @@ impl Api {
     ) -> Api {
         Api {
             db: Mutex::new(db),
+            workdir: WorkdirReader::new(workdir_db, blobs.clone(), log.roots().to_vec()),
             log,
             blobs,
             server_id,
@@ -141,6 +163,8 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::COMMANDS, post(commands))
         .route(path::EVENTS, get(events))
         .route(path::DIRS, get(list_dirs))
+        .route(path::WORKDIR_LIST, get(workdir_list))
+        .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::BLOB_ROUTE, get(blob))
         .route_layer(middleware::from_fn_with_state(api.clone(), authenticate))
         .with_state(api)
@@ -276,6 +300,59 @@ async fn list_dirs(
         }
         Err(_) => {
             tracing::warn!("directory listing timed out");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn workdir_list(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_snapshot(&api, deadline, move |s| s.list(&query)).await
+}
+
+async fn workdir_file(
+    State(api): State<Arc<Api>>,
+    query: std::result::Result<Query<WorkdirQuery>, QueryRejection>,
+) -> Response {
+    let deadline = Instant::now() + workdir::SNAPSHOT_DEADLINE;
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    workdir_snapshot(&api, deadline, move |s| s.file(&query)).await
+}
+
+/// Runs `f` as one workdir snapshot on a blocking thread (module docs,
+/// "Workdir"): its answer is a 200, a passed deadline or [`WORKDIR_TIMEOUT`]
+/// a 503, any other error a 500.
+async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
+    api: &Arc<Api>,
+    deadline: Instant,
+    f: impl FnOnce(&mut Snapshot<'_>) -> Result<T> + Send + 'static,
+) -> Response {
+    let api = api.clone();
+    let work = tokio::task::spawn_blocking(move || api.workdir.snapshot(deadline, f));
+    match tokio::time::timeout(WORKDIR_TIMEOUT, work).await {
+        Ok(Ok(Ok(answer))) => Json(answer).into_response(),
+        Ok(Ok(Err(Error::WorkdirDeadline))) => {
+            tracing::warn!("workdir snapshot passed its deadline");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::error!(error = %e, "workdir read failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "workdir task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => {
+            tracing::warn!("workdir read timed out");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }

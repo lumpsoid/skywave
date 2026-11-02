@@ -19,8 +19,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId, DeviceInfo,
-    DirsResult, EventBatch, EventKind, HelloResponse, PROTOCOL_VERSION, PairRequest, PairResponse,
-    RejectReason, Seq, SessionId, SessionOrigin, path,
+    DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileResult, HelloResponse,
+    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId,
+    SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -839,4 +840,119 @@ async fn dirs_answers_every_outcome_with_200() {
     // Like every authenticated route, it needs a certificate.
     let mut anon = f.anonymous().await;
     assert_eq!(anon.get(path::DIRS).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// `route?session=..&path=..`, with `path` percent-escaped.
+fn workdir_uri(route: &str, session: SessionId, path: &str) -> String {
+    let mut escaped = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{route}?session={}&path={escaped}", session.0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workdir_list_and_file_answer_every_outcome_with_200() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    std::fs::create_dir(workdir.join("src")).unwrap();
+    std::fs::write(workdir.join("my notes & more.txt"), "hello\n").unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let list = |path: &str| workdir_uri(path::WORKDIR_LIST, session, path);
+    let file = |path: &str| workdir_uri(path::WORKDIR_FILE, session, path);
+
+    let reply = device.get(&list("")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let ListResult::Listed { path, entries, .. } = reply.json::<ListResult>() else {
+        panic!("expected a listing: {:?}", reply.body);
+    };
+    assert_eq!(path, "");
+    assert_eq!(
+        entries,
+        vec![
+            DirEntry {
+                name: "my notes & more.txt".into(),
+                kind: EntryKind::File,
+                size: Some(6),
+            },
+            DirEntry {
+                name: "src".into(),
+                kind: EntryKind::Dir,
+                size: None,
+            },
+        ]
+    );
+
+    let reply = device.get(&file("src/../my notes & more.txt")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let FileResult::File {
+        path,
+        size,
+        content: FileBody::Blob(blob),
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected a file: {:?}", reply.body);
+    };
+    assert_eq!((path.as_str(), size), ("my notes & more.txt", 6));
+    let content = device.get(&path::blob(blob.id)).await;
+    assert_eq!(content.status, StatusCode::OK);
+    assert_eq!(&content.body[..], b"hello\n");
+
+    let unknown = SessionId::new();
+    let list_cases = [
+        (list("../.."), ListResult::NotAllowed),
+        (list("missing"), ListResult::NotFound),
+        (list("my notes & more.txt"), ListResult::NotADirectory),
+        (
+            workdir_uri(path::WORKDIR_LIST, unknown, ""),
+            ListResult::UnknownSession,
+        ),
+    ];
+    for (uri, want) in list_cases {
+        let reply = device.get(&uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.json::<ListResult>(), want, "{uri}");
+    }
+    let file_cases = [
+        (file("/etc/hostname"), FileResult::NotAllowed),
+        (file("missing"), FileResult::NotFound),
+        (file("src"), FileResult::IsADirectory),
+        (
+            workdir_uri(path::WORKDIR_FILE, unknown, "x"),
+            FileResult::UnknownSession,
+        ),
+    ];
+    for (uri, want) in file_cases {
+        let reply = device.get(&uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.json::<FileResult>(), want, "{uri}");
+    }
+
+    std::fs::remove_dir_all(&workdir).unwrap();
+    let reply = device.get(&list("")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<ListResult>(), ListResult::WorkdirGone);
+    let reply = device.get(&file("x")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<FileResult>(), FileResult::WorkdirGone);
+
+    // A malformed query is a 400; without a certificate, a 401.
+    let bad = format!("{}?session=nope", path::WORKDIR_LIST);
+    assert_eq!(device.get(&bad).await.status, StatusCode::BAD_REQUEST);
+    let mut anon = f.anonymous().await;
+    for route in [path::WORKDIR_LIST, path::WORKDIR_FILE] {
+        assert_eq!(
+            anon.get(&workdir_uri(route, session, "")).await.status,
+            StatusCode::UNAUTHORIZED,
+            "{route}"
+        );
+    }
 }

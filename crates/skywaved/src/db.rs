@@ -246,6 +246,18 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX shell_runs_session ON shell_runs (session_id, finished_seq);
     "#,
+    // v12: workdir reads (protocol v15, D36). Additive.
+    r#"
+    -- Workdir content stored as a blob, by content: a snapshot of unchanged
+    -- content reuses its blob. Only workdir reads look here, so an event
+    -- blob is never shared with a snapshot. sha256 is lowercase hex.
+    CREATE TABLE workdir_blobs (
+        sha256  TEXT NOT NULL,
+        size    INTEGER NOT NULL CHECK (size >= 0),
+        blob_id TEXT NOT NULL REFERENCES blobs (id),
+        PRIMARY KEY (sha256, size)
+    ) STRICT;
+    "#,
 ];
 
 /// Schema version this build creates and understands.
@@ -374,7 +386,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 10] = [
+    const TABLES: [&str; 11] = [
         "approvals",
         "blobs",
         "commands",
@@ -385,6 +397,7 @@ mod tests {
         "sessions",
         "shell_runs",
         "supervisor_cursor",
+        "workdir_blobs",
     ];
 
     fn schema(db: &Db) -> Vec<(String, String)> {
@@ -867,6 +880,43 @@ mod tests {
         assert!(insert("always", "not json").is_err());
         // Positive control: a row that breaks nothing goes in.
         assert!(insert("on_failure", r#"{"kind":"stopped"}"#).is_ok());
+    }
+
+    /// A v11 database, from before workdir reads, gains an empty
+    /// `workdir_blobs` that takes one row per content and only real blobs.
+    #[test]
+    fn v12_adds_an_empty_workdir_blobs_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..11] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+            conn.execute_batch("INSERT INTO blobs (id, size, sha256) VALUES ('b', 1, 'h')")
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let conn = db.conn();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("blobs"), 1);
+        assert_eq!(count("workdir_blobs"), 0);
+        let insert = |sha: &str, size: i64, blob: &str| {
+            conn.execute(
+                "INSERT INTO workdir_blobs (sha256, size, blob_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sha, size, blob],
+            )
+        };
+        assert!(insert("h", 1, "no-such-blob").is_err());
+        assert!(insert("h", -1, "b").is_err());
+        // Positive control, then the same content again.
+        assert!(insert("h", 1, "b").is_ok());
+        assert!(insert("h", 1, "b").is_err());
     }
 
     #[test]

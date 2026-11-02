@@ -78,23 +78,48 @@ impl BlobStore {
         self.dir.join(id.0.to_string())
     }
 
-    /// Stores `content` as a new blob and records it in `conn`.
-    pub fn put(&self, conn: &Connection, mut content: impl Read) -> Result<BlobMeta> {
+    /// Stores `content` as a new blob and records it in `conn`: [`write`]
+    /// then [`record`].
+    ///
+    /// [`write`]: BlobStore::write
+    /// [`record`]: BlobStore::record
+    pub fn put(&self, conn: &Connection, content: impl Read) -> Result<BlobMeta> {
+        let meta = self.write(content)?;
+        self.record(conn, &meta)?;
+        Ok(meta)
+    }
+
+    /// Writes `content` as the synced file of a new blob, not yet recorded:
+    /// no database access, so it holds no lock. Follow with [`record`], or
+    /// the file is an orphan that is never served.
+    ///
+    /// [`record`]: BlobStore::record
+    pub fn write(&self, mut content: impl Read) -> Result<BlobMeta> {
         let id = BlobId::new();
         let path = self.path(id);
         let (size, sha256) = self
             .write_atomically(&path, &mut content)
             .context(|| format!("writing blob {}", path.display()))?;
-        let meta = BlobMeta { id, size, sha256 };
+        Ok(BlobMeta { id, size, sha256 })
+    }
+
+    /// Inserts the `blobs` row of a blob [`write`](BlobStore::write) made;
+    /// on failure the file is removed.
+    pub fn record(&self, conn: &Connection, meta: &BlobMeta) -> Result<()> {
         if let Err(e) = conn.execute(
             "INSERT INTO blobs (id, size, sha256) VALUES (?1, ?2, ?3)",
-            params![id.0.to_string(), sql_size(meta.size), meta.sha256],
+            params![meta.id.0.to_string(), sql_size(meta.size), meta.sha256],
         ) {
-            let _ = std::fs::remove_file(&path);
+            self.discard(meta.id);
             return Err(e.into());
         }
-        tracing::debug!(blob = %id.0, size, "stored blob");
-        Ok(meta)
+        tracing::debug!(blob = %meta.id.0, size = meta.size, "stored blob");
+        Ok(())
+    }
+
+    /// Removes the file of a blob that was written but never committed.
+    pub fn discard(&self, id: BlobId) {
+        let _ = std::fs::remove_file(self.path(id));
     }
 
     fn write_atomically(&self, path: &Path, content: &mut impl Read) -> io::Result<(u64, String)> {

@@ -106,6 +106,8 @@ version changed. Client and server must match it exactly (checked at
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
+| `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
+| `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
 
 - **Seqs** are global and contiguous: the first event is 1, 0 is "before
   everything". Events carry no seq on the wire; the batch carries `from`.
@@ -128,8 +130,10 @@ version changed. Client and server must match it exactly (checked at
   device unknown or revoked (checked on every request, so a revocation
   applies to an open connection's next request), 400 malformed, 404 unknown
   blob, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
-  `Accepted` and `Rejected` alike, and `/v1/dirs` 200 for every result
-  (never 401/403 beyond authentication, which clients read as revoked).
+  `Accepted` and `Rejected` alike, and `/v1/dirs` and `/v1/workdir/*` 200
+  for every result (never 401/403 beyond authentication, which clients read
+  as revoked). `/v1/dirs` and `/v1/workdir/*` answer 503 when they run out
+  of time.
 
 ## Server
 
@@ -172,6 +176,19 @@ beside a running `serve`.
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would
   start.
+- **Workdir reads** (D36): list and file resolve the session's stored
+  workdir, which must still canonicalise to itself under the roots, then the
+  requested path, which must be relative, must not climb out with `..`, and
+  must canonicalise under the canonical workdir. A file must be a regular
+  file before it is opened (a FIFO would block). Reads run on their own
+  connection, one snapshot at a time behind a mutex, so they never hold the
+  API's connection and a refresh storm costs one snapshot at a time. Each
+  request's deadline (15 s) starts with its handler: a request that gets the
+  lock past it does nothing, work in progress stops at it, and either way
+  the reply is a 503 (the outer timeout is 20 s). Content blobs are
+  deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
+  keeps its blob across refreshes; event blobs are never reused for them.
+  Nothing deletes blobs yet (no GC).
 
 ## Pairing
 
