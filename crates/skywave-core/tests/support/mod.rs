@@ -25,10 +25,11 @@ use skywave_proto::{
     CommandId, CommandKind, CommandResult, ContextRef, Event, EventKind, Seq, SessionId,
     SessionOrigin,
 };
-use skywaved::agent::fake::FakeAgent;
+use skywaved::agent::fake::{FakeAgent, FakeOutside};
+use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, ResultDisplay};
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing;
-use skywaved::server::Server;
+use skywaved::server::{Server, ServerOptions};
 use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
@@ -60,6 +61,16 @@ impl Daemon {
 
     /// As [`Daemon::start`], running shell commands from devices if `shell`.
     pub async fn start_with_shell(agent: FakeAgent, shell: bool) -> Daemon {
+        Daemon::start_with(agent, shell, FakeOutside::new()).await
+    }
+
+    /// As [`Daemon::start`], an adopting `CreateSession` reading its
+    /// conversation from `outside` (keyed by [`Daemon::canonical_workdir`]).
+    pub async fn start_with_outside(agent: FakeAgent, outside: FakeOutside) -> Daemon {
+        Daemon::start_with(agent, false, outside).await
+    }
+
+    async fn start_with(agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let data = tmp.path().join("server");
@@ -75,12 +86,17 @@ impl Daemon {
         let git = Git::default()
             .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_env("GIT_CONFIG_NOSYSTEM", "1");
-        let server = Server::bind_with_git(
+        let options = ServerOptions {
+            git,
+            outside: Arc::new(outside),
+            ..ServerOptions::default()
+        };
+        let server = Server::bind_with(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log.clone(),
-            git,
+            options,
         )
         .await
         .unwrap();
@@ -106,6 +122,12 @@ impl Daemon {
 
     pub fn workdir(&self) -> String {
         self.tmp.path().join("root/project").display().to_string()
+    }
+
+    /// The workdir as the server validates it: what an outside source is
+    /// asked for.
+    pub fn canonical_workdir(&self) -> std::path::PathBuf {
+        std::fs::canonicalize(self.workdir()).unwrap()
     }
 
     pub fn head(&self) -> Seq {
@@ -503,6 +525,61 @@ pub fn config() -> EngineConfig {
         device_name: Some("sync test".into()),
         ..EngineConfig::default()
     }
+}
+
+/// An outside conversation of `turns` turns, each a prompt, a call with a
+/// result of `output_len` bytes (a blob once long enough) and the agent's
+/// answer; then a last call that never got a result. Times are a minute
+/// per turn on 2026-11-01, the result's left unsaid.
+pub fn adopted_history(turns: usize, output_len: usize) -> Vec<HistoryItem> {
+    let at = |turn: usize, second: u32| {
+        let start: chrono::DateTime<Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+        Some(
+            start
+                + chrono::TimeDelta::minutes(turn as i64)
+                + chrono::TimeDelta::seconds(second.into()),
+        )
+    };
+    let call = |id: String, command: String, at| HistoryItem::Agent {
+        at,
+        event: AdapterEvent::ToolCall {
+            call: Some(AgentCallId::from(id.as_str())),
+            parent: None,
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+            display: None,
+        },
+    };
+    let mut items = Vec::new();
+    for turn in 0..turns {
+        let id = format!("toolu_{turn}");
+        items.push(HistoryItem::User {
+            at: at(turn, 0),
+            text: format!("imported prompt {turn}"),
+        });
+        items.push(call(id.clone(), format!("ls {turn}"), at(turn, 1)));
+        items.push(HistoryItem::Agent {
+            at: None,
+            event: AdapterEvent::ToolResult {
+                call: Some(AgentCallId::from(id.as_str())),
+                result: ResultDisplay {
+                    is_error: false,
+                    status: None,
+                    preview: None,
+                    output: format!("{turn}\n").repeat(output_len / 2 + 1),
+                },
+            },
+        });
+        items.push(HistoryItem::Agent {
+            at: at(turn, 2),
+            event: AdapterEvent::Text {
+                text: format!("imported answer {turn}"),
+                parent: None,
+            },
+        });
+    }
+    items.push(call("toolu_open".into(), "sleep 100".into(), at(turns, 0)));
+    items
 }
 
 pub fn is_reconnecting(link: &Link) -> bool {

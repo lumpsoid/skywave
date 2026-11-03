@@ -303,6 +303,23 @@ then pushed as a new `ViewState`.
   requests to the engine under the state lock, in the order of the changes
   that made them, so a purge never overtakes a later request for the same
   id.
+- **Imported history** (D37): an adopted session's `Imported` events are
+  records. They are not activity (the session's `last_seq` and
+  `last_activity` stay at its creation, so a read mark stops before them),
+  never notable, and the "new" divider never lands at or inside them (the
+  creation and its history are one unit, read or not). The first
+  imported prompt is the session's `first_prompt` (its title) and its
+  first context's, and imported prompts count in that context's messages.
+  Their blobs are blobs like any other, so `Eager` fetches them. The
+  timeline shows each as `Entry::Imported` with the agent's own time (the
+  log's when it gave none), a result folded into its call (its `took` zero
+  unless the agent timed both: the log is another clock), a call never
+  answered as `NoResult` (never running), then `Entry::ImportFinished`;
+  narrowing to a context keeps the imported entries and drops that
+  divider. `SessionRow::importing` (the `sessions.importing` column) holds
+  from an adopting `SessionCreated` until its `ImportFinished` is stored:
+  an import longer than one pull shows the session beside its still
+  pending creation (`PendingSession::conversation`) until then.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a
   path and whether it is the untracked entry), a directory and a file;

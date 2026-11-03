@@ -22,13 +22,14 @@ use skywave_core::{
     Transport, TransportConfig, TransportError, ViewState, blob_dir,
 };
 use skywave_proto::{
-    BlobId, Command, CommandResult, Event, EventBatch, EventKind, EventsQuery, HelloResponse, Seq,
-    SessionId,
+    BlobId, Command, CommandResult, Event, EventBatch, EventKind, EventsQuery, HelloResponse,
+    ImportedItem, Seq, SessionId,
 };
-use skywaved::agent::fake::{FakeAgent, FakeScript, Step};
+use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript, Step};
+use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay};
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing;
-use skywaved::server::Server;
+use skywaved::server::{Server, ServerOptions};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,6 +55,12 @@ struct Daemon {
 
 impl Daemon {
     async fn start(agent: FakeAgent) -> Daemon {
+        Daemon::start_with_outside(agent, FakeOutside::new()).await
+    }
+
+    /// As [`Daemon::start`], an adopting `CreateSession` reading its
+    /// conversation from `outside`.
+    async fn start_with_outside(agent: FakeAgent, outside: FakeOutside) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let data = tmp.path().join("server");
@@ -63,11 +70,16 @@ impl Daemon {
                 .unwrap(),
         );
         let log = EventLog::open(&storage.db, vec![tmp.path().join("root")]).unwrap();
-        let server = Server::bind(
+        let options = ServerOptions {
+            outside: Arc::new(outside),
+            ..ServerOptions::default()
+        };
+        let server = Server::bind_with(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log.clone(),
+            options,
         )
         .await
         .unwrap();
@@ -683,6 +695,113 @@ async fn eager_downloads_in_the_background_without_blocking_sync() {
     assert_eq!(std::fs::read(first_path).unwrap(), outputs[0].as_bytes());
     assert_eq!(std::fs::read(second_path).unwrap(), outputs[1].as_bytes());
     assert_eq!(spy.froms(), [0, 0], "each blob fetched once");
+}
+
+/// An adopted conversation's imported blobs are blobs like any other:
+/// `Eager` fetches them in the background, `OnDemand` leaves them until
+/// asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn imported_blobs_download_under_eager_and_wait_under_on_demand() {
+    let output = big_output(200 * 1024, 5);
+    let outside = FakeOutside::new();
+    let daemon =
+        Daemon::start_with_outside(FakeAgent::new(FakeScript::new()), outside.clone()).await;
+    let workdir = daemon.tmp.path().join("root/project");
+    outside.conversation(
+        &std::fs::canonicalize(&workdir).unwrap(),
+        "conv-1",
+        HistoryRead::Read {
+            items: vec![
+                HistoryItem::User {
+                    at: None,
+                    text: "show it".into(),
+                },
+                HistoryItem::Agent {
+                    at: None,
+                    event: AdapterEvent::ToolCall {
+                        call: Some(AgentCallId::from("toolu_1")),
+                        parent: None,
+                        name: "Bash".into(),
+                        input: serde_json::json!({ "command": "cat big" }),
+                        display: None,
+                    },
+                },
+                HistoryItem::Agent {
+                    at: None,
+                    event: AdapterEvent::ToolResult {
+                        call: Some(AgentCallId::from("toolu_1")),
+                        result: ResultDisplay {
+                            is_error: false,
+                            status: None,
+                            preview: None,
+                            output: output.clone(),
+                        },
+                    },
+                },
+            ],
+        },
+    );
+    let proxy = Proxy::start(daemon.addr).await;
+    let (eager_dir, lazy_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (eager_spy, lazy_spy) = (Spy::default(), Spy::default());
+    let eager = Client::open(eager_dir.path(), &eager_spy);
+    let lazy = Client::open(lazy_dir.path(), &lazy_spy);
+    daemon.pair(&eager, &proxy).await;
+    daemon.pair(&lazy, &proxy).await;
+    eager
+        .core
+        .dispatch(Action::SetBlobPolicy(BlobPolicy::Eager))
+        .unwrap();
+
+    eager
+        .core
+        .dispatch(Action::CreateSession {
+            conversation: Some("conv-1".into()),
+            workdir: workdir.display().to_string(),
+        })
+        .unwrap();
+    daemon
+        .wait_log("the import", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ImportFinished { .. }))
+        })
+        .await;
+    let blob = daemon
+        .events()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Imported {
+                item: ImportedItem::ToolResult(result),
+                ..
+            } => result.output.clone(),
+            _ => None,
+        })
+        .expect("the imported output is a blob");
+    let head = daemon.head();
+
+    // Eager: fetched without being asked for, byte for byte.
+    eager
+        .wait("the imported blob downloaded", |c, _| {
+            matches!(
+                c.seam.blob(blob.id).unwrap().map(|b| b.status),
+                Some(BlobStatus::Available { .. })
+            )
+        })
+        .await;
+    let BlobStatus::Available { path } = eager.status(blob.id) else {
+        unreachable!()
+    };
+    assert_eq!(std::fs::read(path).unwrap(), output.as_bytes());
+    assert_eq!(eager_spy.froms(), [0]);
+
+    // On demand: synced to the head, the blob registered and left alone.
+    lazy.wait("the whole log", |c, view| {
+        c.seam.cursor().unwrap() >= head && matches!(view.link, Link::Online { .. })
+    })
+    .await;
+    assert_eq!(lazy.status(blob.id), BlobStatus::NotDownloaded);
+    assert!(lazy_spy.froms().is_empty(), "nothing downloads unasked");
 }
 
 /// A download interrupted by a restart resumes from its `.part` file when

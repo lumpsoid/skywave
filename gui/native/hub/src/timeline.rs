@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use skywave_core::{
     Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
-    Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
-    read_head,
+    ImportedEntry, Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome,
+    ToolView, read_head,
 };
 use skywave_present::format::{
     adopted_line, agent_setting_line, answer_words, asked_by, bytes, context_moved_line,
@@ -253,6 +253,31 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             &mut row,
             RowKind::ContextDivider,
             clean_line(&adopted_line(conversation)),
+        ),
+        // Plain rows of the existing kinds until imported history gets its
+        // own.
+        Entry::Imported { entry: item, .. } => match item {
+            ImportedEntry::UserMessage { text } => {
+                set(&mut row, RowKind::UserMessage, clean_text(text));
+                row.author = Some("imported".to_owned());
+            }
+            ImportedEntry::AgentMessage { text } => {
+                set(&mut row, RowKind::AgentMessage, clean_text(text));
+                row.author = Some("agent".to_owned());
+            }
+            ImportedEntry::Tool(view) => {
+                row.kind = RowKind::ToolCall;
+                row.tool = Some(plain_facts(&view.name, &view.title, expanded, entry));
+            }
+            ImportedEntry::ToolResult { .. } => {
+                row.kind = RowKind::ToolResult;
+                row.tool = Some(plain_facts("result", "", expanded, entry));
+            }
+        },
+        Entry::ImportFinished { .. } => set(
+            &mut row,
+            RowKind::ContextDivider,
+            "imported history ends here".to_owned(),
         ),
         Entry::Renamed { name, by } => set(
             &mut row,

@@ -12,8 +12,9 @@ use skywave_core::{
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
     Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId, DeviceInfo,
-    DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, RejectReason,
-    Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
+    DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, ImportOutcome,
+    ImportedItem, RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
+    TaskId, TaskKind, ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -549,6 +550,7 @@ fn migration_marks_existing_rows_attempted() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 2);
 
     let store = Store::open(&dir).unwrap();
@@ -687,6 +689,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 7);
     let store = Store::open(&dir).unwrap();
     assert_eq!(store.session(id).unwrap().unwrap().usage, None);
@@ -750,7 +753,8 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     // A replica from before the table backfills it from the stored log.
     drop_turns(&dir);
     drop_workdir(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -878,7 +882,8 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_work(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -951,6 +956,7 @@ fn archived_flag_is_projected_and_starts_clear_after_the_migration() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 6);
     let store = Store::open(&dir).unwrap();
     assert!(!summary(&store, a).archived);
@@ -1039,6 +1045,7 @@ fn names_and_first_prompts_are_projected_and_backfilled() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 5);
     let store = Store::open(&dir).unwrap();
     for expected in before {
@@ -1145,6 +1152,7 @@ fn notable_count_is_projected_and_backfilled() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 4);
     let store = Store::open(&dir).unwrap();
     assert_eq!((notable(&store, a), notable(&store, b)), (3, 0));
@@ -1319,6 +1327,7 @@ fn stopped_flag_folds_and_is_backfilled_by_the_migration() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 1);
     let store = Store::open(&dir).unwrap();
     assert!(stopped(&store, a));
@@ -2041,6 +2050,7 @@ fn the_migration_counts_every_pending_approval_as_alerted() {
     drop_agent(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
+    drop_importing(&dir);
     set_user_version(&dir, 9);
     let store = Store::open(&dir).unwrap();
     assert_eq!(sorted(store.load().unwrap().alerted), sorted([x, y]));
@@ -2132,7 +2142,8 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_contexts(&dir);
     drop_turns(&dir);
     drop_workdir(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2186,6 +2197,13 @@ fn drop_workdir(dir: &Path) {
          DROP TABLE workdir_blob_refs;",
     )
     .unwrap();
+}
+
+/// Undoes the importing-flag migration.
+fn drop_importing(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN importing;")
+        .unwrap();
 }
 
 fn drop_shell(dir: &Path) {
@@ -2605,7 +2623,8 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     }
     drop_turns(&dir);
     drop_workdir(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -2885,7 +2904,8 @@ fn the_workdir_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_workdir(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -2895,4 +2915,123 @@ fn the_workdir_migration_keeps_a_populated_replica() {
     let d1 = diff_blob(1);
     let (registered, _) = put(&mut store, &changes_ask(log.a), &changes(&[&d1]));
     assert_eq!(registered, [d1.id]);
+}
+
+/// An adopted session, its imported history (a call's output a blob) and
+/// its `ImportFinished`, as the server logs them; seqs from 1.
+fn adopted_log(session: SessionId, output: &BlobRef) -> Vec<Event> {
+    let mut finished = event(
+        session,
+        3,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Imported { items: 2 },
+        },
+    );
+    finished.command_id = Some(CommandId::new());
+    let created = Event {
+        command_id: None,
+        ..event(
+            session,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: Some(SessionOrigin::Agent {
+                    conversation: "conv-1".into(),
+                }),
+            },
+        )
+    };
+    vec![
+        created,
+        event(
+            session,
+            1,
+            EventKind::Imported {
+                at: None,
+                item: ImportedItem::UserMessage {
+                    text: "fix the build".into(),
+                },
+            },
+        ),
+        event(
+            session,
+            2,
+            EventKind::Imported {
+                at: None,
+                item: ImportedItem::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "ok".into(),
+                    lines: 1,
+                    output: Some(output.clone()),
+                }),
+            },
+        ),
+        finished,
+    ]
+}
+
+#[test]
+fn an_import_split_over_pulls_is_importing_until_its_finish_is_stored() {
+    let (_tmp, dir) = data_dir();
+    let session = SessionId::new();
+    let output = BlobRef {
+        id: BlobId::new(),
+        size: 9000,
+    };
+    let events = adopted_log(session, &output);
+    let mut store = Store::open(&dir).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: events[..3].to_vec(),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let summary = |store: &Store| store.load().unwrap().sessions[0].clone();
+    let before = summary(&store);
+    assert!(before.importing);
+    assert_eq!(before.first_prompt.as_deref(), Some("fix the build"));
+    assert_eq!(before.last_seq, Seq(1), "imported history is not activity");
+    assert_eq!(before.notable, 0);
+    assert!(
+        store.blob(output.id).unwrap().is_some(),
+        "imported blob registered"
+    );
+    drop(store);
+
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(summary(&store), before, "kept over a reopen");
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(4),
+                events: events[3..].to_vec(),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(!summary(&store).importing);
+    drop(store);
+    assert!(!summary(&Store::open(&dir).unwrap()).importing);
+}
+
+#[test]
+fn the_importing_migration_keeps_a_populated_replica() {
+    let (_tmp, dir) = data_dir();
+    let log = Log::new();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let before = store.load().unwrap();
+    drop(store);
+
+    drop_importing(&dir);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    let after = Store::open(&dir).unwrap().load().unwrap();
+    assert_eq!(after, before, "nothing changes");
+    assert!(after.sessions.iter().all(|s| !s.importing));
 }

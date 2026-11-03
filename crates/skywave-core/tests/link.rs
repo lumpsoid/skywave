@@ -32,10 +32,11 @@ use skywave_proto::{
     ApprovalId, CommandKind, CommandResult, Event, EventKind, SessionId, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, LinkStats, Rng, seed};
-use skywaved::agent::fake::{FakeAgent, FakeInput, FakeScript, Gate, Step};
+use skywaved::agent::HistoryRead;
+use skywaved::agent::fake::{FakeAgent, FakeInput, FakeOutside, FakeScript, Gate, Step};
 use support::{
-    Client, Daemon, SOON, assert_exactly_once, assert_same_log, assert_same_view, config, count,
-    is_reconnecting, user_messages,
+    Client, Daemon, SOON, adopted_history, assert_exactly_once, assert_same_log, assert_same_view,
+    config, count, is_reconnecting, user_messages,
 };
 
 const KIB: u64 = 1024;
@@ -397,6 +398,86 @@ async fn two_devices_converge_over_different_links() {
             "the agent got the log's messages, in log order"
         );
     }
+    assert_same_view(&a, &b).await;
+}
+
+/// An adopting `CreateSession` over a lossy link: its import is logged
+/// once whatever the resends, the command settles once (on its
+/// `ImportFinished`), and two devices behind different bad links show the
+/// same imported timeline. Small pull batches split the import.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopting_create_over_a_lossy_link_settles_once_and_converges() {
+    let seed = seed();
+    let outside = FakeOutside::new();
+    let daemon =
+        Daemon::start_with_outside(FakeAgent::new(FakeScript::new()), outside.clone()).await;
+    let history = adopted_history(12, 4000);
+    let items = history.len();
+    outside.conversation(
+        &daemon.canonical_workdir(),
+        "conv-1",
+        HistoryRead::Read { items: history },
+    );
+    let (a, proxy_a) = device(&daemon, seed, "device a", lossy()).await;
+    let (b, proxy_b) = device(&daemon, seed ^ 0xB, "device b", slow()).await;
+
+    a.dispatch(Action::CreateSession {
+        conversation: Some("conv-1".into()),
+        workdir: daemon.workdir(),
+    });
+    daemon
+        .wait_log("the import", |events| {
+            count(events, |k| matches!(k, EventKind::ImportFinished { .. })) == 1
+        })
+        .await;
+    daemon.settle(&[&a, &b], SOON).await;
+    report("proxy a", proxy_a.stats());
+    report("proxy b", proxy_b.stats());
+
+    let events = daemon.events();
+    assert_exactly_once(&daemon, &[&a, &b]);
+    assert_eq!(
+        count(&events, |k| matches!(k, EventKind::ImportFinished { .. })),
+        1
+    );
+    assert_eq!(
+        count(&events, |k| matches!(k, EventKind::Imported { .. })),
+        items,
+        "the history imported once"
+    );
+    assert_same_log(&events, &a.local_events());
+    assert_same_log(&events, &b.local_events());
+    let [entry] = a.outbox().try_into().unwrap();
+    assert!(
+        matches!(
+            entry.status,
+            OutboxStatus::Done(CommandResult::Accepted { .. })
+        ),
+        "{entry:?}"
+    );
+
+    let session = a.sessions()[0];
+    let view = a.open_session(session, |_| true).await;
+    let entries: Vec<&Entry> = view
+        .timeline
+        .iter()
+        .map(|item| match item {
+            TimelineItem::Logged { entry, .. } => entry,
+            pending => panic!("nothing pending: {pending:?}"),
+        })
+        .collect();
+    assert!(matches!(entries[0], Entry::Adopted { .. }), "{entries:?}");
+    // Each turn's call and result are one row: three rows a turn, plus the
+    // unanswered call, then the divider.
+    let imported = entries
+        .iter()
+        .filter(|e| matches!(e, Entry::Imported { .. }))
+        .count();
+    assert_eq!(imported, 12 * 3 + 1);
+    assert!(
+        matches!(entries.last(), Some(Entry::ImportFinished { .. })),
+        "{entries:?}"
+    );
     assert_same_view(&a, &b).await;
 }
 
