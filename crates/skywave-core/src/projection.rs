@@ -199,7 +199,9 @@ impl SessionSummary {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => return,
+            | EventKind::ShellFinished { .. }
+            | EventKind::Imported { .. }
+            | EventKind::ImportFinished { .. } => return,
             _ => {}
         }
         self.last_seq = seq;
@@ -261,7 +263,9 @@ impl SessionSummary {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => {}
+            | EventKind::ShellFinished { .. }
+            | EventKind::Imported { .. }
+            | EventKind::ImportFinished { .. } => {}
         }
     }
 
@@ -353,7 +357,9 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ShellStopRequested { .. }
         | EventKind::ShellStarted { .. }
         | EventKind::ShellOutput { .. }
-        | EventKind::ShellFinished { .. } => false,
+        | EventKind::ShellFinished { .. }
+        | EventKind::Imported { .. }
+        | EventKind::ImportFinished { .. } => false,
     }
 }
 
@@ -401,7 +407,10 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ShellRequested { .. }
         | EventKind::ShellStopRequested { .. }
         | EventKind::ShellStarted { .. }
-        | EventKind::ShellOutput { .. } => (None, None),
+        | EventKind::ShellOutput { .. }
+        | EventKind::ImportFinished { .. } => (None, None),
+        // Not fetched yet: the replica does not fold imported history.
+        EventKind::Imported { .. } => (None, None),
     };
     first.into_iter().chain(second)
 }

@@ -2613,6 +2613,8 @@ impl Model {
                 | EventKind::ShellStarted { .. }
                 | EventKind::ShellOutput { .. }
                 | EventKind::ShellFinished { .. } => None,
+                // Not shown yet: the timeline does not fold imported history.
+                EventKind::Imported { .. } | EventKind::ImportFinished { .. } => None,
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
