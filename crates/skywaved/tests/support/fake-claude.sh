@@ -187,6 +187,16 @@ while IFS= read -r line; do
           printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"session_id":"%s"}\n' "$sid"
           result_aborted aborted_streaming
           ;;
+        *garbage*)
+          # Bytes that are not UTF-8, inside a message and on a stray line,
+          # then a line over the driver's cap (32 MiB).
+          printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"caf\351"}]},"parent_tool_use_id":null,"session_id":"%s"}\n' "$sid"
+          printf 'stray \377\376\n'
+          head -c 33554433 /dev/zero | tr '\0' x
+          printf '\n'
+          text "still here"
+          result_ok
+          ;;
         *)
           text "echo"
           result_ok
