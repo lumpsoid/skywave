@@ -11,6 +11,8 @@
 # then the CLI stops reading stdin (a wedged CLI); any other message gets the text "echo". One containing
 # "orphan" also starts a background `sleep`, its pid in ./child.txt, before
 # it is handled as above; with "stubborn" too, the `sleep` ignores SIGTERM.
+# One containing "litter" first writes a stray line that is not JSON; one
+# containing "quit" then exits 0, mid-turn and without a word.
 # One containing "run" starts the Write call and runs it until interrupted.
 # A SIGTERM makes the CLI write ./term.txt and exit, reporting a running
 # call as killed first, as the real CLI does (§6).
@@ -135,6 +137,12 @@ while IFS= read -r line; do
           ;;
       esac
       case "$line" in
+        *litter*) printf 'not json\n' ;;
+      esac
+      case "$line" in
+        *quit*)
+          exit 0
+          ;;
         *approve*)
           printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"a.txt","content":"hi"}}]},"session_id":"%s"}\n' "$sid"
           printf '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt","content":"hi"},"tool_use_id":"toolu_1"}}\n'

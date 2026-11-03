@@ -1504,6 +1504,83 @@ fn a_failed_turn_and_unknown_messages() {
     );
 }
 
+fn exit_status(code: i32) -> Option<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    Some(std::process::ExitStatus::from_raw(code << 8))
+}
+
+#[test]
+fn stray_output_makes_no_clean_exit_an_error_and_loses_to_stderr() {
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("go".to_owned());
+    protocol.on_line("not json");
+    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+    assert_eq!(
+        protocol.exit_error(Some("boom"), exit_status(3)).as_deref(),
+        Some("boom (exit status: 3)")
+    );
+    // With nothing on stderr, the recent stray line explains the crash.
+    assert_eq!(
+        protocol.exit_error(None, exit_status(3)).as_deref(),
+        Some("not json (exit status: 3)")
+    );
+    assert_eq!(protocol.exit_error(None, None).as_deref(), Some("not json"));
+}
+
+#[test]
+fn a_long_exit_reason_is_cut_so_its_status_survives_the_errored_cap() {
+    use skywave_proto::limits::REFUSAL_MAX_CHARS;
+
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("go".to_owned());
+    let long = "x".repeat(1 << 20);
+    protocol.on_line(&format!("{long} not json"));
+    let stderr = format!("{long}\nsecond line");
+    for error in [
+        protocol.exit_error(Some(&stderr), exit_status(3)),
+        protocol.exit_error(None, exit_status(3)),
+    ] {
+        let error = error.unwrap();
+        assert!(error.starts_with("xxx"), "{error}");
+        assert!(error.ends_with("… (exit status: 3)"), "{error}");
+        assert!(!error.contains("second line"));
+        assert!(error.chars().count() <= protocol::EXIT_REASON_MAX_CHARS + 20);
+        // What the mapper logs fits its cap whole, status included.
+        assert!(format!("agent exited: {error}").chars().count() < REFUSAL_MAX_CHARS);
+    }
+}
+
+#[test]
+fn stray_output_before_the_last_turn_or_the_handshake_explains_nothing() {
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    protocol.start();
+    protocol.on_oversized_line(1 << 30);
+    // Before the handshake it is the best there is, and any exit failed.
+    assert_eq!(
+        protocol.exit_error(None, exit_status(0)).as_deref(),
+        Some("agent wrote a 1073741824-byte line, too long to read (exit status: 0)")
+    );
+    protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
+    assert_eq!(
+        protocol.exit_error(None, exit_status(3)).as_deref(),
+        Some("agent exited (exit status: 3)")
+    );
+    // An error the CLI reported between turns is one for a clean exit,
+    // until the next turn starts.
+    protocol.on_line("not json");
+    protocol.on_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":null,"errors":["API down"]}"#);
+    assert_eq!(
+        protocol.exit_error(None, exit_status(0)).as_deref(),
+        Some("API down")
+    );
+    protocol.send_message("go".to_owned());
+    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+    assert_eq!(
+        protocol.exit_error(None, exit_status(3)).as_deref(),
+        Some("agent exited (exit status: 3)")
+    );
+}
+
 #[test]
 fn resume_handles_round_trip_and_carry_no_rules() {
     let id = Uuid::new_v4();
@@ -2277,7 +2354,7 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
     assert_eq!(
         take(&mut events, 1).await,
         [AdapterEvent::Exited {
-            error: Some("boom: the agent fell over".to_owned())
+            error: Some("boom: the agent fell over (exit status: 3)".to_owned())
         },]
     );
     assert!(events.recv().await.is_none());
@@ -2285,6 +2362,44 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
         session.send_message("anyone?".to_owned()).await,
         Err(AgentError::Closed)
     ));
+}
+
+#[tokio::test]
+async fn a_crash_after_stray_output_is_explained_by_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session
+        .send_message("litter, crash".to_owned())
+        .await
+        .unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(
+        take(&mut events, 1).await,
+        [AdapterEvent::Exited {
+            error: Some("boom: the agent fell over (exit status: 3)".to_owned())
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_clean_exit_after_stray_output_is_no_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session
+        .send_message("litter, quit".to_owned())
+        .await
+        .unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(
+        take(&mut events, 1).await,
+        [AdapterEvent::Exited { error: None }]
+    );
 }
 
 #[tokio::test]

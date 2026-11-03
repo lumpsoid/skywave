@@ -939,6 +939,43 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
 }
 
 #[test]
+fn errored_messages_are_cut_like_refusals() {
+    use skywave_proto::limits::REFUSAL_MAX_CHARS;
+
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+        AgentWork::default(),
+    );
+    let huge = "x".repeat(1 << 20);
+    for event in [
+        AdapterEvent::TurnStarted,
+        AdapterEvent::TurnEnded(TurnOutcome::Failed(format!("{huge}\nmore"))),
+        AdapterEvent::Exited {
+            error: Some(huge.clone()),
+        },
+    ] {
+        mapper.apply(&f.log, &mut f.storage, event).unwrap();
+    }
+    let messages: Vec<String> = f
+        .kinds()
+        .into_iter()
+        .filter_map(|kind| match kind {
+            EventKind::SessionStateChanged(SessionState::Errored { message }) => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    for message in &messages {
+        assert_eq!(message.chars().count(), REFUSAL_MAX_CHARS);
+        assert!(message.ends_with('…'));
+    }
+    assert!(messages[1].starts_with("agent exited: xxx"));
+}
+
+#[test]
 fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
     use skywaved::agent::TurnUsage;
 
