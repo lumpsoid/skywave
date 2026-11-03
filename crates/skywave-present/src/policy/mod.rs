@@ -17,6 +17,8 @@
 //! - [`CompletionSettle`]: workdir completion.
 //! - [`TimelineSearch`]: the timeline search's query, matches and current
 //!   match.
+//! - [`ExpandFetch`]: the downloads expanded items need, each asked for
+//!   once, including blobs that arrive while the item is open.
 //!
 //! And small decisions: [`unanswered`], [`dismissable`],
 //! [`looks_like_pair_uri`], [`shell_stop`].
@@ -24,6 +26,7 @@
 mod alert;
 mod completion;
 mod draft;
+mod expand;
 mod history;
 mod read;
 mod search;
@@ -32,6 +35,7 @@ mod shell;
 pub use alert::{Alert, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise};
 pub use completion::CompletionSettle;
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver};
+pub use expand::ExpandFetch;
 pub use history::{PromptHistory, Recall};
 pub use read::{READ_MARK_EVERY, ReadMarker};
 pub use search::{Jump, TimelineSearch};

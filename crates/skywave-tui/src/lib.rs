@@ -133,6 +133,7 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
                     return Ok(());
                 }
             }
+            fetch_expanded(&mut app, core);
             save_draft(&mut app, core, Instant::now(), false);
             mark_read(&mut app, core, Instant::now(), false);
         }
@@ -197,6 +198,14 @@ pub fn alert(app: &mut App, out: &mut impl Write, notify: Notify, tmux: bool) {
 pub fn save_draft(app: &mut App, core: &Core, now: Instant, force: bool) {
     if let Some(action) = app.draft_save(now, force) {
         app.draft_saved(now, core.dispatch(action));
+    }
+}
+
+/// Dispatches the downloads [`App::expanded_fetches`] has: run after every
+/// snapshot, so a blob that arrives under an open item is fetched too.
+pub fn fetch_expanded(app: &mut App, core: &Core) {
+    for action in app.expanded_fetches() {
+        app.fetched(core.dispatch(action));
     }
 }
 
