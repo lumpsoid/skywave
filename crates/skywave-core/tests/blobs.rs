@@ -816,6 +816,38 @@ async fn imported_blobs_download_under_eager_and_wait_under_on_demand() {
     assert!(lazy_spy.froms().is_empty(), "nothing downloads unasked");
 }
 
+/// Starts downloading the one blob of a turn whose tool printed `output`,
+/// lets the body stall after its first chunk until that chunk is recorded
+/// as progress, then stops the core. Returns the blob and its recorded
+/// progress.
+async fn stop_mid_download(daemon: &Daemon, proxy: &Proxy, dir: &Path) -> (BlobId, u64) {
+    let (_flowing, held) = watch::channel(false);
+    let client = Client::open(dir, &Spy::holding(held));
+    daemon.pair(&client, proxy).await;
+    let session = daemon.session_with_turn(&client).await;
+    client.core.dispatch(Action::OpenSession(session)).unwrap();
+    let view = client
+        .wait("the tool output", |_, view| {
+            Client::shown_blobs(view).len() == 1
+        })
+        .await;
+    let id = Client::shown_blobs(&view)[0].0;
+    client.core.dispatch(Action::DownloadBlob(id)).unwrap();
+    // The stalled body still reports what it got.
+    client
+        .wait(
+            "progress recorded",
+            |c, _| matches!(c.status(id), BlobStatus::Downloading { got, .. } if got > 0),
+        )
+        .await;
+    let BlobStatus::Downloading { got, .. } = client.status(id) else {
+        unreachable!()
+    };
+    // The core goes away mid-download.
+    client.stop();
+    (id, got)
+}
+
 /// A download interrupted by a restart resumes from its `.part` file when
 /// the core opens again.
 #[tokio::test(flavor = "multi_thread")]
@@ -824,25 +856,8 @@ async fn restart_resumes_from_the_part_file() {
     let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
     let proxy = Proxy::start(daemon.addr).await;
     let dir = tempfile::tempdir().unwrap();
-    let (_flowing, held) = watch::channel(false);
-    let id;
-    {
-        let client = Client::open(dir.path(), &Spy::holding(held));
-        daemon.pair(&client, &proxy).await;
-        let session = daemon.session_with_turn(&client).await;
-        client.core.dispatch(Action::OpenSession(session)).unwrap();
-        let view = client
-            .wait("the tool output", |_, view| {
-                Client::shown_blobs(view).len() == 1
-            })
-            .await;
-        id = Client::shown_blobs(&view)[0].0;
-        client.core.dispatch(Action::DownloadBlob(id)).unwrap();
-        wait_part(dir.path(), id).await;
-        assert!(matches!(client.status(id), BlobStatus::Downloading { .. }));
-        // The core goes away mid-download.
-        client.stop();
-    }
+    let (id, got) = stop_mid_download(&daemon, &proxy, dir.path()).await;
+    assert!(wait_part(dir.path(), id).await >= got);
 
     let spy = Spy::default();
     let client = Client::open(dir.path(), &spy);
@@ -860,4 +875,40 @@ async fn restart_resumes_from_the_part_file() {
         "resumed from the partial file: {froms:?}"
     );
     assert_eq!(std::fs::read(path).unwrap(), output.as_bytes());
+}
+
+/// A `.part` file longer than the recorded progress (as a power loss can
+/// leave it: the length kept, the data past the last fsync zeros) is not
+/// trusted past that progress: the restart resumes from the recorded count
+/// and the blob is the tool's output, byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_resumes_from_the_recorded_progress_not_the_file_length() {
+    let output = big_output(1024 * 1024, 6);
+    let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+    let proxy = Proxy::start(daemon.addr).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (id, got) = stop_mid_download(&daemon, &proxy, dir.path()).await;
+
+    // Zeros past the recorded progress, as if the length survived a crash
+    // that lost the data.
+    let part = part_file(dir.path(), id);
+    let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+    file.set_len(got + 256 * 1024).unwrap();
+    drop(file);
+
+    let spy = Spy::default();
+    let client = Client::open(dir.path(), &spy);
+    client
+        .wait("the blob to be available after the restart", |c, _| {
+            matches!(c.status(id), BlobStatus::Available { .. })
+        })
+        .await;
+    let BlobStatus::Available { path } = client.status(id) else {
+        unreachable!()
+    };
+    assert_eq!(spy.froms(), [got], "resumed from the recorded progress");
+    assert!(
+        std::fs::read(path).unwrap() == output.as_bytes(),
+        "the blob is the tool's output, without the zeros"
+    );
 }
