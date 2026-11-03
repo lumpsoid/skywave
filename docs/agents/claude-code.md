@@ -1229,10 +1229,19 @@ notes above:
 - **Once stdout ends the session refuses requests** (`AgentError::Closed`),
   while the driver still waits for the exit: a message sent then fails, so
   the supervisor restarts the agent and delivers it there instead of it
-  being dropped. Messages accepted before stdout ended but not yet read are
-  owed turns: a clean exit with any of them and no turn open is
-  `Exited { error: "N message(s) left unanswered" }`. With a turn open the
-  exit is the turn's, as before (the mapper's "agent exited during a turn").
+  being dropped. A repeated interrupt that kills the CLI refuses requests
+  the same way from the kill on.
+- **Messages that never ran are counted, not dropped silently.** The ones
+  still queued behind a turn when the session stops (a stop sets no new turn
+  going, even once the interrupted turn's `result` comes), when a repeated
+  interrupt kills the CLI, or when it crashes, plus the ones accepted but not
+  read before stdout ended, are `Exited { unsent }`. The exit reason stays
+  the exit's own (a clean exit is still `error: None`); the mapper logs one
+  `Errored` for the exit naming both, e.g. "agent exited during a turn; 1
+  queued message was not sent to the agent; send it again". They are not
+  redelivered on the next start. One race remains: a `result` read before
+  the stop's `Shutdown` request starts the queued turn, which the stop then
+  abandons (logged as "agent exited during a turn").
 
 ## 6b. Tool displays (Tc)
 

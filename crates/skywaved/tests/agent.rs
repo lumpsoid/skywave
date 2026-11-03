@@ -376,7 +376,13 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     );
     session.shutdown().await.unwrap();
     let rest = f.pump(&mut events, &mut mapper, |_| true).await;
-    assert_eq!(rest, [AdapterEvent::Exited { error: None }]);
+    assert_eq!(
+        rest,
+        [AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }]
+    );
     assert_eq!(f.kinds().len(), 11, "a clean exit while idle logs nothing");
 }
 
@@ -616,7 +622,13 @@ async fn restart_resumes_with_the_stored_handle() {
     );
     session.shutdown().await.unwrap();
     let rest = f.pump(&mut events, &mut mapper, |_| true).await;
-    assert_eq!(rest, [AdapterEvent::Exited { error: None }]);
+    assert_eq!(
+        rest,
+        [AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }]
+    );
     assert_eq!(f.spec().conversation, Conversation::Fresh);
     let (mut session, mut events) = agent.start(f.spec()).await.unwrap();
     let mut mapper = EventMapper::new(
@@ -871,7 +883,8 @@ async fn failures_and_exits_mark_the_session_errored() {
     assert_eq!(
         tail,
         [AdapterEvent::Exited {
-            error: Some("crashed".into())
+            error: Some("crashed".into()),
+            unsent: 0,
         }]
     );
     assert_eq!(
@@ -958,24 +971,107 @@ fn errored_messages_are_cut_like_refusals() {
         AdapterEvent::TurnEnded(TurnOutcome::Failed(format!("{huge}\nmore"))),
         AdapterEvent::Exited {
             error: Some(huge.clone()),
+            unsent: 0,
         },
     ] {
         mapper.apply(&f.log, &mut f.storage, event).unwrap();
     }
-    let messages: Vec<String> = f
-        .kinds()
-        .into_iter()
-        .filter_map(|kind| match kind {
-            EventKind::SessionStateChanged(SessionState::Errored { message }) => Some(message),
-            _ => None,
-        })
-        .collect();
+    let messages = errored_messages(&f);
     assert_eq!(messages.len(), 2, "{messages:?}");
     for message in &messages {
         assert_eq!(message.chars().count(), REFUSAL_MAX_CHARS);
         assert!(message.ends_with('…'));
     }
     assert!(messages[1].starts_with("agent exited: xxx"));
+}
+
+fn errored_messages(f: &Fixture) -> Vec<String> {
+    f.kinds()
+        .into_iter()
+        .filter_map(|kind| match kind {
+            EventKind::SessionStateChanged(SessionState::Errored { message }) => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `Errored` messages the mapper logs for `events`, from a fresh
+/// mapper.
+fn errored_after(events: Vec<AdapterEvent>) -> Vec<String> {
+    let mut f = Fixture::new();
+    let mut mapper = EventMapper::new(
+        f.session_id,
+        ContextId::first_of(f.session_id),
+        AgentSettings::default(),
+        AgentWork::default(),
+    );
+    for event in events {
+        mapper.apply(&f.log, &mut f.storage, event).unwrap();
+    }
+    errored_messages(&f)
+}
+
+#[test]
+fn unsent_messages_are_named_in_the_one_errored_of_the_exit() {
+    let exited = |error: Option<&str>, unsent| AdapterEvent::Exited {
+        error: error.map(str::to_owned),
+        unsent,
+    };
+    // A stop after the turn ended: only the notice.
+    assert_eq!(
+        errored_after(vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
+            exited(None, 1),
+        ]),
+        ["1 queued message was not sent to the agent; send it again"]
+    );
+    // Cut short mid-turn, or crashed: the exit, then the notice.
+    assert_eq!(
+        errored_after(vec![AdapterEvent::TurnStarted, exited(None, 2)]),
+        [
+            "agent exited during a turn; 2 queued messages were not sent to the agent; send them again"
+        ]
+    );
+    assert_eq!(
+        errored_after(vec![AdapterEvent::TurnStarted, exited(Some("boom"), 1)]),
+        ["agent exited: boom; 1 queued message was not sent to the agent; send it again"]
+    );
+    // Nothing unsent: as before.
+    assert_eq!(
+        errored_after(vec![
+            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
+            exited(None, 0),
+        ]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        errored_after(vec![AdapterEvent::TurnStarted, exited(Some("boom"), 0)]),
+        ["agent exited: boom"]
+    );
+}
+
+#[test]
+fn a_long_exit_reason_gives_way_to_the_unsent_notice() {
+    use skywave_proto::limits::REFUSAL_MAX_CHARS;
+
+    let huge = "x".repeat(1 << 20);
+    let messages = errored_after(vec![
+        AdapterEvent::TurnStarted,
+        AdapterEvent::Exited {
+            error: Some(huge),
+            unsent: 3,
+        },
+    ]);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    let message = &messages[0];
+    assert_eq!(message.chars().count(), REFUSAL_MAX_CHARS);
+    assert!(message.starts_with("agent exited: xxx"), "{message}");
+    assert!(
+        message.ends_with("…; 3 queued messages were not sent to the agent; send them again"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1050,7 +1146,10 @@ async fn exit_with_a_pending_approval_cancels_it() {
                 output: String::new(),
             },
         },
-        AdapterEvent::Exited { error: None },
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        },
     ] {
         mapper.apply(&f.log, &mut f.storage, event).unwrap();
     }
@@ -1707,7 +1806,10 @@ fn exit_refuses_the_efforts_left_unanswered() {
         &mut mapper,
         vec![
             AdapterEvent::EffortSet(Some(Effort::High)),
-            AdapterEvent::Exited { error: None },
+            AdapterEvent::Exited {
+                error: None,
+                unsent: 0,
+            },
         ],
     );
     assert_eq!(
@@ -1861,7 +1963,10 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
     apply_all(
         &mut f,
         &mut mapper,
-        vec![AdapterEvent::Exited { error: None }],
+        vec![AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        }],
     );
     assert_eq!(
         f.kinds(),
@@ -1874,7 +1979,10 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
     apply_all(
         &mut f,
         &mut mapper,
-        vec![AdapterEvent::Exited { error: None }],
+        vec![AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        }],
     );
     assert_eq!(f.kinds().len(), 2);
 
@@ -1883,7 +1991,10 @@ fn exit_empties_tasks_and_schedules_that_are_not_empty() {
     apply_all(
         &mut f,
         &mut mapper,
-        vec![AdapterEvent::Exited { error: None }],
+        vec![AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        }],
     );
     assert_eq!(f.kinds(), []);
 }
@@ -2255,7 +2366,10 @@ fn exit_names_every_open_call() {
                 input: json!({ "name": "no-id" }),
                 display: None,
             },
-            AdapterEvent::Exited { error: None },
+            AdapterEvent::Exited {
+                error: None,
+                unsent: 0,
+            },
         ],
     );
     let kinds = f.kinds();
@@ -2286,7 +2400,10 @@ fn exit_names_every_open_call() {
             named_call("done", None),
             answer("done"),
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
-            AdapterEvent::Exited { error: None },
+            AdapterEvent::Exited {
+                error: None,
+                unsent: 0,
+            },
         ],
     );
     assert_eq!(unanswered(&fresh.kinds()), Vec::<Vec<CallId>>::new());
@@ -2360,7 +2477,10 @@ fn exit_drops_the_stops_left_unanswered() {
     apply_all(
         &mut f,
         &mut mapper,
-        vec![AdapterEvent::Exited { error: None }],
+        vec![AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        }],
     );
     // The empty set settles the stop; no refusal.
     assert_eq!(f.kinds(), [changed(vec![])]);
@@ -2519,7 +2639,10 @@ fn a_tasks_approval_outlives_the_turn_and_exit_cancels_every_approval() {
     apply_all(
         &mut f,
         &mut mapper,
-        vec![AdapterEvent::Exited { error: None }],
+        vec![AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        }],
     );
     let ids = approval_ids(&f);
     assert_eq!(

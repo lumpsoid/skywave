@@ -1919,6 +1919,99 @@ async fn a_message_sent_after_the_agent_left_between_turns_is_answered_once_by_a
     assert!(!process_exists(pid), "agent process {pid} still exists");
 }
 
+/// The `Errored` notice for one queued message that never ran.
+const ONE_UNSENT: &str = "1 queued message was not sent to the agent; send it again";
+
+/// Sends "again" after whatever ended the agent and waits for its turn:
+/// the supervisor handles the message only after it logged that agent's
+/// exit, so the returned log holds everything the exit logged.
+async fn resume_after_exit(f: &mut Fixture, idle_before: usize) -> Vec<EventKind> {
+    f.send("again");
+    let kinds = f.wait_count("idle again", idle_before + 1, is_idle).await;
+    assert!(argv_has_resume(f), "the agent was not resumed");
+    kinds
+}
+
+#[tokio::test]
+async fn a_stop_reports_a_message_queued_behind_the_turn_once() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+
+    f.send("hang");
+    f.send("hello");
+    accepted(f.stop());
+    let kinds = f.wait_count("errored", 1, is_errored).await;
+    // The turn ends as interrupted, then the exit names the message it
+    // never began.
+    assert_eq!(
+        kinds[kinds.len() - 2..],
+        [
+            state(SessionState::Idle),
+            state(SessionState::Errored {
+                message: ONE_UNSENT.into()
+            }),
+        ]
+    );
+    let kinds = resume_after_exit(&mut f, 1).await;
+    assert_eq!(kinds.iter().filter(|k| is_errored(k)).count(), 1);
+    // "hang" and "again" each ran a turn; "hello" never did.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == state(SessionState::AgentWorking))
+            .count(),
+        2,
+        "{kinds:#?}"
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_with_nothing_queued_reports_nothing_more() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+
+    f.send("hang");
+    accepted(f.stop());
+    f.wait_count("idle", 1, is_idle).await;
+    let kinds = resume_after_exit(&mut f, 1).await;
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_crash_reports_a_message_queued_behind_the_turn_with_the_exit() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+    let said = |text: &'static str| move |k: &EventKind| matches!(k, EventKind::AgentMessage { text: t, .. } if t == text);
+
+    f.send("stuck");
+    f.wait_count("working", 1, said("working")).await;
+    f.send("hello");
+    // The interrupt reaches the CLI after the message reached the agent,
+    // so once the CLI says "ignored" the message is queued.
+    accepted(f.interrupt());
+    f.wait_count("the interrupt ignored", 1, said("ignored"))
+        .await;
+    let pid = fake_cli_pid(&f);
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let kinds = f.wait_count("errored", 1, is_errored).await;
+    let Some(EventKind::SessionStateChanged(SessionState::Errored { message })) = kinds.last()
+    else {
+        panic!("expected Errored last: {kinds:#?}");
+    };
+    assert!(message.starts_with("agent exited: "), "{message}");
+    assert!(message.contains("SIGKILL"), "{message}");
+    assert!(message.ends_with(&format!("; {ONE_UNSENT}")), "{message}");
+    let kinds = resume_after_exit(&mut f, 0).await;
+    assert_eq!(kinds.iter().filter(|k| is_errored(k)).count(), 1);
+    supervisor.shutdown().await.unwrap();
+}
+
 /// Whether the fake CLI last ran with `--resume`, from `argv.txt`.
 fn argv_has_resume(f: &Fixture) -> bool {
     std::fs::read_to_string(f.root.join("project/argv.txt"))

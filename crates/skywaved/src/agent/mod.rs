@@ -402,8 +402,15 @@ pub enum AdapterEvent {
     /// `task`.
     TaskStopRefused { task: String, reason: String },
     /// The agent stopped; no further events follow. `error` is set when it
-    /// stopped abnormally (crash, startup failure).
-    Exited { error: Option<String> },
+    /// stopped abnormally (crash, startup failure). `unsent` counts the
+    /// messages it accepted ([`AgentSession::send_message`] returned `Ok`)
+    /// but never began a turn for: queued behind a turn when it was stopped,
+    /// killed or crashed, or not yet read when it exited. They never run;
+    /// skywaved does not redeliver them.
+    Exited {
+        error: Option<String>,
+        unsent: usize,
+    },
 }
 
 /// Receiving end of an agent session's [`AdapterEvent`] stream.
@@ -500,7 +507,8 @@ pub trait AgentSession: Send + 'static {
     /// Stops the agent; its event stream ends with [`AdapterEvent::Exited`].
     /// Interrupt first to stop a running turn cleanly; a turn still running
     /// without an interrupt is abandoned, not ended, and its approvals are
-    /// left for the caller.
+    /// left for the caller. Messages queued behind the turn are not begun:
+    /// the `Exited` counts them as `unsent`.
     fn shutdown(self) -> impl Future<Output = Result<(), AgentError>> + Send;
 }
 
