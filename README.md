@@ -154,7 +154,9 @@ the other orphans reparented to PID 1.
 > **Bypass mode is the operator's call.** Without `[agent] allow_bypass`,
 > the heads don't offer bypass and the server refuses a switch to it. With
 > it, any paired device can turn off every prompt of a session after one
-> extra confirmation; sessions still start in their usual mode.
+> extra confirmation; sessions still start in their usual mode. It is the
+> only switch: `agent.args` that would enable bypass (such as
+> `--dangerously-skip-permissions`) are refused at startup.
 
 ### 2. Pair a device
 

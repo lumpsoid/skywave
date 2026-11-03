@@ -466,6 +466,11 @@ asks, is available from a head only when the server's operator set
   before the CLI is asked (§3.9). The heads offer bypass only when
   `HelloResponse::bypass` says the server allows it, and ask once more
   before sending it.
+- **No back door.** `agent.args` may not hold
+  `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`
+  or `--permission-mode bypassPermissions` (two arguments or `=`-joined):
+  the config refuses them (`claude_code::bypass_arg`), naming
+  `allow_bypass`.
 - **Rule suggestions.** `rules::offered` offers a `setMode`
   `bypassPermissions` suggestion, labelled `every tool`, only with the
   opt-in, and only when the CLI itself puts it in a request's
@@ -611,8 +616,12 @@ thinking capabilities are not used.
   §3.6). Without the opt-in the command is rejected `BypassDisabled` and
   nothing is logged or sent to the CLI; with it the CLI is launched with
   `--allow-dangerously-skip-permissions` and the switch goes through like
-  any other. A `bypass_not_launched` refusal can now come only from an
-  `agent.command` that ignores that flag; it would be logged as
+  any other. A bypass request accepted while the opt-in was on and
+  reached after a restart without it is refused by the supervisor itself
+  (`PermissionModeRefused`, `supervisor::BYPASS_NOT_ALLOWED`), and a start
+  never asks for bypass without the opt-in, even when the log last had it.
+  A `bypass_not_launched` refusal can now come only from an
+  `agent.command` that ignores the flag; it would be logged as
   `PermissionModeRefused` like any refusal.
 
 ### 3.10 Changing effort mid-session [C]

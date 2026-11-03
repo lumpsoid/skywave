@@ -23,7 +23,7 @@ use skywaved::agent::fake::{
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead};
 use skywaved::config::AgentConfig;
-use skywaved::supervisor::{AGENT_NOT_RUNNING, DAEMON_RESTARTED, TURN_LOST};
+use skywaved::supervisor::{AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
 
@@ -1831,6 +1831,107 @@ async fn a_refused_setting_keeps_what_the_agent_had() {
         Some("bogus")
     );
     supervisor.shutdown().await.unwrap();
+}
+
+/// A `SetPermissionMode` to bypass, accepted while the log allowed it; the
+/// log is then reopened without the opt-in, as a restart that turned it off.
+fn bypass_accepted_then_disallowed(f: &mut Fixture) -> CommandId {
+    f.log = f.log.clone().with_bypass(true);
+    let bypass = f.set_mode(PermissionMode::Bypass);
+    f.reopen_log();
+    assert!(!f.log.bypass_allowed());
+    bypass
+}
+
+fn bypass_refused(command: CommandId) -> EventKind {
+    EventKind::PermissionModeRefused {
+        mode: PermissionMode::Bypass,
+        reason: BYPASS_NOT_ALLOWED.into(),
+        answers: Some(command),
+    }
+}
+
+#[tokio::test]
+async fn a_bypass_request_from_before_the_opt_in_was_turned_off_is_refused_by_the_server() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let bypass = bypass_accepted_then_disallowed(&mut f);
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    assert_eq!(setting_answers(&kinds), [bypass_refused(bypass)]);
+    // Positive control: a later request goes to an agent started for it.
+    let edits = f.set_mode(PermissionMode::AcceptEdits);
+    let kinds = f.wait_count("answers", 2, is_setting_answer).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        setting_answers(&kinds)[1],
+        EventKind::PermissionModeChanged {
+            mode: PermissionMode::AcceptEdits,
+            answers: Some(edits),
+        }
+    );
+    let inputs = agent.inputs(f.session_id);
+    assert_eq!(
+        inputs[..2],
+        [
+            f.started(false),
+            FakeInput::SetPermissionMode(PermissionMode::AcceptEdits),
+        ],
+        "no agent started for the bypass, and none asked for it"
+    );
+    let settings = f.log.agent_settings(&f.storage.db, f.session_id).unwrap();
+    assert_eq!(settings.mode.current, Some(PermissionMode::AcceptEdits));
+}
+
+#[tokio::test]
+async fn an_agent_started_before_an_open_bypass_request_is_reached_is_not_asked_for_it() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    // The message comes first, so its start sees the bypass request open.
+    f.send("hello");
+    let bypass = bypass_accepted_then_disallowed(&mut f);
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(setting_answers(&kinds), [bypass_refused(bypass)]);
+    let inputs = agent.inputs(f.session_id);
+    assert_eq!(inputs[..2], [f.started(false), message("hello")]);
+    assert!(
+        !inputs.contains(&FakeInput::SetPermissionMode(PermissionMode::Bypass)),
+        "{inputs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_without_the_opt_in_does_not_ask_for_the_bypass_the_agent_had() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    f.log = f.log.clone().with_bypass(true);
+    let supervisor = f.start(&agent).await;
+    let bypass = f.set_mode(PermissionMode::Bypass);
+    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        setting_answers(&kinds),
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::Bypass,
+            answers: Some(bypass),
+        }],
+        "with the opt-in, bypass goes to the agent"
+    );
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    f.send("hello");
+    f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    let inputs = agent.inputs(f.session_id);
+    let restarted = inputs
+        .iter()
+        .rposition(|i| matches!(i, FakeInput::Started { .. }))
+        .unwrap();
+    assert_ne!(restarted, 0, "started twice");
+    assert_eq!(inputs[restarted + 1], message("hello"), "{inputs:?}");
 }
 
 #[tokio::test]

@@ -53,6 +53,12 @@
 //!   replaced before the supervisor reached it is skipped, so requests
 //!   never land out of order, and one the agent's start already asked for
 //!   is not asked again.
+//!   Bypass never reaches the agent while the log does not allow it
+//!   ([`EventLog::bypass_allowed`], D38): an open bypass request (accepted
+//!   before a restart that turned the opt-in off) is refused here,
+//!   `PermissionModeRefused` ([`BYPASS_NOT_ALLOWED`]) answering its
+//!   command, without starting an agent; and a start does not ask for a
+//!   bypass the log last had, so the agent's own mode is logged instead.
 //! - `TaskStopRequested` → [`AgentSession::stop_task`], noted with the
 //!   mapper ([`EventMapper::asked_stop`]) so a refusal names the command.
 //!   Never starts an agent: with none running, the supervisor logs
@@ -203,6 +209,9 @@ pub const DAEMON_RESTARTED: &str = "daemon restarted";
 pub const TURN_LOST: &str = "daemon restarted during a turn";
 /// Why a task stop is refused when the session has no agent running.
 pub const AGENT_NOT_RUNNING: &str = "agent not running";
+/// Why a bypass request is refused by the supervisor itself: one accepted
+/// while the server allowed bypass, reached after a restart without it.
+pub const BYPASS_NOT_ALLOWED: &str = "bypass is not allowed on this server";
 /// Default for [`SupervisorConfig::idle_timeout`].
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -707,6 +716,16 @@ impl<A: AgentAdapter> Supervisor<A> {
         setting: Setting,
     ) -> Result<()> {
         self.leave_other_context(session_id, context).await?;
+        if matches!(setting, Setting::Mode(PermissionMode::Bypass)) && !self.log.bypass_allowed() {
+            // Refused from the config, not left to the agent: only the open
+            // request is answered (a replaced one needs no answer), and no
+            // agent is started for it.
+            let open = self.log.agent_settings(&self.storage.db, session_id)?;
+            if command.is_some() && open.mode.requested.as_ref().map(|r| r.command) == command {
+                self.refuse_bypass(session_id, context, command)?;
+            }
+            return Ok(());
+        }
         if !self.running.contains_key(&session_id) {
             if let Err(message) = self.start_session(session_id, context).await? {
                 tracing::warn!(session = %session_id.0, %message, "agent did not start for a setting");
@@ -767,6 +786,26 @@ impl<A: AgentAdapter> Supervisor<A> {
             // The agent is gone; its `Exited` refuses what it was asked.
             tracing::warn!(session = %session_id.0, %error, "cannot ask the agent for a setting");
         }
+        Ok(())
+    }
+
+    /// Logs the server's own refusal of a bypass request, `command`, while
+    /// the log does not allow bypass. Settings belong to the session; the
+    /// refusal is stamped with `context` like any other answer.
+    fn refuse_bypass(
+        &mut self,
+        session_id: SessionId,
+        context: ContextId,
+        command: Option<CommandId>,
+    ) -> Result<()> {
+        tracing::info!(session = %session_id.0, "refusing bypass: not allowed on this server");
+        let kind = EventKind::PermissionModeRefused {
+            mode: PermissionMode::Bypass,
+            reason: BYPASS_NOT_ALLOWED.to_owned(),
+            answers: command,
+        };
+        self.log
+            .append(&mut self.storage.db, session_id, context, kind)?;
         Ok(())
     }
 
@@ -843,9 +882,22 @@ impl<A: AgentAdapter> Supervisor<A> {
             Conversation::Adopt(_) => "adopted",
         };
         let grants = load_grants(&self.storage.db, session_id)?;
-        let settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        let mut settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        // Bypass is never asked for while the server does not allow it: an
+        // open request for it (not handled yet) is refused now, and a bypass
+        // the agent last ran in is not asked again, so the agent's own mode
+        // replaces it in the log.
+        let bypass = self.log.bypass_allowed();
+        if !bypass
+            && let Some(request) = &settings.mode.requested
+            && request.value == PermissionMode::Bypass
+        {
+            self.refuse_bypass(session_id, context, Some(request.command))?;
+            settings = self.log.agent_settings(&self.storage.db, session_id)?;
+        }
+        let mode = (settings.mode.wanted().copied())
+            .filter(|&mode| bypass || mode != PermissionMode::Bypass);
         let work = self.log.agent_work(&self.storage.db, session_id)?;
-        let mode = settings.mode.wanted().copied();
         let model = settings.model.wanted().cloned();
         // An effort the running model takes none of, like an unknown one,
         // asks for nothing.
