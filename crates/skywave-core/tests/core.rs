@@ -1404,7 +1404,7 @@ fn a_shell_run_is_queued_as_the_head_wrote_it() {
 #[test]
 fn offline_runs_keep_their_order_and_go_back_into_the_shell_draft() {
     let dir = tempfile::tempdir().unwrap();
-    let (core, _seam, _requests, sid) = core_with_session(dir.path());
+    let (core, seam, _requests, sid) = core_with_session(dir.path());
     let agent_draft = Draft {
         text: "a message".into(),
         cursor: 2,
@@ -1460,7 +1460,7 @@ fn offline_runs_keep_their_order_and_go_back_into_the_shell_draft() {
     assert_eq!(texts(&queued_runs(dir.path())), ["git status"]);
 
     // On disk too.
-    drop(core);
+    drop((core, seam));
     let core = Core::open_detached(dir.path()).unwrap();
     core.dispatch(Action::OpenSession(sid)).unwrap();
     let view = core.view();
@@ -1542,7 +1542,7 @@ fn drafts_per_mode_and_the_composer_mode_survive_a_restart() {
 #[test]
 fn snippets_of_both_kinds_with_the_same_text_coexist() {
     let dir = tempfile::tempdir().unwrap();
-    let (core, _seam, _requests, _sid) = core_with_session(dir.path());
+    let (core, seam, _requests, _sid) = core_with_session(dir.path());
     for kind in [
         ComposerMode::Agent,
         ComposerMode::Shell,
@@ -1555,7 +1555,7 @@ fn snippets_of_both_kinds_with_the_same_text_coexist() {
         })
         .unwrap();
     }
-    drop(core);
+    drop((core, seam));
     let core = Core::open_detached(dir.path()).unwrap();
     let mut kinds: Vec<_> = core
         .view()

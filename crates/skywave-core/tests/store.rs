@@ -2,12 +2,13 @@
 //! survives a reopen (cold start == normal start).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
-    BlobPolicy, BlobStatus, ComposerMode, Core, Draft, OutboxStatus, PairedCredentials, ReadMark,
-    RunWhen, Settings, Snippet, SnippetId, Store, StoreError,
+    BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError, OutboxStatus,
+    PairedCredentials, ReadMark, RunWhen, Settings, Snippet, SnippetId, Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
@@ -157,6 +158,30 @@ fn fresh_store_is_empty_with_defaults() {
             bypass_allowed: false,
         }
     );
+}
+
+#[test]
+fn a_second_core_on_one_data_dir_is_refused_until_the_first_closes() {
+    let (_tmp, dir) = data_dir();
+    let first = Core::open_detached(&dir).unwrap();
+    let err = Core::open_detached(&dir).err().unwrap();
+    match &err {
+        CoreError::Lock(LockError::InUse { path }) => assert_eq!(path, &dir),
+        other => panic!("expected InUse, got {other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        format!("another skywave client is using {}", dir.display())
+    );
+    // An engine core is refused the same way.
+    assert!(matches!(
+        Core::open(&dir).err().unwrap(),
+        CoreError::Lock(LockError::InUse { .. })
+    ));
+    drop(first);
+    let again = Core::open(&dir).unwrap();
+    again.shutdown(Duration::from_secs(5)).unwrap();
+    Core::open_detached(&dir).unwrap();
 }
 
 #[test]

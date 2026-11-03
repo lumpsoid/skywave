@@ -272,6 +272,14 @@ D9. The server owns a CA; every device holds a certificate it signed.
 receiving `Request`s and reporting results, and every report is persisted,
 then pushed as a new `ViewState`.
 
+One core per data dir: an open core holds an exclusive OS lock (`flock`)
+on `core.lock` in it, released when its last handle goes (`Core::shutdown`
+for a deterministic close) or the process exits. A second core on the same
+dir, in this process or another, fails with `LockError::InUse` ("another
+skywave client is using <dir>"), which the heads show; otherwise both would
+hit SQLite busy errors and each model would go stale against the other's
+writes.
+
 - **Replica** (SQLite, `core.db`): the replicated `events`, projections
   folded in the transaction that stores them (`sessions`, and `turns`, each
   `TurnUsage` by seq for the usage screen), the `outbox`, the `cursor`,

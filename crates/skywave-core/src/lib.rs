@@ -34,6 +34,7 @@ mod conversations;
 mod engine;
 mod https;
 pub mod identity;
+pub mod lock;
 mod model;
 pub mod pairing;
 pub mod projection;
@@ -57,6 +58,7 @@ pub use engine::{
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
+pub use lock::LockError;
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };

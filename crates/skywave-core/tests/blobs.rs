@@ -471,6 +471,18 @@ impl Client {
         }
     }
 
+    /// Ends the core and its engine, as the process dying would, so the
+    /// data dir can be opened again (one core per data dir).
+    fn stop(self) {
+        let Client { core, seam, views } = self;
+        drop((seam, views));
+        // Off the runtime: a shutdown refuses to block a runtime thread.
+        std::thread::spawn(move || core.shutdown(SOON))
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+
     /// Snapshots older than the call — the delivery thread may not have
     /// caught up with a dispatch yet — do not count.
     async fn wait(&self, what: &str, done: impl Fn(&Client, &ViewState) -> bool) -> ViewState {
@@ -829,6 +841,7 @@ async fn restart_resumes_from_the_part_file() {
         wait_part(dir.path(), id).await;
         assert!(matches!(client.status(id), BlobStatus::Downloading { .. }));
         // The core goes away mid-download.
+        client.stop();
     }
 
     let spy = Spy::default();
