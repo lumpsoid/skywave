@@ -8,10 +8,10 @@
 //! expanded. Colour carries the state (the glyph, the state and the
 //! gutter), never the item's type.
 
-use std::cell::Cell;
-use std::io;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::{Modifier, Style, Stylize};
@@ -52,55 +52,221 @@ const TITLE: usize = LEAD + 2;
 /// Narrowest a title may get beside its state before it wraps.
 const MIN_TITLE: usize = 8;
 
-/// Every timeline item's lines at `width` columns, in timeline order, with
-/// the search's matches marked. `wall` is what running calls' elapsed time
-/// and a selected own message's wait count to. Also where the search's
-/// current match is in its blob, if that line is laid out: the item's
-/// timeline index and the line within the item.
-pub(super) fn item_lines(
-    session: &SessionView,
-    ui: &SessionUi,
-    focused: bool,
+/// The timeline's items as last laid out, kept from frame to frame so a
+/// redraw lays out only what changed: the screen redraws every few hundred
+/// milliseconds during a turn, and laying out a long session each time
+/// lags typing over a slow link.
+///
+/// An item's lines are reused while the item is equal to the one they were
+/// laid out from and everything else they show is the same ([`Flags`]);
+/// a change of width or of the search's query drops them all. The one item
+/// laid out against the search's current match in a blob is laid out
+/// afresh each frame: the search's text of that blob is not compared.
+#[derive(Debug, Clone, Default)]
+pub struct TimelineCache {
+    /// The width every item was laid out at.
     width: usize,
-    wall: SystemTime,
-) -> (Vec<Vec<Line<'static>>>, Option<(usize, usize)>) {
-    let current_line = ui
-        .shown
-        .search
-        .as_ref()
-        .and_then(|search| search.current_line(session));
-    let layout = Layout {
-        ui,
-        focused,
-        width: width.max(TITLE + MIN_TITLE),
-        wall_ms: wall_ms(wall),
-        rule: rule_index(session),
-        search: ui.shown.search.as_ref(),
-        current: ui
+    /// The search's query every item was marked with.
+    query: Option<String>,
+    items: HashMap<ItemKey, Cached>,
+    heads: Heads,
+    /// Counts frames, to drop the items gone from the timeline.
+    frame: u64,
+    stats: LayoutStats,
+}
+
+/// How much laying out the timeline took so far: what a redraw that
+/// changed nothing must not add to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutStats {
+    /// Items laid out.
+    pub items: u64,
+    /// Blob heads read from disk.
+    pub blob_reads: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Cached {
+    /// The item as laid out.
+    item: TimelineItem,
+    flags: Flags,
+    /// `false` for the item laid out against the search's current match.
+    reuse: bool,
+    lines: Vec<Line<'static>>,
+    /// The blobs whose heads it shows.
+    blobs: Vec<BlobId>,
+    /// The last frame it was in the timeline.
+    frame: u64,
+}
+
+/// What an item's lines show beside the item itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flags {
+    above: Above,
+    selected: bool,
+    expanded: bool,
+    /// Its time shows: the last item's was another minute.
+    time: bool,
+    /// Its matches are marked; `Some(true)` when it is the current match.
+    mark: Option<bool>,
+    /// The wall clock, for a running call's elapsed time; `None` for the
+    /// rest, which do not change with it.
+    wall_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Above {
+    Nothing,
+    /// The `── new ──` rule.
+    Rule,
+    /// The separator of a new turn.
+    Separator,
+}
+
+/// The heads of downloaded blobs, as read from disk once: a downloaded
+/// blob's file does not change.
+#[derive(Debug, Clone, Default)]
+struct Heads {
+    read: HashMap<BlobId, Head>,
+}
+
+#[derive(Debug, Clone)]
+struct Head {
+    path: PathBuf,
+    /// The first [`SHOW_BYTES`] of the file and its whole size, or why it
+    /// could not be read.
+    head: Result<(String, u64), String>,
+}
+
+impl TimelineCache {
+    pub fn stats(&self) -> LayoutStats {
+        self.stats
+    }
+
+    /// Lays out at `width` columns the timeline items not laid out as they
+    /// are now, with the search's matches marked. `wall` is what running
+    /// calls' elapsed time counts to. Returns each item's height in
+    /// timeline order, and where the search's current match is in its
+    /// blob, if that line is laid out: the item's timeline index and the
+    /// line within the item.
+    pub(super) fn lay_out(
+        &mut self,
+        session: &SessionView,
+        ui: &SessionUi,
+        focused: bool,
+        width: usize,
+        wall: SystemTime,
+    ) -> (Vec<usize>, Option<(usize, usize)>) {
+        let query = ui.shown.search.as_ref().map(|search| search.query.as_str());
+        if self.width != width || self.query.as_deref() != query {
+            self.width = width;
+            self.query = query.map(str::to_owned);
+            self.items.clear();
+        }
+        self.frame += 1;
+        let current_line = ui
             .shown
             .search
             .as_ref()
-            .and_then(|search| find(session, search.current?)),
-        current_line: current_line.map(|(_, line)| line),
-        matched: Cell::new(None),
-    };
-    let mut minute = None;
-    let mut matched = None;
-    let items = session
-        .timeline
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let lines = layout.item(index, item, &mut minute);
+            .and_then(|search| search.current_line(session));
+        let layout = Layout {
+            ui,
+            focused,
+            width: width.max(TITLE + MIN_TITLE),
+            wall_ms: wall_ms(wall),
+            rule: rule_index(session),
+            search: ui.shown.search.as_ref(),
+            current: ui
+                .shown
+                .search
+                .as_ref()
+                .and_then(|search| find(session, search.current?)),
+            current_line: current_line.map(|(_, line)| line),
+            matched: Cell::new(None),
+            heads: RefCell::new(&mut self.heads),
+            used: RefCell::new(Vec::new()),
+            reads: Cell::new(0),
+        };
+        let mut minute = None;
+        let mut matched = None;
+        let mut heights = Vec::with_capacity(session.timeline.len());
+        for (index, item) in session.timeline.iter().enumerate() {
+            let flags = layout.flags(index, item, &mut minute);
+            let key = ItemKey::of(item);
+            if let Some(cached) = self
+                .items
+                .get_mut(&key)
+                .filter(|cached| cached.reuse && cached.flags == flags && cached.item == *item)
+            {
+                cached.frame = self.frame;
+                heights.push(cached.lines.len());
+                continue;
+            }
+            let lines = layout.item(item, flags);
+            self.stats.items += 1;
+            let current = current_line.is_some_and(|(at, _)| at == index);
             if let Some(row) = layout.matched.take()
-                && current_line.is_some_and(|(at, _)| at == index)
+                && current
             {
                 matched = Some((index, row));
             }
-            lines
-        })
-        .collect();
-    (items, matched)
+            heights.push(lines.len());
+            self.items.insert(
+                key,
+                Cached {
+                    item: item.clone(),
+                    flags,
+                    reuse: !current,
+                    lines,
+                    blobs: layout.used.take(),
+                    frame: self.frame,
+                },
+            );
+        }
+        self.stats.blob_reads += layout.reads.get();
+        drop(layout);
+        if self.items.len() > session.timeline.len() {
+            let frame = self.frame;
+            self.items.retain(|_, cached| cached.frame == frame);
+        }
+        if !self.heads.read.is_empty() {
+            let shown: HashSet<BlobId> = self
+                .items
+                .values()
+                .flat_map(|cached| cached.blobs.iter().copied())
+                .collect();
+            self.heads.read.retain(|id, _| shown.contains(id));
+        }
+        (heights, matched)
+    }
+
+    /// At most `height` lines of the timeline as last laid out
+    /// ([`TimelineCache::lay_out`]), from line `top`; `starts` is each
+    /// item's first line.
+    pub(super) fn lines(
+        &self,
+        session: &SessionView,
+        starts: &[usize],
+        top: usize,
+        height: usize,
+    ) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(height);
+        let first = starts
+            .partition_point(|&start| start <= top)
+            .saturating_sub(1);
+        for (index, item) in session.timeline.iter().enumerate().skip(first) {
+            if out.len() >= height {
+                break;
+            }
+            let Some(cached) = self.items.get(&ItemKey::of(item)) else {
+                continue;
+            };
+            let skip = top.saturating_sub(starts[index]);
+            let room = height - out.len();
+            out.extend(cached.lines.iter().skip(skip).take(room).cloned());
+        }
+        out
+    }
 }
 
 /// The timeline item the `── new ──` rule goes above: the first logged one
@@ -128,6 +294,11 @@ struct Layout<'a> {
     current_line: Option<BlobLine>,
     /// The row of the item being laid out that `current_line` landed on.
     matched: Cell<Option<usize>>,
+    heads: RefCell<&'a mut Heads>,
+    /// The blobs whose heads the item being laid out shows.
+    used: RefCell<Vec<BlobId>>,
+    /// Blob heads read from disk.
+    reads: Cell<u64>,
 }
 
 /// Marks a search's matches in an item's text.
@@ -184,40 +355,17 @@ fn marked(spans: Vec<Span<'static>>, mark: Option<Mark>) -> Vec<Span<'static>> {
 }
 
 impl Layout<'_> {
-    /// One item: the `── new ──` rule if the news starts here, else a
-    /// separator if it starts a turn, then its lines. The time shows only
-    /// when it differs from the last one shown (`minute`).
-    fn item(
-        &self,
-        index: usize,
-        item: &TimelineItem,
-        minute: &mut Option<String>,
-    ) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        if self.rule == Some(index) {
-            let rest = self.width.saturating_sub(7);
-            out.push(Line::from(vec![
-                Span::raw("── new ").magenta().bold(),
-                Span::raw("─".repeat(rest)).magenta(),
-            ]));
+    /// What item `index` shows beside the item itself. The time shows only
+    /// when its minute differs from the last one shown (`minute`).
+    fn flags(&self, index: usize, item: &TimelineItem, minute: &mut Option<i64>) -> Flags {
+        let above = if self.rule == Some(index) {
+            Above::Rule
         } else if index > 0 && starts_turn(item) {
-            out.push(Line::from("─".repeat(self.width)).dark_gray());
-        }
-        let key = selectable(item);
-        let selected = self.focused && key.is_some() && key == self.ui.shown.selected;
-        let mark = self.search.and_then(|search| {
-            search.hit(index).map(|_| Mark {
-                query: &search.query,
-                current: self.current == Some(index),
-            })
-        });
-        let expanded =
-            matches!(key, Some(ItemKey::Logged(seq)) if self.ui.shown.expanded.contains(&seq));
-        let marker = if selected {
-            Span::raw("> ").bold().reversed()
+            Above::Separator
         } else {
-            Span::raw("  ")
+            Above::Nothing
         };
+        let key = selectable(item);
         let time = match item {
             // Imported history shows when the agent had it, not when the
             // server logged it.
@@ -226,15 +374,61 @@ impl Layout<'_> {
                 ..
             }
             | TimelineItem::Logged { at, .. } => {
-                let this = at.format("%Y-%m-%d %H:%M").to_string();
-                if minute.as_ref() == Some(&this) {
-                    Span::raw("      ")
-                } else {
-                    *minute = Some(this);
-                    Span::raw(at.format("%H:%M ").to_string()).dark_gray()
-                }
+                let this = at.timestamp().div_euclid(60);
+                minute.replace(this) != Some(this)
             }
-            TimelineItem::Pending { .. } => Span::raw("      "),
+            TimelineItem::Pending { .. } => false,
+        };
+        Flags {
+            above,
+            selected: self.focused && key.is_some() && key == self.ui.shown.selected,
+            expanded: matches!(key, Some(ItemKey::Logged(seq)) if self.ui.shown.expanded.contains(&seq)),
+            time,
+            mark: self
+                .search
+                .and_then(|search| search.hit(index))
+                .map(|_| self.current == Some(index)),
+            wall_ms: ticks(item).then_some(self.wall_ms),
+        }
+    }
+
+    /// One item: the `── new ──` rule if the news starts here, else a
+    /// separator if it starts a turn, then its lines.
+    fn item(&self, item: &TimelineItem, flags: Flags) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        match flags.above {
+            Above::Rule => {
+                let rest = self.width.saturating_sub(7);
+                out.push(Line::from(vec![
+                    Span::raw("── new ").magenta().bold(),
+                    Span::raw("─".repeat(rest)).magenta(),
+                ]));
+            }
+            Above::Separator => out.push(Line::from("─".repeat(self.width)).dark_gray()),
+            Above::Nothing => {}
+        }
+        let selected = flags.selected;
+        let expanded = flags.expanded;
+        let mark = self.search.zip(flags.mark).map(|(search, current)| Mark {
+            query: &search.query,
+            current,
+        });
+        let marker = if selected {
+            Span::raw("> ").bold().reversed()
+        } else {
+            Span::raw("  ")
+        };
+        let time = match item {
+            TimelineItem::Logged {
+                entry: Entry::Imported { at, .. },
+                ..
+            }
+            | TimelineItem::Logged { at, .. }
+                if flags.time =>
+            {
+                Span::raw(at.format("%H:%M ").to_string()).dark_gray()
+            }
+            _ => Span::raw("      "),
         };
         let lead = vec![marker, time];
         let above = out.len();
@@ -662,7 +856,7 @@ impl Layout<'_> {
     /// What an expanded section shows of its downloaded blob: its head, or,
     /// when the search's current match is on a `line` past that, the part
     /// from a few lines above it, out of what the search read.
-    fn blob_part(&self, path: &Path, id: BlobId, line: Option<usize>) -> io::Result<BlobPart> {
+    fn blob_part(&self, path: &Path, id: BlobId, line: Option<usize>) -> Result<BlobPart, String> {
         let searched = line
             .zip(self.search.and_then(|search| search.blob_text(id)))
             .filter(|(line, searched)| {
@@ -670,8 +864,19 @@ impl Layout<'_> {
                 *line >= head.len().min(SHOW_LINES)
             });
         let Some((line, searched)) = searched else {
-            let (text, size) = read_head(path, SHOW_BYTES)?;
-            let lines = content_lines(&text);
+            self.used.borrow_mut().push(id);
+            let mut heads = self.heads.borrow_mut();
+            if heads.read.get(&id).is_none_or(|head| head.path != path) {
+                self.reads.set(self.reads.get() + 1);
+                let head = Head {
+                    path: path.to_owned(),
+                    head: read_head(path, SHOW_BYTES).map_err(|err| err.to_string()),
+                };
+                heads.read.insert(id, head);
+            }
+            let (text, size) = heads.read[&id].head.as_ref().map_err(String::clone)?;
+            let size = *size;
+            let lines = content_lines(text);
             let cut = (lines.len() > SHOW_LINES || size > SHOW_BYTES).then(|| {
                 format!(
                     "… cut short: {} of {} shown; the whole file is {}",
@@ -1092,6 +1297,30 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
     }
 }
 
+/// Whether an item's lines change with the wall clock: those of a call
+/// [`tool_state`] says is running, with its elapsed time.
+fn ticks(item: &TimelineItem) -> bool {
+    match item {
+        TimelineItem::Logged {
+            entry:
+                Entry::Tool(view)
+                | Entry::Imported {
+                    entry: ImportedEntry::Tool(view),
+                    ..
+                },
+            ..
+        } => {
+            matches!(view.outcome, ToolOutcome::Running { .. })
+                && view.subagent.is_none()
+                && !matches!(
+                    view.approval.as_ref().map(|a| &a.status),
+                    Some(ApprovalStatus::Pending)
+                )
+        }
+        _ => false,
+    }
+}
+
 /// This device's answer to a settled approval, when it did not apply:
 /// `you approved · not applied: the approval was cancelled first`.
 fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String> {
@@ -1196,8 +1425,9 @@ pub(super) fn wrap(
 
 /// Breaks `content` into rows: `first` columns wide, then `rest`. Breaks
 /// after the last space that fits, else mid-word; the space at a break goes.
+/// Only the row being filled is kept char by char.
 fn rows(content: &[Span<'static>], first: usize, rest: usize) -> Vec<Vec<Span<'static>>> {
-    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut row: Vec<(char, Style)> = Vec::new();
     let mut used = 0;
     let mut space: Option<usize> = None;
@@ -1216,7 +1446,7 @@ fn rows(content: &[Span<'static>], first: usize, rest: usize) -> Vec<Vec<Span<'s
                 }
                 _ => Vec::new(),
             };
-            rows.push(std::mem::replace(&mut row, carry));
+            rows.push(group(std::mem::replace(&mut row, carry)));
             used = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
             space = row.iter().rposition(|(c, _)| *c == ' ');
             if c == ' ' && row.is_empty() {
@@ -1229,8 +1459,8 @@ fn rows(content: &[Span<'static>], first: usize, rest: usize) -> Vec<Vec<Span<'s
         row.push((c, style));
         used += w;
     }
-    rows.push(row);
-    rows.into_iter().map(group).collect()
+    rows.push(group(row));
+    rows
 }
 
 /// Runs of one style as spans.

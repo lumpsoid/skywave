@@ -13,7 +13,7 @@ mod usage;
 mod workdir;
 
 use timeline::wall_ms;
-pub use timeline::{SHOW_BYTES, SHOW_LINES};
+pub use timeline::{LayoutStats, SHOW_BYTES, SHOW_LINES, TimelineCache};
 pub use workdir::WORKDIR_SHOW_BYTES;
 
 use std::borrow::Cow;

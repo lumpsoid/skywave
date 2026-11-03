@@ -26,8 +26,7 @@ use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sec
 use skywave_present::text::clean;
 
 use super::timeline::{
-    approval_state, detail_lines, glyph, head_lines, item_lines, preview_lines, rule_index,
-    title_spans,
+    approval_state, detail_lines, glyph, head_lines, preview_lines, rule_index, title_spans,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
 use crate::app::{App, Focus, Geometry, Picker, SessionUi, StopKind};
@@ -268,12 +267,13 @@ fn render_timeline(
     wall: SystemTime,
 ) {
     let focused = ui.focus == Focus::Timeline;
-    let (items, matched) = item_lines(session, ui, focused, area.width as usize, wall);
-    let mut starts = Vec::with_capacity(items.len());
+    let mut cache = ui.shown.layout.borrow_mut();
+    let (heights, matched) = cache.lay_out(session, ui, focused, area.width as usize, wall);
+    let mut starts = Vec::with_capacity(heights.len());
     let mut total = 0;
-    for lines in &items {
+    for height in &heights {
         starts.push(total);
-        total += lines.len();
+        total += height;
     }
     let rule = rule_index(session).and_then(|index| starts.get(index).copied());
     let keys: Vec<ItemKey> = session.timeline.iter().map(ItemKey::of).collect();
@@ -308,18 +308,14 @@ fn render_timeline(
     let top = geometry.top(scroll);
     geometry.top = top;
 
-    if items.is_empty() {
+    if heights.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("Nothing here yet. Write to the agent below.").dark_gray()),
             area,
         );
     } else {
-        let lines: Vec<Line> = items
-            .into_iter()
-            .flatten()
-            .skip(top)
-            .take(geometry.height)
-            .collect();
+        // Only what is on screen is copied out of the cache.
+        let lines = cache.lines(session, &geometry.starts, top, geometry.height);
         frame.render_widget(Paragraph::new(lines), area);
     }
     *ui.shown.geometry.borrow_mut() = geometry;

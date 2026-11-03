@@ -36,6 +36,7 @@ use skywave_present::usage::{Grouping, Span};
 use crate::clipboard::{Clip, CopyError};
 use crate::composer::Composer;
 use crate::notify;
+use crate::ui::TimelineCache;
 
 mod workdir;
 
@@ -412,6 +413,9 @@ pub struct ViewUi {
     /// What the expanded items download.
     pub fetch: ExpandFetch,
     pub geometry: RefCell<Geometry>,
+    /// The timeline's items as laid out by the last frames, so a redraw
+    /// lays out only what changed.
+    pub layout: RefCell<TimelineCache>,
     /// The session opened with news and where to scroll is not settled: it
     /// needs the first frame's geometry ([`Geometry::opening`]). Until then
     /// the renderer shows that scroll state itself and nothing is read.
@@ -434,6 +438,7 @@ impl ViewUi {
             expanded: HashSet::new(),
             fetch: ExpandFetch::new(),
             geometry: RefCell::default(),
+            layout: RefCell::default(),
             opening,
             search: None,
             reveal: None,
