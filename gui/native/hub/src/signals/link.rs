@@ -23,9 +23,13 @@ pub struct LinkUpdate {
     /// `RetryNow` would do something: skip the wait while reconnecting, or
     /// ask the server again after a protocol mismatch.
     pub can_retry_now: bool,
-    /// The server refused this device for good (revoked, or a protocol
-    /// mismatch): retries have stopped.
+    /// The server refused this device for good (revoked, a protocol
+    /// mismatch, or its log lost history): retries have stopped.
     pub rejected: bool,
+    /// `ResetReplica` would do something: the server lost history this
+    /// device holds. The reset drops the replica (and queued sends) for a
+    /// fresh copy of the server's log, so ask before sending it.
+    pub can_reset_replica: bool,
     /// Own commands persisted here and not answered by the server yet.
     pub queued: u32,
     /// Approvals waiting outside the open session; `OpenNextApproval`
@@ -50,4 +54,7 @@ pub enum LinkState {
     Revoked,
     /// Client and server speak different protocol versions.
     ProtocolMismatch,
+    /// The server's log lost events this device holds; sync stopped until
+    /// the user resets the replica ([`LinkUpdate::can_reset_replica`]).
+    HistoryLost,
 }

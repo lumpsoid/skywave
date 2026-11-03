@@ -2466,6 +2466,11 @@ impl Rig {
                 server_id: skywave_proto::ServerId::new(),
                 device_id: self.me,
                 head: Seq::ZERO,
+                log: skywave_proto::LogRun {
+                    log: skywave_proto::LogId::new(),
+                    run: skywave_proto::RunId::new(),
+                    since: None,
+                },
                 devices: Vec::new(),
                 shell,
                 bypass,

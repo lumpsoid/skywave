@@ -191,7 +191,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
 
     let transport: Arc<dyn Transport> =
         Arc::new(HttpsTransport::new(&address, &stored, config()).unwrap());
-    let hello = transport.hello().await.unwrap();
+    let hello = transport.hello(None).await.unwrap();
     assert_eq!(hello.device_id, stored.device_id());
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
     assert_eq!(hello.server_id, fx.identity.server_id());
@@ -320,7 +320,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
 
     // Revocation applies to the next request, even on a pooled connection.
     devices::revoke(fx.storage.db.conn(), stored.device_id(), Utc::now()).unwrap();
-    let err = transport.hello().await.unwrap_err();
+    let err = transport.hello(None).await.unwrap_err();
     assert_eq!(err, TransportError::Revoked);
     assert!(!err.is_retryable());
     assert_eq!(err.rejection(), Some(skywave_core::LinkRejection::Revoked));
@@ -335,7 +335,10 @@ async fn pair_then_talk_to_the_server_until_revoked() {
 struct Old;
 
 impl Transport for Old {
-    fn hello(&self) -> skywave_core::BoxFuture<'_, Result<HelloResponse, TransportError>> {
+    fn hello(
+        &self,
+        _: Option<skywave_proto::RunId>,
+    ) -> skywave_core::BoxFuture<'_, Result<HelloResponse, TransportError>> {
         unimplemented!()
     }
     fn send_command<'a>(

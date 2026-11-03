@@ -38,7 +38,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, DeviceId, Event,
-    EventBatch, EventKind, ModelChoice, RunWhen, Seq, SessionId, SessionState, ShellEnd, limits,
+    EventBatch, EventKind, LogId, LogRun, ModelChoice, RunId, RunWhen, RunsSince, Seq, SessionId,
+    SessionState, ShellEnd, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -78,6 +79,9 @@ struct Inner {
     head: watch::Sender<Seq>,
     /// Directories sessions may run in (D14), as configured.
     roots: Vec<PathBuf>,
+    /// The log ([`Db::log_id`]) and this run of it.
+    log: LogId,
+    run: RunId,
 }
 
 /// What the server knows about one session.
@@ -181,11 +185,29 @@ pub fn shell_command_line(command: &str) -> String {
 
 impl EventLog {
     /// A log over the database `db` belongs to; `roots` are the configured
-    /// session roots (`Config::roots`).
+    /// session roots (`Config::roots`). Each open is a new run of the log
+    /// ([`EventLog::run`]), recorded in `log_runs` with the head it starts
+    /// from: open it once per process, before anything appends.
     pub fn open(db: &Db, roots: Vec<PathBuf>) -> Result<EventLog> {
-        let (head, _) = watch::channel(head_in(db.conn())?);
+        let log = db.log_id()?;
+        let run = RunId::new();
+        // One statement: the head and the record of the run that starts
+        // from it cannot fall apart.
+        let start: i64 = db.conn().query_row(
+            "INSERT INTO log_runs (run_id, start)
+             SELECT ?1, COALESCE(MAX(seq), 0) FROM events
+             RETURNING start",
+            [run.0.to_string()],
+            |r| r.get(0),
+        )?;
+        let (head, _) = watch::channel(seq_from_sql(start)?);
         Ok(EventLog {
-            inner: Arc::new(Inner { head, roots }),
+            inner: Arc::new(Inner {
+                head,
+                roots,
+                log,
+                run,
+            }),
             shell_enabled: false,
             bypass_allowed: false,
         })
@@ -221,6 +243,20 @@ impl EventLog {
     /// Whether this log accepts a switch to bypass mode.
     pub fn bypass_allowed(&self) -> bool {
         self.bypass_allowed
+    }
+
+    /// The log and this run of it, as `hello` reports them to a device
+    /// that last saw run `since`. Reads the database, not the head watch.
+    pub fn run(&self, db: &Db, since: Option<RunId>) -> Result<LogRun> {
+        let since = match since {
+            None => None,
+            Some(since) => Some(runs_since_in(db.conn(), since)?),
+        };
+        Ok(LogRun {
+            log: self.inner.log,
+            run: self.inner.run,
+            since,
+        })
     }
 
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
@@ -989,6 +1025,28 @@ pub(crate) fn agent_work_in(conn: &Connection, id: SessionId) -> Result<AgentWor
 }
 
 /// Seq of the newest event in `conn`'s view of the log.
+/// What became of run `since` of this log ([`RunsSince`]).
+fn runs_since_in(conn: &Connection, since: RunId) -> Result<RunsSince> {
+    let position: Option<i64> = conn
+        .query_row(
+            "SELECT position FROM log_runs WHERE run_id = ?1",
+            [since.0.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(position) = position else {
+        return Ok(RunsSince::Unknown);
+    };
+    let next: Option<i64> = conn.query_row(
+        "SELECT MIN(start) FROM log_runs WHERE position > ?1",
+        [position],
+        |r| r.get(0),
+    )?;
+    Ok(RunsSince::Known {
+        next_start: next.map(seq_from_sql).transpose()?,
+    })
+}
+
 pub(crate) fn head_in(conn: &Connection) -> Result<Seq> {
     let max: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
     seq_from_sql(max)

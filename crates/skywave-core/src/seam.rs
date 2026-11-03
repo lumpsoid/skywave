@@ -22,7 +22,7 @@ use crate::client::{BlobLease, Core, CoreError, State, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
 use crate::store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, Settings, StoreError,
+    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, Settings, StoreError,
 };
 use crate::transport::TransportError;
 use crate::view::{ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId};
@@ -201,6 +201,22 @@ impl Seam {
             state.model.shell_enabled(hello.shell);
             state.model.bypass_allowed(hello.bypass);
             Ok(((), Vec::new()))
+        })
+    }
+
+    /// The run of the server to ask a connection's `hello` about
+    /// ([`Store::server_run`](crate::Store::server_run)).
+    pub fn server_run(&self) -> Result<Option<skywave_proto::RunId>, CoreError> {
+        Ok(lock(&self.core.shared.state).store.server_run()?)
+    }
+
+    /// A connection's `hello`, before anything is pulled or sent on it:
+    /// whether the server's log still holds what this replica has seen of
+    /// it ([`Store::take_server_log`](crate::Store::take_server_log)).
+    pub fn log_checked(&self, hello: &HelloResponse) -> Result<LogCheck, CoreError> {
+        self.update(|state| {
+            let check = state.store.take_server_log(hello.head, &hello.log)?;
+            Ok((check, Vec::new()))
         })
     }
 

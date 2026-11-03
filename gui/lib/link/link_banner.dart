@@ -7,7 +7,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The link banner across the top of every screen: Rust's label on the
 /// state's colour, "Retry now" while reconnecting or after a protocol
-/// mismatch (the server may have been updated since), and the approvals
+/// mismatch (the server may have been updated since), "Reset local data"
+/// (after a confirmation) once the server lost history, and the approvals
 /// waiting in other sessions as a button to the next one. Nothing while
 /// Rust's label is empty: unpaired, or online with nothing waiting.
 class LinkBanner extends StatelessWidget {
@@ -75,12 +76,20 @@ class LinkBanner extends StatelessWidget {
                   ),
                 ),
                 // Side by side when there is room, stacked on a phone.
-                if (link.canRetryNow || link.elsewhereLabel != null)
+                if (link.canRetryNow ||
+                    link.canResetReplica ||
+                    link.elsewhereLabel != null)
                   Flexible(
                     child: OverflowBar(
                       alignment: MainAxisAlignment.end,
                       overflowAlignment: OverflowBarAlignment.end,
                       children: [
+                        if (link.canResetReplica)
+                          TextButton(
+                            style: buttonStyle,
+                            onPressed: () => _confirmReset(context),
+                            child: const Text('Reset local data'),
+                          ),
                         if (link.canRetryNow)
                           TextButton(
                             style: buttonStyle,
@@ -107,6 +116,33 @@ class LinkBanner extends StatelessWidget {
     );
   }
 
+  /// Asks before `ResetReplica`: this device's copy is all that is left of
+  /// what the server lost, and queued sends go with it.
+  Future<void> _confirmReset(BuildContext context) async {
+    final reset = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Reset local data?'),
+        content: const Text(
+          'The server lost history this device still shows. Resetting '
+          'replaces this device\'s copy, and anything still queued, with '
+          'the server\'s log. Drafts and settings stay.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Reset'),
+          ),
+        ],
+      ),
+    );
+    if (reset ?? false) send.act(const ActionIntentResetReplica());
+  }
+
   /// The banner's colours (the theme's) and icon for each state.
   static ({Color background, Color foreground, IconData icon}) _look(
     LinkState state,
@@ -118,6 +154,7 @@ class LinkBanner extends StatelessWidget {
       LinkState.connecting || LinkState.catchingUp => Icons.cloud_sync,
       LinkState.reconnecting => Icons.cloud_off,
       LinkState.revoked || LinkState.protocolMismatch => Icons.block,
+      LinkState.historyLost => Icons.history_toggle_off,
       LinkState.unpaired => Icons.link_off,
     };
     return (background: background, foreground: foreground, icon: icon);

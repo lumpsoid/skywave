@@ -43,7 +43,10 @@
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
 //! head `hello` reported (or a later batch revealed), else
 //! `Online { latency_ms }` with `hello`'s round trip — blob downloads play
-//! no part: metadata synced counts as synced (D6). Any other failure ends
+//! no part: metadata synced counts as synced (D6). A `hello` whose log lost
+//! events the replica holds ([`Seam::log_checked`]) shows
+//! `Rejected(HistoryLost)` before anything is pulled or sent, and stops the
+//! link until the user resets the replica. Any other failure ends
 //! the connection: a rejection (401/403, protocol mismatch) shows
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
 //! else shows `Reconnecting { attempt, retry_at, offline_since }`, waits
@@ -98,7 +101,7 @@ use crate::https::{HttpsTransport, TransportConfig};
 use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
-use crate::store::{OutboxEntry, StoreError};
+use crate::store::{LogCheck, OutboxEntry, StoreError};
 use crate::transport::{Transport, TransportError};
 use crate::view::{CommandId, Link, LinkRejection};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
@@ -540,6 +543,10 @@ enum LinkError {
     /// failure.
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// `hello` said the log lost events the replica holds
+    /// ([`Seam::log_checked`]).
+    #[error("the server's log lost events this device holds (seen {have:?}, head {server:?})")]
+    HistoryLost { have: Seq, server: Seq },
 }
 
 impl LinkError {
@@ -547,6 +554,10 @@ impl LinkError {
         match self {
             LinkError::Transport(e) => e.rejection(),
             LinkError::Core(_) => None,
+            LinkError::HistoryLost { have, server } => Some(LinkRejection::HistoryLost {
+                have: *have,
+                server: *server,
+            }),
         }
     }
 }
@@ -743,12 +754,30 @@ async fn connection(
     reporter: &mut LinkReporter,
     errors: &mut ServerErrors,
 ) -> Ended {
+    let since = match ctx.seam.server_run() {
+        Ok(since) => since,
+        Err(error) => return LinkError::from(error).into(),
+    };
     let started = tokio::time::Instant::now();
-    let hello = match transport.hello().await {
+    let hello = match transport.hello(since).await {
         Ok(hello) => hello,
         Err(error) => return LinkError::from(error).into(),
     };
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    // Before anything is pulled or sent: a pull would wait past a head
+    // below the cursor, or stack another history's events onto this one.
+    match ctx.seam.log_checked(&hello) {
+        Ok(LogCheck::Continues) => {}
+        Ok(LogCheck::Lost { seen }) => {
+            tracing::warn!(?seen, head = ?hello.head, log = ?hello.log, "the server's log lost events this device holds");
+            return LinkError::HistoryLost {
+                have: seen,
+                server: hello.head,
+            }
+            .into();
+        }
+        Err(error) => return LinkError::from(error).into(),
+    }
     if let Err(error) = ctx.seam.hello_received(&hello) {
         return LinkError::from(error).into();
     }
@@ -811,7 +840,7 @@ async fn pull(
                 // again, so its name shows without waiting for a reconnect.
                 let unnamed = ctx.seam.unnamed_devices(&batch);
                 if unnamed.into_iter().filter(|id| asked.insert(*id)).count() > 0 {
-                    ctx.seam.hello_received(&transport.hello().await?)?;
+                    ctx.seam.hello_received(&transport.hello(None).await?)?;
                 }
             }
             Err(CoreError::Store(StoreError::Gap { cursor, from })) => {
@@ -925,7 +954,7 @@ async fn settled_by_log(
     transport: &dyn Transport,
     id: CommandId,
 ) -> Result<(), LinkError> {
-    let head = transport.hello().await?.head;
+    let head = transport.hello(None).await?.head;
     loop {
         // Asked for before the look, so a batch in between still wakes it.
         let changed = ctx.outbox.notified();
@@ -955,6 +984,16 @@ mod tests {
     use crate::transport::{BlobDownload, BoxFuture};
     use crate::view::{DeviceId, FailReason, Outgoing, Screen};
 
+    /// The one log, in one run, every fake server here serves: whatever
+    /// run it is asked about is the current one.
+    fn one_run() -> skywave_proto::LogRun {
+        skywave_proto::LogRun {
+            log: skywave_proto::LogId(uuid::Uuid::from_u128(1)),
+            run: skywave_proto::RunId(uuid::Uuid::from_u128(2)),
+            since: Some(skywave_proto::RunsSince::Known { next_start: None }),
+        }
+    }
+
     /// A server that is down until `up` is set, then answers `hello` and
     /// long-polls that never end.
     #[derive(Default)]
@@ -964,7 +1003,10 @@ mod tests {
     }
 
     impl Transport for FlakyServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async move {
                 self.hellos.fetch_add(1, Ordering::SeqCst);
                 if !self.up.load(Ordering::SeqCst) {
@@ -975,6 +1017,7 @@ mod tests {
                     server_id: ServerId::new(),
                     device_id: DeviceId::new(),
                     head: Seq::ZERO,
+                    log: one_run(),
                     devices: Vec::new(),
                     shell: false,
                     bypass: false,
@@ -1372,14 +1415,20 @@ mod tests {
     }
 
     impl Transport for CuttingServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async move {
                 self.answered.store(false, Ordering::SeqCst);
                 Ok(HelloResponse {
                     protocol_version: PROTOCOL_VERSION,
                     server_id: ServerId::new(),
                     device_id: DeviceId::new(),
-                    head: Seq::ZERO,
+                    // Its log holds what it accepted: below that, the
+                    // device would see the log lost history.
+                    head: Seq(self.seen.lock().unwrap().len() as u64),
+                    log: one_run(),
                     devices: Vec::new(),
                     shell: false,
                     bypass: false,
@@ -1630,7 +1679,10 @@ mod tests {
     }
 
     impl Transport for RecordingServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async { Err(TransportError::Io("unused".into())) })
         }
 
@@ -1771,7 +1823,10 @@ mod tests {
     }
 
     impl Transport for RefusingServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async { Err(TransportError::Io("unused".into())) })
         }
 
@@ -1960,7 +2015,10 @@ mod tests {
     }
 
     impl Transport for LogServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async move {
                 self.hellos.fetch_add(1, Ordering::SeqCst);
                 Ok(HelloResponse {
@@ -1968,6 +2026,7 @@ mod tests {
                     server_id: ServerId::new(),
                     device_id: DeviceId::new(),
                     head: Seq(self.log.lock().unwrap().len() as u64),
+                    log: one_run(),
                     // Named, so no event asks `hello` again.
                     devices: vec![skywave_proto::DeviceInfo {
                         id: self.device,

@@ -110,7 +110,7 @@ every version.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
-| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the log head, every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
@@ -175,6 +175,12 @@ the `PROTOCOL_VERSION` it was created with, and `serve` and the admin
 commands refuse one written by another version, before reading it, with an
 error telling the operator to delete the data directory (alpha: old data is
 not migrated). A database from before the stamp takes the current version.
+The database also holds its log's identity (`log_identity`, a `LogId`
+minted with it), and every `serve` is a new run (`RunId`), recorded in
+`log_runs` with the head it started from, in one statement. The record is
+append-only, so a restored backup holds only the runs before it. It runs with `synchronous = FULL`: under WAL, `NORMAL` may
+drop the last commits on power loss, and the log is the only record of what
+users did; the cost is one fsync of the WAL per commit.
 
 - **Connections** (`ConnectionLimits`): at most 512 open at once and 32 per
   source, an IPv4 address or an IPv6 /64 (an IPv4-mapped address counts as
@@ -427,6 +433,48 @@ logs) an event that no longer decodes rather than failing.
   the head says. A revoked device or protocol mismatch is `Rejected`, and
   retries stop until re-pairing. `suspend()` / `resume()` pause the network
   for heads that background.
+- **A log that went backwards.** The server's log can lose events the
+  device holds: a crash dropping its last commits, the data dir restored
+  from an older backup, or the database replaced. Pulling on would wait
+  past a head that never comes (a head below the cursor) or, once the log
+  grows again, stack another history's events onto the replica. The
+  replica keeps the `LogId` and `RunId` of the last `hello` it took
+  (`server_log`). Each connection's `hello` asks about that run
+  (`?since=`) and is checked before anything is pulled or sent, against
+  what the device has *seen*: its cursor, or the seq of any of its
+  commands the server accepted beyond it. The server answers from its
+  record of runs: `Unknown`, or `Known { next_start }`, the lowest head
+  any later run started from. With something seen, the log lost history
+  when `head` < seen; when its `LogId` differs (another database: the id
+  is minted with it); when the run is `Unknown` (or unanswered); or when
+  `next_start` < seen (equal is a clean restart). This is sound because
+  the log is append-only: within one `LogId` only its end can be lost,
+  and only while the server is down, so a run after the loss starts below
+  it, and a restore also takes away the record of the runs after the
+  backup. It holds however many restarts there were since, and however
+  far the log has grown past the cursor again. An `Unknown` run is
+  conservative: the record went back past it, and nothing says how far.
+  A first `hello` (fresh or reset replica) compares only the head.
+  `hello`'s head is the committed one (read from the database, not the
+  in-memory watch, which is published after the commit), so it is never
+  below an event a pull already got. The server id says nothing here: it
+  lives outside the database, and a restored data dir keeps it.
+
+  The link then stops with `Rejected(HistoryLost { have, server })`,
+  writes nothing, and `RetryNow` does not get past it. The replica stays
+  readable, as it is the only copy of what the server lost (messages the
+  device saw `Accepted` included), so nothing is reset on its own and
+  nothing is resent: the server's dedup record of those commands went with
+  the log, so a resend would run them again, after side effects the agent
+  may already have had on the workdir. `Action::ResetReplica` (only in
+  that state) clears what the server's log produced, as
+  `Core::reset_replica` does, in place: events, projections, cursor,
+  outbox (queued commands included: they may name sessions the server no
+  longer has), blobs, workdir answers, devices, offered models and the
+  kept log and run; settings, drafts, composer modes, snippets, read marks,
+  local deletes and alerted approvals stay. It then connects again and
+  pulls the log from seq 0. The GUI's banner offers "Reset local data"
+  after a confirmation; the TUI says to restart with `--reset-replica`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
   link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
   the recorded progress (each progress report follows an fsync, so a
@@ -522,7 +570,7 @@ enum Link {
     CatchingUp { have: Seq, server: Seq },
     // wall-clock instants fixed at the failure; heads count down to retry_at
     Reconnecting { attempt: u32, retry_at: DateTime<Utc>, offline_since: DateTime<Utc> },
-    Rejected(RejectReason),          // revoked cert, protocol mismatch
+    Rejected(LinkRejection),         // revoked cert, protocol mismatch, history lost
 }
 
 enum Outgoing {
@@ -558,6 +606,7 @@ enum BlobState {
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
 | Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
 | `Rejected(Revoked)` | Full-screen state with re-pair action; local data stays readable. |
+| `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
 
 ## Flutter head

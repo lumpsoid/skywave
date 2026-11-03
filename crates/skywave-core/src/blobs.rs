@@ -819,7 +819,10 @@ mod tests {
     }
 
     impl Transport for BlobServer {
-        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
             Box::pin(async { Err(TransportError::Io("unused".into())) })
         }
 

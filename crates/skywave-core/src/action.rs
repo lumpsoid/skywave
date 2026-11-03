@@ -288,6 +288,12 @@ pub enum Action {
     /// After `Rejected(ProtocolMismatch)`, connect again: the server may
     /// have been updated since.
     RetryNow,
+    /// After `Rejected(HistoryLost)`, start the replica over from the
+    /// server's log: the replicated log, cursor, sessions, outbox (queued
+    /// commands too) and blobs go; settings, drafts, composer modes,
+    /// snippets and read marks stay. Then connect again. Ignored in any
+    /// other link state.
+    ResetReplica,
     Navigate(Route),
     /// Go back from the screen shown: a subagent's timeline to the one of
     /// the agent that launched it, a workdir file to its directory, a diff

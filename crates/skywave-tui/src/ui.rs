@@ -153,6 +153,12 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => format!(
             "protocol mismatch · client v{client}, server v{server} · update, then Ctrl-R{queued_part}"
         ),
+        // The replica is the only copy of what the server lost: say so,
+        // and how to start over once the user has what they need.
+        Link::Rejected(LinkRejection::HistoryLost { have, server }) => format!(
+            "server lost history (had {}, server at {}) · sync stopped · restart with --reset-replica to start over{queued_part}",
+            have.0, server.0
+        ),
     }
 }
 

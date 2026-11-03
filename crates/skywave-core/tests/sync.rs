@@ -285,9 +285,12 @@ impl Counting {
 }
 
 impl Transport for Counting {
-    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+    fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
         self.tick();
-        self.inner.hello()
+        self.inner.hello(since)
     }
 
     fn send_command<'a>(
@@ -1273,8 +1276,11 @@ struct ServerErrorFor {
 }
 
 impl Transport for ServerErrorFor {
-    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
-        self.inner.hello()
+    fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        self.inner.hello(since)
     }
 
     fn send_command<'a>(
@@ -1489,4 +1495,226 @@ async fn a_server_error_on_a_send_does_not_stop_the_pull() {
         links.iter().all(|link| !is_reconnecting(link)),
         "the connection held: {links:?}"
     );
+}
+
+// ---- a log that went backwards ----------------------------------------------
+
+/// Where the link stopped because the server's log lost history, if it did.
+fn history_lost(link: &Link) -> Option<(Seq, Seq)> {
+    match link {
+        Link::Rejected(LinkRejection::HistoryLost { have, server }) => Some((*have, *server)),
+        _ => None,
+    }
+}
+
+/// Logs a session the way another device would, straight through the
+/// server's command handling, so it needs no connection.
+fn create_on_server(daemon: &mut Daemon, device: skywave_core::DeviceId) {
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: daemon.workdir(),
+            conversation: None,
+        },
+    };
+    let result = daemon
+        .log
+        .handle(&mut daemon.storage.db, device, &command)
+        .unwrap();
+    assert!(
+        matches!(result, CommandResult::Accepted { .. }),
+        "{result:?}"
+    );
+}
+
+/// The server comes back from a backup older than what the device pulled:
+/// its head is below the cursor. The link stops on `hello` with
+/// `Rejected(HistoryLost)` instead of long-polling past a head that will
+/// not come, the replica stays as it was (the only copy of what was lost),
+/// and the reset starts it over from the restored log, after which the
+/// link syncs as usual.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_log_restored_from_an_older_backup_stops_the_link_until_the_replica_is_reset() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let kept = client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let backup = daemon.backup();
+    let backed_up = daemon.head();
+    let lost = client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let have = client.cursor();
+    assert!(have > backed_up, "{have:?} over {backed_up:?}");
+    let before = client.local_events();
+
+    let daemon = daemon.restore(backup, &proxy, agent.clone()).await;
+    assert_eq!(daemon.head(), backed_up);
+    let view = client
+        .wait("the link to stop on the lost history", |_, view| {
+            history_lost(&view.link).is_some()
+        })
+        .await;
+    assert_eq!(history_lost(&view.link), Some((have, backed_up)));
+    assert_eq!(client.local_events(), before, "the replica stays as it was");
+    assert!(client.sessions().contains(&lost));
+    // Only the reset goes on from here: a retry changes nothing.
+    client.dispatch(Action::RetryNow);
+    assert!(history_lost(&client.core.view().link).is_some());
+
+    client.dispatch(Action::ResetReplica);
+    client
+        .wait("the reset replica to sync the restored log", |c, view| {
+            matches!(view.link, Link::Online { .. }) && c.cursor() == daemon.head()
+        })
+        .await;
+    assert_same_log(&daemon.events(), &client.local_events());
+    let sessions = client.sessions();
+    assert!(sessions.contains(&kept), "{sessions:?}");
+    assert!(!sessions.contains(&lost), "{sessions:?}");
+    // And on from there as usual.
+    let next = client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    assert!(client.sessions().contains(&next));
+    assert_same_log(&daemon.events(), &client.local_events());
+}
+
+/// The restored log grows past the device's cursor before the device is
+/// back: the head alone no longer gives it away, but the run that started
+/// below the cursor does, so nothing of the new history stacks onto the
+/// old.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_log_grown_past_the_cursor_still_stops_the_link() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let backup = daemon.backup();
+    let backed_up = daemon.head();
+    client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let have = client.cursor();
+    let before = client.local_events();
+
+    proxy.down();
+    let mut daemon = daemon.restore(backup, &proxy, agent.clone()).await;
+    while daemon.head() <= have {
+        create_on_server(&mut daemon, client.device());
+    }
+    let server = daemon.head();
+    proxy.up();
+    let view = client
+        .wait("the link to stop on the lost history", |_, view| {
+            history_lost(&view.link).is_some()
+        })
+        .await;
+    assert_eq!(history_lost(&view.link), Some((have, server)));
+    assert!(
+        server > have && have > backed_up,
+        "{backed_up:?} {have:?} {server:?}"
+    );
+    assert_eq!(client.local_events(), before, "nothing stacked");
+}
+
+/// As above, and the server restarted once more before the device is back,
+/// so the run it meets started past its cursor. The record of runs still
+/// has the run the device last saw, and the one after it started below
+/// the cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_log_grown_and_restarted_again_still_stops_the_link() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let backup = daemon.backup();
+    client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let have = client.cursor();
+    let before = client.local_events();
+
+    proxy.down();
+    let mut daemon = daemon.restore(backup, &proxy, agent.clone()).await;
+    while daemon.head() <= have {
+        create_on_server(&mut daemon, client.device());
+    }
+    let restart = daemon.backup();
+    let daemon = daemon.restore(restart, &proxy, agent.clone()).await;
+    let server = daemon.head();
+    assert!(server > have, "the run the device meets starts past it");
+    proxy.up();
+    let view = client
+        .wait("the link to stop on the lost history", |_, view| {
+            history_lost(&view.link).is_some()
+        })
+        .await;
+    assert_eq!(history_lost(&view.link), Some((have, server)));
+    assert_eq!(client.local_events(), before, "nothing stacked");
+}
+
+/// Another log behind the same server, as far as the cursor from the
+/// start: only the log id tells, and it stops the link too. The same
+/// database with its own id is a plain restart, which carries on
+/// (`a_restart_with_the_whole_log_carries_on`).
+#[tokio::test(flavor = "multi_thread")]
+async fn another_log_behind_the_same_server_stops_the_link() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let have = client.cursor();
+    let backup = daemon.backup();
+    rusqlite::Connection::open(backup.path().join("server/skywave.db"))
+        .unwrap()
+        .execute(
+            "UPDATE log_identity SET log_id = ?1",
+            [skywave_proto::LogId::new().0.to_string()],
+        )
+        .unwrap();
+
+    let daemon = daemon.restore(backup, &proxy, agent.clone()).await;
+    assert_eq!(daemon.head(), have, "as far as the replica");
+    let view = client
+        .wait("the link to stop on the other log", |_, view| {
+            history_lost(&view.link).is_some()
+        })
+        .await;
+    assert_eq!(history_lost(&view.link), Some((have, have)));
+}
+
+/// A server restarted with its whole log (a new run that starts at the
+/// head the device has) is a reconnect like any other: online again,
+/// nothing reset, and the next command goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_with_the_whole_log_carries_on() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+    let first = client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let before = client.local_events();
+    let backup = daemon.backup();
+
+    let daemon = daemon.restore(backup, &proxy, agent.clone()).await;
+    let second = client.create_session(&daemon).await;
+    daemon.settle(&[&client], SOON).await;
+    let link = client.core.view().link;
+    assert!(matches!(link, Link::Online { .. }), "{link:?}");
+    assert_eq!(client.local_events()[..before.len()], before[..]);
+    let sessions = client.sessions();
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert!(sessions.contains(&first) && sessions.contains(&second));
+    assert_same_log(&daemon.events(), &client.local_events());
 }

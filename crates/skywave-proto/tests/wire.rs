@@ -20,6 +20,9 @@ fn blob_id() -> BlobId {
 fn server() -> ServerId {
     Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0006).into()
 }
+fn run_id() -> RunId {
+    Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00a3).into()
+}
 fn call() -> CallId {
     Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0007).into()
 }
@@ -695,6 +698,13 @@ fn hello() -> HelloResponse {
         server_id: server(),
         device_id: device(),
         head: Seq(16),
+        log: LogRun {
+            log: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00a1).into(),
+            run: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00a2).into(),
+            since: Some(RunsSince::Known {
+                next_start: Some(Seq(12)),
+            }),
+        },
         devices: vec![DeviceInfo {
             id: device(),
             name: "phone".into(),
@@ -1491,6 +1501,8 @@ fn wire_format_snapshot() {
     struct Snapshot {
         protocol_version: u32,
         hello: HelloResponse,
+        hello_query: HelloQuery,
+        runs_since: Vec<Option<RunsSince>>,
         pair_request: PairRequest,
         pair_response: PairResponse,
         events_query: EventsQuery,
@@ -1506,6 +1518,17 @@ fn wire_format_snapshot() {
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
         hello: hello(),
+        hello_query: HelloQuery {
+            since: Some(run_id()),
+        },
+        runs_since: vec![
+            None,
+            Some(RunsSince::Unknown),
+            Some(RunsSince::Known { next_start: None }),
+            Some(RunsSince::Known {
+                next_start: Some(Seq(5)),
+            }),
+        ],
         pair_request: pair_request(),
         pair_response: pair_response(),
         events_query: EventsQuery {

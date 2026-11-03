@@ -141,6 +141,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             BlobPolicyChoice::OnDemand => BlobPolicy::OnDemand,
         }),
         ActionIntent::RetryNow => Action::RetryNow,
+        ActionIntent::ResetReplica => Action::ResetReplica,
         // Checked here too so a typo is shown, not silently dropped.
         ActionIntent::SetServerAddress { address } => {
             ServerAddress::parse(&address).map_err(|err| err.to_string())?;

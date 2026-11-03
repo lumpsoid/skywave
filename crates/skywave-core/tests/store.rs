@@ -780,7 +780,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -909,7 +909,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1325,7 +1325,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2212,7 +2212,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2722,7 +2722,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3003,7 +3003,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -3128,7 +3128,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -3166,7 +3166,152 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
+}
+
+/// `hello`'s log against what the replica has seen of it: the cursor and
+/// any accepted command beyond it. A head below that, another log, a run
+/// last seen that the server has no record of (or did not answer about),
+/// or a later run that started below it lost events the replica holds; a
+/// restart that started at it or past it did not. Nothing is kept when it
+/// lost them, and the reset forgets the log with the rest of the replica.
+#[test]
+fn the_server_log_is_checked_against_what_the_replica_has_seen() {
+    use skywave_core::LogCheck;
+    use skywave_proto::{LogId, LogRun, RunId, RunsSince};
+
+    let mut store = Store::open_in_memory().unwrap();
+    let log = Log::new();
+    let seven = Seq(log.events.len() as u64);
+    assert_eq!(seven, Seq(7));
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(1),
+                events: log.events,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let id = LogId::new();
+    let hello = |run: RunId, since: Option<RunsSince>| LogRun {
+        log: id,
+        run,
+        since,
+    };
+    let current = Some(RunsSince::Known { next_start: None });
+    let next = |start: u64| {
+        Some(RunsSince::Known {
+            next_start: Some(Seq(start)),
+        })
+    };
+    let lost = |seen: u64| LogCheck::Lost { seen: Seq(seen) };
+
+    // The first `hello` has nothing to compare but the head.
+    let a = RunId::new();
+    assert_eq!(store.server_run().unwrap(), None);
+    assert_eq!(
+        store.take_server_log(Seq(6), &hello(a, None)).unwrap(),
+        lost(7)
+    );
+    assert_eq!(
+        store.take_server_log(seven, &hello(a, None)).unwrap(),
+        LogCheck::Continues
+    );
+    assert_eq!(store.server_run().unwrap(), Some(a), "asked about next");
+    assert_eq!(
+        store.take_server_log(Seq(9), &hello(a, current)).unwrap(),
+        LogCheck::Continues,
+        "the same run, grown"
+    );
+    assert_eq!(
+        store.take_server_log(Seq(5), &hello(a, current)).unwrap(),
+        lost(7)
+    );
+
+    // A restart that found everything this replica has seen: equal is clean.
+    let b = RunId::new();
+    assert_eq!(
+        store.take_server_log(Seq(8), &hello(b, next(7))).unwrap(),
+        LogCheck::Continues
+    );
+    assert_eq!(store.server_run().unwrap(), Some(b));
+    // Some run since started below it: a restore, grown past the cursor
+    // again, however many restarts ago.
+    assert_eq!(
+        store
+            .take_server_log(Seq(12), &hello(RunId::new(), next(5)))
+            .unwrap(),
+        lost(7)
+    );
+    // No record of the run last seen, or no answer about it.
+    for since in [Some(RunsSince::Unknown), None] {
+        assert_eq!(
+            store
+                .take_server_log(Seq(12), &hello(RunId::new(), since))
+                .unwrap(),
+            lost(7),
+            "{since:?}"
+        );
+    }
+    // Another log altogether, however far it reaches.
+    let other = LogRun {
+        log: LogId::new(),
+        ..hello(RunId::new(), current)
+    };
+    assert_eq!(store.take_server_log(Seq(20), &other).unwrap(), lost(7));
+    // Nothing was kept from the refused: the restart's run is still the one.
+    assert_eq!(store.server_run().unwrap(), Some(b));
+    let restart = hello(b, current);
+    assert_eq!(
+        store.take_server_log(Seq(8), &restart).unwrap(),
+        LogCheck::Continues
+    );
+
+    // A command accepted at 9, beyond the cursor, was seen too.
+    let command = Command {
+        id: CommandId::new(),
+        kind: CommandKind::StopSession { session_id: log.a },
+    };
+    store.enqueue(&command).unwrap();
+    store
+        .record_result(
+            command.id,
+            &CommandResult::Accepted { seq: Seq(9) },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(store.take_server_log(Seq(8), &restart).unwrap(), lost(9));
+    assert_eq!(
+        store.take_server_log(Seq(12), &hello(b, next(8))).unwrap(),
+        lost(9)
+    );
+    assert_eq!(
+        store.take_server_log(Seq(12), &hello(b, next(9))).unwrap(),
+        LogCheck::Continues
+    );
+
+    // The reset keeps this device's drafts and forgets the log.
+    let draft = Draft {
+        text: "keep me".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    };
+    store
+        .set_draft(log.a, ComposerMode::Agent, Some(&draft))
+        .unwrap();
+    store.reset_for_lost_history().unwrap();
+    assert_eq!(store.cursor().unwrap(), Seq::ZERO);
+    assert!(store.outbox().unwrap().is_empty());
+    assert_eq!(
+        store.drafts().unwrap().get(&(log.a, ComposerMode::Agent)),
+        Some(&draft)
+    );
+    assert_eq!(
+        store.take_server_log(Seq(3), &other).unwrap(),
+        LogCheck::Continues,
+        "a fresh replica takes any log"
+    );
 }

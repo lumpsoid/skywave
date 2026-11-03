@@ -113,7 +113,9 @@ class SkyColors {
                   foreground: const Color(0xFFFFE082),
                 )
               : (background: const Color(0xFFFFB300), foreground: Colors.black),
-        LinkState.revoked || LinkState.protocolMismatch => (
+        LinkState.revoked ||
+        LinkState.protocolMismatch ||
+        LinkState.historyLost => (
           background: scheme.error,
           foreground: scheme.onError,
         ),

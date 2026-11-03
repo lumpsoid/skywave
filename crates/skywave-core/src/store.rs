@@ -21,7 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
-    DeviceInfo, Event, EventBatch, EventKind, ModelChoice, PROTOCOL_VERSION, Seq, SessionId,
+    DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, PROTOCOL_VERSION, RunId,
+    RunsSince, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -324,6 +325,17 @@ CREATE TABLE IF NOT EXISTS protocol_stamp (
     version INTEGER NOT NULL
 );
 "#,
+    r#"
+-- The server log the replica holds (skywave_proto::LogId), and the run of
+-- the server it last took a `hello` from (RunId), which the next `hello`
+-- asks about; one row once a `hello` was taken, cleared with the replica.
+-- `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS server_log (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    log_id TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -469,6 +481,15 @@ impl Settings {
     fn readable(key: &str, value: &str) -> bool {
         Settings::default().read(key, value.to_owned()).is_ok()
     }
+}
+
+/// What [`Store::take_server_log`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogCheck {
+    /// The log holds everything the replica has seen of it.
+    Continues,
+    /// The log lost events the replica has seen, up to `seen`.
+    Lost { seen: Seq },
 }
 
 /// Delivery state of a queued command.
@@ -751,6 +772,100 @@ impl Store {
     /// Seq of the newest applied event; [`Seq::ZERO`] for a fresh replica.
     pub fn cursor(&self) -> Result<Seq, StoreError> {
         read_cursor(&self.conn)
+    }
+
+    /// The run of the server the last `hello` taken came from
+    /// ([`Store::take_server_log`]), to ask the next one about; `None`
+    /// before the first.
+    pub fn server_run(&self) -> Result<Option<RunId>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT run_id FROM server_log WHERE id = 1", [], |row| {
+                Ok(RunId(uuid_col(row, 0)?))
+            })
+            .optional()?)
+    }
+
+    /// Takes the log a `hello` reported, with its `head`, and says whether
+    /// that log still holds what this replica has seen of it: the cursor,
+    /// and the seq of every command the server accepted from this device
+    /// that the pull may not have reached yet. The `hello` must have asked
+    /// about [`Store::server_run`]. In one transaction: when it does, the
+    /// log and run are kept for the next `hello`; when it does not, nothing
+    /// is written.
+    ///
+    /// The log lost events this replica has seen (architecture.md, "A log
+    /// that went backwards") when `head` is below what was seen; when it is
+    /// another log than the one the replica holds; or when its record of
+    /// runs no longer has the run last seen, or a run since started below
+    /// what was seen: a run starts from the head the server found on disk,
+    /// and within one log only the end of it can be lost. Equal is a clean
+    /// restart. An unknown run is lost history even when everything seen
+    /// may still be in the log: the record went back past that run, and
+    /// nothing says how far. A replica that took no `hello` yet (fresh, or
+    /// reset) has seen nothing to compare, beyond `head`; nor has one that
+    /// has seen nothing.
+    pub fn take_server_log(&mut self, head: Seq, log: &LogRun) -> Result<LogCheck, StoreError> {
+        let tx = self.conn.transaction()?;
+        let cursor = read_cursor(&tx)?;
+        let accepted: Option<i64> = tx.query_row(
+            "SELECT MAX(json_extract(result, '$.seq')) FROM outbox
+             WHERE json_extract(result, '$.result') = 'accepted'",
+            [],
+            |row| row.get(0),
+        )?;
+        let accepted = accepted.map_or(Ok(Seq::ZERO), |seq| {
+            u64::try_from(seq)
+                .map(Seq)
+                .map_err(|_| StoreError::Corrupt("an accepted command's seq is negative"))
+        })?;
+        let seen = cursor.max(accepted);
+        let held: Option<LogId> = tx
+            .query_row("SELECT log_id FROM server_log WHERE id = 1", [], |row| {
+                Ok(LogId(uuid_col(row, 0)?))
+            })
+            .optional()?;
+        let lost = head < seen
+            || (seen > Seq::ZERO
+                && held.is_some_and(|held| {
+                    held != log.log
+                        || match log.since {
+                            // Not answered about the run last seen: nothing
+                            // vouches for it.
+                            None | Some(RunsSince::Unknown) => true,
+                            Some(RunsSince::Known { next_start }) => {
+                                next_start.is_some_and(|start| start < seen)
+                            }
+                        }
+                }));
+        if lost {
+            return Ok(LogCheck::Lost { seen });
+        }
+        tx.execute(
+            "INSERT INTO server_log (id, log_id, run_id) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET log_id = excluded.log_id, run_id = excluded.run_id",
+            params![log.log.0.to_string(), log.run.0.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(LogCheck::Continues)
+    }
+
+    /// Clears the replica for the same server after its log lost events
+    /// this replica holds ([`Store::take_server_log`]): what
+    /// [`Store::reset_replica`] clears goes, in one transaction, and what
+    /// is this device's (settings, drafts, composer modes, snippets, read
+    /// marks, local deletes, alerted approvals) stays. Returns the blobs
+    /// that were known, whose files the caller removes.
+    pub fn reset_for_lost_history(&mut self) -> Result<Vec<BlobId>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let blobs = {
+            let mut stmt = tx.prepare("SELECT id FROM blobs ORDER BY id")?;
+            let rows = stmt.query_map([], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        clear_replica(&tx)?;
+        tx.commit()?;
+        Ok(blobs)
     }
 
     /// Stores the batch's new events, updates the session projection and
@@ -1718,7 +1833,8 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          DELETE FROM devices;
          DELETE FROM offered_models;
          DELETE FROM workdir_snapshots;
-         DELETE FROM workdir_blob_refs;",
+         DELETE FROM workdir_blob_refs;
+         DELETE FROM server_log;",
     )?;
     Ok(())
 }

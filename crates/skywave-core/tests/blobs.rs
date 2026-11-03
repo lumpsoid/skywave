@@ -383,8 +383,11 @@ struct Spied {
 }
 
 impl Transport for Spied {
-    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
-        self.inner.hello()
+    fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        self.inner.hello(since)
     }
 
     fn send_command<'a>(

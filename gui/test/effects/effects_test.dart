@@ -43,6 +43,7 @@ void main() {
           connectionLabel: 'Connected · 12 ms',
           canRetryNow: false,
           rejected: false,
+          canResetReplica: false,
           queued: 2,
           approvalsElsewhere: 0,
         ),

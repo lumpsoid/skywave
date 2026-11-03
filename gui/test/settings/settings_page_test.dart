@@ -117,6 +117,7 @@ void main() {
       connectionLabel: connection,
       canRetryNow: false,
       rejected: false,
+      canResetReplica: false,
       queued: 0,
       approvalsElsewhere: 0,
     );

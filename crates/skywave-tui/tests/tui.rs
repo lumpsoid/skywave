@@ -486,6 +486,13 @@ fn banner_shows_every_link_state() {
             }),
             "protocol mismatch · client v1, server v2 · update, then Ctrl-R",
         ),
+        (
+            Link::Rejected(LinkRejection::HistoryLost {
+                have: Seq(9),
+                server: Seq(4),
+            }),
+            "server lost history (had 9, server at 4) · sync stopped · restart with --reset-replica to start over",
+        ),
     ];
     for (link, text) in cases {
         h.seam.set_link(link);
@@ -1693,6 +1700,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
             server_id: skywave_proto::ServerId::new(),
             device_id: me,
             head: Seq::ZERO,
+            log: any_log(),
             devices: vec![
                 DeviceInfo {
                     id: phone,
@@ -7696,6 +7704,15 @@ fn without_the_servers_leave_the_mode_list_has_no_bypass() {
 
 // ---- shell mode -------------------------------------------------------------
 
+/// A log for a `hello` the view takes alone (no link checks it).
+fn any_log() -> skywave_proto::LogRun {
+    skywave_proto::LogRun {
+        log: skywave_proto::LogId::new(),
+        run: skywave_proto::RunId::new(),
+        since: None,
+    }
+}
+
 /// The server's `hello`, saying whether it runs shell commands.
 fn hello(h: &mut Harness, me: DeviceId, shell: bool) {
     hello_with(h, me, shell, false);
@@ -7710,6 +7727,7 @@ fn hello_with(h: &mut Harness, me: DeviceId, shell: bool, bypass: bool) {
             server_id: skywave_proto::ServerId::new(),
             device_id: me,
             head: Seq::ZERO,
+            log: any_log(),
             devices: Vec::new(),
             shell,
             bypass,

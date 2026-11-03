@@ -166,7 +166,7 @@ enum Dir {
 }
 
 struct Shared {
-    upstream: SocketAddr,
+    upstream: Mutex<SocketAddr>,
     rng: Rng,
     profile: watch::Sender<LinkProfile>,
     mode: Mutex<Mode>,
@@ -234,7 +234,7 @@ impl LinkProxy {
             .expect("bind the link proxy");
         let addr = listener.local_addr().expect("proxy address");
         let shared = Arc::new(Shared {
-            upstream,
+            upstream: Mutex::new(upstream),
             rng: Rng::new(seed),
             profile: watch::Sender::new(profile),
             mode: Mutex::new(Mode::Up),
@@ -288,6 +288,12 @@ impl LinkProxy {
             bytes_up: get(&c.bytes[Dir::Up as usize]),
             bytes_down: get(&c.bytes[Dir::Down as usize]),
         }
+    }
+
+    /// Forwards new connections to `upstream` from now on, e.g. a server
+    /// restarted on another port; live ones stay where they are.
+    pub fn retarget(&self, upstream: SocketAddr) {
+        *lock(&self.shared.upstream) = upstream;
     }
 
     /// Kills every live (and held) connection now.
@@ -386,7 +392,8 @@ impl Budget {
 }
 
 async fn connection(shared: Arc<Shared>, inbound: TcpStream, n: u64) {
-    let Ok(outbound) = TcpStream::connect(shared.upstream).await else {
+    let upstream = *lock(&shared.upstream);
+    let Ok(outbound) = TcpStream::connect(upstream).await else {
         return;
     };
     let _ = inbound.set_nodelay(true);
