@@ -1748,6 +1748,9 @@ pub struct PairResponse {
 /// Response to `GET /v1/hello`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HelloResponse {
+    /// Read alone before the rest is decoded, so a device can tell a
+    /// server of another version from a broken one: keep its name and
+    /// type in every version.
     pub protocol_version: u32,
     pub server_id: ServerId,
     /// The device the caller's certificate belongs to.

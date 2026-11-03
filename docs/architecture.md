@@ -101,7 +101,11 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 but pairing authenticated by the device's client certificate. The types'
 doc comments are the reference; `PROTOCOL_VERSION`'s lists what each
 version changed. Client and server must match it exactly (checked at
-`hello`); there is no compatibility layer.
+`hello`); there is no compatibility layer. The device reads the hello's
+`protocol_version` alone before decoding the rest, so a server of another
+version, whatever its hello's other fields, is a protocol mismatch rather
+than an unreadable reply; that one field must keep its name and type in
+every version.
 
 | Endpoint | Purpose |
 |----------|---------|
