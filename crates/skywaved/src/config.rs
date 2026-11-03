@@ -197,6 +197,14 @@ impl Config {
             path: path.to_owned(),
             source,
         })?;
+        // Bypass has one switch, `allow_bypass`, which `hello` reports:
+        // agent flags that enable it behind that switch are refused (D38).
+        if let Some(arg) = crate::agent::claude_code::bypass_arg(&raw.agent.args) {
+            return Err(Error::BypassInAgentArgs {
+                path: path.to_owned(),
+                arg,
+            });
+        }
         Self::resolve(raw, path.parent(), env)
     }
 
@@ -389,6 +397,54 @@ mod tests {
                 matches!(parse(bad), Err(Error::ConfigParse { .. })),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn agent_args_that_allow_bypass_are_refused() {
+        let parse = |args: &str| {
+            let text = format!("[agent]\nallow_bypass = true\nargs = [{args}]");
+            Config::parse(&text, Path::new("/c.toml"), &env(&[("HOME", "/h")]))
+        };
+        for (args, named) in [
+            (
+                r#""--dangerously-skip-permissions""#,
+                "--dangerously-skip-permissions",
+            ),
+            (
+                r#""--dangerously-skip-permissions=true""#,
+                "--dangerously-skip-permissions=true",
+            ),
+            (
+                r#""--allow-dangerously-skip-permissions""#,
+                "--allow-dangerously-skip-permissions",
+            ),
+            (
+                r#""--verbose", "--permission-mode", "bypassPermissions""#,
+                "--permission-mode bypassPermissions",
+            ),
+            (
+                r#""--permission-mode=bypassPermissions""#,
+                "--permission-mode=bypassPermissions",
+            ),
+        ] {
+            let err = parse(args).unwrap_err();
+            let Error::BypassInAgentArgs { arg, .. } = &err else {
+                panic!("{args}: {err:?}");
+            };
+            assert_eq!(arg, named);
+            let text = err.to_string();
+            assert!(text.contains("[agent] allow_bypass"), "{text}");
+        }
+        // Positive controls: other modes, and look-alikes, are fine.
+        for args in [
+            r#""--permission-mode", "acceptEdits""#,
+            r#""--permission-mode=plan""#,
+            r#""bypassPermissions""#,
+            r#""--dangerously-skip-permissionsX""#,
+            r#""--model", "haiku""#,
+        ] {
+            assert!(parse(args).is_ok(), "{args}");
         }
     }
 

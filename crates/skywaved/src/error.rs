@@ -17,6 +17,13 @@ pub enum Error {
         #[source]
         source: toml::de::Error,
     },
+    /// `agent.args` would turn bypass on behind `agent.allow_bypass` (D38).
+    #[error(
+        "config {}: `agent.args` has `{arg}`, which allows bypass mode; \
+         set `[agent] allow_bypass = true` instead",
+        path.display()
+    )]
+    BypassInAgentArgs { path: PathBuf, arg: String },
     #[error("no config directory: neither XDG_CONFIG_HOME nor HOME is set")]
     NoConfigDir,
     #[error("no data directory: set `data_dir` in the config, XDG_DATA_HOME or HOME")]

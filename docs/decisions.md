@@ -867,7 +867,17 @@ asks once more (`mode_needs_confirmation`).
 `SetPermissionMode` to bypass is `RejectReason::BypassDisabled`, from the
 config, before anything is logged or the agent asked: a definitive answer,
 not a guess from the agent's error text. A head that offered bypass from a
-stale `hello` gets that refusal.
+stale `hello` gets that refusal. A bypass request accepted before a restart
+that turned the opt-in off is refused by the supervisor
+(`PermissionModeRefused`, "bypass is not allowed on this server",
+answering its command) and never sent; nor does a start ask again for a
+bypass the agent last ran in, so the agent's own mode replaces it.
+**One switch.** `allow_bypass` is the only way in: the config refuses
+`agent.args` that would enable bypass behind it (Claude Code:
+`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`,
+`--permission-mode bypassPermissions`), so `hello` always tells the truth.
+The list is the adapter's (`claude_code::bypass_arg`); the config only
+calls it.
 **Rule suggestions too.** The agent's own "always allow every tool"
 suggestion is dropped from approval prompts without the opt-in, and a grant
 of it from while it was on is not applied again after it is turned off.

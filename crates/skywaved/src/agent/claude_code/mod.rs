@@ -141,6 +141,32 @@ pub const REQUIRED_ARGS: [&str; 8] = [
 /// `--dangerously-skip-permissions` would (docs/agents/claude-code.md §3.6).
 pub const ALLOW_BYPASS_ARG: &str = "--allow-dangerously-skip-permissions";
 
+/// The first of `args` (`agent.args`) that would let the CLI run in
+/// bypass on its own, as written: `--dangerously-skip-permissions`,
+/// [`ALLOW_BYPASS_ARG`], or `--permission-mode bypassPermissions` (either
+/// as two arguments or `=`-joined). Bypass has one switch, the server's
+/// `agent.allow_bypass` (D38), so the config refuses these.
+pub fn bypass_arg(args: &[String]) -> Option<String> {
+    const MODE: &str = "--permission-mode";
+    const BYPASS: &str = "bypassPermissions";
+    let flag = |arg: &str, name: &str| {
+        arg == name
+            || arg
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('='))
+    };
+    args.iter().enumerate().find_map(|(at, arg)| {
+        if flag(arg, "--dangerously-skip-permissions") || flag(arg, ALLOW_BYPASS_ARG) {
+            return Some(arg.clone());
+        }
+        if arg.strip_prefix(MODE).and_then(|r| r.strip_prefix('=')) == Some(BYPASS) {
+            return Some(arg.clone());
+        }
+        (arg == MODE && args.get(at + 1).map(String::as_str) == Some(BYPASS))
+            .then(|| format!("{MODE} {BYPASS}"))
+    })
+}
+
 /// How long shutdown waits for a turn to end, and then for the exit.
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// How long start waits for the initialize handshake.
