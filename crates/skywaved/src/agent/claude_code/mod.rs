@@ -69,6 +69,15 @@
 //! reported as an `Exited` error, so a wedged process cannot block its
 //! session.
 //!
+//! **Unanswered interrupts.** The CLI is sent one interrupt per turn. An
+//! [`AgentSession::escalate_interrupt`] (the user interrupting again) that
+//! arrives while that interrupt is unanswered, the turn's `result` not yet
+//! read, kills the process as an abandoned shutdown does and reports
+//! [`INTERRUPT_UNANSWERED`](super::INTERRUPT_UNANSWERED) as the `Exited`
+//! error. One arriving after the result does nothing: it follows its
+//! interrupt on the same request channel, so the turn running then, if any,
+//! is a later one (a queued message's).
+//!
 //! **Output.** stdout is read as raw lines ([`lines`]): bytes that are not
 //! UTF-8 are replaced, and a line over [`lines::MAX_LINE`] is dropped. Either
 //! way the line is stray output, like one that is not JSON, and reading goes
@@ -108,7 +117,7 @@ use self::lines::{Line, LineReader, MAX_LINE};
 use self::protocol::{Output, Protocol};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    Conversation, Effort, PermissionMode, StartSpec,
+    Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, StartSpec,
 };
 use crate::config::AgentConfig;
 use crate::process::{self, DEFAULT_TERM_GRACE, Group};
@@ -516,6 +525,10 @@ impl AgentSession for ClaudeCodeSession {
         self.request(Request::Interrupt)
     }
 
+    async fn escalate_interrupt(&mut self) -> Result<(), AgentError> {
+        self.request(Request::EscalateInterrupt)
+    }
+
     async fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), AgentError> {
         self.request(Request::Mode(mode))
     }
@@ -547,6 +560,7 @@ enum Request {
     Message(String),
     Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
+    EscalateInterrupt,
     Mode(PermissionMode),
     Model(String),
     Effort(Effort),
@@ -756,6 +770,16 @@ impl Driver {
                             self.protocol.answer(&request, decision, rule)
                         }
                         Some(Request::Interrupt) => self.protocol.interrupt(),
+                        // The interrupt is unanswered while its turn's
+                        // result has not been read: a definitive signal,
+                        // not a timeout.
+                        Some(Request::EscalateInterrupt) if self.protocol.interrupting() => {
+                            break self.stop_unanswered().await;
+                        }
+                        // The interrupt it repeats came first on this
+                        // channel, so its turn is over: a turn running now
+                        // (a queued message's) is not the one interrupted.
+                        Some(Request::EscalateInterrupt) => Output::default(),
                         Some(Request::Mode(mode)) => self.protocol.set_permission_mode(mode),
                         Some(Request::Model(model)) => self.protocol.set_model(model),
                         Some(Request::Effort(effort)) => self.protocol.set_effort(effort),
@@ -833,6 +857,16 @@ impl Driver {
             self.process.drain_stderr().await;
         }
         None
+    }
+
+    /// The interrupt went unanswered and the user asked again: kills the
+    /// process like an abandoned shutdown, reporting why. What the CLI
+    /// says as it dies (a result for the turn included) is still reported.
+    async fn stop_unanswered(&mut self) -> Option<String> {
+        tracing::warn!("agent did not answer the interrupt; killing it");
+        self.protocol.begin_shutdown();
+        self.kill().await;
+        Some(INTERRUPT_UNANSWERED.to_owned())
     }
 
     /// Kills the process, reporting what it says until its stdout ends: on

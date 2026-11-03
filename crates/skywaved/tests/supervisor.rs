@@ -21,7 +21,7 @@ use skywaved::agent::fake::{
     REFUSE_REASON, Step, schedule, task,
 };
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
-use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead};
+use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED};
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
@@ -1746,6 +1746,60 @@ async fn daemon_restart_cancels_a_claude_approval_left_pending_at_shutdown() {
     let pid = fake_cli_pid(&f);
     supervisor.shutdown().await.unwrap();
     assert!(!process_exists(pid), "agent process {pid} still exists");
+}
+
+#[tokio::test]
+async fn a_repeated_interrupt_stops_an_agent_that_ignores_the_first() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+    let said = |text: &'static str| move |k: &EventKind| matches!(k, EventKind::AgentMessage { text: t, .. } if t == text);
+
+    f.send("stuck");
+    f.wait_count("working", 1, said("working")).await;
+    let pid = fake_cli_pid(&f);
+    accepted(f.interrupt());
+    // The CLI got the interrupt and ignores it: the turn stays open.
+    f.wait_count("the interrupt ignored", 1, said("ignored"))
+        .await;
+    accepted(f.interrupt());
+    let kinds = f.wait_count("errored", 1, is_errored).await;
+    assert_eq!(
+        kinds.last(),
+        Some(&state(SessionState::Errored {
+            message: format!("agent exited: {INTERRUPT_UNANSWERED}")
+        }))
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == EventKind::TurnInterrupted)
+            .count(),
+        2
+    );
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    // The turn is over: nothing left to interrupt.
+    assert_eq!(
+        f.interrupt(),
+        CommandResult::Rejected {
+            reason: RejectReason::NoActiveTurn
+        }
+    );
+
+    // The next message resumes the agent.
+    f.send("again");
+    f.wait_count("idle", 1, is_idle).await;
+    assert!(argv_has_resume(&f), "the agent was not resumed");
+    let pid = fake_cli_pid(&f);
+    supervisor.shutdown().await.unwrap();
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+}
+
+/// Whether the fake CLI last ran with `--resume`, from `argv.txt`.
+fn argv_has_resume(f: &Fixture) -> bool {
+    std::fs::read_to_string(f.root.join("project/argv.txt"))
+        .unwrap()
+        .lines()
+        .any(|arg| arg == "--resume")
 }
 
 fn is_setting_answer(kind: &EventKind) -> bool {

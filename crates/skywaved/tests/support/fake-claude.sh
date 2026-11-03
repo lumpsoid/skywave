@@ -14,6 +14,8 @@
 # One containing "litter" first writes a stray line that is not JSON; one
 # containing "quit" then exits 0, mid-turn and without a word.
 # One containing "run" starts the Write call and runs it until interrupted.
+# One containing "stuck" gets the text "working", then the CLI answers
+# nothing more, interrupts included (each one gets the text "ignored").
 # A SIGTERM makes the CLI write ./term.txt and exit, reporting a running
 # call as killed first, as the real CLI does (§6).
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id,
@@ -187,6 +189,18 @@ while IFS= read -r line; do
           text "deaf"
           result_ok
           sleep 300
+          ;;
+        *stuck*)
+          # Hung: answers nothing it reads, until stdin ends or a SIGTERM
+          # comes. Each interrupt it ignores gets the text "ignored", so a
+          # test sees it arrive; the turn stays open.
+          text "working"
+          while IFS= read -r req; do
+            case "$req" in
+              *'"subtype":"interrupt"'*) text "ignored" ;;
+            esac
+          done
+          exit 0
           ;;
         *hang*)
           text "working"

@@ -392,6 +392,8 @@ fn each_accepted_command_logs_one_event_naming_it() {
         "SessionCreated, two Imported, then the create's ImportFinished"
     );
     logged.push((adopt.id, seq));
+    // The interrupted turn ends; until then an interrupt is a repeat.
+    f.agent(session, EventKind::SessionStateChanged(SessionState::Idle));
     let head = f.log.head();
     let (_, refused, _) = send(
         &mut f,
@@ -1141,7 +1143,17 @@ fn interrupt_needs_an_active_turn_and_ends_it() {
             .unwrap()
             .turn_active
     );
-    // The turn is already interrupted, so a second interrupt has nothing to stop.
+    // Until the agent ends the interrupted turn, an interrupt is a repeat
+    // (the supervisor escalates it), stamped like the first.
+    let again = accepted(f.handle(CommandKind::Interrupt {
+        session_id: session,
+    }));
+    let events = f.all_events();
+    let (first, repeat) = (&events[seq.0 as usize - 1], &events[again.0 as usize - 1]);
+    assert_eq!(repeat.kind, EventKind::TurnInterrupted);
+    assert_eq!(repeat.context, first.context);
+    f.agent(session, EventKind::SessionStateChanged(SessionState::Idle));
+    // Ended: nothing left to stop.
     assert_eq!(
         f.handle(CommandKind::Interrupt {
             session_id: session

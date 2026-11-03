@@ -1135,7 +1135,9 @@ waiting on stays pending.
   retried the tool, which failed with "Stream closed", then wrote text and
   `result/success`. The CLI exited only after that. So closing stdin is
   **not** a way to stop work. To stop a turn, T09 sends `interrupt` and
-  waits for `result`. To stop the process, it closes stdin when idle, or
+  waits for `result`; it sends one per turn, and a repeated interrupt from
+  the user before that `result` kills the process instead (a CLI that never
+  answers would otherwise hold the turn). To stop the process, it closes stdin when idle, or
   kills the process if it does not exit within a grace period.
 - **stderr [C].** Empty in every stream-json run. Startup errors (bad flags,
   an unknown resume id, a session id already in use) are printed as one line,

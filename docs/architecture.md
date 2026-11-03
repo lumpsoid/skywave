@@ -191,7 +191,11 @@ not migrated). A database from before the stamp takes the current version.
   else fresh. A clear or switch stops a running agent like `StopSession`.
   The session's grants pass to every start of its contexts, never to
   another session. An approval waits with no timeout but ends with the agent
-  process. On daemon start every pending approval gets
+  process. An `Interrupt` repeated before the agent ends the interrupted
+  turn is accepted and stops an agent that has not answered the first
+  (no timer: the turn's end is the answer); the turn ends `Errored`
+  ("agent did not answer the interrupt; stopped it") and the next
+  message resumes the agent. On daemon start every pending approval gets
   `ApprovalCancelled { reason: "daemon restarted" }` and every call left
   without a result is named in a `CallsUnanswered`. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
