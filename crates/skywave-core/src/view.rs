@@ -412,6 +412,60 @@ pub struct SessionListView {
     /// ([`Action::CompleteWorkdir`](crate::Action::CompleteWorkdir)); only
     /// on the active list.
     pub completion: Option<Completion>,
+    /// The server agent's conversations to continue one in a new session,
+    /// while the picker is open
+    /// ([`Action::ListConversations`](crate::Action::ListConversations));
+    /// only on the active list.
+    pub conversations: Option<ConversationPicker>,
+}
+
+/// The conversations the server's agent keeps, as the server last listed
+/// them on request. In memory only: a listing of another machine's
+/// terminal sessions goes stale at once and is cheap to ask for again.
+/// Continuing one is [`Action::CreateSession`](crate::Action::CreateSession)
+/// with the item's `workdir` and `id` as `conversation`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationPicker {
+    pub status: ConversationsStatus,
+    /// Newest first, as the server sent them; empty until it answers, and
+    /// when it could not.
+    pub items: Vec<ConversationItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationsStatus {
+    /// Asked; no answer yet.
+    Loading,
+    /// The server answered; `truncated` when it listed only the newest.
+    Ready { truncated: bool },
+    /// No listing, and why: offline (nothing is asked for later), an agent
+    /// that cannot list its conversations, a refused or timed-out request.
+    Unavailable(String),
+}
+
+/// One conversation the server's agent had, in or outside Skywave. Texts
+/// come from the server: heads sanitise them before writing them raw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationItem {
+    /// The agent's id for it: what `CreateSession::conversation` takes.
+    pub id: String,
+    /// The server directory it ran in: the new session's workdir.
+    pub workdir: String,
+    /// The agent's title for it.
+    pub title: Option<String>,
+    /// The first line of its first message.
+    pub first_prompt: Option<String>,
+    pub last_active: DateTime<Utc>,
+    /// User and agent messages in it.
+    pub messages: u32,
+    /// The Skywave session one of whose contexts runs it now, if the server
+    /// says so and that session is in this device's replica (not deleted
+    /// here, already pulled): it is already in Skywave.
+    pub session: Option<SessionId>,
+    /// Sessions in the replica that adopted it, most recently active first,
+    /// archived ones included. Adopting it
+    /// again is allowed; heads say it was continued before.
+    pub continued_in: Vec<SessionId>,
 }
 
 /// The session list's two halves: [`Route::SessionList`](crate::Route) and

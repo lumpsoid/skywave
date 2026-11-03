@@ -297,6 +297,19 @@ CREATE INDEX workdir_blob_refs_by_blob ON workdir_blob_refs (blob_id);
 -- events of v16, so no session is mid-import: nothing to backfill.
 ALTER TABLE sessions ADD COLUMN importing INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- `SessionSummary::adopted`: the outside conversation a session adopted, as
+-- its `SessionCreated` names it (`from` of kind `agent`, protocol v12 on).
+-- Backfilled from the stored log.
+ALTER TABLE sessions ADD COLUMN adopted TEXT;
+UPDATE sessions SET adopted = (SELECT json_extract(event, '$.kind.from.conversation')
+    FROM events
+    WHERE session_id = sessions.id
+        AND json_extract(event, '$.kind.type') = 'session_created'
+        AND json_extract(event, '$.kind.from.kind') = 'agent'
+    ORDER BY seq
+    LIMIT 1);
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -1613,7 +1626,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing";
+    stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing, adopted";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -1628,7 +1641,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         ),
         params![
             summary.id.0.to_string(),
@@ -1647,6 +1660,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             summary.context.0.to_string(),
             to_json(&summary.work)?,
             summary.importing,
+            summary.adopted,
         ],
     )?;
     Ok(())
@@ -1670,6 +1684,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         context: ContextId(uuid_col(row, 13)?),
         work: opt_json_col(row, 14)?.unwrap_or_default(),
         importing: row.get(15)?,
+        adopted: row.get(16)?,
     })
 }
 

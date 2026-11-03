@@ -58,6 +58,10 @@ pub struct SessionSummary {
     /// `SessionOrigin::Agent`) and its `ImportFinished` is not in the
     /// replica yet: an import too long for one pull is still arriving.
     pub importing: bool,
+    /// The agent's id of the outside conversation the session adopted (its
+    /// `SessionCreated` came from `SessionOrigin::Agent`): what the
+    /// conversation picker's `continued_in` looks up.
+    pub adopted: Option<String>,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -159,6 +163,7 @@ impl SessionSummary {
             work: AgentWork::default(),
             context: ContextId::first_of(event.session_id),
             importing: false,
+            adopted: None,
         };
         summary.apply(seq, event);
         summary
@@ -232,7 +237,11 @@ impl SessionSummary {
             EventKind::SessionCreated { workdir, from, .. } => {
                 self.workdir = Some(workdir.clone());
                 self.context = event.context;
-                self.importing = matches!(from, Some(SessionOrigin::Agent { .. }));
+                self.adopted = match from {
+                    Some(SessionOrigin::Agent { conversation }) => Some(conversation.clone()),
+                    _ => None,
+                };
+                self.importing = self.adopted.is_some();
             }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } => {
