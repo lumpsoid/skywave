@@ -89,6 +89,11 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 - **Payloads:** event metadata is small; large content (tool outputs, file
   contents, logs) is a blob referenced by id and fetched separately.
 - **Transport** sits behind a `Transport` trait: HTTPS today, QUIC later.
+- **Slowest link:** an event batch or blob body is timed per chunk, not as
+  a whole, so a slow link that keeps delivering bytes finishes. A chunk is
+  one TLS record (up to 16 KB) and must arrive within `request_timeout`
+  (30 s), so below about 550 B/s the link counts as dead. Accepted limit:
+  revisit only if a real network that slow turns up.
 
 ## Protocol
 
