@@ -33,14 +33,18 @@
 //! - the *outbox sender* sends the oldest pending command, marking it
 //!   `Sending` first, and waits for its `CommandResult` before the next, so
 //!   the server sees commands in the order they were made. A failed send is
-//!   repeated with the same command id; the server dedups (D7).
+//!   repeated with the same command id; the server dedups (D7). A refusal
+//!   (4xx), an unreadable reply or a server error (5xx) is an answer about
+//!   one command, so it keeps the connection and the pull going
+//!   ([`send_entry`]); after [`MAX_SERVER_ERRORS`] server errors in a row
+//!   the command is settled from the log instead of sent again.
 //!
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
 //! head `hello` reported (or a later batch revealed), else
 //! `Online { latency_ms }` with `hello`'s round trip — blob downloads play
-//! no part: metadata synced counts as synced (D6). Any failure ends the
-//! connection: a rejection (401/403, protocol mismatch) shows
+//! no part: metadata synced counts as synced (D6). Any other failure ends
+//! the connection: a rejection (401/403, protocol mismatch) shows
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
 //! else shows `Reconnecting { attempt, retry_at, offline_since }`, waits
 //! [`Backoff::delay`] and connects again, still showing `Reconnecting`
@@ -113,6 +117,13 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(12);
 /// the `retry_at` the view shows. Only waits longer than this tick more
 /// than once, and only while the device is awake.
 pub const WALL_CHECK: Duration = Duration::from_secs(5);
+/// How many server errors (5xx answers,
+/// [`TransportError::is_server_error`]) in a row the outbox takes for the
+/// command at its head before it stops resending it and settles it from
+/// the log: accepted if the log holds its event, else undeliverable. Until
+/// then each resend waits [`Backoff::delay`] for the count so far, on the
+/// same connection, so the pull goes on meanwhile.
+pub const MAX_SERVER_ERRORS: u32 = 5;
 
 /// How the sync engine talks to the server; [`Default`] is what heads use.
 #[derive(Debug, Clone)]
@@ -575,6 +586,29 @@ impl Retry {
     }
 }
 
+/// The server errors counted against the command at the head of the
+/// outbox ([`MAX_SERVER_ERRORS`]). Kept by the link across connections, so
+/// a connection that drops for another reason does not start the count
+/// over; in memory only, so a restart does.
+#[derive(Default)]
+struct ServerErrors {
+    id: Option<CommandId>,
+    count: u32,
+}
+
+impl ServerErrors {
+    /// Counts one more server error for `id` and returns the count. A
+    /// different command starts over: only the head of the outbox is sent.
+    fn note(&mut self, id: CommandId) -> u32 {
+        if self.id != Some(id) {
+            self.id = Some(id);
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count
+    }
+}
+
 /// How a connection ended and how far it got.
 struct Ended {
     error: LinkError,
@@ -603,11 +637,12 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
     };
     reporter.set(Link::Connecting);
     let mut retry = Retry::default();
+    let mut errors = ServerErrors::default();
     let mut transport: Option<Arc<dyn Transport>> = None;
     loop {
         let error = match &transport {
             Some(transport) => {
-                let ended = connection(&ctx, transport.as_ref(), &mut reporter).await;
+                let ended = connection(&ctx, transport.as_ref(), &mut reporter, &mut errors).await;
                 retry.connection_ended(&ended);
                 ended.error
             }
@@ -699,11 +734,14 @@ impl Wait {
     }
 }
 
-/// One connection: `hello`, then pull and send until either fails.
+/// One connection: `hello`, then pull and send until either fails. A
+/// server error for one command is not a failure of the sender
+/// ([`send_entry`]), so it never cuts the pull short.
 async fn connection(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     reporter: &mut LinkReporter,
+    errors: &mut ServerErrors,
 ) -> Ended {
     let started = tokio::time::Instant::now();
     let hello = match transport.hello().await {
@@ -717,7 +755,7 @@ async fn connection(
     let progress = AtomicBool::new(false);
     let ended = tokio::select! {
         ended = pull(ctx, transport, reporter, &progress, hello.head, latency_ms) => ended,
-        ended = send(ctx, transport, &progress) => ended,
+        ended = send(ctx, transport, &progress, errors) => ended,
     };
     let Err(error) = ended;
     Ended {
@@ -800,13 +838,14 @@ async fn send(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     progress: &AtomicBool,
+    errors: &mut ServerErrors,
 ) -> Result<Infallible, LinkError> {
     loop {
         let Some(entry) = ctx.seam.pending_outbox()?.into_iter().next() else {
             ctx.outbox.notified().await;
             continue;
         };
-        if send_entry(ctx, transport, &entry).await? {
+        if send_entry(ctx, transport, &entry, errors).await? {
             progress.store(true, Ordering::Relaxed);
         }
     }
@@ -827,10 +866,19 @@ async fn send(
 /// unreadable reply before the pull can apply the event. It does not count
 /// as settled by the server here: the pull that settles it is progress of
 /// its own.
+///
+/// A server error (5xx) is an answer too, but not about the command: the
+/// link stays up and the entry is sent again after [`Backoff::delay`] for
+/// the count so far, so the pull on this connection goes on meanwhile. The
+/// [`MAX_SERVER_ERRORS`]th in a row for one command ends the resends: it is
+/// settled from the log like an unreadable reply, so one command the server
+/// keeps failing cannot hold back every later one forever, and one it did
+/// take (D7 dedups the resends) is not shown failed.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     entry: &OutboxEntry,
+    errors: &mut ServerErrors,
 ) -> Result<bool, LinkError> {
     let id = entry.command.id;
     if !ctx.seam.command_sending(id)? {
@@ -849,6 +897,18 @@ async fn send_entry(
         Err(TransportError::Decode(error)) => {
             tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
             settled_by_log(ctx, transport, id).await?;
+            Ok(false)
+        }
+        Err(error) if error.is_server_error() => {
+            let count = errors.note(id);
+            if count < MAX_SERVER_ERRORS {
+                let after = ctx.config.backoff.delay(count);
+                tracing::warn!(%error, ?id, count, ?after, "server error; sending again");
+                tokio::time::sleep(after).await;
+            } else {
+                tracing::warn!(%error, ?id, count, "server error again; settling from the log");
+                settled_by_log(ctx, transport, id).await?;
+            }
             Ok(false)
         }
         Err(error) => Err(error.into()),
@@ -1648,8 +1708,12 @@ mod tests {
         let progress = AtomicBool::new(false);
 
         // The sender drains the outbox, then waits for more forever.
-        let drained =
-            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
+        let errors = &mut ServerErrors::default();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(1),
+            send(&ctx, &server, &progress, errors),
+        )
+        .await;
         assert!(drained.is_err(), "the sender only ends on an error");
         assert!(progress.load(Ordering::Relaxed), "answers are progress");
         assert_eq!(
@@ -1677,14 +1741,15 @@ mod tests {
                 [deleted.id.0.to_string()],
             )
             .unwrap();
-        assert!(!send_entry(&ctx, &server, &entry).await.unwrap());
+        let errors = &mut ServerErrors::default();
+        assert!(!send_entry(&ctx, &server, &entry, errors).await.unwrap());
 
         let answered = enqueue(&seam, "answered");
         let entry = seam.pending_outbox().unwrap().remove(0);
         seam.command_result(answered.id, &CommandResult::Accepted { seq: Seq(1) })
             .unwrap();
         assert!(
-            !send_entry(&ctx, &server, &entry).await.unwrap(),
+            !send_entry(&ctx, &server, &entry, errors).await.unwrap(),
             "a skipped row is no progress"
         );
 
@@ -1767,8 +1832,12 @@ mod tests {
         let ctx = sender_ctx(&seam);
         let progress = AtomicBool::new(false);
 
-        let drained =
-            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
+        let errors = &mut ServerErrors::default();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(1),
+            send(&ctx, &server, &progress, errors),
+        )
+        .await;
         assert!(drained.is_err(), "the refusal does not end the sender");
         assert_eq!(*server.seen.lock().unwrap(), ["/bad", "/good"]);
         assert!(seam.pending_outbox().unwrap().is_empty());
@@ -1802,10 +1871,13 @@ mod tests {
         assert!(outbox[0].answered_at.is_some());
     }
 
-    /// A 5xx is the server's trouble, not the command's: the sender ends
-    /// so the link backs off and sends the same command again.
+    /// A 5xx is the server's answer, but not about the command: the sender
+    /// does not end, and sends the same command again after a backoff, up
+    /// to [`MAX_SERVER_ERRORS`] times in a row. Then it turns to the log
+    /// (`hello` for the head), which this server cannot give, so only then
+    /// does the sender end; the command behind never went out.
     #[tokio::test(start_paused = true)]
-    async fn a_server_error_keeps_the_command_queued() {
+    async fn a_server_error_resends_the_command_up_to_the_limit() {
         let dir = tempfile::tempdir().unwrap();
         let seam = paired_seam(dir.path());
         create(&seam, "/busy");
@@ -1817,15 +1889,25 @@ mod tests {
         };
         let ctx = sender_ctx(&seam);
         let progress = AtomicBool::new(false);
+        let errors = &mut ServerErrors::default();
 
-        let ended =
-            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
-        assert!(matches!(
-            ended,
-            Ok(Err(LinkError::Transport(TransportError::BadStatus(503))))
-        ));
+        let ended = tokio::time::timeout(
+            Duration::from_secs(120),
+            send(&ctx, &server, &progress, errors),
+        )
+        .await;
+        assert!(
+            matches!(
+                ended,
+                Ok(Err(LinkError::Transport(TransportError::Io(ref unused)))) if unused == "unused"
+            ),
+            "{ended:?}"
+        );
         assert!(!progress.load(Ordering::Relaxed), "a 5xx is no progress");
-        assert_eq!(*server.seen.lock().unwrap(), ["/busy"]);
+        assert_eq!(
+            *server.seen.lock().unwrap(),
+            ["/busy"; MAX_SERVER_ERRORS as usize]
+        );
         assert_eq!(seam.pending_outbox().unwrap().len(), 2);
     }
 

@@ -387,7 +387,9 @@ pub enum OutboxStatus {
     /// The server's answer; final.
     Done(CommandResult),
     /// The server refused the request without an answer
-    /// ([`TransportError::refuses_command`](crate::TransportError::refuses_command));
+    /// ([`TransportError::refuses_command`](crate::TransportError::refuses_command)),
+    /// or the log shows it never applied after an unreadable reply or
+    /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors;
     /// final, never sent again.
     Undeliverable,
 }

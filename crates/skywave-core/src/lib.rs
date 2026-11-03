@@ -53,8 +53,8 @@ pub use backoff::{Backoff, Jitter};
 pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
-    CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, WALL_CHECK, WallClock,
-    default_device_name,
+    CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, MAX_SERVER_ERRORS,
+    WALL_CHECK, WallClock, default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};

@@ -200,6 +200,15 @@ impl TransportError {
         }
     }
 
+    /// The server answered with an error of its own (5xx): it is up, and
+    /// the request reached something that could not handle it. Unlike a
+    /// timeout or a broken connection, this is a definitive answer, so the
+    /// outbox counts it against the command
+    /// ([`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS)).
+    pub fn is_server_error(&self) -> bool {
+        matches!(self, TransportError::BadStatus(status) if (500..600).contains(status))
+    }
+
     /// The server refuses this device for good: the link becomes
     /// [`Link::Rejected`](crate::Link::Rejected) until the user re-pairs.
     pub fn rejection(&self) -> Option<LinkRejection> {
@@ -253,5 +262,10 @@ mod tests {
         assert!(!TransportError::NotFound.refuses_command());
         assert!(!TransportError::Revoked.refuses_command());
         assert!(!TransportError::Timeout.refuses_command());
+        assert!(TransportError::BadStatus(500).is_server_error());
+        assert!(TransportError::BadStatus(503).is_server_error());
+        assert!(!TransportError::BadStatus(429).is_server_error());
+        assert!(!TransportError::Timeout.is_server_error());
+        assert!(!TransportError::Io("x".into()).is_server_error());
     }
 }

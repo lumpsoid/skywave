@@ -310,7 +310,13 @@ writes.
   they were made. A pulled event naming an unanswered command settles it as
   `Accepted` at its seq; a reply that stays unreadable is settled from the
   log, or failed as undeliverable once the replica has passed the log head
-  read after it, so it is never resent into a duplicate. Reconnects back off
+  read after it, so it is never resent into a duplicate. A refusal (4xx),
+  an unreadable reply or a server error (5xx) is an answer about one
+  command and keeps the connection, so the pull goes on. A 5xx is resent
+  after a backoff; after `MAX_SERVER_ERRORS` (5) in a row the command is
+  settled from the log the same way, so one the server keeps failing ends
+  undeliverable (shown failed, discardable, never resent) instead of
+  holding back every later command. Reconnects back off
   exponentially with jitter to 30 s. The attempt count starts over after a
   connection that made progress (a pull returned or the server settled a
   command); `hello` alone is not progress, so a server that answers it and

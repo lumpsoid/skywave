@@ -17,8 +17,8 @@ use std::time::Duration;
 use chrono::Utc;
 use skywave_core::{
     Action, ApprovalStatus, BlobDownload, BoxFuture, Connector, Core, Decision, EngineConfig,
-    Entry, FailReason, HttpsTransport, Link, LinkRejection, OutboxStatus, Outgoing, Screen,
-    SessionRow, TimelineItem, Transport, TransportError, ViewState,
+    Entry, FailReason, HttpsTransport, Link, LinkRejection, MAX_SERVER_ERRORS, OutboxStatus,
+    Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError, ViewState,
 };
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
@@ -1259,4 +1259,234 @@ async fn the_shell_flag_from_hello_is_kept_for_offline() {
         assert_eq!(offline.link, Link::Connecting, "never online");
         assert_eq!(shown(&offline), Some(shell), "kept over a restart");
     }
+}
+
+/// Answers every send of the message `text` with a 503 of its own, never
+/// passing it on, and counts them in `sends`; the `n`th such send of
+/// `hold` first waits for a permit of its semaphore. Everything else goes
+/// to the real server.
+struct ServerErrorFor {
+    inner: Arc<dyn Transport>,
+    text: &'static str,
+    sends: Arc<AtomicUsize>,
+    hold: Option<(usize, Arc<tokio::sync::Semaphore>)>,
+}
+
+impl Transport for ServerErrorFor {
+    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        self.inner.hello()
+    }
+
+    fn send_command<'a>(
+        &'a self,
+        command: &'a Command,
+    ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+        if !matches!(&command.kind, CommandKind::SendMessage { text, .. } if text == self.text) {
+            return self.inner.send_command(command);
+        }
+        Box::pin(async move {
+            let n = self.sends.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((at, gate)) = &self.hold
+                && n == *at
+            {
+                gate.acquire().await.unwrap().forget();
+            }
+            Err(TransportError::BadStatus(503))
+        })
+    }
+
+    fn events(&self, query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+        self.inner.events(query)
+    }
+
+    fn blob(&self, id: BlobId, from: u64) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+        self.inner.blob(id, from)
+    }
+}
+
+/// A client whose sends of the message `text` all get a 503
+/// ([`ServerErrorFor`]).
+fn server_error_for(
+    text: &'static str,
+    sends: Arc<AtomicUsize>,
+    hold: Option<(usize, Arc<tokio::sync::Semaphore>)>,
+) -> Client {
+    Client::open(EngineConfig {
+        connector: Connector::new(move |address, identity, config| {
+            let inner = HttpsTransport::new(address, identity, config.clone())?;
+            Ok(Arc::new(ServerErrorFor {
+                inner: Arc::new(inner),
+                text,
+                sends: sends.clone(),
+                hold: hold.clone(),
+            }) as Arc<dyn Transport>)
+        }),
+        ..config()
+    })
+}
+
+/// The pending item for the command `id` in `session`'s timeline, as
+/// (outgoing, discardable).
+fn pending(session: &skywave_core::SessionView, id: CommandId) -> Option<(Outgoing, bool)> {
+    session.timeline.iter().find_map(|item| match item {
+        TimelineItem::Pending {
+            command_id,
+            outgoing,
+            discardable,
+            ..
+        } if *command_id == id => Some((*outgoing, *discardable)),
+        _ => None,
+    })
+}
+
+/// A message the server answers with a 5xx every time is sent
+/// `MAX_SERVER_ERRORS` times, then, as the log never shows it, fails as
+/// undeliverable instead of holding back the queue: the message behind it
+/// goes out, the failed one is never sent again, and the user can discard
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_the_server_keeps_failing_becomes_undeliverable_and_the_next_goes_out() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&daemon).await;
+    let sends = Arc::new(AtomicUsize::new(0));
+    let client = server_error_for("poison", sends.clone(), None);
+    daemon.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&daemon).await;
+
+    for text in ["poison", "after"] {
+        client.dispatch(Action::SendMessage {
+            session_id: session,
+            text: text.into(),
+        });
+    }
+    let ids: Vec<CommandId> = client.outbox()[1..].iter().map(|e| e.command.id).collect();
+    let (poison, after) = (ids[0], ids[1]);
+
+    client
+        .wait("the poison to fail and the next to go out", |c, _| {
+            let outbox = c.outbox();
+            let status = |id| {
+                outbox
+                    .iter()
+                    .find(|e| e.command.id == id)
+                    .unwrap()
+                    .status
+                    .clone()
+            };
+            status(poison) == OutboxStatus::Undeliverable
+                && matches!(
+                    status(after),
+                    OutboxStatus::Done(CommandResult::Accepted { .. })
+                )
+        })
+        .await;
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        MAX_SERVER_ERRORS as usize,
+        "sent up to the limit, then settled from the log"
+    );
+    daemon
+        .wait_log("the echo", |events| {
+            count(
+                events,
+                |k| matches!(k, EventKind::AgentMessage { text, .. } if text.starts_with("echo:")),
+            ) == 1
+        })
+        .await;
+    assert_eq!(
+        user_messages(&daemon.events()),
+        vec![(after, "after".to_owned())]
+    );
+
+    let view = client
+        .open_session(session, |s| pending(s, poison).is_some())
+        .await;
+    assert_eq!(
+        pending(&view, poison),
+        Some((Outgoing::Failed(FailReason::Undeliverable), true)),
+        "shown failed, and the user may take it back"
+    );
+    client.dispatch(Action::Discard(poison));
+    client
+        .open_session(session, |s| pending(s, poison).is_none())
+        .await;
+    assert!(client.outbox().iter().all(|e| e.command.id != poison));
+    // Nothing woke the sender for it again.
+    client
+        .wait("caught up", |c, _| c.cursor() == daemon.head())
+        .await;
+    assert_eq!(sends.load(Ordering::SeqCst), MAX_SERVER_ERRORS as usize);
+}
+
+/// A server error for one command keeps the connection: the pull goes on
+/// and applies another device's events while the command is still being
+/// resent, and the link never shows `Reconnecting`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_error_on_a_send_does_not_stop_the_pull() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let daemon = Daemon::start(agent).await;
+    let (proxy_a, proxy_b) = (proxy(&daemon).await, proxy(&daemon).await);
+    let sends = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = server_error_for("poison", sends.clone(), Some((2, gate.clone())));
+    let b = Client::open(config());
+    daemon.pair(&a, &proxy_a.address()).await;
+    daemon.pair(&b, &proxy_b.address()).await;
+    let session = a.create_session(&daemon).await;
+    daemon.settle(&[&a, &b], SOON).await;
+
+    let links = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = links.clone();
+    a.core
+        .subscribe(move |view| sink.lock().unwrap().push(view.link));
+    a.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "poison".into(),
+    });
+    let poison = a.outbox().last().unwrap().command.id;
+    // The second claim comes after the first send got its 503, on the same
+    // connection; that send then waits at the gate.
+    a.wait("the resend", |c, _| {
+        c.outbox()
+            .iter()
+            .any(|e| e.command.id == poison && e.tries == 2)
+    })
+    .await;
+    assert_eq!(
+        links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| is_reconnecting(l))
+            .count(),
+        0
+    );
+
+    // Another device makes the log grow; a pulls it meanwhile.
+    b.create_session(&daemon).await;
+    a.wait("a to pull b's session", |c, _| c.cursor() == daemon.head())
+        .await;
+    let entry = a
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == poison)
+        .unwrap();
+    assert_eq!(entry.status, OutboxStatus::Sending, "still being sent");
+    assert_eq!(entry.tries, 2);
+    assert!(sends.load(Ordering::SeqCst) <= 2);
+
+    gate.add_permits(1);
+    a.wait("the poison to fail", |c, _| {
+        c.outbox()
+            .iter()
+            .any(|e| e.command.id == poison && e.status == OutboxStatus::Undeliverable)
+    })
+    .await;
+    let links = links.lock().unwrap().clone();
+    assert!(!links.is_empty());
+    assert!(
+        links.iter().all(|link| !is_reconnecting(link)),
+        "the connection held: {links:?}"
+    );
 }

@@ -249,7 +249,8 @@ impl Seam {
         })
     }
 
-    /// Settles the command `id`, whose reply was unreadable, from the log:
+    /// Settles the command `id`, whose reply was unreadable (or which got
+    /// [`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS) server errors), from the log:
     /// returns whether it is settled. `head` is the server's log head read
     /// after that reply. An accepted command logs its event before the
     /// server replies, so once the replica has applied the log through
