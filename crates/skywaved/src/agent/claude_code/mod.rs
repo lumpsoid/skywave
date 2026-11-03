@@ -73,6 +73,13 @@
 //! UTF-8 are replaced, and a line over [`lines::MAX_LINE`] is dropped. Either
 //! way the line is stray output, like one that is not JSON, and reading goes
 //! on; only EOF or a read error ends the output.
+//!
+//! **Exit errors.** A process that exits successfully after the handshake
+//! exited cleanly unless the CLI reported an error since the last turn
+//! started; stray output does not make it an error. A failed exit is
+//! explained by the stderr tail with the exit status, falling back to stray
+//! output seen since the handshake or the last turn start
+//! ([`protocol::Protocol::exit_error`]).
 
 pub mod display;
 mod lines;
@@ -456,7 +463,9 @@ async fn handshake(
             Ok(Some(line)) => out = on_stdout(protocol, line),
             Ok(None) | Err(_) => {
                 let status = process.wait_exit().await;
-                return Err(process.error_text(protocol, status).await);
+                // Always an error: no exit before the handshake is clean.
+                let error = process.exit_error(protocol, status).await;
+                return Err(error.unwrap_or_else(|| "agent exited".to_owned()));
             }
         }
     }
@@ -682,29 +691,23 @@ impl Process {
         }
     }
 
-    /// The error text for a process that stopped with `status`.
-    async fn error_text(
+    /// Why the process stopped with `status`; `None` for a clean exit
+    /// ([`Protocol::exit_error`]).
+    async fn exit_error(
         &mut self,
         protocol: &Protocol,
         status: Option<std::process::ExitStatus>,
-    ) -> String {
+    ) -> Option<String> {
         self.drain_stderr().await;
+        if self.wedged {
+            return Some("agent stopped reading its input; killed it".to_owned());
+        }
         let stderr = self
             .stderr_tail
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        if self.wedged {
-            return "agent stopped reading its input; killed it".to_owned();
-        }
-        protocol
-            .exit_error()
-            .map(str::to_owned)
-            .or(stderr)
-            .unwrap_or_else(|| match status {
-                Some(status) => format!("agent exited ({status})"),
-                None => "agent exited".to_owned(),
-            })
+        protocol.exit_error(stderr.as_deref(), status)
     }
 }
 
@@ -797,12 +800,7 @@ impl Driver {
                 None
             }
         };
-        let clean = status.is_some_and(|s| s.success());
-        if clean && self.protocol.exit_error().is_none() {
-            self.process.drain_stderr().await;
-            return None;
-        }
-        Some(self.process.error_text(&self.protocol, status).await)
+        self.process.exit_error(&self.protocol, status).await
     }
 
     /// Stops the process on request; a requested stop is not an error.

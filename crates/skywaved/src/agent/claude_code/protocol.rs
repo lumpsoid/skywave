@@ -94,6 +94,7 @@ use skywave_proto::Decision;
 use uuid::Uuid;
 
 use super::{display, rules, usage};
+use crate::agent::mapper::cut_line;
 use crate::agent::{
     AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
     PermissionMode, ResumeHandle, TaskKind, TurnOutcome,
@@ -115,6 +116,14 @@ pub const TURN_ENDED_REASON: &str = "turn ended";
 /// Reason for a background task's approvals still pending when the task
 /// left the set.
 pub const TASK_ENDED_REASON: &str = "task ended";
+
+/// Chars of a stray stdout line kept and logged: the line can be megabytes.
+const STRAY_MAX_CHARS: usize = 500;
+
+/// Chars of the reason an exit error gives before its status: with the
+/// mapper's `agent exited: ` prefix and the status, the whole fits in the
+/// `Errored` cap (`REFUSAL_MAX_CHARS`), so the status is never cut off.
+pub const EXIT_REASON_MAX_CHARS: usize = 120;
 
 /// What one protocol step produces, in order.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -387,9 +396,12 @@ pub struct Protocol {
     initialize_id: Option<String>,
     ready: bool,
     startup_error: Option<String>,
-    /// An error the CLI reported outside a turn after startup.
+    /// An error the CLI reported outside a turn after startup, since the
+    /// last turn started.
     error: Option<String>,
-    /// The last stdout line that was not JSON (startup errors may land here).
+    /// The last stdout line that was not JSON (startup errors may land
+    /// here), since the handshake or, after it, since the last turn
+    /// started: an older one says nothing about a later exit.
     stray_output: Option<String>,
     version: Option<String>,
     /// The model the latest `system/init` named.
@@ -518,12 +530,38 @@ impl Protocol {
         self.startup_error.as_deref()
     }
 
-    /// The best error text the CLI gave, for an abnormal exit.
-    pub fn exit_error(&self) -> Option<&str> {
-        self.startup_error
+    /// Why the process ended with `status` (`None`: not known, as when it
+    /// had to be killed), given `stderr`, its last stderr line; `None` for
+    /// a clean exit.
+    ///
+    /// A successful status after the handshake is clean unless the CLI
+    /// reported an error: stray stdout alone is not one. Any exit before
+    /// the handshake failed. For a failed exit the CLI's own startup error
+    /// comes first, then the stderr tail, then a recent error result, then
+    /// recent stray output, cut to its first line and
+    /// [`EXIT_REASON_MAX_CHARS`], followed by the status.
+    pub fn exit_error(
+        &self,
+        stderr: Option<&str>,
+        status: Option<std::process::ExitStatus>,
+    ) -> Option<String> {
+        let reason = |text: &str| cut_line(text, EXIT_REASON_MAX_CHARS).0;
+        if self.ready && status.is_some_and(|s| s.success()) {
+            return self.error.as_deref().map(reason);
+        }
+        let text = self
+            .startup_error
             .as_deref()
+            .or(stderr)
             .or(self.error.as_deref())
             .or(self.stray_output.as_deref())
+            .map(reason);
+        Some(match (text, status) {
+            (Some(text), Some(status)) => format!("{text} ({status})"),
+            (Some(text), None) => text,
+            (None, Some(status)) => format!("agent exited ({status})"),
+            (None, None) => "agent exited".to_owned(),
+        })
     }
 
     /// A message has been written and its `result` not yet read.
@@ -663,8 +701,13 @@ impl Protocol {
         match serde_json::from_str::<Value>(line) {
             Ok(message) => self.on_message(&message),
             Err(_) => {
-                tracing::warn!("agent wrote a non-JSON line: {line}");
-                self.stray_output = Some(line.to_owned());
+                let (stray, cut) = cut_line(line, STRAY_MAX_CHARS);
+                if cut {
+                    tracing::warn!("agent wrote a {}-byte non-JSON line: {stray}", line.len());
+                } else {
+                    tracing::warn!("agent wrote a non-JSON line: {stray}");
+                }
+                self.stray_output = Some(stray);
                 Output::default()
             }
         }
@@ -715,6 +758,9 @@ impl Protocol {
     fn open_turn(&mut self, out: &mut Output) {
         self.turn_open = true;
         self.interrupt_sent = false;
+        // What went wrong before this turn does not explain a later exit.
+        self.error = None;
+        self.stray_output = None;
         if !self.handle_reported {
             self.handle_reported = true;
             out.events
@@ -1274,6 +1320,8 @@ impl Protocol {
                 out.events.push(AdapterEvent::ModelsOffered(models));
             }
             self.ready = true;
+            // Startup noise does not explain a later exit.
+            self.stray_output = None;
             // The CLI reports no task set at start: nothing is running.
             out.events.push(AdapterEvent::BackgroundTasks(Vec::new()));
             // Neither this answer nor `system/init` names the effort.

@@ -106,7 +106,9 @@ const AGENT_EXITED: &str = "agent exited";
 ///
 /// **Bounds.** Every event is cut to `skywave_proto::limits`, whatever the
 /// adapter handed over: a title, detail or status to its first non-blank
-/// line and its char cap (a cut one ends in `…`), and so is a rule
+/// line and its char cap (a cut one ends in `…`), and so are a refusal's
+/// reason and an `Errored` message (to [`REFUSAL_MAX_CHARS`]: a crash
+/// reason can be a stray multi-megabyte stdout line) and a rule
 /// suggestion's label, of which only the first [`RULE_SUGGESTIONS_MAX`]
 /// are kept (the indices the adapter knows them by stay); a body or result preview
 /// to its first [`PREVIEW_MAX_LINES`] lines and [`PREVIEW_MAX_BYTES`] bytes.
@@ -441,7 +443,12 @@ impl EventMapper {
                 let (reason, state) = match outcome {
                     TurnOutcome::Completed => (TURN_ENDED, SessionState::Idle),
                     TurnOutcome::Interrupted => (TURN_INTERRUPTED, SessionState::Idle),
-                    TurnOutcome::Failed(message) => (TURN_ENDED, SessionState::Errored { message }),
+                    TurnOutcome::Failed(message) => (
+                        TURN_ENDED,
+                        SessionState::Errored {
+                            message: cut_line(&message, REFUSAL_MAX_CHARS).0,
+                        },
+                    ),
                 };
                 // A backstop: the adapter cancels the turn's own first.
                 self.cancel_pending(log, storage, reason, |a| !a.of_task, &mut seqs)?;
@@ -615,6 +622,7 @@ impl EventMapper {
                 };
                 self.turn_open = false;
                 if let Some(message) = message {
+                    let message = cut_line(&message, REFUSAL_MAX_CHARS).0;
                     seqs.push(self.append(
                         log,
                         storage,
