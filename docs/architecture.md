@@ -230,8 +230,12 @@ not migrated). A database from before the stamp takes the current version.
   --exclude-standard` the untracked ones. One streamed `git diff` gives the
   patches, split at `diff --git ` lines and paired with entries by their
   exact expected header, never by position; an entry with a quoted path, a
-  header shared with another entry, or no section gets its own `git diff --
-  :(literal)<path>`, of which it keeps only sections with its own header.
+  header shared with another kept entry, more sections than its record
+  gives (an entry past the cap may share its header), or no section gets
+  its own `git diff -- :(literal)<path>`, of which it keeps only sections
+  with its own header. Both listings stream into a heap of the first 500
+  by path, so memory is bounded by the cap rather than the workdir, and
+  only those untracked paths are `lstat`ed.
   An unmerged path whose worktree equals `HEAD` is still a `Conflicted`
   entry. Untracked diffs are synthesised from `lstat` (a
   symlink's diff is its link text). At most 500 entries (`total` counts
