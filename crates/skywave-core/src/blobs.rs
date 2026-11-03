@@ -6,8 +6,10 @@
 //! front. With [`BlobPolicy::Eager`], every blob a pulled batch registers
 //! goes to the back, as does every blob not yet available when the policy
 //! switches to `Eager`; switching back to `OnDemand` drops the waiting
-//! blobs nobody asked for (a download in progress finishes). On startup a
-//! blob left `Downloading` is queued again, under either policy.
+//! blobs nobody asked for (a download in progress finishes, but is not
+//! queued again if the downloader stops first). On startup a blob left
+//! `Downloading` in the replica is queued again, under either policy: the
+//! restart resumes what the store says was under way.
 //! Workdir blobs (named by a stored workdir answer, `BlobRecord::workdir`)
 //! are never fetched eagerly, whatever the policy: only a request for one
 //! queues it, so a Changes refresh never starts megabytes of diffs.
@@ -346,9 +348,10 @@ enum Slot {
     Wanted,
 }
 
-/// A blob a worker holds. Dropped unfinished (the downloader stopped), or
-/// asked for again meanwhile, it goes back to the front of the queue;
-/// handed over, it goes there for the Wanted worker alone.
+/// A blob a worker holds. Asked for again meanwhile, or dropped unfinished
+/// (the downloader stopped) while asked for or under `Eager`, it goes back
+/// to the front of the queue; handed over, it goes there for the Wanted
+/// worker alone.
 struct Claim<'a> {
     queue: &'a BlobQueue,
     item: Queued,
@@ -387,8 +390,13 @@ impl Claim<'_> {
                 ..Queued::wanted(id)
             }),
             _ if again => queue.waiting.push_front(Queued::wanted(id)),
-            LetGo::Unfinished => queue.waiting.push_front(self.item),
-            LetGo::Finished => {}
+            // Not asked for, it waits only while the policy is Eager: one
+            // switched to OnDemand while a worker held it goes, as the
+            // switch dropped the waiting ones.
+            LetGo::Unfinished if self.item.wanted || queue.policy == BlobPolicy::Eager => {
+                queue.waiting.push_front(self.item);
+            }
+            LetGo::Unfinished | LetGo::Finished => {}
         }
     }
 }
@@ -1379,6 +1387,48 @@ mod tests {
         queue.set_policy(BlobPolicy::OnDemand, &[]);
         drop(claim);
         assert_eq!(waiting(&queue), [(id, true)]);
+    }
+
+    /// An eager blob a worker holds while the policy goes to OnDemand,
+    /// left unfinished when the downloader stops, is not queued again.
+    #[tokio::test]
+    async fn an_unfinished_eager_blob_held_across_a_switch_to_on_demand_goes() {
+        let queue = BlobQueue::default();
+        let id = ProtoBlobId::new();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+        drop(claim);
+        assert!(waiting(&queue).is_empty());
+        assert!(!lock(&queue.queue).holds(id), "let go");
+    }
+
+    /// The same, asked for while held: it is queued again, as asked for.
+    #[tokio::test]
+    async fn an_unfinished_eager_blob_asked_for_across_a_switch_to_on_demand_stays() {
+        let queue = BlobQueue::default();
+        let id = ProtoBlobId::new();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+        queue.want(id);
+        drop(claim);
+        assert_eq!(waiting(&queue), [(id, true)]);
+    }
+
+    /// Under Eager, an unfinished eager blob is queued again, at the front.
+    #[tokio::test]
+    async fn an_unfinished_eager_blob_under_eager_is_queued_again() {
+        let queue = BlobQueue::default();
+        let (id, other) = (ProtoBlobId::new(), ProtoBlobId::new());
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id, other]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!(claim.item.id, id);
+        drop(claim);
+        assert_eq!(waiting(&queue), [(id, false), (other, false)]);
     }
 
     #[tokio::test(start_paused = true)]
