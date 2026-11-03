@@ -25,6 +25,12 @@ skywave-proto.workspace = true
 # The wall clock as the shell runs' times (`shell_took`).
 chrono.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# SIGHUP/SIGTERM/SIGINT into the event loop, so a dropped SSH session still
+# saves the draft and restores the terminal; already in the tree through
+# crossterm.
+signal-hook.workspace = true
+
 [dev-dependencies]
 # Tests play the engine through `core.seam()`, which speaks proto types.
 tempfile.workspace = true

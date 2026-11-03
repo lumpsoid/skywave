@@ -8,12 +8,14 @@
 //! - [`clipboard`]: copies to the terminal's clipboard (OSC 52).
 //! - [`notify`]: alerts for new approvals (bell, OSC 9/777).
 //! - [`run`]: the terminal event loop; [`handle_key`], [`copy`], [`alert`],
-//!   [`save_draft`] and [`mark_read`] are its steps.
+//!   [`save_draft`] and [`mark_read`] are its steps, and [`shut_down`] its
+//!   one exit, for quit, SIGHUP/SIGTERM/SIGINT and a failed terminal read.
 
 pub mod app;
 pub mod clipboard;
 pub mod composer;
 pub mod notify;
+mod signals;
 pub mod ui;
 
 use std::io::{self, Write};
@@ -37,11 +39,14 @@ enum Msg {
     View(Box<ViewState>),
     Term(Event),
     TermFailed(io::Error),
+    /// SIGHUP, SIGTERM or SIGINT: leave as quitting does.
+    Signal,
 }
 
-/// Runs the TUI over `core` until the user quits, alerting to new
-/// approvals as `notify` says. Restores the terminal on return and on
-/// panic.
+/// Runs the TUI over `core` until the user quits or a SIGHUP, SIGTERM or
+/// SIGINT arrives, alerting to new approvals as `notify` says. Every exit
+/// (quit, signal, a failed terminal read) goes through [`shut_down`] and
+/// restores the terminal; a panic restores it too.
 pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
     let tmux = notify::in_tmux();
     let (tx, rx) = mpsc::channel();
@@ -56,6 +61,9 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
         unreachable!("the first message is the snapshot subscribe delivers");
     };
     let mut app = App::new(*first);
+
+    // Only after the first snapshot, which the line above expects first.
+    let signals = signals::forward(tx.clone(), || Msg::Signal)?;
 
     // Terminal input on its own thread; it ends with the process.
     thread::spawn(move || {
@@ -119,6 +127,7 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
                     Msg::Term(Event::Paste(text)) => app.on_paste(&text),
                     Msg::Term(_) => {}
                     Msg::TermFailed(err) => return Err(err),
+                    Msg::Signal => return Ok(()),
                 }
                 if app.ui().quit {
                     return Ok(());
@@ -128,6 +137,10 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
             mark_read(&mut app, core, Instant::now(), false);
         }
     })();
+    // A quit key has saved already, and this finds nothing left; a signal
+    // or a failed read (an SSH drop) has not.
+    shut_down(&mut app, core);
+    signals.close();
     core.unsubscribe(subscription);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::try_restore()?;
@@ -150,10 +163,17 @@ pub fn handle_key(app: &mut App, core: &Core, key: KeyEvent) -> Option<Action> {
         app.dispatched(core.dispatch(action.clone()));
     }
     if app.ui().quit {
-        save_draft(app, core, Instant::now(), true);
-        mark_read(app, core, Instant::now(), true);
+        shut_down(app, core);
     }
     action
+}
+
+/// Saves what the TUI holds unsaved before it exits, however it exits: the
+/// open session's draft and its read mark, both forced past their idle
+/// wait.
+pub fn shut_down(app: &mut App, core: &Core) {
+    save_draft(app, core, Instant::now(), true);
+    mark_read(app, core, Instant::now(), true);
 }
 
 /// Sends the copy [`App::take_copy`] has, if any, to the terminal's
