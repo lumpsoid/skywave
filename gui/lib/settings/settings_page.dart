@@ -83,8 +83,9 @@ class SettingsPage extends StatelessWidget {
                   const SizedBox(height: 4),
                   Text(
                     'On demand: a blob downloads when you expand its tool '
-                    'output. Eager: every blob downloads as soon as it is '
-                    'synced, which uses more data and disk.',
+                    'output. Eager: every tool blob downloads as soon as it '
+                    'is synced, which uses more data and disk. Workdir diffs '
+                    'and files download only when opened, either way.',
                     style: muted,
                   ),
                 ],

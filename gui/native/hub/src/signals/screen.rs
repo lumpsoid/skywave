@@ -2,6 +2,7 @@ use rinf::{RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
 use super::timeline::{OutgoingView, SectionView, ToolKindView};
+use super::workdir::WorkdirScreen;
 
 /// The screen to show, with everything on it but the timeline (its own
 /// signal) and the banner. Sent whole whenever it changes; Dart replaces
@@ -86,6 +87,10 @@ pub enum ScreenView {
         empty_label: Option<String>,
         /// What the totals leave out: sessions deleted from this device.
         note: String,
+    },
+    /// A session's workdir, read on request and kept for offline reading.
+    Workdir {
+        workdir: WorkdirScreen,
     },
 }
 

@@ -5,11 +5,11 @@ import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Which page the navigator shows; one per [ScreenView] variant.
-enum ScreenKind { pairing, sessionList, session, settings, usage }
+enum ScreenKind { pairing, sessionList, session, settings, usage, workdir }
 
 /// The screen as Rust last sent it: what the navigator shows, and the
-/// data of the pairing, session list, session, settings and usage pages. Lives
-/// for the app's lifetime.
+/// data of the pairing, session list, session, settings, usage and
+/// workdir pages. Lives for the app's lifetime.
 class ScreenHolder extends ChangeNotifier {
   StreamSubscription<RustSignalPack<ScreenUpdate>>? _subscription;
 
@@ -24,6 +24,7 @@ class ScreenHolder extends ChangeNotifier {
     ScreenViewSession() => ScreenKind.session,
     ScreenViewSettings() => ScreenKind.settings,
     ScreenViewUsage() => ScreenKind.usage,
+    ScreenViewWorkdir() => ScreenKind.workdir,
     _ => null,
   };
 

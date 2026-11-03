@@ -813,7 +813,7 @@ fn line_style(section: &Section, line: &str) -> LineStyle {
 
 /// The lines of some content; a final line break ends the last line, it
 /// does not start one. Nothing for empty content.
-fn content_lines(text: &str) -> Vec<&str> {
+pub fn content_lines(text: &str) -> Vec<&str> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     if text.is_empty() {
         return Vec::new();

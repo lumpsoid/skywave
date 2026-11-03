@@ -2,12 +2,13 @@
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
 use skywave_core::{
-    Action, BlobPolicy, Decision, Effort, PermissionMode, Route, ServerAddress, TaskId,
+    Action, BlobPolicy, Decision, Effort, PermissionMode, Route, ServerAddress, TaskId, WorkdirPane,
 };
 use uuid::Uuid;
 
 use crate::signals::{
     ActionIntent, BlobPolicyChoice, DecisionView, EffortView, PermissionModeView, RouteView,
+    WorkdirPaneKind,
 };
 
 /// `intent` as a core action, or why it is not one.
@@ -119,6 +120,20 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::OpenSession { session_id } => {
             Action::OpenSession(id("session", &session_id)?)
         }
+        ActionIntent::OpenWorkdir { session_id } => Action::OpenWorkdir {
+            session_id: id("session", &session_id)?,
+        },
+        ActionIntent::ShowWorkdir {
+            pane,
+            path,
+            untracked,
+        } => Action::ShowWorkdir(match pane {
+            WorkdirPaneKind::Changes => WorkdirPane::Changes,
+            WorkdirPaneKind::Diff => WorkdirPane::Diff { path, untracked },
+            WorkdirPaneKind::Dir => WorkdirPane::Dir { path },
+            WorkdirPaneKind::File => WorkdirPane::File { path },
+        }),
+        ActionIntent::RefreshWorkdir => Action::RefreshWorkdir,
         ActionIntent::OpenNextApproval => Action::OpenNextApproval,
         ActionIntent::DownloadBlob { blob_id } => Action::DownloadBlob(id("blob", &blob_id)?),
         ActionIntent::SetBlobPolicy { policy } => Action::SetBlobPolicy(match policy {

@@ -33,6 +33,7 @@ use crate::signals::{
     UsageRowView, UsageSpanView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
+use crate::workdir;
 
 /// Most lines of the gated call's content the approval panel shows.
 pub const APPROVAL_LINES: usize = 10;
@@ -50,6 +51,8 @@ pub struct Ui<'a> {
     pub usage: (Span, Grouping),
     /// The wall clock in unix-epoch millis: the usage span ends on its day.
     pub wall_ms: i64,
+    /// The text of the workdir blob shown ([`workdir::WorkdirText::of`]).
+    pub workdir_text: Option<&'a Result<workdir::Text, String>>,
 }
 
 /// The new-session prompt: its input as the hub knows it and the
@@ -75,19 +78,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Settings(settings) => settings_view(settings),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
-        // Placeholder until this head shows workdirs (nothing opens one
-        // yet): an empty list saying so, so no new signal is needed.
-        Screen::Workdir(workdir) => ScreenView::SessionList {
-            kind: ListKindView::Active,
-            title: clean_line(&workdir.title),
-            empty_label: Some("Workdir: not shown in this head yet.".to_owned()),
-            rows: Vec::new(),
-            other_count: 0,
-            creating: Vec::new(),
-            dismissable: None,
-            create: None,
-            rename: None,
-        },
+        Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
     };
     ScreenUpdate {
         screen,
@@ -751,7 +742,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
 
 fn settings_view(settings: &SettingsView) -> ScreenView {
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
-        BlobPolicy::Eager => (BlobPolicyView::Eager, "eager (download every blob)"),
+        BlobPolicy::Eager => (BlobPolicyView::Eager, "eager (download every tool blob)"),
         BlobPolicy::OnDemand => (BlobPolicyView::OnDemand, "on demand (download when opened)"),
     };
     ScreenView::Settings {
@@ -905,6 +896,7 @@ mod tests {
             revoked_dismissed: false,
             usage: Default::default(),
             wall_ms: 0,
+            workdir_text: None,
         };
         match update(&view, ui).screen {
             ScreenView::Session { session } => session,

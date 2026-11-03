@@ -32,6 +32,7 @@ use crate::signals::{
     TimelineUpdate, UsageGroupingView, UsageSpanView,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
+use crate::workdir::{WorkdirText, shown_blob};
 use crate::{intents, link, screen, search, shell, timeline};
 
 /// How often running clocks on screen (a tool's elapsed time, how long a
@@ -278,6 +279,8 @@ pub struct Head {
     revoked_dismissed: bool,
     /// The usage screen's days and grouping (`UsageShow`).
     usage: (Span, Grouping),
+    /// The text of the workdir diff or file shown.
+    workdir_text: WorkdirText,
     session: Option<SessionHead>,
     sent: Sent,
 }
@@ -755,16 +758,21 @@ impl Head {
             GuiIntent::OpenFull { blob_id } => {
                 let id = intents::id("blob", &blob_id)?;
                 // A shell run's output shows in the app (`ExpandShellRun`).
-                let state = open_session(&self.view).and_then(|view| {
-                    view.timeline.iter().find_map(|item| match item {
-                        TimelineItem::Logged { entry, .. } => sections(entry)
-                            .into_iter()
-                            .filter_map(|s| s.blob)
-                            .find(|b| b.id == id)
-                            .map(|b| b.state.clone()),
-                        TimelineItem::Pending { .. } => None,
-                    })
-                });
+                let state = match self.view.as_ref().map(|view| &view.screen) {
+                    Some(Screen::Workdir(view)) => shown_blob(view)
+                        .filter(|b| b.id == id)
+                        .map(|b| b.state.clone()),
+                    _ => open_session(&self.view).and_then(|view| {
+                        view.timeline.iter().find_map(|item| match item {
+                            TimelineItem::Logged { entry, .. } => sections(entry)
+                                .into_iter()
+                                .filter_map(|s| s.blob)
+                                .find(|b| b.id == id)
+                                .map(|b| b.state.clone()),
+                            TimelineItem::Pending { .. } => None,
+                        })
+                    }),
+                };
                 out.push(Out::Effect(match state {
                     Some(BlobState::Available { path }) => PlatformEffect::OpenFile {
                         path: path.display().to_string(),
@@ -1220,6 +1228,10 @@ impl Head {
                 ..s.composer.shown.clone()
             }
         });
+        let workdir_text = match &view.screen {
+            Screen::Workdir(workdir) => self.workdir_text.of(workdir),
+            _ => None,
+        };
         let ui = Ui {
             form: &self.form,
             create: self.create.as_ref(),
@@ -1228,6 +1240,7 @@ impl Head {
             revoked_dismissed: self.revoked_dismissed,
             usage: self.usage,
             wall_ms: clock.wall_ms,
+            workdir_text,
         };
         let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {
