@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -235,7 +236,7 @@ impl Server {
 }
 
 /// Serves one TCP connection: TLS handshake, then HTTP/1.1 with the peer's
-/// certificate attached to every request.
+/// certificate and address attached to every request.
 async fn connection(
     tcp: TcpStream,
     peer: SocketAddr,
@@ -263,6 +264,7 @@ async fn connection(
     let peer_cert = PeerCert(cert);
     let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
         req.extensions_mut().insert(peer_cert.clone());
+        req.extensions_mut().insert(ConnectInfo(peer));
         let mut app = app.clone();
         async move { app.call(req.map(Body::new)).await }
     });
