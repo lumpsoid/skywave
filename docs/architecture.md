@@ -155,6 +155,13 @@ reissues the certificate (same CA) when its names change. Admin commands
 (`pair`, `devices list`, `devices revoke`) work on the database directly,
 beside a running `serve`.
 
+Opening the database migrates its schema (`PRAGMA user_version`), but no
+migration rewrites the wire JSON its columns hold. So the database records
+the `PROTOCOL_VERSION` it was created with, and `serve` and the admin
+commands refuse one written by another version, before reading it, with an
+error telling the operator to delete the data directory (alpha: old data is
+not migrated). A database from before the stamp takes the current version.
+
 - **Commands** are deduplicated, validated and appended in one transaction;
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,

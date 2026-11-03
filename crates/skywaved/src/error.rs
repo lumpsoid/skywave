@@ -30,6 +30,19 @@ pub enum Error {
     NoDataDir,
     #[error("database schema version {found} is newer than this skywaved supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    /// The database was written by a build of another protocol version; its
+    /// stored wire JSON may not parse, and alpha data is not migrated.
+    #[error(
+        "database {} was written by protocol version {found}, this skywaved speaks \
+         version {current}; stop skywaved, delete its data directory and pair \
+         devices again (old data is not migrated)",
+        path.display()
+    )]
+    ProtocolMismatch {
+        path: PathBuf,
+        found: u32,
+        current: u32,
+    },
     #[error("blob {id}: stored size {expected}, file has {actual} bytes")]
     BlobSizeMismatch {
         id: String,
