@@ -162,7 +162,7 @@ async fn serve(
     // each clone keeps its own.
     let log = EventLog::open(&storage.db, config.roots.clone())?.with_shell(config.shell.enabled);
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
-    let supervisor = Supervisor::start(
+    let mut supervisor = Supervisor::start(
         adapter,
         config.data_dir.clone(),
         log.clone(),
@@ -199,13 +199,17 @@ async fn serve(
         protocol_version = skywave_proto::PROTOCOL_VERSION,
         "listening"
     );
-    // A failed shell runner stops the daemon: running on without it would
-    // accept runs nothing starts. Its error is what `shutdown` returns, so
-    // the daemon exits non-zero; the next start settles its runs `Lost`.
+    // A failed shell runner or agent supervisor stops the daemon: running on
+    // without one would accept runs nothing starts, or messages no agent
+    // hears. Its error is what `shutdown` returns, so the daemon exits
+    // non-zero; the next start settles what it left.
     let stop = async {
         tokio::select! {
             () = shutdown_signal() => {}
             () = shell.failed() => tracing::error!("shell runner failed; stopping the daemon"),
+            () = supervisor.failed() => {
+                tracing::error!("agent supervisor failed; stopping the daemon");
+            }
         }
     };
     let served = server.serve(stop).await;

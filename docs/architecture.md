@@ -177,7 +177,8 @@ beside a running `serve`.
   another session. An approval waits with no timeout but ends with the agent
   process. On daemon start every pending approval gets
   `ApprovalCancelled { reason: "daemon restarted" }` and every call left
-  without a result is named in a `CallsUnanswered`.
+  without a result is named in a `CallsUnanswered`. If the supervisor
+  fails, `serve` stops rather than accept messages no agent would hear.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
