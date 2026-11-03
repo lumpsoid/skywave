@@ -101,7 +101,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v17: bypass by opt-in. `bypass` on [`HelloResponse`] and
 /// `RejectReason::BypassDisabled`.
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// v18: bounded messages. [`limits::MESSAGE_MAX_BYTES`] and
+/// `RejectReason::MessageTooLong`.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -820,6 +823,13 @@ pub mod limits {
     /// longer one as `BadShellCommand` rather than cut it, as a cut command
     /// would run something else.
     pub const SHELL_COMMAND_MAX_BYTES: usize = 8192;
+    /// Longest `SendMessage::text`, in UTF-8 bytes; the server refuses a
+    /// longer one as `MessageTooLong` rather than cut it, as a cut message
+    /// would ask something else. Generous for anything typed or pasted (a
+    /// few thousand lines of code); it bounds the log a client minting new
+    /// command ids can write per request, which the HTTP body limit (2 MB)
+    /// alone leaves near 2 MB.
+    pub const MESSAGE_MAX_BYTES: usize = 256 * 1024;
     /// Most [`ChangedFile`](crate::ChangedFile)s in one
     /// [`ChangeSet`](crate::ChangeSet); the rest are only counted in
     /// [`ChangeSet::total`](crate::ChangeSet::total).
@@ -1382,7 +1392,8 @@ pub enum CommandKind {
     },
     /// Send `text` to the agent. `context` is the session's context the
     /// message was written in; the server refuses it as `ContextChanged`
-    /// when that is no longer the current one.
+    /// when that is no longer the current one, and as `MessageTooLong` when
+    /// `text` is over [`limits::MESSAGE_MAX_BYTES`].
     SendMessage {
         session_id: SessionId,
         context: ContextId,
@@ -1706,6 +1717,8 @@ pub enum RejectReason {
     /// A `SetPermissionMode` asking for [`PermissionMode::Bypass`] while the
     /// server does not allow it ([`HelloResponse::bypass`]).
     BypassDisabled,
+    /// `SendMessage.text` is longer than [`limits::MESSAGE_MAX_BYTES`].
+    MessageTooLong,
 }
 
 impl RejectReason {

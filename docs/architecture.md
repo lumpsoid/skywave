@@ -112,7 +112,7 @@ every version.
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
 | `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the log head, every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
-| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. |
+| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
@@ -137,6 +137,12 @@ every version.
   agent's tool name. `CallId`s are minted by the server; the agent's own ids
   and resume handles never leave `skywaved`. Size caps live in
   `skywave_proto::limits`; content past them is a blob.
+- **Command text is capped, never cut.** A `SendMessage` over
+  `MESSAGE_MAX_BYTES` (256 KiB) is `MessageTooLong`, a `RunShell` over
+  `SHELL_COMMAND_MAX_BYTES` `BadShellCommand`, so a client minting fresh
+  command ids cannot write more than that to the permanent log per request.
+  The heads refuse an over-cap message before dispatching, keeping it in the
+  composer; the server's refusal is the backstop.
 - **Errors are plain HTTP statuses** with no typed body. Pairing: 400
   malformed, 401 wrong, used or expired code (indistinguishable), 429 too
   many failures (`Retry-After`). Elsewhere: 401 no client certificate, 403 a

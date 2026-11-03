@@ -24,8 +24,8 @@ use skywave_present::format::{
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop, stop_needs_confirmation,
-    unanswered,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
+    stop_needs_confirmation, unanswered,
 };
 use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
@@ -2477,8 +2477,13 @@ impl App {
                             when,
                         });
                     }
-                    // A blank draft is refused by the core.
+                    // A blank draft is refused by the core; one over the
+                    // cap here, keeping its text.
                     KeyCode::Enter => {
+                        if let Some(refusal) = message_refusal(draft.text()) {
+                            self.ui.notice = Some(refusal);
+                            return None;
+                        }
                         draft.submitted = true;
                         return Some(Action::SendMessage {
                             session_id: view.id,

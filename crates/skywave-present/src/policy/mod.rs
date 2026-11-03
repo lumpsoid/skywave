@@ -21,7 +21,7 @@
 //!   once, including blobs that arrive while the item is open.
 //!
 //! And small decisions: [`unanswered`], [`dismissable`],
-//! [`looks_like_pair_uri`], [`shell_stop`].
+//! [`looks_like_pair_uri`], [`shell_stop`], [`message_refusal`].
 
 mod alert;
 mod completion;
@@ -34,7 +34,7 @@ mod shell;
 
 pub use alert::{Alert, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise};
 pub use completion::CompletionSettle;
-pub use draft::{DRAFT_SAVE_AFTER, DraftSaver};
+pub use draft::{DRAFT_SAVE_AFTER, DraftSaver, message_refusal};
 pub use expand::ExpandFetch;
 pub use history::{PromptHistory, Recall};
 pub use read::{READ_MARK_EVERY, ReadMarker};

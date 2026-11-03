@@ -658,6 +658,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::RunFinished,
             RejectReason::BadShellCommand,
             RejectReason::BypassDisabled,
+            RejectReason::MessageTooLong,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -1292,11 +1293,12 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v17() {
-    assert_eq!(PROTOCOL_VERSION, 17);
+fn protocol_is_v18() {
+    assert_eq!(PROTOCOL_VERSION, 18);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
+    assert_eq!(limits::MESSAGE_MAX_BYTES, 256 * 1024);
     assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);

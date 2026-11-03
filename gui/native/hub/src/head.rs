@@ -15,7 +15,7 @@ use skywave_core::{
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop,
+    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::usage::{Grouping, Span};
@@ -548,6 +548,11 @@ impl Head {
                         command: text,
                         when: session.when,
                     }
+                } else if let Some(text) = message_refusal(&text) {
+                    // Refused here, not by the server, so it stays in the
+                    // composer to cut down.
+                    out.push(Out::Effect(PlatformEffect::Notice { text }));
+                    return Ok(());
                 } else {
                     // A blank message is refused by the core.
                     Action::SendMessage {
