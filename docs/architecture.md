@@ -321,8 +321,10 @@ writes.
   retries stop until re-pairing. `suspend()` / `resume()` pause the network
   for heads that background.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
-  link, two at a time, into `blobs/<id>.part`, resumed with `Range`,
-  verified by size and renamed when complete; `Link` ignores them (synced
+  link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
+  the recorded progress (each progress report follows an fsync, so a
+  power loss never resumes past durable bytes), verified by size and
+  renamed when complete; `Link` ignores them (synced
   metadata counts as synced). Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server

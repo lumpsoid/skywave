@@ -35,9 +35,15 @@
 //! reconnect or a restart picks up where it left off.
 //!
 //! **Files.** `<data_dir>/blobs/<id>.part` while downloading, renamed to
-//! `<data_dir>/blobs/<id>` once complete. A try resumes from the `.part`
-//! file's length (`Range: bytes=<len>-`); if the server sends the whole
-//! blob instead, the file starts over. The content must have exactly the
+//! `<data_dir>/blobs/<id>` once complete. Every `Downloading { got }` the
+//! store records follows an fsync of those `got` bytes, so the recorded
+//! count never runs past durable data. A try resumes from that count (or
+//! the file's length, if shorter; `Range: bytes=<from>-`) and truncates
+//! the file there: bytes written after the last report, or a length a
+//! power loss kept without its data, are fetched again rather than trusted.
+//! `BlobId` is no content hash, so the recorded count is the only check of
+//! the bytes before it. If the server sends the whole blob instead of the
+//! range, the file starts over. The content must have exactly the
 //! size the event's `BlobRef` gave, and the server must agree on it; a
 //! mismatch, an unknown blob or a local file error deletes the `.part`
 //! file, logs an error and leaves the blob `NotDownloaded`, failed with
@@ -66,7 +72,8 @@
 //!
 //! **Status.** `Downloading { got, path }` (`path` the `.part` file) is
 //! reported when a response starts, then at most every
-//! [`PROGRESS_EVERY`], and when a try ends early;
+//! [`PROGRESS_EVERY`] (also while the body stalls, if bytes arrived since
+//! the last report), and when a try ends early;
 //! `Available { path }` carries the absolute path of the complete file.
 
 use std::collections::{HashSet, VecDeque};
@@ -589,17 +596,29 @@ async fn fetch(
     tokio::fs::create_dir_all(&dir).await?;
     let part = part_path(&dir, id);
     let size = record.size;
-    let have = match tokio::fs::metadata(&part).await {
-        Ok(meta) if meta.len() <= size => Some(meta.len()),
-        // Longer than the blob: not ours to trust.
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    // Only the recorded progress is durable: every report follows an fsync
+    // of the bytes it counts. The file may be longer (written after the
+    // last report) and, after a power loss, hold a kept length over lost
+    // data; the excess is truncated below.
+    let recorded = match &record.status {
+        BlobStatus::Downloading { got, .. } => *got,
+        BlobStatus::NotDownloaded | BlobStatus::Available { .. } => 0,
+    };
+    let from = match tokio::fs::metadata(&part).await {
+        Ok(meta) => recorded.min(meta.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
-    if have == Some(size) {
+    if from == size {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await?;
+        file.set_len(size).await?;
+        file.sync_all().await?;
+        drop(file);
         return complete(ctx, id, lease, &part, &done, size).await;
     }
-    let from = have.unwrap_or(0);
 
     let transport = transport
         .get_or_try_init(|| async {
@@ -637,7 +656,11 @@ async fn fetch(
         .await?;
     file.set_len(got).await?;
     file.seek(SeekFrom::Start(got)).await?;
-    let report = |got: u64| {
+    // Records `got` bytes as downloaded, once they are durable: a restart
+    // resumes from the recorded count, never past what survived.
+    let report = async |file: &mut tokio::fs::File, got: u64| -> Result<(), FetchError> {
+        file.flush().await?;
+        file.sync_data().await?;
         ctx.seam.leased_blob_status(
             id,
             lease,
@@ -645,17 +668,32 @@ async fn fetch(
                 got,
                 path: part.clone(),
             },
-        )
+        )?;
+        Ok(())
     };
-    report(got)?;
+    report(&mut file, got).await?;
     let mut reported = tokio::time::Instant::now();
+    let mut recorded = got;
     loop {
-        let chunk = match download.body.next_chunk().await {
+        // A stalled body still records what it got, so a kill while it
+        // waits keeps that progress.
+        let next = {
+            let mut next = download.body.next_chunk();
+            loop {
+                tokio::select! {
+                    chunk = &mut next => break chunk,
+                    () = tokio::time::sleep_until(reported + PROGRESS_EVERY), if got > recorded => {
+                        report(&mut file, got).await?;
+                        (reported, recorded) = (tokio::time::Instant::now(), got);
+                    }
+                }
+            }
+        };
+        let chunk = match next {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                file.flush().await?;
-                report(got)?;
+                report(&mut file, got).await?;
                 return Err(error.into());
             }
         };
@@ -670,14 +708,13 @@ async fn fetch(
         got += len;
         *progressed |= len > 0;
         if reported.elapsed() >= PROGRESS_EVERY {
-            report(got)?;
-            reported = tokio::time::Instant::now();
+            report(&mut file, got).await?;
+            (reported, recorded) = (tokio::time::Instant::now(), got);
         }
     }
     if got != size {
         // The body ended early without an error: a broken response.
-        file.flush().await?;
-        report(got)?;
+        report(&mut file, got).await?;
         return Err(TransportError::Io(format!("blob body ended at {got} of {size} bytes")).into());
     }
     file.sync_all().await?;
