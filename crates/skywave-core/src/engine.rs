@@ -917,6 +917,7 @@ mod tests {
                     head: Seq::ZERO,
                     devices: Vec::new(),
                     shell: false,
+                    bypass: false,
                 })
             })
         }
@@ -1321,6 +1322,7 @@ mod tests {
                     head: Seq::ZERO,
                     devices: Vec::new(),
                     shell: false,
+                    bypass: false,
                 })
             })
         }
@@ -1890,6 +1892,7 @@ mod tests {
                         name: "phone".into(),
                     }],
                     shell: false,
+                    bypass: false,
                 })
             })
         }

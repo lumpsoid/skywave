@@ -1763,9 +1763,22 @@ fn a_mode_switch_shows_as_waiting_and_a_refused_model_as_its_reason() {
     let agent = rig.agent();
     assert_eq!(agent.mode_label, "ask");
     assert_eq!(agent.model_label, "Sonnet");
-    assert_eq!(agent.modes.len(), 6);
-    assert!(agent.modes[0].current);
+    // No bypass until a server allows it; then last, asking once more.
+    use crate::signals::PermissionModeView as V;
+    let offered = |agent: &crate::signals::AgentSettingsView| -> Vec<V> {
+        agent.modes.iter().map(|m| m.mode).collect()
+    };
+    let safe = [V::Ask, V::AcceptEdits, V::Plan, V::Auto, V::DontAsk];
+    assert_eq!(offered(&agent), safe);
+    assert!(agent.modes.iter().all(|m| !m.needs_confirmation));
+    rig.hello(false, true);
+    let agent = rig.agent();
+    assert_eq!(offered(&agent)[..5], safe);
+    assert_eq!(offered(&agent)[5], V::Bypass);
     assert!(agent.modes[5].needs_confirmation);
+    assert!(agent.modes[0].current);
+    rig.hello(false, false);
+    assert_eq!(offered(&rig.agent()), safe, "a later hello takes it back");
     assert!(agent.models[0].current);
 
     rig.intent(GuiIntent::Act {
@@ -2300,6 +2313,12 @@ fn nothing_is_marked_read_from_a_subagents_view() {
 impl Rig {
     /// The server says whether it runs shell commands, as its `hello` does.
     fn shell_enabled(&mut self, shell: bool) {
+        self.hello(shell, false);
+    }
+
+    /// The server's `hello`: whether it runs shell commands and whether
+    /// it allows bypass mode.
+    fn hello(&mut self, shell: bool, bypass: bool) {
         self.seam
             .hello_received(&skywave_proto::HelloResponse {
                 protocol_version: skywave_proto::PROTOCOL_VERSION,
@@ -2308,6 +2327,7 @@ impl Rig {
                 head: Seq::ZERO,
                 devices: Vec::new(),
                 shell,
+                bypass,
             })
             .unwrap();
         self.view();

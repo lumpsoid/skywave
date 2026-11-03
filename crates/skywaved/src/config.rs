@@ -43,6 +43,9 @@ pub struct AgentConfig {
     /// Executable path, or a bare name looked up on `PATH`.
     pub command: PathBuf,
     pub args: Vec<String>,
+    /// Whether a device may switch a session to bypass mode, where every
+    /// tool runs without asking (`allow_bypass`); off by default (D38).
+    pub allow_bypass: bool,
 }
 
 /// The file as written; every field optional.
@@ -68,6 +71,8 @@ struct RawAgent {
     command: Option<PathBuf>,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    allow_bypass: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +230,7 @@ impl Config {
                     .map(program)
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMMAND)),
                 args: raw.agent.args,
+                allow_bypass: raw.agent.allow_bypass,
             },
             log_file: raw.log_file.map(abs),
             server_names: raw.server_names,
@@ -308,6 +314,7 @@ mod tests {
             [agent]
             command = "bin/claude"
             args = ["--verbose"]
+            allow_bypass = true
 
             [shell]
             enabled = true
@@ -324,6 +331,7 @@ mod tests {
         );
         assert_eq!(c.agent.command, Path::new("/etc/skywave/bin/claude"));
         assert_eq!(c.agent.args, ["--verbose"]);
+        assert!(c.agent.allow_bypass);
         assert_eq!(
             c.log_file.as_deref(),
             Some(Path::new("/var/log/skywaved.log"))
@@ -357,6 +365,34 @@ mod tests {
     }
 
     #[test]
+    fn bypass_is_allowed_only_by_a_true_flag() {
+        let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
+        assert!(
+            parse("[agent]\nallow_bypass = true")
+                .unwrap()
+                .agent
+                .allow_bypass
+        );
+        assert!(
+            !parse("[agent]\nallow_bypass = false")
+                .unwrap()
+                .agent
+                .allow_bypass
+        );
+        assert!(!parse("[agent]\nargs = []").unwrap().agent.allow_bypass);
+        for bad in [
+            "[agent]\nallow_bypass = \"yes\"",
+            "[agent]\nallow_bypass = 1",
+            "allow_bypass = true",
+        ] {
+            assert!(
+                matches!(parse(bad), Err(Error::ConfigParse { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn sizes_take_binary_units() {
         assert_eq!(parse_size("0"), Ok(0));
         assert_eq!(parse_size("17"), Ok(17));
@@ -382,6 +418,7 @@ mod tests {
         assert!(c.roots.is_empty());
         assert_eq!(c.agent.command, Path::new(DEFAULT_AGENT_COMMAND));
         assert!(c.agent.args.is_empty());
+        assert!(!c.agent.allow_bypass, "bypass is opt-in");
         assert_eq!(c.log_file, None);
         assert!(c.server_names.is_empty());
         assert_eq!(c.shell, ShellConfig::default());

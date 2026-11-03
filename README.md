@@ -121,6 +121,8 @@ server_names = ["devbox.example.net"] # names in the server certificate
 [agent]
 command = "claude"                   # default: claude on PATH
 args = []
+# allow_bypass = true                # let devices switch a session to bypass
+                                     # mode (every tool runs unasked); off by default
 
 [shell]                 # shell commands from devices; off by default
 enabled = true
@@ -148,6 +150,11 @@ the other orphans reparented to PID 1.
 > (`cmd &` included) is killed; a process that escaped the group (`setsid`,
 > a daemonizing tool) keeps running and is not tracked. With `program` set
 > to bash, aliases from `rc` need `shopt -s expand_aliases` in it.
+
+> **Bypass mode is the operator's call.** Without `[agent] allow_bypass`,
+> the heads don't offer bypass and the server refuses a switch to it. With
+> it, any paired device can turn off every prompt of a session after one
+> extra confirmation; sessions still start in their usual mode.
 
 ### 2. Pair a device
 

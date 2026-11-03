@@ -1620,6 +1620,7 @@ fn claude_adapter() -> ClaudeCodeAdapter {
     ClaudeCodeAdapter::new(AgentConfig {
         command: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-claude.sh"),
         args: Vec::new(),
+        allow_bypass: false,
     })
     .with_grace_period(Duration::from_secs(5))
 }
@@ -1792,14 +1793,14 @@ async fn a_refused_setting_keeps_what_the_agent_had() {
     let mut f = Fixture::new();
     let agent = FakeAgent::new(
         FakeScript::new()
-            .refuse_mode(PermissionMode::Bypass)
+            .refuse_mode(PermissionMode::DontAsk)
             .refuse_model("bogus"),
     );
     let supervisor = f.start(&agent).await;
 
     let edits = f.set_mode(PermissionMode::AcceptEdits);
     f.wait_count("first answer", 1, is_setting_answer).await;
-    let bypass = f.set_mode(PermissionMode::Bypass);
+    let dont_ask = f.set_mode(PermissionMode::DontAsk);
     let bogus = f.set_model("bogus");
     let kinds = f.wait_count("answers", 3, is_setting_answer).await;
     assert_eq!(
@@ -1810,9 +1811,9 @@ async fn a_refused_setting_keeps_what_the_agent_had() {
                 answers: Some(edits),
             },
             EventKind::PermissionModeRefused {
-                mode: PermissionMode::Bypass,
+                mode: PermissionMode::DontAsk,
                 reason: REFUSE_REASON.into(),
-                answers: Some(bypass),
+                answers: Some(dont_ask),
             },
             EventKind::ModelRefused {
                 model: "bogus".into(),

@@ -930,6 +930,10 @@ pub struct AgentView {
     /// newest list any session's agent reported. Empty until one did; a
     /// head may still send a model by name.
     pub models: Vec<ModelChoice>,
+    /// Whether the server allows [`PermissionMode::Bypass`], as its last
+    /// `hello` said (kept for offline); `false` until one said so. Where
+    /// it does not, the server refuses a switch to it.
+    pub bypass_allowed: bool,
 }
 
 impl AgentView {

@@ -281,6 +281,7 @@ async fn hello(
             head: api.log.head(),
             devices,
             shell: api.log.shell_enabled(),
+            bypass: api.log.bypass_allowed(),
         })
         .into_response(),
         Err(status) => status.into_response(),

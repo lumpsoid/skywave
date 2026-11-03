@@ -204,6 +204,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::UnknownRun => "the session has no such shell run",
         RejectReason::RunFinished => "that shell run already finished",
         RejectReason::BadShellCommand => "empty or too long shell command",
+        RejectReason::BypassDisabled => "bypass mode is off on the server",
     }
 }
 
@@ -248,6 +249,16 @@ pub fn mode_detail(mode: PermissionMode) -> &'static str {
 /// once more before sending it.
 pub fn mode_needs_confirmation(mode: PermissionMode) -> bool {
     mode == PermissionMode::Bypass
+}
+
+/// The modes a picker offers, from the most asking to the least: every
+/// mode, but bypass only where the server allows it (`bypass`, from its
+/// hello); elsewhere the server refuses it, so it is not offered at all.
+pub fn offered_modes(bypass: bool) -> Vec<PermissionMode> {
+    PermissionMode::ALL
+        .into_iter()
+        .filter(|&mode| bypass || mode != PermissionMode::Bypass)
+        .collect()
 }
 
 fn count(n: usize, one: &str, many: &str) -> String {
@@ -1506,6 +1517,17 @@ mod tests {
             agent_setting_line(&AgentSetting::Mode(PermissionMode::Bypass), Some("no")),
             "mode bypass refused: no"
         );
+    }
+
+    #[test]
+    fn bypass_is_offered_only_where_the_server_allows_it() {
+        use PermissionMode::*;
+        let safe = [Ask, AcceptEdits, Plan, Auto, DontAsk];
+        assert_eq!(offered_modes(false), safe);
+        assert_eq!(offered_modes(true), PermissionMode::ALL);
+        // Offered, it still asks once more; no other mode does.
+        assert!(mode_needs_confirmation(Bypass));
+        assert!(!safe.into_iter().any(mode_needs_confirmation));
     }
 
     #[test]

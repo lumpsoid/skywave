@@ -158,9 +158,11 @@ async fn serve(
     identity: ServerIdentity,
 ) -> skywaved::Result<()> {
     // The one event log of the process: every writer shares it so appends
-    // wake the API's long-polls. The shell flag is set before any clone:
-    // each clone keeps its own.
-    let log = EventLog::open(&storage.db, config.roots.clone())?.with_shell(config.shell.enabled);
+    // wake the API's long-polls. The shell and bypass flags are set before
+    // any clone: each clone keeps its own.
+    let log = EventLog::open(&storage.db, config.roots.clone())?
+        .with_shell(config.shell.enabled)
+        .with_bypass(config.agent.allow_bypass);
     let adapter = ClaudeCodeAdapter::new(config.agent.clone());
     let mut supervisor = Supervisor::start(
         adapter,

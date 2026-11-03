@@ -4,12 +4,13 @@
 //! A `can_use_tool` request may carry `permission_suggestions`: permission
 //! updates the CLI would apply to stop asking. [`offered`] keeps the ones
 //! that widen what is allowed (`addRules` with `behavior: "allow"`,
-//! `setMode` to `acceptEdits` or `bypassPermissions`, `addDirectories`),
-//! labels each for the user and maps its `destination` to a [`RuleScope`];
-//! an approval that grants one sends that update back verbatim as the allow
-//! response's `updatedPermissions`. Anything else (removals, rules that deny
-//! or ask, modes that allow less, unknown shapes or destinations) is not
-//! offered.
+//! `setMode` to `acceptEdits`, or to `bypassPermissions` where the server
+//! allows bypass, `addDirectories`), labels each for the user and maps its
+//! `destination` to a [`RuleScope`]; an approval that grants one sends that
+//! update back verbatim as the allow response's `updatedPermissions`.
+//! Anything else (removals, rules that deny or ask, modes that allow less,
+//! bypass where the server does not allow it, unknown shapes or
+//! destinations) is not offered.
 //!
 //! Labels read after "always allow": `Bash(cargo test)`, `file edits`,
 //! `access to /srv/data`. They are handed over uncut; the mapper applies the
@@ -44,8 +45,9 @@ pub fn parse_grants(grants: &Grants) -> Result<Vec<Value>, String> {
 }
 
 /// The suggestions of a request worth offering, each with the update to
-/// send back when it is granted, in the request's order.
-pub fn offered(suggestions: Option<&Value>) -> Vec<(RuleSuggestion, Value)> {
+/// send back when it is granted, in the request's order. A switch to
+/// bypass is offered only when `allow_bypass` (`agent.allow_bypass`).
+pub fn offered(suggestions: Option<&Value>, allow_bypass: bool) -> Vec<(RuleSuggestion, Value)> {
     let Some(suggestions) = suggestions.and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -53,7 +55,7 @@ pub fn offered(suggestions: Option<&Value>) -> Vec<(RuleSuggestion, Value)> {
         .iter()
         .filter_map(|update| {
             let suggestion = RuleSuggestion {
-                label: label(update)?,
+                label: label(update, allow_bypass)?,
                 scope: scope(update)?,
             };
             Some((suggestion, update.clone()))
@@ -76,10 +78,12 @@ pub fn keep(kept: &mut Vec<Value>, update: &Value) -> bool {
 }
 
 /// The CLI flags that grant `kept` again, in order. Updates that allow
-/// nothing more are skipped, so stored grants cannot narrow the process.
-pub fn cli_args(kept: &[Value]) -> Vec<String> {
+/// nothing more are skipped, so stored grants cannot narrow the process,
+/// and so is a bypass grant unless `allow_bypass`: one granted while the
+/// server allowed bypass does not outlive the operator turning it off.
+pub fn cli_args(kept: &[Value], allow_bypass: bool) -> Vec<String> {
     let mut args = Vec::new();
-    for update in kept.iter().filter(|u| label(u).is_some()) {
+    for update in kept.iter().filter(|u| label(u, allow_bypass).is_some()) {
         let (flag, values): (&str, Vec<String>) = match update["type"].as_str() {
             Some("setMode") => ("--permission-mode", strings(&update["mode"])),
             Some("addRules") => (
@@ -111,8 +115,9 @@ fn strings(value: &Value) -> Vec<String> {
     value.as_str().map(str::to_owned).into_iter().collect()
 }
 
-/// What granting `update` allows, or `None` when it allows nothing more.
-fn label(update: &Value) -> Option<String> {
+/// What granting `update` allows, or `None` when it allows nothing more or
+/// is a switch to bypass the server does not allow.
+fn label(update: &Value, allow_bypass: bool) -> Option<String> {
     match update.get("type")?.as_str()? {
         "addRules" if update.get("behavior")?.as_str()? == "allow" => {
             let rules: Vec<String> = update
@@ -125,7 +130,7 @@ fn label(update: &Value) -> Option<String> {
         }
         "setMode" => match update.get("mode")?.as_str()? {
             "acceptEdits" => Some("file edits".to_owned()),
-            "bypassPermissions" => Some("every tool".to_owned()),
+            "bypassPermissions" if allow_bypass => Some("every tool".to_owned()),
             _ => None,
         },
         "addDirectories" => {
@@ -168,7 +173,11 @@ mod tests {
     use super::*;
 
     fn labels(suggestions: Value) -> Vec<(String, RuleScope)> {
-        offered(Some(&suggestions))
+        labels_with(suggestions, true)
+    }
+
+    fn labels_with(suggestions: Value, allow_bypass: bool) -> Vec<(String, RuleScope)> {
+        offered(Some(&suggestions), allow_bypass)
             .into_iter()
             .map(|(s, _)| (s.label, s.scope))
             .collect()
@@ -197,6 +206,34 @@ mod tests {
     }
 
     #[test]
+    fn bypass_is_offered_and_granted_again_only_where_allowed() {
+        let edits = json!({"type":"setMode","mode":"acceptEdits","destination":"session"});
+        let every = json!({"type":"setMode","mode":"bypassPermissions","destination":"cliArg"});
+        let suggestions = json!([edits.clone(), every.clone()]);
+        let edits_only = [("file edits".to_owned(), RuleScope::Session)];
+        assert_eq!(labels_with(suggestions.clone(), false), edits_only);
+        assert_eq!(
+            labels_with(suggestions, true),
+            [
+                edits_only[0].clone(),
+                ("every tool".to_owned(), RuleScope::Session)
+            ]
+        );
+        // A bypass kept while it was allowed is not granted again after.
+        let kept = [edits, every];
+        assert_eq!(cli_args(&kept, false), ["--permission-mode", "acceptEdits"]);
+        assert_eq!(
+            cli_args(&kept, true),
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--permission-mode",
+                "bypassPermissions"
+            ]
+        );
+    }
+
+    #[test]
     fn narrowing_or_unknown_updates_are_not_offered() {
         let suggestions = json!([
             {"type":"addRules","rules":[{"toolName":"Bash"}],"behavior":"deny","destination":"session"},
@@ -209,8 +246,8 @@ mod tests {
             "not an object",
         ]);
         assert!(labels(suggestions).is_empty());
-        assert!(offered(None).is_empty());
-        assert!(offered(Some(&json!({"type":"setMode"}))).is_empty());
+        assert!(offered(None, true).is_empty());
+        assert!(offered(Some(&json!({"type":"setMode"})), true).is_empty());
     }
 
     #[test]
@@ -241,7 +278,7 @@ mod tests {
             json!({"type":"addRules","rules":[{"toolName":"Bash"}],"behavior":"deny","destination":"session"}),
         ];
         assert_eq!(
-            cli_args(&kept),
+            cli_args(&kept, true),
             [
                 "--permission-mode",
                 "acceptEdits",
@@ -269,7 +306,7 @@ mod tests {
     #[test]
     fn the_update_is_kept_verbatim() {
         let update = json!({"type":"setMode","mode":"acceptEdits","destination":"session"});
-        let offered = offered(Some(&json!([update.clone()])));
+        let offered = offered(Some(&json!([update.clone()])), false);
         assert_eq!(offered[0].1, update);
     }
 }

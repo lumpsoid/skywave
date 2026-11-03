@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
     ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, ImportOutcome,
-    ImportedItem, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq,
-    SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay,
-    ToolKind, ToolResult, limits,
+    ImportedItem, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
+    ScheduleId, Seq, SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall,
+    ToolDisplay, ToolKind, ToolResult, limits,
 };
 use skywaved::agent::fake::FakeOutside;
 use skywaved::agent::import::{self, IMPORT_DEADLINE, Prepared};
@@ -1712,6 +1712,53 @@ fn appended(result: Result<ShellAppended, Error>) -> Seq {
         Ok(ShellAppended::Appended(seq)) => seq,
         other => panic!("expected Appended, got {other:?}"),
     }
+}
+
+#[test]
+fn bypass_is_refused_unless_the_server_allows_it() {
+    let mut f = Fixture::new();
+    assert!(!f.log.bypass_allowed(), "off by default");
+    let session = f.create_session();
+    let set = |mode| CommandKind::SetPermissionMode {
+        session_id: session,
+        mode,
+    };
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(set(PermissionMode::Bypass)),
+        rejected(RejectReason::BypassDisabled)
+    );
+    // Before the session is looked up: a disabled server says so first.
+    assert_eq!(
+        f.handle(CommandKind::SetPermissionMode {
+            session_id: SessionId::new(),
+            mode: PermissionMode::Bypass,
+        }),
+        rejected(RejectReason::BypassDisabled)
+    );
+    assert_eq!(f.log.head(), head, "a rejected command logs nothing");
+    // Positive control: every other mode goes in as before.
+    for mode in PermissionMode::ALL {
+        if mode != PermissionMode::Bypass {
+            accepted(f.handle(set(mode)));
+        }
+    }
+
+    f.log = f.log.clone().with_bypass(true);
+    assert!(f.log.bypass_allowed());
+    let seq = accepted(f.handle(set(PermissionMode::Bypass)));
+    let event = f.all_events().pop().unwrap();
+    assert_eq!(f.log.head(), seq);
+    assert!(
+        matches!(
+            event.kind,
+            EventKind::PermissionModeRequested {
+                mode: PermissionMode::Bypass,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
 }
 
 #[test]

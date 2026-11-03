@@ -474,7 +474,8 @@ pub struct AgentSettingsView {
     pub model_refusal: Option<String>,
     /// Likewise for an effort.
     pub effort_refusal: Option<String>,
-    /// Every mode, from the most asking to the least.
+    /// The modes to offer, from the most asking to the least: bypass only
+    /// where the server allows it (`skywave_present::format::offered_modes`).
     pub modes: Vec<ModeOption>,
     /// The models the agents offer; empty until one has, when only a name
     /// typed in switches.

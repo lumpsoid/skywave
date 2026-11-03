@@ -189,15 +189,17 @@ impl Seam {
         })
     }
 
-    /// The server said `hello`: keep the names of its devices and whether
-    /// it runs shell commands, and show them wherever the views do, offline
-    /// too after a restart.
+    /// The server said `hello`: keep the names of its devices, whether it
+    /// runs shell commands and whether it allows bypass mode, and show them
+    /// wherever the views do, offline too after a restart.
     pub fn hello_received(&self, hello: &HelloResponse) -> Result<(), CoreError> {
         self.update(|state| {
             state.store.set_devices(&hello.devices)?;
             state.store.set_shell_enabled(hello.shell)?;
+            state.store.set_bypass_allowed(hello.bypass)?;
             state.model.devices_named(&hello.devices);
             state.model.shell_enabled(hello.shell);
+            state.model.bypass_allowed(hello.bypass);
             Ok(((), Vec::new()))
         })
     }
