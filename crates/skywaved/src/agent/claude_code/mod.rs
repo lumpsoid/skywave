@@ -815,8 +815,21 @@ impl Driver {
         self.process.kill().await;
     }
 
-    /// stdout ended on its own: the exit error, if the exit was abnormal.
+    /// stdout ended on its own: the exit error, if the exit was abnormal or
+    /// left messages unanswered.
+    ///
+    /// The process reads nothing more, so requests are refused from here
+    /// on: a message sent now fails with `Closed` and its sender can start
+    /// another agent, rather than having it dropped with this one. Messages
+    /// accepted before that and not yet read are owed turns the process
+    /// never answers ([`Protocol::undelivered`]).
     async fn exited(&mut self) -> Option<String> {
+        self.requests.close();
+        while let Ok(request) = self.requests.try_recv() {
+            if let Request::Message(text) = request {
+                self.protocol.undelivered(text);
+            }
+        }
         let status = match timeout(self.grace_period, self.process.wait_exit()).await {
             Ok(status) => status,
             Err(_) => {

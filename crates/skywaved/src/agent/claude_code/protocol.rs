@@ -535,7 +535,9 @@ impl Protocol {
     /// a clean exit.
     ///
     /// A successful status after the handshake is clean unless the CLI
-    /// reported an error: stray stdout alone is not one. Any exit before
+    /// reported an error, or messages it owes turns for went unanswered with
+    /// no turn open (an open turn is reported as such by whoever reads the
+    /// exit): stray stdout alone is not one. Any exit before
     /// the handshake failed. For a failed exit the CLI's own startup error
     /// comes first, then the stderr tail, then a recent error result, then
     /// recent stray output, cut to its first line and
@@ -547,7 +549,13 @@ impl Protocol {
     ) -> Option<String> {
         let reason = |text: &str| cut_line(text, EXIT_REASON_MAX_CHARS).0;
         if self.ready && status.is_some_and(|s| s.success()) {
-            return self.error.as_deref().map(reason);
+            return self.error.as_deref().map(reason).or_else(|| {
+                let owed = self.queued.len();
+                (!self.turn_open && owed > 0).then(|| match owed {
+                    1 => "1 message left unanswered".to_owned(),
+                    n => format!("{n} messages left unanswered"),
+                })
+            });
         }
         let text = self
             .startup_error
@@ -683,6 +691,12 @@ impl Protocol {
         let mut out = Output::default();
         self.next_effort(&mut out);
         out
+    }
+
+    /// `text` was accepted for the process but it exited before reading it:
+    /// a turn owed that never runs, which [`Protocol::exit_error`] reports.
+    pub fn undelivered(&mut self, text: String) {
+        self.queued.push_back(text);
     }
 
     /// The session is stopping: queued messages are dropped and no new turn
