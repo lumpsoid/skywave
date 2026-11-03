@@ -1039,11 +1039,12 @@ fn session_origin_is_tagged_by_kind() {
     round_trip(&adopted);
 }
 
-/// Only a moved context's `SessionCreated` is the daemon's: a fresh or an
-/// adopting one is its `CreateSession`'s own event, so a device whose reply
-/// was lost settles the command from it.
+/// Only a fresh `SessionCreated` is its `CreateSession`'s own event: a moved
+/// context's `MoveContext` names itself on the `ContextMoved` after it, and
+/// an adopting `CreateSession` on the `ImportFinished` after its imported
+/// history, so a device that settles either from the log has the session.
 #[test]
-fn session_created_is_logged_by_command_unless_moved() {
+fn session_created_is_logged_by_command_only_when_fresh() {
     let created = |from| EventKind::SessionCreated {
         workdir: "/w".into(),
         context_name: "start".into(),
@@ -1051,9 +1052,15 @@ fn session_created_is_logged_by_command_unless_moved() {
     };
     assert!(created(None).logged_by_command());
     assert!(
-        created(Some(SessionOrigin::Agent {
+        !created(Some(SessionOrigin::Agent {
             conversation: "abc".into(),
         }))
+        .logged_by_command()
+    );
+    assert!(
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::NotFound
+        }
         .logged_by_command()
     );
     assert!(

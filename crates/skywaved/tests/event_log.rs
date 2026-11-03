@@ -1,7 +1,7 @@
 //! Event log and command handling (T03), driven through the public API.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
@@ -10,7 +10,12 @@ use skywave_proto::{
     SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay,
     ToolKind, ToolResult, limits,
 };
-use skywaved::agent::{ResumeHandle, store_resume_handle};
+use skywaved::agent::fake::FakeOutside;
+use skywaved::agent::import::{self, IMPORT_DEADLINE, Prepared};
+use skywaved::agent::{
+    AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay, ResumeHandle,
+    store_resume_handle,
+};
 use skywaved::event_log::{
     DEFAULT_BATCH_LIMIT, PendingApproval, ShellAppended, ShellRun, ShellStatus,
 };
@@ -366,6 +371,27 @@ fn each_accepted_command_logs_one_event_naming_it() {
         "the new session's SessionCreated, then the move's own event"
     );
     logged.push((id, seq));
+    // An adoption: its session and imported history, then its own event.
+    let adopt = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: f.root.join("project").display().to_string(),
+            conversation: Some(CONVERSATION.into()),
+        },
+    };
+    let prepared = f.prepare_import(two_items());
+    let before = f.log.head();
+    let result = f
+        .log
+        .handle_with(&mut f.storage.db, device, &adopt, Some(prepared))
+        .unwrap();
+    let seq = accepted(result);
+    assert_eq!(
+        seq,
+        Seq(before.0 + 4),
+        "SessionCreated, two Imported, then the create's ImportFinished"
+    );
+    logged.push((adopt.id, seq));
     let head = f.log.head();
     let (_, refused, _) = send(
         &mut f,
@@ -673,10 +699,11 @@ fn adopt_kind(workdir: String, conversation: &str) -> CommandKind {
     }
 }
 
-/// An adoption is one `SessionCreated` naming its command at the command's
-/// seq, with the id trimmed and otherwise as sent; its first context
-/// records that as its origin. A resend gives the same answer and appends
-/// nothing.
+/// An adoption with nothing imported is a `SessionCreated` naming no
+/// command, with the id trimmed and otherwise as sent, then the command's
+/// `ImportFinished` (`Unavailable`: `handle` imports nothing) at its seq;
+/// its first context records the origin. A resend gives the same answer
+/// and appends nothing.
 #[test]
 fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
     let mut f = Fixture::new();
@@ -690,11 +717,22 @@ fn an_adopting_create_session_logs_the_trimmed_id_and_names_its_command() {
     };
     let result = f.log.handle(&mut f.storage.db, device, &command).unwrap();
     let seq = accepted(result.clone());
-    assert_eq!(seq, Seq(1), "one event, nothing else");
-    let event = f.all_events().pop().unwrap();
-    assert_eq!(event.command_id, Some(command.id));
+    assert_eq!(seq, Seq(2), "the session, then the command's own event");
+    let mut events = f.all_events();
+    let finished = events.pop().unwrap();
+    assert_eq!(finished.command_id, Some(command.id));
+    assert_eq!(
+        finished.kind,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Unavailable
+        }
+    );
+    let event = events.pop().unwrap();
+    assert_eq!(event.command_id, None);
     let session = event.session_id;
     assert_eq!(event.context, ContextId::first_of(session));
+    assert_eq!(finished.session_id, session);
+    assert_eq!(finished.context, ContextId::first_of(session));
     let EventKind::SessionCreated {
         workdir: dir, from, ..
     } = &event.kind
@@ -770,6 +808,170 @@ fn a_bad_conversation_id_is_refused_after_the_workdir() {
     // Positive control: the longest id is accepted, whole.
     let longest = "a".repeat(skywave_proto::limits::CONVERSATION_ID_MAX_CHARS);
     accepted(f.handle(adopt_kind(project, &longest)));
+}
+
+/// Two imported items: a call, and its result long enough for a blob.
+fn two_items() -> Vec<HistoryItem> {
+    vec![
+        HistoryItem::Agent {
+            at: None,
+            event: AdapterEvent::ToolCall {
+                call: Some(AgentCallId::from("toolu_1")),
+                parent: None,
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "ls" }),
+                display: None,
+            },
+        },
+        HistoryItem::Agent {
+            at: None,
+            event: AdapterEvent::ToolResult {
+                call: Some(AgentCallId::from("toolu_1")),
+                result: ResultDisplay {
+                    is_error: false,
+                    status: None,
+                    preview: None,
+                    output: "file\n".repeat(1000),
+                },
+            },
+        },
+    ]
+}
+
+impl Fixture {
+    /// The import of [`CONVERSATION`] in the project, as the API prepares
+    /// it: its blob is written, not recorded.
+    fn prepare_import(&self, items: Vec<HistoryItem>) -> Prepared {
+        let project = workdir(&self.root.join("project"));
+        let source = FakeOutside::new();
+        source.conversation(
+            Path::new(&project),
+            CONVERSATION,
+            HistoryRead::Read { items },
+        );
+        let deadline = Instant::now() + IMPORT_DEADLINE;
+        import::prepare(
+            &source,
+            self.storage.blobs.clone(),
+            &project,
+            CONVERSATION,
+            deadline,
+        )
+    }
+
+    /// Blob files and `blobs` rows.
+    fn blobs(&self) -> (usize, i64) {
+        let files = std::fs::read_dir(self.storage.dir.blobs_dir())
+            .unwrap()
+            .filter(|e| {
+                !e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            })
+            .count();
+        let rows = self
+            .storage
+            .db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        (files, rows)
+    }
+}
+
+/// A prepared import is logged only by the adopting create it was read
+/// for: one answered already, refused, or whose workdir now canonicalises
+/// elsewhere leaves none of its blob files behind.
+#[test]
+fn a_prepared_import_not_logged_leaves_no_blob() {
+    let mut f = Fixture::new();
+    let device = DeviceId::new();
+    let project = workdir(&f.root.join("project"));
+    let adopt = |workdir: &str| Command {
+        id: CommandId::new(),
+        kind: adopt_kind(workdir.to_owned(), CONVERSATION),
+    };
+
+    // Answered already: the stored result, nothing logged.
+    let answered = adopt(&project);
+    let result = f.log.handle(&mut f.storage.db, device, &answered).unwrap();
+    let head = f.log.head();
+    let prepared = f.prepare_import(two_items());
+    assert_eq!(f.blobs(), (1, 0), "written, not recorded");
+    let again = f
+        .log
+        .handle_with(&mut f.storage.db, device, &answered, Some(prepared))
+        .unwrap();
+    assert_eq!(again, result);
+    assert_eq!(f.log.head(), head);
+    assert_eq!(f.blobs(), (0, 0));
+
+    // Refused.
+    let missing = adopt(&workdir(&f.root.join("missing")));
+    let prepared = f.prepare_import(two_items());
+    assert_eq!(
+        f.log
+            .handle_with(&mut f.storage.db, device, &missing, Some(prepared))
+            .unwrap(),
+        rejected(RejectReason::WorkdirNotFound)
+    );
+    assert_eq!(f.blobs(), (0, 0));
+
+    // Read for another workdir than the command now canonicalises to.
+    let other = f.root.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let moved = adopt(&workdir(&other));
+    let prepared = f.prepare_import(two_items());
+    let seq = accepted(
+        f.log
+            .handle_with(&mut f.storage.db, device, &moved, Some(prepared))
+            .unwrap(),
+    );
+    assert_eq!(seq, Seq(head.0 + 2), "the session, then its ImportFinished");
+    assert_eq!(
+        f.all_events().pop().unwrap().kind,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Failed {
+                reason: import::WORKDIR_CHANGED.into()
+            }
+        }
+    );
+    assert_eq!(f.blobs(), (0, 0));
+
+    // Refused when the API was to read it, accepted now (the directory
+    // appeared in between): it changed, the agent is not `Unavailable`.
+    let appeared = adopt(&project);
+    let refused = Prepared::workdir_refused(f.storage.blobs.clone());
+    accepted(
+        f.log
+            .handle_with(&mut f.storage.db, device, &appeared, Some(refused))
+            .unwrap(),
+    );
+    assert_eq!(
+        f.all_events().pop().unwrap().kind,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Failed {
+                reason: import::WORKDIR_CHANGED.into()
+            }
+        }
+    );
+
+    // Positive control: read for this very create, it is logged and kept.
+    let prepared = f.prepare_import(two_items());
+    let seq = accepted(
+        f.log
+            .handle_with(&mut f.storage.db, device, &adopt(&project), Some(prepared))
+            .unwrap(),
+    );
+    assert_eq!(
+        f.all_events()[(seq.0 - 1) as usize].kind,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Imported { items: 2 }
+        }
+    );
+    assert_eq!(f.blobs(), (1, 1));
 }
 
 // --- SendMessage, ResolveApproval, Interrupt -------------------------------

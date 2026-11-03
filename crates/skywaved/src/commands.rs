@@ -4,9 +4,11 @@
 //!
 //! What each command appends, and the seq its `Accepted` names:
 //! - `CreateSession` → `SessionCreated` with the canonical workdir, a new
-//!   [`SessionId`], a generated name for its first context and, when it
-//!   adopts an outside conversation, `from` = [`SessionOrigin::Agent`] with
-//!   the checked id;
+//!   [`SessionId`] and a generated name for its first context; when it
+//!   adopts an outside conversation, that `SessionCreated` has `from` =
+//!   [`SessionOrigin::Agent`] with the checked id and names no command, and
+//!   is followed by an `Imported` for each item of the conversation's
+//!   history, then `ImportFinished` with the import's outcome;
 //! - `SendMessage` → `UserMessage`;
 //! - `ResolveApproval` → `ApprovalResolved`, echoing the granted `rule`;
 //! - `Interrupt` → `TurnInterrupted`;
@@ -28,7 +30,10 @@
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
 //! appends, and nothing else but the new session's `SessionCreated` a
-//! `MoveContext` logs before it. So the log acknowledges an accepted
+//! `MoveContext` logs before it, and an adopting `CreateSession`'s
+//! `SessionCreated` and `Imported`s before its `ImportFinished`. Every
+//! adopting create's own event is its `ImportFinished`, whatever the import's
+//! outcome. So the log acknowledges an accepted
 //! command as its `Accepted` does: a device whose reply was lost settles
 //! the command when it pulls that event, and batches are contiguous, so it
 //! has whatever the command appended before it too. A rejected command
@@ -37,7 +42,8 @@
 //! **Context stamps.** The server stamps each event with the context it
 //! belongs to ([`Event::context`](skywave_proto::Event::context)):
 //! `SessionCreated` with the session's first context, which has the
-//! session's id; `ContextStarted` and `ContextSwitched` with the context
+//! session's id, and so an adopting create's `Imported`s and
+//! `ImportFinished`; `ContextStarted` and `ContextSwitched` with the context
 //! they make current; `ApprovalResolved` with the approval's context;
 //! `TurnInterrupted` with the context of the running turn, which after a
 //! switch is the old context until its agent reports the turn over;
@@ -49,10 +55,15 @@
 //! `conversation` must pass [`skywave_proto::check_conversation_id`], else
 //! `BadConversation`. That is a syntax check only, and the id is logged
 //! trimmed, never cut. Whether the agent has such a conversation in the
-//! workdir is not checked here, and cannot be: the log has no agent
-//! adapter, the transaction is synchronous, and the conversation lives in
-//! the agent's own storage. The agent settles it when the session first
-//! starts.
+//! workdir is not checked here: the agent settles it when the session
+//! first starts. Its history is imported before the transaction (D37): the
+//! API reads it off the database within
+//! [`IMPORT_DEADLINE`](crate::agent::import::IMPORT_DEADLINE) and bounds it
+//! into blobs it has written but not recorded
+//! ([`crate::agent::import`]); [`EventLog::handle_with`] logs it. An
+//! import that found nothing, failed or timed out is an outcome of the
+//! `ImportFinished` (`NotFound`, `Failed`), never a refusal: the session is
+//! created all the same. A refused create logs nothing and leaves no blob.
 //!
 //! **SendMessage.** `ContextChanged` when its `context` is no longer the
 //! session's current one: the message was written for a conversation the
@@ -150,10 +161,11 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
-    EventKind, RejectReason, Seq, SessionId, SessionOrigin, check_conversation_id, context_name,
-    limits, normalise_context_name,
+    EventKind, ImportOutcome, RejectReason, Seq, SessionId, SessionOrigin, check_conversation_id,
+    context_name, limits, normalise_context_name,
 };
 
+use crate::agent::import::{self, Prepared};
 use crate::db::Db;
 use crate::dirs;
 use crate::error::Result;
@@ -168,17 +180,38 @@ impl EventLog {
     /// database failed and nothing was recorded, so a resend is still safe.
     ///
     /// Blocking: it runs SQLite and, for `CreateSession`, file system calls.
+    /// An adopting `CreateSession` imports nothing here: its
+    /// `ImportFinished` says `Unavailable` (see [`EventLog::handle_with`]).
     pub fn handle(
         &self,
         db: &mut Db,
         device: DeviceId,
         command: &Command,
     ) -> Result<CommandResult> {
+        self.handle_with(db, device, command, None)
+    }
+
+    /// [`EventLog::handle`], with the history an adopting `CreateSession`
+    /// imports, prepared beforehand off the database ([`import::prepare`]).
+    /// Its blob rows and `Imported` events are logged in the command's
+    /// transaction. It is logged only for an accepted adopting create whose
+    /// workdir canonicalises to the one it was read for; one that
+    /// canonicalises elsewhere now logs `Failed("workdir changed")`, and
+    /// with none the outcome is `Unavailable`. Whatever is not logged and
+    /// committed, a stored or refused command or a failed transaction
+    /// included, has its blob files removed.
+    pub fn handle_with(
+        &self,
+        db: &mut Db,
+        device: DeviceId,
+        command: &Command,
+        mut prepared: Option<Prepared>,
+    ) -> Result<CommandResult> {
         let tx = event_log::begin(db)?;
         if let Some(stored) = stored_result(&tx, command.id)? {
             return Ok(stored);
         }
-        let result = match self.apply(&tx, device, command)? {
+        let result = match self.apply(&tx, device, command, prepared.as_mut())? {
             Ok(seq) => CommandResult::Accepted { seq },
             Err(reason) => CommandResult::Rejected { reason },
         };
@@ -191,6 +224,9 @@ impl EventLog {
             ],
         )?;
         tx.commit()?;
+        if let Some(prepared) = prepared {
+            prepared.kept();
+        }
         match &result {
             CommandResult::Accepted { seq } => {
                 tracing::debug!(command = %command.id.0, seq = seq.0, "command accepted");
@@ -203,6 +239,11 @@ impl EventLog {
         Ok(result)
     }
 
+    /// The stored result of command `id`, if it was handled.
+    pub fn command_result(&self, db: &Db, id: CommandId) -> Result<Option<CommandResult>> {
+        stored_result(db.conn(), id)
+    }
+
     /// Validates `command` and appends its events, returning the seq of the
     /// one naming it, the last, or why the command is refused.
     fn apply(
@@ -210,6 +251,7 @@ impl EventLog {
         tx: &Connection,
         device: DeviceId,
         command: &Command,
+        prepared: Option<&mut Prepared>,
     ) -> Result<Result<Seq, RejectReason>> {
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
@@ -229,12 +271,34 @@ impl EventLog {
                     Some(None) => return Ok(Err(RejectReason::BadConversation)),
                 };
                 let session = SessionId::new();
+                let context = ContextId::first_of(session);
+                let adopting = from.is_some();
                 let kind = EventKind::SessionCreated {
-                    workdir,
+                    workdir: workdir.clone(),
                     context_name: context_name::random(),
                     from,
                 };
-                (session, ContextId::first_of(session), kind)
+                if !adopting {
+                    (session, context, kind)
+                } else {
+                    // The session first, naming no command, then its
+                    // imported history; the command names itself on the
+                    // `ImportFinished` after it, the last event it appends.
+                    event_log::append_in(tx, session, context, None, &kind)?;
+                    let outcome = match prepared {
+                        Some(prepared) if prepared.workdir() == Some(workdir.as_str()) => {
+                            prepared.log(tx, session, context)?
+                        }
+                        // Renamed or relinked since it was read: the history
+                        // read may be another directory's. Or refused then
+                        // and accepted now: nothing was read.
+                        Some(_) => ImportOutcome::Failed {
+                            reason: import::WORKDIR_CHANGED.to_owned(),
+                        },
+                        None => ImportOutcome::Unavailable,
+                    };
+                    (session, context, EventKind::ImportFinished { outcome })
+                }
             }
             CommandKind::SendMessage {
                 session_id,

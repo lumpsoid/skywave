@@ -116,7 +116,9 @@ version changed. Client and server must match it exactly (checked at
   (`Event.command_id`), the last it appends, at the seq of its `Accepted`;
   a rejected one logs nothing. So the log acknowledges a command as its
   reply does (`MoveContext` also logs the new session's `SessionCreated`
-  first).
+  first; an adopting `CreateSession` logs its `SessionCreated` and the
+  imported history first, and names itself on the `ImportFinished` after
+  them, D37).
 - **Every event carries its context** (`Event.context`), stamped by the
   server, never derived from position (D29). Session-level state (name,
   archived, mode, model, effort) folds per session regardless.
@@ -150,6 +152,18 @@ beside a running `serve`.
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,
   `shell_runs`) updated in the transaction that appends the event.
+- **Importing an outside conversation** (D37): for an adopting
+  `CreateSession` the API first reads the conversation's history from the
+  agent's source (built next to the adapter) on a blocking thread, off its
+  database connection, within a 20 s deadline (under the device's 30 s
+  reply timeout; past it `Failed("timed out")`), and bounds it with the
+  event mapper's helpers into blobs written but not yet recorded. The
+  command's transaction then records them and appends `SessionCreated`,
+  one `Imported` per item and the command's `ImportFinished`; any path
+  that does not commit them removes their files. A resend while the first
+  request prepares waits for it; one after it is answered from the stored
+  result. Imported items are records: never delivered to the agent, never
+  open calls.
 - **Agent supervisor** (D3, D4, D8): at most one agent process per session,
   started lazily for the context a message or setting request is stamped
   with: resumed from that context's opaque handle, else forked from the

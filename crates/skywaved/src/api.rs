@@ -42,9 +42,20 @@
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
 //! future, and the deadline is what stops the abandoned work.
 //!
+//! **Adopting creates** (`CreateSession` with a `conversation`, D37): the
+//! conversation's history is read and bounded first, on a blocking thread
+//! and off the API's connection, then handed to
+//! [`EventLog::handle_with`]. A command already handled is answered from its
+//! stored result without reading anything; a resend that arrives while the
+//! first request is still preparing waits for that request's reply. The
+//! import gets the server's import deadline
+//! ([`import::IMPORT_DEADLINE`]), after which the reply goes on with
+//! `Failed("timed out")`.
+//!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
 //! 500 server fault.
 
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -61,20 +72,24 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, DeviceId, DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloResponse,
-    PROTOCOL_VERSION, ServerId, WorkdirQuery, path,
+    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo, DirsQuery,
+    EventsQuery, Fingerprint, HelloResponse, ImportOutcome, PROTOCOL_VERSION, ServerId,
+    WorkdirQuery, check_conversation_id, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::EventLog;
+use crate::agent::OutsideConversations;
+use crate::agent::import::{self, Prepared};
 use crate::blobs::BlobStore;
 use crate::db::Db;
 use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
 use crate::event_log::DEFAULT_BATCH_LIMIT;
-use crate::workdir::{self, Git, Snapshot, WorkdirReader};
+use crate::server::ServerOptions;
+use crate::workdir::{self, Snapshot, WorkdirReader};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -111,28 +126,39 @@ pub(crate) struct Api {
     server_id: ServerId,
     /// Becomes `true` when the server shuts down, ending long-poll waits.
     shutdown: watch::Receiver<bool>,
+    /// What an adopting `CreateSession` imports from.
+    outside: Arc<dyn OutsideConversations>,
+    import_deadline: Duration,
+    /// The adopting creates whose import is being prepared, by command id:
+    /// each answers with the command's reply once it has one.
+    importing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
 }
 
+/// A command's reply: its result, or the status of a request that failed.
+type Reply = std::result::Result<CommandResult, StatusCode>;
+
 impl Api {
-    /// `db` and `workdir_db` are two connections to the same database;
-    /// workdir changes run git as `git` says.
+    /// `db` and `workdir_db` are two connections to the same database.
     pub(crate) fn new(
         db: Db,
         workdir_db: Db,
-        git: Git,
         log: EventLog,
         blobs: BlobStore,
         server_id: ServerId,
         shutdown: watch::Receiver<bool>,
+        options: ServerOptions,
     ) -> Api {
         Api {
             db: Mutex::new(db),
             workdir: WorkdirReader::new(workdir_db, blobs.clone(), log.roots().to_vec())
-                .with_git(git),
+                .with_git(options.git),
             log,
             blobs,
             server_id,
             shutdown,
+            outside: options.outside,
+            import_deadline: options.import_deadline,
+            importing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -252,14 +278,148 @@ async fn commands(
         }
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let adopting = matches!(
+        command.kind,
+        CommandKind::CreateSession {
+            conversation: Some(_),
+            ..
+        }
+    );
+    let reply = if adopting {
+        adopt(&api, device, command).await
+    } else {
+        api.blocking(move |api, db| api.log.handle(db, device, &command))
+            .await
+    };
     // Accepted and Rejected are both 200: a rejection is a domain answer.
-    match api
-        .blocking(move |api, db| api.log.handle(db, device, &command))
-        .await
-    {
+    match reply {
         Ok(result) => Json(result).into_response(),
         Err(status) => status.into_response(),
     }
+}
+
+/// Handles an adopting `CreateSession`, whose history is read and bounded
+/// before its transaction, outside the API's connection: a slow read must
+/// not hold up every other device's commands. A resend that arrives while
+/// the import is being prepared waits for that one's reply, so a command
+/// is never imported twice.
+async fn adopt(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
+    loop {
+        let role = {
+            let mut importing = lock(&api.importing);
+            match importing.get(&command.id) {
+                Some(reply) => Err(reply.clone()),
+                None => {
+                    let (reply, waiting) = watch::channel(None);
+                    importing.insert(command.id, waiting);
+                    Ok(Leading {
+                        api,
+                        id: command.id,
+                        reply,
+                    })
+                }
+            }
+        };
+        match role {
+            Ok(leading) => {
+                let reply = prepare_and_handle(api, device, command).await;
+                leading.reply.send_replace(Some(reply.clone()));
+                return reply;
+            }
+            Err(mut waiting) => {
+                if let Ok(reply) = waiting.wait_for(Option::is_some).await {
+                    return reply.clone().expect("waited for a reply");
+                }
+                // The first request was dropped before it had a reply:
+                // whatever it did is stored or undone, so start over.
+            }
+        }
+    }
+}
+
+/// The request preparing a command's import; dropped, its entry goes.
+struct Leading<'a> {
+    api: &'a Api,
+    id: CommandId,
+    reply: watch::Sender<Option<Reply>>,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        lock(&self.api.importing).remove(&self.id);
+    }
+}
+
+async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
+    // A command already handled is answered from the log: no second import.
+    let id = command.id;
+    if let Some(stored) = api
+        .blocking(move |api, db| api.log.command_result(db, id))
+        .await?
+    {
+        return Ok(stored);
+    }
+    let prepared = prepare_import(api, &command).await;
+    api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
+        .await
+}
+
+/// The import of an adopting create, or `None` for a conversation id
+/// `handle_with` refuses (a pure syntax check, so it refuses it too). The
+/// history read
+/// and its blob writes run on a blocking thread; past the deadline the
+/// reply goes on without them as `Failed("timed out")`, and whatever the
+/// abandoned thread still writes is removed when it ends.
+async fn prepare_import(api: &Arc<Api>, command: &Command) -> Option<Prepared> {
+    let CommandKind::CreateSession {
+        workdir,
+        conversation: Some(conversation),
+    } = &command.kind
+    else {
+        return None;
+    };
+    let conversation = check_conversation_id(conversation)?.to_owned();
+    let deadline = Instant::now() + api.import_deadline;
+    let (roots, workdir) = (api.log.roots().to_vec(), workdir.clone());
+    // A refused workdir imports nothing: `handle_with` canonicalises again
+    // and refuses the command, or, should it accept the workdir now, logs
+    // `Failed("workdir changed")`.
+    let canonical =
+        tokio::task::spawn_blocking(move || dirs::canonical_under_roots(&roots, &workdir));
+    let workdir = match canonical.await {
+        Ok(Ok(workdir)) => workdir,
+        Ok(Err(_refused)) => return Some(Prepared::workdir_refused(api.blobs.clone())),
+        Err(e) => {
+            tracing::error!(error = %e, "canonicalising a workdir failed");
+            return Some(Prepared::workdir_refused(api.blobs.clone()));
+        }
+    };
+    let (source, blobs, read_for) = (api.outside.clone(), api.blobs.clone(), workdir.clone());
+    let read = tokio::task::spawn_blocking(move || {
+        import::prepare(&*source, blobs, &read_for, &conversation, deadline)
+    });
+    match tokio::time::timeout_at(deadline.into(), read).await {
+        Ok(Ok(prepared)) => Some(prepared),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "preparing an import failed");
+            let outcome = ImportOutcome::Failed {
+                reason: "could not read the history".to_owned(),
+            };
+            Some(Prepared::without_items(
+                api.blobs.clone(),
+                &workdir,
+                outcome,
+            ))
+        }
+        Err(_) => {
+            tracing::warn!(command = %command.id.0, "importing a conversation timed out");
+            Some(Prepared::timed_out(api.blobs.clone(), &workdir))
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().expect("api lock poisoned")
 }
 
 async fn events(

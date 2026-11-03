@@ -452,7 +452,10 @@ own, true because both heads render a per-task stop.
 `CreateSession { workdir, conversation: Some(id) }` creates a session that
 continues a conversation the agent had outside Skywave, in `workdir`. The
 server logs one `SessionCreated { workdir, from: Some(Agent { conversation
-}) }` (named by the command, settled at its own `Accepted { seq }`). The
+}) }`, followed since D37 by the imported history and the command's own
+`ImportFinished` (D37 supersedes "named by the command": the
+`SessionCreated` names none, and the command settles at the
+`ImportFinished`'s `Accepted { seq }`). The
 first context stores `from` as its `origin`: one JSON `SessionOrigin`
 column for a move and an adoption alike, so a context cannot continue both.
 On that context's first start the supervisor passes
@@ -486,7 +489,8 @@ fits instead: D30 rejected `CreateSession { workdir, from }` for moves
 because a move has another command's validation and two events, and
 adoption has neither); a second optional field next to `from`, since a
 session continues at most one thing, so one `SessionOrigin` enum
-(`Context` | `Agent`; `logged_by_command()` is true for `None` and `Agent`).
+(`Context` | `Agent`; `logged_by_command()` is true for `None` only, since
+D37).
 Both heads adopt by pasting the id (decided by the user 2026-11-02): TUI
 `c`, the GUI dialog's second field. An adopted session's first timeline
 item is a divider, `Entry::Adopted`.
@@ -494,9 +498,9 @@ item is a divider, `Entry::Adopted`.
 conversation's cumulative spend shows in the fork's `total_cost_usd`;
 per-turn cost is unaffected. An adopted first context that never ran
 (cleared before its first message) cannot be moved (`NoConversation`).
-**Deferred:** showing the outside history (a best-effort parse of
-`~/.claude/projects/*.jsonl`); listing adoptable conversations on the server
-or picking from a list in a head; handing a conversation back to the
+**Deferred:** showing the outside history and listing adoptable
+conversations / picking from a list in a head, both since taken up by
+D37; handing a conversation back to the
 terminal (showing the fork's CLI id); adopt by resume; checking existence at
 command time; adopting into an existing session as a new context; carrying
 mode, model, effort or grants; an agent capability that lets clients hide
@@ -782,3 +786,58 @@ so a refresh costs no server disk and no device fetch. Only workdir content
 is looked up, so a snapshot never shares a blob with an event, whose
 per-session deletion on the device could then remove it.
 **Deferred:** blob GC (workdir and event blobs alike grow without bound).
+
+## D37. Browsing and importing outside conversations
+An adopting `CreateSession` (D32) imports the outside conversation's
+history into the log, so every head shows what the agent remembers. It
+logs, in one transaction: `SessionCreated { from: Some(Agent) }` naming no
+command, an `Imported { at, item }` for each history item (stamped, like
+the `SessionCreated`, with the first context), then `ImportFinished {
+outcome }` naming the command at its `Accepted { seq }`. The ack rule
+stays "the command names its last event": every adopting create's own
+event is its `ImportFinished`, whatever the outcome (`Imported { items }`,
+`NotFound`, `Failed { reason }`, `Unavailable`), so heads always have the
+fork point to draw. A fresh create is unchanged.
+**At command time, before the transaction.** The API reads the history
+from the agent's source (`OutsideConversations`, built next to the
+adapter; for Claude Code the transcripts under the projects dir) on a
+blocking thread, off its database connection, and bounds it with the
+live mapper's helpers into blobs it writes but does not record; the
+transaction records them with the events. Every path that does not commit
+them (stored, refused, failed transaction, abandoned past the deadline,
+workdir canonicalising differently than when read, `Failed("workdir
+changed")`) removes their files. A resend while the first request is still
+preparing waits for it; a resend after it is answered from the stored
+result without reading anything. **Why not in the supervisor** when it
+reaches the `SessionCreated`: a device that queued a message behind the
+create would see it land before the history, so heads would reorder by
+kind; at command time the history is always between the `SessionCreated`
+and the ack. **Rejected:** importing inside the write transaction (blob
+fsyncs would hold the lock the supervisor and shell runner need), or while
+holding the API's connection (every other device's command would wait).
+**A separate wrapper kind, `Imported`,** not existing kinds plus a flag:
+an imported `UserMessage` would be delivered to the agent, unarchive the
+session, need a device and command id and count as activity, and every
+fold would need a flag check a new fold forgets. `Imported` keeps the item
+nested, so the top-level `type` of an imported call is never `tool_call`:
+`open_calls` and the supervisor never see one.
+**The 20 s deadline** (`IMPORT_DEADLINE`, user decision 2026-11-03). The
+reply waits for the import, and a device treats a reply later than its
+30 s request timeout as a dead link (drop, reconnect, resend), so the
+deadline sits well under it (the user asked for ~60 s, which would drop the
+creating device's link on every slow import). Past it the outcome is
+`Failed("timed out")`, a recorded result; the session is still created.
+Measured: the biggest local transcript parses in 77 ms with ~800 blob
+writes at worst.
+**No cap** on the number of imported items (user decision): every item is
+logged and replicated like any event (D6). **No rejection:** `NotFound` or
+`Failed` is an outcome, not a `RejectReason`; the agent's own lookup at
+first start still decides (D32), and a reader bug must not block an
+adoption the agent would accept. Skywave's own conversations are listed
+too, with a hint naming their session.
+**Known gap:** the history is read at command time and the fork made at
+first start; turns the terminal adds in between are in the agent's memory
+but not in the imported history. **Deferred:** forking eagerly at create
+time; re-importing or importing into an existing session (the only way
+back from a timed-out import); subagent lines, thinking, attachments and
+per-turn usage of imported turns; blob GC (as D36).
