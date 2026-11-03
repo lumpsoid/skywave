@@ -285,6 +285,31 @@ fn ok_json<T: DeserializeOwned>(reply: Reply) -> Result<T, TransportError> {
     reply.json()
 }
 
+/// Just the version of a hello body: the one field every protocol
+/// version's [`HelloResponse`] keeps, whatever else it adds or drops.
+#[derive(serde::Deserialize)]
+struct HelloVersion {
+    protocol_version: u32,
+}
+
+/// The [`HelloResponse`] in `reply`, checking the protocol version before
+/// decoding the rest: the shape of the rest is what versions change, so a
+/// server of another version must be reported as a mismatch, not as an
+/// unreadable body (a field this client requires and that server lacks).
+fn hello_from(reply: Reply) -> Result<HelloResponse, TransportError> {
+    if reply.status != StatusCode::OK {
+        return Err(status_error(reply.status, &reply.headers));
+    }
+    let HelloVersion { protocol_version } = reply.json()?;
+    if protocol_version != PROTOCOL_VERSION {
+        return Err(TransportError::ProtocolMismatch {
+            client: PROTOCOL_VERSION,
+            server: protocol_version,
+        });
+    }
+    reply.json()
+}
+
 /// The [`Transport`] of a paired device: mTLS with the device certificate,
 /// trusting only the CA pinned at pairing. Cheap to share behind an `Arc`;
 /// requests may run concurrently.
@@ -318,14 +343,7 @@ impl HttpsTransport {
                 self.http.request_timeout(),
             )
             .await?;
-        let hello: HelloResponse = ok_json(reply)?;
-        if hello.protocol_version != PROTOCOL_VERSION {
-            return Err(TransportError::ProtocolMismatch {
-                client: PROTOCOL_VERSION,
-                server: hello.protocol_version,
-            });
-        }
-        Ok(hello)
+        hello_from(reply)
     }
 
     async fn send_command(&self, command: &Command) -> Result<CommandResult, TransportError> {
@@ -576,6 +594,95 @@ mod tests {
             query_escape("/a b&c=d%#+é"),
             "/a%20b%26c%3Dd%25%23%2B%C3%A9"
         );
+    }
+
+    fn hello_json() -> serde_json::Value {
+        serde_json::to_value(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: skywave_proto::ServerId::new(),
+            device_id: skywave_proto::DeviceId::new(),
+            head: skywave_proto::Seq::ZERO,
+            devices: Vec::new(),
+            shell: false,
+            bypass: false,
+        })
+        .unwrap()
+    }
+
+    fn reply(status: StatusCode, body: &serde_json::Value) -> Reply {
+        Reply {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(body).unwrap()),
+        }
+    }
+
+    /// A hello of this version decodes whole; one that lacks a field this
+    /// client requires is unreadable, not a mismatch.
+    #[test]
+    fn a_hello_of_this_version_decodes() {
+        let json = hello_json();
+        let hello = hello_from(reply(StatusCode::OK, &json)).unwrap();
+        assert_eq!(serde_json::to_value(hello).unwrap(), json);
+
+        let mut missing = json.clone();
+        missing.as_object_mut().unwrap().remove("bypass");
+        let err = hello_from(reply(StatusCode::OK, &missing)).unwrap_err();
+        assert!(matches!(err, TransportError::Decode(_)), "{err:?}");
+        assert_eq!(err.rejection(), None);
+    }
+
+    /// An older server's hello lacks fields this client requires; a newer
+    /// one's has fields it does not know (and may lack some it does). Both
+    /// are a protocol mismatch, which rejects the link, rather than a
+    /// decode error the link would retry forever.
+    #[test]
+    fn a_hello_of_another_version_is_a_mismatch_whatever_its_shape() {
+        let mut older = hello_json();
+        let fields = older.as_object_mut().unwrap();
+        fields.insert("protocol_version".into(), (PROTOCOL_VERSION - 1).into());
+        fields.remove("bypass");
+        fields.remove("devices");
+        let mut newer = hello_json();
+        let fields = newer.as_object_mut().unwrap();
+        fields.insert("protocol_version".into(), (PROTOCOL_VERSION + 1).into());
+        fields.insert("something_new".into(), serde_json::json!({"a": [1]}));
+        fields.remove("shell");
+
+        for (body, server) in [(older, PROTOCOL_VERSION - 1), (newer, PROTOCOL_VERSION + 1)] {
+            let err = hello_from(reply(StatusCode::OK, &body)).unwrap_err();
+            assert_eq!(
+                err,
+                TransportError::ProtocolMismatch {
+                    client: PROTOCOL_VERSION,
+                    server,
+                }
+            );
+            assert_eq!(
+                err.rejection(),
+                Some(crate::LinkRejection::ProtocolMismatch {
+                    client: PROTOCOL_VERSION,
+                    server,
+                })
+            );
+        }
+    }
+
+    /// A status is reported before the body is read; a body without a
+    /// version is unreadable.
+    #[test]
+    fn a_hello_without_a_version_is_not_a_mismatch() {
+        let json = hello_json();
+        assert_eq!(
+            hello_from(reply(StatusCode::FORBIDDEN, &json)).unwrap_err(),
+            TransportError::Revoked
+        );
+        let mut bare = json;
+        bare.as_object_mut().unwrap().remove("protocol_version");
+        assert!(matches!(
+            hello_from(reply(StatusCode::OK, &bare)).unwrap_err(),
+            TransportError::Decode(_)
+        ));
     }
 
     #[test]
