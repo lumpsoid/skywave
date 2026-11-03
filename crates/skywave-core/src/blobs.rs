@@ -19,7 +19,13 @@
 //! metadata synced counts as synced (D6). Two workers take whatever comes
 //! first in the queue; a third takes only blobs the user asked for, so a
 //! request never waits on eager downloads that are slow, stalled or
-//! waiting out a retry.
+//! waiting out a retry. A blob asked for while one of the first two holds
+//! it moves to the third when a try there fails (a stall ends in the
+//! transport's timeout), if that worker is idle: the eager worker lets it
+//! go instead of backing off, and the blob waits for the third worker
+//! alone, so it is never fetched twice at once and the eager worker never
+//! takes it back to back off again. The hand-over takes the idle worker
+//! (one blob per idle spell), which takes that blob before any other.
 //! A retryable failure (D7) is retried after [`Backoff::delay`], the
 //! attempt count resetting whenever a try received some bytes; a rejection
 //! is retried the same way until the link, which sees it too, stops the
@@ -108,6 +114,27 @@ struct Queued {
     /// Asked for by the user (or resumed): kept when the policy goes back
     /// to `OnDemand`.
     wanted: bool,
+    /// Let go by an eager worker to the [`Slot::Wanted`] worker: only that
+    /// one takes it.
+    reserved: bool,
+}
+
+impl Queued {
+    fn eager(id: BlobId) -> Queued {
+        Queued {
+            id,
+            wanted: false,
+            reserved: false,
+        }
+    }
+
+    fn wanted(id: BlobId) -> Queued {
+        Queued {
+            id,
+            wanted: true,
+            reserved: false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +146,8 @@ struct Queue {
     /// Blobs asked for while a worker held them: queued again, as asked
     /// for, once it lets go.
     again: HashSet<BlobId>,
+    /// The [`Slot::Wanted`] worker waits for a blob.
+    wanted_idle: bool,
 }
 
 impl Queue {
@@ -128,7 +157,7 @@ impl Queue {
 
     fn push_back(&mut self, id: BlobId) {
         if !self.holds(id) {
-            self.waiting.push_back(Queued { id, wanted: false });
+            self.waiting.push_back(Queued::eager(id));
         }
     }
 }
@@ -157,10 +186,7 @@ impl BlobQueue {
             let mut queue = lock(&this.queue);
             for blob in &blobs {
                 if matches!(blob.status, BlobStatus::Downloading { .. }) {
-                    queue.waiting.push_back(Queued {
-                        id: blob.id,
-                        wanted: true,
-                    });
+                    queue.waiting.push_back(Queued::wanted(blob.id));
                 }
             }
         }
@@ -168,15 +194,20 @@ impl BlobQueue {
         this
     }
 
-    /// The user asked for this blob: it goes first.
+    /// The user asked for this blob: it goes first. One a worker holds is
+    /// marked asked for, and an eager worker backing off from it lets it go.
     pub(crate) fn want(&self, id: BlobId) {
         let mut queue = lock(&self.queue);
         if queue.active.contains(&id) {
             queue.again.insert(id);
-            return;
+        } else {
+            let reserved = queue.waiting.iter().any(|q| q.id == id && q.reserved);
+            queue.waiting.retain(|q| q.id != id);
+            queue.waiting.push_front(Queued {
+                reserved,
+                ..Queued::wanted(id)
+            });
         }
-        queue.waiting.retain(|q| q.id != id);
-        queue.waiting.push_front(Queued { id, wanted: true });
         drop(queue);
         self.wake.notify_waiters();
     }
@@ -228,27 +259,81 @@ impl BlobQueue {
 
     /// Waits for the next blob `slot` takes and holds it.
     async fn next(&self, slot: Slot) -> Claim<'_> {
+        // However this ends (a blob taken, or the downloader stopped), the
+        // Wanted worker is no longer idle.
+        let _idle = matches!(slot, Slot::Wanted).then_some(WantedIdle(self));
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let became_idle = {
+                let mut queue = lock(&self.queue);
+                let at = match slot {
+                    Slot::Any => queue.waiting.iter().position(|q| !q.reserved),
+                    // The blob handed over first: it was asked for before
+                    // anything queued since, and nothing else may take it.
+                    Slot::Wanted => (queue.waiting.iter().position(|q| q.reserved))
+                        .or_else(|| queue.waiting.iter().position(|q| q.wanted)),
+                };
+                if let Some(mut item) = at.and_then(|at| queue.waiting.remove(at)) {
+                    item.reserved = false;
+                    queue.active.insert(item.id);
+                    return Claim {
+                        queue: self,
+                        item,
+                        released: false,
+                    };
+                }
+                matches!(slot, Slot::Wanted) && !std::mem::replace(&mut queue.wanted_idle, true)
+            };
+            if became_idle {
+                // An eager worker backing off from a blob asked for can
+                // let it go now.
+                self.wake.notify_waiters();
+            }
+            notified.await;
+        }
+    }
+
+    /// Waits out an eager worker's backoff `delay` before it tries `claim`
+    /// again, and gives the claim back; or, once the blob is asked for and
+    /// the Wanted worker idle, hands the blob over to that worker and
+    /// returns `None`. The hand-over takes the idle Wanted worker in the
+    /// same critical section, so one idle period takes one blob, and that
+    /// worker takes it before anything else.
+    async fn back_off<'a>(&'a self, mut claim: Claim<'a>, delay: Duration) -> Option<Claim<'a>> {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
         loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
                 let mut queue = lock(&self.queue);
-                let at = match slot {
-                    Slot::Any => (!queue.waiting.is_empty()).then_some(0),
-                    Slot::Wanted => queue.waiting.iter().position(|q| q.wanted),
-                };
-                if let Some(item) = at.and_then(|at| queue.waiting.remove(at)) {
-                    queue.active.insert(item.id);
-                    return Claim {
-                        queue: self,
-                        item,
-                        done: false,
-                    };
+                let wanted = claim.item.wanted || queue.again.contains(&claim.item.id);
+                if wanted && queue.wanted_idle {
+                    queue.wanted_idle = false;
+                    claim.let_go(&mut queue, LetGo::HandedOver);
+                    drop(queue);
+                    self.wake.notify_waiters();
+                    return None;
                 }
             }
-            notified.await;
+            tokio::select! {
+                () = &mut sleep => return Some(claim),
+                () = notified => {}
+            }
         }
+    }
+}
+
+/// The Wanted worker waiting in [`BlobQueue::next`]; no longer idle once
+/// dropped.
+struct WantedIdle<'a>(&'a BlobQueue);
+
+impl Drop for WantedIdle<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.queue).wanted_idle = false;
     }
 }
 
@@ -262,33 +347,62 @@ enum Slot {
 }
 
 /// A blob a worker holds. Dropped unfinished (the downloader stopped), or
-/// asked for again meanwhile, it goes back to the front of the queue.
+/// asked for again meanwhile, it goes back to the front of the queue;
+/// handed over, it goes there for the Wanted worker alone.
 struct Claim<'a> {
     queue: &'a BlobQueue,
     item: Queued,
-    done: bool,
+    /// Let go already: dropping it does nothing.
+    released: bool,
+}
+
+/// How a worker lets go of a blob.
+#[derive(Debug, Clone, Copy)]
+enum LetGo {
+    Finished,
+    /// The downloader stopped.
+    Unfinished,
+    /// To the Wanted worker; see [`BlobQueue::back_off`].
+    HandedOver,
 }
 
 impl Claim<'_> {
     fn finish(mut self) {
-        self.done = true;
+        let owner = self.queue;
+        let mut queue = lock(&owner.queue);
+        self.let_go(&mut queue, LetGo::Finished);
+        drop(queue);
+        owner.wake.notify_waiters();
+    }
+
+    /// Lets go of the blob under the queue's lock, which `queue` is.
+    fn let_go(&mut self, queue: &mut Queue, how: LetGo) {
+        self.released = true;
+        let id = self.item.id;
+        queue.active.remove(&id);
+        let again = queue.again.remove(&id);
+        match how {
+            LetGo::HandedOver => queue.waiting.push_front(Queued {
+                reserved: true,
+                ..Queued::wanted(id)
+            }),
+            _ if again => queue.waiting.push_front(Queued::wanted(id)),
+            LetGo::Unfinished => queue.waiting.push_front(self.item),
+            LetGo::Finished => {}
+        }
     }
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        let mut queue = lock(&self.queue.queue);
-        queue.active.remove(&self.item.id);
-        if queue.again.remove(&self.item.id) {
-            queue.waiting.push_front(Queued {
-                id: self.item.id,
-                wanted: true,
-            });
-        } else if !self.done {
-            queue.waiting.push_front(self.item);
+        if self.released {
+            return;
         }
+        let owner = self.queue;
+        let mut queue = lock(&owner.queue);
+        self.let_go(&mut queue, LetGo::Unfinished);
         drop(queue);
-        self.queue.wake.notify_waiters();
+        owner.wake.notify_waiters();
     }
 }
 
@@ -315,25 +429,25 @@ pub(crate) async fn run_downloader(ctx: BlobCtx) -> Infallible {
 
 async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: Slot) -> Infallible {
     loop {
-        let claim = ctx.queue.next(slot).await;
+        let mut claim = ctx.queue.next(slot).await;
         let id = claim.item.id;
         let mut attempt = 0u32;
         loop {
             let mut progressed = false;
             let mut lease = None;
             let error = match fetch(ctx, transport, id, &mut lease, &mut progressed).await {
-                Ok(()) => break,
+                Ok(()) => break claim.finish(),
                 Err(error) => error,
             };
             if error.is_purged() {
                 // Whatever this try wrote may have outlived the deletion.
                 tracing::debug!(?id, "blob purged during its download");
                 remove_blob_files(&ctx.seam.data_dir(), id);
-                break;
+                break claim.finish();
             }
             if !error.is_retryable() {
                 give_up(ctx, id, lease, &error).await;
-                break;
+                break claim.finish();
             }
             attempt = if progressed {
                 1
@@ -342,9 +456,17 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
             };
             let next_in = ctx.config.backoff.delay(attempt);
             tracing::debug!(?id, %error, attempt, ?next_in, "blob download interrupted");
-            tokio::time::sleep(next_in).await;
+            match slot {
+                Slot::Any => match ctx.queue.back_off(claim, next_in).await {
+                    Some(kept) => claim = kept,
+                    None => {
+                        tracing::debug!(?id, "blob asked for: handed to the wanted slot");
+                        break;
+                    }
+                },
+                Slot::Wanted => tokio::time::sleep(next_in).await,
+            }
         }
-        claim.finish();
     }
 }
 
@@ -787,13 +909,17 @@ mod tests {
         }
 
         fn ctx(&self) -> BlobCtx {
+            self.ctx_backing_off(Duration::from_millis(1), Duration::from_millis(5))
+        }
+
+        fn ctx_backing_off(&self, base: Duration, cap: Duration) -> BlobCtx {
             let server = self.server.clone();
             BlobCtx {
                 seam: self.seam.clone(),
                 config: Arc::new(EngineConfig {
                     backoff: Backoff {
-                        base: Duration::from_millis(1),
-                        cap: Duration::from_millis(5),
+                        base,
+                        cap,
                         jitter: Jitter::fixed(1.0),
                     },
                     connector: Connector::new(move |_, _, _| {
@@ -1178,6 +1304,189 @@ mod tests {
     async fn a_wanted_blob_passes_eager_downloads_retrying_offline() {
         let f = Fixture::new(3000, content(3000), 3000);
         f.want_past_held_eager(Hold::Offline).await;
+    }
+
+    /// An eager worker waiting out an hour's backoff on a blob the user
+    /// then asks for lets it go at once, and the Wanted worker fetches it.
+    #[tokio::test]
+    async fn an_eager_worker_backing_off_hands_a_blob_asked_for_to_the_wanted_slot() {
+        let bytes = content(3000);
+        let f = Fixture::new(3000, bytes.clone(), 3000);
+        f.server
+            .held
+            .lock()
+            .unwrap()
+            .insert(f.blob.id, Hold::Offline);
+        f.queue.set_policy(BlobPolicy::Eager, &[]);
+        f.queue.registered(&[f.blob.id]);
+        let hour = Duration::from_secs(3600);
+        let downloader = tokio::spawn(run_downloader(f.ctx_backing_off(hour, hour)));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.server.calls.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an eager worker tries the blob");
+        assert!(lock(&f.queue.queue).active.contains(&f.blob.id));
+
+        f.server.held.lock().unwrap().clear();
+        f.queue.want(f.blob.id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(f.status(), BlobStatus::Available { .. }) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("blob status stuck at {:?}", f.status()));
+        downloader.abort();
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 2, "one more try");
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    /// Polls `future` once: `Some` if it is ready.
+    async fn ready_now<F: Future>(future: F) -> Option<F::Output> {
+        tokio::time::timeout(Duration::ZERO, future).await.ok()
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_blob_an_eager_worker_holds_survives_on_demand() {
+        let queue = BlobQueue::default();
+        let id = ProtoBlobId::new();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id]);
+        let other = ProtoBlobId::new();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id, other]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let unasked = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!((claim.item.id, unasked.item.id), (id, other));
+        queue.want(id);
+        // The downloader stops, then the policy goes back to OnDemand:
+        // the blob asked for waits, the other one goes.
+        drop(claim);
+        drop(unasked);
+        assert_eq!(waiting(&queue), [(other, false), (id, true)]);
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+        assert_eq!(waiting(&queue), [(id, true)]);
+
+        // The other order: switched while held, then stopped.
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        queue.want(id);
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+        drop(claim);
+        assert_eq!(waiting(&queue), [(id, true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_blob_whose_eager_try_fails_goes_to_the_wanted_slot_next() {
+        let queue = BlobQueue::default();
+        let id = ProtoBlobId::new();
+        let hour = Duration::from_secs(3600);
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let wanted = queue.next(Slot::Wanted);
+        tokio::pin!(wanted);
+        assert!(ready_now(&mut wanted).await.is_none(), "nothing asked for");
+
+        // Not asked for: the eager worker waits out its backoff.
+        let start = tokio::time::Instant::now();
+        let claim = queue.back_off(claim, hour).await.expect("kept");
+        assert_eq!(start.elapsed(), hour);
+
+        // Asked for: it lets the blob go at once, to the Wanted worker
+        // alone.
+        queue.want(id);
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(claim, hour).await.is_none(), "handed over");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(waiting(&queue), [(id, true)]);
+        assert!(ready_now(queue.next(Slot::Any)).await.is_none(), "reserved");
+        let taken = ready_now(&mut wanted)
+            .await
+            .expect("the Wanted worker takes it");
+        assert_eq!(taken.item, Queued::wanted(id));
+    }
+
+    /// While the Wanted worker is busy, an eager worker keeps the blob
+    /// asked for and backs off as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_blob_stays_with_its_eager_worker_while_the_wanted_slot_is_busy() {
+        let queue = BlobQueue::default();
+        let (busy, id) = (ProtoBlobId::new(), ProtoBlobId::new());
+        let hour = Duration::from_secs(3600);
+        queue.want(busy);
+        let _busy = ready_now(queue.next(Slot::Wanted))
+            .await
+            .expect("asked for");
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[id]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        queue.want(id);
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(claim, hour).await.is_some(), "kept");
+        assert_eq!(start.elapsed(), hour);
+    }
+
+    /// Two eager workers back off from blobs asked for while the Wanted
+    /// worker is idle: it takes one, and the other stays with its eager
+    /// worker rather than waiting behind the first.
+    #[tokio::test(start_paused = true)]
+    async fn one_idle_wanted_slot_takes_one_handed_over_blob() {
+        let queue = BlobQueue::default();
+        let (a, b) = (ProtoBlobId::new(), ProtoBlobId::new());
+        let hour = Duration::from_secs(3600);
+        // Both resumed (asked for), both taken by the eager workers first.
+        queue.want(b);
+        queue.want(a);
+        let claim_a = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let claim_b = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!((claim_a.item.id, claim_b.item.id), (a, b));
+        let wanted = queue.next(Slot::Wanted);
+        tokio::pin!(wanted);
+        assert!(ready_now(&mut wanted).await.is_none(), "idle");
+
+        // Both tries fail before the Wanted worker runs again.
+        assert!(queue.back_off(claim_a, hour).await.is_none(), "handed over");
+        let start = tokio::time::Instant::now();
+        let _claim_b = queue.back_off(claim_b, hour).await.expect("kept");
+        assert_eq!(start.elapsed(), hour);
+        let taken = ready_now(&mut wanted).await.expect("takes a");
+        assert_eq!(taken.item.id, a);
+        assert!(waiting(&queue).is_empty());
+    }
+
+    /// A blob asked for after one was handed over does not pass it: the
+    /// Wanted worker takes the handed-over blob first.
+    #[tokio::test(start_paused = true)]
+    async fn the_wanted_slot_takes_a_handed_over_blob_before_a_newer_request() {
+        let queue = BlobQueue::default();
+        let (a, x) = (ProtoBlobId::new(), ProtoBlobId::new());
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[a]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let wanted = queue.next(Slot::Wanted);
+        tokio::pin!(wanted);
+        assert!(ready_now(&mut wanted).await.is_none(), "idle");
+        queue.want(a);
+        assert!(
+            queue
+                .back_off(claim, Duration::from_secs(3600))
+                .await
+                .is_none()
+        );
+
+        queue.want(x);
+        assert_eq!(waiting(&queue), [(x, true), (a, true)]);
+        let taken = ready_now(&mut wanted).await.expect("takes a");
+        assert_eq!(taken.item.id, a);
+        // Positive control: the newer request is next, for any worker.
+        let next = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!(next.item.id, x);
     }
 
     /// Changes on many threads hand their requests to the engine in the
