@@ -7,10 +7,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use skywave_core::{
     AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView,
-    ConversationItem, Decision, Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing,
-    PendingSession, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
-    SessionId, SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId,
-    TaskKind,
+    ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable, Decision,
+    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, PendingSession,
+    PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, SessionId,
+    SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId, TaskKind,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -704,16 +704,48 @@ pub fn conversation_link(
     })
 }
 
-/// Why the conversation picker lists nothing: offline, else the core's
-/// reason (`ConversationsStatus::Unavailable`).
-pub fn conversations_unavailable(reason: &str) -> String {
-    // The core says "not connected" offline, or wraps it ("server
-    // unreachable: not connected") when the engine found the link down.
-    if reason == "not connected" || reason.ends_with(": not connected") {
-        "offline · the server lists its conversations once connected".to_owned()
-    } else {
-        format!("can't list conversations: {reason}")
+/// Why the conversation picker lists nothing. A failure carries the
+/// transport's words: heads sanitise it before writing it raw.
+pub fn conversations_unavailable(why: &ConversationsUnavailable) -> String {
+    match why {
+        ConversationsUnavailable::Offline => {
+            "offline · the server lists its conversations once connected".to_owned()
+        }
+        ConversationsUnavailable::AgentCannotList => {
+            "can't list conversations: the server's agent cannot list its conversations".to_owned()
+        }
+        ConversationsUnavailable::Failed(reason) => {
+            format!("can't list conversations: {reason}")
+        }
     }
+}
+
+/// The conversation picker's footnote: still listing, or listed only the
+/// newest. `None` for a full listing or none.
+pub fn conversations_status(status: &ConversationsStatus) -> Option<&'static str> {
+    match status {
+        ConversationsStatus::Loading => Some("listing…"),
+        ConversationsStatus::Ready { truncated: true } => Some("only the newest are listed"),
+        ConversationsStatus::Ready { truncated: false } | ConversationsStatus::Unavailable(_) => {
+            None
+        }
+    }
+}
+
+/// What the conversation picker shows in place of its rows while it has
+/// none: that it is asking, that there are none, or why it has no listing
+/// ([`conversations_unavailable`]). `None` while it has rows.
+pub fn conversations_empty(picker: &ConversationPicker) -> Option<String> {
+    if !picker.items.is_empty() {
+        return None;
+    }
+    Some(match &picker.status {
+        ConversationsStatus::Loading => "Asking the server for its agent's conversations…".into(),
+        ConversationsStatus::Ready { .. } => {
+            "The server's agent has no conversations under the roots.".into()
+        }
+        ConversationsStatus::Unavailable(why) => conversations_unavailable(why),
+    })
 }
 
 /// What a picker adds to a moved context's row: `moved → “fix the flaky
@@ -997,20 +1029,61 @@ mod tests {
 
     #[test]
     fn an_unavailable_listing_says_offline_or_why() {
-        let offline = "offline · the server lists its conversations once connected";
-        assert_eq!(conversations_unavailable("not connected"), offline);
         assert_eq!(
-            conversations_unavailable("server unreachable: not connected"),
-            offline
+            conversations_unavailable(&ConversationsUnavailable::Offline),
+            "offline · the server lists its conversations once connected"
         );
         assert_eq!(
-            conversations_unavailable("the server's agent cannot list its conversations"),
+            conversations_unavailable(&ConversationsUnavailable::AgentCannotList),
             "can't list conversations: the server's agent cannot list its conversations"
         );
         assert_eq!(
-            conversations_unavailable("unexpected HTTP status 503"),
+            conversations_unavailable(&ConversationsUnavailable::Failed(
+                "unexpected HTTP status 503".into()
+            )),
             "can't list conversations: unexpected HTTP status 503"
         );
+    }
+
+    #[test]
+    fn the_picker_footnote_and_empty_text_follow_its_status() {
+        let picker = |status| ConversationPicker {
+            status,
+            items: Vec::new(),
+        };
+        let loading = picker(ConversationsStatus::Loading);
+        assert_eq!(conversations_status(&loading.status), Some("listing…"));
+        assert_eq!(
+            conversations_empty(&loading).as_deref(),
+            Some("Asking the server for its agent's conversations…")
+        );
+        let none = picker(ConversationsStatus::Ready { truncated: false });
+        assert_eq!(conversations_status(&none.status), None);
+        assert_eq!(
+            conversations_empty(&none).as_deref(),
+            Some("The server's agent has no conversations under the roots.")
+        );
+        let cut = ConversationsStatus::Ready { truncated: true };
+        assert_eq!(
+            conversations_status(&cut),
+            Some("only the newest are listed")
+        );
+        let offline = picker(ConversationsStatus::Unavailable(
+            ConversationsUnavailable::Offline,
+        ));
+        assert_eq!(conversations_status(&offline.status), None);
+        assert_eq!(
+            conversations_empty(&offline),
+            Some(conversations_unavailable(
+                &ConversationsUnavailable::Offline
+            ))
+        );
+        // With rows there is nothing to say in their place.
+        let listed = ConversationPicker {
+            items: vec![conversation(Some("fix it"), None)],
+            ..none
+        };
+        assert_eq!(conversations_empty(&listed), None);
     }
 
     #[test]

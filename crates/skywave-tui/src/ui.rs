@@ -35,7 +35,8 @@ use skywave_core::{
 };
 use skywave_present::format::{
     IMPORTING_HISTORY, adopting_note, blob_size, bytes, conversation_detail, conversation_link,
-    conversation_title, conversations_unavailable, dollars, fail_reason, scope_label,
+    conversation_title, conversations_empty, conversations_status, dollars, fail_reason,
+    scope_label,
 };
 use skywave_present::sections::{discardable, wanted_blob};
 
@@ -349,28 +350,20 @@ fn render_conversations(
     let mut block = Block::bordered()
         .title(" Continue a conversation from outside Skywave ")
         .cyan();
-    let status = match &picker.status {
-        ConversationsStatus::Loading => Some("listing…"),
-        ConversationsStatus::Ready { truncated: true } => Some("only the newest are listed"),
-        ConversationsStatus::Ready { truncated: false } | ConversationsStatus::Unavailable(_) => {
-            None
-        }
-    };
-    if let Some(status) = status {
+    if let Some(status) = conversations_status(&picker.status) {
         block = block.title_bottom(Line::from(format!(" {status} ")).dark_gray());
     }
     frame.render_widget(Clear, area);
-    if picker.items.is_empty() {
+    if let Some(empty) = conversations_empty(picker) {
+        let empty = Line::from(timeline::clean(&empty));
         let lines = match &picker.status {
-            ConversationsStatus::Loading => {
-                vec![Line::from("Asking the server for its agent's conversations…").dark_gray()]
-            }
-            ConversationsStatus::Unavailable(reason) => vec![
-                Line::from(timeline::clean(&conversations_unavailable(reason))).yellow(),
+            ConversationsStatus::Loading => vec![empty.dark_gray()],
+            ConversationsStatus::Unavailable(_) => vec![
+                empty.yellow(),
                 Line::from("Press p to paste a conversation id instead.").dark_gray(),
             ],
             ConversationsStatus::Ready { .. } => vec![
-                Line::from("The server's agent has no conversations under the roots.").dark_gray(),
+                empty.dark_gray(),
                 Line::from("Press p to paste a conversation id instead.").dark_gray(),
             ],
         };
