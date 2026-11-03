@@ -21,8 +21,8 @@ use skywave_proto::{
     BlobId, BlobRef, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
     ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind,
     EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse, ImportOutcome,
-    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId,
-    SessionOrigin, path,
+    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, RunId, RunsSince, Seq,
+    SessionId, SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -410,6 +410,7 @@ async fn hello_names_the_caller_and_records_last_seen() {
             server_id: f.identity.server_id(),
             device_id: creds.id,
             head: Seq::ZERO,
+            log: f.log.run(&f.storage.db, None).unwrap(),
             devices: vec![DeviceInfo {
                 id: creds.id,
                 name: "laptop".into(),
@@ -422,6 +423,56 @@ async fn hello_names_the_caller_and_records_last_seen() {
         .unwrap()
         .unwrap();
     assert!(device.last_seen.is_some());
+}
+
+/// `hello`'s log is the database's: its id stays with the database, and
+/// every open of it is a new run, recorded with the head it found. Asked
+/// about a run (`since`), it says whether the record has it and the lowest
+/// start of the runs after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_reports_the_log_and_what_became_of_a_run() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut client = f.client(&creds).await;
+    let first: HelloResponse = client.get(path::HELLO).await.json();
+    assert_eq!(first.log.log, f.storage.db.log_id().unwrap());
+    assert_eq!(first.log.since, None, "asked about no run");
+    let since = |run: RunId| format!("{}?since={}", path::HELLO, run.0);
+    let current: HelloResponse = client.get(&since(first.log.run)).await.json();
+    assert_eq!(
+        current.log.since,
+        Some(RunsSince::Known { next_start: None }),
+        "the current run"
+    );
+    let created = client.command(&f.create_session_command()).await;
+    assert_eq!(created, CommandResult::Accepted { seq: Seq(1) });
+    let later: HelloResponse = client.get(&since(first.log.run)).await.json();
+    assert_eq!(later.log, current.log, "appending is not a new run");
+    assert_eq!(later.head, Seq(1));
+    let unknown: HelloResponse = client.get(&since(RunId::new())).await.json();
+    assert_eq!(unknown.log.since, Some(RunsSince::Unknown));
+    let bad = client.get(&format!("{}?since=nope", path::HELLO)).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+    let reopened = EventLog::open(&f.storage.db, vec![f.root.clone()]).unwrap();
+    let again = reopened.run(&f.storage.db, Some(first.log.run)).unwrap();
+    assert_eq!(again.log, first.log.log, "the same database");
+    assert_ne!(again.run, first.log.run, "a new run");
+    assert_eq!(
+        again.since,
+        Some(RunsSince::Known {
+            next_start: Some(Seq(1))
+        }),
+        "started from the head it found"
+    );
+
+    let other = Fixture::start().await;
+    let other = other
+        .log
+        .run(&other.storage.db, Some(first.log.run))
+        .unwrap();
+    assert_ne!(other.log, first.log.log, "another database");
+    assert_eq!(other.since, Some(RunsSince::Unknown));
 }
 
 #[tokio::test(flavor = "multi_thread")]

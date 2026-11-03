@@ -95,7 +95,7 @@ use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
-    DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloResponse, ImportOutcome,
+    DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
     PROTOCOL_VERSION, ServerId, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -109,7 +109,7 @@ use crate::db::Db;
 use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
-use crate::event_log::{DEFAULT_BATCH_LIMIT, MAX_SEQ};
+use crate::event_log::{DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::server::ServerOptions;
 use crate::workdir::{self, Snapshot, WorkdirReader};
 use crate::{EventLog, lock};
@@ -294,24 +294,33 @@ async fn authenticate(State(api): State<Arc<Api>>, mut req: Request, next: Next)
 async fn hello(
     State(api): State<Arc<Api>>,
     Extension(Caller(device)): Extension<Caller>,
+    query: std::result::Result<Query<HelloQuery>, QueryRejection>,
 ) -> Response {
-    let devices = api
-        .blocking(|_, db| {
-            Ok(devices::list(db.conn())?
+    let Ok(Query(query)) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let read = api
+        .blocking(move |api, db| {
+            let devices = devices::list(db.conn())?
                 .into_iter()
                 .map(|d| DeviceInfo {
                     id: d.id,
                     name: d.name,
                 })
-                .collect())
+                .collect();
+            // The committed head, not the watch: that is published after
+            // the commit, so it may lag an event a pull already got.
+            let head = head_in(db.conn())?;
+            Ok((devices, head, api.log.run(db, query.since)?))
         })
         .await;
-    match devices {
-        Ok(devices) => Json(HelloResponse {
+    match read {
+        Ok((devices, head, log)) => Json(HelloResponse {
             protocol_version: PROTOCOL_VERSION,
             server_id: api.server_id,
             device_id: device,
-            head: api.log.head(),
+            head,
+            log,
             devices,
             shell: api.log.shell_enabled(),
             bypass: api.log.bypass_allowed(),

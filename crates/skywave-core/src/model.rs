@@ -71,6 +71,10 @@ pub(crate) enum Effect {
     /// Delete the session from this device's replica, then from the model
     /// ([`Model::session_deleted`]), and remove its blobs' files.
     DeleteLocally(SessionId),
+    /// Clear the replica after the server's log lost events it holds
+    /// ([`Store::reset_for_lost_history`](crate::Store::reset_for_lost_history)),
+    /// then the model ([`Model::replica_reset`]), and remove the blob files.
+    ResetReplica,
     /// Hand to the engine once every persistence effect succeeded.
     Request(Request),
 }
@@ -700,6 +704,17 @@ impl Model {
                 Link::Rejected(LinkRejection::ProtocolMismatch { .. }) => {
                     self.link = Link::Connecting;
                     vec![Effect::Request(Request::Connect)]
+                }
+                _ => Vec::new(),
+            },
+            Action::ResetReplica => match self.link {
+                Link::Rejected(LinkRejection::HistoryLost { .. }) => {
+                    self.place = Place::SessionList;
+                    self.open = None;
+                    self.viewing = None;
+                    self.subagent = None;
+                    self.link = Link::Connecting;
+                    vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
                 }
                 _ => Vec::new(),
             },
@@ -6548,6 +6563,36 @@ mod tests {
         assert_eq!(
             f.dispatch(Action::RetryNow),
             vec![Effect::Request(Request::Connect)]
+        );
+        assert_eq!(f.model.view().link, Link::Connecting);
+    }
+
+    /// The reset is for a log that lost history only; anywhere else it
+    /// would throw the replica away for nothing.
+    #[test]
+    fn reset_replica_only_after_the_server_lost_history() {
+        let mut f = Fixture::paired();
+        for link in [
+            Link::Connecting,
+            Link::Online { latency_ms: 5 },
+            Link::Rejected(LinkRejection::Revoked),
+            Link::Rejected(LinkRejection::ProtocolMismatch {
+                client: 3,
+                server: 2,
+            }),
+        ] {
+            f.model.set_link(link);
+            assert!(f.dispatch(Action::ResetReplica).is_empty());
+        }
+        f.model.set_link(Link::Rejected(LinkRejection::HistoryLost {
+            have: Seq(9),
+            server: Seq(4),
+        }));
+        // Retrying does not get past it.
+        assert!(f.dispatch(Action::RetryNow).is_empty());
+        assert_eq!(
+            f.dispatch(Action::ResetReplica),
+            vec![Effect::ResetReplica, Effect::Request(Request::Connect)]
         );
         assert_eq!(f.model.view().link, Link::Connecting);
     }

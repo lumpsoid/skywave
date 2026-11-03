@@ -333,15 +333,17 @@ impl HttpsTransport {
         })
     }
 
-    async fn hello(&self) -> Result<HelloResponse, TransportError> {
+    async fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> Result<HelloResponse, TransportError> {
+        let uri = match since {
+            Some(run) => format!("{}?since={}", path::HELLO, run.0),
+            None => path::HELLO.to_owned(),
+        };
         let reply = self
             .http
-            .request(
-                Method::GET,
-                path::HELLO,
-                Bytes::new(),
-                self.http.request_timeout(),
-            )
+            .request(Method::GET, &uri, Bytes::new(), self.http.request_timeout())
             .await?;
         hello_from(reply)
     }
@@ -527,8 +529,11 @@ impl BlobBody for TimedBody {
 }
 
 impl Transport for HttpsTransport {
-    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
-        Box::pin(HttpsTransport::hello(self))
+    fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        Box::pin(HttpsTransport::hello(self, since))
     }
 
     fn send_command<'a>(
@@ -602,6 +607,11 @@ mod tests {
             server_id: skywave_proto::ServerId::new(),
             device_id: skywave_proto::DeviceId::new(),
             head: skywave_proto::Seq::ZERO,
+            log: skywave_proto::LogRun {
+                log: skywave_proto::LogId::new(),
+                run: skywave_proto::RunId::new(),
+                since: None,
+            },
             devices: Vec::new(),
             shell: false,
             bypass: false,

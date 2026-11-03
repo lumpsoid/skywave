@@ -53,6 +53,13 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
                 "protocol mismatch · client v{client}, server v{server} · update, then retry{queued_part}"
             ),
         ),
+        Link::Rejected(LinkRejection::HistoryLost { have, server }) => (
+            LinkState::HistoryLost,
+            format!(
+                "server lost history (had {}, server at {}) · sync stopped{queued_part}",
+                have.0, server.0
+            ),
+        ),
     };
     LinkUpdate {
         state,
@@ -64,6 +71,7 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
             Link::Reconnecting { .. } | Link::Rejected(LinkRejection::ProtocolMismatch { .. })
         ),
         rejected: matches!(link, Link::Rejected(_)),
+        can_reset_replica: matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. })),
         queued: count(queued),
         approvals_elsewhere: count(elsewhere),
         elsewhere_label: match elsewhere {
@@ -87,6 +95,7 @@ fn connection_label(link: &Link, retry: &str) -> String {
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => {
             format!("Protocol mismatch · client v{client}, server v{server}")
         }
+        Link::Rejected(LinkRejection::HistoryLost { .. }) => "Server lost history".to_owned(),
     }
 }
 
@@ -153,9 +162,19 @@ mod tests {
                 Link::Rejected(LinkRejection::Revoked),
                 "device revoked · re-pair to reconnect · 2 queued",
             ),
+            (
+                Link::Rejected(LinkRejection::HistoryLost {
+                    have: Seq(9),
+                    server: Seq(4),
+                }),
+                "server lost history (had 9, server at 4) · sync stopped · 2 queued",
+            ),
         ];
         for (link, label) in cases {
-            assert_eq!(update(&link, 2, 0, now).label, label, "{link:?}");
+            let banner = update(&link, 2, 0, now);
+            assert_eq!(banner.label, label, "{link:?}");
+            let lost = matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. }));
+            assert_eq!(banner.can_reset_replica, lost, "{link:?}");
         }
         let online = Link::Online { latency_ms: 12 };
         assert_eq!(update(&online, 0, 0, now).label, "", "nothing to say");

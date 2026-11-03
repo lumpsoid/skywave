@@ -103,7 +103,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `RejectReason::BypassDisabled`.
 ///
 /// v18: bounded messages. [`limits::MESSAGE_MAX_BYTES`] and
-/// `RejectReason::MessageTooLong`.
+/// `RejectReason::MessageTooLong`. A log that went backwards: `log` on
+/// [`HelloResponse`] ([`LogRun`], [`LogId`], [`RunId`], [`RunsSince`]),
+/// asked about with [`HelloQuery`].
 pub const PROTOCOL_VERSION: u32 = 18;
 
 macro_rules! uuid_id {
@@ -171,6 +173,18 @@ uuid_id!(
     /// Users see a context's name, never its id. A cleared context's id is
     /// chosen by the client that clears (`CommandKind::ClearContext`).
     ContextId
+);
+
+uuid_id!(
+    /// Identifies one server event log: minted when the server's database
+    /// is created and kept in it, so a new database is a new log, while a
+    /// copy restored from a backup keeps its id ([`LogRun`]).
+    LogId
+);
+uuid_id!(
+    /// Identifies one run of the server process: minted at every start
+    /// ([`LogRun`]).
+    RunId
 );
 
 impl ContextId {
@@ -1770,6 +1784,9 @@ pub struct HelloResponse {
     pub device_id: DeviceId,
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
     pub head: Seq,
+    /// Which log this is and where this run of the server took it up: a
+    /// device tells from it whether the log still holds what it pulled.
+    pub log: LogRun,
     /// Every device ever paired with the server, revoked ones included:
     /// the log names devices by id only, and its old events still name
     /// the revoked.
@@ -1780,6 +1797,47 @@ pub struct HelloResponse {
     /// Whether the server's operator allows [`PermissionMode::Bypass`];
     /// when not, a `SetPermissionMode` asking for it is `BypassDisabled`.
     pub bypass: bool,
+}
+
+/// Query string of `GET /v1/hello`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelloQuery {
+    /// The run of the server this device last said `hello` to, so the
+    /// answer can say what became of it ([`LogRun::since`]).
+    pub since: Option<RunId>,
+}
+
+/// The server's log as this run of the server serves it
+/// ([`HelloResponse::log`]).
+///
+/// The log is append-only, so within one `log` it only ever loses events
+/// at its end: a crash that drops the last commits, or the database
+/// restored from an older backup. Either happens with the server down, and
+/// every run of the server is recorded in the database with the head it
+/// started from, so the runs after a loss start below it, and a restore
+/// also takes away the record of the runs after the backup. A device that
+/// last saw run `since` therefore knows the log lost events it holds when
+/// that run is gone from the record, or a run after it started below what
+/// the device has seen, even after the log has grown past it again.
+/// Another `log` is another history altogether.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogRun {
+    pub log: LogId,
+    pub run: RunId,
+    /// What became of the run the query named; `None` when it named none.
+    pub since: Option<RunsSince>,
+}
+
+/// What became of a run of the server ([`HelloQuery::since`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunsSince {
+    /// This log has no record of it: another log, or one restored from
+    /// before that run.
+    Unknown,
+    /// Recorded. `next_start` is the lowest head any later run started
+    /// from; `None` when it is the current run.
+    Known { next_start: Option<Seq> },
 }
 
 /// A paired device as other devices show it.

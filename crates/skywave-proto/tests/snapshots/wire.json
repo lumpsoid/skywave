@@ -5,6 +5,14 @@
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
+    "log": {
+      "log": "01920000-0000-7000-8000-0000000000a1",
+      "run": "01920000-0000-7000-8000-0000000000a2",
+      "since": {
+        "kind": "known",
+        "next_start": 12
+      }
+    },
     "devices": [
       {
         "id": "01920000-0000-7000-8000-000000000003",
@@ -14,6 +22,23 @@
     "shell": true,
     "bypass": true
   },
+  "hello_query": {
+    "since": "01920000-0000-7000-8000-0000000000a3"
+  },
+  "runs_since": [
+    null,
+    {
+      "kind": "unknown"
+    },
+    {
+      "kind": "known",
+      "next_start": null
+    },
+    {
+      "kind": "known",
+      "next_start": 5
+    }
+  ],
   "pair_request": {
     "code": "K7Q4-9M2X",
     "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIIB\n-----END CERTIFICATE REQUEST-----\n",

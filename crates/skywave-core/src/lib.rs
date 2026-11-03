@@ -68,8 +68,8 @@ pub use search::Query;
 pub use skywave_proto::Fingerprint;
 pub use skywave_proto::PROTOCOL_VERSION;
 pub use store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings,
-    Snapshot, Store, StoreError,
+    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, OutboxStatus, ReadMark,
+    Settings, Snapshot, Store, StoreError,
 };
 pub use transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
 pub use view::{

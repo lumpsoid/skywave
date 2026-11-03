@@ -359,6 +359,20 @@ impl Core {
                             }
                             requests.push(Request::BlobsPurged(blobs));
                         }),
+                    Effect::ResetReplica => {
+                        state.store.reset_for_lost_history().and_then(|blobs| {
+                            // The link is stopped, but a handle bound to
+                            // the old replica must not write into the new.
+                            state.server_epoch += 1;
+                            state.model.replica_reset(state.store.load()?);
+                            state.blobs_purged(&blobs);
+                            remove_all_blob_files(data_dir);
+                            if !blobs.is_empty() {
+                                requests.push(Request::BlobsPurged(blobs));
+                            }
+                            Ok(())
+                        })
+                    }
                     Effect::Request(request) => {
                         requests.push(request);
                         Ok(())

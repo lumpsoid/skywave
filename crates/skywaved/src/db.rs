@@ -20,7 +20,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use skywave_proto::PROTOCOL_VERSION;
+use skywave_proto::{LogId, PROTOCOL_VERSION};
+use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
@@ -289,6 +290,24 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX workdir_answer_blobs_by_blob ON workdir_answer_blobs (blob_id);
     "#,
+    r#"
+    -- The log's identity (skywave_proto::LogId); one row, written by
+    -- `migrate` with the migration that creates it and never rewritten: a
+    -- new database is a new log, a restored backup keeps its id. Devices
+    -- compare it on `hello` (architecture.md, "A log that went backwards").
+    CREATE TABLE log_identity (
+        id     INTEGER PRIMARY KEY CHECK (id = 1),
+        log_id TEXT NOT NULL
+    ) STRICT;
+    -- Every run of `serve` over this log (skywave_proto::RunId), in the
+    -- order they opened it, with the head each started from. Append-only;
+    -- a restored backup holds only the runs before it was taken.
+    CREATE TABLE log_runs (
+        position INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id   TEXT NOT NULL UNIQUE,
+        start    INTEGER NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -313,7 +332,11 @@ impl Db {
         if !mode.eq_ignore_ascii_case("wal") {
             tracing::warn!(%mode, "SQLite refused WAL journal mode");
         }
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL, not NORMAL: in WAL mode NORMAL may lose the last commits on
+        // power loss, and the log is the only record of what users did. A
+        // device that pulled them would then see the log go backwards
+        // (`LogRun`). The cost is an fsync of the WAL per commit.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut db = Db { conn };
         db.migrate(path)?;
@@ -374,6 +397,21 @@ impl Db {
         Ok(found)
     }
 
+    /// The log this database holds (`log_identity`), minted when it was
+    /// created.
+    pub fn log_id(&self) -> Result<LogId> {
+        let text: String = self
+            .conn
+            .query_row("SELECT log_id FROM log_identity WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| Error::Corrupt("log_identity has no row".into()))?;
+        Uuid::parse_str(&text)
+            .map(LogId)
+            .map_err(|e| Error::Corrupt(format!("log id {text:?}: {e}")))
+    }
+
     /// The protocol version the database was written with
     /// (`protocol_stamp`); [`Db::open`] refuses any other.
     pub fn protocol_version(&self) -> Result<u32> {
@@ -410,6 +448,10 @@ impl Db {
         tx.execute(
             "INSERT OR IGNORE INTO protocol_stamp (id, version) VALUES (1, ?1)",
             [PROTOCOL_VERSION],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO log_identity (id, log_id) VALUES (1, ?1)",
+            [LogId::new().0.hyphenated().to_string()],
         )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;

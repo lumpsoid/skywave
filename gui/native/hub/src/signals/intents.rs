@@ -347,6 +347,9 @@ pub enum ActionIntent {
         policy: BlobPolicyChoice,
     },
     RetryNow,
+    /// After the server lost history ([`LinkState::HistoryLost`](crate::signals::LinkState)),
+    /// start the replica over from its log; ignored otherwise.
+    ResetReplica,
     /// Reach the paired server at `address` (`host:port`) from now on,
     /// without re-pairing. One that does not parse is answered with
     /// `PlatformEffect::Error`.

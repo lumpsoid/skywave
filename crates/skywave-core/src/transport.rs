@@ -11,7 +11,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, WorkdirQuery,
+    EventsQuery, FileResult, HelloResponse, ListResult, RunId, WorkdirQuery,
 };
 
 use crate::view::LinkRejection;
@@ -21,9 +21,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The v1 API as seen by a paired device.
 pub trait Transport: Send + Sync {
-    /// `GET /v1/hello`. A server speaking another protocol version is
-    /// [`TransportError::ProtocolMismatch`].
-    fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>>;
+    /// `GET /v1/hello`, asking what became of run `since` of the server
+    /// ([`HelloQuery`](skywave_proto::HelloQuery)). A server speaking another
+    /// protocol version is [`TransportError::ProtocolMismatch`].
+    fn hello(&self, since: Option<RunId>) -> BoxFuture<'_, Result<HelloResponse, TransportError>>;
 
     /// `POST /v1/commands`. Resending a command id is safe (the server
     /// returns the original result).

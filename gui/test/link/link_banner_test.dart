@@ -16,7 +16,11 @@ LinkUpdate link(
   label: label,
   connectionLabel: '',
   canRetryNow: canRetryNow,
-  rejected: state == LinkState.revoked || state == LinkState.protocolMismatch,
+  rejected:
+      state == LinkState.revoked ||
+      state == LinkState.protocolMismatch ||
+      state == LinkState.historyLost,
+  canResetReplica: state == LinkState.historyLost,
   queued: 0,
   approvalsElsewhere: elsewhere,
   elsewhereLabel: elsewhereLabel,
@@ -113,6 +117,30 @@ void main() {
       const GuiIntentAct(action: ActionIntentRetryNow()),
       const GuiIntentAct(action: ActionIntentRetryNow()),
     ]);
+  });
+
+  testWidgets('Reset local data asks first, then sends ResetReplica', (
+    tester,
+  ) async {
+    await pump(tester);
+    holder.apply(link(LinkState.reconnecting, 'offline', canRetryNow: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Reset local data'), findsNothing);
+
+    holder.apply(link(LinkState.historyLost, 'server lost history'));
+    await tester.pumpAndSettle();
+    expect(find.text('Retry now'), findsNothing);
+    await tester.tap(find.text('Reset local data'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent, isEmpty);
+
+    await tester.tap(find.text('Reset local data'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reset'));
+    await tester.pumpAndSettle();
+    expect(sent, [const GuiIntentAct(action: ActionIntentResetReplica())]);
   });
 
   testWidgets('approvals elsewhere and Ctrl+G open the next one', (

@@ -163,6 +163,13 @@ pub enum LinkRejection {
     Revoked,
     /// Client and server speak different protocol versions.
     ProtocolMismatch { client: u32, server: u32 },
+    /// The server's log lost events this replica holds (a crash dropped
+    /// its last commits, or it was restored from an older backup or
+    /// replaced). The replica, the only copy of what was lost, stays
+    /// readable and nothing is sent until the user resets it
+    /// ([`Action::ResetReplica`](crate::Action::ResetReplica)). `have` is
+    /// how far this device had seen the log, `server` the head it reports.
+    HistoryLost { have: Seq, server: Seq },
 }
 
 /// Delivery state of one of this device's commands.

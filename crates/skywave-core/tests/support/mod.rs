@@ -25,6 +25,7 @@ use skywave_proto::{
     CommandId, CommandKind, CommandResult, ContextRef, Event, EventKind, Seq, SessionId,
     SessionOrigin,
 };
+use skywave_testkit::LinkProxy;
 use skywaved::agent::fake::{FakeAgent, FakeOutside};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, ResultDisplay};
 use skywaved::identity::ServerIdentity;
@@ -71,7 +72,47 @@ impl Daemon {
     }
 
     async fn start_with(agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {
+        Daemon::start_in(tempfile::tempdir().unwrap(), agent, shell, outside).await
+    }
+
+    /// A copy of the data dir as a backup would take it: the identity
+    /// files and the database as of now, without blobs. [`Daemon::restore`]
+    /// starts a server over it.
+    pub fn backup(&self) -> TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        let from = self.tmp.path().join("server");
+        let to = tmp.path().join("server");
+        for dir in ["ca", "server"] {
+            std::fs::create_dir_all(to.join(dir)).unwrap();
+            for file in std::fs::read_dir(from.join(dir)).unwrap() {
+                let file = file.unwrap();
+                std::fs::copy(file.path(), to.join(dir).join(file.file_name())).unwrap();
+            }
+        }
+        std::fs::copy(from.join("server_id"), to.join("server_id")).unwrap();
+        let db = to.join("skywave.db");
+        self.storage
+            .db
+            .conn()
+            .execute("VACUUM INTO ?1", [db.to_str().unwrap()])
+            .unwrap();
+        tmp
+    }
+
+    /// Stops this server and starts another over `backup`
+    /// ([`Daemon::backup`]) in its place: `proxy` forwards to it from now
+    /// on. Sessions keep their old workdirs, which are gone.
+    pub async fn restore(self, backup: TempDir, proxy: &LinkProxy, agent: FakeAgent) -> Daemon {
+        drop(self);
+        let daemon = Daemon::start_in(backup, agent, false, FakeOutside::new()).await;
+        // Connections to the old server die with it, whatever it still
+        // serves on them.
+        proxy.retarget(daemon.addr);
+        proxy.cut();
+        daemon
+    }
+
+    async fn start_in(tmp: TempDir, agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let data = tmp.path().join("server");
         let storage = Storage::open(&data).unwrap();
