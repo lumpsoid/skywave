@@ -804,6 +804,28 @@ fn backgrounding_saves_an_unsaved_draft_at_once_before_any_suspend() {
 }
 
 #[test]
+fn stopping_saves_an_unsaved_draft_at_once() {
+    let mut rig = Rig::new();
+    rig.edit("typed then closed");
+    assert!(rig.actions.is_empty(), "still within the debounce");
+    let outs = rig.head.on_stop(rig.clock);
+    assert!(
+        outs.iter().all(|out| matches!(out, Out::Dispatch(..))),
+        "only dispatches once Dart may be gone: {outs:?}"
+    );
+    rig.apply(outs);
+    assert_eq!(rig.kinds(), ["save draft"]);
+    rig.results();
+    let Screen::Session(view) = rig.core.view().screen else {
+        panic!("left the session");
+    };
+    assert_eq!(
+        view.draft.map(|d| d.text).as_deref(),
+        Some("typed then closed")
+    );
+}
+
+#[test]
 fn backgrounding_without_an_unsaved_draft_dispatches_nothing() {
     let mut rig = Rig::new();
     rig.intent(GuiIntent::AppBackgrounded);

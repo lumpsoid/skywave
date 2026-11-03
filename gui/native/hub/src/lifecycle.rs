@@ -12,6 +12,10 @@
 //! was seen is marked read at once, both forced, as the TUI does on quit.
 //! They go to the dispatcher before the suspend; suspend only pauses the
 //! network loops, and a dispatch still writes the store after it.
+//!
+//! Closing (the hub task stopping, whatever stopped it) saves and marks the
+//! same way, without counting on Dart having reported the app leaving
+//! first: closing the core applies every action still queued, these last.
 
 use skywave_core::Action;
 
@@ -36,6 +40,8 @@ impl Target {
 pub enum Moved {
     Backgrounded,
     Foregrounded,
+    /// The hub is stopping: the core closes next.
+    Closed,
 }
 
 /// What to do to the core, in order.
@@ -66,6 +72,8 @@ pub fn calls(moved: Moved, target: Target) -> Vec<Call> {
         (Target::Mobile, Moved::Foregrounded) => {
             vec![Call::Resume, Call::Dispatch(Action::RetryNow)]
         }
+        // No suspend: the core shuts down right after.
+        (_, Moved::Closed) => vec![Call::SaveDraft, Call::MarkRead],
     }
 }
 
@@ -92,6 +100,16 @@ mod tests {
             vec![Call::SaveDraft, Call::MarkRead]
         );
         assert_eq!(calls(Moved::Foregrounded, Target::Desktop), vec![]);
+    }
+
+    #[test]
+    fn closing_saves_and_marks_on_every_target() {
+        for target in [Target::Mobile, Target::Desktop] {
+            assert_eq!(
+                calls(Moved::Closed, target),
+                vec![Call::SaveDraft, Call::MarkRead]
+            );
+        }
     }
 
     #[test]
