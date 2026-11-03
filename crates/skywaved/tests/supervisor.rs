@@ -882,6 +882,41 @@ async fn idle_agent_is_shut_down_and_resumed_on_next_message() {
     );
 }
 
+/// Daemon shutdown stops every warm agent at once, so it takes one agent's
+/// grace period rather than the sum of them. The fake holds each shutdown
+/// until both are under way: stopped one after another, the first never
+/// returns and the bounded wait fails.
+#[tokio::test]
+async fn shutdown_stops_the_warm_agents_concurrently() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().shutdowns_wait_for_each_other(2));
+    let supervisor = f.start(&agent).await;
+
+    let first = f.session_id;
+    f.send("one");
+    f.wait_count("the first session's reply", 1, is_idle).await;
+    let second = f.create_session();
+    f.session_id = second;
+    f.send("two");
+    f.wait_count("the second session's reply", 1, is_idle).await;
+    let logged = |f: &mut Fixture, id: SessionId| {
+        f.session_id = id;
+        f.kinds()
+    };
+    let before = [logged(&mut f, first), logged(&mut f, second)];
+
+    tokio::time::timeout(WAIT, supervisor.shutdown())
+        .await
+        .expect("the agents stopped one after another")
+        .unwrap();
+    for (id, before) in [first, second].into_iter().zip(before) {
+        let inputs = agent.inputs(id);
+        assert_eq!(inputs.last(), Some(&FakeInput::Shutdown), "{inputs:?}");
+        // Their exit is still left unrecorded for the next start.
+        assert_eq!(logged(&mut f, id), before);
+    }
+}
+
 /// A turn the agent starts on its own (a scheduled wakeup, like `/loop`)
 /// keeps it running past the idle deadline of the turn before, and the idle
 /// timer starts again once it ends.
