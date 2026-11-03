@@ -50,10 +50,18 @@
 //! wait ends once either clock says the delay has passed: the monotonic
 //! clock stops while a device sleeps, so the link also checks the wall
 //! clock every [`WALL_CHECK`] and retries soon after the `retry_at` it
-//! showed, and a `RetryNow` after a long sleep retries at once. The
-//! attempt count and `offline_since` reset once
-//! a pull succeeds, so a server that answers `hello` and then fails keeps
-//! backing off.
+//! showed, and a `RetryNow` after a long sleep retries at once.
+//!
+//! The bookkeeping resets on definitive signals only, when a connection
+//! ends. The attempt count resets if the connection made *progress*: a
+//! pull returned (with or without events) or the server settled a command
+//! (a `CommandResult`, or a refusal for good). `hello` alone is not
+//! progress, so a server that answers `hello` and then always fails keeps
+//! backing off instead of being retried every half second. A connection
+//! cut during every long-poll still delivers one command per connection at
+//! the base delay. `offline_since` resets once `hello` succeeds, as the
+//! link showed online from there: the next failure starts a new offline
+//! stretch, whatever the attempt count.
 //!
 //! [`Core::suspend`](crate::Core::suspend) stops the link and the
 //! downloader (in-flight requests are dropped; an unanswered command is
@@ -71,6 +79,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -546,7 +555,7 @@ impl LinkReporter {
     }
 }
 
-/// Reconnect bookkeeping, reset by a successful pull.
+/// Reconnect bookkeeping (see the module doc for when it resets).
 #[derive(Default)]
 struct Retry {
     attempt: u32,
@@ -554,8 +563,35 @@ struct Retry {
 }
 
 impl Retry {
-    fn reset(&mut self) {
-        *self = Retry::default();
+    /// Books how far a connection that ended got: past `hello` starts a new
+    /// offline stretch, and progress starts the attempt count over.
+    fn connection_ended(&mut self, ended: &Ended) {
+        if ended.up {
+            self.offline_since = None;
+        }
+        if ended.progressed {
+            self.attempt = 0;
+        }
+    }
+}
+
+/// How a connection ended and how far it got.
+struct Ended {
+    error: LinkError,
+    /// `hello` succeeded, so the link showed `Online` or `CatchingUp`.
+    up: bool,
+    /// A pull returned or the server settled a command.
+    progressed: bool,
+}
+
+impl From<LinkError> for Ended {
+    /// A connection that ended before `hello` succeeded.
+    fn from(error: LinkError) -> Ended {
+        Ended {
+            error,
+            up: false,
+            progressed: false,
+        }
     }
 }
 
@@ -571,7 +607,9 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
     loop {
         let error = match &transport {
             Some(transport) => {
-                connection(&ctx, transport.as_ref(), &mut reporter, &mut retry).await
+                let ended = connection(&ctx, transport.as_ref(), &mut reporter).await;
+                retry.connection_ended(&ended);
+                ended.error
             }
             None => {
                 match ctx.config.connector.connect(
@@ -666,31 +704,36 @@ async fn connection(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     reporter: &mut LinkReporter,
-    retry: &mut Retry,
-) -> LinkError {
+) -> Ended {
     let started = tokio::time::Instant::now();
     let hello = match transport.hello().await {
         Ok(hello) => hello,
-        Err(error) => return error.into(),
+        Err(error) => return LinkError::from(error).into(),
     };
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
     if let Err(error) = ctx.seam.hello_received(&hello) {
-        return error.into();
+        return LinkError::from(error).into();
     }
+    let progress = AtomicBool::new(false);
     let ended = tokio::select! {
-        ended = pull(ctx, transport, reporter, retry, hello.head, latency_ms) => ended,
-        ended = send(ctx, transport) => ended,
+        ended = pull(ctx, transport, reporter, &progress, hello.head, latency_ms) => ended,
+        ended = send(ctx, transport, &progress) => ended,
     };
     let Err(error) = ended;
-    error
+    Ended {
+        error,
+        up: true,
+        progressed: progress.load(Ordering::Relaxed),
+    }
 }
 
 /// The pull loop: long-polls from the store's cursor and applies batches.
+/// Sets `progress` once a pull returns.
 async fn pull(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     reporter: &mut LinkReporter,
-    retry: &mut Retry,
+    progress: &AtomicBool,
     mut head: Seq,
     latency_ms: u32,
 ) -> Result<Infallible, LinkError> {
@@ -715,7 +758,7 @@ async fn pull(
                 limit: ctx.config.limit,
             })
             .await?;
-        retry.reset();
+        progress.store(true, Ordering::Relaxed);
         if batch.events.is_empty() {
             continue;
         }
@@ -751,17 +794,26 @@ async fn pull(
 /// on disk before the request leaves, so the server never sees a command
 /// with `tries == 0`. Any future batched send must claim every row of the
 /// batch before the request leaves.
-async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, LinkError> {
+///
+/// Sets `progress` once the server settles a command.
+async fn send(
+    ctx: &LinkCtx,
+    transport: &dyn Transport,
+    progress: &AtomicBool,
+) -> Result<Infallible, LinkError> {
     loop {
         let Some(entry) = ctx.seam.pending_outbox()?.into_iter().next() else {
             ctx.outbox.notified().await;
             continue;
         };
-        send_entry(ctx, transport, &entry).await?;
+        if send_entry(ctx, transport, &entry).await? {
+            progress.store(true, Ordering::Relaxed);
+        }
     }
 }
 
-/// Claims and sends one outbox entry read earlier. An entry that can no
+/// Claims and sends one outbox entry read earlier, and says whether the
+/// server settled it: answered it or refused it for good. An entry that can no
 /// longer be claimed (gone from the outbox, or answered meanwhile) is
 /// skipped. One the server refuses for good fails and the link stays up:
 /// resending it would only hold back every later command.
@@ -772,29 +824,35 @@ async fn send(ctx: &LinkCtx, transport: &dyn Transport) -> Result<Infallible, Li
 /// ([`Seam::apply_events`]); if it logged none, the log shows that too
 /// ([`settled_by_log`]). The entry waits for either, holding back the later
 /// ones (D7); resending at once would most likely bring back the same
-/// unreadable reply before the pull can apply the event.
+/// unreadable reply before the pull can apply the event. It does not count
+/// as settled by the server here: the pull that settles it is progress of
+/// its own.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     entry: &OutboxEntry,
-) -> Result<(), LinkError> {
+) -> Result<bool, LinkError> {
     let id = entry.command.id;
     if !ctx.seam.command_sending(id)? {
-        return Ok(());
+        return Ok(false);
     }
     match transport.send_command(&entry.command).await {
-        Ok(result) => ctx.seam.command_result(id, &result)?,
+        Ok(result) => {
+            ctx.seam.command_result(id, &result)?;
+            Ok(true)
+        }
         Err(error) if error.refuses_command() => {
             tracing::warn!(%error, ?id, "server refused the command; giving up on it");
             ctx.seam.command_undeliverable(id)?;
+            Ok(true)
         }
         Err(TransportError::Decode(error)) => {
             tracing::warn!(%error, ?id, "unreadable reply; waiting for the log to settle it");
             settled_by_log(ctx, transport, id).await?;
+            Ok(false)
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 /// Waits until the log settles the outbox command `id`, whose reply was
@@ -1238,6 +1296,136 @@ mod tests {
         link.abort();
     }
 
+    /// A server behind a proxy that cuts every connection: `hello` works,
+    /// the first command of a connection is answered and any later one is
+    /// cut, and every long-poll is cut after `CUT` without returning.
+    #[derive(Default)]
+    struct CuttingServer {
+        /// A command was answered since the last `hello`.
+        answered: AtomicBool,
+        seen: Mutex<Vec<CommandId>>,
+    }
+
+    impl CuttingServer {
+        const CUT: Duration = Duration::from_secs(3);
+    }
+
+    impl Transport for CuttingServer {
+        fn hello(&self) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async move {
+                self.answered.store(false, Ordering::SeqCst);
+                Ok(HelloResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_id: ServerId::new(),
+                    device_id: DeviceId::new(),
+                    head: Seq::ZERO,
+                    devices: Vec::new(),
+                    shell: false,
+                })
+            })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                if self.answered.swap(true, Ordering::SeqCst) {
+                    return Err(TransportError::Io("cut".into()));
+                }
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(command.id);
+                Ok(CommandResult::Accepted {
+                    seq: Seq(seen.len() as u64),
+                })
+            })
+        }
+
+        fn events(&self, _query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async {
+                tokio::time::sleep(CuttingServer::CUT).await;
+                Err(TransportError::Io("cut".into()))
+            })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+    }
+
+    /// Connections that each get one command through before they are cut
+    /// keep the attempt count at 1, so the queue drains at the base delay.
+    /// Once the outbox is empty, a connection that only got through `hello`
+    /// is no progress and the count climbs again. Every connection got past
+    /// `hello`, so each failure starts its own offline stretch.
+    #[tokio::test(start_paused = true)]
+    async fn connections_that_deliver_a_command_keep_the_attempt_count_low() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        let commands: Vec<_> = (0..4)
+            .map(|n| enqueue(&seam, &format!("m{n}")).id)
+            .collect();
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let sink = links.clone();
+        seam.core
+            .subscribe(move |view| sink.lock().unwrap().push(view.link));
+
+        let server = Arc::new(CuttingServer::default());
+        let fake = server.clone();
+        let (wall_clock, _) = paused_wall();
+        let config = EngineConfig {
+            backoff: Backoff {
+                base: Duration::from_secs(1),
+                cap: Duration::from_secs(8),
+                jitter: Jitter::fixed(1.0),
+            },
+            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            wall_clock,
+            ..EngineConfig::default()
+        };
+        let link = tokio::spawn(run_link(link_ctx(&seam, config, Arc::new(Notify::new()))));
+
+        // `retry_at - offline_since` is the delay when the stretch started
+        // at this very failure. Snapshots for outbox changes repeat the
+        // link, so one entry per wait.
+        let reconnects = |links: &[Link]| -> Vec<(u32, i64)> {
+            let mut links = links.to_vec();
+            links.dedup();
+            links
+                .iter()
+                .filter_map(|l| match l {
+                    Link::Reconnecting {
+                        attempt,
+                        retry_at,
+                        offline_since,
+                    } => Some((*attempt, (*retry_at - *offline_since).num_milliseconds())),
+                    _ => None,
+                })
+                .collect()
+        };
+        while reconnects(&links.lock().unwrap()).len() < 6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(*server.seen.lock().unwrap(), commands);
+        assert!(seam.pending_outbox().unwrap().is_empty());
+        assert_eq!(
+            reconnects(&links.lock().unwrap())[..6],
+            [
+                (1, 1_000),
+                (1, 1_000),
+                (1, 1_000),
+                (1, 1_000),
+                (2, 2_000),
+                (3, 4_000)
+            ]
+        );
+        link.abort();
+    }
+
     /// A config whose link waits 30 s per attempt against a server that is
     /// down, on a wall clock that moves with the paused one; with the
     /// server and the handle that jumps the wall clock.
@@ -1455,10 +1643,13 @@ mod tests {
         let commands = [enqueue(&seam, "one"), enqueue(&seam, "two")];
         let server = RecordingServer::new(dir.path());
         let ctx = sender_ctx(&seam);
+        let progress = AtomicBool::new(false);
 
         // The sender drains the outbox, then waits for more forever.
-        let drained = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        let drained =
+            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
         assert!(drained.is_err(), "the sender only ends on an error");
+        assert!(progress.load(Ordering::Relaxed), "answers are progress");
         assert_eq!(
             *server.seen.lock().unwrap(),
             vec![(commands[0].id, 1), (commands[1].id, 1)]
@@ -1484,13 +1675,16 @@ mod tests {
                 [deleted.id.0.to_string()],
             )
             .unwrap();
-        send_entry(&ctx, &server, &entry).await.unwrap();
+        assert!(!send_entry(&ctx, &server, &entry).await.unwrap());
 
         let answered = enqueue(&seam, "answered");
         let entry = seam.pending_outbox().unwrap().remove(0);
         seam.command_result(answered.id, &CommandResult::Accepted { seq: Seq(1) })
             .unwrap();
-        send_entry(&ctx, &server, &entry).await.unwrap();
+        assert!(
+            !send_entry(&ctx, &server, &entry).await.unwrap(),
+            "a skipped row is no progress"
+        );
 
         assert!(server.seen.lock().unwrap().is_empty());
         let outbox = crate::client::lock(&seam.core.shared.state)
@@ -1569,8 +1763,10 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let ctx = sender_ctx(&seam);
+        let progress = AtomicBool::new(false);
 
-        let drained = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        let drained =
+            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
         assert!(drained.is_err(), "the refusal does not end the sender");
         assert_eq!(*server.seen.lock().unwrap(), ["/bad", "/good"]);
         assert!(seam.pending_outbox().unwrap().is_empty());
@@ -1618,12 +1814,15 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let ctx = sender_ctx(&seam);
+        let progress = AtomicBool::new(false);
 
-        let ended = tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server)).await;
+        let ended =
+            tokio::time::timeout(Duration::from_secs(1), send(&ctx, &server, &progress)).await;
         assert!(matches!(
             ended,
             Ok(Err(LinkError::Transport(TransportError::BadStatus(503))))
         ));
+        assert!(!progress.load(Ordering::Relaxed), "a 5xx is no progress");
         assert_eq!(*server.seen.lock().unwrap(), ["/busy"]);
         assert_eq!(seam.pending_outbox().unwrap().len(), 2);
     }
