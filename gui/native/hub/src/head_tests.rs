@@ -1129,6 +1129,105 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
     );
 }
 
+impl Rig {
+    /// Logs `kinds` in `session` and shows the head the view that follows.
+    fn log_in(&mut self, session: SessionId, kinds: Vec<EventKind>) -> Vec<Out> {
+        let from = Seq(self.seam.cursor().unwrap().0 + 1);
+        let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+        let events = kinds
+            .into_iter()
+            .map(|kind| Event {
+                session_id: session,
+                at,
+                command_id: None,
+                context: skywave_proto::ContextId::first_of(session),
+                kind,
+            })
+            .collect();
+        self.seam
+            .apply_events(&EventBatch { from, events })
+            .unwrap();
+        self.view()
+    }
+}
+
+/// The notifications `outs` shows, as `(id, session_id)`, and the ids it
+/// takes down.
+fn notifications(outs: &[Out]) -> (Vec<(i32, Option<String>)>, Vec<i32>) {
+    let mut shown = Vec::new();
+    let mut dismissed = Vec::new();
+    for out in outs {
+        match out {
+            Out::Effect(PlatformEffect::Notify { id, session_id, .. }) => {
+                shown.push((*id, session_id.clone()));
+            }
+            Out::Effect(PlatformEffect::Dismiss { id }) => dismissed.push(*id),
+            _ => {}
+        }
+    }
+    (shown, dismissed)
+}
+
+#[test]
+fn each_session_has_its_own_notification_taken_down_when_answered_elsewhere() {
+    use skywave_proto::{ApprovalId, Decision};
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    let (a, b) = (rig.session, SessionId::new());
+    rig.log_in(
+        b,
+        vec![EventKind::SessionCreated {
+            workdir: "/srv/other".into(),
+            context_name: "start".into(),
+            from: None,
+        }],
+    );
+    let approval = |id| EventKind::ApprovalRequested {
+        id,
+        call: None,
+        tool: "Bash".into(),
+        summary: "ls".into(),
+        input: None,
+        suggestions: Vec::new(),
+    };
+    let (in_a, in_b) = (ApprovalId::new(), ApprovalId::new());
+    let (shown_a, none) = notifications(&rig.log_in(a, vec![approval(in_a)]));
+    assert!(none.is_empty());
+    let (shown_b, none) = notifications(&rig.log_in(b, vec![approval(in_b)]));
+    assert!(none.is_empty());
+    let [(id_a, Some(session_a))] = shown_a.as_slice() else {
+        panic!("one notification for a: {shown_a:?}");
+    };
+    let [(id_b, Some(session_b))] = shown_b.as_slice() else {
+        panic!("one notification for b: {shown_b:?}");
+    };
+    assert_eq!((session_a, session_b), (&a.0.to_string(), &b.0.to_string()));
+    assert_ne!(id_a, id_b, "b's does not replace a's");
+
+    // Another device answers a's: a's notification goes, b's stays.
+    let outs = rig.log_in(
+        a,
+        vec![EventKind::ApprovalResolved {
+            id: in_a,
+            decision: Decision::Approve,
+            by: DeviceId::new(),
+            rule: None,
+        }],
+    );
+    assert_eq!(notifications(&outs), (vec![], vec![*id_a]));
+    // Once.
+    assert_eq!(notifications(&rig.view()), (vec![], vec![]));
+    // Cancelled counts as answered too.
+    let outs = rig.log_in(
+        b,
+        vec![EventKind::ApprovalCancelled {
+            id: in_b,
+            reason: "daemon restarted".into(),
+        }],
+    );
+    assert_eq!(notifications(&outs), (vec![], vec![*id_b]));
+}
+
 #[test]
 fn the_list_title_leaves_the_counts_to_the_toggle() {
     let mut rig = Rig::new();
@@ -2819,6 +2918,7 @@ fn a_long_shell_run_of_this_devices_notifies() {
                 title,
                 body,
                 session_id,
+                ..
             }) => Some((title.clone(), body.clone(), session_id.clone())),
             _ => None,
         })

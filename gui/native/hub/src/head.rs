@@ -24,6 +24,7 @@ use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::{self, Call, Moved, Target};
+use crate::notify::{Kind, NotificationIds};
 use crate::screen::{CreateUi, Ui, rename_initial, revoked};
 use crate::signals::{
     ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
@@ -265,6 +266,8 @@ pub struct Head {
     /// From 0, not from the first snapshot: a run that finished in a
     /// catch-up before it is still news.
     shell_alerts: ShellAlertWatcher,
+    /// Each session's system notification ids.
+    notifications: NotificationIds,
     next_tag: Tag,
     pending: HashMap<Tag, Purpose>,
     /// Bumped for every value the hub writes into a Dart field.
@@ -295,28 +298,35 @@ impl Head {
             // The first snapshot's approvals need no alert.
             None => self.alerts = Some(AlertWatcher::new(&view.attention)),
             Some(alerts) => {
-                if let Some(alert) = alerts.observe(&view.attention) {
+                let update = alerts.observe(&view.attention);
+                for session in update.cleared {
+                    out.push(Out::Effect(PlatformEffect::Dismiss {
+                        id: self.notifications.id(session, Kind::Approval),
+                    }));
+                }
+                // An alert whose approvals were all answered by the same
+                // snapshot names no session: nothing is left to show.
+                if let Some((alert, session)) = update
+                    .alert
+                    .and_then(|alert| alert.session_id.map(|s| (alert, s)))
+                {
                     out.push(Out::Effect(PlatformEffect::Notify {
+                        id: self.notifications.id(session, Kind::Approval),
                         body: alert.notice(),
                         title: alert.title.unwrap_or_default(),
-                        session_id: view
-                            .attention
-                            .approvals
-                            .last()
-                            .map(|a| a.session_id.0.to_string()),
+                        session_id: Some(session.0.to_string()),
                     }));
                 }
             }
         }
-        if let Some(notice) = self.shell_alerts.observe(&view.attention) {
+        if let Some(notice) = self.shell_alerts.observe(&view.attention)
+            && let Some(last) = &view.attention.last_shell
+        {
             out.push(Out::Effect(PlatformEffect::Notify {
+                id: self.notifications.id(last.session_id, Kind::Shell),
                 body: notice.notice(),
                 title: notice.title,
-                session_id: view
-                    .attention
-                    .last_shell
-                    .as_ref()
-                    .map(|s| s.session_id.0.to_string()),
+                session_id: Some(last.session_id.0.to_string()),
             }));
         }
         if !revoked(&view) {

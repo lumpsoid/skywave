@@ -7,6 +7,7 @@
 //! - `head`: snapshots, intents and results in; signals and actions out.
 //! - `link`, `screen`, `timeline`, `search`, `clip`, `intents`: the
 //!   mapping, one feature each.
+//! - `notify`: system notification ids, one per session.
 //! - `run`: the hub task's `select!` loop, and catching its panics;
 //!   `boot`, `dispatcher`: opening the core and dispatching to it in order.
 //! - `lifecycle`: what the app leaving and returning to the screen does to
@@ -20,6 +21,7 @@ mod intents;
 mod lifecycle;
 mod link;
 mod logging;
+mod notify;
 mod run;
 mod screen;
 mod search;

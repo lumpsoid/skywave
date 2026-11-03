@@ -5,15 +5,21 @@ use serde::Serialize;
 /// and keeps nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub enum PlatformEffect {
-    /// New approvals came in: a system notification. `title` is the
-    /// newest one's session, sanitised (may be empty); `body` the line
-    /// to show, `approval needed · <title>`; `session_id` the session to
-    /// open on a tap.
+    /// New approvals came in, or a long shell run finished: a system
+    /// notification. `id` is the notification's, one per session and kind
+    /// (showing it again replaces it); `title` is the session's, sanitised
+    /// (may be empty); `body` the line to show, `approval needed · <title>`;
+    /// `session_id` the session to open on a tap.
     Notify {
+        id: i32,
         title: String,
         body: String,
         session_id: Option<String>,
     },
+    /// Take down notification `id` if it is up: its session no longer
+    /// waits on an approval (answered or cancelled from any device, or the
+    /// session is gone).
+    Dismiss { id: i32 },
     /// Put `text` on the clipboard.
     CopyToClipboard { text: String },
     /// Open the file at `path` with the system's viewer.

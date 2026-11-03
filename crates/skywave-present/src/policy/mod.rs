@@ -9,7 +9,8 @@
 //!   on failure.
 //! - [`ReadMarker`]: throttled read marks while the newest item is on
 //!   screen, forced on leaving.
-//! - [`AlertWatcher`]: an alert when new approvals come in.
+//! - [`AlertWatcher`]: an alert when new approvals come in, and which
+//!   sessions no longer wait on one.
 //! - [`ShellAlertWatcher`]: a notice when a long shell run of this
 //!   device's finished.
 //! - [`PromptHistory`]: recalling earlier prompts, or shell commands, with
@@ -32,7 +33,9 @@ mod read;
 mod search;
 mod shell;
 
-pub use alert::{Alert, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise};
+pub use alert::{
+    Alert, AlertUpdate, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise,
+};
 pub use completion::CompletionSettle;
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver, message_refusal};
 pub use expand::ExpandFetch;

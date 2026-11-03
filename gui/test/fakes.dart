@@ -8,10 +8,14 @@ class FakeEffectSink implements EffectSink {
 
   @override
   void notify({
+    required int id,
     required String title,
     required String body,
     String? sessionId,
-  }) => done.add('notify: $body ($sessionId)');
+  }) => done.add('notify $id: $body ($sessionId)');
+
+  @override
+  void dismiss(int id) => done.add('dismiss $id');
 
   @override
   void copy(String text) => done.add('copy: $text');

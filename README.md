@@ -308,8 +308,10 @@ Admin commands work on the database directly, so `serve` can keep running.
    Answers given offline are queued and go out when the phone is back
    online.
 
-5. **Get alerts.** Allow notifications when asked. The app posts one
-   notification per new approval while it is open. In the background it
+5. **Get alerts.** Allow notifications when asked. The app posts a
+   notification for new approvals while it is open, one per session, and
+   removes it once that session's approvals are answered, from any
+   device. In the background it
    suspends its connection, so alerts wait until you return to it.
 
 6. **Revoke.** `skywaved devices revoke <id>` on the server. Within about a
