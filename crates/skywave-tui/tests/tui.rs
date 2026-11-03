@@ -3362,6 +3362,23 @@ fn drafts_survive_a_restart() {
     assert_eq!(h.app.composer().unwrap().text(), "before the crXash");
 }
 
+/// The exit a signal or a failed terminal read takes, with no quit key:
+/// typing the idle timer has not saved yet survives it.
+#[test]
+fn shutting_down_saves_the_draft() {
+    let (mut h, _, _) = open_session();
+    h.type_text("cut off");
+    assert_eq!(h.core_draft(), None, "nothing saved before the exit");
+    assert!(!h.app.ui().quit);
+
+    skywave_tui::shut_down(&mut h.app, &h.core);
+    h.sync();
+    assert_eq!(h.core_draft().map(|d| d.text), Some("cut off".into()));
+    let mut h = h.restart();
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.composer().unwrap().text(), "cut off");
+}
+
 #[test]
 fn idle_draft_is_saved_once() {
     let (mut h, _, _) = open_session();
