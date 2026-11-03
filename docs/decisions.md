@@ -828,6 +828,10 @@ reply waits for the import, and a device treats a reply later than its
 deadline sits well under it (the user asked for ~60 s, which would drop the
 creating device's link on every slow import). Past it the outcome is
 `Failed("timed out")`, a recorded result; the session is still created.
+The workdir's canonicalisation before the read shares the deadline, but
+past it the reply is a 503 and the command is not handled: the transaction
+canonicalises again, unbounded and on the API's connection, so a hung mount
+would block every device; the device resends instead.
 Measured: the biggest local transcript parses in 77 ms with ~800 blob
 writes at worst.
 **No cap** on the number of imported items (user decision): every item is

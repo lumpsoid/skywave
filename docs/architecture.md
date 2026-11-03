@@ -158,7 +158,9 @@ beside a running `serve`.
   `CreateSession` the API first reads the conversation's history from the
   agent's source (built next to the adapter) on a blocking thread, off its
   database connection, within a 20 s deadline (under the device's 30 s
-  reply timeout; past it `Failed("timed out")`), and bounds it with the
+  reply timeout; past it `Failed("timed out")`; a workdir that is still
+  canonicalising then gets a 503 and nothing is handled, so the device
+  resends), and bounds it with the
   event mapper's helpers into blobs written but not yet recorded. The
   command's transaction then records them and appends `SessionCreated`,
   one `Imported` per item and the command's `ImportFinished`; any path

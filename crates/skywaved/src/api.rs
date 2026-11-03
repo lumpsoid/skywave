@@ -60,7 +60,9 @@
 //! first request is still preparing waits for that request's reply. The
 //! import gets the server's import deadline
 //! ([`import::IMPORT_DEADLINE`]), after which the reply goes on with
-//! `Failed("timed out")`.
+//! `Failed("timed out")`. Canonicalising the workdir first shares that
+//! deadline; past it the reply is a 503 and nothing is handled, so the
+//! device resends.
 //!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
 //! 500 server fault.
@@ -378,7 +380,7 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
     {
         return Ok(stored);
     }
-    let prepared = prepare_import(api, &command).await;
+    let prepared = prepare_import(api, &command).await?;
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
         .await
 }
@@ -388,16 +390,26 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
 /// history read
 /// and its blob writes run on a blocking thread; past the deadline the
 /// reply goes on without them as `Failed("timed out")`, and whatever the
-/// abandoned thread still writes is removed when it ends.
-async fn prepare_import(api: &Arc<Api>, command: &Command) -> Option<Prepared> {
+/// abandoned thread still writes is removed when it ends. The workdir's
+/// canonicalisation before it shares the deadline; past it the request is a
+/// 503 and the command is not handled: `handle_with` would canonicalise
+/// again, unbounded and holding the API's connection, so the device resends
+/// it instead.
+async fn prepare_import(
+    api: &Arc<Api>,
+    command: &Command,
+) -> std::result::Result<Option<Prepared>, StatusCode> {
     let CommandKind::CreateSession {
         workdir,
         conversation: Some(conversation),
     } = &command.kind
     else {
-        return None;
+        return Ok(None);
     };
-    let conversation = check_conversation_id(conversation)?.to_owned();
+    let Some(conversation) = check_conversation_id(conversation) else {
+        return Ok(None);
+    };
+    let conversation = conversation.to_owned();
     let deadline = Instant::now() + api.import_deadline;
     let (roots, workdir) = (api.log.roots().to_vec(), workdir.clone());
     // A refused workdir imports nothing: `handle_with` canonicalises again
@@ -405,36 +417,38 @@ async fn prepare_import(api: &Arc<Api>, command: &Command) -> Option<Prepared> {
     // `Failed("workdir changed")`.
     let canonical =
         tokio::task::spawn_blocking(move || dirs::canonical_under_roots(&roots, &workdir));
-    let workdir = match canonical.await {
-        Ok(Ok(workdir)) => workdir,
-        Ok(Err(_refused)) => return Some(Prepared::workdir_refused(api.blobs.clone())),
-        Err(e) => {
+    let workdir = match tokio::time::timeout_at(deadline.into(), canonical).await {
+        Ok(Ok(Ok(workdir))) => workdir,
+        Ok(Ok(Err(_refused))) => return Ok(Some(Prepared::workdir_refused(api.blobs.clone()))),
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "canonicalising a workdir failed");
-            return Some(Prepared::workdir_refused(api.blobs.clone()));
+            return Ok(Some(Prepared::workdir_refused(api.blobs.clone())));
+        }
+        Err(_) => {
+            tracing::warn!(command = %command.id.0, "canonicalising a workdir timed out");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
     let (source, blobs, read_for) = (api.outside.clone(), api.blobs.clone(), workdir.clone());
     let read = tokio::task::spawn_blocking(move || {
         import::prepare(&*source, blobs, &read_for, &conversation, deadline)
     });
-    match tokio::time::timeout_at(deadline.into(), read).await {
-        Ok(Ok(prepared)) => Some(prepared),
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "preparing an import failed");
-            let outcome = ImportOutcome::Failed {
-                reason: "could not read the history".to_owned(),
-            };
-            Some(Prepared::without_items(
-                api.blobs.clone(),
-                &workdir,
-                outcome,
-            ))
-        }
-        Err(_) => {
-            tracing::warn!(command = %command.id.0, "importing a conversation timed out");
-            Some(Prepared::timed_out(api.blobs.clone(), &workdir))
-        }
-    }
+    Ok(Some(
+        match tokio::time::timeout_at(deadline.into(), read).await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "preparing an import failed");
+                let outcome = ImportOutcome::Failed {
+                    reason: "could not read the history".to_owned(),
+                };
+                Prepared::without_items(api.blobs.clone(), &workdir, outcome)
+            }
+            Err(_) => {
+                tracing::warn!(command = %command.id.0, "importing a conversation timed out");
+                Prepared::timed_out(api.blobs.clone(), &workdir)
+            }
+        },
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
