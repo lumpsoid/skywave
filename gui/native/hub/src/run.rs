@@ -10,7 +10,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::boot::{self, Running};
 use crate::head::{Clock, Head, Out};
-use crate::signals::{Boot, BootFailed, Booted, GuiIntent, ScreenUpdate, ScreenView};
+use crate::signals::{Boot, Booted, GuiIntent, ScreenUpdate, ScreenView};
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
 /// `BootFailed` and waiting for the next `Boot`; then runs the loop. Returns
@@ -30,9 +30,9 @@ pub async fn boot_then_run(mut stop: oneshot::Receiver<()>) {
                         Booted.send_signal_to_dart();
                         break running;
                     }
-                    Err(message) => {
-                        tracing::warn!("boot failed: {message}");
-                        BootFailed { message }.send_signal_to_dart();
+                    Err(failed) => {
+                        tracing::warn!(unreadable = failed.unreadable, "boot failed: {}", failed.message);
+                        failed.send_signal_to_dart();
                     }
                 }
             }

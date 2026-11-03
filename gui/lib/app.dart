@@ -91,9 +91,12 @@ class _SkywaveAppState extends State<SkywaveApp> {
           BootPending() => const Scaffold(
             body: Center(child: CircularProgressIndicator()),
           ),
-          BootError(:final message) => BootFailurePage(
+          BootError(:final message, :final unreadable) => BootFailurePage(
             message: message,
             onRetry: () => unawaited(widget.boot.boot()),
+            onReset: unreadable
+                ? () => unawaited(widget.boot.boot(resetReplica: true))
+                : null,
           ),
           BootReady() => LinkShortcuts(
             send: widget.send,

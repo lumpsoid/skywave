@@ -303,6 +303,28 @@ skywave client is using <dir>"), which the heads show; otherwise both would
 hit SQLite busy errors and each model would go stale against the other's
 writes.
 
+The replica, like the server's database, records the `PROTOCOL_VERSION` it
+was created with (`protocol_stamp`; one from before the stamp takes the
+current one). `Core::open` fails with `CoreError::ReplicaUnreadable` when
+the stamp differs, the schema is newer, the file is damaged, or a row it
+loads no longer decodes (`StoreError::unreadable`), instead of reading
+wire JSON another build wrote. Nothing migrates such a replica (alpha).
+`Core::reset_replica(data_dir)` needs no open core, only the data dir's
+lock: it drops what the server's log produced (events and their
+projections, cursor, outbox, blob rows and files, workdir answers, offered
+models, device names) and restamps, in one transaction, keeping the
+identity and everything that is this device's (settings, drafts, composer
+modes, snippets, read marks, local deletes, alerted approvals), so the
+next open pulls the whole log again from seq 0. A settings row this build
+cannot read goes in the same transaction. If even that fails as
+unreadable, it builds a new database as `core.db.new` (schema, stamp and
+the old settings this build reads, in one transaction), checks that it
+loads, removes the old WAL files and renames it over `core.db`, so a crash
+leaves either the old database or the whole new one. The TUI names `--reset-replica` and exits; the GUI's
+boot failure (`BootFailed.unreadable`) offers "Reset local data", which
+sends `Boot` with `reset_replica`. Deleting a session locally skips (and
+logs) an event that no longer decodes rather than failing.
+
 - **Replica** (SQLite, `core.db`): the replicated `events`, projections
   folded in the transaction that stores them (`sessions`, and `turns`, each
   `TurnUsage` by seq for the usage screen), the `outbox`, the `cursor`,

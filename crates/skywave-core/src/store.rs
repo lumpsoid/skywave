@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
-    DeviceInfo, Event, EventBatch, EventKind, ModelChoice, Seq, SessionId,
+    DeviceInfo, Event, EventBatch, EventKind, ModelChoice, PROTOCOL_VERSION, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -314,10 +314,31 @@ UPDATE sessions SET adopted = (SELECT json_extract(event, '$.kind.from.conversat
     ORDER BY seq
     LIMIT 1);
 "#,
+    r#"
+-- The skywave_proto::PROTOCOL_VERSION whose wire JSON the replica's JSON
+-- columns hold; one row, written by `migrate` when the replica is created
+-- and only rewritten by `Store::reset_replica`. `IF NOT EXISTS`: the
+-- migration tests rerun later migrations over a current schema.
+CREATE TABLE IF NOT EXISTS protocol_stamp (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
+"#,
 ];
+
+/// First schema version with `protocol_stamp`.
+const STAMPED_SINCE: i64 = 21;
 
 /// Highest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// The files SQLite keeps beside [`DB_FILE`] in WAL mode.
+const WAL_FILES: [&str; 2] = ["core.db-wal", "core.db-shm"];
+
+/// Where [`Store::reset_replica`] builds a new database before renaming it
+/// over [`DB_FILE`].
+const FRESH_DB_FILE: &str = "core.db.new";
+const FRESH_JOURNAL_FILE: &str = "core.db.new-journal";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -332,6 +353,20 @@ pub enum StoreError {
     },
     #[error("database schema version {found} is newer than supported version {SCHEMA_VERSION}")]
     NewerSchema { found: i64 },
+    /// The replica was written by a build of another protocol version,
+    /// whose stored wire JSON this build may not read (alpha: never
+    /// migrated; [`Store::reset_replica`] starts it again).
+    #[error("the replica was written for protocol version {found}, this build speaks {current}")]
+    ProtocolMismatch { found: u32, current: u32 },
+    /// The replica breaks an invariant of its own schema.
+    #[error("the replica is corrupt: {0}")]
+    Corrupt(&'static str),
+    /// Replacing the database file ([`Store::reset_replica`]) failed.
+    #[error("cannot replace {path}: {source}")]
+    Replace {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// The batch starts after `cursor + 1`; applying it would leave a hole.
     #[error("event batch from {from:?} leaves a gap after cursor {cursor:?}")]
     Gap { cursor: Seq, from: Seq },
@@ -355,6 +390,35 @@ pub enum StoreError {
     WorkdirMismatch,
 }
 
+impl StoreError {
+    /// Whether the error says the replica itself cannot be read by this
+    /// build — written by another protocol or schema version, a stored row
+    /// that no longer decodes, or a damaged database file — as opposed to
+    /// a failure of the moment (I/O, a busy lock) or of the call. Only
+    /// [`Store::reset_replica`] gets past it.
+    pub fn unreadable(&self) -> bool {
+        use rusqlite::Error as Sql;
+        match self {
+            StoreError::ProtocolMismatch { .. }
+            | StoreError::NewerSchema { .. }
+            | StoreError::Corrupt(_)
+            | StoreError::Json(_) => true,
+            StoreError::Sqlite(err) => match err {
+                Sql::FromSqlConversionFailure(..)
+                | Sql::InvalidColumnType(..)
+                | Sql::IntegralValueOutOfRange(..)
+                | Sql::QueryReturnedNoRows => true,
+                Sql::SqliteFailure(failure, _) => matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
 /// Whether blobs download alongside metadata or on explicit intent (D6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlobPolicy {
@@ -375,6 +439,36 @@ pub struct Settings {
     /// Whether the server allows bypass mode, as its last `hello` said
     /// ([`Store::set_bypass_allowed`]); `false` until one said so.
     pub bypass_allowed: bool,
+}
+
+impl Settings {
+    /// Takes in the stored row `key` = `value`; an error if this build
+    /// cannot read the value. Keys written by a newer build are left alone.
+    fn read(&mut self, key: &str, value: String) -> Result<(), StoreError> {
+        match key {
+            KEY_BLOB_POLICY => {
+                self.blob_policy = match value.as_str() {
+                    "eager" => BlobPolicy::Eager,
+                    "on_demand" => BlobPolicy::OnDemand,
+                    _ => {
+                        return Err(
+                            bad_value(1, Type::Text, format!("blob policy {value:?}")).into()
+                        );
+                    }
+                }
+            }
+            KEY_SERVER_ADDRESS => self.server_address = Some(value),
+            KEY_SHELL_ENABLED => self.shell_enabled = flag(&value, "shell")?,
+            KEY_BYPASS_ALLOWED => self.bypass_allowed = flag(&value, "bypass")?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether [`read`](Settings::read) takes the row in.
+    fn readable(key: &str, value: &str) -> bool {
+        Settings::default().read(key, value.to_owned()).is_ok()
+    }
 }
 
 /// Delivery state of a queued command.
@@ -568,18 +662,11 @@ impl Store {
     /// Commands left in `Sending` by a previous run go back to `Queued`:
     /// nothing is in flight after a restart, and the server dedups the
     /// resend (D7). Their `tries` are kept: they may have gone out.
+    ///
+    /// A replica stamped with another `PROTOCOL_VERSION` is refused with
+    /// [`StoreError::ProtocolMismatch`] before anything reads it.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
-        fs::create_dir_all(data_dir).map_err(|source| StoreError::DataDir {
-            path: data_dir.to_path_buf(),
-            source,
-        })?;
-        let conn = Connection::open(data_dir.join(DB_FILE))?;
-        // rusqlite's default too; stated so it does not depend on that.
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        // Every user action must survive power loss once dispatch returns.
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        Store::init(conn)
+        Store::init(connect(data_dir)?)
     }
 
     /// A replica that lives only in memory, for tests of components above
@@ -589,9 +676,38 @@ impl Store {
     }
 
     fn init(mut conn: Connection) -> Result<Store, StoreError> {
-        migrate(&mut conn)?;
+        migrate(&mut conn, Stamp::Check)?;
         conn.execute("UPDATE outbox SET sending = 0 WHERE result IS NULL", [])?;
         Ok(Store { conn })
+    }
+
+    /// Makes the replica in `data_dir` a fresh one for the same server,
+    /// for a replica this build cannot read ([`StoreError::unreadable`]):
+    /// the event log, session summaries, cursor, outbox, blob rows, stored
+    /// workdir answers, offered models and device names go, and the
+    /// replica is stamped with this build's `PROTOCOL_VERSION`, so the
+    /// next sync pulls the whole log again. What is this device's stays —
+    /// settings (the server address with them), drafts, composer modes,
+    /// snippets, read marks, local deletes and alerted approvals — as does
+    /// the device identity, which lives beside the database.
+    ///
+    /// A settings row this build cannot read goes, with a warning.
+    ///
+    /// If even that cannot be done in place (the file is damaged, from a
+    /// newer schema, or a kept row does not decode either), the database
+    /// is replaced by a new one holding only the settings rows this build
+    /// can read, built beside it and renamed over it, so a crash leaves
+    /// either the old database or the whole new one. The caller holds the data dir's
+    /// lock and removes the blob files.
+    pub fn reset_replica(data_dir: &Path) -> Result<(), StoreError> {
+        match clear_replica_at(data_dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.unreadable() => {
+                tracing::warn!(%err, "cannot reset the replica in place; creating it again");
+                recreate_replica(data_dir)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Reads back the whole replica state except the event log.
@@ -793,7 +909,9 @@ impl Store {
     /// Returns the blobs its events referenced and the workdir blobs no
     /// other session's answer still names, whose files the caller removes.
     /// Whether the session may go (archived, nothing pending) is the
-    /// caller's rule.
+    /// caller's rule. An event that no longer decodes does not hold the
+    /// session back: it is logged and deleted with the rest, and a blob
+    /// only it named keeps its row until a reset.
     pub fn delete_session_locally(
         &mut self,
         id: SessionId,
@@ -804,11 +922,16 @@ impl Store {
         // The blobs table has no session column: the events say which.
         let mut blobs = Vec::new();
         {
-            let mut stmt = tx.prepare("SELECT event FROM events WHERE session_id = ?1")?;
+            let mut stmt = tx.prepare("SELECT seq, event FROM events WHERE session_id = ?1")?;
             let mut rows = stmt.query([&session])?;
             while let Some(row) = rows.next()? {
-                let event: Event = json_col(row, 0)?;
-                blobs.extend(blob_refs(&event.kind).map(|blob| blob.id));
+                match json_col::<Event>(row, 1) {
+                    Ok(event) => blobs.extend(blob_refs(&event.kind).map(|blob| blob.id)),
+                    Err(error) => {
+                        let seq: i64 = row.get(0)?;
+                        tracing::warn!(seq, %error, "deleting an event that does not decode");
+                    }
+                }
             }
         }
         for blob in &blobs {
@@ -862,8 +985,8 @@ impl Store {
     /// Makes the replica a fresh one for the server at `address`, in one
     /// transaction: the event log, session summaries, cursor, outbox,
     /// stored workdir answers and
-    /// blob rows the old server produced go, as do its device names,
-    /// and so does what this
+    /// blob rows the old server produced go, as do its device names and
+    /// offered models, and so does what this
     /// device kept beside them — drafts, composer modes, read marks, locally
     /// deleted sessions and alerted approvals. Of the settings, the server
     /// address becomes `address` and the old server's shell flag goes;
@@ -877,21 +1000,13 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        clear_replica(&tx)?;
         tx.execute_batch(
-            "DELETE FROM events;
-             DELETE FROM turns;
-             DELETE FROM sessions;
-             UPDATE cursor SET seq = 0 WHERE id = 0;
-             DELETE FROM outbox;
-             DELETE FROM blobs;
-             DELETE FROM drafts;
+            "DELETE FROM drafts;
              DELETE FROM composer_modes;
              DELETE FROM read_marks;
              DELETE FROM deleted_sessions;
-             DELETE FROM alerted_approvals;
-             DELETE FROM devices;
-             DELETE FROM workdir_snapshots;
-             DELETE FROM workdir_blob_refs;",
+             DELETE FROM alerted_approvals;",
         )?;
         // The old server's word on shell commands says nothing of the new.
         tx.execute("DELETE FROM settings WHERE key = ?1", [KEY_SHELL_ENABLED])?;
@@ -1459,24 +1574,7 @@ impl Store {
         while let Some(row) = rows.next()? {
             let key: String = row.get(0)?;
             let value: String = row.get(1)?;
-            match key.as_str() {
-                KEY_BLOB_POLICY => {
-                    settings.blob_policy = match value.as_str() {
-                        "eager" => BlobPolicy::Eager,
-                        "on_demand" => BlobPolicy::OnDemand,
-                        _ => {
-                            return Err(
-                                bad_value(1, Type::Text, format!("blob policy {value:?}")).into()
-                            );
-                        }
-                    }
-                }
-                KEY_SERVER_ADDRESS => settings.server_address = Some(value),
-                KEY_SHELL_ENABLED => settings.shell_enabled = flag(&value, "shell")?,
-                KEY_BYPASS_ALLOWED => settings.bypass_allowed = flag(&value, "bypass")?,
-                // Keys written by a newer build are left alone.
-                _ => {}
-            }
+            settings.read(&key, value)?;
         }
         Ok(settings)
     }
@@ -1535,19 +1633,206 @@ fn flag(value: &str, what: &str) -> Result<bool, StoreError> {
     }
 }
 
-fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+/// Opens the database in `data_dir`, creating both if needed, unmigrated.
+fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
+    fs::create_dir_all(data_dir).map_err(|source| StoreError::DataDir {
+        path: data_dir.to_path_buf(),
+        source,
+    })?;
+    let conn = Connection::open(data_dir.join(DB_FILE))?;
+    // rusqlite's default too; stated so it does not depend on that.
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    // Every user action must survive power loss once dispatch returns.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    Ok(conn)
+}
+
+/// Whether [`migrate`] refuses a replica of another protocol version.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    Check,
+    /// [`Store::reset_replica`], which restamps it once it is cleared.
+    Ignore,
+}
+
+fn migrate(conn: &mut Connection, stamp: Stamp) -> Result<(), StoreError> {
     let tx = conn.transaction()?;
+    migrate_in(&tx, stamp)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`migrate`] inside the caller's transaction, which commits it.
+fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
     let found: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found > SCHEMA_VERSION {
         return Err(StoreError::NewerSchema { found });
+    }
+    // Before any migration reads the stored JSON.
+    if stamp == Stamp::Check && found >= STAMPED_SINCE {
+        match stamped_protocol(tx)? {
+            Some(PROTOCOL_VERSION) => {}
+            Some(found) => {
+                return Err(StoreError::ProtocolMismatch {
+                    found,
+                    current: PROTOCOL_VERSION,
+                });
+            }
+            None => return Err(StoreError::Corrupt("protocol_stamp has no row")),
+        }
     }
     let start = usize::try_from(found).unwrap_or(0);
     for script in &MIGRATIONS[start..] {
         tx.execute_batch(script)?;
     }
+    // A fresh replica, or one from before the stamp, gets this build's.
+    tx.execute(
+        "INSERT OR IGNORE INTO protocol_stamp (id, version) VALUES (1, ?1)",
+        [PROTOCOL_VERSION],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    tx.commit()?;
     Ok(())
+}
+
+fn stamped_protocol(conn: &Connection) -> Result<Option<u32>, StoreError> {
+    Ok(conn
+        .query_row("SELECT version FROM protocol_stamp WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Deletes what the server's log produced: the events and what is folded
+/// from them, the cursor, the outbox, blob rows, stored workdir answers,
+/// offered models and the server's device names. What is this device's
+/// alone is the caller's to keep or drop.
+fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        "DELETE FROM events;
+         DELETE FROM turns;
+         DELETE FROM sessions;
+         UPDATE cursor SET seq = 0 WHERE id = 0;
+         DELETE FROM outbox;
+         DELETE FROM blobs;
+         DELETE FROM devices;
+         DELETE FROM offered_models;
+         DELETE FROM workdir_snapshots;
+         DELETE FROM workdir_blob_refs;",
+    )?;
+    Ok(())
+}
+
+/// [`Store::reset_replica`] in place: migrates the schema without checking
+/// the stamp, then in one transaction clears the replica, drops the
+/// settings rows this build cannot read and restamps it, then reads back
+/// what was kept, so a reset that leaves it unreadable fails.
+fn clear_replica_at(data_dir: &Path) -> Result<(), StoreError> {
+    let mut conn = connect(data_dir)?;
+    migrate(&mut conn, Stamp::Ignore)?;
+    let tx = conn.transaction()?;
+    clear_replica(&tx)?;
+    let mut unreadable = Vec::new();
+    for (rowid, setting) in setting_rows(&tx)? {
+        if setting.is_none() {
+            unreadable.push(rowid);
+        }
+    }
+    for rowid in unreadable {
+        tracing::warn!(rowid, "dropping a setting this build cannot read");
+        tx.execute("DELETE FROM settings WHERE rowid = ?1", [rowid])?;
+    }
+    tx.execute(
+        "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET version = excluded.version",
+        [PROTOCOL_VERSION],
+    )?;
+    tx.commit()?;
+    Store::init(conn)?.load()?;
+    Ok(())
+}
+
+/// A settings row's rowid, with its key and value if this build can read
+/// them ([`Settings::readable`]).
+type SettingRow = (i64, Option<(String, String)>);
+
+/// Every settings row.
+fn setting_rows(conn: &Connection) -> rusqlite::Result<Vec<SettingRow>> {
+    let mut stmt = conn.prepare("SELECT rowid, key, value FROM settings")?;
+    let rows = stmt.query_map([], |row| {
+        let text = |idx| row.get_ref(idx).map(|v| v.as_str().ok().map(str::to_owned));
+        let setting = match (text(1)?, text(2)?) {
+            (Some(key), Some(value)) if Settings::readable(&key, &value) => Some((key, value)),
+            _ => None,
+        };
+        Ok((row.get(0)?, setting))
+    })?;
+    rows.collect()
+}
+
+/// [`Store::reset_replica`] when the replica cannot be reset in place:
+/// builds a new database beside it — schema, stamp and the old settings
+/// this build can read, in one transaction — checks that it loads, and
+/// renames it over [`DB_FILE`]. The old WAL files go just before the
+/// rename, never after, so SQLite never replays old frames into the new
+/// file; a crash before the rename leaves the old database, to reset again.
+fn recreate_replica(data_dir: &Path) -> Result<(), StoreError> {
+    let replace = |path: PathBuf| move |source| StoreError::Replace { path, source };
+    let remove = |path: PathBuf| match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StoreError::Replace { path, source }),
+    };
+    let settings = salvage_settings(data_dir);
+    let fresh = data_dir.join(FRESH_DB_FILE);
+    // Left by a reset that crashed before its rename; its hot journal
+    // first, which SQLite would otherwise roll back into the new file.
+    remove(data_dir.join(FRESH_JOURNAL_FILE))?;
+    remove(fresh.clone())?;
+    {
+        // The default rollback journal: the file stands alone once closed.
+        let mut conn = Connection::open(&fresh)?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = conn.transaction()?;
+        migrate_in(&tx, Stamp::Check)?;
+        for (key, value) in &settings {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Store { conn }.load()?;
+    }
+    for name in WAL_FILES {
+        remove(data_dir.join(name))?;
+    }
+    let db = data_dir.join(DB_FILE);
+    fs::rename(&fresh, &db).map_err(replace(db))?;
+    Ok(())
+}
+
+/// The settings rows of the database in `data_dir` that this build can
+/// read; the rest, or all if the table does not read, are lost.
+fn salvage_settings(data_dir: &Path) -> Vec<(String, String)> {
+    let read = || -> rusqlite::Result<Vec<SettingRow>> {
+        setting_rows(&Connection::open(data_dir.join(DB_FILE))?)
+    };
+    match read() {
+        Ok(rows) => {
+            let lost = rows.iter().filter(|(_, s)| s.is_none()).count();
+            if lost > 0 {
+                tracing::warn!(lost, "dropping settings this build cannot read");
+            }
+            rows.into_iter()
+                .filter_map(|(_, setting)| setting)
+                .collect()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the old settings; they are lost");
+            Vec::new()
+        }
+    }
 }
 
 /// Settles the outbox command `id` as `settled` at `now`, unless it is

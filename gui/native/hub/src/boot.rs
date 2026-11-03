@@ -9,12 +9,12 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use skywave_core::{Core, EngineConfig, ShutdownError, SubscriptionId, ViewState};
+use skywave_core::{Core, CoreError, EngineConfig, ShutdownError, SubscriptionId, ViewState};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::dispatcher::{Dispatched, Dispatcher};
-use crate::signals::Boot;
+use crate::signals::{Boot, BootFailed};
 
 /// The core's data dir under the directory Dart sends.
 pub const DATA_DIR: &str = "skywave";
@@ -37,22 +37,41 @@ pub struct Running {
 }
 
 /// Opens the core in `<boot.dir>/skywave` under the device name Dart sent,
-/// subscribes to its snapshots and starts the dispatcher. The error is the
-/// message Dart shows.
-pub async fn open(boot: Boot) -> Result<Running, String> {
+/// first resetting its replica if Dart asked, subscribes to its snapshots
+/// and starts the dispatcher. The error is what Dart shows.
+pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
+    let failed = |message: String| BootFailed {
+        message,
+        unreadable: false,
+    };
     let slot = CORE_SLOT.lock().await;
     let dir = Path::new(&boot.dir).join(DATA_DIR);
     let config = EngineConfig {
         device_name: Some(boot.device_name),
         ..EngineConfig::default()
     };
-    tracing::info!(dir = %dir.display(), "opening the core");
+    let reset = boot.reset_replica;
+    tracing::info!(dir = %dir.display(), reset, "opening the core");
     // Opening reads SQLite and builds the engine's runtime, which must not
     // be dropped (on failure) on a runtime thread.
-    let core = tokio::task::spawn_blocking(move || Core::open_with(&dir, config))
-        .await
-        .map_err(|err| format!("Opening the data failed: {err}"))?
-        .map_err(|err| format!("Cannot open the data: {err}"))?;
+    let opened = tokio::task::spawn_blocking(move || {
+        if reset {
+            Core::reset_replica(&dir)?;
+        }
+        Core::open_with(&dir, config)
+    })
+    .await
+    .map_err(|err| failed(format!("Opening the data failed: {err}")))?;
+    let core = match opened {
+        Ok(core) => core,
+        Err(err @ CoreError::ReplicaUnreadable { .. }) => {
+            return Err(BootFailed {
+                message: format!("Cannot open the data: {err}"),
+                unreadable: true,
+            });
+        }
+        Err(err) => return Err(failed(format!("Cannot open the data: {err}"))),
+    };
 
     let (results_tx, results) = unbounded_channel();
     let dispatcher = match Dispatcher::start(core.clone(), results_tx) {
@@ -61,7 +80,7 @@ pub async fn open(boot: Boot) -> Result<Running, String> {
             if let Err(close) = shutdown_core(core, SHUTDOWN_TIMEOUT) {
                 tracing::error!("closing the core after a failed boot: {close}");
             }
-            return Err(format!("Cannot start the dispatcher: {err}"));
+            return Err(failed(format!("Cannot start the dispatcher: {err}")));
         }
     };
     let (views_tx, views) = unbounded_channel();
@@ -170,16 +189,20 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn open_then_close_releases_the_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let boot = || Boot {
-            dir: dir.path().display().to_string(),
-            device_name: "test device".into(),
-        };
-        let running = open(boot()).await.unwrap();
+        let running = open(boot_in(dir.path(), false)).await.unwrap();
         assert!(dir.path().join(DATA_DIR).is_dir());
         running.close();
         // A second open (a hot restart's) gets the slot and the same data.
-        let running = open(boot()).await.unwrap();
+        let running = open(boot_in(dir.path(), false)).await.unwrap();
         running.close();
+    }
+
+    fn boot_in(dir: &Path, reset_replica: bool) -> Boot {
+        Boot {
+            dir: dir.display().to_string(),
+            device_name: "test device".into(),
+            reset_replica,
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -187,13 +210,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The data dir's place is taken by a file.
         std::fs::write(dir.path().join(DATA_DIR), b"").unwrap();
-        let err = open(Boot {
-            dir: dir.path().display().to_string(),
-            device_name: "test device".into(),
-        })
-        .await
-        .err()
-        .unwrap();
-        assert!(err.starts_with("Cannot open the data"), "{err}");
+        let err = open(boot_in(dir.path(), false)).await.err().unwrap();
+        assert!(err.message.starts_with("Cannot open the data"), "{err:?}");
+        assert!(!err.unreadable, "a reset would not help");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_data_fails_as_such_until_a_boot_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join(DATA_DIR);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join(skywave_core::store::DB_FILE), b"not sqlite").unwrap();
+        let err = open(boot_in(dir.path(), false)).await.err().unwrap();
+        assert!(err.unreadable, "{err:?}");
+        // A retry alone fails the same way.
+        assert!(
+            open(boot_in(dir.path(), false))
+                .await
+                .err()
+                .unwrap()
+                .unreadable
+        );
+        let running = open(boot_in(dir.path(), true)).await.unwrap();
+        running.close();
     }
 }
