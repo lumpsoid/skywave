@@ -287,7 +287,11 @@ then pushed as a new `ViewState`.
   `Accepted` at its seq; a reply that stays unreadable is settled from the
   log, or failed as undeliverable once the replica has passed the log head
   read after it, so it is never resent into a duplicate. Reconnects back off
-  exponentially with jitter to 30 s, and the wait ends by whichever of the
+  exponentially with jitter to 30 s. The attempt count starts over after a
+  connection that made progress (a pull returned or the server settled a
+  command); `hello` alone is not progress, so a server that answers it and
+  then fails keeps backing off. `offline_since` starts over once `hello`
+  succeeds. The wait ends by whichever of the
   monotonic and wall clocks says first, so a device that slept retries when
   the head says. A revoked device or protocol mismatch is `Rejected`, and
   retries stop until re-pairing. `suspend()` / `resume()` pause the network

@@ -139,14 +139,16 @@ pub enum Link {
     /// against its own clock. Wall time, unlike a monotonic clock, keeps
     /// counting while a device sleeps.
     Reconnecting {
-        /// Failed attempts in this outage, 1 for the first failure.
+        /// Failed connections since the last one that made progress (a
+        /// pull returned or a command was settled), 1 for the first.
         attempt: u32,
         /// When the next attempt is due: the failure plus the backoff
         /// delay, or less after a `RetryNow`. After a sleep the attempt
         /// comes at most [`WALL_CHECK`](crate::WALL_CHECK) after it.
         retry_at: DateTime<Utc>,
-        /// When the link first went down in this outage; kept across
-        /// attempts until a pull succeeds.
+        /// When the link went down in this offline stretch: the first
+        /// failure since `hello` last succeeded, kept across the attempts
+        /// that fail before it.
         offline_since: DateTime<Utc>,
     },
     /// The server refused this device for good; retries stop until the user
