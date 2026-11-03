@@ -159,6 +159,14 @@
 //! cannot outlive the daemon: the agent's request for it lives only in the
 //! agent process (D8).
 //!
+//! **Failure.** An error while following the log (the database full or
+//! gone, say) ends the supervisor: its agent sessions are dropped, which
+//! kills their processes, nothing more is logged, and the error is logged.
+//! [`SupervisorHandle::failed`] then returns, and `serve` stops the daemon
+//! on it and exits non-zero: a daemon without its supervisor would go on
+//! accepting commands no agent hears. The next start settles what it left,
+//! as after a crash.
+//!
 //! **Threading.** SQLite and the mapper block, so the supervisor runs on its
 //! own thread with a current-thread runtime and its own [`Storage`]; agent
 //! sessions (and any tasks their adapter spawns) live on that runtime. All
@@ -223,6 +231,9 @@ impl Default for SupervisorConfig {
 pub struct SupervisorHandle {
     stop: Option<oneshot::Sender<()>>,
     done: oneshot::Receiver<Result<()>>,
+    /// What the supervisor ended with, once [`SupervisorHandle::failed`] has
+    /// seen it.
+    ended: Option<Result<()>>,
 }
 
 impl SupervisorHandle {
@@ -231,7 +242,29 @@ impl SupervisorHandle {
     /// failed earlier.
     pub async fn shutdown(mut self) -> Result<()> {
         drop(self.stop.take());
-        match (&mut self.done).await {
+        match self.ended.take() {
+            Some(result) => result,
+            None => Self::outcome(&mut self.done).await,
+        }
+    }
+
+    /// Returns once the supervisor has stopped on an error (or panicked);
+    /// never while it runs, nor after a clean end. Its agent sessions are
+    /// gone by then, killed with their processes and logging nothing, as at
+    /// a shutdown. [`SupervisorHandle::shutdown`] then returns the error.
+    /// Cancel safe.
+    pub async fn failed(&mut self) {
+        if self.ended.is_none() {
+            let result = Self::outcome(&mut self.done).await;
+            self.ended = Some(result);
+        }
+        if matches!(self.ended, Some(Ok(()))) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn outcome(done: &mut oneshot::Receiver<Result<()>>) -> Result<()> {
+        match done.await {
             Ok(result) => result,
             Err(_) => Err(Error::Supervisor("supervisor thread panicked".into())),
         }
@@ -343,6 +376,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             Ok(Ok(())) => Ok(SupervisorHandle {
                 stop: Some(stop_tx),
                 done: done_rx,
+                ended: None,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::Supervisor("supervisor thread panicked".into())),

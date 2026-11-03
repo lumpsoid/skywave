@@ -329,6 +329,28 @@ impl Fixture {
     }
 
     /// The session's first context, the one it was created with.
+    /// Makes every write of the supervisor's cursor fail as a full disk
+    /// would, for every connection to the database, until
+    /// [`Fixture::disk_has_room`].
+    fn cursor_disk_full(&self) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER disk_full BEFORE UPDATE ON supervisor_cursor
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+    }
+
+    fn disk_has_room(&self) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch("DROP TRIGGER disk_full;")
+            .unwrap();
+    }
+
     fn first(&self) -> ContextId {
         ContextId::first_of(self.session_id)
     }
@@ -3351,4 +3373,98 @@ async fn shell_events_never_reach_the_agent() {
         ),
         "{rest:#?}"
     );
+}
+
+// --- failure ------------------------------------------------------------
+
+#[tokio::test]
+async fn a_supervisor_error_surfaces_and_the_next_start_delivers() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let mut supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("first reply", 1, is_idle).await;
+
+    // The cursor passes a message before the agent gets it: that write
+    // fails, so the supervisor stops on it.
+    f.cursor_disk_full();
+    f.send("two");
+    tokio::time::timeout(WAIT, supervisor.failed())
+        .await
+        .expect("the supervisor's failure surfaces");
+    let error = supervisor.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("disk is full"), "{error}");
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [f.started(false), message("one")],
+        "the failed supervisor never handed the message out"
+    );
+
+    // Its cursor never passed "two": the next start delivers it.
+    f.disk_has_room();
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    f.wait_count("second reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("one"),
+            f.started(true),
+            message("two"),
+            FakeInput::Shutdown,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_running_supervisor_reports_no_failure() {
+    let f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let mut supervisor = f.start(&agent).await;
+    let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
+    assert!(failed.is_err(), "a running supervisor has not failed");
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The daemon stops, non-zero and with the error logged, when its agent
+/// supervisor fails, instead of accepting messages no agent would hear.
+#[tokio::test]
+async fn the_daemon_stops_when_its_supervisor_fails() {
+    let f = Fixture::new();
+    // The session's creation is past the cursor: following it writes the
+    // cursor, which fails.
+    f.cursor_disk_full();
+    let dir = f.data.parent().unwrap();
+    let log_file = dir.join("skywaved.log");
+    let config = dir.join("skywaved.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n",
+            f.data, f.root, log_file
+        ),
+    )
+    .unwrap();
+    let daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_skywaved"))
+        .arg("--config")
+        .arg(&config)
+        .arg("serve")
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(WAIT, daemon)
+        .await
+        .expect("the daemon stops on its own")
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("disk is full"), "{stderr}");
+    let logged = std::fs::read_to_string(&log_file).unwrap();
+    assert!(logged.contains("listening"), "{logged}");
+    assert!(
+        logged.contains("agent supervisor failed; stopping the daemon"),
+        "{logged}"
+    );
+    f.disk_has_room();
 }
