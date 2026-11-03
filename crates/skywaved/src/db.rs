@@ -7,6 +7,11 @@
 //! moves the schema from version `i` to `i + 1`. Append new migrations; never
 //! edit a released one.
 //!
+//! The JSON columns hold wire JSON, which a migration does not rewrite, so
+//! the database is also stamped with the `PROTOCOL_VERSION` that created it
+//! (`protocol_stamp`), and opening one stamped with another version fails
+//! with [`Error::ProtocolMismatch`] before anything reads it.
+//!
 //! Column conventions: ids are hyphenated UUID text, timestamps are RFC 3339
 //! UTC text, `JSON` columns hold the serde_json encoding of the named
 //! `skywave-proto` type.
@@ -14,7 +19,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use skywave_proto::PROTOCOL_VERSION;
 
 use crate::error::{Error, Result};
 
@@ -258,7 +264,20 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (sha256, size)
     ) STRICT;
     "#,
+    // v13: the protocol stamp. The row is written by `migrate`, which knows
+    // `PROTOCOL_VERSION`; a database from before it gets this build's.
+    r#"
+    -- The skywave_proto::PROTOCOL_VERSION whose wire JSON the JSON columns
+    -- hold; one row, set when the database is created and never changed.
+    CREATE TABLE protocol_stamp (
+        id      INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+    ) STRICT;
+    "#,
 ];
+
+/// First schema version with `protocol_stamp`.
+const STAMPED_SINCE: u32 = 13;
 
 /// Schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -282,7 +301,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut db = Db { conn };
-        db.migrate()?;
+        db.migrate(path)?;
         Ok(db)
     }
 
@@ -340,13 +359,23 @@ impl Db {
         Ok(found)
     }
 
-    fn migrate(&mut self) -> Result<()> {
+    /// The protocol version the database was written with
+    /// (`protocol_stamp`); [`Db::open`] refuses any other.
+    pub fn protocol_version(&self) -> Result<u32> {
+        stamped_protocol(&self.conn)?
+            .ok_or_else(|| Error::Corrupt("protocol_stamp has no row".into()))
+    }
+
+    /// Migrates the schema and checks the protocol stamp, before anything
+    /// reads a JSON column: a database written by another protocol version
+    /// is refused untouched, as its stored wire JSON may not parse.
+    fn migrate(&mut self, path: &Path) -> Result<()> {
         // Fast path without a write lock, so admin commands don't contend
         // with a running `serve` once the schema is current.
         let found = user_version(&self.conn)?;
         check_supported(found)?;
         if found == SCHEMA_VERSION {
-            return Ok(());
+            return check_protocol(&self.conn, path);
         }
         // IMMEDIATE takes the write lock up front; re-read the version under
         // it in case another process migrated in between.
@@ -355,10 +384,18 @@ impl Db {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let found = user_version(&tx)?;
         check_supported(found)?;
+        if found >= STAMPED_SINCE {
+            check_protocol(&tx, path)?;
+        }
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
             tracing::info!(from = i, to = i + 1, "migrating database schema");
             tx.execute_batch(sql)?;
         }
+        // A fresh database, or one from before the stamp, gets this build's.
+        tx.execute(
+            "INSERT OR IGNORE INTO protocol_stamp (id, version) VALUES (1, ?1)",
+            [PROTOCOL_VERSION],
+        )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -367,6 +404,31 @@ impl Db {
 
 fn user_version(conn: &Connection) -> Result<u32> {
     Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+}
+
+fn stamped_protocol(conn: &Connection) -> Result<Option<u32>> {
+    Ok(conn
+        .query_row("SELECT version FROM protocol_stamp WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Refuses a database whose stamp is not [`PROTOCOL_VERSION`] (alpha: old
+/// data is not migrated, the operator wipes the data dir).
+fn check_protocol(conn: &Connection, path: &Path) -> Result<()> {
+    match stamped_protocol(conn)? {
+        Some(PROTOCOL_VERSION) => Ok(()),
+        Some(found) => Err(Error::ProtocolMismatch {
+            path: path.to_owned(),
+            found,
+            current: PROTOCOL_VERSION,
+        }),
+        None => Err(Error::Corrupt(format!(
+            "{}: protocol_stamp has no row",
+            path.display()
+        ))),
+    }
 }
 
 fn check_supported(found: u32) -> Result<()> {
@@ -386,7 +448,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 11] = [
+    const TABLES: [&str; 12] = [
         "approvals",
         "blobs",
         "commands",
@@ -394,6 +456,7 @@ mod tests {
         "devices",
         "events",
         "pair_codes",
+        "protocol_stamp",
         "sessions",
         "shell_runs",
         "supervisor_cursor",
@@ -486,6 +549,90 @@ mod tests {
             Db::open(&path),
             Err(Error::SchemaTooNew { found, .. }) if found == SCHEMA_VERSION + 1
         ));
+    }
+
+    #[test]
+    fn fresh_database_records_the_protocol_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        drop(db);
+
+        // The same version reopens, keeping its stamp and its data.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM protocol_stamp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Stamps the database at `path` with protocol `version`.
+    fn restamp(path: &Path, version: u32) {
+        Connection::open(path)
+            .unwrap()
+            .execute("UPDATE protocol_stamp SET version = ?1", [version])
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_a_database_of_another_protocol_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        for other in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            restamp(&path, other);
+            let err = Db::open(&path).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::ProtocolMismatch { path: p, found, current }
+                        if *p == path && *found == other && *current == PROTOCOL_VERSION
+                ),
+                "{err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("delete its data directory"), "{message}");
+            assert!(
+                message.contains(&format!("protocol version {other}")),
+                "{message}"
+            );
+        }
+        // Refused untouched: the stamp is still the other version.
+        let stamp: u32 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT version FROM protocol_stamp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamp, PROTOCOL_VERSION + 1);
+        // Positive control: restamped with this build's version, it opens.
+        restamp(&path, PROTOCOL_VERSION);
+        assert!(Db::open(&path).is_ok());
+    }
+
+    /// A v12 database, from before the stamp, gets this build's protocol
+    /// version: nothing recorded which build wrote it.
+    #[test]
+    fn v13_stamps_a_database_from_before_the_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..12] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 12).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        // One row only.
+        assert!(
+            db.conn()
+                .execute("INSERT INTO protocol_stamp (id, version) VALUES (2, 1)", [])
+                .is_err()
+        );
     }
 
     /// A v6 database, from before session contexts, moves each session into
