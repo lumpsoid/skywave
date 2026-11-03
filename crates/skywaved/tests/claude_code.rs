@@ -2288,6 +2288,32 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
 }
 
 #[tokio::test]
+async fn bytes_that_are_not_utf8_and_an_over_long_line_do_not_end_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("garbage".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(
+        take(&mut events, 3).await,
+        [text("caf\u{fffd}"), text("still here"), COMPLETED]
+    );
+    // The agent is still being read.
+    session.send_message("again".to_owned()).await.unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[tokio::test]
 async fn dropping_the_session_stops_the_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter()

@@ -68,8 +68,14 @@
 //! A CLI that stops reading stdin for the write timeout is killed and
 //! reported as an `Exited` error, so a wedged process cannot block its
 //! session.
+//!
+//! **Output.** stdout is read as raw lines ([`lines`]): bytes that are not
+//! UTF-8 are replaced, and a line over [`lines::MAX_LINE`] is dropped. Either
+//! way the line is stray output, like one that is not JSON, and reading goes
+//! on; only EOF or a read error ends the output.
 
 pub mod display;
+mod lines;
 pub mod protocol;
 pub mod rules;
 pub mod transcripts;
@@ -83,7 +89,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use skywave_proto::{Decision, SessionId};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -91,6 +97,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tracing::Instrument;
 use uuid::Uuid;
 
+use self::lines::{Line, LineReader, MAX_LINE};
 use self::protocol::{Output, Protocol};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
@@ -446,12 +453,20 @@ async fn handshake(
             return Err(error.to_owned());
         }
         match process.stdout.next_line().await {
-            Ok(Some(line)) => out = protocol.on_line(&line),
+            Ok(Some(line)) => out = on_stdout(protocol, line),
             Ok(None) | Err(_) => {
                 let status = process.wait_exit().await;
                 return Err(process.error_text(protocol, status).await);
             }
         }
+    }
+}
+
+/// Translates one stdout line.
+fn on_stdout(protocol: &mut Protocol, line: Line) -> Output {
+    match line {
+        Line::Text(text) => protocol.on_line(&text),
+        Line::TooLong(len) => protocol.on_oversized_line(len),
     }
 }
 
@@ -538,7 +553,7 @@ struct Process {
     child: Child,
     /// `None` once closed.
     stdin: Option<ChildStdin>,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: LineReader<BufReader<ChildStdout>>,
     stderr_task: Option<JoinHandle<()>>,
     /// The last non-blank stderr line.
     stderr_tail: Arc<Mutex<Option<String>>>,
@@ -568,7 +583,7 @@ impl Process {
             group: Group::of(&child),
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout).lines(),
+            stdout: LineReader::new(BufReader::new(stdout), MAX_LINE),
             stderr_task: Some(stderr_task),
             stderr_tail,
             write_timeout,
@@ -695,8 +710,9 @@ impl Process {
 
 /// Logs the agent's stderr lines and keeps the last one.
 async fn read_stderr(stderr: ChildStderr, tail: Arc<Mutex<Option<String>>>) {
-    let mut lines = BufReader::new(stderr).lines();
+    let mut lines = LineReader::new(BufReader::new(stderr), MAX_LINE);
     while let Ok(Some(line)) = lines.next_line().await {
+        let Line::Text(line) = line else { continue };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -723,7 +739,7 @@ impl Driver {
             tokio::select! {
                 line = self.process.stdout.next_line() => match line {
                     Ok(Some(line)) => {
-                        let out = self.protocol.on_line(&line);
+                        let out = on_stdout(&mut self.protocol, line);
                         if !self.apply(out).await {
                             return self.abandon().await;
                         }
@@ -838,7 +854,7 @@ impl Driver {
             }
             match self.process.stdout.next_line().await {
                 Ok(Some(line)) => {
-                    let out = self.protocol.on_line(&line);
+                    let out = on_stdout(&mut self.protocol, line);
                     self.apply(out).await;
                 }
                 Ok(None) | Err(_) => return,

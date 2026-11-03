@@ -670,6 +670,15 @@ impl Protocol {
         }
     }
 
+    /// A stdout line of `len` bytes, too long to keep, went by: stray
+    /// output, like a line that is not JSON.
+    pub fn on_oversized_line(&mut self, len: usize) -> Output {
+        let stray = format!("agent wrote a {len}-byte line, too long to read");
+        tracing::warn!("{stray}");
+        self.stray_output = Some(stray);
+        Output::default()
+    }
+
     /// Translates one stdout message. Unknown types and fields are ignored.
     pub fn on_message(&mut self, message: &Value) -> Output {
         let mut out = Output::default();
