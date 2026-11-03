@@ -287,6 +287,10 @@ impl ClaudeTranscripts {
 }
 
 impl OutsideConversations for ClaudeTranscripts {
+    fn own(&self, db: &crate::db::Db) -> crate::error::Result<HashMap<String, SessionId>> {
+        super::own_conversations(db.conn())
+    }
+
     fn list(
         &self,
         roots: &[PathBuf],

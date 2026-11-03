@@ -100,7 +100,7 @@
 pub mod claude_code;
 pub mod fake;
 pub mod import;
-mod mapper;
+pub(crate) mod mapper;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -514,6 +514,14 @@ pub trait OutsideConversations: Send + Sync + 'static {
     /// The conversation `id` kept for `workdir` (exactly; the caller has
     /// checked it against the roots), as history items, oldest first.
     fn history(&self, workdir: &Path, id: &str, deadline: Instant) -> HistoryRead;
+
+    /// The `own` map [`OutsideConversations::list`] takes, read from the
+    /// contexts' resume handles in `db`: the agent's id of each
+    /// conversation a context runs, with that context's session. Only the
+    /// agent knows what its handles name; by default none is its own.
+    fn own(&self, _db: &Db) -> Result<HashMap<String, SessionId>> {
+        Ok(HashMap::new())
+    }
 }
 
 /// One conversation in a [`Listed`].

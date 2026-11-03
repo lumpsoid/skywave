@@ -106,6 +106,7 @@ version changed. Client and server must match it exactly (checked at
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
+| `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
@@ -133,10 +134,11 @@ version changed. Client and server must match it exactly (checked at
   device unknown or revoked (checked on every request, so a revocation
   applies to an open connection's next request), 400 malformed, 404 unknown
   blob, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
-  `Accepted` and `Rejected` alike, and `/v1/dirs` and `/v1/workdir/*` 200
-  for every result (never 401/403 beyond authentication, which clients read
-  as revoked). `/v1/dirs` and `/v1/workdir/*` answer 503 when they run out
-  of time.
+  `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations` and
+  `/v1/workdir/*` 200 for every result (never 401/403 beyond
+  authentication, which clients read as revoked). `/v1/dirs`,
+  `/v1/conversations` and `/v1/workdir/*` answer 503 when they run out of
+  time.
 
 ## Server
 

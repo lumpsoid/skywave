@@ -19,12 +19,16 @@ use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, ContextId, Event, EventBatch, EventKind,
-    ImportOutcome, ImportedItem, PairRequest, PairResponse, RejectReason, Seq, SessionOrigin, path,
+    Command, CommandId, CommandKind, CommandResult, ContextId, ConversationsResult, Event,
+    EventBatch, EventKind, ImportOutcome, ImportedItem, OutsideConversation, PairRequest,
+    PairResponse, RejectReason, Seq, SessionOrigin, limits, path,
 };
-use skywaved::agent::fake::{FakeOutside, Gate};
+use skywaved::agent::fake::{FakeAgent, FakeOutside, Gate};
 use skywaved::agent::import::{DEADLINE_EVERY, TIMED_OUT};
-use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay};
+use skywaved::agent::{
+    self, AdapterEvent, AgentCallId, HistoryItem, HistoryRead, Listed, ResultDisplay, SourceError,
+};
+use skywaved::api::CONVERSATIONS_TIMEOUT;
 use skywaved::identity::ServerIdentity;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::{EventLog, Storage, pairing};
@@ -59,6 +63,18 @@ impl Fixture {
     }
 
     async fn start_with_deadline(outside: FakeOutside, import_deadline: Duration) -> Fixture {
+        Fixture::start_with(outside, import_deadline, CONVERSATIONS_TIMEOUT).await
+    }
+
+    async fn start_with_listing_timeout(outside: FakeOutside, timeout: Duration) -> Fixture {
+        Fixture::start_with(outside, skywaved::agent::import::IMPORT_DEADLINE, timeout).await
+    }
+
+    async fn start_with(
+        outside: FakeOutside,
+        import_deadline: Duration,
+        conversations_timeout: Duration,
+    ) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
@@ -73,6 +89,7 @@ impl Fixture {
         let options = ServerOptions {
             outside: Arc::new(outside.clone()),
             import_deadline,
+            conversations_timeout,
             ..ServerOptions::default()
         };
         let server = Server::bind_with(
@@ -597,4 +614,154 @@ async fn a_fresh_create_reads_nothing() {
         EventKind::SessionCreated { from: None, .. }
     ));
     assert_eq!(f.outside.history_calls(), 0);
+}
+
+/// An item as the fake source lists it.
+fn listed_item(
+    id: &str,
+    workdir: &str,
+    title: &str,
+    first_prompt: &str,
+) -> agent::OutsideConversation {
+    agent::OutsideConversation {
+        id: id.to_owned(),
+        workdir: workdir.to_owned(),
+        title: Some(title.to_owned()),
+        first_prompt: Some(first_prompt.to_owned()),
+        last_active: "2026-11-01T10:00:00Z".parse().unwrap(),
+        messages: 4,
+        session: None,
+    }
+}
+
+async fn list(device: &mut Client) -> (StatusCode, Option<ConversationsResult>) {
+    let (status, body) = device
+        .send(Method::GET, path::CONVERSATIONS, Bytes::new())
+        .await;
+    let result = (status == StatusCode::OK).then(|| serde_json::from_slice(&body).unwrap());
+    (status, result)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_carries_the_owning_session_and_cuts_the_texts() {
+    let f = Fixture::start(FakeOutside::new()).await;
+    let mut device = f.device().await;
+    device.command(&f.create(&f.workdir, None)).await;
+    let session = device.events().await[0].session_id;
+    // The context runs a conversation of its own once the agent reports
+    // its handle; the fake names that conversation by the context's id.
+    let context = ContextId::first_of(session);
+    agent::store_resume_handle(&f.storage.db, context, &FakeAgent::resume_handle(context)).unwrap();
+    let own_id = context.0.to_string();
+    f.outside.listing(Ok(Listed {
+        conversations: vec![
+            listed_item(
+                &own_id,
+                &f.workdir,
+                &"t".repeat(300),
+                "fix the bug\nin detail",
+            ),
+            listed_item(CONVERSATION, &f.workdir, "short", "hello"),
+        ],
+        truncated: true,
+    }));
+
+    let (status, result) = list(&mut device).await;
+    assert_eq!(status, StatusCode::OK);
+    let wire = |id: &str, title: String, first_prompt: &str, session| OutsideConversation {
+        id: id.to_owned(),
+        workdir: f.workdir.clone(),
+        title: Some(title),
+        first_prompt: Some(first_prompt.to_owned()),
+        last_active: "2026-11-01T10:00:00Z".parse().unwrap(),
+        messages: 4,
+        session,
+    };
+    assert_eq!(
+        result,
+        Some(ConversationsResult::Listed {
+            conversations: vec![
+                wire(
+                    &own_id,
+                    format!("{}…", "t".repeat(limits::TITLE_MAX_CHARS - 1)),
+                    "fix the bug…",
+                    Some(session),
+                ),
+                wire(CONVERSATION, "short".into(), "hello", None),
+            ],
+            truncated: true,
+        })
+    );
+    assert_eq!(f.outside.lists(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_first_prompt_is_cut_to_its_limit() {
+    let f = Fixture::start(FakeOutside::new()).await;
+    let mut device = f.device().await;
+    f.outside.listing(Ok(Listed {
+        conversations: vec![listed_item(CONVERSATION, &f.workdir, "t", &"p".repeat(500))],
+        truncated: false,
+    }));
+    let (_, result) = list(&mut device).await;
+    let Some(ConversationsResult::Listed {
+        conversations,
+        truncated,
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert!(!truncated);
+    let prompt = conversations[0].first_prompt.as_deref().unwrap();
+    assert_eq!(prompt.chars().count(), limits::FIRST_PROMPT_MAX_CHARS);
+    assert!(prompt.ends_with('…'), "{prompt}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unavailable_source_answers_unavailable_and_a_failed_one_500() {
+    let f = Fixture::start(FakeOutside::new()).await;
+    let mut device = f.device().await;
+    f.outside.listing(Err(SourceError::Unavailable));
+    assert_eq!(
+        list(&mut device).await,
+        (StatusCode::OK, Some(ConversationsResult::Unavailable))
+    );
+    f.outside
+        .listing(Err(SourceError::Failed("disk on fire".into())));
+    assert_eq!(
+        list(&mut device).await,
+        (StatusCode::INTERNAL_SERVER_ERROR, None)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_slower_than_the_timeout_is_a_503() {
+    let timeout = Duration::from_millis(300);
+    let f = Fixture::start_with_listing_timeout(FakeOutside::new(), timeout).await;
+    let gate = Gate::new();
+    let _open = OpenOnDrop(gate.clone());
+    f.outside.block_list(gate.clone());
+    let mut device = f.device().await;
+
+    let started = Instant::now();
+    assert_eq!(
+        list(&mut device).await,
+        (StatusCode::SERVICE_UNAVAILABLE, None)
+    );
+    assert!(started.elapsed() >= timeout);
+    assert!(started.elapsed() < SOON);
+    assert_eq!(f.outside.lists(), 1, "the listing was asked and held");
+
+    // Once the source answers again, so does the route.
+    gate.open();
+    assert_eq!(
+        list(&mut device).await,
+        (
+            StatusCode::OK,
+            Some(ConversationsResult::Listed {
+                conversations: vec![],
+                truncated: false,
+            })
+        )
+    );
 }

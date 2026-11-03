@@ -28,6 +28,16 @@
 //! [`DIRS_TIMEOUT`] gets a 503, and the scan, bounded by its cap, finishes
 //! unobserved.
 //!
+//! **Conversations** (`GET /v1/conversations`, D37): the agent's
+//! conversations under the roots, a 200
+//! [`ConversationsResult`](skywave_proto::ConversationsResult) (an agent
+//! that keeps none Skywave can read answers `Unavailable`). One short read
+//! on the API's connection names the conversations Skywave's contexts run
+//! ([`OutsideConversations::own`]); the scan itself runs on a blocking
+//! thread outside it, with a deadline a little shorter than
+//! [`CONVERSATIONS_TIMEOUT`], past which the reply is a 503. Titles and
+//! first prompts are cut to one line of the wire limits.
+//!
 //! **Workdir** (`GET /v1/workdir/changes`, `/v1/workdir/list` and
 //! `/v1/workdir/file`, D36): reads of a session's workdir, every outcome a
 //! 200 [`ChangesResult`](skywave_proto::ChangesResult),
@@ -72,16 +82,17 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, DeviceId, DeviceInfo, DirsQuery,
-    EventsQuery, Fingerprint, HelloResponse, ImportOutcome, PROTOCOL_VERSION, ServerId,
-    WorkdirQuery, check_conversation_id, path,
+    BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
+    DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloResponse, ImportOutcome,
+    PROTOCOL_VERSION, ServerId, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::EventLog;
-use crate::agent::OutsideConversations;
 use crate::agent::import::{self, Prepared};
+use crate::agent::mapper::cut_line;
+use crate::agent::{self, OutsideConversations, SourceError};
 use crate::blobs::BlobStore;
 use crate::db::Db;
 use crate::devices;
@@ -97,6 +108,11 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 pub const TOUCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 /// Longest a `GET /v1/dirs` listing may take before the reply gives up.
 pub const DIRS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest a `GET /v1/conversations` listing may take before the reply
+/// gives up with a 503 (the default of `ServerOptions::conversations_timeout`).
+/// The source's own deadline is [`listing_deadline`] of it, so a slow scan
+/// normally answers `truncated` rather than a 503.
+pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a workdir request may take before the reply gives up with a 503.
 /// Longer than [`workdir::SNAPSHOT_DEADLINE`], which stops the snapshot
 /// itself; this only stops waiting for it.
@@ -129,6 +145,7 @@ pub(crate) struct Api {
     /// What an adopting `CreateSession` imports from.
     outside: Arc<dyn OutsideConversations>,
     import_deadline: Duration,
+    conversations_timeout: Duration,
     /// The adopting creates whose import is being prepared, by command id:
     /// each answers with the command's reply once it has one.
     importing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
@@ -158,6 +175,7 @@ impl Api {
             shutdown,
             outside: options.outside,
             import_deadline: options.import_deadline,
+            conversations_timeout: options.conversations_timeout,
             importing: Mutex::new(HashMap::new()),
         }
     }
@@ -195,6 +213,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::COMMANDS, post(commands))
         .route(path::EVENTS, get(events))
         .route(path::DIRS, get(list_dirs))
+        .route(path::CONVERSATIONS, get(list_conversations))
         .route(path::WORKDIR_CHANGES, get(workdir_changes))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
@@ -469,6 +488,66 @@ async fn list_dirs(
             tracing::warn!("directory listing timed out");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
+    }
+}
+
+/// The source's own deadline for a listing given `timeout`, measured from
+/// the request's start: four fifths of it, which leaves the rest for the
+/// own-ids read and the reply.
+fn listing_deadline(timeout: Duration) -> Duration {
+    timeout * 4 / 5
+}
+
+async fn list_conversations(State(api): State<Arc<Api>>) -> Response {
+    let timeout = api.conversations_timeout;
+    let deadline = Instant::now() + listing_deadline(timeout);
+    let listing = async {
+        let own = api.blocking(|api, db| api.outside.own(db)).await?;
+        // Not `Api::blocking`: a slow file system must not hold the database.
+        let outside = api.outside.clone();
+        let roots = api.log.roots().to_vec();
+        let listed = tokio::task::spawn_blocking(move || {
+            outside.list(&roots, &own, limits::CONVERSATIONS_MAX, deadline)
+        })
+        .await;
+        match listed {
+            Ok(Ok(listed)) => Ok(ConversationsResult::Listed {
+                conversations: listed.conversations.into_iter().map(to_wire).collect(),
+                truncated: listed.truncated,
+            }),
+            Ok(Err(SourceError::Unavailable)) => Ok(ConversationsResult::Unavailable),
+            Ok(Err(e @ SourceError::Failed(_))) => {
+                tracing::error!(error = %e, "conversations listing failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "conversations listing task failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, listing).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(status)) => status.into_response(),
+        Err(_) => {
+            tracing::warn!("conversations listing timed out");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+/// `conversation` as the wire carries it, title and first prompt cut to
+/// one line of their limits.
+fn to_wire(conversation: agent::OutsideConversation) -> skywave_proto::OutsideConversation {
+    let cut = |text: Option<String>, max| text.map(|text| cut_line(&text, max).0);
+    skywave_proto::OutsideConversation {
+        id: conversation.id,
+        workdir: conversation.workdir,
+        title: cut(conversation.title, limits::TITLE_MAX_CHARS),
+        first_prompt: cut(conversation.first_prompt, limits::FIRST_PROMPT_MAX_CHARS),
+        last_active: conversation.last_active,
+        messages: conversation.messages,
+        session: conversation.session,
     }
 }
 
