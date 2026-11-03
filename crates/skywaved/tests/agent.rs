@@ -502,6 +502,9 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
     // A message sent mid-turn is queued for the next turn.
     session.send_message("second".into()).await.unwrap();
     session.interrupt().await.unwrap();
+    // A repeat reaches the agent after the interrupt ended the turn: the
+    // queued message's turn is a later one, and runs on untouched.
+    session.escalate_interrupt().await.unwrap();
     let tail = f.pump(&mut events, &mut mapper, turn_ended).await;
     assert_eq!(tail, [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]);
 

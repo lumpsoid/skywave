@@ -53,6 +53,9 @@
 //!   that point are reported as [`AdapterEvent::ApprovalCancelled`] (or are
 //!   cancelled by the mapper when the turn ends), followed by
 //!   `TurnEnded(Interrupted)`. The session stays usable for the next turn.
+//!   An agent that does not answer an interrupt is stopped by
+//!   [`AgentSession::escalate_interrupt`], the user's repeated interrupt:
+//!   it exits with [`INTERRUPT_UNANSWERED`] as its error, like a crash.
 //! - [`AgentSession::set_permission_mode`], [`AgentSession::set_model`] and
 //!   [`AgentSession::set_effort`] work at any time, mid-turn and with an
 //!   approval pending too. Each request gets exactly one answer, in the
@@ -437,6 +440,10 @@ pub trait AgentAdapter: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(Self::Session, AdapterEvents), AgentError>> + Send;
 }
 
+/// The exit error of an agent stopped by
+/// [`AgentSession::escalate_interrupt`].
+pub const INTERRUPT_UNANSWERED: &str = "agent did not answer the interrupt; stopped it";
+
 /// One running agent session.
 ///
 /// Requests return once the agent has been told; results arrive as
@@ -460,6 +467,15 @@ pub trait AgentSession: Send + 'static {
 
     /// Stops the current turn, if any; a no-op when idle.
     fn interrupt(&mut self) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// The user asked again to stop a turn already interrupted; called only
+    /// after [`AgentSession::interrupt`] for that turn. If the agent has not
+    /// answered that interrupt (the turn has not ended), it is stopped: its
+    /// stream ends with [`AdapterEvent::Exited`] carrying
+    /// [`INTERRUPT_UNANSWERED`], the turn and its approvals left for the
+    /// caller as on a crash. Otherwise it does nothing: a turn running by
+    /// then (a queued message's) is a later one, never interrupted by it.
+    fn escalate_interrupt(&mut self) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Asks the agent to run in `mode`; answered by `PermissionModeSet` or
     /// `PermissionModeRefused`.

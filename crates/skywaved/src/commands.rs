@@ -99,8 +99,12 @@
 //! accepted, not when the agent has actually stopped. The result is then
 //! settled inside the command's transaction like every other command, and
 //! `Accepted { seq }` names the command's own event. The event records that
-//! the turn was interrupted: from that seq the session has no active turn, so
-//! a second `Interrupt` is `NoActiveTurn`. The supervisor (T10) reacts to the
+//! the turn was interrupted: from that seq the session has no active turn.
+//! A second `Interrupt` before the agent ends the turn (the session's
+//! newest state event is still that `TurnInterrupted`) is accepted too and
+//! appends another, stamped with the same context: the supervisor stops an
+//! agent that has not answered the first. Once the turn has ended an
+//! `Interrupt` is `NoActiveTurn`. The supervisor (T10) reacts to the
 //! event by interrupting the agent, cancels approvals the agent abandons
 //! with [`EventLog::cancel_approval`], and appends
 //! `SessionStateChanged(Idle)` once the agent has stopped.
@@ -345,18 +349,17 @@ impl EventLog {
                 (approval.session_id, approval.context, kind)
             }
             CommandKind::Interrupt { session_id } => {
-                let session = match known(*session_id)? {
+                let context = match known(*session_id)? {
                     None => return Ok(Err(RejectReason::UnknownSession)),
-                    Some(session) if !session.turn_active => {
-                        return Ok(Err(RejectReason::NoActiveTurn));
-                    }
-                    Some(session) => session,
+                    Some(session) if session.turn_active => session.running_turn_context(),
+                    // Interrupted, and the agent has not ended the turn
+                    // yet: a repeat, stamped like the first.
+                    Some(_) => match event_log::last_state_event_in(tx, *session_id)? {
+                        Some((EventKind::TurnInterrupted, context)) => context,
+                        _ => return Ok(Err(RejectReason::NoActiveTurn)),
+                    },
                 };
-                (
-                    *session_id,
-                    session.running_turn_context(),
-                    EventKind::TurnInterrupted,
-                )
+                (*session_id, context, EventKind::TurnInterrupted)
             }
             CommandKind::ClearContext {
                 session_id,

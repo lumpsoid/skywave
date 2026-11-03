@@ -25,7 +25,14 @@
 //!   turn began before the interrupt. The agent then reports
 //!   `TurnEnded(Interrupted)` and the mapper cancels leftover approvals and
 //!   appends `SessionStateChanged(Idle)`. An interrupt aimed at an earlier
-//!   turn (that already ended) is ignored, so it can't stop a later one.
+//!   turn (that already ended) is ignored, so it can't stop a later one. A
+//!   further `TurnInterrupted` for a turn already handed an interrupt
+//!   (command handling accepts one until the turn ends) goes out as
+//!   [`AgentSession::escalate_interrupt`]: an agent that has not answered
+//!   the first is stopped and exits with
+//!   [`INTERRUPT_UNANSWERED`](crate::agent::INTERRUPT_UNANSWERED), which the
+//!   mapper logs as `Errored` like any crash; the next `UserMessage`
+//!   resumes it.
 //! - `SessionStopped` → [`AgentSession::interrupt`] if a turn runs or a
 //!   delivered message's turn has not ended, then
 //!   [`AgentSession::shutdown`]. The agent reports `TurnEnded(Interrupted)`
@@ -203,7 +210,7 @@ use crate::agent::{
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::event_log::parse_id;
+use crate::event_log::{self, parse_id};
 use crate::{EventLog, Storage};
 
 /// Reason of the `ApprovalCancelled` appended on daemon start (architecture.md "Server").
@@ -308,6 +315,9 @@ struct Running<S> {
     /// Seq of the `SessionStateChanged(AgentWorking)` that opened the current
     /// turn; `None` between turns.
     turn_started: Option<Seq>,
+    /// The current turn was already handed an interrupt: a later
+    /// `TurnInterrupted` escalates. Cleared when the turn ends.
+    interrupted: bool,
     /// Messages delivered whose turn has not ended yet.
     owed_turns: usize,
     /// The live background tasks the agent last reported that are not
@@ -417,7 +427,8 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
             // Settled in the context of the turn it settles, which a switch
             // logged after it does not change.
-            let Some((kind, context)) = last_state_event(db, session.id)? else {
+            let Some((kind, context)) = event_log::last_state_event_in(db.conn(), session.id)?
+            else {
                 continue;
             };
             let settle = match kind {
@@ -587,9 +598,18 @@ impl<A: AgentAdapter> Supervisor<A> {
                 let Some(running) = self.running.get_mut(&session_id) else {
                     return Ok(());
                 };
-                if running.turn_started.is_some_and(|started| started < seq)
-                    && let Err(error) = running.session.interrupt().await
-                {
+                // Aimed at an earlier turn, or before this one began.
+                if running.turn_started.is_none_or(|started| started >= seq) {
+                    return Ok(());
+                }
+                let sent = if running.interrupted {
+                    tracing::info!(session = %session_id.0, "interrupted again; escalating");
+                    running.session.escalate_interrupt().await
+                } else {
+                    running.interrupted = true;
+                    running.session.interrupt().await
+                };
+                if let Err(error) = sent {
                     tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
                 }
             }
@@ -944,6 +964,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                     events,
                     mapper,
                     turn_started: None,
+                    interrupted: false,
                     owed_turns: 0,
                     busy_tasks: 0,
                     idle_since: None,
@@ -1004,9 +1025,11 @@ impl<A: AgentAdapter> Supervisor<A> {
         let seqs = running.mapper.apply(&self.log, &mut self.storage, event)?;
         if started && let Some(&seq) = seqs.first() {
             running.turn_started = Some(seq);
+            running.interrupted = false;
         }
         if ended {
             running.turn_started = None;
+            running.interrupted = false;
             running.owed_turns = running.owed_turns.saturating_sub(1);
         }
         // A turn the agent started on its own is work too, as is a task.
@@ -1247,24 +1270,6 @@ async fn sleep_until(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
-}
-
-/// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
-/// the context it is stamped with.
-fn last_state_event(db: &Db, session_id: SessionId) -> Result<Option<(EventKind, ContextId)>> {
-    let row: Option<(String, String)> = db
-        .conn()
-        .prepare_cached(
-            "SELECT kind, context FROM events WHERE session_id = ?1 \
-             AND json_extract(kind, '$.type') IN ('session_state_changed', 'turn_interrupted') \
-             ORDER BY seq DESC LIMIT 1",
-        )?
-        .query_row([session_id.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((kind, context)) = row else {
-        return Ok(None);
-    };
-    Ok(Some((serde_json::from_str(&kind)?, parse_id(&context)?)))
 }
 
 /// The context of the session's newest `BackgroundTasksChanged` or

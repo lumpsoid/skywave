@@ -18,9 +18,9 @@ use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{ALLOW_BYPASS_ARG, ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
-    AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
-    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, ToolDisplay,
-    ToolKind, TurnOutcome, TurnUsage,
+    AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants,
+    INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
+    RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -2599,6 +2599,116 @@ async fn a_kill_reports_what_the_agent_says_as_it_stops() {
     assert_eq!(*call, Some(CALL.into()));
     assert!(result.is_error);
     assert_eq!(result.output, "Exit code 137");
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("stuck".to_owned()).await.unwrap();
+    let id = handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    let pid = fake_pid(tmp.path());
+
+    // The first interrupt reaches the CLI, which ignores it: the turn
+    // stays open.
+    session.interrupt().await.unwrap();
+    assert_eq!(next(&mut events).await, text("ignored"));
+    // The second is not sent again, it stops the agent, reporting why.
+    session.escalate_interrupt().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited {
+            error: Some(INTERRUPT_UNANSWERED.to_owned())
+        }
+    );
+    assert!(events.recv().await.is_none());
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    assert!(matches!(
+        session.send_message("anyone?".to_owned()).await,
+        Err(AgentError::Closed)
+    ));
+
+    // The conversation resumes as after any crash.
+    let (mut session, mut events) = adapter()
+        .start(spec(
+            tmp.path(),
+            Conversation::Resume(protocol::resume_handle(id)),
+        ))
+        .await
+        .unwrap();
+    session
+        .send_message("hello again".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+    );
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_interrupt_after_the_answer_does_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    // Answered, and the session idle: the repeat keeps it.
+    session.send_message("hang".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    session.interrupt().await.unwrap();
+    assert_eq!(next(&mut events).await, INTERRUPTED);
+    session.escalate_interrupt().await.unwrap();
+    session
+        .send_message("still there?".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited { error: None }
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_interrupt_leaves_the_turn_a_queued_message_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("hang".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    // Queued behind the running turn; its result starts this one, which
+    // ignores interrupts.
+    session.send_message("stuck".to_owned()).await.unwrap();
+    session.interrupt().await.unwrap();
+    assert_eq!(
+        take(&mut events, 3).await,
+        [INTERRUPTED, AdapterEvent::TurnStarted, text("working")]
+    );
+    // The repeat of the answered interrupt reaches the new turn: neither
+    // stopped nor interrupted. Were it interrupted, the shutdown would wait
+    // for its result, reading the CLI's "ignored" first; untouched, the
+    // turn is abandoned and the CLI killed at once.
+    session.escalate_interrupt().await.unwrap();
+    session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
         AdapterEvent::Exited { error: None }

@@ -510,6 +510,9 @@ pub enum FakeInput {
     /// An answer and the rule it grants, if any.
     Answer(AgentRequestId, Decision, Option<u8>),
     Interrupt,
+    /// A repeated interrupt. The fake answers every interrupt as it comes,
+    /// so it never finds one unanswered: this does nothing.
+    EscalateInterrupt,
     SetPermissionMode(PermissionMode),
     SetModel(String),
     SetEffort(Effort),
@@ -748,6 +751,10 @@ impl AgentSession for FakeSession {
         self.request(FakeInput::Interrupt)
     }
 
+    async fn escalate_interrupt(&mut self) -> Result<(), AgentError> {
+        self.request(FakeInput::EscalateInterrupt)
+    }
+
     async fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), AgentError> {
         let answer = self.script.answer_mode(mode);
         self.answer(FakeInput::SetPermissionMode(mode), answer)
@@ -897,6 +904,7 @@ impl Runner {
                         // Idle: nothing to interrupt or answer.
                         Some(
                             FakeInput::Interrupt
+                            | FakeInput::EscalateInterrupt
                             | FakeInput::Answer(..)
                             | FakeInput::Started { .. }
                             | FakeInput::SetPermissionMode(_)
@@ -1099,7 +1107,10 @@ impl Runner {
                 Ok(())
             }
             Some(
-                FakeInput::Answer(..)
+                // The interrupt it repeats came first and ended its turn:
+                // this turn is a later one.
+                FakeInput::EscalateInterrupt
+                | FakeInput::Answer(..)
                 | FakeInput::Started { .. }
                 | FakeInput::SetPermissionMode(_)
                 | FakeInput::SetModel(_)

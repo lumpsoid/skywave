@@ -987,6 +987,26 @@ pub(crate) fn session_in(conn: &Connection, id: SessionId) -> Result<Option<Sess
     .transpose()
 }
 
+/// The session's newest `SessionStateChanged` or `TurnInterrupted`, with
+/// the context it is stamped with.
+pub(crate) fn last_state_event_in(
+    conn: &Connection,
+    session_id: SessionId,
+) -> Result<Option<(EventKind, ContextId)>> {
+    let row: Option<(String, String)> = conn
+        .prepare_cached(
+            "SELECT kind, context FROM events WHERE session_id = ?1 \
+             AND json_extract(kind, '$.type') IN ('session_state_changed', 'turn_interrupted') \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([session_id.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((kind, context)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((serde_json::from_str(&kind)?, parse_id(&context)?)))
+}
+
 /// A `sessions` row's columns before its ids are parsed.
 struct SessionRow {
     workdir: String,
