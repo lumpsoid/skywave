@@ -18,6 +18,7 @@ use crate::action::Action;
 use crate::blobs::remove_blob_files;
 use crate::engine::{Engine, EngineConfig};
 use crate::identity::{FileIdentity, IdentityError};
+use crate::lock::{DataDirLock, LockError};
 use crate::model::{Effect, Model, Paired};
 use crate::seam::{Request, Seam};
 use crate::store::{Store, StoreError};
@@ -29,6 +30,9 @@ pub enum CoreError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    /// The data dir is locked, most likely by another client using it.
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("cannot start the sync engine: {0}")]
     Runtime(std::io::Error),
     /// The device paired with another server since this engine-side
@@ -77,6 +81,8 @@ pub(crate) struct Shared {
     /// A detached core's receiver, for [`Seam::take_requests`].
     pub(crate) request_rx: Mutex<Option<Receiver<Request>>>,
     delivery: Delivery,
+    /// Last, so it is released only once the store above has closed.
+    _lock: DataDirLock,
 }
 
 /// Where requests go: to the engine, or to whoever took the receiver.
@@ -438,6 +444,7 @@ impl Shared {
         requests: Requests,
         request_rx: Option<Receiver<Request>>,
     ) -> Result<Arc<Shared>, CoreError> {
+        let lock = DataDirLock::take(data_dir)?;
         let store = Store::open(data_dir)?;
         let identity = FileIdentity::load(data_dir)?.map(Arc::new);
         let model = Model::new(store.load()?, identity.as_deref().map(Paired::of));
@@ -454,6 +461,7 @@ impl Shared {
             requests,
             request_rx: Mutex::new(request_rx),
             delivery: Delivery::default(),
+            _lock: lock,
         }))
     }
 

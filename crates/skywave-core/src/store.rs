@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -30,6 +31,9 @@ use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// File name of the database inside the core's data directory.
 pub const DB_FILE: &str = "core.db";
+
+/// How long a statement waits for SQLite's own lock before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema migrations; entry `i` moves the schema from version `i` to `i + 1`.
 /// The schema version is SQLite's `user_version`.
@@ -555,6 +559,10 @@ impl Store {
     /// Opens (creating if needed) the replica in `data_dir` and migrates it
     /// to the current schema.
     ///
+    /// Takes no lock: the [`Core`](crate::Core) holds the data dir's
+    /// ([`LOCK_FILE`](crate::lock::LOCK_FILE)). A bare store beside a live
+    /// core is for inspecting the replica (tests).
+    ///
     /// Commands left in `Sending` by a previous run go back to `Queued`:
     /// nothing is in flight after a restart, and the server dedups the
     /// resend (D7). Their `tries` are kept: they may have gone out.
@@ -564,6 +572,8 @@ impl Store {
             source,
         })?;
         let conn = Connection::open(data_dir.join(DB_FILE))?;
+        // rusqlite's default too; stated so it does not depend on that.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         // Every user action must survive power loss once dispatch returns.
         conn.pragma_update(None, "synchronous", "FULL")?;

@@ -72,8 +72,15 @@ impl Harness {
     /// Drops the core and the TUI without quitting, as a crash does, and
     /// starts both again over the same data.
     fn restart(self) -> Harness {
-        let Harness { dir, core, app, .. } = self;
-        drop((core, app));
+        let Harness {
+            dir,
+            core,
+            seam,
+            app,
+            ..
+        } = self;
+        // The seam holds the core too: only the last handle frees the dir.
+        drop((core, seam, app));
         Harness::open(dir)
     }
 
