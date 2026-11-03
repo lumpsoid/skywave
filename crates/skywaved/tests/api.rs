@@ -18,10 +18,11 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
-    DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody,
-    FileChange, FileResult, HelloResponse, ImportOutcome, ListResult, PROTOCOL_VERSION,
-    PairRequest, PairResponse, RejectReason, Seq, SessionId, SessionOrigin, path,
+    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
+    ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind,
+    EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse, ImportOutcome,
+    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId,
+    SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -352,6 +353,7 @@ async fn without_a_client_cert_only_pairing_answers() {
         (Method::GET, path::HELLO),
         (Method::POST, path::COMMANDS),
         (Method::GET, "/v1/events?after=0"),
+        (Method::GET, path::CONVERSATIONS),
         (Method::GET, blob.as_str()),
     ] {
         let reply = anon.send(method.clone(), uri, &[], Bytes::new()).await;
@@ -860,6 +862,20 @@ async fn dirs_answers_every_outcome_with_200() {
     // Like every authenticated route, it needs a certificate.
     let mut anon = f.anonymous().await;
     assert_eq!(anon.get(path::DIRS).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// The default server's agent keeps no conversations it can read.
+#[tokio::test(flavor = "multi_thread")]
+async fn conversations_are_unavailable_without_a_source() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let reply = device.get(path::CONVERSATIONS).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.json::<ConversationsResult>(),
+        ConversationsResult::Unavailable
+    );
 }
 
 /// `route?session=..&path=..`, with `path` percent-escaped.

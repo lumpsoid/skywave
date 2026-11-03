@@ -49,7 +49,7 @@ use tower::Service;
 use crate::EventLog;
 use crate::agent::import::IMPORT_DEADLINE;
 use crate::agent::{NoOutsideConversations, OutsideConversations};
-use crate::api::{self, Api, PeerCert};
+use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, PeerCert};
 use crate::blobs::BlobStore;
 use crate::data_dir::DataDir;
 use crate::db::Db;
@@ -68,14 +68,19 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// What a server reads besides its data dir. The default runs git from
 /// `PATH`, reads no outside conversations and imports within
-/// [`IMPORT_DEADLINE`].
+/// [`IMPORT_DEADLINE`], and gives a conversations listing
+/// [`CONVERSATIONS_TIMEOUT`].
 pub struct ServerOptions {
     /// How workdir changes run git.
     pub git: Git,
-    /// Where an adopting `CreateSession` reads the conversation's history.
+    /// What `GET /v1/conversations` lists and where an adopting
+    /// `CreateSession` reads the conversation's history.
     pub outside: Arc<dyn OutsideConversations>,
     /// How long such an import may take; tests shorten it.
     pub import_deadline: Duration,
+    /// How long a conversations listing may take before the reply is a
+    /// 503; tests shorten it.
+    pub conversations_timeout: Duration,
 }
 
 impl Default for ServerOptions {
@@ -84,6 +89,7 @@ impl Default for ServerOptions {
             git: Git::default(),
             outside: Arc::new(NoOutsideConversations),
             import_deadline: IMPORT_DEADLINE,
+            conversations_timeout: CONVERSATIONS_TIMEOUT,
         }
     }
 }

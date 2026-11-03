@@ -1120,7 +1120,12 @@ impl Runner {
 /// `NotFound`. [`FakeOutside::block_history`] holds every history read
 /// until its gate opens; [`FakeOutside::history_entered`] opens once a read
 /// has begun, so a test knows one is in flight. Reads are counted
-/// ([`FakeOutside::history_calls`]).
+/// ([`FakeOutside::history_calls`]). [`FakeOutside::block_list`] holds
+/// listings the same way.
+///
+/// [`FakeOutside::own`] reads the handles [`FakeAgent`] reports: a context
+/// holding [`FakeAgent::resume_handle`] runs the conversation whose id is
+/// that context's id.
 #[derive(Debug, Clone, Default)]
 pub struct FakeOutside {
     state: Arc<Mutex<OutsideState>>,
@@ -1132,6 +1137,7 @@ struct OutsideState {
     listing: Option<std::result::Result<Listed, SourceError>>,
     histories: HashMap<(PathBuf, String), HistoryRead>,
     block: Option<Gate>,
+    block_list: Option<Gate>,
     history_calls: usize,
     lists: usize,
 }
@@ -1161,6 +1167,12 @@ impl FakeOutside {
         self
     }
 
+    /// Holds every later listing until `gate` opens.
+    pub fn block_list(&self, gate: Gate) -> &FakeOutside {
+        lock(&self.state).block_list = Some(gate);
+        self
+    }
+
     /// Opens once a history read has begun (before any block).
     pub fn history_entered(&self) -> Gate {
         self.entered.clone()
@@ -1185,8 +1197,15 @@ impl OutsideConversations for FakeOutside {
         max: usize,
         _deadline: std::time::Instant,
     ) -> std::result::Result<Listed, SourceError> {
-        let mut state = lock(&self.state);
-        state.lists += 1;
+        let block = {
+            let mut state = lock(&self.state);
+            state.lists += 1;
+            state.block_list.clone()
+        };
+        if let Some(gate) = block {
+            gate.wait_blocking();
+        }
+        let state = lock(&self.state);
         let mut listed = state.listing.clone().unwrap_or(Ok(Listed::default()))?;
         if listed.conversations.len() > max {
             listed.conversations.truncate(max);
@@ -1196,6 +1215,24 @@ impl OutsideConversations for FakeOutside {
             conversation.session = own.get(&conversation.id).copied();
         }
         Ok(listed)
+    }
+
+    fn own(&self, db: &crate::db::Db) -> crate::error::Result<HashMap<String, SessionId>> {
+        let mut statement = db.conn().prepare_cached(
+            "SELECT session_id, agent_state FROM contexts
+             WHERE agent_state IS NOT NULL AND moved_to IS NULL",
+        )?;
+        let rows =
+            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut own = HashMap::new();
+        for row in rows {
+            let (session, state) = row?;
+            let handle = ResumeHandle(serde_json::from_str(&state)?);
+            if let Some(context) = FakeAgent::handle_context(&handle) {
+                own.insert(context.0.to_string(), crate::event_log::parse_id(&session)?);
+            }
+        }
+        Ok(own)
     }
 
     fn history(&self, workdir: &Path, id: &str, _deadline: std::time::Instant) -> HistoryRead {
