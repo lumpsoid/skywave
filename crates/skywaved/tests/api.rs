@@ -1,6 +1,6 @@
 //! The mTLS HTTPS API (T06), over real TLS on 127.0.0.1.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,12 +26,13 @@ use skywave_proto::{
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
-use skywaved::server::Server;
+use skywaved::server::{ConnectionLimits, Server, ServerOptions};
 use skywaved::workdir::Git;
 use skywaved::{EventLog, Storage, devices, pairing};
 use tempfile::TempDir;
-use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
@@ -63,20 +64,25 @@ impl Fixture {
 
     /// [`Fixture::start`] with shell commands on or off.
     async fn start_with_shell(shell: bool) -> Fixture {
-        Fixture::start_with(shell, false, isolated_git()).await
+        Fixture::start_with(shell, false, isolated_git(), ConnectionLimits::DEFAULT).await
     }
 
     /// [`Fixture::start`] with bypass mode allowed or not.
     async fn start_with_bypass(bypass: bool) -> Fixture {
-        Fixture::start_with(false, bypass, isolated_git()).await
+        Fixture::start_with(false, bypass, isolated_git(), ConnectionLimits::DEFAULT).await
     }
 
     /// [`Fixture::start`] with workdir changes running git as `git` says.
     async fn start_with_git(git: Git) -> Fixture {
-        Fixture::start_with(false, false, git).await
+        Fixture::start_with(false, false, git, ConnectionLimits::DEFAULT).await
     }
 
-    async fn start_with(shell: bool, bypass: bool, git: Git) -> Fixture {
+    /// [`Fixture::start`] with connection limits `limits`.
+    async fn start_with_limits(limits: ConnectionLimits) -> Fixture {
+        Fixture::start_with(false, false, isolated_git(), limits).await
+    }
+
+    async fn start_with(shell: bool, bypass: bool, git: Git, limits: ConnectionLimits) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
@@ -87,12 +93,17 @@ impl Fixture {
             .unwrap()
             .with_shell(shell)
             .with_bypass(bypass);
-        let server = Server::bind_with_git(
+        let options = ServerOptions {
+            git,
+            limits,
+            ..ServerOptions::default()
+        };
+        let server = Server::bind_with(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log.clone(),
-            git,
+            options,
         )
         .await
         .unwrap();
@@ -1197,4 +1208,413 @@ async fn a_long_workdir_changes_does_not_block_hello() {
         "{:?}",
         reply.body
     );
+}
+
+/// A TLS connection to `f` from the loopback address `local`, with `creds`
+/// if given, and a small receive buffer when `small_window`.
+async fn tls_from(
+    f: &Fixture,
+    local: Ipv4Addr,
+    creds: Option<&Credentials>,
+    small_window: bool,
+) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let socket = TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((local, 0)))?;
+    if small_window {
+        socket.set_recv_buffer_size(4096)?;
+    }
+    let tcp = socket.connect(f.addr).await?;
+    let config = client_config(f.identity.ca_cert_der(), creds);
+    TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+}
+
+/// Whether a TLS connection from `local` gets through the handshake, decided
+/// within [`SOON`]. A connection over a cap is closed before TLS, so its
+/// handshake fails.
+async fn admitted(f: &Fixture, local: Ipv4Addr) -> bool {
+    tokio::time::timeout(SOON, tls_from(f, local, None, false))
+        .await
+        .expect("the handshake ends promptly either way")
+        .is_ok()
+}
+
+const LOCAL: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_past_the_cap_are_closed_until_one_ends() {
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        max_connections: 2,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    // One connection that never starts TLS, one served: both under the cap.
+    let idle = TcpStream::connect(f.addr).await.unwrap();
+    let mut served = f.anonymous().await;
+    assert_eq!(
+        served.get(path::HELLO).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    assert!(!admitted(&f, LOCAL).await, "a third connection is closed");
+    assert_eq!(
+        served.get(path::HELLO).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the admitted ones are still served"
+    );
+
+    // Closing one gives its place back once the server sees the close,
+    // which this side cannot observe: retry until then.
+    drop(idle);
+    let started = Instant::now();
+    while !admitted(&f, LOCAL).await {
+        assert!(
+            started.elapsed() < SOON,
+            "the closed connection's place came back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_address_past_its_cap_does_not_shut_out_another() {
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        max_per_ip: 1,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let _held = tls_from(&f, LOCAL, None, false).await.unwrap();
+    assert!(!admitted(&f, LOCAL).await, "a second from the same address");
+    // Linux routes all of 127.0.0.0/8 to loopback.
+    assert!(
+        admitted(&f, Ipv4Addr::new(127, 0, 0, 2)).await,
+        "another address"
+    );
+}
+
+/// Starts `POST /v1/pair` on a new anonymous connection with a body sent
+/// chunk by chunk through the returned sender; the request's status (or
+/// error) arrives on the returned task.
+async fn post_pair_streamed(
+    f: &Fixture,
+) -> (
+    mpsc::UnboundedSender<Bytes>,
+    JoinHandle<hyper::Result<StatusCode>>,
+) {
+    let tls = tls_from(f, LOCAL, None, false).await.unwrap();
+    let (mut sender, conn) = http1::handshake(TokioIo::new(tls)).await.unwrap();
+    tokio::spawn(conn);
+    let (chunks, rx) = mpsc::unbounded_channel::<Bytes>();
+    let frames = futures_util::stream::unfold(rx, |mut rx| async move {
+        let chunk = rx.recv().await?;
+        Some((
+            Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(chunk)),
+            rx,
+        ))
+    });
+    let req = Request::post(path::PAIR)
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(http_body_util::StreamBody::new(frames))
+        .unwrap();
+    let reply = tokio::spawn(async move { Ok(sender.send_request(req).await?.status()) });
+    (chunks, reply)
+}
+
+fn pair_request(f: &Fixture) -> Bytes {
+    let issued =
+        pairing::issue_code(f.storage.db.conn(), Utc::now(), pairing::DEFAULT_TTL).unwrap();
+    let key = KeyPair::generate().unwrap();
+    json(&PairRequest {
+        code: issued.code.to_string(),
+        csr_pem: CertificateParams::default()
+            .serialize_request(&key)
+            .unwrap()
+            .pem()
+            .unwrap(),
+        device_name: "trickle".into(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_body_that_stops_arriving_fails() {
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        body_stall: Duration::from_millis(200),
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let body = pair_request(&f);
+    let (chunks, reply) = post_pair_streamed(&f).await;
+    chunks.send(body.slice(..10)).unwrap();
+    // `chunks` stays open: the rest never comes.
+    let status = tokio::time::timeout(SOON, reply)
+        .await
+        .expect("a stalled body ends the request")
+        .unwrap();
+    // 408, which a device retries, not the 400 the JSON extractor makes of
+    // a failed body, which it takes as final.
+    assert_eq!(status.unwrap(), StatusCode::REQUEST_TIMEOUT);
+    drop(chunks);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_body_that_keeps_arriving_has_no_deadline() {
+    let stall = Duration::from_secs(2);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        body_stall: stall,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let body = pair_request(&f);
+    let (chunks, reply) = post_pair_streamed(&f).await;
+    // Six chunks a quarter of the stall apart: longer than the stall in
+    // total, never stalled.
+    let started = Instant::now();
+    let step = body.len().div_ceil(6);
+    for start in (0..body.len()).step_by(step) {
+        if start > 0 {
+            tokio::time::sleep(stall / 4).await;
+        }
+        chunks
+            .send(body.slice(start..(start + step).min(body.len())))
+            .unwrap();
+    }
+    drop(chunks);
+    let status = tokio::time::timeout(SOON, reply).await.unwrap().unwrap();
+    assert_eq!(status.unwrap(), StatusCode::OK);
+    assert!(
+        started.elapsed() > stall,
+        "the body took longer than the stall"
+    );
+}
+
+/// Downloads `uri` with `creds` over a connection with a small receive
+/// window, reading nothing for `pause` first; how many bytes arrive before
+/// the connection ends.
+async fn download_after(f: &Fixture, creds: &Credentials, uri: &str, pause: Duration) -> usize {
+    let mut tls = tls_from(f, LOCAL, Some(creds), true).await.unwrap();
+    let request = format!("GET {uri} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(pause).await;
+    let mut received = 0;
+    let mut buf = vec![0; 64 * 1024];
+    let read_all = async {
+        // A closed connection may end in an error rather than a clean EOF.
+        while let Ok(n @ 1..) = tls.read(&mut buf).await {
+            received += n;
+        }
+    };
+    tokio::time::timeout(SOON, read_all)
+        .await
+        .expect("the download ends");
+    received
+}
+
+/// Stores `size` bytes as a blob; its content and download URI.
+fn put_blob(f: &Fixture, size: usize) -> (Vec<u8>, String) {
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let blob = BlobStore::new(f.storage.dir.blobs_dir())
+        .put(f.storage.db.conn(), &content[..])
+        .unwrap();
+    (content, path::blob(blob.id))
+}
+
+/// `TCP_USER_TIMEOUT` is Linux's: elsewhere a peer that stops taking data
+/// is only dropped by the OS's own retransmission limit.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_stops_reading_loses_the_connection() {
+    let unacked = Duration::from_millis(200);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        unacked_timeout: unacked,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let creds = f.pair().await;
+    // Far more than the socket buffers on both sides hold.
+    let size = 32 << 20;
+    let (_, uri) = put_blob(&f, size);
+
+    // Read at once, the whole blob arrives.
+    let whole = download_after(&f, &creds, &uri, Duration::ZERO).await;
+    assert!(whole > size, "{whole} bytes for a {size} byte blob");
+    // Read nothing for long enough that the server's zero-window probes
+    // (which back off from the 200 ms minimum retransmission timeout) pass
+    // the limit: the server gives up.
+    let cut = download_after(&f, &creds, &uri, Duration::from_secs(3)).await;
+    assert!(cut < size, "{cut} bytes for a {size} byte blob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_download_outlasts_the_idle_and_unacked_limits_on_a_kept_connection() {
+    let idle = Duration::from_millis(300);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        idle_timeout: idle,
+        unacked_timeout: Duration::from_millis(200),
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let creds = f.pair().await;
+    // More than hyper's write buffer holds, so the response is fully
+    // encoded long before a slow reader has taken it.
+    let size = 1 << 20;
+    let (content, uri) = put_blob(&f, size);
+
+    // A small receive window and small reads keep the rest waiting on the
+    // server, not in a client-side buffer: once the last byte is read, the
+    // server has just sent it. Raw HTTP, so the request keeps the
+    // connection alive.
+    let mut tls = tls_from(&f, LOCAL, Some(&creds), true).await.unwrap();
+    let get = |uri: &str| format!("GET {uri} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let started = Instant::now();
+    tls.write_all(get(&uri).as_bytes()).await.unwrap();
+    let mut received = Vec::new();
+    let mut buf = [0; 4096];
+    let body_start = loop {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the connection ended inside the head");
+        received.extend_from_slice(&buf[..n]);
+        if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+    let head = String::from_utf8(received[..body_start].to_vec()).unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    while received.len() < body_start + size {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the connection ended after {} bytes", received.len());
+        received.extend_from_slice(&buf[..n]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        started.elapsed() > idle * 3,
+        "the download was slow: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(received.len(), body_start + size);
+    assert!(
+        received[body_start..] == content[..],
+        "the blob arrived intact"
+    );
+
+    // The same connection still serves the next request.
+    tls.write_all(get(path::HELLO).as_bytes()).await.unwrap();
+    let n = tls.read(&mut buf).await.unwrap();
+    assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", &buf[..n]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_sent_request_head_is_closed() {
+    let idle = Duration::from_millis(300);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        idle_timeout: idle,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    // The clock starts with the connection: the handshake counts.
+    let started = Instant::now();
+    let mut tls = tls_from(&f, LOCAL, None, false).await.unwrap();
+    // Half a request head, then nothing: closed after the idle limit.
+    tls.write_all(b"GET /v1/hello HTTP/1.1\r\n").await.unwrap();
+    let mut buf = [0; 1024];
+    let read = tokio::time::timeout(SOON, async {
+        while let Ok(1..) = tls.read(&mut buf).await {}
+    })
+    .await;
+    assert!(read.is_ok(), "the connection was closed");
+    assert!(started.elapsed() >= idle, "not before the limit");
+}
+
+/// Reads one whole response (`Content-Length` framed) from `tls`; its
+/// status line.
+async fn read_response(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> String {
+    let mut received = Vec::new();
+    let mut buf = [0; 4096];
+    let (head_end, length) = loop {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the connection ended inside the head");
+        received.extend_from_slice(&buf[..n]);
+        if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+            break (end + 4, length);
+        }
+    };
+    while received.len() < head_end + length {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the connection ended inside the body");
+        received.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&received[..head_end]);
+    head.lines().next().unwrap().to_owned()
+}
+
+/// Sends `GET uri` on a keep-alive connection, reads the whole response,
+/// then sends nothing more: asserts the server closes the connection after
+/// `idle`, counted from the response.
+async fn closed_when_idle_after(
+    f: &Fixture,
+    creds: Option<&Credentials>,
+    uri: &str,
+    idle: Duration,
+    small_window: bool,
+) {
+    let mut tls = tls_from(f, LOCAL, creds, small_window).await.unwrap();
+    let request = format!("GET {uri} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    let status = read_response(&mut tls).await;
+    assert!(status.starts_with("HTTP/1.1 "), "{status}");
+    let answered = Instant::now();
+    let mut buf = [0; 1024];
+    let closed = tokio::time::timeout(SOON, async {
+        while let Ok(1..) = tls.read(&mut buf).await {}
+    })
+    .await;
+    assert!(closed.is_ok(), "the idle connection was closed");
+    assert!(answered.elapsed() >= idle / 2, "not long before the limit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_connection_idle_after_a_response_is_closed() {
+    let idle = Duration::from_millis(300);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        idle_timeout: idle,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    closed_when_idle_after(&f, None, path::HELLO, idle, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_connection_idle_after_a_blocked_download_is_closed() {
+    let idle = Duration::from_millis(300);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        idle_timeout: idle,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let creds = f.pair().await;
+    // Through a small window the server's last writes pend: the clock must
+    // start once they go through.
+    let (_, uri) = put_blob(&f, 1 << 20);
+    closed_when_idle_after(&f, Some(&creds), &uri, idle, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_connection_idle_after_a_long_poll_is_closed() {
+    let idle = Duration::from_millis(300);
+    let f = Fixture::start_with_limits(ConnectionLimits {
+        idle_timeout: idle,
+        ..ConnectionLimits::DEFAULT
+    })
+    .await;
+    let creds = f.pair().await;
+    // Longer than the idle limit: the wait itself is not idleness.
+    let uri = events_uri(f.log.head(), 1);
+    closed_when_idle_after(&f, Some(&creds), &uri, idle, false).await;
 }
