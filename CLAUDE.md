@@ -35,6 +35,9 @@ cargo test --workspace
 - Wire snapshots: `UPDATE_SNAPSHOTS=1 cargo test -p skywave-proto --test wire`
   rewrites them. Only do that for a deliberate wire change, and bump
   `PROTOCOL_VERSION` once per batch of wire changes.
+- `skywave-claude-compat` calls `skywaved`'s adapter internals
+  (`agent::claude_code::protocol`). A change to a `pub` item there must
+  pass `cargo clippy --workspace`; `-p skywaved` alone misses the break.
 - While iterating, run the narrowest test (`cargo test -p <crate> --test <file> <name>`).
   In multi-phase work, run only the tests you changed or added. Run the full
   gates once, at the end.
