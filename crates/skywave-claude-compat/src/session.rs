@@ -116,6 +116,8 @@ pub struct Session {
     stdin: Option<ChildStdin>,
     lines: Receiver<Line>,
     stdout_closed: bool,
+    /// The last stderr line, for [`Protocol::exit_error`].
+    stderr_tail: Option<String>,
     pub protocol: Protocol,
     /// Every stdout message so far.
     pub seen: Vec<Seen>,
@@ -187,6 +189,7 @@ impl Session {
             child,
             lines,
             stdout_closed: false,
+            stderr_tail: None,
             protocol: Protocol::new(session_id, false),
             seen: Vec::new(),
             auto_approve: true,
@@ -211,7 +214,7 @@ impl Session {
                     )));
                 }
                 Pumped::Closed => {
-                    let why = session.protocol.exit_error().unwrap_or("no error given");
+                    let why = session.exit_error();
                     return Err(Stop::Stalled(format!(
                         "the CLI exited during the handshake: {why}"
                     )));
@@ -347,6 +350,37 @@ impl Session {
             .map(|at| from + at)
     }
 
+    /// Why the CLI ended, once stdout has closed ([`Protocol::exit_error`]).
+    ///
+    /// Reads the rest of stderr until both pipes have closed (up to
+    /// [`EXIT`]), so its last line is known, then takes the status if the
+    /// process has already exited; a process still running gives no status,
+    /// which `exit_error` reports as not known.
+    fn exit_error(&mut self) -> String {
+        self.stdin = None;
+        let deadline = Instant::now() + EXIT;
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(wait) {
+                Ok(Line::Err(text)) => self.on_stderr(text),
+                Ok(Line::Out(_) | Line::Closed) => {}
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let status = self.child.try_wait().ok().flatten();
+        self.protocol
+            .exit_error(self.stderr_tail.as_deref(), status)
+            .unwrap_or_else(|| "it exited cleanly".to_owned())
+    }
+
+    /// Records a stderr line and keeps it as the tail if it says anything.
+    fn on_stderr(&mut self, text: String) {
+        self.note(&format!("stderr: {text}"));
+        if !text.trim().is_empty() {
+            self.stderr_tail = Some(text);
+        }
+    }
+
     fn record(&mut self, record: Value) {
         self.recorder.borrow_mut().records.push(record);
     }
@@ -381,7 +415,7 @@ impl Session {
         let text = match line {
             Line::Out(text) => text,
             Line::Err(text) => {
-                self.note(&format!("stderr: {text}"));
+                self.on_stderr(text);
                 return Pumped::Other;
             }
             Line::Closed => {
