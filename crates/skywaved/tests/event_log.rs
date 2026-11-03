@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, CallId, Command, CommandId, CommandKind, CommandResult,
-    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
-    ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay, ToolKind, ToolResult, limits,
+    ContextId, ContextRef, Decision, DeviceId, Effort, Event, EventKind, ImportOutcome,
+    ImportedItem, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq,
+    SessionId, SessionOrigin, SessionState, ShellEnd, TaskId, TaskKind, ToolCall, ToolDisplay,
+    ToolKind, ToolResult, limits,
 };
 use skywaved::agent::{ResumeHandle, store_resume_handle};
 use skywaved::event_log::{
@@ -2110,6 +2111,13 @@ fn agent_appends_are_checked() {
             task: TaskId("t1".into()),
             by: DeviceId::new(),
         },
+        EventKind::Imported {
+            at: None,
+            item: ImportedItem::UserMessage { text: "x".into() },
+        },
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Unavailable,
+        },
     ] {
         assert!(matches!(
             f.log.append(&mut f.storage.db, session, context, kind),
@@ -2831,6 +2839,57 @@ fn switching_to_a_moved_context_is_refused() {
     assert_eq!(f.current_context(session), current);
     // Positive control: a context that stayed is switched to as before.
     accepted(f.handle(switch(current)));
+}
+
+/// An imported call is history, not a call the agent left open: its event's
+/// top-level `type` is `imported`, so `open_calls` never selects it. Only
+/// the daemon's command path logs imports, so the test writes the row as
+/// `append_in` would.
+#[test]
+fn an_imported_tool_call_is_not_open() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let context = f.current_context(session);
+    let tool_call = |call| ToolCall {
+        call: Some(call),
+        parent: None,
+        name: "exec".into(),
+        display: ToolDisplay {
+            kind: ToolKind::Shell,
+            title: "$ true".into(),
+            detail: None,
+            body: None,
+        },
+        input: None,
+    };
+    let (imported, live) = (CallId::new(), CallId::new());
+    let kind = EventKind::Imported {
+        at: None,
+        item: ImportedItem::ToolCall(tool_call(imported)),
+    };
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO events (seq, session_id, at, context, kind)
+             VALUES (?1, ?2, '2026-11-03T00:00:00Z', ?3, ?4)",
+            rusqlite::params![
+                i64::try_from(f.log.head().0 + 1).unwrap(),
+                session.0.to_string(),
+                context.0.to_string(),
+                serde_json::to_string(&kind).unwrap()
+            ],
+        )
+        .unwrap();
+    let imported_row = f.all_kinds().into_iter().any(|k| k == kind);
+    assert!(imported_row, "the imported call reads back from the log");
+    assert_eq!(f.log.open_calls(&f.storage.db, session).unwrap(), vec![]);
+    // Positive control: the same call logged live is open.
+    f.agent(session, EventKind::ToolCall(tool_call(live)));
+    assert_eq!(
+        f.log.open_calls(&f.storage.db, session).unwrap(),
+        vec![(context, vec![live])]
+    );
 }
 
 /// Times `open_calls` on a large log; run by hand

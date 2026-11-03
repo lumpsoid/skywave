@@ -92,7 +92,13 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`FileBody`]); and [`limits::WORKDIR_CHANGES_MAX`],
 /// [`limits::WORKDIR_DIFF_MAX_BYTES`], [`limits::WORKDIR_DIFFS_MAX_BYTES`],
 /// [`limits::WORKDIR_FILE_MAX_BYTES`] and [`limits::WORKDIR_LIST_MAX`].
-pub const PROTOCOL_VERSION: u32 = 15;
+///
+/// v16: outside conversations. `EventKind::Imported` (an [`ImportedItem`]
+/// of an adopted conversation's history) and `EventKind::ImportFinished`
+/// (with [`ImportOutcome`]); `GET` [`path::CONVERSATIONS`] answering
+/// [`ConversationsResult`] (with [`OutsideConversation`]); and
+/// [`limits::CONVERSATIONS_MAX`].
+pub const PROTOCOL_VERSION: u32 = 16;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -504,6 +510,58 @@ pub enum EventKind {
         output: Option<BlobRef>,
         truncated: bool,
     },
+    /// One item of the history of the conversation an adopting
+    /// `CreateSession` took over ([`SessionOrigin::Agent`]), as the agent
+    /// kept it outside Skywave; logged by the daemon, in the conversation's
+    /// order, between the `SessionCreated` and its `ImportFinished`. `at` is
+    /// when the agent recorded it, `None` when it did not say. A record, not
+    /// a live event: it is not delivered to the agent, not notable, not
+    /// activity, and opens no call. `item` stays nested, so the top-level
+    /// `type` of an imported call is `imported`, never `tool_call`.
+    Imported {
+        at: Option<DateTime<Utc>>,
+        item: ImportedItem,
+    },
+    /// The import an adopting `CreateSession` ran is over: the command's own
+    /// event, logged after every `Imported` it brought. Logged for every
+    /// adopting create, whatever the outcome, so heads always know where
+    /// the imported history ends. Not notable, not activity.
+    ImportFinished {
+        outcome: ImportOutcome,
+    },
+}
+
+/// What an `EventKind::Imported` carries: the parts of an outside
+/// conversation a head shows. Subagent lines are not imported, so a call's
+/// `parent` is always `None`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImportedItem {
+    UserMessage {
+        text: String,
+    },
+    AgentMessage {
+        text: String,
+    },
+    ToolCall(ToolCall),
+    /// Links by `call` to an imported `ToolCall`.
+    ToolResult(ToolResult),
+}
+
+/// How the import of an adopted conversation ended
+/// (`EventKind::ImportFinished::outcome`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportOutcome {
+    /// `items` `Imported` events were logged before this one.
+    Imported { items: u32 },
+    /// The agent keeps no such conversation for the session's workdir.
+    NotFound,
+    /// Reading the conversation failed; `reason` is bounded text
+    /// ([`limits::REFUSAL_MAX_CHARS`]).
+    Failed { reason: String },
+    /// The server's agent cannot read conversations it had outside Skywave.
+    Unavailable,
 }
 
 /// When a shell run starts, matched against the session's last status
@@ -585,7 +643,9 @@ impl EventKind {
             | EventKind::TaskStopRefused { .. }
             | EventKind::CallsUnanswered { .. }
             | EventKind::ShellStarted { .. }
-            | EventKind::ShellOutput { .. } => None,
+            | EventKind::ShellOutput { .. }
+            | EventKind::Imported { .. }
+            | EventKind::ImportFinished { .. } => None,
         }
     }
 
@@ -615,7 +675,8 @@ impl EventKind {
             | EventKind::ContextMoved { .. }
             | EventKind::TaskStopRequested { .. }
             | EventKind::ShellRequested { .. }
-            | EventKind::ShellStopRequested { .. } => true,
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ImportFinished { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -636,7 +697,8 @@ impl EventKind {
             | EventKind::CallsUnanswered { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => false,
+            | EventKind::ShellFinished { .. }
+            | EventKind::Imported { .. } => false,
         }
     }
 
@@ -681,7 +743,9 @@ impl EventKind {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => None,
+            | EventKind::ShellFinished { .. }
+            | EventKind::Imported { .. }
+            | EventKind::ImportFinished { .. } => None,
         }
     }
 }
@@ -770,6 +834,10 @@ pub mod limits {
     /// [`ListResult::Listed`](crate::ListResult::Listed); past it the
     /// listing is `truncated`.
     pub const WORKDIR_LIST_MAX: usize = 1000;
+    /// Most [`OutsideConversation`](crate::OutsideConversation)s in one
+    /// [`ConversationsResult::Listed`](crate::ConversationsResult::Listed);
+    /// past it the listing is `truncated`.
+    pub const CONVERSATIONS_MAX: usize = 100;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -1738,6 +1806,43 @@ pub enum DirsResult {
     NotFound,
 }
 
+/// Response to `GET /v1/conversations` (no query), always 200: every
+/// outcome is a domain answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ConversationsResult {
+    /// The conversations the agent keeps for workdirs under the configured
+    /// roots, at most [`limits::CONVERSATIONS_MAX`]. `truncated` when the
+    /// cap or the scan's deadline cut the listing short.
+    Listed {
+        conversations: Vec<OutsideConversation>,
+        truncated: bool,
+    },
+    /// The server's agent cannot read conversations it had outside Skywave.
+    Unavailable,
+}
+
+/// One conversation of a [`ConversationsResult::Listed`]: one a
+/// `CreateSession` can adopt by its `id` (`CreateSession::conversation`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OutsideConversation {
+    /// The agent's id for it, at most [`limits::CONVERSATION_ID_MAX_CHARS`].
+    pub id: String,
+    /// The directory it ran in, on the server.
+    pub workdir: String,
+    /// The agent's title for it, cut to [`limits::TITLE_MAX_CHARS`].
+    pub title: Option<String>,
+    /// The first line of its first message, cut to
+    /// [`limits::FIRST_PROMPT_MAX_CHARS`].
+    pub first_prompt: Option<String>,
+    /// When it last changed.
+    pub last_active: DateTime<Utc>,
+    /// User and agent messages in it.
+    pub messages: u32,
+    /// The Skywave session one of whose contexts runs this conversation.
+    pub session: Option<SessionId>,
+}
+
 /// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
@@ -1934,6 +2039,8 @@ pub mod path {
     pub const COMMANDS: &str = "/v1/commands";
     pub const EVENTS: &str = "/v1/events";
     pub const DIRS: &str = "/v1/dirs";
+    /// The agent's conversations outside Skywave: [`crate::ConversationsResult`].
+    pub const CONVERSATIONS: &str = "/v1/conversations";
     /// What changed in a session's workdir: [`crate::ChangesResult`].
     pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
     /// One directory of a session's workdir: [`crate::ListResult`].
@@ -1991,6 +2098,24 @@ mod tests {
         assert_eq!(kind.device(), None);
         assert!(!kind.logged_by_command());
         assert_eq!(kind.archived_effect(), None);
+    }
+
+    #[test]
+    fn imported_history_is_the_daemons_and_its_end_the_commands() {
+        let imported = EventKind::Imported {
+            at: None,
+            item: ImportedItem::UserMessage { text: "hi".into() },
+        };
+        let finished = EventKind::ImportFinished {
+            outcome: ImportOutcome::Imported { items: 1 },
+        };
+        // (kind, logged by a command)
+        for (kind, by_command) in [(&imported, false), (&finished, true)] {
+            assert_eq!(kind.device(), None, "{kind:?}");
+            assert_eq!(kind.logged_by_command(), by_command, "{kind:?}");
+            // An imported user message is history: it brings nothing back.
+            assert_eq!(kind.archived_effect(), None, "{kind:?}");
+        }
     }
 
     #[test]

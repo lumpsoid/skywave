@@ -394,7 +394,99 @@ fn all_event_kinds() -> Vec<EventKind> {
     ]
     .into_iter()
     .chain(all_shell_ends().into_iter().map(shell_finished))
+    .chain(
+        all_imported_items()
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                EventKind::Imported {
+                    // One item without a timestamp: a transcript line may lack one.
+                    at: (i != 0).then(at),
+                    item,
+                }
+            }),
+    )
+    .chain(
+        all_import_outcomes()
+            .into_iter()
+            .map(|outcome| EventKind::ImportFinished { outcome }),
+    )
     .collect()
+}
+
+fn all_imported_items() -> Vec<ImportedItem> {
+    vec![
+        ImportedItem::UserMessage {
+            text: "Where is the event log?".into(),
+        },
+        ImportedItem::AgentMessage {
+            text: "In crates/skywaved/src/event_log.rs.".into(),
+        },
+        ImportedItem::ToolCall(ToolCall {
+            call: Some(call()),
+            parent: None,
+            name: "Bash".into(),
+            display: ToolDisplay {
+                kind: ToolKind::Shell,
+                title: "ls crates".into(),
+                detail: None,
+                body: None,
+            },
+            input: Some(blob()),
+        }),
+        ImportedItem::ToolResult(ToolResult {
+            call: Some(call()),
+            is_error: false,
+            status: Some("exit 0".into()),
+            preview: "skywave-core\nskywaved".into(),
+            lines: 2,
+            output: None,
+        }),
+    ]
+}
+
+fn all_import_outcomes() -> Vec<ImportOutcome> {
+    vec![
+        ImportOutcome::Imported { items: 4 },
+        ImportOutcome::NotFound,
+        ImportOutcome::Failed {
+            reason: "transcript unreadable".into(),
+        },
+        ImportOutcome::Unavailable,
+    ]
+}
+
+fn all_conversations_results() -> Vec<ConversationsResult> {
+    vec![
+        ConversationsResult::Listed {
+            conversations: vec![
+                OutsideConversation {
+                    id: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
+                    workdir: "/srv/code/skywave".into(),
+                    title: Some("Find the event log".into()),
+                    first_prompt: Some("Where is the event log?".into()),
+                    last_active: at(),
+                    messages: 12,
+                    session: None,
+                },
+                OutsideConversation {
+                    id: "0d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6".into(),
+                    workdir: "/srv/code/skywave".into(),
+                    title: None,
+                    first_prompt: None,
+                    last_active: at(),
+                    messages: 0,
+                    session: Some(session()),
+                },
+            ],
+            truncated: true,
+        },
+        ConversationsResult::Listed {
+            conversations: vec![],
+            truncated: false,
+        },
+        ConversationsResult::Unavailable,
+    ]
 }
 
 fn all_shell_ends() -> Vec<ShellEnd> {
@@ -1158,8 +1250,41 @@ fn workdir_caps() {
 }
 
 #[test]
-fn protocol_is_v15() {
-    assert_eq!(PROTOCOL_VERSION, 15);
+fn every_conversations_result_round_trips() {
+    for result in all_conversations_results() {
+        round_trip(&result);
+    }
+}
+
+/// The imported item stays nested under `item`: the event's top-level
+/// `type` is `imported` whatever it carries, so nothing that selects on the
+/// top-level `type` (the server's open calls) mistakes it for a live one.
+#[test]
+fn an_imported_item_is_nested_under_item() {
+    for item in all_imported_items() {
+        let json = serde_json::to_value(EventKind::Imported { at: None, item }).unwrap();
+        assert_eq!(json["type"], "imported", "{json}");
+        assert!(json["item"]["type"].is_string(), "{json}");
+        assert!(json.get("call").is_none(), "{json}");
+    }
+    let finished = serde_json::to_value(EventKind::ImportFinished {
+        outcome: ImportOutcome::NotFound,
+    })
+    .unwrap();
+    assert_eq!(
+        finished,
+        serde_json::json!({"type": "import_finished", "outcome": {"kind": "not_found"}})
+    );
+}
+
+#[test]
+fn conversation_caps() {
+    assert_eq!(limits::CONVERSATIONS_MAX, 100);
+}
+
+#[test]
+fn protocol_is_v16() {
+    assert_eq!(PROTOCOL_VERSION, 16);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1321,6 +1446,7 @@ fn api_paths() {
     assert_eq!(path::HELLO, "/v1/hello");
     assert_eq!(path::COMMANDS, "/v1/commands");
     assert_eq!(path::EVENTS, "/v1/events");
+    assert_eq!(path::CONVERSATIONS, "/v1/conversations");
     assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
@@ -1364,6 +1490,7 @@ fn wire_format_snapshot() {
         workdir_changes: Vec<ChangesResult>,
         workdir_list: Vec<ListResult>,
         workdir_file: Vec<FileResult>,
+        conversations: Vec<ConversationsResult>,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1382,6 +1509,7 @@ fn wire_format_snapshot() {
         workdir_changes: all_changes_results(),
         workdir_list: all_list_results(),
         workdir_file: all_file_results(),
+        conversations: all_conversations_results(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");

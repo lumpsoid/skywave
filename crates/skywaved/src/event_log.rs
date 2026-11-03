@@ -317,7 +317,10 @@ impl EventLog {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => {
+            | EventKind::ShellFinished { .. }
+            // The adopting `CreateSession` logs the import, not the agent.
+            | EventKind::Imported { .. }
+            | EventKind::ImportFinished { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -779,6 +782,9 @@ pub(crate) fn append_in(
         | EventKind::TaskStopRefused { .. }
         | EventKind::CallsUnanswered { .. }
         | EventKind::ShellOutput { .. } => {}
+        // Imported history is a record: an imported call opens nothing, and
+        // `open_calls` never sees it, as it selects on the top-level `type`.
+        EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
         // The run's id is the command's: a `ShellRequested` naming none
         // has no run to track.
         EventKind::ShellRequested { when, .. } => {
@@ -1120,6 +1126,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ShellStarted { .. } => "ShellStarted",
         EventKind::ShellOutput { .. } => "ShellOutput",
         EventKind::ShellFinished { .. } => "ShellFinished",
+        EventKind::Imported { .. } => "Imported",
+        EventKind::ImportFinished { .. } => "ImportFinished",
     }
 }
 
