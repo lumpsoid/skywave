@@ -66,8 +66,7 @@ fn an_adopted_session_starts_with_a_divider_row() {
         rows,
         [(
             RowKind::ContextDivider,
-            "Continues agent conversation 3f2a-91bc from outside Skywave; its earlier history is not shown here"
-                .to_owned(),
+            "Continues agent conversation 3f2a-91bc from outside Skywave".to_owned(),
             false
         )]
     );

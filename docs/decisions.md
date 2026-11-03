@@ -492,8 +492,9 @@ session continues at most one thing, so one `SessionOrigin` enum
 (`Context` | `Agent`; `logged_by_command()` is true for `None` only, since
 D37).
 Both heads adopt by pasting the id (decided by the user 2026-11-02): TUI
-`c`, the GUI dialog's second field. An adopted session's first timeline
-item is a divider, `Entry::Adopted`.
+`c` then `p` (since D37, `c` opens the conversation picker first), the GUI
+dialog's second field. An adopted session's first timeline item is a
+divider, `Entry::Adopted`.
 **Not carried:** mode, model, effort and grants (as D30). The outside
 conversation's cumulative spend shows in the fork's `total_cost_usd`;
 per-turn cost is unaffected. An adopted first context that never ran

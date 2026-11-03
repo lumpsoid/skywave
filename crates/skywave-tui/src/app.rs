@@ -13,10 +13,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
-    Completion, ComposerMode, ContextId, CoreError, Decision, Entry, Link, LinkRejection, ListKind,
-    PairUri, PairingView, PermissionMode, Route, RunWhen, Screen, Seq, ServerAddress, SessionId,
-    SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId, TimelineItem,
-    ToolOutcome, ViewState, parse_pair_uri,
+    Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
+    Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route, RunWhen,
+    Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun,
+    ShellRunState, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
@@ -141,10 +141,11 @@ pub enum PromptKind {
     /// completion. Whether the path is acceptable is the server's call
     /// (D14).
     Create,
-    /// "Continue an outside conversation", on the session list, in two
-    /// steps: the server workdir (Tab completion, like [`Create`]), then
-    /// the agent's own id of the conversation to fork, which the server
-    /// checks. The step is [`Prompt::workdir`].
+    /// "Continue an outside conversation" by its id, from `p` in the
+    /// conversation picker, in two steps: the server workdir (Tab
+    /// completion, like [`Create`]), then the agent's own id of the
+    /// conversation to fork, which the server checks. The step is
+    /// [`Prompt::workdir`].
     ///
     /// [`Create`]: PromptKind::Create
     Adopt,
@@ -1307,6 +1308,11 @@ pub struct UiState {
     pub selected: Option<SessionId>,
     /// The open "new session" or rename prompt, if any.
     pub prompt: Option<Prompt>,
+    /// The conversation picker's highlighted row, by the agent's id so it
+    /// stays put when a refresh reorders the rows; the first row when
+    /// `None` or gone. Whether the picker is open is the core's
+    /// ([`SessionListView::conversations`]).
+    pub conversation: Option<String>,
     /// `D` on the archived list asks whether to delete this session from
     /// this device; `y` does, any other key does not.
     pub delete: Option<SessionId>,
@@ -1360,6 +1366,7 @@ impl App {
                 form: PairingForm::default(),
                 selected: None,
                 prompt: None,
+                conversation: None,
                 delete: None,
                 session: None,
                 usage: UsageUi::default(),
@@ -1430,6 +1437,9 @@ impl App {
             .session()
             .and_then(|(view, ui)| find(view, ui.shown.search.as_ref()?.current?));
         self.view = view;
+        if self.conversation_picker().is_none() {
+            self.ui.conversation = None;
+        }
         if let (Some(create), Screen::SessionList(list)) = (&mut self.ui.prompt, &self.view.screen)
             && create.asks_workdir()
             && let Some(completion) = &list.completion
@@ -1939,6 +1949,9 @@ impl App {
             Some(PromptKind::ServerAddress) => return self.address_key(key, ctrl),
             None => {}
         }
+        if self.conversation_picker().is_some() {
+            return self.conversations_key(key);
+        }
         match &self.view.screen {
             Screen::Pairing(_) => self.pairing_key(key, ctrl),
             Screen::SessionList(list) => match key.code {
@@ -1960,10 +1973,10 @@ impl App {
                     None
                 }
                 // A conversation started outside Skywave continues in a new
-                // session, so also from the active list.
+                // session, so also from the active list: the core asks the
+                // server for them and opens the picker.
                 KeyCode::Char('c') if list.kind == ListKind::Active => {
-                    self.ui.prompt = Some(Prompt::new(PromptKind::Adopt, String::new()));
-                    None
+                    Some(Action::ListConversations)
                 }
                 // The row leaves the list; the selection moves to its
                 // neighbour (`keep_selection`).
@@ -2095,6 +2108,79 @@ impl App {
         };
         let completion = list.completion.as_ref()?;
         Some((completion, create.completion.selected()))
+    }
+
+    /// The conversation picker, while the core has it open on the session
+    /// list.
+    pub fn conversation_picker(&self) -> Option<&ConversationPicker> {
+        self.session_list()?.conversations.as_ref()
+    }
+
+    /// The highlighted row of `picker`: [`UiState::conversation`], else
+    /// the first. `None` while it lists nothing.
+    pub fn conversation_index(&self, picker: &ConversationPicker) -> Option<usize> {
+        if picker.items.is_empty() {
+            return None;
+        }
+        let id = self.ui.conversation.as_deref();
+        Some(
+            picker
+                .items
+                .iter()
+                .position(|item| Some(item.id.as_str()) == id)
+                .unwrap_or(0),
+        )
+    }
+
+    /// The highlighted conversation, if the picker lists any.
+    pub fn conversation_item(&self) -> Option<&ConversationItem> {
+        let picker = self.conversation_picker()?;
+        Some(&picker.items[self.conversation_index(picker)?])
+    }
+
+    /// Keys while the conversation picker is open: ↑↓ choose, Enter
+    /// continues the highlighted conversation in a new session (the core
+    /// closes the picker), `o` opens the session that already runs it, `p`
+    /// pastes an id instead (the two-step prompt), `r` lists again, Esc
+    /// closes.
+    fn conversations_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let picker = self.conversation_picker()?;
+        let index = self.conversation_index(picker);
+        let item = index.map(|i| &picker.items[i]);
+        match key.code {
+            KeyCode::Esc => Some(Action::EndConversations),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                let (Some(index), Some(last)) = (index, picker.items.len().checked_sub(1)) else {
+                    return None;
+                };
+                let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+                let to = if down {
+                    (index + 1).min(last)
+                } else {
+                    index.saturating_sub(1)
+                };
+                self.ui.conversation = Some(picker.items[to].id.clone());
+                None
+            }
+            KeyCode::Enter => item.map(|item| Action::CreateSession {
+                workdir: item.workdir.clone(),
+                conversation: Some(item.id.clone()),
+            }),
+            KeyCode::Char('o') => match item?.session {
+                Some(session) => Some(Action::OpenSession(session)),
+                None => {
+                    self.ui.notice = Some("no session runs this conversation".to_owned());
+                    None
+                }
+            },
+            KeyCode::Char('p') => {
+                self.ui.prompt = Some(Prompt::new(PromptKind::Adopt, String::new()));
+                Some(Action::EndConversations)
+            }
+            KeyCode::Char('r') => Some(Action::ListConversations),
+            KeyCode::Char('q') => self.quit(),
+            _ => None,
+        }
     }
 
     /// Keys while the new-session prompt is open. Tab completes the

@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_core::{
-    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView, Decision,
-    Delivery, DeviceRef, Effort, FailReason, Outgoing, PermissionMode, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, Schedule, SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState,
-    SubagentStatus, TaskId, TaskKind,
+    AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView,
+    ConversationItem, Decision, Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing,
+    PendingSession, PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
+    SessionId, SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId,
+    TaskKind,
 };
 
 /// How an own command went out, all by this device's clock. Once answered,
@@ -589,11 +590,130 @@ pub fn moved_from_line(name: &str, from: &SessionRef) -> String {
 }
 
 /// An adopted session's first item: `Continues agent conversation 3f2a from
-/// outside Skywave; its earlier history is not shown here`.
+/// outside Skywave`. Its imported history follows, up to the
+/// [`import_finished_line`].
 pub fn adopted_line(conversation: &str) -> String {
+    format!("Continues agent conversation {conversation} from outside Skywave")
+}
+
+/// What a head marks a row of imported history with: it happened outside
+/// Skywave, before the session adopted the conversation.
+pub const IMPORTED_MARK: &str = "imported";
+
+/// The divider where an adopted conversation's imported history ends and
+/// the session's own begins. `Unavailable` says so too: with no history
+/// above it, the timeline would otherwise not say why there is none.
+pub fn import_finished_line(outcome: &ImportOutcome) -> String {
+    match outcome {
+        ImportOutcome::Imported { .. } => "Continued in Skywave from here".to_owned(),
+        ImportOutcome::NotFound => {
+            "history not found · continued in Skywave from here".to_owned()
+        }
+        ImportOutcome::Failed { reason } => {
+            format!("history could not be read: {reason} · continued in Skywave from here")
+        }
+        ImportOutcome::Unavailable => {
+            "history not imported: the server's agent cannot read it · continued in Skywave from here"
+                .to_owned()
+        }
+    }
+}
+
+/// What a session row adds while an adopted conversation's history is
+/// still arriving ([`SessionRow::importing`](skywave_core::SessionRow::importing)).
+pub const IMPORTING_HISTORY: &str = "importing history…";
+
+/// What a pending creation that adopts a conversation adds while it is not
+/// on the server yet: the server imports the history as it creates the
+/// session. `None` for one that adopts nothing, or once answered.
+pub fn adopting_note(pending: &PendingSession) -> Option<&'static str> {
+    pending.conversation.as_ref()?;
+    match pending.outgoing {
+        Outgoing::Sending => Some("Importing conversation history…"),
+        Outgoing::Queued => Some("will import when online"),
+        Outgoing::Accepted(_) | Outgoing::Failed(_) => None,
+    }
+}
+
+/// How long ago `at` was at `now`, coarsely: `just now`, `12 min ago`,
+/// `3 h ago`, `5 d ago`, then the date (`2026-10-01`). A time ahead of
+/// `now` (another clock) reads `just now`.
+pub fn ago(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (now - at).num_seconds();
+    match secs {
+        ..60 => "just now".to_owned(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..2_592_000 => format!("{} d ago", secs / 86_400),
+        _ => at.format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// A server path's last two components, `…/personal/skywave`; a shorter
+/// path whole.
+pub fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 2 {
+        return path.to_owned();
+    }
+    format!("…/{}", parts[parts.len() - 2..].join("/"))
+}
+
+/// What a conversation picker row is called: the agent's title, else its
+/// first prompt, else its id.
+pub fn conversation_title(item: &ConversationItem) -> &str {
+    item.title
+        .as_deref()
+        .or(item.first_prompt.as_deref())
+        .unwrap_or(&item.id)
+}
+
+/// A conversation picker row's detail: `…/personal/skywave · 3 h ago · 42
+/// messages`.
+pub fn conversation_detail(item: &ConversationItem, now: DateTime<Utc>) -> String {
     format!(
-        "Continues agent conversation {conversation} from outside Skywave; its earlier history is not shown here"
+        "{} · {} · {}",
+        short_path(&item.workdir),
+        ago(item.last_active, now),
+        count(item.messages as usize, "message", "messages")
     )
+}
+
+/// Where a listed conversation already is in Skywave: `already in Skywave:
+/// “fix the flaky test”` when a session runs it now, else `continued in
+/// “fix the flaky test”` (`… and 2 more`) for sessions that adopted it
+/// before. `title` names a session of the replica (`None`: not on this
+/// list). `None` when Skywave has it nowhere.
+pub fn conversation_link(
+    item: &ConversationItem,
+    title: impl Fn(SessionId) -> Option<String>,
+) -> Option<String> {
+    let word = |id: SessionId| {
+        session_word(&SessionRef {
+            id,
+            title: title(id),
+        })
+    };
+    if let Some(session) = item.session {
+        return Some(format!("already in Skywave: {}", word(session)));
+    }
+    let (first, rest) = item.continued_in.split_first()?;
+    Some(match rest.len() {
+        0 => format!("continued in {}", word(*first)),
+        more => format!("continued in {} and {more} more", word(*first)),
+    })
+}
+
+/// Why the conversation picker lists nothing: offline, else the core's
+/// reason (`ConversationsStatus::Unavailable`).
+pub fn conversations_unavailable(reason: &str) -> String {
+    // The core says "not connected" offline, or wraps it ("server
+    // unreachable: not connected") when the engine found the link down.
+    if reason == "not connected" || reason.ends_with(": not connected") {
+        "offline · the server lists its conversations once connected".to_owned()
+    } else {
+        format!("can't list conversations: {reason}")
+    }
 }
 
 /// What a picker adds to a moved context's row: `moved → “fix the flaky
@@ -783,10 +903,165 @@ pub fn queued_label(run: &ShellRun) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use skywave_core::{
-        BackgroundTask, ModelChoice, Refusal, Schedule, ScheduleId, SettingChange, TaskId, TaskKind,
+        BackgroundTask, CommandId, ModelChoice, Refusal, Schedule, ScheduleId, SettingChange,
+        TaskId, TaskKind,
     };
 
     use super::*;
+
+    fn conversation(title: Option<&str>, first_prompt: Option<&str>) -> ConversationItem {
+        ConversationItem {
+            id: "3f2a".into(),
+            workdir: "/home/me/Projects/personal/skywave".into(),
+            title: title.map(Into::into),
+            first_prompt: first_prompt.map(Into::into),
+            last_active: DateTime::parse_from_rfc3339("2026-11-03T09:00:00Z")
+                .unwrap()
+                .to_utc(),
+            messages: 42,
+            session: None,
+            continued_in: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_picker_row_is_called_by_its_title_else_its_first_prompt_else_its_id() {
+        assert_eq!(
+            conversation_title(&conversation(Some("Fix the test"), Some("fix it"))),
+            "Fix the test"
+        );
+        assert_eq!(
+            conversation_title(&conversation(None, Some("fix it"))),
+            "fix it"
+        );
+        assert_eq!(conversation_title(&conversation(None, None)), "3f2a");
+    }
+
+    #[test]
+    fn a_picker_row_says_where_how_long_ago_and_how_long() {
+        let item = conversation(None, None);
+        let at = |rfc: &str| DateTime::parse_from_rfc3339(rfc).unwrap().to_utc();
+        assert_eq!(
+            conversation_detail(&item, at("2026-11-03T12:10:00Z")),
+            "…/personal/skywave · 3 h ago · 42 messages"
+        );
+        let one = ConversationItem {
+            messages: 1,
+            workdir: "/srv/app".into(),
+            ..item.clone()
+        };
+        assert_eq!(
+            conversation_detail(&one, at("2026-11-03T09:00:30Z")),
+            "/srv/app · just now · 1 message"
+        );
+        // Every step of the scale, and a clock behind the agent's.
+        let ago_at = |now: &str| ago(item.last_active, at(now));
+        assert_eq!(ago_at("2026-11-03T08:59:00Z"), "just now");
+        assert_eq!(ago_at("2026-11-03T09:12:00Z"), "12 min ago");
+        assert_eq!(ago_at("2026-11-08T10:00:00Z"), "5 d ago");
+        assert_eq!(ago_at("2026-12-25T09:00:00Z"), "2026-11-03");
+    }
+
+    #[test]
+    fn a_picker_row_says_where_skywave_has_it() {
+        let item = conversation(None, None);
+        let (here, other, gone) = (SessionId::new(), SessionId::new(), SessionId::new());
+        let title = |id: SessionId| (id == here).then(|| "fix the flaky test".to_owned());
+        assert_eq!(conversation_link(&item, title), None);
+        let continued = ConversationItem {
+            continued_in: vec![here],
+            ..item.clone()
+        };
+        assert_eq!(
+            conversation_link(&continued, title).as_deref(),
+            Some("continued in “fix the flaky test”")
+        );
+        let twice = ConversationItem {
+            continued_in: vec![gone, here, other],
+            ..item.clone()
+        };
+        assert_eq!(
+            conversation_link(&twice, title).as_deref(),
+            Some("continued in another session and 2 more")
+        );
+        // Running in a session now wins over earlier adoptions.
+        let running = ConversationItem {
+            session: Some(here),
+            ..twice
+        };
+        assert_eq!(
+            conversation_link(&running, title).as_deref(),
+            Some("already in Skywave: “fix the flaky test”")
+        );
+    }
+
+    #[test]
+    fn an_unavailable_listing_says_offline_or_why() {
+        let offline = "offline · the server lists its conversations once connected";
+        assert_eq!(conversations_unavailable("not connected"), offline);
+        assert_eq!(
+            conversations_unavailable("server unreachable: not connected"),
+            offline
+        );
+        assert_eq!(
+            conversations_unavailable("the server's agent cannot list its conversations"),
+            "can't list conversations: the server's agent cannot list its conversations"
+        );
+        assert_eq!(
+            conversations_unavailable("unexpected HTTP status 503"),
+            "can't list conversations: unexpected HTTP status 503"
+        );
+    }
+
+    #[test]
+    fn every_import_outcome_draws_its_divider() {
+        assert_eq!(
+            import_finished_line(&ImportOutcome::Imported { items: 12 }),
+            "Continued in Skywave from here"
+        );
+        assert_eq!(
+            import_finished_line(&ImportOutcome::NotFound),
+            "history not found · continued in Skywave from here"
+        );
+        assert_eq!(
+            import_finished_line(&ImportOutcome::Failed {
+                reason: "bad line 3".into()
+            }),
+            "history could not be read: bad line 3 · continued in Skywave from here"
+        );
+        assert_eq!(
+            import_finished_line(&ImportOutcome::Unavailable),
+            "history not imported: the server's agent cannot read it · continued in Skywave from here"
+        );
+    }
+
+    #[test]
+    fn a_pending_adopting_creation_says_it_imports() {
+        let pending = |conversation: Option<&str>, outgoing| PendingSession {
+            command_id: CommandId::new(),
+            workdir: "/srv/app".into(),
+            conversation: conversation.map(Into::into),
+            outgoing,
+            discardable: false,
+        };
+        assert_eq!(
+            adopting_note(&pending(Some("3f2a"), Outgoing::Sending)),
+            Some("Importing conversation history…")
+        );
+        assert_eq!(
+            adopting_note(&pending(Some("3f2a"), Outgoing::Queued)),
+            Some("will import when online")
+        );
+        assert_eq!(
+            adopting_note(&pending(
+                Some("3f2a"),
+                Outgoing::Failed(FailReason::Rejected(RejectReason::BadShellCommand))
+            )),
+            None
+        );
+        assert_eq!(adopting_note(&pending(None, Outgoing::Sending)), None);
+        assert_eq!(adopting_note(&pending(None, Outgoing::Queued)), None);
+    }
 
     #[test]
     fn every_shell_end_is_worded() {
@@ -1357,7 +1632,7 @@ mod tests {
         );
         assert_eq!(
             adopted_line("3f2a"),
-            "Continues agent conversation 3f2a from outside Skywave; its earlier history is not shown here"
+            "Continues agent conversation 3f2a from outside Skywave"
         );
 
         let mut view = SessionView {
