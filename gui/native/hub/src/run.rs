@@ -75,6 +75,9 @@ async fn run(
         };
         perform(outs, &hub, &mut shown);
     }
+    // The one way out of the loop: the unsaved draft and read mark are
+    // queued now, and closing applies everything queued before shutdown.
+    perform(head.on_stop(Clock::read()), &hub, &mut shown);
     hub.close();
 }
 

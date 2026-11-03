@@ -474,6 +474,15 @@ impl Head {
         out
     }
 
+    /// The hub is stopping: what must reach the core before it closes, the
+    /// open session's unsaved draft and read mark, both forced. Only
+    /// dispatches: Dart may be gone already.
+    pub fn on_stop(&mut self, clock: Clock) -> Vec<Out> {
+        let mut out = Vec::new();
+        self.moved(Moved::Closed, clock, &mut out);
+        out
+    }
+
     /// When something is due without input: a draft save, a read mark, the
     /// retry countdown, a running clock on screen. `None`: nothing is.
     pub fn next_wake(&self, clock: Clock) -> Option<Instant> {

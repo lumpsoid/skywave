@@ -474,6 +474,8 @@ skywave-core                 all logic, sync, replica
   core behind `CORE_SLOT` (D27).
 - **Lifecycle:** Dart reports `AppBackgrounded`/`AppForegrounded`; on
   Android and iOS the hub suspends the core, and resumes it then retries the
-  link (D21's rule, without A15's background work). Desktop ignores both.
+  link (D21's rule, without A15's background work). Every platform saves the
+  open session's unsaved draft and marks it read at once on leaving, and
+  again whenever the hub task stops, before the core closes.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).
