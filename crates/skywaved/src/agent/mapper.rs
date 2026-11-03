@@ -318,7 +318,7 @@ impl EventMapper {
                 display,
             } => {
                 let id = CallId::new();
-                let (display, input_blob) = call_display(storage, &input, display)?;
+                let (display, input_blob) = call_display(&mut stored(storage), &input, display)?;
                 let parent = parent.filter(|p| self.linked(Some(p)).is_some());
                 let title = display.title.clone();
                 let seq = self.append(
@@ -369,7 +369,7 @@ impl EventMapper {
                         None
                     }
                 };
-                let result = tool_result(storage, call, result)?;
+                let result = tool_result(&mut stored(storage), call, result)?;
                 seqs.push(self.append(log, storage, EventKind::ToolResult(result))?);
             }
             AdapterEvent::ApprovalRequested {
@@ -385,7 +385,7 @@ impl EventMapper {
                         let blob = if logged.input == input {
                             None
                         } else {
-                            Some(input_blob(storage, &input)?)
+                            Some(input_blob(&mut stored(storage), &input)?)
                         };
                         (Some(logged.id), logged.title.clone(), blob)
                     }
@@ -394,7 +394,7 @@ impl EventMapper {
                         let blob = if shown_whole {
                             None
                         } else {
-                            Some(input_blob(storage, &input)?)
+                            Some(input_blob(&mut stored(storage), &input)?)
                         };
                         (None, summary, blob)
                     }
@@ -802,10 +802,21 @@ impl EventMapper {
     }
 }
 
+// The bounding helpers below take a blob sink, `put`, for the content they
+// leave out of an event: it stores the bytes as a blob and returns the
+// reference the event carries. The live mapper's sink records each blob as
+// it is stored ([`Storage::put_blob`]); a caller that must record its blobs
+// later, in one transaction with its events, can collect them instead.
+
+/// The live mapper's blob sink: each blob recorded in `storage` as stored.
+fn stored(storage: &Storage) -> impl FnMut(&[u8]) -> Result<BlobRef> + '_ {
+    |bytes| storage.put_blob(bytes)
+}
+
 /// The bounded display for a call and, when it does not show all of the
 /// input, the input as a blob.
-fn call_display(
-    storage: &Storage,
+pub(crate) fn call_display(
+    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
     input: &Value,
     display: Option<ToolDisplay>,
 ) -> Result<(proto::ToolDisplay, Option<BlobRef>)> {
@@ -821,8 +832,8 @@ fn call_display(
                 None => (None, false),
             };
             let (body, title_cut) = match display.body {
-                Some(body) => (Some(display_body(storage, body)?), title_cut),
-                None => (title_body(storage, &display.title, title_cut)?, false),
+                Some(body) => (Some(display_body(put, body)?), title_cut),
+                None => (title_body(put, &display.title, title_cut)?, false),
             };
             let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
@@ -839,7 +850,7 @@ fn call_display(
         None => {
             let (text, whole) = generic_text(input);
             let (title, title_cut) = cut_line(&text, TITLE_MAX_CHARS);
-            let body = title_body(storage, &text, title_cut)?;
+            let body = title_body(put, &text, title_cut)?;
             let body_cut = body.as_ref().is_some_and(|b| b.full.is_some());
             let display = proto::ToolDisplay {
                 kind: ToolKind::Other,
@@ -853,14 +864,18 @@ fn call_display(
     let blob = if shown_whole {
         None
     } else {
-        Some(input_blob(storage, input)?)
+        Some(input_blob(put, input)?)
     };
     Ok((display, blob))
 }
 
 /// The body standing in for a cut title: its whole text, so a long or
 /// multi-line title (a shell command) is never shown in part only.
-fn title_body(storage: &Storage, title: &str, cut: bool) -> Result<Option<Body>> {
+fn title_body(
+    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    title: &str,
+    cut: bool,
+) -> Result<Option<Body>> {
     if !cut {
         return Ok(None);
     }
@@ -868,14 +883,17 @@ fn title_body(storage: &Storage, title: &str, cut: bool) -> Result<Option<Body>>
         format: BodyFormat::Text,
         text: title.trim().to_owned(),
     };
-    display_body(storage, body).map(Some)
+    display_body(put, body).map(Some)
 }
 
 /// A body's preview, with its text as a blob when the preview is shorter.
-fn display_body(storage: &Storage, body: DisplayBody) -> Result<Body> {
+pub(crate) fn display_body(
+    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    body: DisplayBody,
+) -> Result<Body> {
     let (preview, cut) = cut_preview(&body.text);
     let full = if cut {
-        Some(storage.put_blob(body.text.as_bytes())?)
+        Some(put(body.text.as_bytes())?)
     } else {
         None
     };
@@ -889,15 +907,15 @@ fn display_body(storage: &Storage, body: DisplayBody) -> Result<Body> {
 
 /// A result's preview (of the adapter's preview text, else of the output),
 /// with the output as a blob when the preview does not hold all of it.
-fn tool_result(
-    storage: &Storage,
+pub(crate) fn tool_result(
+    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
     call: Option<CallId>,
     result: ResultDisplay,
 ) -> Result<ToolResult> {
     let shown = result.preview.as_deref().unwrap_or(&result.output);
     let (preview, cut) = cut_preview(shown);
     let output = if cut || shown != result.output {
-        Some(storage.put_blob(result.output.as_bytes())?)
+        Some(put(result.output.as_bytes())?)
     } else {
         None
     };
@@ -937,12 +955,15 @@ fn generic_text(input: &Value) -> (String, bool) {
 }
 
 /// `input` stored whole: a string as itself, anything else pretty-printed.
-fn input_blob(storage: &Storage, input: &Value) -> Result<BlobRef> {
+pub(crate) fn input_blob(
+    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    input: &Value,
+) -> Result<BlobRef> {
     let bytes = match input {
         Value::String(text) => text.clone().into_bytes(),
         _ => serde_json::to_vec_pretty(input)?,
     };
-    storage.put_blob(bytes.as_slice())
+    put(&bytes)
 }
 
 /// The first non-blank line of `text`, trimmed, at most `max_chars` chars,
@@ -1120,6 +1141,43 @@ mod tests {
         assert_eq!(cut_preview(""), (String::new(), false));
         let eight: String = (0..PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
         assert!(!cut_preview(&eight).1);
+    }
+
+    #[test]
+    fn a_body_stores_its_full_text_through_the_sink_only_when_cut() {
+        let mut stored: Vec<Vec<u8>> = Vec::new();
+        let blob = BlobRef {
+            id: proto::BlobId::new(),
+            size: 0,
+        };
+        let mut put = |bytes: &[u8]| {
+            stored.push(bytes.to_vec());
+            Ok(blob.clone())
+        };
+
+        let long: String = (0..=PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
+        let body = display_body(
+            &mut put,
+            DisplayBody {
+                format: BodyFormat::Text,
+                text: long.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(body.full, Some(blob.clone()));
+
+        let short = display_body(
+            &mut put,
+            DisplayBody {
+                format: BodyFormat::Text,
+                text: "a\nb\n".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(short.full, None);
+        assert_eq!(short.preview, "a\nb\n");
+
+        assert_eq!(stored, vec![long.into_bytes()]);
     }
 
     #[test]
