@@ -538,7 +538,9 @@ pub fn assert_same_log(server: &[Event], local: &[(Seq, Event)]) {
 /// Ground truth for D7 across `clients`: the server stored exactly one
 /// result per command made, the one each device recorded; every accepted
 /// command's seq names its own event; nothing else reached the log but the
-/// new session's `SessionCreated` right before each move's `ContextMoved`.
+/// new session's `SessionCreated` right before each move's `ContextMoved`,
+/// and an adopted session's `SessionCreated` and imported history before
+/// its `ImportFinished`.
 pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     let events = daemon.events();
     let results = daemon.command_results();
@@ -568,8 +570,39 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
                 "seq {seq:?} names the command it acknowledges"
             );
             let name = match (&entry.command.kind, kind) {
-                (CommandKind::CreateSession { .. }, EventKind::SessionCreated { .. }) => {
-                    "SessionCreated"
+                (
+                    CommandKind::CreateSession {
+                        conversation: None, ..
+                    },
+                    EventKind::SessionCreated { from: None, .. },
+                ) => "SessionCreated",
+                // An adopting create names itself on its `ImportFinished`,
+                // after its session's `SessionCreated` and imported history.
+                (
+                    CommandKind::CreateSession {
+                        conversation: Some(_),
+                        ..
+                    },
+                    EventKind::ImportFinished { .. },
+                ) => {
+                    let session = events[(seq.0 - 1) as usize].session_id;
+                    let created = events
+                        .iter()
+                        .find(|e| e.session_id == session)
+                        .expect("the adopted session's events");
+                    assert_eq!(created.command_id, None);
+                    assert!(
+                        matches!(
+                            &created.kind,
+                            EventKind::SessionCreated {
+                                from: Some(SessionOrigin::Agent { .. }),
+                                ..
+                            }
+                        ),
+                        "{created:?} is not an adopted session's first event"
+                    );
+                    *accepted.entry("AdoptedSessionCreated").or_default() += 1;
+                    "ImportFinished"
                 }
                 (
                     CommandKind::SendMessage {
@@ -666,11 +699,14 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
     let logged = |name: &str| {
         count(&events, |k| {
             name == match k {
-                // A fresh or adopting one is its `CreateSession`'s own event.
+                // A fresh one is its `CreateSession`'s own event; an adopting
+                // one's is the `ImportFinished` after it.
+                EventKind::SessionCreated { from: None, .. } => "SessionCreated",
                 EventKind::SessionCreated {
-                    from: None | Some(SessionOrigin::Agent { .. }),
+                    from: Some(SessionOrigin::Agent { .. }),
                     ..
-                } => "SessionCreated",
+                } => "AdoptedSessionCreated",
+                EventKind::ImportFinished { .. } => "ImportFinished",
                 EventKind::SessionCreated {
                     from: Some(SessionOrigin::Context(_)),
                     ..
@@ -694,6 +730,8 @@ pub fn assert_exactly_once(daemon: &Daemon, clients: &[&Client]) {
         "ContextSwitched",
         "ContextMoved",
         "MovedSessionCreated",
+        "ImportFinished",
+        "AdoptedSessionCreated",
     ] {
         assert_eq!(
             logged(name),

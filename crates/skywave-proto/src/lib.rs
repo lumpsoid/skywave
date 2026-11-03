@@ -651,16 +651,15 @@ impl EventKind {
 
     /// Whether only a command logs this event, so it carries the
     /// [`Event::command_id`] of the command that did. The agent and the
-    /// daemon log the rest, `ApprovalCancelled` included, and so the
-    /// `SessionCreated` of a moved context ([`SessionOrigin::Context`]): its
-    /// `MoveContext` names itself on the `ContextMoved` that follows. A
-    /// fresh or adopting `SessionCreated` is its `CreateSession`'s own event.
+    /// daemon log the rest, `ApprovalCancelled` included. Only a fresh
+    /// `SessionCreated` is its `CreateSession`'s own event: a moved
+    /// context's ([`SessionOrigin::Context`]) `MoveContext` names itself on
+    /// the `ContextMoved` that follows, and an adopting
+    /// ([`SessionOrigin::Agent`]) `CreateSession` on the `ImportFinished`
+    /// that ends its imported history.
     pub fn logged_by_command(&self) -> bool {
         match self {
-            EventKind::SessionCreated { from, .. } => match from {
-                None | Some(SessionOrigin::Agent { .. }) => true,
-                Some(SessionOrigin::Context(_)) => false,
-            },
+            EventKind::SessionCreated { from, .. } => from.is_none(),
             EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::TurnInterrupted
@@ -2440,9 +2439,10 @@ mod tests {
     }
 
     #[test]
-    fn an_adopting_session_created_is_logged_by_its_command() {
-        // An adoption is one `CreateSession`, whose own event this is: a
-        // device whose reply was lost settles the command from it.
+    fn an_adopting_session_created_is_logged_by_the_daemon() {
+        // The adopting `CreateSession` names itself on the `ImportFinished`
+        // after the imported history, the last event it appends; its
+        // `SessionCreated` names no command.
         let adopted = EventKind::SessionCreated {
             workdir: "/w".into(),
             context_name: "start".into(),
@@ -2450,7 +2450,7 @@ mod tests {
                 conversation: "9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8".into(),
             }),
         };
-        assert!(adopted.logged_by_command());
+        assert!(!adopted.logged_by_command());
         assert_eq!(adopted.device(), None);
         assert_eq!(adopted.archived_effect(), None);
     }

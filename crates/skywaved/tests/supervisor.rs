@@ -15,12 +15,13 @@ use skywave_proto::{
     RuleScope, RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
     TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
-use skywaved::agent::AdapterEvent;
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
-    FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, REFUSE_REASON,
-    Step, schedule, task,
+    FakeAgent, FakeConversation, FakeInput, FakeOutside, FakeScript, Gate, INTERRUPT_REASON,
+    REFUSE_REASON, Step, schedule, task,
 };
+use skywaved::agent::import::{self, IMPORT_DEADLINE};
+use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead};
 use skywaved::config::AgentConfig;
 use skywaved::supervisor::{AGENT_NOT_RUNNING, DAEMON_RESTARTED, TURN_LOST};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
@@ -48,8 +49,18 @@ impl Fixture {
         Fixture::created(Some(id.into()))
     }
 
+    /// A fixture whose session adopts the outside agent conversation `id`,
+    /// importing `history` as the API does.
+    fn importing(id: &str, history: Vec<HistoryItem>) -> Fixture {
+        Fixture::created_with(Some(id.into()), Some(history))
+    }
+
     /// A fixture with one session, adopting `conversation` if any.
     fn created(conversation: Option<String>) -> Fixture {
+        Fixture::created_with(conversation, None)
+    }
+
+    fn created_with(conversation: Option<String>, history: Option<Vec<HistoryItem>>) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let workdir = root.join("project");
@@ -65,13 +76,29 @@ impl Fixture {
             log,
             session_id: SessionId::new(),
         };
-        let seq = accepted(f.handle(
-            DeviceId::new(),
-            CommandKind::CreateSession {
-                workdir: workdir.to_str().unwrap().to_owned(),
+        let workdir = workdir.to_str().unwrap().to_owned();
+        let prepared = match (&conversation, history) {
+            (Some(id), Some(items)) => {
+                let source = FakeOutside::new();
+                source.conversation(Path::new(&workdir), id, HistoryRead::Read { items });
+                let deadline = std::time::Instant::now() + IMPORT_DEADLINE;
+                let blobs = f.storage.blobs.clone();
+                Some(import::prepare(&source, blobs, &workdir, id, deadline))
+            }
+            _ => None,
+        };
+        let command = Command {
+            id: CommandId::new(),
+            kind: CommandKind::CreateSession {
+                workdir,
                 conversation,
             },
-        ));
+        };
+        let seq = accepted(
+            f.log
+                .handle_with(&mut f.storage.db, DeviceId::new(), &command, prepared)
+                .unwrap(),
+        );
         f.session_id = f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0].session_id;
         f
     }
@@ -3155,6 +3182,68 @@ async fn a_context_moved_out_of_an_adopted_session_forks_its_copy() {
         starts_in(&agent, new),
         [started_as(forked, FakeConversation::Fork(a))]
     );
+}
+
+/// An imported history is a record: its user message never reaches the
+/// agent, which adopts the conversation it already holds, and its call,
+/// unanswered, is not one a restart names.
+#[tokio::test]
+async fn an_imported_history_never_reaches_the_agent_nor_opens_a_call() {
+    let history = vec![
+        HistoryItem::User {
+            at: None,
+            text: "imported prompt".into(),
+        },
+        HistoryItem::Agent {
+            at: None,
+            event: AdapterEvent::ToolCall {
+                call: Some(AgentCallId::from("toolu_1")),
+                parent: None,
+                name: "Bash".into(),
+                input: json!({ "command": "sleep 100" }),
+                display: None,
+            },
+        },
+    ];
+    let mut f = Fixture::importing("ext-1", history);
+    let a = f.first();
+    let imported = f
+        .kinds()
+        .iter()
+        .filter(|k| matches!(k, EventKind::Imported { .. }))
+        .count();
+    assert_eq!(imported, 2, "the history is in the log");
+    assert_eq!(f.log.open_calls(&f.storage.db, f.session_id).unwrap(), []);
+
+    // The daemon starts with the import in the log: nothing to settle.
+    let head = f.log.head();
+    let agent = FakeAgent::new(FakeScript::new()).with_outside_conversation("ext-1");
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("the reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            started_as(a, adopt("ext-1")),
+            message("one"),
+            FakeInput::Shutdown
+        ]
+    );
+    let after = f.stamped_after(head);
+    assert!(
+        !after
+            .iter()
+            .any(|(k, _)| matches!(k, EventKind::CallsUnanswered { .. })),
+        "{after:?}"
+    );
+
+    // Nor does a restart find an open call.
+    f.reopen_log();
+    let head = f.log.head();
+    let supervisor = f.start(&agent).await;
+    assert_eq!(f.stamped_after(head), []);
+    supervisor.shutdown().await.unwrap();
 }
 
 /// Shell runs are the shell runner's: the agent never sees one, and a turn

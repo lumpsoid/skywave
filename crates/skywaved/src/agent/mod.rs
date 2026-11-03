@@ -89,7 +89,8 @@
 //! the adapter: a listing of the conversations under the roots, and one
 //! conversation's history as [`HistoryItem`]s (the same [`AdapterEvent`]s a
 //! live session reports, uncut). [`NoOutsideConversations`] is the source
-//! of an agent that keeps none Skywave can read.
+//! of an agent that keeps none Skywave can read. [`import`] turns a history
+//! into the bounded `Imported` events an adopting `CreateSession` logs.
 //!
 //! The scripted [`fake::FakeAgent`] implements the trait for deterministic
 //! tests (and [`fake::FakeOutside`] the source); [`claude_code`] holds the
@@ -98,6 +99,7 @@
 
 pub mod claude_code;
 pub mod fake;
+pub mod import;
 mod mapper;
 
 use std::collections::HashMap;

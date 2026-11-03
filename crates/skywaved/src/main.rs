@@ -5,11 +5,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
+use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
+use skywaved::agent::{NoOutsideConversations, OutsideConversations};
 use skywaved::config::{Config, ProcessEnv};
 use skywaved::devices::{self, Revoke};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::pairing;
-use skywaved::server::Server;
+use skywaved::server::{Server, ServerOptions};
 use skywaved::shell::ShellRunner;
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig};
 
@@ -171,7 +173,27 @@ async fn serve(
     // left, then ends.
     let mut shell =
         ShellRunner::start(config.data_dir.clone(), log.clone(), config.shell.clone()).await?;
-    let server = Server::bind(config.listen, &storage.dir, Arc::new(identity), log).await?;
+    // The agent's own conversations, read from the environment the CLI the
+    // adapter spawns inherits.
+    let outside: Arc<dyn OutsideConversations> = match transcripts::projects_dir() {
+        Some(projects) => Arc::new(ClaudeTranscripts::new(projects)),
+        None => {
+            tracing::warn!("no CLAUDE_CONFIG_DIR or HOME: outside conversations cannot be read");
+            Arc::new(NoOutsideConversations)
+        }
+    };
+    let options = ServerOptions {
+        outside,
+        ..ServerOptions::default()
+    };
+    let server = Server::bind_with(
+        config.listen,
+        &storage.dir,
+        Arc::new(identity),
+        log,
+        options,
+    )
+    .await?;
     tracing::info!(
         addr = %server.local_addr(),
         protocol_version = skywave_proto::PROTOCOL_VERSION,

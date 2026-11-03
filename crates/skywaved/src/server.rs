@@ -47,6 +47,8 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
 use crate::EventLog;
+use crate::agent::import::IMPORT_DEADLINE;
+use crate::agent::{NoOutsideConversations, OutsideConversations};
 use crate::api::{self, Api, PeerCert};
 use crate::blobs::BlobStore;
 use crate::data_dir::DataDir;
@@ -63,6 +65,28 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// On shutdown, in-flight requests get this long before connections are
 /// dropped. Long-polls end at once on shutdown, so this is plenty.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// What a server reads besides its data dir. The default runs git from
+/// `PATH`, reads no outside conversations and imports within
+/// [`IMPORT_DEADLINE`].
+pub struct ServerOptions {
+    /// How workdir changes run git.
+    pub git: Git,
+    /// Where an adopting `CreateSession` reads the conversation's history.
+    pub outside: Arc<dyn OutsideConversations>,
+    /// How long such an import may take; tests shorten it.
+    pub import_deadline: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        ServerOptions {
+            git: Git::default(),
+            outside: Arc::new(NoOutsideConversations),
+            import_deadline: IMPORT_DEADLINE,
+        }
+    }
+}
 
 /// A bound, not yet serving, HTTPS server.
 pub struct Server {
@@ -98,16 +122,31 @@ impl Server {
         log: EventLog,
         git: Git,
     ) -> Result<Server> {
+        let options = ServerOptions {
+            git,
+            ..ServerOptions::default()
+        };
+        Server::bind_with(addr, dir, identity, log, options).await
+    }
+
+    /// [`Server::bind`], with what [`ServerOptions`] sets.
+    pub async fn bind_with(
+        addr: SocketAddr,
+        dir: &DataDir,
+        identity: Arc<ServerIdentity>,
+        log: EventLog,
+        options: ServerOptions,
+    ) -> Result<Server> {
         let tls = TlsAcceptor::from(tls_config(&identity)?);
         let (stop, stopped) = watch::channel(false);
         let api = Api::new(
             Db::open(&dir.db_path())?,
             Db::open(&dir.db_path())?,
-            git,
             log,
             BlobStore::new(dir.blobs_dir()),
             identity.server_id(),
             stopped,
+            options,
         );
         let pairing = PairService::new(
             Db::open(&dir.db_path())?,

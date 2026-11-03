@@ -969,7 +969,7 @@ pub(crate) fn input_blob(
 /// The first non-blank line of `text`, trimmed, at most `max_chars` chars,
 /// and whether anything but surrounding whitespace was left out. A cut line
 /// ends in `…` (within `max_chars`).
-fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
+pub(crate) fn cut_line(text: &str, max_chars: usize) -> (String, bool) {
     let text = text.trim();
     let line = text.lines().next().unwrap_or("").trim_end();
     let mut out: String = line.chars().take(max_chars).collect();

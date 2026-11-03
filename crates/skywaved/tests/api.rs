@@ -20,8 +20,8 @@ use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
     DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, EventBatch, EventKind, FileBody,
-    FileChange, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse,
-    RejectReason, Seq, SessionId, SessionOrigin, path,
+    FileChange, FileResult, HelloResponse, ImportOutcome, ListResult, PROTOCOL_VERSION,
+    PairRequest, PairResponse, RejectReason, Seq, SessionId, SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -559,8 +559,10 @@ async fn commands_are_deduplicated_and_rejections_are_results() {
 }
 
 /// Adopting an outside conversation over the wire: the trimmed id comes
-/// back in the `SessionCreated` naming the command; a bad id is a result,
-/// not an error, and stays one on resend.
+/// back in the `SessionCreated`, and the command names the
+/// `ImportFinished` after it (`Unavailable`: this server reads no outside
+/// conversations); a bad id is a result, not an error, and stays one on
+/// resend.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_session_adopts_a_conversation_by_its_id() {
     let f = Fixture::start().await;
@@ -584,12 +586,19 @@ async fn create_session_adopts_a_conversation_by_its_id() {
 
     let good = adopt(" 9b2c1e4a-5f3d-4c8e-a1b2-c3d4e5f6a7b8 ");
     let accepted = device.command(&good).await;
-    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(1) });
+    assert_eq!(accepted, CommandResult::Accepted { seq: Seq(2) });
     assert_eq!(device.command(&good).await, accepted);
     let batch = device.events(Seq::ZERO, 0).await;
-    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events.len(), 2);
+    assert_eq!(batch.events[1].command_id, Some(good.id));
+    assert_eq!(
+        batch.events[1].kind,
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Unavailable
+        }
+    );
     let event = &batch.events[0];
-    assert_eq!(event.command_id, Some(good.id));
+    assert_eq!(event.command_id, None);
     let EventKind::SessionCreated { from, .. } = &event.kind else {
         panic!("{batch:?}");
     };

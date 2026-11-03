@@ -571,3 +571,16 @@ async fn bad_input_is_reported_on_the_pairing_screen() {
     );
     assert!(FileIdentity::load(data.path()).unwrap().is_none());
 }
+
+/// The reply to an adopting `CreateSession` waits for the server's import;
+/// a device treats a reply later than its request timeout as a dead link
+/// (drop, reconnect, resend), so the server's import deadline leaves room
+/// under it for the transaction and the network.
+#[test]
+fn the_import_deadline_leaves_the_reply_inside_the_request_timeout() {
+    let margin = Duration::from_secs(5);
+    assert!(
+        skywaved::agent::import::IMPORT_DEADLINE + margin
+            <= TransportConfig::default().request_timeout
+    );
+}
