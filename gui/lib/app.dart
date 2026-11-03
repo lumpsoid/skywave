@@ -11,8 +11,8 @@ import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The app: a spinner until Rust has booted, its failure with a Retry, or
-/// the app itself. Holders are created in `main` and passed down from here.
+/// The app: a spinner until Rust has booted, its failure with a Retry (a
+/// Restart after the hub crashed), or the app itself. Holders are created in `main` and passed down from here.
 /// Each time Rust answers `Booted`, [AppReady] asks it to send everything
 /// again, so a rebuilt widget tree starts whole.
 class SkywaveApp extends StatefulWidget {
@@ -91,13 +91,15 @@ class _SkywaveAppState extends State<SkywaveApp> {
           BootPending() => const Scaffold(
             body: Center(child: CircularProgressIndicator()),
           ),
-          BootError(:final message, :final unreadable) => BootFailurePage(
-            message: message,
-            onRetry: () => unawaited(widget.boot.boot()),
-            onReset: unreadable
-                ? () => unawaited(widget.boot.boot(resetReplica: true))
-                : null,
-          ),
+          BootError(:final message, :final unreadable, :final crashed) =>
+            BootFailurePage(
+              message: message,
+              onRetry: () => unawaited(widget.boot.boot()),
+              retryLabel: crashed ? 'Restart' : 'Retry',
+              onReset: unreadable
+                  ? () => unawaited(widget.boot.boot(resetReplica: true))
+                  : null,
+            ),
           BootReady() => LinkShortcuts(
             send: widget.send,
             child: ScreenNavigator(holders: widget.holders, send: widget.send),

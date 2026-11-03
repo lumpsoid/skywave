@@ -7,8 +7,8 @@
 //! - `head`: snapshots, intents and results in; signals and actions out.
 //! - `link`, `screen`, `timeline`, `search`, `clip`, `intents`: the
 //!   mapping, one feature each.
-//! - `run`: the hub task's `select!` loop; `boot`, `dispatcher`: opening
-//!   the core and dispatching to it in order.
+//! - `run`: the hub task's `select!` loop, and catching its panics;
+//!   `boot`, `dispatcher`: opening the core and dispatching to it in order.
 //! - `lifecycle`: what the app leaving and returning to the screen does to
 //!   the core, per platform.
 
