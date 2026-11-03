@@ -15,6 +15,8 @@
 //!   a downloaded one.
 //! - [`usage`]: cost and tokens totalled across sessions for the usage
 //!   screen.
+//! - [`text`]: agent content made safe to show: control characters
+//!   dropped, bidirectional controls escaped visibly.
 //! - [`utf16`]: code-point cursors and byte ranges as UTF-16 code units.
 //! - [`policy`]: clock-free controllers for draft saves, read marks,
 //!   alerts, prompt history, workdir completion and timeline search.
@@ -28,6 +30,7 @@ pub mod format;
 pub mod output;
 pub mod policy;
 pub mod sections;
+pub mod text;
 pub mod usage;
 pub mod utf16;
 pub mod workdir;

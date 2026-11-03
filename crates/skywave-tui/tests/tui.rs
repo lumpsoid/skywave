@@ -1023,6 +1023,28 @@ fn every_session_state_has_its_own_badge() {
 }
 
 #[test]
+fn a_session_error_shows_bidi_controls_and_drops_escapes() {
+    let mut h = Harness::paired();
+    let errored = SessionId::new();
+    pull(
+        &mut h,
+        vec![
+            created(errored, 0, "/srv/errored"),
+            event(
+                errored,
+                1,
+                EventKind::SessionStateChanged(LogState::Errored {
+                    message: "bad \u{202E}gnp.exe\u{1b}[31m red".into(),
+                }),
+            ),
+        ],
+    );
+    let row = line_with(&h.screen(), "/srv/errored");
+    assert_contains(&row, "bad <U+202E>gnp.exe[31m red");
+    assert!(!row.contains(['\u{202E}', '\u{1b}']), "{row}");
+}
+
+#[test]
 fn create_session_goes_from_queued_to_the_real_row() {
     let mut h = Harness::paired();
     assert_eq!(h.key(KeyCode::Char('n')), None);

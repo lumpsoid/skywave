@@ -25,7 +25,9 @@ use skywave_present::output::{
 };
 
 use super::outgoing_badge;
-use super::timeline::{clean, device_label, wrap};
+use skywave_present::text::clean;
+
+use super::timeline::{device_label, wrap};
 use crate::app::{Focus, SessionUi};
 
 /// Output lines a run not expanded shows: the newest.

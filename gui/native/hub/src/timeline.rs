@@ -21,6 +21,7 @@ use skywave_present::format::{
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
 };
+use skywave_present::text::{clean_line, clean_text};
 
 use crate::signals::{
     BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
@@ -857,32 +858,6 @@ pub fn content_lines(text: &str) -> Vec<&str> {
     text.split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect()
-}
-
-/// The first line of `text`, safe for a one-line label: tabs as spaces,
-/// other control characters dropped.
-pub fn clean_line(text: &str) -> String {
-    clean(text.split('\n').next().unwrap_or_default())
-}
-
-/// `text` with its line breaks, otherwise as [`clean_line`].
-pub fn clean_text(text: &str) -> String {
-    text.split('\n')
-        .map(|line| clean(line.strip_suffix('\r').unwrap_or(line)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn clean(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    for c in line.chars() {
-        match c {
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

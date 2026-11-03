@@ -23,9 +23,10 @@ use skywave_present::format::{
     task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
+use skywave_present::text::clean;
 
 use super::timeline::{
-    approval_state, clean, detail_lines, glyph, head_lines, item_lines, preview_lines, rule_index,
+    approval_state, detail_lines, glyph, head_lines, item_lines, preview_lines, rule_index,
     title_spans,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
