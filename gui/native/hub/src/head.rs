@@ -928,6 +928,43 @@ impl Head {
                     create.rev = self.revs;
                 }
             }
+            GuiIntent::ConversationsOpen => {
+                if let Some(Screen::SessionList(list)) = self.view.as_ref().map(|v| &v.screen)
+                    && list.kind == skywave_core::ListKind::Active
+                {
+                    self.dispatch_user(Action::ListConversations, Purpose::Plain, clock, out);
+                }
+            }
+            GuiIntent::ConversationPick { conversation_id } => {
+                let workdir = match self.view.as_ref().map(|v| &v.screen) {
+                    Some(Screen::SessionList(list)) => list
+                        .conversations
+                        .iter()
+                        .flat_map(|picker| &picker.items)
+                        .find(|item| item.id == conversation_id)
+                        .map(|item| item.workdir.clone()),
+                    _ => None,
+                };
+                let Some(workdir) = workdir else {
+                    return Ok(());
+                };
+                // The core closes the picker as it takes the session.
+                let action = Action::CreateSession {
+                    workdir,
+                    conversation: Some(conversation_id),
+                };
+                let tag = self.dispatch_user(action, Purpose::Create, clock, out);
+                self.create_tag = Some(tag);
+            }
+            GuiIntent::ConversationsClose => {
+                let open = matches!(
+                    self.view.as_ref().map(|v| &v.screen),
+                    Some(Screen::SessionList(list)) if list.conversations.is_some()
+                );
+                if open {
+                    self.dispatch_user(Action::EndConversations, Purpose::Plain, clock, out);
+                }
+            }
             GuiIntent::CompletionCancel => {
                 let completing = matches!(
                     self.view.as_ref().map(|v| &v.screen),

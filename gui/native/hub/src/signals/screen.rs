@@ -52,6 +52,10 @@ pub enum ScreenView {
         /// The new-session prompt, while open (`CreateOpen`); it closes
         /// once the core took the session.
         create: Option<CreatePrompt>,
+        /// The picker of the server agent's conversations, while open
+        /// (`ConversationsOpen`); it closes on `ConversationsClose`, once
+        /// one is picked, or on leaving the list.
+        conversations: Option<ConversationsView>,
         /// The rename prompt, while open (`RenameOpen`).
         rename: Option<RenamePrompt>,
     },
@@ -177,6 +181,9 @@ pub struct SessionRowView {
     pub rename: Option<OutgoingView>,
     /// `queued`, `rename failed: <why>`; `None` once settled.
     pub rename_label: Option<String>,
+    /// `importing history…` while an adopted conversation's history is
+    /// still arriving; `None` otherwise.
+    pub importing_label: Option<String>,
     /// `DeleteSessionLocally` would remove it (archived, nothing waiting).
     pub deletable: bool,
     /// Why it cannot be deleted yet, for an archived row that is not
@@ -191,9 +198,42 @@ pub struct CreatingView {
     pub command_id: String,
     pub workdir: String,
     pub outgoing: OutgoingView,
-    /// `waits for the server`, `created, syncing…`, why it was refused.
+    /// `waits for the server`, `created, syncing…`, why it was refused;
+    /// `Importing conversation history…`, `will import when online` for
+    /// one that continues an outside conversation.
     pub note: Option<String>,
     pub discardable: bool,
+}
+
+/// The conversations the server's agent keeps, to continue one in a new
+/// session: newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ConversationsView {
+    pub rows: Vec<ConversationRowView>,
+    /// `listing…`, `only the newest are listed`; `None` otherwise.
+    pub status_label: Option<String>,
+    /// What an empty picker says: asking, none under the roots, or why
+    /// the server cannot list (`offline · …`, `can't list conversations:
+    /// …`); `None` when it has rows.
+    pub empty_label: Option<String>,
+    /// `empty_label` says why the server could not list: a warning.
+    pub unavailable: bool,
+}
+
+/// One conversation of the picker. `ConversationPick` continues it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct ConversationRowView {
+    /// The agent's id for it, for `ConversationPick`.
+    pub conversation_id: String,
+    /// The agent's title, else its first prompt, else its id.
+    pub title: String,
+    /// `…/personal/skywave · 3 h ago · 42 messages`.
+    pub detail: String,
+    /// `already in Skywave: “fix the flaky test”`, `continued in …`;
+    /// `None` when Skywave has it nowhere.
+    pub link_label: Option<String>,
+    /// The session running it now, to open instead (`OpenSession`).
+    pub session_id: Option<String>,
 }
 
 /// The new-session prompt: a server workdir with completion. The

@@ -17,6 +17,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// field takes the id of a Claude Code conversation started outside
 /// Skywave, to continue it; it is wholly Dart's, only its edits are sent,
 /// and Enter in it creates the session like Enter in the workdir field.
+/// "Pick a conversation…" opens the server agent's conversations instead
+/// (`ConversationPicker`), to continue one in its own workdir.
 class CreateDialog extends StatefulWidget {
   const CreateDialog({required this.prompt, required this.send, super.key});
 
@@ -211,6 +213,16 @@ class _CreateDialogState extends State<CreateDialog> {
                     GuiIntentCreateConversationTyped(conversation: text),
                   ),
                   onSubmitted: (_) => _send(const GuiIntentCompletionAccept()),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  key: const Key('create-pick-conversation'),
+                  icon: const Icon(Icons.history),
+                  label: const Text('Pick a conversation…'),
+                  onPressed: () => _send(const GuiIntentConversationsOpen()),
                 ),
               ),
             ],

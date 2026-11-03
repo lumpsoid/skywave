@@ -493,7 +493,7 @@ session continues at most one thing, so one `SessionOrigin` enum
 D37).
 Both heads adopt by pasting the id (decided by the user 2026-11-02): TUI
 `c` then `p` (since D37, `c` opens the conversation picker first), the GUI
-dialog's second field. An adopted session's first timeline item is a
+dialog's second field (since D37 beside its "Pick a conversation…" sheet). An adopted session's first timeline item is a
 divider, `Entry::Adopted`.
 **Not carried:** mode, model, effort and grants (as D30). The outside
 conversation's cumulative spend shows in the fork's `total_cost_usd`;

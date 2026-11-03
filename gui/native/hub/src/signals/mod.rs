@@ -30,11 +30,11 @@ pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiInt
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
-    EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
-    RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    ShellPromptView, SnippetView, StopHeadings, SubagentHeaderView, TaskRow, UsageGroupingView,
-    UsageRowView, UsageSpanView,
+    ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
+    CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
+    PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption, ScheduleRow,
+    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, ShellPromptView, SnippetView,
+    StopHeadings, SubagentHeaderView, TaskRow, UsageGroupingView, UsageRowView, UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

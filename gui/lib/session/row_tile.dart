@@ -142,7 +142,9 @@ class RowTile extends StatelessWidget {
       RowKind.userMessage ||
       RowKind.pendingMessage ||
       RowKind.agentMessage ||
-      RowKind.agentError => _Message(
+      RowKind.agentError ||
+      RowKind.importedUserMessage ||
+      RowKind.importedAgentMessage => _Message(
         row: row,
         hit: hit,
         mark: mark,
@@ -152,7 +154,8 @@ class RowTile extends StatelessWidget {
       RowKind.tool ||
       RowKind.toolCall ||
       RowKind.toolResult ||
-      RowKind.approval => _ToolCard(
+      RowKind.approval ||
+      RowKind.importedTool => _ToolCard(
         row: row,
         hit: hit,
         mark: mark,
@@ -257,10 +260,25 @@ class RowTile extends StatelessWidget {
             child: Divider(height: 1, color: theme.colorScheme.outlineVariant),
           ),
         if (row.unreadRule) _UnreadRule(color: theme.colorScheme.error),
-        if (row.timeLabel case final time?)
+        // Imported history says so beside its time, as the TUI does.
+        if (row.timeLabel != null || row.mark != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
-            child: Text(time, style: small),
+            child: Text.rich(
+              TextSpan(
+                style: small,
+                children: [
+                  if (row.timeLabel case final time?) TextSpan(text: time),
+                  if (row.timeLabel != null && row.mark != null)
+                    const TextSpan(text: ' · '),
+                  if (row.mark case final mark?)
+                    TextSpan(
+                      text: mark,
+                      style: const TextStyle(fontStyle: FontStyle.italic),
+                    ),
+                ],
+              ),
+            ),
           ),
         Material(
           type: MaterialType.transparency,
@@ -296,13 +314,17 @@ class RowTile extends StatelessWidget {
                 ),
               ),
               padding: const EdgeInsets.fromLTRB(13, 4, 16, 4),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  body,
-                  if (sections.isNotEmpty)
-                    _Indented(own: row.own, children: sections),
-                ],
+              // Imported history is dimmed: a record from outside Skywave.
+              child: Opacity(
+                opacity: _imported(row) ? 0.65 : 1,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    body,
+                    if (sections.isNotEmpty)
+                      _Indented(own: _mine(row), children: sections),
+                  ],
+                ),
               ),
             ),
           ),
@@ -311,6 +333,19 @@ class RowTile extends StatelessWidget {
     );
   }
 }
+
+/// History imported from outside Skywave.
+bool _imported(TimelineRow row) => switch (row.kind) {
+  RowKind.importedUserMessage ||
+  RowKind.importedAgentMessage ||
+  RowKind.importedTool => true,
+  _ => false,
+};
+
+/// Drawn as the user's own: this device's message, or the user's in
+/// imported history.
+bool _mine(TimelineRow row) =>
+    row.own || row.kind == RowKind.importedUserMessage;
 
 /// Content under an own message lines up with its bubble.
 class _Indented extends StatelessWidget {
@@ -385,14 +420,17 @@ class _Message extends StatelessWidget {
     final scheme = theme.colorScheme;
     final colors = SkyColors.of(context);
     final error = row.kind == RowKind.agentError;
-    final agent = row.kind == RowKind.agentMessage;
+    final agent =
+        row.kind == RowKind.agentMessage ||
+        row.kind == RowKind.importedAgentMessage;
+    final mine = _mine(row);
     final (background, foreground, authorColor) = switch (row) {
       _ when error => (
         scheme.errorContainer,
         scheme.onErrorContainer,
         scheme.error,
       ),
-      _ when row.own => (
+      _ when mine => (
         scheme.primaryContainer,
         scheme.onPrimaryContainer,
         scheme.primary,
@@ -420,8 +458,8 @@ class _Message extends StatelessWidget {
         borderRadius: BorderRadius.only(
           topLeft: const Radius.circular(16),
           topRight: const Radius.circular(16),
-          bottomLeft: Radius.circular(row.own ? 16 : 4),
-          bottomRight: Radius.circular(row.own ? 4 : 16),
+          bottomLeft: Radius.circular(mine ? 16 : 4),
+          bottomRight: Radius.circular(mine ? 4 : 16),
         ),
       ),
       child: Column(
@@ -456,12 +494,12 @@ class _Message extends StatelessWidget {
     );
 
     return Align(
-      alignment: row.own ? Alignment.centerRight : Alignment.centerLeft,
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: LayoutBuilder(
         builder: (context, constraints) => ConstrainedBox(
           constraints: BoxConstraints(maxWidth: constraints.maxWidth * 0.88),
           child: Column(
-            crossAxisAlignment: row.own
+            crossAxisAlignment: mine
                 ? CrossAxisAlignment.end
                 : CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,

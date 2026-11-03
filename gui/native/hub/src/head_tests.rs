@@ -6,7 +6,9 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
-use crate::signals::{ActionIntent, ListKindView, RouteView, RowKind, ScreenView, ShellPromptView};
+use crate::signals::{
+    ActionIntent, ListKindView, RouteView, RowKind, ScreenView, ShellPromptView, ToolState,
+};
 
 /// The head over a detached, paired core, with one session open.
 /// Dispatches go to the core one by one, in order, as the dispatcher
@@ -70,6 +72,482 @@ fn an_adopted_session_starts_with_a_divider_row() {
             false
         )]
     );
+}
+
+/// An event of `session` logged at `at`.
+fn event_at(session: SessionId, at: chrono::DateTime<Utc>, kind: EventKind) -> Event {
+    Event {
+        session_id: session,
+        at,
+        command_id: None,
+        context: skywave_proto::ContextId::first_of(session),
+        kind,
+    }
+}
+
+/// The created event of a session that adopted `conversation`.
+fn adopted_created(conversation: &str) -> EventKind {
+    EventKind::SessionCreated {
+        workdir: "/srv/adopted".into(),
+        context_name: "start".into(),
+        from: Some(skywave_proto::SessionOrigin::Agent {
+            conversation: conversation.into(),
+        }),
+    }
+}
+
+#[test]
+fn imported_history_has_its_own_row_kinds_at_the_agents_time() {
+    use skywave_proto::{CallId, ImportOutcome, ImportedItem, ToolKind, ToolResult};
+    let mut rig = Rig::new();
+    let logged = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let agent_at = Utc.with_ymd_and_hms(2026, 10, 30, 9, 15, 0).unwrap();
+    let new = SessionId::new();
+    let call = CallId::new();
+    let EventKind::ToolCall(tool_call) = a_call(None, call, "Bash", ToolKind::Shell, "cargo test")
+    else {
+        unreachable!()
+    };
+    let result = |call| ToolResult {
+        call,
+        is_error: false,
+        status: Some("exit 0".into()),
+        preview: "ok".into(),
+        lines: 1,
+        output: None,
+    };
+    let imported = |item| EventKind::Imported {
+        at: Some(agent_at),
+        item,
+    };
+    let kinds = vec![
+        adopted_created("3f2a"),
+        imported(ImportedItem::UserMessage {
+            text: "fix the build".into(),
+        }),
+        imported(ImportedItem::ToolCall(tool_call)),
+        imported(ImportedItem::ToolResult(result(Some(call)))),
+        imported(ImportedItem::ToolResult(result(None))),
+        imported(ImportedItem::AgentMessage {
+            text: "fixed".into(),
+        }),
+        EventKind::ImportFinished {
+            outcome: ImportOutcome::Imported { items: 5 },
+        },
+        EventKind::AgentMessage {
+            parent: None,
+            text: "live again".into(),
+        },
+    ];
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: kinds
+                .into_iter()
+                .map(|kind| event_at(new, logged, kind))
+                .collect(),
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSession {
+            session_id: new.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    let rows: Vec<_> = rig
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.kind,
+                row.mark.clone(),
+                row.author.clone(),
+                row.text.clone(),
+                row.tool.as_ref().map(|t| (t.name.clone(), t.state)),
+            )
+        })
+        .collect();
+    let imported = Some("imported".to_owned());
+    assert_eq!(
+        rows,
+        [
+            (
+                RowKind::ContextDivider,
+                None,
+                None,
+                "Continues agent conversation 3f2a from outside Skywave".into(),
+                None
+            ),
+            (
+                RowKind::ImportedUserMessage,
+                imported.clone(),
+                Some("you".into()),
+                "fix the build".into(),
+                None
+            ),
+            (
+                RowKind::ImportedTool,
+                imported.clone(),
+                None,
+                String::new(),
+                Some(("Bash".into(), ToolState::Done))
+            ),
+            (
+                RowKind::ImportedTool,
+                imported.clone(),
+                None,
+                String::new(),
+                Some(("result".into(), ToolState::Plain))
+            ),
+            (
+                RowKind::ImportedAgentMessage,
+                imported,
+                Some("agent".into()),
+                "fixed".into(),
+                None
+            ),
+            (
+                RowKind::ContextDivider,
+                None,
+                None,
+                "Continued in Skywave from here".into(),
+                None
+            ),
+            (
+                RowKind::AgentMessage,
+                None,
+                Some("agent".into()),
+                "live again".into(),
+                None
+            ),
+        ]
+    );
+    // Imported rows show the agent's time, the session's own the log's.
+    let times: Vec<_> = rig.rows().iter().map(|r| r.time_label.clone()).collect();
+    assert_eq!(times[0].as_deref(), Some("12:01"));
+    assert_eq!(times[1].as_deref(), Some("09:15"));
+    assert_eq!(times[2], None, "same minute as the row above");
+    assert_eq!(times[5].as_deref(), Some("12:01"));
+    assert_eq!(rig.rows()[1].at_ms, Some(agent_at.timestamp_millis()));
+    // Imported messages select (copy), like the session's own.
+    assert!(rig.rows()[1].selectable);
+}
+
+#[test]
+fn an_import_that_found_nothing_says_so_in_its_divider() {
+    use skywave_proto::ImportOutcome;
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let new = SessionId::new();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![
+                event_at(new, at, adopted_created("3f2a")),
+                event_at(
+                    new,
+                    at,
+                    EventKind::ImportFinished {
+                        outcome: ImportOutcome::NotFound,
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::OpenSession {
+            session_id: new.0.to_string(),
+        },
+    });
+    rig.results();
+    rig.view();
+    assert_eq!(
+        rig.rows()[1].text,
+        "history not found · continued in Skywave from here"
+    );
+    assert_eq!(rig.rows()[1].kind, RowKind::ContextDivider);
+}
+
+impl Rig {
+    /// The session list as the head last sent it.
+    fn list(&self) -> ScreenView {
+        match &self.head.sent.screen.as_ref().unwrap().screen {
+            list @ ScreenView::SessionList { .. } => list.clone(),
+            other => panic!("not the list: {other:?}"),
+        }
+    }
+
+    /// The conversation picker as the head last sent it.
+    fn conversations(&self) -> Option<crate::signals::ConversationsView> {
+        match self.list() {
+            ScreenView::SessionList { conversations, .. } => conversations,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Back to the session list, online.
+    fn online_on_the_list(&mut self) {
+        self.seam
+            .set_link(skywave_core::Link::Online { latency_ms: 5 });
+        self.intent(GuiIntent::Act {
+            action: ActionIntent::Back,
+        });
+        self.results();
+        self.view();
+    }
+
+    /// Answers the newest conversation listing the core asked for with
+    /// `listed`.
+    fn answer_conversations(
+        &mut self,
+        requests: &std::sync::mpsc::Receiver<skywave_core::Request>,
+        listed: Vec<skywave_proto::OutsideConversation>,
+        truncated: bool,
+    ) {
+        let req = requests
+            .try_iter()
+            .filter_map(|r| match r {
+                skywave_core::Request::ListConversations { req } => Some(req),
+                _ => None,
+            })
+            .last()
+            .expect("the core asked for the conversations");
+        self.seam.conversations_listed(
+            req,
+            Ok(skywave_proto::ConversationsResult::Listed {
+                conversations: listed,
+                truncated,
+            }),
+        );
+        self.view();
+    }
+}
+
+fn outside(id: &str, session: Option<SessionId>) -> skywave_proto::OutsideConversation {
+    skywave_proto::OutsideConversation {
+        id: id.into(),
+        workdir: "/home/me/personal/skywave".into(),
+        title: Some(format!("title of {id}")),
+        first_prompt: Some("fix the build".into()),
+        last_active: Utc.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).unwrap(),
+        messages: 42,
+        session,
+    }
+}
+
+#[test]
+fn the_conversation_picker_lists_and_continues_one() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    assert_eq!(rig.conversations(), None);
+
+    rig.intent(GuiIntent::ConversationsOpen);
+    assert_eq!(rig.actions.last(), Some(&Action::ListConversations));
+    rig.results();
+    rig.view();
+    let loading = rig.conversations().expect("open while it lists");
+    assert_eq!(loading.status_label.as_deref(), Some("listing…"));
+    assert_eq!(
+        loading.empty_label.as_deref(),
+        Some("Asking the server for its agent's conversations…")
+    );
+    assert!(!loading.unavailable);
+
+    rig.answer_conversations(
+        &requests,
+        vec![outside("aaa", Some(rig.session)), outside("bbb", None)],
+        true,
+    );
+    let ready = rig.conversations().unwrap();
+    assert_eq!(
+        ready.status_label.as_deref(),
+        Some("only the newest are listed")
+    );
+    assert_eq!(ready.empty_label, None);
+    let row = &ready.rows[0];
+    assert_eq!(row.conversation_id, "aaa");
+    assert_eq!(row.title, "title of aaa");
+    assert_eq!(row.detail, "…/personal/skywave · 2026-10-01 · 42 messages");
+    assert_eq!(row.session_id, Some(rig.session.0.to_string()));
+    assert!(
+        row.link_label
+            .as_deref()
+            .is_some_and(|l| l.starts_with("already in Skywave: ")),
+        "{row:?}"
+    );
+    assert_eq!(ready.rows[1].session_id, None);
+    assert_eq!(ready.rows[1].link_label, None);
+
+    // One no longer listed does nothing.
+    let outs = rig.intent(GuiIntent::ConversationPick {
+        conversation_id: "gone".into(),
+    });
+    assert!(outs.is_empty());
+    assert!(queued_creations(&rig).is_empty());
+
+    rig.intent(GuiIntent::ConversationPick {
+        conversation_id: "bbb".into(),
+    });
+    assert_eq!(
+        rig.actions.last(),
+        Some(&Action::CreateSession {
+            workdir: "/home/me/personal/skywave".into(),
+            conversation: Some("bbb".into()),
+        })
+    );
+    rig.results();
+    rig.view();
+    assert_eq!(rig.conversations(), None, "taking one closes the picker");
+    // The pending creation says it imports.
+    let ScreenView::SessionList { creating, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert_eq!(creating.len(), 1);
+    assert_eq!(
+        creating[0].note.as_deref(),
+        Some("will import when online"),
+        "{creating:?}"
+    );
+}
+
+#[test]
+fn a_picked_conversation_closes_the_new_session_prompt() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::ConversationsOpen);
+    rig.results();
+    rig.view();
+    rig.answer_conversations(&requests, vec![outside("aaa", None)], false);
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert!(create.is_some(), "the prompt stays under the picker");
+    rig.intent(GuiIntent::ConversationPick {
+        conversation_id: "aaa".into(),
+    });
+    rig.results();
+    rig.view();
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert_eq!(create, None);
+}
+
+#[test]
+fn closing_the_conversation_picker_keeps_the_prompt() {
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::CreateOpen);
+    rig.intent(GuiIntent::ConversationsOpen);
+    rig.results();
+    rig.view();
+    rig.answer_conversations(&requests, Vec::new(), false);
+    assert_eq!(
+        rig.conversations().unwrap().empty_label.as_deref(),
+        Some("The server's agent has no conversations under the roots.")
+    );
+    rig.intent(GuiIntent::ConversationsClose);
+    assert_eq!(rig.actions.last(), Some(&Action::EndConversations));
+    rig.results();
+    rig.view();
+    assert_eq!(rig.conversations(), None);
+    let ScreenView::SessionList { create, .. } = rig.list() else {
+        unreachable!()
+    };
+    assert!(create.is_some());
+    // Closed, a second close dispatches nothing.
+    let before = rig.actions.len();
+    rig.intent(GuiIntent::ConversationsClose);
+    assert_eq!(rig.actions.len(), before);
+}
+
+#[test]
+fn offline_the_conversation_picker_says_why_it_is_empty() {
+    let mut rig = Rig::new();
+    rig.seam.set_link(skywave_core::Link::Reconnecting {
+        attempt: 1,
+        retry_at: Utc::now() + chrono::TimeDelta::seconds(2),
+        offline_since: Utc::now(),
+    });
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    rig.intent(GuiIntent::ConversationsOpen);
+    rig.results();
+    rig.view();
+    let picker = rig.conversations().unwrap();
+    assert!(picker.unavailable);
+    assert_eq!(picker.status_label, None);
+    assert_eq!(
+        picker.empty_label.as_deref(),
+        Some("offline · the server lists its conversations once connected")
+    );
+    assert!(picker.rows.is_empty());
+}
+
+#[test]
+fn the_conversation_picker_opens_only_over_the_active_list() {
+    let mut rig = Rig::new();
+    // On the session screen.
+    let outs = rig.intent(GuiIntent::ConversationsOpen);
+    assert!(outs.is_empty());
+    assert!(!rig.actions.contains(&Action::ListConversations));
+}
+
+#[test]
+fn an_adopted_session_row_says_its_history_is_importing() {
+    use skywave_proto::ImportOutcome;
+    let mut rig = Rig::new();
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 1, 0).unwrap();
+    let new = SessionId::new();
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(new, at, adopted_created("3f2a"))],
+        })
+        .unwrap();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Back,
+    });
+    rig.results();
+    rig.view();
+    let importing = |rig: &Rig| match rig.list() {
+        ScreenView::SessionList { rows, .. } => rows
+            .iter()
+            .map(|r| (r.session_id.clone(), r.importing_label.clone()))
+            .collect::<Vec<_>>(),
+        _ => unreachable!(),
+    };
+    let label = |rig: &Rig, id: SessionId| {
+        importing(rig)
+            .into_iter()
+            .find(|(s, _)| *s == id.0.to_string())
+            .unwrap()
+            .1
+    };
+    assert_eq!(label(&rig, new).as_deref(), Some("importing history…"));
+    assert_eq!(label(&rig, rig.session), None);
+    rig.seam
+        .apply_events(&EventBatch {
+            from: Seq(rig.seam.cursor().unwrap().0 + 1),
+            events: vec![event_at(
+                new,
+                at,
+                EventKind::ImportFinished {
+                    outcome: ImportOutcome::Unavailable,
+                },
+            )],
+        })
+        .unwrap();
+    rig.view();
+    assert_eq!(label(&rig, new), None);
 }
 
 impl Rig {
