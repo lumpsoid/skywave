@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! <agent.command> -p --input-format stream-json --output-format stream-json \
-//!   --verbose --permission-prompt-tool stdio [<session rules>] \
+//!   --verbose --permission-prompt-tool stdio \
+//!   [--allow-dangerously-skip-permissions] [<session rules>] \
 //!   (--session-id <uuid> | --resume <uuid> |
 //!    --resume <parent> --fork-session --session-id <uuid>) <agent.args...>
 //! ```
@@ -134,6 +135,12 @@ pub const REQUIRED_ARGS: [&str; 8] = [
     "stdio",
 ];
 
+/// The flag a process gets when the server allows bypass
+/// (`agent.allow_bypass`): `set_permission_mode` may then switch to
+/// `bypassPermissions` mid-session, without the session starting in it as
+/// `--dangerously-skip-permissions` would (docs/agents/claude-code.md §3.6).
+pub const ALLOW_BYPASS_ARG: &str = "--allow-dangerously-skip-permissions";
+
 /// How long shutdown waits for a turn to end, and then for the exit.
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// How long start waits for the initialize handshake.
@@ -199,11 +206,16 @@ impl ClaudeCodeAdapter {
     }
 
     /// The CLI arguments for a process taking up `session`: the required
-    /// flags, the flags granting `session_rules`, the session's flags
+    /// flags, [`ALLOW_BYPASS_ARG`] when `agent.allow_bypass`, the flags
+    /// granting `session_rules`, the session's flags
     /// ([`CliSession::args`]), then `agent.args`.
     pub fn command_args(&self, session: CliSession, session_rules: &[Value]) -> Vec<String> {
+        let allow_bypass = self.config.allow_bypass;
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
-        args.extend(rules::cli_args(session_rules));
+        if allow_bypass {
+            args.push(ALLOW_BYPASS_ARG.to_owned());
+        }
+        args.extend(rules::cli_args(session_rules, allow_bypass));
         args.extend(session.args());
         args.extend(self.config.args.iter().cloned());
         args
@@ -318,8 +330,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
         let child = self.spawn(&spec.workdir, session, &session_rules)?;
         let mut process = Process::new(child, &span, self.write_timeout, self.term_grace)?;
-        let mut protocol =
-            Protocol::new(session.id(), session.handle_stored()).with_session_rules(session_rules);
+        let mut protocol = Protocol::new(session.id(), session.handle_stored())
+            .with_session_rules(session_rules)
+            .with_bypass(self.config.allow_bypass);
 
         let mut early = Vec::new();
         let handshake = handshake(&mut process, &mut protocol, &mut early).instrument(span.clone());

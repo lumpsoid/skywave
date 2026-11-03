@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId};
 use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
 use skywaved::agent::claude_code::rules;
-use skywaved::agent::claude_code::{ClaudeCodeAdapter, REQUIRED_ARGS};
+use skywaved::agent::claude_code::{ALLOW_BYPASS_ARG, ClaudeCodeAdapter, REQUIRED_ARGS};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
     AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants, ModelChoice,
@@ -243,7 +243,7 @@ fn granted_rule(offers: &HashMap<String, Value>, request: &str, response: &Value
     let [update] = granted.as_array().map(Vec::as_slice).unwrap_or_default() else {
         panic!("request {request}: expected one granted update, got {granted}");
     };
-    let offered = rules::offered(offers.get(request));
+    let offered = rules::offered(offers.get(request), false);
     let index = offered
         .iter()
         .position(|(_, u)| u == update)
@@ -824,6 +824,33 @@ fn granting_a_rule_sends_its_suggestion_as_updated_permissions() {
             "request #{n}"
         );
     }
+}
+
+#[test]
+fn a_bypass_suggestion_is_offered_only_where_the_server_allows_it() {
+    // A recorded request, with the CLI's `bypassPermissions` suggestion
+    // (docs/agents/claude-code.md §3.6) added after its own.
+    let mut request = permission_requests("permissions").remove(1);
+    let every = json!({"type":"setMode","mode":"bypassPermissions","destination":"cliArg"});
+    request["request"]["permission_suggestions"]
+        .as_array_mut()
+        .unwrap()
+        .push(every);
+    let line = serde_json::to_string(&request).unwrap();
+    let labels = |protocol: Protocol| -> Vec<String> {
+        let mut protocol = protocol;
+        let out = protocol.on_line(&line);
+        let [AdapterEvent::ApprovalRequested { suggestions, .. }] = &out.events[..] else {
+            panic!("{:?}", out.events);
+        };
+        suggestions.iter().map(|s| s.label.clone()).collect()
+    };
+    let without = labels(Protocol::new(Uuid::new_v4(), false));
+    assert_eq!(without.len(), 3, "the recorded ones: {without:?}");
+    assert!(!without.iter().any(|l| l == "every tool"), "{without:?}");
+    let with = labels(Protocol::new(Uuid::new_v4(), false).with_bypass(true));
+    assert_eq!(with[..3], without[..]);
+    assert_eq!(with[3..], ["every tool"]);
 }
 
 #[test]
@@ -1588,6 +1615,7 @@ fn adapter() -> ClaudeCodeAdapter {
     ClaudeCodeAdapter::new(AgentConfig {
         command: fake_cli(),
         args: vec!["--model".to_owned(), "haiku".to_owned()],
+        allow_bypass: false,
     })
     .with_grace_period(Duration::from_secs(5))
 }
@@ -2186,6 +2214,7 @@ async fn a_missing_command_is_a_start_error() {
     let adapter = ClaudeCodeAdapter::new(AgentConfig {
         command: tmp.path().join("no-such-agent"),
         args: Vec::new(),
+        allow_bypass: false,
     });
     let error = adapter
         .start(spec(tmp.path(), Conversation::Fresh))
@@ -2460,6 +2489,46 @@ fn the_agent_dies_with_the_thread_that_started_it() {
     let pid = fake_pid(tmp.path());
     assert!(gone(pid), "agent process {pid} outlived its thread");
     assert!(tmp.path().join("term.txt").exists(), "no SIGTERM came");
+}
+
+#[tokio::test]
+async fn with_bypass_allowed_the_cli_is_launched_to_switch_to_it_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let adapter = ClaudeCodeAdapter::new(AgentConfig {
+        command: fake_cli(),
+        args: Vec::new(),
+        allow_bypass: true,
+    })
+    .with_grace_period(Duration::from_secs(5));
+    let (mut session, mut events) = adapter
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    assert_eq!(
+        take_raw(&mut events, 2).await,
+        [
+            AdapterEvent::BackgroundTasks(Vec::new()),
+            AdapterEvent::Effort(Some(Effort::Medium)),
+        ]
+    );
+    // The flag that allows a switch, not one that starts in bypass.
+    let argv = argv(tmp.path());
+    assert_eq!(argv[..REQUIRED_ARGS.len()], REQUIRED_ARGS);
+    assert_eq!(argv[REQUIRED_ARGS.len()], ALLOW_BYPASS_ARG);
+    assert_eq!(argv[REQUIRED_ARGS.len() + 1], "--session-id");
+    assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+    assert!(!argv.iter().any(|a| a == "--permission-mode"));
+    // Then the switch goes through (the fake refuses it without the flag,
+    // as the real CLI does).
+    session
+        .set_permission_mode(PermissionMode::Bypass)
+        .await
+        .unwrap();
+    assert_eq!(
+        take_raw(&mut events, 1).await,
+        [AdapterEvent::PermissionModeSet(PermissionMode::Bypass)]
+    );
+    session.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -106,7 +106,7 @@ version changed. Client and server must match it exactly (checked at
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
-| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the log head, every paired device with its name, and whether the server runs shell commands. |
+| `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the log head, every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
 | `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). |
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |

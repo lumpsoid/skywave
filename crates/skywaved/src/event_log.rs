@@ -58,6 +58,9 @@ pub struct EventLog {
     /// Whether `RunShell` and `StopShell` are accepted ([`EventLog::with_shell`]).
     /// Beside `inner`, not in it, so the builder needs no unique `Arc`.
     shell_enabled: bool,
+    /// Whether a `SetPermissionMode` may ask for bypass
+    /// ([`EventLog::with_bypass`]). Beside `inner` like `shell_enabled`.
+    bypass_allowed: bool,
 }
 
 #[derive(Debug)]
@@ -175,6 +178,7 @@ impl EventLog {
         Ok(EventLog {
             inner: Arc::new(Inner { head, roots }),
             shell_enabled: false,
+            bypass_allowed: false,
         })
     }
 
@@ -191,6 +195,23 @@ impl EventLog {
     /// Whether this log accepts shell commands.
     pub fn shell_enabled(&self) -> bool {
         self.shell_enabled
+    }
+
+    /// This log with bypass mode allowed or not (`agent.allow_bypass`);
+    /// [`EventLog::open`] does not allow it, and a `SetPermissionMode`
+    /// asking for [`PermissionMode::Bypass`](skywave_proto::PermissionMode)
+    /// is then refused `BypassDisabled`. Set it before cloning, like
+    /// [`EventLog::with_shell`].
+    pub fn with_bypass(self, allowed: bool) -> EventLog {
+        EventLog {
+            bypass_allowed: allowed,
+            ..self
+        }
+    }
+
+    /// Whether this log accepts a switch to bypass mode.
+    pub fn bypass_allowed(&self) -> bool {
+        self.bypass_allowed
     }
 
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.

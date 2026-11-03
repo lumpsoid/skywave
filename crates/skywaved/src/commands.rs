@@ -137,7 +137,11 @@
 //! the agent (starting it if needed), and logs its answer as a `…Changed`
 //! or `…Refused` naming the command. A model is logged as
 //! [`skywave_proto::normalise_model`] leaves it; a blank one is
-//! `UnknownModel`.
+//! `UnknownModel`. A `SetPermissionMode` asking for
+//! [`PermissionMode::Bypass`] is `BypassDisabled` while the log does not
+//! allow bypass ([`EventLog::with_bypass`]), before anything else is
+//! checked: the server refuses it from its own config, never leaving it to
+//! the agent.
 //!
 //! **StopTask.** `UnknownTask` unless the task is in the session's live
 //! set as last logged (the folded `BackgroundTasksChanged`): a definitive
@@ -161,8 +165,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
-    EventKind, ImportOutcome, RejectReason, Seq, SessionId, SessionOrigin, check_conversation_id,
-    context_name, limits, normalise_context_name,
+    EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId, SessionOrigin,
+    check_conversation_id, context_name, limits, normalise_context_name,
 };
 
 use crate::agent::import::{self, Prepared};
@@ -484,6 +488,9 @@ impl EventLog {
                 (*session_id, session.context, kind)
             }
             CommandKind::SetPermissionMode { session_id, mode } => {
+                if *mode == PermissionMode::Bypass && !self.bypass_allowed() {
+                    return Ok(Err(RejectReason::BypassDisabled));
+                }
                 let Some(session) = known(*session_id)? else {
                     return Ok(Err(RejectReason::UnknownSession));
                 };

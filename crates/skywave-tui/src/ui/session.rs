@@ -11,16 +11,16 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, PermissionMode,
-    RuleSuggestion, RunWhen, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, RunWhen,
+    SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
     TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, agent_refusal,
     answer_words, approval_origin, background_rows, blob_size, bytes, context_moved_label,
-    context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, outgoing_label,
-    repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status, task_kind_word, tokens,
-    trail, turn_time, viewing_hint, work_summary,
+    context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, offered_modes,
+    outgoing_label, repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status,
+    task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
 
@@ -508,7 +508,8 @@ fn render_picker(
             selected,
             confirm: true,
         } => {
-            let mode = PermissionMode::ALL[*selected];
+            let modes = offered_modes(agent.bypass_allowed);
+            let mode = modes[(*selected).min(modes.len() - 1)];
             let lines = vec![
                 Line::from(format!("Switch to {}?", mode_label(mode))).bold(),
                 Line::from(format!("{}.", capitalised(mode_detail(mode)))).yellow(),
@@ -517,7 +518,7 @@ fn render_picker(
             (" Permission mode ".to_owned(), lines, None)
         }
         Picker::Mode { selected, .. } => {
-            let modes = PermissionMode::ALL.map(|mode| {
+            let modes = offered_modes(agent.bypass_allowed).into_iter().map(|mode| {
                 let mut spans = vec![
                     Span::raw(format!("{:<14}", mode_label(mode))),
                     Span::raw(mode_detail(mode)).dark_gray(),
@@ -527,7 +528,7 @@ fn render_picker(
                 }
                 spans
             });
-            let lines = list_lines(modes.into(), *selected, rows);
+            let lines = list_lines(modes.collect(), *selected, rows);
             (
                 format!(" Permission mode · now {} ", agent_mode_label(agent)),
                 lines,

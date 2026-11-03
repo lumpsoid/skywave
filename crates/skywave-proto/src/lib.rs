@@ -98,7 +98,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// (with [`ImportOutcome`]); `GET` [`path::CONVERSATIONS`] answering
 /// [`ConversationsResult`] (with [`OutsideConversation`]); and
 /// [`limits::CONVERSATIONS_MAX`].
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// v17: bypass by opt-in. `bypass` on [`HelloResponse`] and
+/// `RejectReason::BypassDisabled`.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -855,7 +858,9 @@ pub enum PermissionMode {
     Auto,
     /// Never asks: what no rule allows is denied.
     DontAsk,
-    /// Never asks: everything runs.
+    /// Never asks: everything runs. Only on a server that allows it
+    /// ([`HelloResponse::bypass`]); elsewhere asking for it is
+    /// `BypassDisabled`.
     Bypass,
 }
 
@@ -1695,6 +1700,9 @@ pub enum RejectReason {
     /// `RunShell.command` is blank after trimming, or longer than
     /// [`limits::SHELL_COMMAND_MAX_BYTES`].
     BadShellCommand,
+    /// A `SetPermissionMode` asking for [`PermissionMode::Bypass`] while the
+    /// server does not allow it ([`HelloResponse::bypass`]).
+    BypassDisabled,
 }
 
 impl RejectReason {
@@ -1750,6 +1758,9 @@ pub struct HelloResponse {
     /// Whether the server runs shell commands (`RunShell`); when off it
     /// refuses them as `ShellDisabled`.
     pub shell: bool,
+    /// Whether the server's operator allows [`PermissionMode::Bypass`];
+    /// when not, a `SetPermissionMode` asking for it is `BypassDisabled`.
+    pub bypass: bool,
 }
 
 /// A paired device as other devices show it.

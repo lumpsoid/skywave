@@ -1376,6 +1376,11 @@ impl Model {
         self.settings.shell_enabled = enabled;
     }
 
+    /// The server said whether it allows bypass mode (already stored).
+    pub(crate) fn bypass_allowed(&mut self, allowed: bool) {
+        self.settings.bypass_allowed = allowed;
+    }
+
     /// Devices the events name that this device knows no name for.
     pub(crate) fn unnamed_devices(&self, batch: &EventBatch) -> HashSet<DeviceId> {
         batch
@@ -2248,6 +2253,7 @@ impl Model {
             mode_refused: agent.mode.refused.clone(),
             model_refused: agent.model.refused.clone(),
             models: self.models.clone(),
+            bypass_allowed: self.settings.bypass_allowed,
         }
     }
 

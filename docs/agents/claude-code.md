@@ -51,6 +51,7 @@ The spec needs no change.
 claude -p \
   --input-format stream-json --output-format stream-json --verbose \
   --permission-prompt-tool stdio \
+  [--allow-dangerously-skip-permissions] \
   [--session-id <uuid> | --resume <uuid> |
    --resume <parent> --fork-session --session-id <uuid>] \
   [--include-partial-messages] [--model <m>]
@@ -72,6 +73,10 @@ skywaved starts a fresh context with `--session-id`, a restart with
   so the user's plugins, hooks and MCP servers stayed out of the transcript.
   Whether T09 does the same is a config question (`agent.args`). Without these
   flags, user hooks and MCP servers can add messages and prompts.
+- `--allow-dangerously-skip-permissions` is passed only when the server
+  allows bypass (`agent.allow_bypass`, §3.6). **[C]** with 2.1.310: the
+  session still starts in `default`, and `set_permission_mode
+  bypassPermissions` then succeeds instead of `bypass_not_launched`.
 - `--include-partial-messages` adds `stream_event` lines that carry
   Anthropic-API stream events (§2.4). **[C]**
 - The working directory is the process cwd (D14). `system/init.cwd` echoes it. **[C]**
@@ -281,7 +286,7 @@ started with them as flags, before the session flag:
 
 | update | flags |
 |--------|-------|
-| `setMode` `acceptEdits` / `bypassPermissions` | `--permission-mode <mode>` |
+| `setMode` `acceptEdits` / `bypassPermissions` | `--permission-mode <mode>` (`bypassPermissions` only while `agent.allow_bypass`) |
 | `addRules` (`allow`) | `--allowedTools <Tool(content)>` per rule |
 | `addDirectories` | `--add-dir <dir>` per directory |
 
@@ -444,28 +449,33 @@ the reply shape is wrong. Record what the CLI does instead (does it change
 `system/init.permissionMode`? does it write `.claude/settings.local.json`?)
 before changing `protocol::allow_always_response`.
 
-### 3.6 Open decision: offering `bypassPermissions`
+### 3.6 Bypass only where the operator allows it (D38)
 
-**Current behaviour (unchanged).** `rules::offered` offers a
-`setMode` `bypassPermissions` suggestion, labelled `every tool`, only when
-the CLI itself puts it in a request's `permission_suggestions`. Skywave
-never makes one up. None of the recorded requests had one. Once granted, a
-session-scoped one is kept in the session's grants and comes back as
-`--permission-mode bypassPermissions` on every later start. That is **[U]**
-(§3.2).
+Decided (D38): bypass, where every tool runs and nothing
+asks, is available from a head only when the server's operator set
+`[agent] allow_bypass = true` in `skywaved.toml`. It is off by default.
 
-**Trade-off, for the user to decide:**
-
-- *Keep offering it when suggested.* Skywave stays a faithful remote for
-  what the CLI offers. But one keypress, perhaps on a phone over a bad link,
-  turns off every later prompt for the session, including after a restart.
-- *Never offer it.* Prompts can only be widened one tool, one directory, or
-  file edits at a time. A user who wants bypass starts the agent with it
-  (`agent.args`) on purpose. The cost: Skywave hides an option the CLI gave,
-  and a session that needs many approvals asks more often.
-
-A middle way is to offer it only with an extra confirmation in the client.
-That changes the protocol and the UI, so it is not part of d29758.
+- **Launch.** With the opt-in, every CLI process gets
+  `--allow-dangerously-skip-permissions` (§1): it starts in its usual mode
+  and may be switched to `bypassPermissions` mid-session (§3.7). Skywave
+  never launches with `--dangerously-skip-permissions`, which would start
+  every session in bypass. Checked with 2.1.310 (`--help` lists both
+  flags; `skywave-claude-compat --only bypass_allowed`).
+- **Mode switch.** Without the opt-in the server refuses a
+  `SetPermissionMode` to bypass itself, as `RejectReason::BypassDisabled`,
+  before the CLI is asked (§3.9). The heads offer bypass only when
+  `HelloResponse::bypass` says the server allows it, and ask once more
+  before sending it.
+- **Rule suggestions.** `rules::offered` offers a `setMode`
+  `bypassPermissions` suggestion, labelled `every tool`, only with the
+  opt-in, and only when the CLI itself puts it in a request's
+  `permission_suggestions` (Skywave never makes one up; none of the
+  recorded requests had one). Without the opt-in it is dropped, so no
+  approval can grant it. A session-scoped one granted while the opt-in was
+  on is kept in the session's grants, but `rules::cli_args` passes it back
+  as `--permission-mode bypassPermissions` only while the opt-in is still
+  on: turning it off takes bypass away from every later start. Whether
+  that flag holds on resume is **[U]** (§3.2).
 
 ### 3.7 Changing the permission mode mid-session [C]
 
@@ -597,9 +607,13 @@ thinking capabilities are not used.
   from the newest list in the log. The effort is said by nobody unasked,
   so the adapter reads it (`get_settings`, §3.10) after the `initialize`
   answer and after every successful `set_model`, and logs it like the rest.
-- Bypass is offered like any mode; without `--dangerously-skip-permissions`
-  in `agent.args` the CLI refuses it (`bypass_not_launched`) and the
-  refusal is logged (§3.6 is about rule suggestions, not this switch).
+- Bypass is accepted only where the server allows it (`agent.allow_bypass`,
+  §3.6). Without the opt-in the command is rejected `BypassDisabled` and
+  nothing is logged or sent to the CLI; with it the CLI is launched with
+  `--allow-dangerously-skip-permissions` and the switch goes through like
+  any other. A `bypass_not_launched` refusal can now come only from an
+  `agent.command` that ignores that flag; it would be logged as
+  `PermissionModeRefused` like any refusal.
 
 ### 3.10 Changing effort mid-session [C]
 

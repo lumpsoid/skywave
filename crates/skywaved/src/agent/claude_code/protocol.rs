@@ -380,6 +380,9 @@ pub struct Protocol {
     /// Granted permission updates the process keeps only in itself: the
     /// session's grants.
     session_rules: Vec<Value>,
+    /// Whether a switch to bypass is offered as a rule suggestion
+    /// ([`Protocol::with_bypass`]).
+    allow_bypass: bool,
     next_request: u64,
     initialize_id: Option<String>,
     ready: bool,
@@ -452,6 +455,7 @@ impl Protocol {
             session_id,
             handle_reported: resumed,
             session_rules: Vec::new(),
+            allow_bypass: false,
             next_request: 0,
             initialize_id: None,
             ready: false,
@@ -481,6 +485,13 @@ impl Protocol {
     /// The process was started with `rules`, the session's grants so far.
     pub fn with_session_rules(mut self, rules: Vec<Value>) -> Protocol {
         self.session_rules = rules;
+        self
+    }
+
+    /// Whether the server allows bypass (`agent.allow_bypass`), so a
+    /// `bypassPermissions` suggestion is offered; [`Protocol::new`] does not.
+    pub fn with_bypass(mut self, allow: bool) -> Protocol {
+        self.allow_bypass = allow;
         self
     }
 
@@ -970,9 +981,10 @@ impl Protocol {
             .get("tool_use_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let (suggestions, updates) = rules::offered(request.get("permission_suggestions"))
-            .into_iter()
-            .unzip();
+        let (suggestions, updates) =
+            rules::offered(request.get("permission_suggestions"), self.allow_bypass)
+                .into_iter()
+                .unzip();
         // A background subagent asks under its task id; one not live (a
         // foreground subagent) works for the turn, so is the turn's.
         let task = request

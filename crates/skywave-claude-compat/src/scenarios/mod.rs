@@ -64,6 +64,12 @@ pub const ALL: &[Scenario] = &[
         run: controls::permission_modes,
     },
     Scenario {
+        name: "bypass_allowed",
+        tier: Tier::Quick,
+        about: "--allow-dangerously-skip-permissions: starts asking, may switch to bypass",
+        run: controls::bypass_allowed,
+    },
+    Scenario {
         name: "model_switch",
         tier: Tier::Quick,
         about: "set_model: resolved model, refusal, default",

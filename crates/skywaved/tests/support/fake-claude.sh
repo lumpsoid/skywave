@@ -18,7 +18,8 @@
 # with `--fork-session` too (the parent is unknown; §5). A fork otherwise
 # runs as its `--session-id`, as the real CLI does.
 # `set_permission_mode` and `set_model` are answered like the real CLI's
-# (§3.7): bypassPermissions and the model "bogus" are refused.
+# (§3.7): bypassPermissions is refused unless the CLI was launched with
+# --allow-dangerously-skip-permissions (§3.6), and the model "bogus" is.
 # `apply_flag_settings` and `get_settings` are answered like the real CLI's
 # (§3.10): the apply is acked with an empty success and sets `effortLevel`
 # only when it is a level the CLI knows, and `get_settings` reads back
@@ -37,13 +38,17 @@ model=""
 effort="medium"
 resume=""
 fork=""
+allow_bypass=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
     --session-id) sid="$arg" ;;
     --resume) resume="$arg" ;;
   esac
-  case "$arg" in --fork-session) fork=1 ;; esac
+  case "$arg" in
+    --fork-session) fork=1 ;;
+    --allow-dangerously-skip-permissions) allow_bypass=1 ;;
+  esac
   prev="$arg"
 done
 # Without --fork-session the process runs as the session it resumes.
@@ -87,7 +92,7 @@ while IFS= read -r line; do
       ;;
     *'"subtype":"set_permission_mode"'*)
       asked=$(printf '%s' "$line" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
-      if [ "$asked" = "bypassPermissions" ]; then
+      if [ "$asked" = "bypassPermissions" ] && [ -z "$allow_bypass" ]; then
         printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions","error_code":"bypass_not_launched"}}\n' "$(reqid "$line")"
       else
         mode="$asked"

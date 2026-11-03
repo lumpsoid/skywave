@@ -1665,6 +1665,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
                 },
             ],
             shell: false,
+            bypass: false,
         })
         .unwrap();
     h.sync();
@@ -6505,6 +6506,7 @@ fn logged_command(h: &mut Harness, id: SessionId, minute: u32, kind: EventKind) 
 #[test]
 fn the_mode_list_switches_and_bypass_asks_once_more() {
     let (mut h, id, me) = open_session();
+    hello_with(&mut h, me, false, true);
     // A `p` in the composer is text, not the mode list.
     assert_eq!(h.key(KeyCode::Char('p')), None);
     assert!(h.app.ui().session.as_ref().unwrap().picker.is_none());
@@ -7456,10 +7458,39 @@ fn the_help_lists_o_and_the_subagent_stop() {
     assert_contains(&help, "in a subagent's view: stop its task");
 }
 
+#[test]
+fn without_the_servers_leave_the_mode_list_has_no_bypass() {
+    let (mut h, id, me) = open_session();
+    hello_with(&mut h, me, false, false);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('p'));
+    let screen = h.screen();
+    assert_contains(&screen, "never asks; what no rule allows is denied");
+    assert!(!screen.contains("never asks; everything runs"), "{screen}");
+    // The last row is don't ask: going on stays there, and Enter sends it
+    // without asking once more.
+    for _ in 0..8 {
+        h.key(KeyCode::Char('j'));
+    }
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::SetPermissionMode {
+            session_id: id,
+            mode: PermissionMode::DontAsk,
+        })
+    );
+}
+
 // ---- shell mode -------------------------------------------------------------
 
 /// The server's `hello`, saying whether it runs shell commands.
 fn hello(h: &mut Harness, me: DeviceId, shell: bool) {
+    hello_with(h, me, shell, false);
+}
+
+/// The server's `hello`, saying whether it runs shell commands and
+/// whether it allows bypass mode.
+fn hello_with(h: &mut Harness, me: DeviceId, shell: bool, bypass: bool) {
     h.seam
         .hello_received(&HelloResponse {
             protocol_version: skywave_proto::PROTOCOL_VERSION,
@@ -7468,6 +7499,7 @@ fn hello(h: &mut Harness, me: DeviceId, shell: bool) {
             head: Seq::ZERO,
             devices: Vec::new(),
             shell,
+            bypass,
         })
         .unwrap();
     h.sync();

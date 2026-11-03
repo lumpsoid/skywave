@@ -2,6 +2,7 @@
 //! no tokens.
 
 use serde_json::{Value, json};
+use skywaved::agent::claude_code::ALLOW_BYPASS_ARG;
 use skywaved::agent::claude_code::protocol::{mode_name, parse_effort};
 use skywaved::agent::{AdapterEvent, Effort, ModelChoice, PermissionMode};
 
@@ -109,6 +110,33 @@ pub fn permission_modes(ctx: &mut Ctx) -> Result<(), Stop> {
     ctx.checks.contract(
         "set_permission_mode default succeeds",
         expect_mode(back, PermissionMode::Ask),
+    );
+    Ok(())
+}
+
+/// What `agent.allow_bypass` launches with: the session does not start in
+/// bypass, and may switch to it (docs/agents/claude-code.md §3.6).
+pub fn bypass_allowed(ctx: &mut Ctx) -> Result<(), Stop> {
+    let mut s = ctx.session(Setup {
+        args: vec![ALLOW_BYPASS_ARG.to_owned()],
+        ..Setup::default()
+    })?;
+    let mode = s.find_event(0, |e| match e {
+        AdapterEvent::PermissionMode(mode) => Some(*mode),
+        _ => None,
+    });
+    ctx.checks.contract(
+        "the allow flag does not start the session in bypass",
+        match mode.map(|(_, mode)| mode) {
+            Some(PermissionMode::Bypass) => Err("starts in bypassPermissions".into()),
+            Some(_) => Ok(()),
+            None => Err("no current_permission_mode the adapter reads".into()),
+        },
+    );
+    let bypass = set_mode(&mut s, PermissionMode::Bypass);
+    ctx.checks.contract(
+        "with the allow flag, set_permission_mode bypassPermissions succeeds",
+        expect_mode(bypass, PermissionMode::Bypass),
     );
     Ok(())
 }

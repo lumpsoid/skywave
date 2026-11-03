@@ -368,6 +368,9 @@ pub struct Settings {
     /// Whether the server runs shell commands, as its last `hello` said
     /// ([`Store::set_shell_enabled`]); `false` until one said so.
     pub shell_enabled: bool,
+    /// Whether the server allows bypass mode, as its last `hello` said
+    /// ([`Store::set_bypass_allowed`]); `false` until one said so.
+    pub bypass_allowed: bool,
 }
 
 /// Delivery state of a queued command.
@@ -1457,17 +1460,8 @@ impl Store {
                     }
                 }
                 KEY_SERVER_ADDRESS => settings.server_address = Some(value),
-                KEY_SHELL_ENABLED => {
-                    settings.shell_enabled = match value.as_str() {
-                        "true" => true,
-                        "false" => false,
-                        _ => {
-                            return Err(
-                                bad_value(1, Type::Text, format!("shell flag {value:?}")).into()
-                            );
-                        }
-                    }
-                }
+                KEY_SHELL_ENABLED => settings.shell_enabled = flag(&value, "shell")?,
+                KEY_BYPASS_ALLOWED => settings.bypass_allowed = flag(&value, "bypass")?,
                 // Keys written by a newer build are left alone.
                 _ => {}
             }
@@ -1493,6 +1487,12 @@ impl Store {
         self.put_setting(KEY_SHELL_ENABLED, Some(value))
     }
 
+    /// Keeps whether the server allows bypass mode, as its `hello` said.
+    pub fn set_bypass_allowed(&self, allowed: bool) -> Result<(), StoreError> {
+        let value = if allowed { "true" } else { "false" };
+        self.put_setting(KEY_BYPASS_ALLOWED, Some(value))
+    }
+
     fn put_setting(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
         match value {
             Some(value) => self.conn.execute(
@@ -1511,6 +1511,17 @@ impl Store {
 const KEY_BLOB_POLICY: &str = "blob_policy";
 const KEY_SERVER_ADDRESS: &str = "server_address";
 const KEY_SHELL_ENABLED: &str = "shell_enabled";
+const KEY_BYPASS_ALLOWED: &str = "bypass_allowed";
+
+/// A server flag setting as [`Store::set_shell_enabled`] and
+/// [`Store::set_bypass_allowed`] write it.
+fn flag(value: &str, what: &str) -> Result<bool, StoreError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(bad_value(1, Type::Text, format!("{what} flag {value:?}")).into()),
+    }
+}
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn.transaction()?;

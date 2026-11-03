@@ -17,9 +17,9 @@ use skywave_present::format::{
     context_moved_label, context_row, conversation_detail, conversation_link, conversation_title,
     conversations_empty, conversations_status, delivery_label, dollars, effort_label,
     effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
-    model_refusal, move_refusal, outgoing_label, repeat_word, scope_label, stop_heading,
-    stop_warning, subagent_status, task_kind_word, tokens, trail, turn_time, viewing_hint,
-    work_summary,
+    model_refusal, move_refusal, offered_modes, outgoing_label, repeat_word, scope_label,
+    stop_heading, stop_warning, subagent_status, task_kind_word, tokens, trail, turn_time,
+    viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -578,7 +578,7 @@ fn agent_settings(agent: &AgentView) -> AgentSettingsView {
             .map(failure)
             .or_else(|| effort_refusal(agent))
             .map(|r| clean_line(&r)),
-        modes: PermissionMode::ALL
+        modes: offered_modes(agent.bypass_allowed)
             .into_iter()
             .map(|mode| ModeOption {
                 mode: mode_view(mode),

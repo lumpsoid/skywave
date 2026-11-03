@@ -850,3 +850,33 @@ but not in the imported history. **Deferred:** forking eagerly at create
 time; re-importing or importing into an existing session (the only way
 back from a timed-out import); subagent lines, thinking, attachments and
 per-turn usage of imported turns; blob GC (as D36).
+
+## D38. Bypass mode only where the operator accepted the risk
+Bypass (`PermissionMode::Bypass`: every tool runs, nothing asks) can be
+chosen from a head only when the server's operator set `[agent]
+allow_bypass = true` in `skywaved.toml` (protocol v17). It is off by
+default. One keypress, perhaps on a phone over a bad link, would otherwise
+turn off every prompt of a session that keeps running unattended, so the
+risk is accepted once, where the agent runs, by whoever runs it.
+**Advertised, then confirmed.** `HelloResponse::bypass` tells heads; the
+core keeps it with the settings, so the pickers are right offline too.
+`skywave_present::format::offered_modes` leaves bypass out where it is not
+allowed, so both heads offer the same modes; where it is, choosing it still
+asks once more (`mode_needs_confirmation`).
+**Refused by the server, not the agent.** Without the opt-in a
+`SetPermissionMode` to bypass is `RejectReason::BypassDisabled`, from the
+config, before anything is logged or the agent asked: a definitive answer,
+not a guess from the agent's error text. A head that offered bypass from a
+stale `hello` gets that refusal.
+**Rule suggestions too.** The agent's own "always allow every tool"
+suggestion is dropped from approval prompts without the opt-in, and a grant
+of it from while it was on is not applied again after it is turned off.
+**Launch, not start, in bypass.** With the opt-in the agent is launched so
+that it may switch to bypass mid-session (Claude Code:
+`--allow-dangerously-skip-permissions`), never so that it starts there; a
+session's mode stays what the user picked. Agent-agnostic name (D3): the
+opt-in says what it allows, not which CLI flag it sets.
+**Rejected:** offering bypass everywhere and leaving the refusal to the
+agent (an option shown only to fail, and the agent's flag the only guard);
+never offering it (an operator who wants it would have to start every
+session in it through `agent.args`).

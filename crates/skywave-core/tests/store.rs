@@ -154,6 +154,7 @@ fn fresh_store_is_empty_with_defaults() {
             blob_policy: BlobPolicy::OnDemand,
             server_address: None,
             shell_enabled: false,
+            bypass_allowed: false,
         }
     );
 }
@@ -1866,6 +1867,7 @@ fn pairing_with_another_server_resets_the_replica_and_the_same_server_keeps_it()
             blob_policy: BlobPolicy::Eager,
             server_address: Some("new.example:7443".into()),
             shell_enabled: false,
+            bypass_allowed: false,
         },
         "the blob policy is this device's; the shell flag was the old server's"
     );
@@ -2587,6 +2589,24 @@ fn the_shell_flag_is_kept_in_the_settings() {
     assert!(store.load().unwrap().settings.shell_enabled);
     store.set_shell_enabled(false).unwrap();
     assert!(!store.settings().unwrap().shell_enabled);
+}
+
+#[test]
+fn the_bypass_flag_is_kept_in_the_settings_apart_from_the_shell_flag() {
+    let (_tmp, dir) = data_dir();
+    let store = Store::open(&dir).unwrap();
+    assert!(
+        !store.settings().unwrap().bypass_allowed,
+        "off until a hello"
+    );
+    store.set_bypass_allowed(true).unwrap();
+    drop(store);
+    let store = Store::open(&dir).unwrap();
+    let settings = store.load().unwrap().settings;
+    assert!(settings.bypass_allowed);
+    assert!(!settings.shell_enabled);
+    store.set_bypass_allowed(false).unwrap();
+    assert!(!store.settings().unwrap().bypass_allowed);
 }
 
 /// Name, type, `NOT NULL`, default and primary key position of each column.

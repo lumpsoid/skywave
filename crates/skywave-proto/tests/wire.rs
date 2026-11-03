@@ -657,6 +657,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::UnknownRun,
             RejectReason::RunFinished,
             RejectReason::BadShellCommand,
+            RejectReason::BypassDisabled,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -698,6 +699,7 @@ fn hello() -> HelloResponse {
             name: "phone".into(),
         }],
         shell: true,
+        bypass: true,
     }
 }
 
@@ -1290,8 +1292,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v16() {
-    assert_eq!(PROTOCOL_VERSION, 16);
+fn protocol_is_v17() {
+    assert_eq!(PROTOCOL_VERSION, 17);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

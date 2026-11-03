@@ -14,12 +14,13 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, LinkRejection, ListKind, PairUri, PairingView, PermissionMode, Route, RunWhen,
-    Screen, Seq, ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun,
-    ShellRunState, TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, LinkRejection, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq,
+    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
+    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
+    offered_modes,
 };
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall,
@@ -451,7 +452,7 @@ struct RulePick {
 /// timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Picker {
-    /// The modes, [`PermissionMode::ALL`] in order. `confirm` once Enter
+    /// The modes [`offered_modes`] lists, in order. `confirm` once Enter
     /// chose one that lets every tool run unasked, until `y` sends it.
     Mode { selected: usize, confirm: bool },
     /// The models the agent offers, and a name typed instead: sent as it
@@ -535,7 +536,11 @@ impl Picker {
     fn mode(agent: &AgentView) -> Picker {
         let mode = agent.mode_change.as_ref().map(|c| c.value).or(agent.mode);
         let selected = mode
-            .and_then(|mode| PermissionMode::ALL.iter().position(|m| *m == mode))
+            .and_then(|mode| {
+                offered_modes(agent.bypass_allowed)
+                    .iter()
+                    .position(|m| *m == mode)
+            })
             .unwrap_or(0);
         Picker::Mode {
             selected,
@@ -620,10 +625,13 @@ impl Picker {
             } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => (
                     true,
-                    Some(Action::SetPermissionMode {
-                        session_id,
-                        mode: PermissionMode::ALL[*selected],
-                    }),
+                    // Only the mode confirmed: none if the server stopped
+                    // allowing it meanwhile and the list shrank.
+                    offered_modes(view.agent.bypass_allowed)
+                        .get(*selected)
+                        .copied()
+                        .filter(|&mode| mode_needs_confirmation(mode))
+                        .map(|mode| Action::SetPermissionMode { session_id, mode }),
                 ),
                 _ => {
                     *confirm = false;
@@ -637,11 +645,15 @@ impl Picker {
                     (false, None)
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *selected = (*selected + 1).min(PermissionMode::ALL.len() - 1);
+                    let last = offered_modes(view.agent.bypass_allowed).len() - 1;
+                    *selected = (*selected + 1).min(last);
                     (false, None)
                 }
                 KeyCode::Enter => {
-                    let mode = PermissionMode::ALL[*selected];
+                    let Some(&mode) = offered_modes(view.agent.bypass_allowed).get(*selected)
+                    else {
+                        return (true, None);
+                    };
                     if mode_needs_confirmation(mode) {
                         *confirm = true;
                         return (false, None);

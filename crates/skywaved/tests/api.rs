@@ -63,15 +63,20 @@ impl Fixture {
 
     /// [`Fixture::start`] with shell commands on or off.
     async fn start_with_shell(shell: bool) -> Fixture {
-        Fixture::start_with(shell, isolated_git()).await
+        Fixture::start_with(shell, false, isolated_git()).await
+    }
+
+    /// [`Fixture::start`] with bypass mode allowed or not.
+    async fn start_with_bypass(bypass: bool) -> Fixture {
+        Fixture::start_with(false, bypass, isolated_git()).await
     }
 
     /// [`Fixture::start`] with workdir changes running git as `git` says.
     async fn start_with_git(git: Git) -> Fixture {
-        Fixture::start_with(false, git).await
+        Fixture::start_with(false, false, git).await
     }
 
-    async fn start_with(shell: bool, git: Git) -> Fixture {
+    async fn start_with(shell: bool, bypass: bool, git: Git) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
@@ -80,7 +85,8 @@ impl Fixture {
             Arc::new(ServerIdentity::bootstrap(&storage.dir, &["localhost".into()]).unwrap());
         let log = EventLog::open(&storage.db, vec![root.clone()])
             .unwrap()
-            .with_shell(shell);
+            .with_shell(shell)
+            .with_bypass(bypass);
         let server = Server::bind_with_git(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
@@ -398,6 +404,7 @@ async fn hello_names_the_caller_and_records_last_seen() {
                 name: "laptop".into(),
             }],
             shell: false,
+            bypass: false,
         }
     );
     let device = devices::get(f.storage.db.conn(), creds.id)
@@ -413,6 +420,18 @@ async fn hello_reports_whether_shell_commands_are_on() {
         let creds = f.pair().await;
         let hello: HelloResponse = f.client(&creds).await.get(path::HELLO).await.json();
         assert_eq!(hello.shell, shell);
+        assert!(!hello.bypass, "apart from bypass");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_reports_whether_bypass_is_allowed() {
+    for bypass in [false, true] {
+        let f = Fixture::start_with_bypass(bypass).await;
+        let creds = f.pair().await;
+        let hello: HelloResponse = f.client(&creds).await.get(path::HELLO).await.json();
+        assert_eq!(hello.bypass, bypass);
+        assert!(!hello.shell, "apart from shell commands");
     }
 }
 
