@@ -2924,6 +2924,29 @@ fn a_refused_move_appends_nothing() {
     assert_eq!(f.log.head(), head);
 }
 
+/// An adopted first context holds the outside conversation only as its
+/// origin until its agent first runs and stores a handle, so it moves only
+/// then (D32); continuing the conversation elsewhere before is another
+/// adoption.
+#[test]
+fn an_adopted_context_moves_only_once_its_agent_ran() {
+    let mut f = Fixture::new();
+    let seq = accepted(f.handle(adopt_kind(workdir(&f.root.join("project")), CONVERSATION)));
+    let session = f.all_events()[(seq.0 - 2) as usize].session_id;
+    let adopted = ContextId::first_of(session);
+    accepted(f.clear(session, ContextId::new(), "next"));
+
+    let head = f.log.head();
+    assert_eq!(
+        f.handle(move_kind(session, adopted, "x")),
+        rejected(RejectReason::NoConversation)
+    );
+    assert_eq!(f.log.head(), head, "a refused move logs nothing");
+
+    f.converse(adopted);
+    accepted(f.handle(move_kind(session, adopted, "x")));
+}
+
 #[test]
 fn a_move_needs_the_workdir_as_the_source_stored_it() {
     let mut f = Fixture::new();

@@ -8698,6 +8698,36 @@ mod tests {
         assert!(context_row(&f, start).can_move);
     }
 
+    /// An adopted context's imported history is not its agent's work: the
+    /// server has no handle to fork until a live turn ran (D32), so the move
+    /// is not offered; adopting the conversation again continues it instead.
+    #[test]
+    fn an_adopted_context_with_only_imported_history_is_not_offered_a_move() {
+        let mut f = Fixture::paired();
+        let sid = SessionId::new();
+        let start = ContextId::first_of(sid);
+        let items = vec![
+            imported(Some(1), imported_text(true, "fix it")),
+            imported(Some(2), imported_text(false, "done")),
+        ];
+        log_adopted(&mut f, sid, CommandId::new(), items);
+        f.log_in(sid, ContextId::new(), vec![started("velvet walrus", f.me)]);
+        f.open(sid);
+        let row = context_row(&f, start);
+        assert_eq!((row.messages, row.can_move), (1, false), "imported only");
+        assert!(f.dispatch(move_context(sid, start)).is_empty());
+        // Positive control: once its agent worked in it, it moves.
+        f.log_stamped(
+            sid,
+            vec![(
+                None,
+                start,
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+            )],
+        );
+        assert!(context_row(&f, start).can_move);
+    }
+
     #[test]
     fn a_move_refused_for_the_current_context_shows_failed_and_can_go() {
         let mut f = Fixture::paired();
