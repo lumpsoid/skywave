@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
+import 'package:skywave_gui/sessions/conversation_picker.dart';
 import 'package:skywave_gui/sessions/create_dialog.dart';
 import 'package:skywave_gui/sessions/rename_dialog.dart';
 import 'package:skywave_gui/sessions/session_row.dart';
@@ -8,7 +9,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// The session list, active or archived, with each row's labels as Rust
 /// worded them; the sessions this device is creating; and the new-session
-/// and rename prompts while Rust holds them open.
+/// and rename prompts and the conversation picker while Rust holds them
+/// open.
 class SessionListPage extends StatelessWidget {
   const SessionListPage({
     required this.screen,
@@ -108,6 +110,8 @@ class SessionListPage extends StatelessWidget {
         ),
         if (screen.create case final create?)
           CreateDialog(prompt: create, send: send),
+        if (screen.conversations case final picker?)
+          ConversationPicker(picker: picker, send: send),
         if (screen.rename case final rename?)
           RenameDialog(
             key: ValueKey(rename.sessionId),

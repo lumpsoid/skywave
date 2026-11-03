@@ -50,11 +50,14 @@ pub struct TimelineRow {
     /// (`interrupted · the agent stopped its turn`, `turn · 12.4s ·
     /// $0.04`). Empty for tool items: see `tool`.
     pub text: String,
+    /// What the row is marked with beside its author or name: `imported`
+    /// on the imported kinds; `None` for every other.
+    pub mark: Option<String>,
     /// `14:02` (UTC), only where the minute differs from the last time
     /// shown above; `None` otherwise and for pending messages.
     pub time_label: Option<String>,
-    /// When the server logged it, ms since the Unix epoch; `None` while
-    /// pending.
+    /// When the server logged it, ms since the Unix epoch; for imported
+    /// history when the agent recorded it. `None` while pending.
     pub at_ms: Option<i64>,
     /// A separator goes above: a new turn starts here.
     pub turn_start: bool,
@@ -110,6 +113,16 @@ pub enum RowKind {
     AgentSetting,
     /// The agent refused a switch and kept what it had: a warning.
     SettingRefused,
+    /// History of an adopted conversation, from before it came to
+    /// Skywave: a record, shown apart from the session's own items and
+    /// marked with `mark`. A user message of it.
+    ImportedUserMessage,
+    /// An agent message of imported history.
+    ImportedAgentMessage,
+    /// A tool call of imported history with its result folded in, or a
+    /// result whose call was not imported (`tool.name` `result`). Never
+    /// running and never gated.
+    ImportedTool,
 }
 
 /// A command's delivery state with its words.

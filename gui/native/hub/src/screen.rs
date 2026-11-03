@@ -2,22 +2,23 @@
 //! state (the pairing form, the open prompts, the composer), every label
 //! worded here as the TUI words it without its key hints.
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
-    CompletionStatus, Effort, Entry, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
-    PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen, SessionListView,
-    SessionRow, SessionState, SessionUsage, SessionView, SettingsView, Snippet, SubagentHeader,
-    TimelineItem, UsageView, ViewState,
+    CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, LinkRejection,
+    ListKind, Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion,
+    Screen, SessionId, SessionListView, SessionRow, SessionState, SessionUsage, SessionView,
+    SettingsView, Snippet, SubagentHeader, TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
-    AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
-    TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, answer_words,
-    approval_origin, background_rows, blob_size, bytes, context_moved_label, context_row,
-    delivery_label, dollars, effort_label, effort_refusal, fail_reason, mode_detail, mode_label,
-    mode_needs_confirmation, mode_refusal, model_refusal, move_refusal, outgoing_label,
-    repeat_word, scope_label, stop_heading, stop_warning, subagent_status, task_kind_word, tokens,
-    trail, turn_time, viewing_hint, work_summary,
+    AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
+    StopAction, TRAIL_SEPARATOR, adopting_note, agent_effort_label, agent_mode_label,
+    agent_model_label, answer_words, approval_origin, background_rows, blob_size, bytes,
+    context_moved_label, context_row, conversation_detail, conversation_link, conversation_title,
+    conversations_unavailable, delivery_label, dollars, effort_label, effort_refusal, fail_reason,
+    mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal, move_refusal,
+    outgoing_label, repeat_word, scope_label, stop_heading, stop_warning, subagent_status,
+    task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -26,11 +27,11 @@ use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
-    ComposerModeView, ComposerView, ContextRow, CreatePrompt, CreatingView, EffortOption,
-    EffortView, ListKindView, ModeOption, ModelOption, PairForm, PairingState, PermissionModeView,
-    RenamePrompt, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
-    SnippetView, StopHeadings, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView,
-    UsageRowView, UsageSpanView,
+    ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
+    CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
+    PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption, ScheduleRow,
+    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, StopHeadings,
+    SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
 };
 use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
 use crate::workdir;
@@ -153,7 +154,56 @@ fn list_view(list: &SessionListView, link: &Link, ui: Ui) -> ScreenView {
         create: ui
             .create
             .map(|create| create_prompt(create, list.completion.as_ref(), link)),
+        conversations: list
+            .conversations
+            .as_ref()
+            .map(|picker| conversations_view(picker, &list.sessions, ui.wall_ms)),
         rename: ui.rename.cloned(),
+    }
+}
+
+/// The conversation picker, worded as the TUI words it without its keys.
+fn conversations_view(
+    picker: &ConversationPicker,
+    sessions: &[SessionRow],
+    wall_ms: i64,
+) -> ConversationsView {
+    let now = DateTime::<Utc>::from_timestamp_millis(wall_ms).unwrap_or_default();
+    let title = |id: SessionId| {
+        sessions
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.title.clone())
+    };
+    let empty = picker.items.is_empty();
+    let (status_label, empty_label) = match &picker.status {
+        ConversationsStatus::Loading => (
+            Some("listing…".to_owned()),
+            empty.then(|| "Asking the server for its agent's conversations…".to_owned()),
+        ),
+        ConversationsStatus::Ready { truncated } => (
+            truncated.then(|| "only the newest are listed".to_owned()),
+            empty.then(|| "The server's agent has no conversations under the roots.".to_owned()),
+        ),
+        ConversationsStatus::Unavailable(reason) => {
+            (None, Some(clean_line(&conversations_unavailable(reason))))
+        }
+    };
+    ConversationsView {
+        rows: picker
+            .items
+            .iter()
+            .map(|item| ConversationRowView {
+                conversation_id: item.id.clone(),
+                title: clean_line(conversation_title(item)),
+                detail: clean_line(&conversation_detail(item, now)),
+                link_label: conversation_link(item, title).map(|link| clean_line(&link)),
+                session_id: item.session.map(|id| id.0.to_string()),
+            })
+            .collect(),
+        status_label,
+        unavailable: matches!(picker.status, ConversationsStatus::Unavailable(_)),
+        empty_label,
     }
 }
 
@@ -181,6 +231,7 @@ fn row_view(row: &SessionRow, archived: bool) -> SessionRowView {
         last_activity_ms: row.last_activity.timestamp_millis(),
         rename: row.rename.as_ref().map(outgoing_view),
         rename_label: rename_label(row.rename.as_ref()),
+        importing_label: row.importing.then(|| IMPORTING_HISTORY.to_owned()),
         deletable: row.deletable,
         delete_blocked_label: (archived && !row.deletable)
             .then(|| format!("cannot delete {title} yet: answer or cancel first")),
@@ -214,11 +265,12 @@ fn creating_view(pending: &PendingSession) -> CreatingView {
         command_id: pending.command_id.0.to_string(),
         workdir: clean_line(&pending.workdir),
         outgoing: outgoing_view(&pending.outgoing),
-        note: match pending.outgoing {
-            Outgoing::Queued => Some("waits for the server".to_owned()),
-            Outgoing::Sending => None,
-            Outgoing::Accepted(_) => Some("created, syncing…".to_owned()),
-            Outgoing::Failed(reason) => Some(fail_reason(reason).to_owned()),
+        note: match (adopting_note(pending), pending.outgoing) {
+            (Some(note), _) => Some(note.to_owned()),
+            (None, Outgoing::Queued) => Some("waits for the server".to_owned()),
+            (None, Outgoing::Sending) => None,
+            (None, Outgoing::Accepted(_)) => Some("created, syncing…".to_owned()),
+            (None, Outgoing::Failed(reason)) => Some(fail_reason(reason).to_owned()),
         },
         discardable: pending.discardable,
     }

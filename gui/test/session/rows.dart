@@ -22,6 +22,7 @@ TimelineRow anyRow(
   ToolFacts? tool,
   List<SectionView> sections = const [],
   String? timeLabel,
+  String? mark,
   bool turnStart = false,
   bool unreadRule = false,
 }) => TimelineRow(
@@ -30,6 +31,7 @@ TimelineRow anyRow(
   author: author,
   own: own,
   text: text,
+  mark: mark,
   timeLabel: timeLabel,
   turnStart: turnStart,
   unreadRule: unreadRule,

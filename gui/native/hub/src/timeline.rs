@@ -13,10 +13,10 @@ use skywave_core::{
     ToolView, read_head,
 };
 use skywave_present::format::{
-    adopted_line, agent_setting_line, answer_words, asked_by, bytes, context_moved_line,
-    context_started_line, context_switched_line, decision_label, delivery_label, dollars,
-    fail_reason, moved_from_line, outgoing_label, percent, seconds, subagent_status, took_label,
-    turn_time,
+    IMPORTED_MARK, adopted_line, agent_setting_line, answer_words, asked_by, bytes,
+    context_moved_line, context_started_line, context_switched_line, decision_label,
+    delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
+    percent, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
@@ -116,7 +116,12 @@ pub fn rows(
     let mut out = Rows::default();
     for (index, item) in view.timeline.iter().enumerate() {
         let time_label = match item {
-            TimelineItem::Logged { at, .. } => {
+            // Imported history shows when the agent recorded it.
+            TimelineItem::Logged {
+                entry: Entry::Imported { at, .. },
+                ..
+            }
+            | TimelineItem::Logged { at, .. } => {
                 let this = at.format("%Y-%m-%d %H:%M").to_string();
                 (minute.as_ref() != Some(&this)).then(|| {
                     minute = Some(this);
@@ -162,6 +167,7 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
         author: None,
         own: false,
         text: String::new(),
+        mark: None,
         time_label: None,
         at_ms: None,
         turn_start: false,
@@ -192,7 +198,11 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             row.discardable = *discardable;
             return row;
         }
-        TimelineItem::Logged { at, entry, .. } => (at, entry),
+        TimelineItem::Logged {
+            entry: entry @ Entry::Imported { at, .. },
+            ..
+        }
+        | TimelineItem::Logged { at, entry, .. } => (at, entry),
     };
     row.at_ms = Some(at.timestamp_millis());
     match entry {
@@ -254,30 +264,31 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             RowKind::ContextDivider,
             clean_line(&adopted_line(conversation)),
         ),
-        // Plain rows of the existing kinds until imported history gets its
-        // own.
-        Entry::Imported { entry: item, .. } => match item {
-            ImportedEntry::UserMessage { text } => {
-                set(&mut row, RowKind::UserMessage, clean_text(text));
-                row.author = Some("imported".to_owned());
+        Entry::Imported { entry: item, .. } => {
+            row.mark = Some(IMPORTED_MARK.to_owned());
+            match item {
+                ImportedEntry::UserMessage { text } => {
+                    set(&mut row, RowKind::ImportedUserMessage, clean_text(text));
+                    row.author = Some("you".to_owned());
+                }
+                ImportedEntry::AgentMessage { text } => {
+                    set(&mut row, RowKind::ImportedAgentMessage, clean_text(text));
+                    row.author = Some("agent".to_owned());
+                }
+                ImportedEntry::Tool(view) => {
+                    row.kind = RowKind::ImportedTool;
+                    row.tool = Some(tool_facts(view, wall_ms, expanded, entry));
+                }
+                ImportedEntry::ToolResult { .. } => {
+                    row.kind = RowKind::ImportedTool;
+                    row.tool = Some(plain_facts("result", "", expanded, entry));
+                }
             }
-            ImportedEntry::AgentMessage { text } => {
-                set(&mut row, RowKind::AgentMessage, clean_text(text));
-                row.author = Some("agent".to_owned());
-            }
-            ImportedEntry::Tool(view) => {
-                row.kind = RowKind::ToolCall;
-                row.tool = Some(plain_facts(&view.name, &view.title, expanded, entry));
-            }
-            ImportedEntry::ToolResult { .. } => {
-                row.kind = RowKind::ToolResult;
-                row.tool = Some(plain_facts("result", "", expanded, entry));
-            }
-        },
-        Entry::ImportFinished { .. } => set(
+        }
+        Entry::ImportFinished { outcome } => set(
             &mut row,
             RowKind::ContextDivider,
-            "imported history ends here".to_owned(),
+            clean_line(&import_finished_line(outcome)),
         ),
         Entry::Renamed { name, by } => set(
             &mut row,

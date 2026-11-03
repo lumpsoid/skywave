@@ -90,6 +90,14 @@ class SessionRow extends StatelessWidget {
                 spacing: 12,
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
+                  if (row.importingLabel case final importing?)
+                    _Marker(
+                      key: const Key('row-importing'),
+                      icon: Icons.history,
+                      text: importing,
+                      semanticLabel: importing,
+                      color: colors.primary,
+                    ),
                   if (row.unread > 0)
                     _Marker(
                       key: const Key('row-unread'),
@@ -156,6 +164,7 @@ String rowSemanticsLabel(SessionRowView row) {
     row.title,
     if (rename != null) rename.startsWith('rename') ? rename : 'rename $rename',
     if (saysState) row.badgeLabel,
+    ?row.importingLabel,
     if (row.unread > 0) _unreadLabel(row.unread),
     if (row.approvalsLabel case final approvals?) _approvalsLabel(approvals),
     if (row.error case final error?) _errorLabel(error),

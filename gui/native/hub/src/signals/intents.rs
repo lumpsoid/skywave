@@ -167,6 +167,19 @@ pub enum GuiIntent {
     CompletionPick {
         index: u32,
     },
+    /// Open the picker of the server agent's conversations, or list them
+    /// again while it is open. Only over the active list.
+    ConversationsOpen,
+    /// Continue the listed conversation `conversation_id` in a new session
+    /// in its workdir; the new-session prompt closes once the core took
+    /// it, as on `CompletionAccept`. One no longer listed is ignored. To
+    /// open the session already running it instead, `OpenSession` its
+    /// `session_id`.
+    ConversationPick {
+        conversation_id: String,
+    },
+    /// Close the conversation picker; the new-session prompt stays.
+    ConversationsClose,
     /// Open the rename prompt for a session.
     RenameOpen {
         session_id: String,

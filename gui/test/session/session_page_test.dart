@@ -148,6 +148,66 @@ void main() {
     );
   });
 
+  testWidgets('imported history is marked beside its time and dimmed', (
+    tester,
+  ) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow(
+        's:1',
+        RowKind.importedUserMessage,
+        'fix the build',
+        author: 'you',
+        mark: 'imported',
+        timeLabel: '09:15',
+      ),
+      anyRow(
+        's:2',
+        RowKind.importedTool,
+        '',
+        tool: shellFacts('cargo test'),
+        mark: 'imported',
+      ),
+      anyRow(
+        's:3',
+        RowKind.importedAgentMessage,
+        'fixed',
+        author: 'agent',
+        mark: 'imported',
+      ),
+      anyRow('s:4', RowKind.contextDivider, 'Continued in Skywave from here'),
+      anyRow('s:5', RowKind.agentMessage, 'live again', author: 'agent'),
+    ]);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: <GuiIntent>[],
+    );
+    expect(find.text('09:15 · imported', findRichText: true), findsOneWidget);
+    expect(find.text('imported', findRichText: true), findsNWidgets(2));
+    expect(find.text('Bash  cargo test', findRichText: true), findsOneWidget);
+    expect(
+      find.text('Continued in Skywave from here', findRichText: true),
+      findsOneWidget,
+    );
+    double opacityOf(String text) => tester
+        .widget<Opacity>(
+          find
+              .ancestor(
+                of: find.text(text, findRichText: true),
+                matching: find.byType(Opacity),
+              )
+              .first,
+        )
+        .opacity;
+    expect(opacityOf('fix the build'), lessThan(1));
+    expect(opacityOf('fixed'), lessThan(1));
+    expect(opacityOf('Bash  cargo test'), lessThan(1));
+    // The session's own rows are not.
+    expect(opacityOf('live again'), 1);
+  });
+
   testWidgets('a logged message replacing its pending one keeps the selection '
       'and the scroll', (tester) async {
     final timeline = holding([

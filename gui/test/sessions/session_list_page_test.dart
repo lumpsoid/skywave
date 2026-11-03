@@ -270,6 +270,33 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+  testWidgets('a row whose history is importing says so', (tester) async {
+    final semantics = tester.ensureSemantics();
+    final plain = sessionRow('a');
+    final importing = SessionRowView(
+      sessionId: 'b',
+      title: 'adopted',
+      state: AgentState.idle,
+      badgeLabel: 'idle',
+      unread: 0,
+      approvals: 0,
+      hasDraft: false,
+      lastActivityLabel: plain.lastActivityLabel,
+      lastActivityMs: 0,
+      importingLabel: 'importing history…',
+      deletable: false,
+      archived: false,
+    );
+    await pump(tester, list(rows: [plain, importing]));
+    expect(find.byKey(const Key('row-importing')), findsOneWidget);
+    expect(find.text('importing history…'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel(RegExp('^adopted, idle, importing history…, ')),
+      findsOneWidget,
+    );
+    semantics.dispose();
+  });
+
   testWidgets('a row reads as one sentence, its markers named', (tester) async {
     final semantics = tester.ensureSemantics();
     await pump(tester, list(rows: [sessionRow('a')]));
