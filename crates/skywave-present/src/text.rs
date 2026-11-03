@@ -20,11 +20,19 @@ pub fn clean(line: &str) -> String {
         match c {
             '\t' => out.push_str("    "),
             c if c.is_control() => {}
-            c if is_bidi_control(c) => out.push_str(&format!("<U+{:04X}>", u32::from(c))),
-            c => out.push(c),
+            c => match bidi_escape(c) {
+                Some(escape) => out.push_str(&escape),
+                None => out.push(c),
+            },
         }
     }
     out
+}
+
+/// The visible escape a bidirectional formatting character `c` shows as
+/// (`<U+202E>`), or `None` when `c` is not one.
+pub(crate) fn bidi_escape(c: char) -> Option<String> {
+    is_bidi_control(c).then(|| format!("<U+{:04X}>", u32::from(c)))
 }
 
 /// The first line of `text`, as [`clean`].
