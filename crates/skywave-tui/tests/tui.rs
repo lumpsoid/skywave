@@ -4295,6 +4295,84 @@ fn an_expanded_file_shows_every_line_numbered() {
     assert!(!screen.contains("+2 lines"), "{screen}");
 }
 
+/// How much laying out the open session's timeline took so far.
+fn layout_stats(h: &Harness) -> ui::LayoutStats {
+    h.app
+        .ui()
+        .session
+        .as_ref()
+        .unwrap()
+        .shown
+        .layout
+        .borrow()
+        .stats()
+}
+
+#[test]
+fn a_redraw_lays_out_only_the_items_that_changed() {
+    let (mut h, _, file_blob, output_blob) = mockup();
+    select_the_write(&mut h);
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::DownloadBlob(file_blob)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hello.rs");
+    let content: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, content).unwrap();
+    h.seam
+        .blob_status(file_blob, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    let items = h.app.session().unwrap().0.timeline.len() as u64;
+    // Selecting drew frames 100 columns wide, before the file was here.
+    let before = layout_stats(&h);
+    assert_eq!(before.blob_reads, 0);
+
+    let now = mockup_now();
+    let first = trimmed(&h.frame(90, 58, now));
+    assert_contains(&first, "│ 10 line 10 ");
+    let laid = layout_stats(&h);
+    assert_eq!(
+        laid.items,
+        before.items + items,
+        "a new width lays out every item"
+    );
+    assert_eq!(laid.blob_reads, 1, "the expanded file is read");
+
+    // Nothing changed: nothing is laid out or read again, and the frame
+    // is the same.
+    assert_eq!(trimmed(&h.frame(90, 58, now)), first);
+    assert_eq!(layout_stats(&h), laid);
+
+    // The clock moved: only the running call's elapsed time changes.
+    let later = now + chrono::Duration::seconds(1);
+    h.frame(90, 58, later);
+    let ticked = layout_stats(&h);
+    assert_eq!(ticked.items, laid.items + 1);
+    assert_eq!(ticked.blob_reads, 1);
+
+    // One item's blob starts downloading: that item alone is laid out.
+    h.seam
+        .blob_status(
+            output_blob,
+            BlobStatus::Downloading {
+                got: 1024,
+                path: dir.path().join("partial"),
+            },
+        )
+        .unwrap();
+    h.sync();
+    assert_contains(&trimmed(&h.frame(90, 58, later)), "downloading 50%");
+    let changed = layout_stats(&h);
+    assert_eq!(changed.items, ticked.items + 1);
+    assert_eq!(changed.blob_reads, 1);
+
+    // A new width lays out every item again, from the file as read.
+    let narrow = trimmed(&h.frame(80, 58, later));
+    assert_contains(&narrow, "│ 10 line 10 ");
+    let resized = layout_stats(&h);
+    assert_eq!(resized.items, changed.items + items);
+    assert_eq!(resized.blob_reads, 1);
+}
+
 #[test]
 fn expanding_above_the_screen_keeps_the_view_still() {
     let (mut h, _, file_blob, _) = mockup();
