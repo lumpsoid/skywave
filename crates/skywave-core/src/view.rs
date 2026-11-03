@@ -197,9 +197,11 @@ impl From<&OutboxStatus> for Outgoing {
 pub enum FailReason {
     /// The server answered with a refusal.
     Rejected(RejectReason),
-    /// The server refused the request itself rather than answer it: a bug
-    /// or a version skew, not a domain answer. Sending it again would fail
-    /// the same way.
+    /// The server refused the request itself rather than answer it (a bug
+    /// or a version skew, not a domain answer), kept failing it with server
+    /// errors ([`MAX_SERVER_ERRORS`](crate::MAX_SERVER_ERRORS)), or never
+    /// logged a command whose reply was unreadable. It never applied, and
+    /// it is not sent again.
     Undeliverable,
 }
 

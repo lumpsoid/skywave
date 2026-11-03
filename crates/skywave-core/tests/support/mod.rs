@@ -369,7 +369,16 @@ impl Client {
             let sending: bool = row.get(1)?;
             let result: Option<String> = row.get(2)?;
             let status = match (result, sending) {
-                (Some(result), _) => OutboxStatus::Done(serde_json::from_str(&result).unwrap()),
+                // The core's own marker for a command it gave up on, or
+                // the server's answer.
+                (Some(result), _) => {
+                    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+                    if value["result"] == "undeliverable" {
+                        OutboxStatus::Undeliverable
+                    } else {
+                        OutboxStatus::Done(serde_json::from_value(value).unwrap())
+                    }
+                }
                 (None, true) => OutboxStatus::Sending,
                 (None, false) => OutboxStatus::Queued,
             };
