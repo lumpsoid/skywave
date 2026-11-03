@@ -425,13 +425,201 @@ async fn conversations_are_listed_by_a_real_server() {
 
 /// A transport for a device freshly paired with `fx`.
 async fn paired_transport(fx: &Fixture) -> HttpsTransport {
+    let (_data, identity) = paired_identity(fx).await;
+    HttpsTransport::new(&fx.addr, &identity, config()).unwrap()
+}
+
+/// The identity of a device freshly paired with `fx`, and the directory
+/// that holds it.
+async fn paired_identity(fx: &Fixture) -> (TempDir, FileIdentity) {
     let code = fx.issue_code().code.to_string();
     let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
         .await
         .unwrap();
+    assert_eq!(paired.address, fx.addr);
     let data = tempfile::tempdir().unwrap();
     let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
-    HttpsTransport::new(&paired.address, &identity, config()).unwrap()
+    (data, identity)
+}
+
+/// The request timeout of the slow-link tests: short, so a whole-exchange
+/// deadline would be blown well within a test's run.
+const SHORT: Duration = Duration::from_secs(1);
+
+/// A TCP proxy that relays server-to-client bytes `PIECE` at a time with
+/// `PAUSE` between pieces (40 KB/s: a 16 KB TLS record in 0.4 s, inside
+/// [`SHORT`]), and stops relaying, holding the connection open, once it has
+/// relayed `stall_after` bytes on a connection.
+struct SlowLink {
+    addr: String,
+    task: JoinHandle<()>,
+}
+
+impl SlowLink {
+    const PIECE: usize = 4 * 1024;
+    const PAUSE: Duration = Duration::from_millis(100);
+
+    async fn start(upstream: u16, stall_after: Option<u64>) -> SlowLink {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let task = tokio::spawn(async move {
+            // Dropped with the task when the proxy is: every pipe ends too.
+            let mut pipes = tokio::task::JoinSet::new();
+            loop {
+                let Ok((inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                pipes.spawn(async move {
+                    let Ok(outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                    else {
+                        return;
+                    };
+                    let (mut client_rx, mut client_tx) = inbound.into_split();
+                    let (mut server_rx, mut server_tx) = outbound.into_split();
+                    let up = tokio::io::copy(&mut client_rx, &mut server_tx);
+                    let down = async {
+                        let mut relayed = 0u64;
+                        let mut buf = vec![0u8; SlowLink::PIECE];
+                        loop {
+                            if stall_after.is_some_and(|limit| relayed >= limit) {
+                                std::future::pending::<()>().await;
+                            }
+                            let n = match server_rx.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            if client_tx.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                            relayed += n as u64;
+                            tokio::time::sleep(SlowLink::PAUSE).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = up => {}
+                        () = down => {}
+                    }
+                });
+            }
+        });
+        SlowLink { addr, task }
+    }
+}
+
+impl Drop for SlowLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A session with `messages` user messages of `len` bytes each: an events
+/// body of about `messages * len` bytes.
+async fn big_log(transport: &HttpsTransport, fx: &Fixture, messages: usize, len: usize) -> Seq {
+    let create = Command {
+        id: CommandId::new(),
+        kind: CommandKind::CreateSession {
+            workdir: fx.workdir(),
+            conversation: None,
+        },
+    };
+    let CommandResult::Accepted { mut seq } = transport.send_command(&create).await.unwrap() else {
+        panic!("session not created");
+    };
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    let session_id = batch.events[0].session_id;
+    for i in 0..messages {
+        let send = Command {
+            id: CommandId::new(),
+            kind: CommandKind::SendMessage {
+                session_id,
+                context: ContextId::first_of(session_id),
+                text: format!("{i}").repeat(len),
+            },
+        };
+        let CommandResult::Accepted { seq: sent } = transport.send_command(&send).await.unwrap()
+        else {
+            panic!("message not accepted");
+        };
+        seq = sent;
+    }
+    seq
+}
+
+/// An events batch whose body takes longer to arrive than the request
+/// timeout, but whose every chunk arrives within it, is read whole: a slow
+/// but live link catches up instead of re-pulling the same batch forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_events_body_arrives_whole() {
+    let fx = Fixture::start().await;
+    let (_data, identity) = paired_identity(&fx).await;
+    let direct = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    let last = big_log(&direct, &fx, 5, 20 * 1024).await;
+
+    let link = SlowLink::start(fx.port, None).await;
+    let slow = TransportConfig {
+        connect_timeout: SOON,
+        request_timeout: SHORT,
+        ..TransportConfig::default()
+    };
+    let transport = HttpsTransport::new(&link.addr, &identity, slow).unwrap();
+    let started = tokio::time::Instant::now();
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    // Positive control: the exchange took longer than the old deadline over
+    // the whole of it (the request timeout, with no wait).
+    assert!(started.elapsed() > SHORT * 2, "{:?}", started.elapsed());
+    assert_eq!(batch.last(), Some(last));
+    assert_eq!(batch.events.len(), 6);
+}
+
+/// An events body that stops arriving times out one request timeout after
+/// its last chunk, not after the long-poll's `wait`: a dead link is still
+/// detected.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_events_body_times_out() {
+    let fx = Fixture::start().await;
+    let (_data, identity) = paired_identity(&fx).await;
+    let direct = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    big_log(&direct, &fx, 5, 20 * 1024).await;
+
+    // Past the handshake and the response head, well short of the body.
+    let link = SlowLink::start(fx.port, Some(40 * 1024)).await;
+    let slow = TransportConfig {
+        connect_timeout: SOON,
+        request_timeout: SHORT,
+        ..TransportConfig::default()
+    };
+    let transport = HttpsTransport::new(&link.addr, &identity, slow).unwrap();
+    let started = tokio::time::Instant::now();
+    let wait = 30;
+    let result = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: Some(wait),
+            limit: None,
+        })
+        .await;
+    assert_eq!(result.unwrap_err(), TransportError::Timeout);
+    assert!(
+        started.elapsed() < Duration::from_secs(u64::from(wait)),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// A transport that cannot read workdirs answers `NotFound`, as a server

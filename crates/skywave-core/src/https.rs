@@ -36,8 +36,9 @@ use crate::workdir::WORKDIR_TIMEOUT;
 pub struct TransportConfig {
     /// TCP connect plus TLS handshake.
     pub connect_timeout: Duration,
-    /// A whole request, or one body chunk of a blob. A long-poll gets its
-    /// `wait` on top.
+    /// A whole request; for blobs and event batches, the response head and
+    /// then each body chunk, so a slow link that keeps delivering bytes
+    /// never times out. An events long-poll's head gets its `wait` on top.
     pub request_timeout: Duration,
     /// Idle connections kept for reuse.
     pub max_idle: usize,
@@ -214,6 +215,35 @@ impl Http {
             .map_err(|_| TransportError::Timeout)?
     }
 
+    /// Sends a request, waits up to `head_timeout` for the response head,
+    /// then reads the body with each chunk due within the request timeout.
+    /// A slow link that keeps delivering bytes never times out; one that
+    /// stalls for a request timeout does.
+    async fn request_chunked(
+        &self,
+        method: Method,
+        uri: &str,
+        head_timeout: Duration,
+    ) -> Result<Reply, TransportError> {
+        let head = tokio::time::timeout(head_timeout, self.head(method, uri, &[], Bytes::new()))
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        let mut body = TimedBody {
+            body: Some(head.body),
+            timeout: self.request_timeout(),
+        };
+        let mut read = Vec::new();
+        while let Some(chunk) = body.next_chunk().await? {
+            read.extend_from_slice(&chunk);
+        }
+        self.put_idle(head.sender);
+        Ok(Reply {
+            status: head.status,
+            headers: head.headers,
+            body: read.into(),
+        })
+    }
+
     pub(crate) fn request_timeout(&self) -> Duration {
         self.config.request_timeout
     }
@@ -321,11 +351,14 @@ impl HttpsTransport {
         if let Some(limit) = query.limit {
             uri.push_str(&format!("&limit={limit}"));
         }
-        let timeout =
+        // The server answers within `wait`; the body is bounded per chunk,
+        // so a batch slower to download than any whole-exchange deadline
+        // still lands instead of being re-pulled from the same cursor.
+        let head_timeout =
             self.http.request_timeout() + Duration::from_secs(u64::from(query.wait.unwrap_or(0)));
         let reply = self
             .http
-            .request(Method::GET, &uri, Bytes::new(), timeout)
+            .request_chunked(Method::GET, &uri, head_timeout)
             .await?;
         ok_json(reply)
     }
@@ -406,7 +439,7 @@ impl HttpsTransport {
         Ok(BlobDownload {
             offset,
             total,
-            body: Box::new(HttpBlobBody {
+            body: Box::new(TimedBody {
                 body: Some(head.body),
                 timeout: self.http.request_timeout(),
             }),
@@ -437,13 +470,15 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
     Some((first.trim().parse().ok()?, size.trim().parse().ok()?))
 }
 
-struct HttpBlobBody {
+/// A response body read one chunk at a time, each within `timeout`: blobs
+/// and event batches.
+struct TimedBody {
     /// `None` once the body ended.
     body: Option<Incoming>,
     timeout: Duration,
 }
 
-impl BlobBody for HttpBlobBody {
+impl BlobBody for TimedBody {
     fn next_chunk(&mut self) -> BoxFuture<'_, Result<Option<Bytes>, TransportError>> {
         Box::pin(async move {
             loop {
