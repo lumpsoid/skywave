@@ -54,7 +54,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
 /// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
 /// | `BackgroundTasks` | `CallsUnanswered` for the open calls of the subagents whose task left, then `BackgroundTasksChanged` if the set changed, `call` linked to its call |
-/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped, `CallsUnanswered` for every open call; `Errored` if a turn was open or the exit was abnormal |
+/// | `Exited` | leftover approvals cancelled, a task's too, leftover mode, model and effort requests refused, leftover stops dropped, `CallsUnanswered` for every open call; one `Errored` if a turn was open, the exit was abnormal or messages went unsent, naming each that applies, the unsent ones last ("N queued messages were not sent to the agent; send them again") |
 ///
 /// **Settings.** The supervisor tells the mapper of every mode, model or
 /// effort request it hands the agent ([`EventMapper::asked_mode`],
@@ -595,7 +595,7 @@ impl EventMapper {
                 };
                 seqs.push(self.append(log, storage, kind)?);
             }
-            AdapterEvent::Exited { error } => {
+            AdapterEvent::Exited { error, unsent } => {
                 self.cancel_pending(log, storage, AGENT_EXITED, |_| true, &mut seqs)?;
                 self.refuse_asked(log, storage, &mut seqs)?;
                 // The empty set logged below settles them.
@@ -615,12 +615,21 @@ impl EventMapper {
                     };
                     seqs.push(self.append(log, storage, kind)?);
                 }
-                let message = match error {
+                let exit = match error {
                     Some(error) => Some(format!("agent exited: {error}")),
                     None if self.turn_open => Some("agent exited during a turn".to_owned()),
                     None => None,
                 };
                 self.turn_open = false;
+                // One `Errored` for the exit: the notice comes last and is
+                // never cut, the exit's reason giving way to it.
+                let message = match (exit, unsent_notice(unsent)) {
+                    (Some(exit), Some(notice)) => {
+                        let room = REFUSAL_MAX_CHARS.saturating_sub(notice.chars().count() + 2);
+                        Some(format!("{}; {notice}", cut_line(&exit, room).0))
+                    }
+                    (exit, notice) => exit.or(notice),
+                };
                 if let Some(message) = message {
                     let message = cut_line(&message, REFUSAL_MAX_CHARS).0;
                     seqs.push(self.append(
@@ -972,6 +981,21 @@ pub(crate) fn input_blob(
         _ => serde_json::to_vec_pretty(input)?,
     };
     put(&bytes)
+}
+
+/// What an `Errored` says of `unsent` messages an agent accepted and exited
+/// without beginning ([`AdapterEvent::Exited`]); `None` for none. They are
+/// reported, not redelivered: after a stop the user chose to end the work,
+/// and after a crash or kill delivery stays at most once (architecture.md
+/// "Agent supervisor"), so the user decides whether to send them again.
+fn unsent_notice(unsent: usize) -> Option<String> {
+    match unsent {
+        0 => None,
+        1 => Some("1 queued message was not sent to the agent; send it again".to_owned()),
+        n => Some(format!(
+            "{n} queued messages were not sent to the agent; send them again"
+        )),
+    }
 }
 
 /// The first non-blank line of `text`, trimmed, at most `max_chars` chars,

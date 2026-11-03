@@ -37,7 +37,9 @@
 //!   delivered message's turn has not ended, then
 //!   [`AgentSession::shutdown`]. The agent reports `TurnEnded(Interrupted)`
 //!   (so the mapper appends `SessionStateChanged(Idle)`) and `Exited`. A
-//!   session whose agent is not running is left alone. Like an idle
+//!   message delivered behind that turn never runs: the `Exited` counts it
+//!   as unsent and the mapper logs one `Errored` saying so, after the
+//!   `Idle`. A session whose agent is not running is left alone. Like an idle
 //!   shutdown, the next `UserMessage` resumes the agent.
 //! - `ContextStarted` / `ContextSwitched` (stamped with the context they
 //!   make current) → exactly what `SessionStopped` does, when the agent runs
@@ -117,8 +119,12 @@
 //! stopped reading but whose `Exited` is not handled yet refuses the
 //! message (`AgentError::Closed`): `deliver` stops it, logging its exit, and
 //! gives the message to a new one, so it still reaches exactly one agent.
-//! Messages it accepted and never answered are logged as `Errored` by its
-//! exit.
+//! Messages it accepted and never began a turn for (queued behind a turn it
+//! crashed or was killed in, or not read before it left) are counted by its
+//! `Exited` and named in the one `Errored` the mapper logs for the exit
+//! ("N queued messages were not sent to the agent; send them again"). They
+//! are reported, never redelivered: delivery is at most once (below), and
+//! after a stop the user chose to end the work.
 //!
 //! **Cursor and delivery.** The cursor (`supervisor_cursor`, the seq of the
 //! last event handled) is persisted, so a message accepted but not yet
@@ -186,7 +192,9 @@
 //! ([`AgentSession::shutdown`] abandons a running turn, so the agent cancels
 //! none of its approvals) and does not record their exit. Open turns and
 //! approvals stay as they are in the log, and the next start settles them the
-//! same way whether the daemon stopped cleanly or crashed. A pending approval
+//! same way whether the daemon stopped cleanly or crashed. The unsent count
+//! that `Exited` carries is dropped with it, so a message queued behind
+//! such a turn is not reported. A pending approval
 //! cannot outlive the daemon: the agent's request for it lives only in the
 //! agent process (D8). The agents stop concurrently, so shutdown takes about
 //! one agent's grace period however many run (systemd's stop timeout is a
@@ -1018,8 +1026,10 @@ impl<A: AgentAdapter> Supervisor<A> {
 
     async fn on_agent_event(&mut self, id: SessionId, event: Option<AdapterEvent>) -> Result<()> {
         // A stream that ends without `Exited` is an agent that went away.
+        // What it had queued is not known then.
         let event = event.unwrap_or_else(|| AdapterEvent::Exited {
             error: Some("event stream ended".into()),
+            unsent: 0,
         });
         let exited = matches!(event, AdapterEvent::Exited { .. });
         self.map(id, event)?;
@@ -1276,7 +1286,10 @@ async fn halt<S: AgentSession>(id: SessionId, running: Running<S>) -> Halted {
         tracing::warn!(session = %id.0, %error, "agent shutdown failed");
     }
     if !matches!(reported.last(), Some(AdapterEvent::Exited { .. })) {
-        reported.push(AdapterEvent::Exited { error: None });
+        reported.push(AdapterEvent::Exited {
+            error: None,
+            unsent: 0,
+        });
     }
     Halted {
         mapper,

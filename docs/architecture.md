@@ -238,7 +238,12 @@ not migrated). A database from before the stamp takes the current version.
   one); a message at the stored cursor that no agent took (no
   `AgentWorking` or `Errored` after it in its context) gets `Errored`
   ("message lost when the server stopped; send it again") on the next
-  start, once. If the supervisor
+  start, once. Messages an agent accepted but never began (queued behind a
+  turn when it is stopped, killed or crashes) are counted by the adapter's
+  `Exited`; the one `Errored` its exit logs ends with "N queued messages were
+  not sent to the agent; send them again". They are reported, not
+  redelivered: the user stopped the work, or a crash leaves delivery at most
+  once. A daemon shutdown does not report them yet. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for

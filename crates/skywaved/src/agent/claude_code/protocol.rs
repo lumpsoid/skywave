@@ -408,6 +408,9 @@ pub struct Protocol {
     model: Option<String>,
     turn_open: bool,
     interrupt_sent: bool,
+    /// Messages accepted and not written yet, oldest first: each starts the
+    /// next turn, unless the session is shutting down. Kept then, so the
+    /// exit can count them ([`Protocol::unsent`]).
     queued: VecDeque<String>,
     pending: Vec<Pending>,
     /// Tool name of each call this turn that has no result yet, by
@@ -535,9 +538,9 @@ impl Protocol {
     /// a clean exit.
     ///
     /// A successful status after the handshake is clean unless the CLI
-    /// reported an error, or messages it owes turns for went unanswered with
-    /// no turn open (an open turn is reported as such by whoever reads the
-    /// exit): stray stdout alone is not one. Any exit before
+    /// reported an error: stray stdout alone is not one, nor are an open
+    /// turn or unsent messages ([`Protocol::unsent`]), which whoever reads
+    /// the exit reports. Any exit before
     /// the handshake failed. For a failed exit the CLI's own startup error
     /// comes first, then the stderr tail, then a recent error result, then
     /// recent stray output, cut to its first line and
@@ -549,13 +552,7 @@ impl Protocol {
     ) -> Option<String> {
         let reason = |text: &str| cut_line(text, EXIT_REASON_MAX_CHARS).0;
         if self.ready && status.is_some_and(|s| s.success()) {
-            return self.error.as_deref().map(reason).or_else(|| {
-                let owed = self.queued.len();
-                (!self.turn_open && owed > 0).then(|| match owed {
-                    1 => "1 message left unanswered".to_owned(),
-                    n => format!("{n} messages left unanswered"),
-                })
-            });
+            return self.error.as_deref().map(reason);
         }
         let text = self
             .startup_error
@@ -694,16 +691,22 @@ impl Protocol {
     }
 
     /// `text` was accepted for the process but it exited before reading it:
-    /// a turn owed that never runs, which [`Protocol::exit_error`] reports.
+    /// a turn owed that never runs, counted by [`Protocol::unsent`].
     pub fn undelivered(&mut self, text: String) {
         self.queued.push_back(text);
     }
 
-    /// The session is stopping: queued messages are dropped and no new turn
-    /// starts.
+    /// The session is stopping: no new turn starts, so the messages queued
+    /// now are never written ([`Protocol::unsent`]).
     pub fn begin_shutdown(&mut self) {
         self.shutting_down = true;
-        self.queued.clear();
+    }
+
+    /// Messages accepted and not written to the process: queued behind the
+    /// open turn, or [`Protocol::undelivered`]. Once the process is gone
+    /// (or [`Protocol::begin_shutdown`]) none of them will run.
+    pub fn unsent(&self) -> usize {
+        self.queued.len()
     }
 
     /// Translates one stdout line.

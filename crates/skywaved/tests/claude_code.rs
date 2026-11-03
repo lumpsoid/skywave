@@ -291,7 +291,10 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 )
             }
             AdapterEvent::Grants(grants) => format!("grants: {}", grants.0),
-            AdapterEvent::Exited { error } => format!("exited: {error:?}"),
+            AdapterEvent::Exited { error, unsent: 0 } => format!("exited: {error:?}"),
+            AdapterEvent::Exited { error, unsent } => {
+                format!("exited: {error:?}, {unsent} unsent")
+            }
             AdapterEvent::PermissionMode(mode) => format!("mode: {mode:?}"),
             AdapterEvent::PermissionModeSet(mode) => format!("mode set: {mode:?}"),
             AdapterEvent::PermissionModeRefused { mode, reason } => {
@@ -1528,22 +1531,16 @@ fn stray_output_makes_no_clean_exit_an_error_and_loses_to_stderr() {
 }
 
 #[test]
-fn messages_owed_with_no_turn_open_make_a_clean_exit_an_error() {
+fn undelivered_messages_are_unsent_and_leave_a_clean_exit_clean() {
     let (mut protocol, _) = ready_protocol();
     protocol.send_message("go".to_owned());
     protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
-    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+    assert_eq!(protocol.unsent(), 0);
     protocol.undelivered("one".to_owned());
-    assert_eq!(
-        protocol.exit_error(None, exit_status(0)).as_deref(),
-        Some("1 message left unanswered")
-    );
     protocol.undelivered("two".to_owned());
-    assert_eq!(
-        protocol.exit_error(None, exit_status(0)).as_deref(),
-        Some("2 messages left unanswered")
-    );
-    // A failed exit says why it failed.
+    assert_eq!(protocol.unsent(), 2);
+    // The count travels in `Exited`; the reason stays the exit's own.
+    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
     assert_eq!(
         protocol.exit_error(Some("boom"), exit_status(3)).as_deref(),
         Some("boom (exit status: 3)")
@@ -1551,13 +1548,30 @@ fn messages_owed_with_no_turn_open_make_a_clean_exit_an_error() {
 }
 
 #[test]
-fn messages_queued_behind_an_open_turn_leave_the_exit_to_that_turn() {
+fn messages_queued_behind_a_turn_stay_unsent_once_shutting_down() {
     let (mut protocol, _) = ready_protocol();
     protocol.send_message("go".to_owned());
     protocol.send_message("queued".to_owned());
     protocol.undelivered("unread".to_owned());
-    // The open turn is reported as cut short by whoever reads the exit.
-    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+    assert_eq!(protocol.unsent(), 2);
+    protocol.begin_shutdown();
+    let end =
+        protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    // The turn ended and none of them began.
+    assert!(end.writes.is_empty(), "{:?}", end.writes);
+    assert_eq!(protocol.unsent(), 2);
+}
+
+#[test]
+fn a_queued_message_begun_after_its_turn_is_no_longer_unsent() {
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("go".to_owned());
+    protocol.send_message("queued".to_owned());
+    assert_eq!(protocol.unsent(), 1);
+    let end =
+        protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    assert_eq!(end.writes.len(), 1);
+    assert_eq!(protocol.unsent(), 0);
 }
 
 #[test]
@@ -1992,7 +2006,10 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
 }
@@ -2044,7 +2061,10 @@ async fn a_restart_resumes_with_the_handle_and_the_sessions_grants() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2073,7 +2093,10 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2090,7 +2113,10 @@ async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
     // conversation to resume, so the context stores no handle.
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
 
@@ -2203,7 +2229,10 @@ async fn a_fork_resumes_its_parent_under_a_new_session_id() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2256,7 +2285,10 @@ async fn adopting_an_outside_conversation_forks_it_under_a_new_session_id() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2343,13 +2375,20 @@ async fn shutdown_after_an_interrupt_waits_for_the_result() {
     session.send_message("hang".to_owned()).await.unwrap();
     handle_then_turn(&mut events).await;
     assert_eq!(take(&mut events, 1).await, [text("working")]);
-    // A message queued behind the running turn is dropped by the shutdown.
+    // A message queued behind the running turn is not begun by the
+    // shutdown: the exit counts it.
     session.send_message("never sent".to_owned()).await.unwrap();
     session.interrupt().await.unwrap();
     session.shutdown().await.unwrap();
     assert_eq!(
         take(&mut events, 2).await,
-        [INTERRUPTED, AdapterEvent::Exited { error: None }]
+        [
+            INTERRUPTED,
+            AdapterEvent::Exited {
+                error: None,
+                unsent: 1
+            }
+        ]
     );
     assert!(events.recv().await.is_none());
 }
@@ -2369,7 +2408,10 @@ async fn shutdown_mid_turn_abandons_the_turn_and_its_approval() {
     // Neither cancelled nor ended: the process was killed, not interrupted.
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
     assert!(!process_exists(pid), "agent process {pid} still exists");
@@ -2387,7 +2429,8 @@ async fn a_crash_is_reported_with_stderr_and_closes_the_session() {
     assert_eq!(
         take(&mut events, 1).await,
         [AdapterEvent::Exited {
-            error: Some("boom: the agent fell over (exit status: 3)".to_owned())
+            error: Some("boom: the agent fell over (exit status: 3)".to_owned()),
+            unsent: 0,
         },]
     );
     assert!(events.recv().await.is_none());
@@ -2412,7 +2455,8 @@ async fn a_crash_after_stray_output_is_explained_by_stderr() {
     assert_eq!(
         take(&mut events, 1).await,
         [AdapterEvent::Exited {
-            error: Some("boom: the agent fell over (exit status: 3)".to_owned())
+            error: Some("boom: the agent fell over (exit status: 3)".to_owned()),
+            unsent: 0,
         }]
     );
 }
@@ -2431,7 +2475,10 @@ async fn a_clean_exit_after_stray_output_is_no_error() {
     handle_then_turn(&mut events).await;
     assert_eq!(
         take(&mut events, 1).await,
-        [AdapterEvent::Exited { error: None }]
+        [AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }]
     );
 }
 
@@ -2467,7 +2514,10 @@ async fn a_cli_that_left_between_turns_refuses_requests_before_its_exit_is_repor
     // Nothing it was sent was owed: a clean exit.
     assert_eq!(
         take(&mut events, 1).await,
-        [AdapterEvent::Exited { error: None }]
+        [AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }]
     );
 }
 
@@ -2493,7 +2543,10 @@ async fn bytes_that_are_not_utf8_and_an_over_long_line_do_not_end_the_turn() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2511,7 +2564,10 @@ async fn dropping_the_session_stops_the_agent() {
     drop(session);
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
     assert!(!process_exists(pid), "agent process {pid} still exists");
@@ -2561,7 +2617,10 @@ async fn a_clean_exit_kills_what_the_agent_left_running() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(gone(child), "the agent's child {child} outlived it");
 }
@@ -2584,7 +2643,10 @@ async fn killing_the_agent_kills_what_it_started() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(
         tmp.path().join("term.txt").exists(),
@@ -2612,7 +2674,10 @@ async fn what_ignores_sigterm_is_killed_after_the_term_grace() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(
         tmp.path().join("term.txt").exists(),
@@ -2639,7 +2704,8 @@ async fn an_agent_that_stops_reading_is_killed_and_reported() {
     assert_eq!(
         next(&mut events).await,
         AdapterEvent::Exited {
-            error: Some("agent stopped reading its input; killed it".to_owned())
+            error: Some("agent stopped reading its input; killed it".to_owned()),
+            unsent: 0,
         }
     );
     assert!(events.recv().await.is_none());
@@ -2670,7 +2736,10 @@ async fn a_kill_reports_what_the_agent_says_as_it_stops() {
     assert_eq!(result.output, "Exit code 137");
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
 }
@@ -2696,7 +2765,8 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
     assert_eq!(
         next(&mut events).await,
         AdapterEvent::Exited {
-            error: Some(INTERRUPT_UNANSWERED.to_owned())
+            error: Some(INTERRUPT_UNANSWERED.to_owned()),
+            unsent: 0,
         }
     );
     assert!(events.recv().await.is_none());
@@ -2726,6 +2796,60 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
 }
 
 #[tokio::test]
+async fn messages_queued_behind_a_turn_stopped_by_an_escalation_are_counted_unsent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("stuck".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    session.send_message("queued one".to_owned()).await.unwrap();
+    session.send_message("queued two".to_owned()).await.unwrap();
+    session.interrupt().await.unwrap();
+    assert_eq!(next(&mut events).await, text("ignored"));
+    session.escalate_interrupt().await.unwrap();
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::Exited {
+            error: Some(INTERRUPT_UNANSWERED.to_owned()),
+            unsent: 2,
+        }
+    );
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn messages_queued_behind_a_turn_the_cli_died_in_are_counted_unsent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("stuck".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 1).await, [text("working")]);
+    session.send_message("queued".to_owned()).await.unwrap();
+    // The interrupt follows the message on the request channel, so once
+    // the CLI has seen it the message is queued in the driver.
+    session.interrupt().await.unwrap();
+    assert_eq!(next(&mut events).await, text("ignored"));
+    let pid = fake_pid(tmp.path());
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let AdapterEvent::Exited { error, unsent } = next(&mut events).await else {
+        panic!("expected the exit");
+    };
+    assert!(error.is_some_and(|e| e.contains("SIGKILL")));
+    assert_eq!(unsent, 1);
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn a_repeated_interrupt_after_the_answer_does_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter()
@@ -2750,7 +2874,10 @@ async fn a_repeated_interrupt_after_the_answer_does_nothing() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -2780,7 +2907,10 @@ async fn a_repeated_interrupt_leaves_the_turn_a_queued_message_started() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
     assert!(events.recv().await.is_none());
 }
@@ -2922,7 +3052,10 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next_raw(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 
@@ -3416,7 +3549,10 @@ async fn a_session_starts_with_and_switches_its_effort() {
     session.shutdown().await.unwrap();
     assert_eq!(
         next_raw(&mut events).await,
-        AdapterEvent::Exited { error: None }
+        AdapterEvent::Exited {
+            error: None,
+            unsent: 0
+        }
     );
 }
 

@@ -943,7 +943,9 @@ impl Runner {
                 Flow::Exit(error) => break error,
             }
         };
-        self.emit(AdapterEvent::Exited { error }).await;
+        // Messages queued behind the turn it stopped in never run.
+        let unsent = self.queued.len();
+        self.emit(AdapterEvent::Exited { error, unsent }).await;
     }
 
     /// The earliest wakeup that is due, if one is; of those due at once,

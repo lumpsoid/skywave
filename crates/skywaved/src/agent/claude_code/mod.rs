@@ -792,7 +792,13 @@ impl Driver {
                 }
             }
         };
-        let _ = self.events.send(AdapterEvent::Exited { error }).await;
+        // Every way out (exit, stop, escalation kill) left the queue as it
+        // is: what is still in it never ran.
+        let unsent = self.protocol.unsent();
+        let _ = self
+            .events
+            .send(AdapterEvent::Exited { error, unsent })
+            .await;
     }
 
     /// Writes `out`'s lines and reports its events; false when nobody reads
@@ -815,21 +821,16 @@ impl Driver {
         self.process.kill().await;
     }
 
-    /// stdout ended on its own: the exit error, if the exit was abnormal or
-    /// left messages unanswered.
+    /// stdout ended on its own: the exit error, if the exit was abnormal.
     ///
     /// The process reads nothing more, so requests are refused from here
     /// on: a message sent now fails with `Closed` and its sender can start
     /// another agent, rather than having it dropped with this one. Messages
     /// accepted before that and not yet read are owed turns the process
-    /// never answers ([`Protocol::undelivered`]).
+    /// never answers ([`Protocol::undelivered`]), counted as unsent like the
+    /// queued ones.
     async fn exited(&mut self) -> Option<String> {
-        self.requests.close();
-        while let Ok(request) = self.requests.try_recv() {
-            if let Request::Message(text) = request {
-                self.protocol.undelivered(text);
-            }
-        }
+        self.refuse_requests();
         let status = match timeout(self.grace_period, self.process.wait_exit()).await {
             Ok(status) => status,
             Err(_) => {
@@ -877,9 +878,22 @@ impl Driver {
     /// says as it dies (a result for the turn included) is still reported.
     async fn stop_unanswered(&mut self) -> Option<String> {
         tracing::warn!("agent did not answer the interrupt; killing it");
+        self.refuse_requests();
         self.protocol.begin_shutdown();
         self.kill().await;
         Some(INTERRUPT_UNANSWERED.to_owned())
+    }
+
+    /// The process will read nothing more: refuses requests from now on
+    /// (`Closed`, so the sender can start another agent) and keeps the
+    /// messages already accepted as [`Protocol::undelivered`].
+    fn refuse_requests(&mut self) {
+        self.requests.close();
+        while let Ok(request) = self.requests.try_recv() {
+            if let Request::Message(text) = request {
+                self.protocol.undelivered(text);
+            }
+        }
     }
 
     /// Kills the process, reporting what it says until its stdout ends: on
