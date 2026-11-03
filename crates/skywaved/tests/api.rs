@@ -661,6 +661,32 @@ async fn events_page_with_limit_and_reject_a_bad_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_after_past_any_log_is_a_400_and_the_server_keeps_answering() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+
+    // The highest seq a log can hold is still a cursor like any other.
+    let last = i64::MAX as u64;
+    let batch = device.events(Seq(last), 0).await;
+    assert_eq!((batch.from, batch.events.len()), (Seq(last + 1), 0));
+
+    // Past it, no log has that position: a client error, never a 500 (a
+    // panic there used to poison the API's database lock for good).
+    for after in [last + 1, u64::MAX] {
+        let uri = events_uri(Seq(after), 0);
+        assert_eq!(
+            device.get(&uri).await.status,
+            StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+    }
+    assert_eq!(device.get(path::HELLO).await.status, StatusCode::OK);
+    let batch = device.events(Seq::ZERO, 0).await;
+    assert_eq!(batch.from, Seq(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn long_poll_returns_when_an_event_is_appended() {
     let mut f = Fixture::start().await;
     let creds = f.pair().await;

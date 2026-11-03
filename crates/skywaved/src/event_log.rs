@@ -50,6 +50,9 @@ use crate::error::{Error, Result};
 pub const DEFAULT_BATCH_LIMIT: u32 = 500;
 /// Largest batch [`EventLog::read`] returns, whatever the caller asks for.
 pub const MAX_BATCH_LIMIT: u32 = 5000;
+/// Highest seq the log can hold: seqs are SQLite integers. A cursor past it
+/// names no position in any log, so `GET /v1/events` refuses it.
+pub const MAX_SEQ: Seq = Seq(i64::MAX as u64);
 
 /// Handle to the global event log. Cheap to clone; share one per process.
 #[derive(Debug, Clone)]
