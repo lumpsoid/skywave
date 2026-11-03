@@ -13,6 +13,8 @@
 # it is handled as above; with "stubborn" too, the `sleep` ignores SIGTERM.
 # One containing "litter" first writes a stray line that is not JSON; one
 # containing "quit" then exits 0, mid-turn and without a word.
+# One containing "leave" gets the text "echo" and its result, then the CLI
+# closes stdout and exits 0 a second later, between turns.
 # One containing "run" starts the Write call and runs it until interrupted.
 # One containing "stuck" gets the text "working", then the CLI answers
 # nothing more, interrupts included (each one gets the text "ignored").
@@ -208,6 +210,16 @@ while IFS= read -r line; do
           ack "$req"
           printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"session_id":"%s"}\n' "$sid"
           result_aborted aborted_streaming
+          ;;
+        *leave*)
+          # Ends the turn, then exits 0 between turns: stdout closes at
+          # once and the process lingers a moment, so whatever is sent
+          # meanwhile meets a CLI that will never read it.
+          text "echo"
+          result_ok
+          exec >&-
+          sleep 1
+          exit 0
           ;;
         *garbage*)
           # Bytes that are not UTF-8, inside a message and on a stray line,

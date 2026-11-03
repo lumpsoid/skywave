@@ -1528,6 +1528,39 @@ fn stray_output_makes_no_clean_exit_an_error_and_loses_to_stderr() {
 }
 
 #[test]
+fn messages_owed_with_no_turn_open_make_a_clean_exit_an_error() {
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("go".to_owned());
+    protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+    protocol.undelivered("one".to_owned());
+    assert_eq!(
+        protocol.exit_error(None, exit_status(0)).as_deref(),
+        Some("1 message left unanswered")
+    );
+    protocol.undelivered("two".to_owned());
+    assert_eq!(
+        protocol.exit_error(None, exit_status(0)).as_deref(),
+        Some("2 messages left unanswered")
+    );
+    // A failed exit says why it failed.
+    assert_eq!(
+        protocol.exit_error(Some("boom"), exit_status(3)).as_deref(),
+        Some("boom (exit status: 3)")
+    );
+}
+
+#[test]
+fn messages_queued_behind_an_open_turn_leave_the_exit_to_that_turn() {
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("go".to_owned());
+    protocol.send_message("queued".to_owned());
+    protocol.undelivered("unread".to_owned());
+    // The open turn is reported as cut short by whoever reads the exit.
+    assert_eq!(protocol.exit_error(None, exit_status(0)), None);
+}
+
+#[test]
 fn a_long_exit_reason_is_cut_so_its_status_survives_the_errored_cap() {
     use skywave_proto::limits::REFUSAL_MAX_CHARS;
 
@@ -2396,6 +2429,42 @@ async fn a_clean_exit_after_stray_output_is_no_error() {
         .await
         .unwrap();
     handle_then_turn(&mut events).await;
+    assert_eq!(
+        take(&mut events, 1).await,
+        [AdapterEvent::Exited { error: None }]
+    );
+}
+
+#[tokio::test]
+async fn a_cli_that_left_between_turns_refuses_requests_before_its_exit_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, mut events) = adapter()
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("leave".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    assert_eq!(take(&mut events, 2).await, [text("echo"), COMPLETED]);
+    // Its stdout has ended; the process lingers a second. An interrupt
+    // while idle does nothing, so it probes for the refusal harmlessly.
+    tokio::time::timeout(WAIT, async {
+        while session.interrupt().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("requests still taken after the CLI's stdout ended");
+    // Refused while the process still runs: its exit is not reported yet,
+    // so this is not the driver having gone away.
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        session.send_message("hello".to_owned()).await,
+        Err(AgentError::Closed)
+    ));
+    // Nothing it was sent was owed: a clean exit.
     assert_eq!(
         take(&mut events, 1).await,
         [AdapterEvent::Exited { error: None }]

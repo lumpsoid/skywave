@@ -1226,6 +1226,13 @@ notes above:
   after the signal, so the CLI handles the signal rather than an EOF.
 - **A write the CLI does not read within 30 s** kills it, reported as
   `Exited { error }`: a wedged CLI cannot hold up its session's driver.
+- **Once stdout ends the session refuses requests** (`AgentError::Closed`),
+  while the driver still waits for the exit: a message sent then fails, so
+  the supervisor restarts the agent and delivers it there instead of it
+  being dropped. Messages accepted before stdout ended but not yet read are
+  owed turns: a clean exit with any of them and no turn open is
+  `Exited { error: "N message(s) left unanswered" }`. With a turn open the
+  exit is the turn's, as before (the mapper's "agent exited during a turn").
 
 ## 6b. Tool displays (Tc)
 

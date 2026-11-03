@@ -1794,6 +1794,42 @@ async fn a_repeated_interrupt_stops_an_agent_that_ignores_the_first() {
     assert!(!process_exists(pid), "agent process {pid} still exists");
 }
 
+#[tokio::test]
+async fn a_message_sent_after_the_agent_left_between_turns_is_answered_once_by_a_new_one() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+    let echoed =
+        |k: &&EventKind| matches!(k, EventKind::AgentMessage { text, .. } if text == "echo");
+
+    // The CLI answers, then closes its stdout and lingers a second before
+    // exiting 0: the message below reaches the supervisor while that
+    // agent is still running but will never read it.
+    f.send("leave");
+    f.wait_count("idle", 1, is_idle).await;
+    let left = fake_cli_pid(&f);
+    f.send("hello");
+    let kinds = f.wait_count("idle again", 2, is_idle).await;
+    assert_ne!(
+        fake_cli_pid(&f),
+        left,
+        "the message went to the agent that left"
+    );
+    assert!(argv_has_resume(&f), "the agent was not resumed");
+    assert_eq!(kinds.iter().filter(echoed).count(), 2);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == state(SessionState::AgentWorking))
+            .count(),
+        2,
+        "the message was not answered exactly once: {kinds:?}"
+    );
+    assert!(!kinds.iter().any(is_errored), "{kinds:?}");
+    let pid = fake_cli_pid(&f);
+    supervisor.shutdown().await.unwrap();
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+}
+
 /// Whether the fake CLI last ran with `--resume`, from `argv.txt`.
 fn argv_has_resume(f: &Fixture) -> bool {
     std::fs::read_to_string(f.root.join("project/argv.txt"))

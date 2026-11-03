@@ -113,7 +113,12 @@
 //! Everything the agent reports goes through the session's [`EventMapper`].
 //! An agent that exits on its own (crash) is logged by the mapper (`Errored`
 //! when it was mid-turn, its approvals cancelled) and dropped; the next
-//! `UserMessage` starts it again with its resume handle.
+//! `UserMessage` starts it again with its resume handle. An agent that has
+//! stopped reading but whose `Exited` is not handled yet refuses the
+//! message (`AgentError::Closed`): `deliver` stops it, logging its exit, and
+//! gives the message to a new one, so it still reaches exactly one agent.
+//! Messages it accepted and never answered are logged as `Errored` by its
+//! exit.
 //!
 //! **Cursor and delivery.** The cursor (`supervisor_cursor`, the seq of the
 //! last event handled) is persisted, so a message accepted but not yet
