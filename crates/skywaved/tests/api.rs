@@ -18,7 +18,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
+    BlobId, BlobRef, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
     ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind,
     EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse, ImportOutcome,
     ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, Seq, SessionId,
@@ -1036,6 +1036,47 @@ async fn workdir_list_and_file_answer_every_outcome_with_200() {
             "{route}"
         );
     }
+}
+
+/// The content blob of the answer to reading file `name`.
+async fn file_blob(device: &mut Client, session: SessionId, name: &str) -> BlobRef {
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_FILE, session, name))
+        .await;
+    match reply.json::<FileResult>() {
+        FileResult::File {
+            content: FileBody::Blob(blob),
+            ..
+        } => blob,
+        other => panic!("expected a file blob, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_only_a_replaced_answer_named_is_a_404() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let workdir = f.root.join("project");
+    std::fs::write(workdir.join("notes"), "first\n").unwrap();
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+    let first = file_blob(&mut device, session, "notes").await;
+    assert_eq!(
+        device.get(&path::blob(first.id)).await.status,
+        StatusCode::OK
+    );
+    std::fs::write(workdir.join("notes"), "second\n").unwrap();
+    let second = file_blob(&mut device, session, "notes").await;
+    assert_ne!(second.id, first.id);
+    assert_eq!(
+        device.get(&path::blob(first.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        device.get(&path::blob(second.id)).await.status,
+        StatusCode::OK
+    );
 }
 
 /// The daemon's git, immune to the user's config.

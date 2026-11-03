@@ -229,7 +229,23 @@ not migrated). A database from before the stamp takes the current version.
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
   keeps its blob across refreshes; event blobs are never reused for them.
-  Nothing deletes blobs yet (no GC).
+  **Blob GC**: a workdir blob lives while the latest answer to some read
+  names it, any session: `workdir_answer_blobs` keeps the blobs of each
+  read's latest answer, keyed as the core keys its stored answers
+  (session, `changes` or `file`, the path as requested), and every
+  changes or file answer but `ChangesResult::Failed` replaces its read's
+  rows. In that transaction every workdir blob no answer names loses its
+  rows; its file goes after the commit. All of it runs on the workdir
+  connection under the snapshot mutex, so no pass falls between a store
+  reusing a blob and the answer naming it. A device holding a replaced
+  answer (lost reply, another device's refresh) gets a 404 for its blob
+  and shows the download failed until a refresh. Event blobs live as long
+  as the log, which is never pruned. `serve`, once its address is bound
+  (so a second daemon on that address fails first) and before the
+  supervisor, shell runner or API can write blobs, runs the same pass,
+  then removes every `.tmp-*` file in `blobs/` and every blob file without
+  a row (an interrupted write, or a crash between a file and its row).
+  There is no data dir lock: one `serve` per data dir is assumed.
   Changes run the `git` CLI in the workdir (no git library): `rev-parse`
   decides `NotGit` from its output, then one `git diff <HEAD or the empty
   tree> --relative -M -z --raw --numstat` gives the entries (so a workdir

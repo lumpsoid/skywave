@@ -15,7 +15,7 @@ use skywave_proto::{
 };
 
 use super::git::{GitError, Repo};
-use super::{Located, READ_CHUNK, Snapshot, looks_binary};
+use super::{AnswerKind, Located, READ_CHUNK, Snapshot, looks_binary};
 use crate::error::Result;
 
 /// Every patch section, and only a patch section, starts with this line
@@ -209,10 +209,30 @@ impl<'a> Snapshot<'a> {
     }
 
     /// [`Snapshot::changes`], and the diff bytes it held at most at once.
+    /// Every answer but `Failed` is recorded as the read's latest (the
+    /// parent module's docs, "Garbage").
     pub(super) fn changes_measured(
         &mut self,
         query: &WorkdirQuery,
     ) -> Result<(ChangesResult, Kept)> {
+        let (answer, kept) = self.changes_unrecorded(query)?;
+        let blobs = match &answer {
+            ChangesResult::Failed { .. } => return Ok((answer, kept)),
+            ChangesResult::Changes(set) => set
+                .files
+                .iter()
+                .filter_map(|file| match &file.diff {
+                    DiffBody::Blob(blob) => Some(blob.id),
+                    DiffBody::Binary | DiffBody::TooLarge { .. } | DiffBody::Omitted => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.answered(query.session, AnswerKind::Changes, "", &blobs)?;
+        Ok((answer, kept))
+    }
+
+    fn changes_unrecorded(&mut self, query: &WorkdirQuery) -> Result<(ChangesResult, Kept)> {
         let workdir = match self.workdir(query.session)? {
             Ok(workdir) => workdir,
             Err(Located::UnknownSession) => {
@@ -1092,7 +1112,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use skywave_proto::BlobRef;
+    use skywave_proto::{BlobId, BlobRef};
 
     use super::super::tests::Tree;
     use super::super::{Git, WorkdirReader};
@@ -1245,6 +1265,52 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn diff_blob(set: &ChangeSet, path: &str) -> BlobId {
+        match &entry(set, path, false).diff {
+            DiffBody::Blob(blob) => blob.id,
+            other => panic!("expected a diff blob for {path:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_deletes_the_diffs_only_the_answer_before_named() {
+        let t = Tree::new();
+        let wd = &t.workdir;
+        init(wd);
+        write(wd.join("a"), "one\n");
+        write(wd.join("b"), "two\n");
+        commit_all(wd);
+        write(wd.join("a"), "one, changed\n");
+        write(wd.join("b"), "two, changed\n");
+        let before = change_set(&t);
+        let (a, b) = (diff_blob(&before, "a"), diff_blob(&before, "b"));
+
+        write(wd.join("a"), "one, changed again\n");
+        let after = change_set(&t);
+        assert_ne!(diff_blob(&after, "a"), a);
+        assert_eq!(
+            diff_blob(&after, "b"),
+            b,
+            "an unchanged diff keeps its blob"
+        );
+        assert!(!t.stored(a), "the replaced diff is gone");
+        assert!(t.stored(b));
+        assert!(t.stored(diff_blob(&after, "a")));
+
+        // A failed answer is not stored, so it replaces nothing.
+        let missing = Git::new(t.root.join("no-such-git"));
+        assert!(matches!(
+            answer_with(&t, missing).0,
+            ChangesResult::Failed { .. }
+        ));
+        assert!(t.stored(b));
+        assert!(t.stored(diff_blob(&after, "a")));
+        // Not a git work tree any more: that answer names nothing.
+        std::fs::remove_dir_all(wd.join(".git")).unwrap();
+        assert_eq!(answer(&t), ChangesResult::NotGit);
+        assert!(!t.stored(b));
     }
 
     #[test]

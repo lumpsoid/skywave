@@ -793,7 +793,14 @@ content anyway, so it is accepted.
 so a refresh costs no server disk and no device fetch. Only workdir content
 is looked up, so a snapshot never shares a blob with an event, whose
 per-session deletion on the device could then remove it.
-**Deferred:** blob GC (workdir and event blobs alike grow without bound).
+**Workdir blob GC:** a workdir blob lives while
+the latest answer to some read (any session) names it; a refresh that
+replaces an answer deletes what only it named, in the same transaction,
+under the snapshot mutex that already serialises every store, so a blob a
+store just reused is named before any pass can run. Definitive (the rows
+of answers sent), not a time window: a device still holding a replaced
+answer gets a 404 and refreshes. **Deferred:** event blob GC; they live
+as long as the log, which is never pruned.
 
 ## D37. Browsing and importing outside conversations
 An adopting `CreateSession` (D32) imports the outside conversation's
@@ -852,7 +859,7 @@ first start; turns the terminal adds in between are in the agent's memory
 but not in the imported history. **Deferred:** forking eagerly at create
 time; re-importing or importing into an existing session (the only way
 back from a timed-out import); subagent lines, thinking, attachments and
-per-turn usage of imported turns; blob GC (as D36).
+per-turn usage of imported turns; event blob GC (as D36).
 
 ## D38. Bypass mode only where the operator accepted the risk
 Bypass (`PermissionMode::Bypass`: every tool runs, nothing asks) can be

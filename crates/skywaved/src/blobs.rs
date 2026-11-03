@@ -5,6 +5,14 @@
 //! `blobs/`, synced and renamed into place before the row is inserted, so a
 //! row never points at a partial file. A crash between rename and insert can
 //! leave an orphan file, which is never served.
+//!
+//! **Deleting.** Only workdir blobs are ever deleted (`workdir.rs`,
+//! "Garbage"): the row first, in the transaction that makes the blob
+//! unnamed, then the file. Event blobs live as long as the log, which is
+//! never pruned. At startup, before anything can be writing,
+//! [`BlobStore::sweep`] removes every `.tmp-*` file and every blob file
+//! without a row: what an interrupted write, a crash between rename and
+//! insert, or one between a deletion's commit and its unlink left behind.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -117,9 +125,44 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Removes the file of a blob that was written but never committed.
+    /// Removes the file of a blob that was written but never committed, or
+    /// whose row was deleted.
     pub fn discard(&self, id: BlobId) {
         let _ = std::fs::remove_file(self.path(id));
+    }
+
+    /// Removes every file in the store that is not a recorded blob: `.tmp-*`
+    /// files and blob files without a row (module docs, "Deleting"); returns
+    /// how many. Startup only: a write in flight has exactly such files, so
+    /// nothing may be writing blobs to this directory meanwhile. Files
+    /// named otherwise are left alone.
+    pub fn sweep(&self, conn: &Connection) -> Result<usize> {
+        let entries = std::fs::read_dir(&self.dir)
+            .context(|| format!("listing blobs in {}", self.dir.display()))?;
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry.context(|| format!("listing blobs in {}", self.dir.display()))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let stale = if name.starts_with(".tmp-") {
+                true
+            } else if let Ok(id) = uuid::Uuid::parse_str(name) {
+                self.meta(conn, BlobId(id))?.is_none()
+            } else {
+                false
+            };
+            if !stale || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).context(|| format!("removing {}", entry.path().display()));
+                }
+            }
+        }
+        Ok(removed)
     }
 
     fn write_atomically(&self, path: &Path, content: &mut impl Read) -> io::Result<(u64, String)> {
@@ -166,14 +209,23 @@ impl BlobStore {
 
     /// Opens blob `id` for reading, positioned at the start.
     ///
-    /// `None` if no such blob is recorded. A recorded blob whose file is
-    /// missing or has the wrong size is an error.
+    /// `None` if no such blob is recorded, including one deleted between
+    /// reading its row and opening its file (a collected workdir blob). A
+    /// recorded blob whose file is missing or has the wrong size is an
+    /// error.
     pub fn open(&self, conn: &Connection, id: BlobId) -> Result<Option<BlobFile>> {
         let Some(meta) = self.meta(conn, id)? else {
             return Ok(None);
         };
         let path = self.path(id);
-        let file = File::open(&path).context(|| format!("opening blob {}", path.display()))?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            // Deleted since its row was read: the row went first.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.meta(conn, id)?.is_none() => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e).context(|| format!("opening blob {}", path.display())),
+        };
         let actual = file
             .metadata()
             .context(|| format!("reading blob metadata {}", path.display()))?
