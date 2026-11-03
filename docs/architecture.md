@@ -159,9 +159,9 @@ every version.
 
 `skywaved`. Its config keys are in the README; its data directory holds
 `skywave.db` (SQLite, WAL), `blobs/`, `ca/` and `server/` (ECDSA P-256 keys,
-mode 0600), `server_id`, and `shell/` (running shell output until it becomes
-a blob). `serve` creates the CA, certificate and id on first run and
-reissues the certificate (same CA) when its names change. Admin commands
+mode 0600), `server_id`, `shell/` (running shell output until it becomes
+a blob) and `serve.lock` (held locked by the one running `serve`).
+`serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change. Admin commands
 (`pair`, `devices list`, `devices revoke`) work on the database directly,
 beside a running `serve`.
 
@@ -278,11 +278,14 @@ not migrated). A database from before the stamp takes the current version.
   answer (lost reply, another device's refresh) gets a 404 for its blob
   and shows the download failed until a refresh. Event blobs live as long
   as the log, which is never pruned. `serve`, once its address is bound
-  (so a second daemon on that address fails first) and before the
-  supervisor, shell runner or API can write blobs, runs the same pass,
-  then removes every `.tmp-*` file in `blobs/` and every blob file without
-  a row (an interrupted write, or a crash between a file and its row).
-  There is no data dir lock: one `serve` per data dir is assumed.
+  and before the supervisor, shell runner or API can write blobs, runs the
+  same pass, then removes every `.tmp-*` file in `blobs/` and every blob
+  file without a row (an interrupted write, or a crash between a file and
+  its row). One `serve` per data dir is enforced: `serve` first takes an
+  exclusive OS lock (`flock`) on `serve.lock` in the data dir, held for
+  the process lifetime, so a second `serve` on the dir, on any address,
+  fails at once naming the dir. `pair` and `devices` do not take it and
+  run beside the daemon.
   Changes run the `git` CLI in the workdir (no git library): `rev-parse`
   decides `NotGit` from its output, then one `git diff <HEAD or the empty
   tree> --relative -M -z --raw --numstat` gives the entries (so a workdir

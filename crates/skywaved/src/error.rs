@@ -28,6 +28,9 @@ pub enum Error {
     NoConfigDir,
     #[error("no data directory: set `data_dir` in the config, XDG_DATA_HOME or HOME")]
     NoDataDir,
+    /// Another `skywaved serve` holds the data dir's serve lock.
+    #[error("another skywaved serve is running on data directory {}", path.display())]
+    DataDirInUse { path: PathBuf },
     #[error("database schema version {found} is newer than this skywaved supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
     /// The database was written by a build of another protocol version; its
