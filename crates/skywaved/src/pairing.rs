@@ -10,20 +10,25 @@
 //! caller. The update, the device insert and the certificate signing share
 //! one transaction: a bad CSR rolls back and leaves the code usable.
 //!
-//! **Rate limit:** one global window over failed code attempts
-//! ([`RateLimit`], default 5 per minute), kept in memory. Every attempt
-//! reserves a slot before the code is checked and gives it back if the code
-//! was right, so parallel guesses can't overrun the limit. While the window
-//! is full every attempt, right or wrong, gets 429 without the code being
-//! looked at. Global (not per peer) because the server has a single owner:
-//! a flood can delay pairing for a minute but can't make guessing feasible —
-//! 7 200 guesses a day against 2^50 codes.
+//! **Rate limit:** sliding windows over failed code attempts ([`RateLimit`]),
+//! kept in memory: one per source (default 5 per minute) and a global
+//! backstop over every remote source (default 100 per minute). Every attempt
+//! reserves a slot in its windows before the code is checked and gives it
+//! back if the code was right, so parallel guesses can't overrun the limit.
+//! While a window is full every attempt it covers, right or wrong, gets 429
+//! without the code being looked at. A source is the peer's IP, an IPv6
+//! address cut to its /64 (one host usually owns the whole prefix), and all
+//! of loopback as one source. Loopback is outside the global window, so no
+//! remote flood can lock out pairing from the server itself. The global
+//! window keeps distributed guessing hopeless — 144 000 guesses a day against
+//! 2^50 codes — and bounds the per-source map: an entry lives only while it
+//! holds a slot, and every remote slot is also a global one.
 //!
 //! **HTTP** ([`router`]): the only route is `POST /v1/pair`; errors are bare
 //! status codes (architecture.md "Protocol"): 400 malformed request or CSR, 401 wrong, used or
 //! expired code, 429 rate limited with `Retry-After`, 500 server fault.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -31,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -254,56 +259,146 @@ impl Clock for SystemClock {
     }
 }
 
-/// At most `max_failures` failed code attempts in any `window`.
+/// At most `per_source` failed code attempts from one source, and
+/// `global` from all remote sources together, in any `window` (module docs,
+/// "Rate limit").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimit {
-    pub max_failures: usize,
+    pub per_source: usize,
+    pub global: usize,
     pub window: Duration,
 }
 
 impl Default for RateLimit {
     fn default() -> RateLimit {
         RateLimit {
-            max_failures: 5,
+            per_source: 5,
+            global: 100,
             window: Duration::minutes(1),
         }
     }
 }
 
-/// Sliding window of attempt times; an attempt holds its slot until it
-/// turns out to be a success.
+/// Where an attempt comes from, as far as the rate limit cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Source {
+    /// Any loopback address: the server's own host.
+    Loopback,
+    /// An IPv4 address, or an IPv6 address with all but its /64 zeroed.
+    Remote(IpAddr),
+}
+
+impl Source {
+    fn of(ip: IpAddr) -> Source {
+        let ip = ip.to_canonical();
+        if ip.is_loopback() {
+            return Source::Loopback;
+        }
+        match ip {
+            IpAddr::V4(_) => Source::Remote(ip),
+            IpAddr::V6(v6) => {
+                let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+                Source::Remote(IpAddr::V6(prefix.into()))
+            }
+        }
+    }
+}
+
+/// One sliding window of attempt times.
+#[derive(Debug, Default)]
+struct Window(VecDeque<DateTime<Utc>>);
+
+impl Window {
+    /// Drops the attempts older than `window` before `now`.
+    fn expire(&mut self, now: DateTime<Utc>, window: Duration) {
+        // A clock that went back must not lock pairing out for the gap.
+        for t in self.0.iter_mut() {
+            *t = (*t).min(now);
+        }
+        while self.0.front().is_some_and(|t| *t + window <= now) {
+            self.0.pop_front();
+        }
+    }
+
+    /// How long until a slot frees up, if all `max` are taken.
+    fn full(&self, max: usize, now: DateTime<Utc>, window: Duration) -> Option<Duration> {
+        (self.0.len() >= max).then(|| match self.0.front() {
+            Some(oldest) => *oldest + window - now,
+            None => window,
+        })
+    }
+
+    fn remove(&mut self, at: DateTime<Utc>) {
+        if let Some(i) = self.0.iter().position(|t| *t == at) {
+            self.0.remove(i);
+        }
+    }
+}
+
+/// A slot taken by [`Attempts::reserve`].
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    source: Source,
+    at: DateTime<Utc>,
+}
+
+/// The rate limit's windows; an attempt holds its slots until it turns out
+/// to be a success.
 #[derive(Debug)]
 struct Attempts {
     limit: RateLimit,
-    at: VecDeque<DateTime<Utc>>,
+    /// Every remote attempt.
+    global: Window,
+    /// Only sources holding a slot: an emptied window is dropped.
+    by_source: HashMap<Source, Window>,
 }
 
 impl Attempts {
-    /// Reserves a slot at `now`, or says how long until one frees up.
-    fn reserve(&mut self, now: DateTime<Utc>) -> std::result::Result<DateTime<Utc>, Duration> {
-        // A clock that went back must not lock pairing out for the gap.
-        for t in self.at.iter_mut() {
-            *t = (*t).min(now);
+    fn new(limit: RateLimit) -> Attempts {
+        Attempts {
+            limit,
+            global: Window::default(),
+            by_source: HashMap::new(),
         }
-        while self
-            .at
-            .front()
-            .is_some_and(|t| *t + self.limit.window <= now)
+    }
+
+    /// Reserves a slot for `ip` at `now`, or says how long until one frees
+    /// up.
+    fn reserve(&mut self, ip: IpAddr, now: DateTime<Utc>) -> std::result::Result<Slot, Duration> {
+        let window = self.limit.window;
+        self.global.expire(now, window);
+        self.by_source.retain(|_, w| {
+            w.expire(now, window);
+            !w.0.is_empty()
+        });
+        let source = Source::of(ip);
+        if let Some(retry) = self
+            .by_source
+            .get(&source)
+            .and_then(|w| w.full(self.limit.per_source, now, window))
         {
-            self.at.pop_front();
+            return Err(retry);
         }
-        if self.at.len() >= self.limit.max_failures {
-            let oldest = *self.at.front().expect("window is full");
-            return Err(oldest + self.limit.window - now);
+        if source != Source::Loopback {
+            if let Some(retry) = self.global.full(self.limit.global, now, window) {
+                return Err(retry);
+            }
+            self.global.0.push_back(now);
         }
-        self.at.push_back(now);
-        Ok(now)
+        self.by_source.entry(source).or_default().0.push_back(now);
+        Ok(Slot { source, at: now })
     }
 
     /// Gives back a slot taken by [`Attempts::reserve`].
-    fn release(&mut self, slot: DateTime<Utc>) {
-        if let Some(i) = self.at.iter().position(|t| *t == slot) {
-            self.at.remove(i);
+    fn release(&mut self, slot: Slot) {
+        if slot.source != Source::Loopback {
+            self.global.remove(slot.at);
+        }
+        if let Some(w) = self.by_source.get_mut(&slot.source) {
+            w.remove(slot.at);
+            if w.0.is_empty() {
+                self.by_source.remove(&slot.source);
+            }
         }
     }
 }
@@ -350,16 +445,18 @@ impl PairService {
         PairService {
             db: Mutex::new(db),
             identity,
-            attempts: Mutex::new(Attempts {
-                limit,
-                at: VecDeque::new(),
-            }),
+            attempts: Mutex::new(Attempts::new(limit)),
             clock,
         }
     }
 
     /// Checks the code, signs the CSR with the CA and records the device.
-    pub fn pair(&self, req: &PairRequest) -> std::result::Result<PairResponse, PairError> {
+    /// `peer` is the address the request came from, for the rate limit.
+    pub fn pair(
+        &self,
+        peer: IpAddr,
+        req: &PairRequest,
+    ) -> std::result::Result<PairResponse, PairError> {
         let name = req.device_name.trim();
         if name.is_empty()
             || name.chars().count() > MAX_DEVICE_NAME
@@ -372,12 +469,12 @@ impl PairService {
 
         let now = self.clock.now();
         let slot = lock(&self.attempts)
-            .reserve(now)
+            .reserve(peer, now)
             .map_err(|retry_after| PairError::RateLimited { retry_after })?;
         let result = self.redeem(req, name, now);
         match &result {
             Err(PairError::InvalidCode) => {
-                tracing::warn!("pairing attempt with an invalid code");
+                tracing::warn!(%peer, "pairing attempt with an invalid code");
             }
             _ => lock(&self.attempts).release(slot),
         }
@@ -433,8 +530,10 @@ pub fn router(service: Arc<PairService>) -> Router {
 
 async fn pair_handler(
     State(service): State<Arc<PairService>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     body: std::result::Result<Json<PairRequest>, JsonRejection>,
 ) -> Response {
+    let peer = peer.ip();
     let req = match body {
         Ok(Json(req)) => req,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -443,7 +542,7 @@ async fn pair_handler(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     // SQLite and signing block; keep them off the async workers.
-    let result = match tokio::task::spawn_blocking(move || service.pair(&req)).await {
+    let result = match tokio::task::spawn_blocking(move || service.pair(peer, &req)).await {
         Ok(result) => result,
         Err(e) => {
             tracing::error!(error = %e, "pairing task failed");
@@ -538,6 +637,34 @@ mod tests {
         fn devices(&self) -> Vec<devices::Device> {
             devices::list(self.storage.db.conn()).unwrap()
         }
+
+        /// Pairs from [`REMOTE`].
+        fn pair(&self, req: &PairRequest) -> std::result::Result<PairResponse, PairError> {
+            self.service.pair(REMOTE, req)
+        }
+
+        /// Spends `n` failed attempts from `peer`, each answered 401.
+        fn fail(&self, peer: IpAddr, n: usize, right: &PairCode) {
+            for _ in 0..n {
+                assert!(matches!(
+                    self.service.pair(peer, &request(&wrong_code(right))),
+                    Err(PairError::InvalidCode)
+                ));
+            }
+        }
+    }
+
+    const REMOTE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+
+    fn remote(n: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n))
+    }
+
+    fn rate_limited(result: std::result::Result<PairResponse, PairError>) -> Duration {
+        match result {
+            Err(PairError::RateLimited { retry_after }) => retry_after,
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     fn csr() -> String {
@@ -570,10 +697,7 @@ mod tests {
         let f = fixture();
         let code = f.issue(DEFAULT_TTL);
         // Typed loosely: lowercase, with the separator.
-        let resp = f
-            .service
-            .pair(&request(&code.to_string().to_lowercase()))
-            .unwrap();
+        let resp = f.pair(&request(&code.to_string().to_lowercase())).unwrap();
 
         assert_eq!(resp.ca_cert_pem, f.identity.ca_cert_pem());
         let (_, pem) = x509_parser::pem::parse_x509_pem(resp.device_cert_pem.as_bytes()).unwrap();
@@ -598,9 +722,9 @@ mod tests {
     fn code_is_single_use() {
         let f = fixture();
         let code = f.issue(DEFAULT_TTL);
-        f.service.pair(&request(code.as_str())).unwrap();
+        f.pair(&request(code.as_str())).unwrap();
         assert!(matches!(
-            f.service.pair(&request(code.as_str())),
+            f.pair(&request(code.as_str())),
             Err(PairError::InvalidCode)
         ));
         assert_eq!(f.devices().len(), 1);
@@ -612,7 +736,7 @@ mod tests {
         let code = f.issue(Duration::minutes(10));
         f.clock.advance(Duration::minutes(10));
         assert!(matches!(
-            f.service.pair(&request(code.as_str())),
+            f.pair(&request(code.as_str())),
             Err(PairError::InvalidCode)
         ));
         assert!(f.devices().is_empty());
@@ -620,7 +744,7 @@ mod tests {
         let code = f.issue(Duration::minutes(10));
         f.clock
             .advance(Duration::minutes(10) - Duration::seconds(1));
-        f.service.pair(&request(code.as_str())).unwrap();
+        f.pair(&request(code.as_str())).unwrap();
     }
 
     #[test]
@@ -629,12 +753,12 @@ mod tests {
         let code = f.issue(DEFAULT_TTL);
         for attempt in [wrong_code(&code), "short".into(), "U".repeat(CODE_LEN)] {
             assert!(matches!(
-                f.service.pair(&request(&attempt)),
+                f.pair(&request(&attempt)),
                 Err(PairError::InvalidCode)
             ));
         }
         assert!(f.devices().is_empty());
-        f.service.pair(&request(code.as_str())).unwrap();
+        f.pair(&request(code.as_str())).unwrap();
     }
 
     #[test]
@@ -643,62 +767,121 @@ mod tests {
         let code = f.issue(DEFAULT_TTL);
         let mut req = request(code.as_str());
         req.csr_pem = "not a csr".into();
-        assert!(matches!(
-            f.service.pair(&req),
-            Err(PairError::BadRequest(_))
-        ));
+        assert!(matches!(f.pair(&req), Err(PairError::BadRequest(_))));
         for name in ["", "  ", "a\nb", &"x".repeat(MAX_DEVICE_NAME + 1)] {
             let mut req = request(code.as_str());
             req.device_name = name.to_owned();
-            assert!(matches!(
-                f.service.pair(&req),
-                Err(PairError::BadRequest(_))
-            ));
+            assert!(matches!(f.pair(&req), Err(PairError::BadRequest(_))));
         }
         assert!(f.devices().is_empty());
-        f.service.pair(&request(code.as_str())).unwrap();
+        f.pair(&request(code.as_str())).unwrap();
     }
 
     #[test]
     fn failed_attempts_are_rate_limited() {
         let f = fixture();
         let code = f.issue(Duration::hours(1));
-        let wrong = wrong_code(&code);
         let limit = RateLimit::default();
-        for _ in 0..limit.max_failures {
-            assert!(matches!(
-                f.service.pair(&request(&wrong)),
-                Err(PairError::InvalidCode)
-            ));
+        for _ in 0..limit.per_source {
+            f.fail(REMOTE, 1, &code);
             f.clock.advance(Duration::seconds(1));
         }
         // Window full: even the right code is refused, unchecked.
-        match f.service.pair(&request(code.as_str())) {
-            Err(PairError::RateLimited { retry_after }) => {
-                assert_eq!(retry_after, limit.window - Duration::seconds(5));
-            }
-            other => panic!("expected RateLimited, got {other:?}"),
-        }
+        let retry_after = rate_limited(f.pair(&request(code.as_str())));
+        assert_eq!(retry_after, limit.window - Duration::seconds(5));
         // The oldest failure leaves the window: one slot frees up.
         f.clock.advance(limit.window - Duration::seconds(5));
-        f.service.pair(&request(code.as_str())).unwrap();
+        f.pair(&request(code.as_str())).unwrap();
+    }
+
+    #[test]
+    fn one_source_does_not_lock_out_another() {
+        let f = fixture();
+        let code = f.issue(Duration::hours(1));
+        let limit = RateLimit::default();
+        f.fail(REMOTE, limit.per_source, &code);
+        rate_limited(f.pair(&request(code.as_str())));
+
+        // Another address still has its code checked: wrong is 401, not 429.
+        f.fail(remote(1), 1, &code);
+        // Loopback, whichever address and form, is one source of its own.
+        let v4_mapped: IpAddr = "::ffff:127.0.0.2".parse().unwrap();
+        f.fail(v4_mapped, limit.per_source - 1, &code);
+        f.fail(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1, &code);
+        rate_limited(
+            f.service
+                .pair("127.0.0.1".parse().unwrap(), &request(code.as_str())),
+        );
+
+        // An IPv6 host is its /64: rotating the interface id doesn't help.
+        for n in 0..limit.per_source as u16 {
+            let ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, n + 1);
+            f.fail(IpAddr::V6(ip), 1, &code);
+        }
+        let neighbour = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0xffff, 0, 0, 9);
+        rate_limited(
+            f.service
+                .pair(IpAddr::V6(neighbour), &request(code.as_str())),
+        );
+        let other_prefix = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1);
+        f.service
+            .pair(IpAddr::V6(other_prefix), &request(code.as_str()))
+            .unwrap();
+    }
+
+    #[test]
+    fn global_cap_backstops_every_remote_source_but_spares_loopback() {
+        let f = fixture();
+        let code = f.issue(Duration::hours(1));
+        let limit = RateLimit::default();
+        let sources = (limit.global / limit.per_source) as u32;
+        for n in 0..sources {
+            f.fail(remote(n), limit.per_source, &code);
+            f.clock.advance(Duration::seconds(1));
+        }
+        // A fresh remote address is refused, unchecked, until the oldest
+        // failures leave the window.
+        let fresh = remote(sources);
+        let retry_after = rate_limited(f.service.pair(fresh, &request(code.as_str())));
+        assert_eq!(
+            retry_after,
+            limit.window - Duration::seconds(sources.into())
+        );
+        // Loopback is outside the global window.
+        f.service
+            .pair("127.0.0.1".parse().unwrap(), &request(code.as_str()))
+            .unwrap();
+
+        // The per-source map holds only sources with a slot, so the global
+        // cap bounds it (plus loopback, which released its slot).
+        assert_eq!(lock(&f.service.attempts).by_source.len(), sources as usize);
+        f.clock.advance(retry_after);
+        let code = f.issue(Duration::hours(1));
+        f.service.pair(fresh, &request(code.as_str())).unwrap();
+        assert_eq!(
+            lock(&f.service.attempts).by_source.len(),
+            sources as usize - 1
+        );
+        f.clock.advance(limit.window);
+        f.fail(fresh, 1, &code);
+        assert_eq!(lock(&f.service.attempts).by_source.len(), 1);
     }
 
     #[test]
     fn successes_do_not_count_against_the_limit() {
         let f = fixture();
-        for _ in 0..RateLimit::default().max_failures + 2 {
+        for _ in 0..RateLimit::default().per_source + 2 {
             let code = f.issue(DEFAULT_TTL);
-            f.service.pair(&request(code.as_str())).unwrap();
+            f.pair(&request(code.as_str())).unwrap();
         }
-        assert_eq!(f.devices().len(), RateLimit::default().max_failures + 2);
+        assert_eq!(f.devices().len(), RateLimit::default().per_source + 2);
     }
 
     #[test]
     fn issuing_stores_only_the_hash_and_prunes_stale_codes() {
         let f = fixture();
         let used = f.issue(DEFAULT_TTL);
-        f.service.pair(&request(used.as_str())).unwrap();
+        f.pair(&request(used.as_str())).unwrap();
         f.issue(Duration::minutes(1));
         f.clock.advance(Duration::minutes(2));
         let live = f.issue(DEFAULT_TTL);
@@ -790,7 +973,9 @@ mod tests {
     }
 
     async fn post(f: &Fixture, body: Body, content_type: bool) -> Response {
-        let mut req = Request::post(path::PAIR);
+        // What the server's connection loop attaches to every request.
+        let mut req =
+            Request::post(path::PAIR).extension(ConnectInfo(SocketAddr::new(REMOTE, 50_000)));
         if content_type {
             req = req.header(header::CONTENT_TYPE, "application/json");
         }
@@ -842,7 +1027,7 @@ mod tests {
         );
 
         // One failure so far (the reuse); fill the window, then 429.
-        for _ in 1..RateLimit::default().max_failures {
+        for _ in 1..RateLimit::default().per_source {
             let resp = post(&f, json(&request(&wrong_code(&code))), true).await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }

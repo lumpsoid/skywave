@@ -252,8 +252,12 @@ D9. The server owns a CA; every device holds a certificate it signed.
 
 - **Codes:** 10 Crockford base32 symbols (50 bits), shown `XXXXX-XXXXX`;
   input ignores case, `-` and spaces, and reads `O` as `0`, `I`/`L` as `1`.
-- **Rate limit:** at most 5 failed attempts per sliding minute, server-wide,
-  in memory; a full window answers 429 even to the right code. The pairing
+- **Rate limit:** at most 5 failed attempts per sliding minute per source,
+  and 100 from all remote sources together, in memory; a full window
+  answers 429 even to the right code. A source is the peer's IP (an IPv6
+  address by its /64; all of loopback is one source). Loopback is outside
+  the global cap, so a remote flood can't lock out pairing on the server
+  itself; 100 a minute still leaves guessing a 50-bit code hopeless. The pairing
   endpoint is the only one without a client certificate and exposes
   nothing else.
 - **Pairing URI** (the QR code):
