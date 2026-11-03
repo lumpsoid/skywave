@@ -173,6 +173,7 @@ use crate::db::Db;
 use crate::dirs;
 use crate::error::{Error, IoContext, Result};
 use crate::event_log::{self, parse_id};
+use crate::lock;
 
 mod changes;
 mod git;
@@ -227,7 +228,7 @@ impl WorkdirReader {
         deadline: Instant,
         f: impl FnOnce(&mut Snapshot<'_>) -> Result<T>,
     ) -> Result<T> {
-        let mut db = self.db.lock().expect("workdir db lock poisoned");
+        let mut db = lock(&self.db);
         let mut snapshot = Snapshot {
             db: &mut db,
             blobs: &self.blobs,

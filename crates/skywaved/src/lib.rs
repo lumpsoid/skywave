@@ -25,6 +25,7 @@ pub mod workdir;
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub use error::{Error, Result};
 pub use event_log::EventLog;
@@ -34,6 +35,17 @@ use blobs::{BlobFile, BlobStore};
 use data_dir::DataDir;
 use db::Db;
 use skywave_proto::{BlobId, BlobRef};
+
+/// Locks shared server state, recovering it from a poisoned mutex.
+///
+/// A request handler that panics on a blocking thread poisons the mutex it
+/// held. Failing on poison would turn that one bad request into a 500 for
+/// every later one while the process stays up. The guarded state is still
+/// consistent: a database transaction rolls back when it is dropped during
+/// the unwind, and the other guarded maps are updated in single steps.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Everything the daemon persists: the data dir, its database and blobs.
 #[derive(Debug)]
@@ -67,6 +79,21 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_recovers_a_mutex_poisoned_by_a_panic() {
+        let shared = std::sync::Arc::new(Mutex::new(1));
+        let held = shared.clone();
+        let panicked = std::thread::spawn(move || {
+            let mut value = held.lock().unwrap();
+            *value = 2;
+            panic!("a request handler panics while holding the lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(shared.is_poisoned());
+        assert_eq!(*lock(&shared), 2);
+    }
 
     #[test]
     fn opening_a_fresh_data_dir_creates_layout_and_schema() {

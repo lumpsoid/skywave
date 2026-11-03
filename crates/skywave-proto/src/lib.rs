@@ -210,9 +210,12 @@ impl Seq {
     /// Before the first event; the cursor of a device that has seen nothing.
     pub const ZERO: Seq = Seq(0);
 
-    /// The seq directly after this one.
+    /// The seq directly after this one. Saturates at `u64::MAX` rather than
+    /// panicking: no log reaches that position (the server stores seqs as
+    /// SQLite integers, at most `i64::MAX`), so only a bogus cursor gets
+    /// there, and the server rejects that one at the edge.
     pub fn next(self) -> Seq {
-        Seq(self.0 + 1)
+        Seq(self.0.saturating_add(1))
     }
 }
 
@@ -2069,6 +2072,12 @@ pub mod path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_next_saturates_instead_of_overflowing() {
+        assert_eq!(Seq::ZERO.next(), Seq(1));
+        assert_eq!(Seq(u64::MAX).next(), Seq(u64::MAX));
+    }
 
     #[test]
     fn archived_effect_sets_on_archive_and_clears_on_a_message() {

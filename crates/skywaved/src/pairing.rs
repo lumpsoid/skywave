@@ -44,6 +44,7 @@ use crate::db::Db;
 use crate::devices;
 use crate::error::{Error, Result};
 use crate::identity::ServerIdentity;
+use crate::lock;
 
 /// `skywaved pair` default code lifetime (architecture.md "Pairing").
 pub const DEFAULT_TTL: Duration = Duration::minutes(10);
@@ -370,10 +371,7 @@ impl PairService {
         }
 
         let now = self.clock.now();
-        let slot = self
-            .attempts
-            .lock()
-            .expect("attempts lock poisoned")
+        let slot = lock(&self.attempts)
             .reserve(now)
             .map_err(|retry_after| PairError::RateLimited { retry_after })?;
         let result = self.redeem(req, name, now);
@@ -381,11 +379,7 @@ impl PairService {
             Err(PairError::InvalidCode) => {
                 tracing::warn!("pairing attempt with an invalid code");
             }
-            _ => self
-                .attempts
-                .lock()
-                .expect("attempts lock poisoned")
-                .release(slot),
+            _ => lock(&self.attempts).release(slot),
         }
         result
     }
@@ -397,7 +391,7 @@ impl PairService {
         now: DateTime<Utc>,
     ) -> std::result::Result<PairResponse, PairError> {
         let code = PairCode::parse(&req.code).ok_or(PairError::InvalidCode)?;
-        let mut db = self.db.lock().expect("pairing db lock poisoned");
+        let mut db = lock(&self.db);
         // IMMEDIATE: two redemptions of one code serialize on the write lock.
         let tx = db
             .conn_mut()

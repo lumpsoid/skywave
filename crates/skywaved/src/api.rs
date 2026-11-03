@@ -91,7 +91,6 @@ use skywave_proto::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
-use crate::EventLog;
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
 use crate::agent::{self, OutsideConversations, SourceError};
@@ -100,9 +99,10 @@ use crate::db::Db;
 use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
-use crate::event_log::DEFAULT_BATCH_LIMIT;
+use crate::event_log::{DEFAULT_BATCH_LIMIT, MAX_SEQ};
 use crate::server::ServerOptions;
 use crate::workdir::{self, Snapshot, WorkdirReader};
+use crate::{EventLog, lock};
 
 /// Longest a `GET /v1/events` waits, whatever `wait` asks for.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -190,7 +190,7 @@ impl Api {
     ) -> std::result::Result<T, StatusCode> {
         let api = self.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let mut db = api.db.lock().expect("api db lock poisoned");
+            let mut db = lock(&api.db);
             f(&api, &mut db)
         })
         .await;
@@ -452,10 +452,6 @@ async fn prepare_import(
     ))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().expect("api lock poisoned")
-}
-
 async fn events(
     State(api): State<Arc<Api>>,
     query: std::result::Result<Query<EventsQuery>, QueryRejection>,
@@ -464,6 +460,9 @@ async fn events(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let after = query.after;
+    if after > MAX_SEQ {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let limit = query.limit.unwrap_or(DEFAULT_BATCH_LIMIT);
     let wait = Duration::from_secs(query.wait.unwrap_or(0).into()).min(MAX_WAIT);
     if api.log.head() <= after && !wait.is_zero() {
