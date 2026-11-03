@@ -1085,7 +1085,8 @@ waiting on stays pending.
   `subtype:"error_during_execution"`, `num_turns:0` and `errors:[...]`, and
   exits 1. **[C]** Fallback for T09: surface a session error. Silently
   starting a fresh session would lose history.
-- Sessions persist under `~/.claude/projects/<cwd with / replaced by ->/<id>.jsonl`.
+- Sessions persist under `~/.claude/projects/<dir>/<id>.jsonl`, `<dir>`
+  being the cwd made a file name (exact rule in §6c).
   The resume must run with the **same cwd**: lookup is per project directory.
   The per-cwd layout is **[C]**; resuming from a different cwd was not tested
   **[U]**. D14 already fixes the workdir per session, so this holds.
@@ -1254,7 +1255,78 @@ context" or "STOP what you are doing" stay out of the preview.
 cancelled approval as the call's outcome, so `denied` / `cancelled` match it.
 Only the Write, Bash and error shapes are confirmed by the fixtures; the
 others follow the CLI's documented result types and fall back to the plain
-output when a field is missing.
+output when a field is missing. The transcript fixtures (§6c) also show
+Read's `{type, file}` and Edit's `structuredPatch` shapes. **[C]**
+
+## 6c. Stored transcripts (outside conversations)
+
+`claude_code/transcripts.rs` reads the CLI's own transcripts to list the
+conversations a session can adopt and to replay one's history. Probed and
+recorded with 2.1.310 on 2026-11-03; the fixtures are
+`tests/fixtures/claude-code/transcripts/` (recorded with
+`tests/support/record-transcript.sh`, scenarios in its README).
+
+**Where.** `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` **[U]**
+(only the default was seen), then one dir per cwd holding `<id>.jsonl` per
+conversation, `<id>/subagents/agent-*.jsonl` per subagent and
+`<id>/tool-results/*.txt` for big tool outputs. **[C]** Every conversation
+is there, Skywave's own (fresh, resumed, forked) as much as the terminal's.
+
+**Dir name.** **[C]** (probe: cwds `/tmp/skywave-sanitise-probe/a.b_c d+é`
+and one of 269 chars.) Each UTF-16 unit that is not an ASCII letter or digit
+becomes `-` (`a.b_c d+é` → `a-b-c-d--`). A name longer than 200 is cut to
+200, then `-` and a hash of the whole cwd: the JavaScript string hash
+(`h = (h << 5) - h + unit | 0`, absolute value, base 36). The rule is
+lossy (`/a/b-c` and `/a/b/c` share `-a-b-c`), so the reader never takes a
+workdir from the dir name: a transcript's workdir is the `cwd` of its first
+non-sidechain `user` line, and it counts only when that cwd's dir name is
+the dir it sits in.
+
+**Lines.** One JSON object per line, appended as the conversation goes; a
+line being written may be cut short, so a line that does not parse is
+skipped. **[C]** Types seen: `user`, `assistant` (the API `message`, one
+content block per line), `attachment` (context the CLI adds: environment,
+skills, date, …), `system` (`compact_boundary`, `local_command`, …),
+`queue-operation`, `last-prompt`, `mode`, `atis-latch`, `cost-state`,
+`api-request*` (whole request bodies, the user's context included),
+`ai-title` (`aiTitle`, interactive sessions only: `-p` writes none). Every
+`user`/`assistant`/`attachment`/`system` line carries `uuid`,
+`parentUuid`, `isSidechain`, `cwd`, `timestamp`, `sessionId`, `version`.
+A tool result's structured form is the line's `toolUseResult` (the stream's
+`tool_use_result`), and it is translated with the same helpers as the
+stream, so a call and its result look the same imported or live.
+- `isMeta` user lines are the CLI's own context (`<local-command-caveat>`).
+- The `/compact` summary is a `user` line with `isCompactSummary` (and
+  `isVisibleInTranscriptOnly`): left out, since the walk reads the history
+  it summarises. The command itself leaves `<command-name>/compact…` and
+  `<local-command-stdout>Compacted…` user lines, kept verbatim, like the
+  interrupt marker `[Request interrupted by user for tool use]`.
+- A subagent's lines (`isSidechain: true`) live in its own file under
+  `subagents/` in this build; the main file has only the `Agent` call and its
+  result. Sidechain lines are dropped wherever they are.
+- A big tool output is a `<persisted-output>` stub naming the
+  `tool-results/` file and a preview; the stub is kept as the output.
+
+**Active branch.** **[C]** for the fixtures (straight chains, one
+`/compact`). Lines chain through `parentUuid`, attachment and system lines
+included. The reader starts at the last non-sidechain `user`/`assistant`
+line and walks parents back, then reverses: what `--resume` continues. A
+`compact_boundary` has `parentUuid: null` and the pre-compaction leaf as
+`logicalParentUuid`, which the walk follows, so a compacted conversation is
+read whole. Parallel calls do not chain: each `tool_result` line is parented
+to the assistant line holding its own `tool_use`, so every result but the
+last is a sibling off the walked chain (`parallel.jsonl`). The reader keeps
+a results-only `user` line whose parent is on the chain, in file order,
+which is the stream's order. Where a parent is missing (or a cycle), the reader falls back to
+file order minus sidechain lines. Rewound or edited branches were not
+recorded **[U]**; a test builds one.
+
+**Listing.** Title: the last `ai-title`. First prompt: the first line of the
+first user text on the branch. Messages: user texts plus agent texts on the
+branch. Last active: the last line's `timestamp`, else the file's mtime.
+A project dir or transcript that is a symlink is skipped, by listing and
+history alike. Only a canonical cwd under a root is listed (a cwd through a symlink cannot
+be resumed, §5).
 
 ## 7. Not covered (out of MVP scope or not needed by T09)
 

@@ -118,7 +118,7 @@ fn list_dirs_capped(roots: &[PathBuf], dir: &str, scan_cap: usize, reply_cap: us
 }
 
 /// The roots that exist, canonical, in configured order.
-fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     roots
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
