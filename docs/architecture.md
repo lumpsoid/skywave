@@ -44,7 +44,7 @@ Android app; the Kotlin head it replaced is gone (D28).
 | `skywave-proto`    | Versioned wire types shared by daemon and core |
 | `skywaved`         | Server daemon: agent supervisor, event log, HTTPS API, admin CLI |
 | `skywave-core`     | All client logic: state machine, sync, outbox, local replica, transport |
-| `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors; pure, on `skywave-core` only |
+| `skywave-present`  | Head-side presentation every head shares: timeline sections, neutral wording, UTF-16 cursors, the display filter for agent content (control characters dropped, bidi controls escaped visibly); pure, on `skywave-core` only |
 | `skywave-tui`      | First head |
 | `skywave-testkit`  | Test-only: the link harness proxy (latency, jitter, bandwidth, drops); a dev-dependency only |
 | `skywave-claude-compat` | Manual tool: runs the real Claude Code CLI through the adapter's `Protocol` and reports broken contracts and newly available features (docs/agents/claude-code.md) |

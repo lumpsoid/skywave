@@ -210,7 +210,10 @@ support dir, also app-private (D25); A19 still applies to it.
 ## D23. Head-side presentation and policies live in `skywave-present`
 What a head decides beyond `ViewState` (timeline sections and which item is
 selectable or discardable, neutral wording for bytes, durations, failures
-and rejections, UTF-16 cursor conversion, and the clock-free policies:
+and rejections, UTF-16 cursor conversion, the filter agent content goes
+through before it is shown (control characters dropped, bidi controls
+escaped visibly so an approval reads as what will run), and the
+clock-free policies:
 draft debounce, read marks, approval alerts, prompt history, completion,
 timeline search) lives in one crate above `skywave-core`. The TUI and the
 Flutter hub both import it; each keeps only what is purely UI (key maps,

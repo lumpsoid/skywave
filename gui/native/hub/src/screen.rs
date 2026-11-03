@@ -34,7 +34,9 @@ use crate::signals::{
     ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, StopHeadings,
     SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
 };
-use crate::timeline::{clean_line, key_string, outgoing_view, preview_view, tool_kind};
+use skywave_present::text::clean_line;
+
+use crate::timeline::{key_string, outgoing_view, preview_view, tool_kind};
 use crate::workdir;
 
 /// Most lines of the gated call's content the approval panel shows.

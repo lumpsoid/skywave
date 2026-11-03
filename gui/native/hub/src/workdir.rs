@@ -23,7 +23,9 @@ use crate::signals::{
     ScreenView, WorkdirChangeKind, WorkdirChangeRow, WorkdirContent, WorkdirEntryRow, WorkdirLine,
     WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
 };
-use crate::timeline::{blob_facts, clean_line, content_lines};
+use skywave_present::text::clean_line;
+
+use crate::timeline::{blob_facts, content_lines};
 
 /// Most of a diff or file the screen carries. Lower than the TUI's
 /// 4 MiB: every line crosses to Dart in the screen signal, which is sent

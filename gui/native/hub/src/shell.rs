@@ -18,7 +18,9 @@ use skywave_present::output::{
 };
 
 use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
-use crate::timeline::{blob_facts, clean_line, clean_text, outgoing_view};
+use skywave_present::text::{clean_line, clean_text};
+
+use crate::timeline::{blob_facts, outgoing_view};
 
 /// The downloaded outputs expanded rows showed, by blob, as `whole` holds
 /// them: a file is read once, not on every snapshot or tick. A downloaded

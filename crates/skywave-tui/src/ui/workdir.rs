@@ -25,7 +25,9 @@ use skywave_present::workdir::{
     list_wording, taken_label,
 };
 
-use super::timeline::{blob_note, clean, content_lines, wrap};
+use skywave_present::text::clean;
+
+use super::timeline::{blob_note, content_lines, wrap};
 use crate::app::{App, BlobLines, ReadLines, WorkdirRow, WorkdirUi, workdir_rows};
 
 /// Most of a diff or file read to show: the server sends no file past

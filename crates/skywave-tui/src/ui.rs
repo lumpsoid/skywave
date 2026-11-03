@@ -39,6 +39,7 @@ use skywave_present::format::{
     scope_label,
 };
 use skywave_present::sections::{discardable, wanted_blob};
+use skywave_present::text::clean;
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
 use crate::notify;
@@ -88,7 +89,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
     }
 
     let footer_line = match (&app.ui().error, app.delete_row()) {
-        (Some(error), _) => Line::from(format!("error: {error}")).red(),
+        (Some(error), _) => Line::from(format!("error: {}", clean(error))).red(),
         (None, Some(row)) => Line::from(format!(
             "Delete {} from this device for good? It stays on the server and other devices. y/N",
             notify::sanitise(&row.title)
@@ -355,7 +356,7 @@ fn render_conversations(
     }
     frame.render_widget(Clear, area);
     if let Some(empty) = conversations_empty(picker) {
-        let empty = Line::from(timeline::clean(&empty));
+        let empty = Line::from(clean(&empty));
         let lines = match &picker.status {
             ConversationsStatus::Loading => vec![empty.dark_gray()],
             ConversationsStatus::Unavailable(_) => vec![
@@ -381,15 +382,12 @@ fn render_conversations(
         .items
         .iter()
         .map(|item| {
-            let mut head = vec![Span::raw(timeline::clean(conversation_title(item))).bold()];
+            let mut head = vec![Span::raw(clean(conversation_title(item))).bold()];
             if let Some(link) = conversation_link(item, title) {
-                head.push(Span::raw(format!("  · {}", timeline::clean(&link))).green());
+                head.push(Span::raw(format!("  · {}", clean(&link))).green());
             }
-            let detail = Span::raw(format!(
-                "  {}",
-                timeline::clean(&conversation_detail(item, now))
-            ))
-            .dark_gray();
+            let detail =
+                Span::raw(format!("  {}", clean(&conversation_detail(item, now)))).dark_gray();
             ListItem::new(vec![Line::from(head), Line::from(detail)])
         })
         .collect();
@@ -507,11 +505,11 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     let mut spans = vec![
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        Span::raw(timeline::clean(&row.title)).bold(),
+        Span::raw(clean(&row.title)).bold(),
     ];
     spans.extend(rename_badge(row.rename.as_ref()));
     if let Some(workdir) = &row.workdir {
-        spans.push(Span::raw(format!("  {}", timeline::clean(workdir))).dark_gray());
+        spans.push(Span::raw(format!("  {}", clean(workdir))).dark_gray());
     }
     if row.importing {
         spans.push(Span::raw(format!("  {IMPORTING_HISTORY}")).cyan());
@@ -533,7 +531,7 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
         );
     }
     if let SessionState::Errored(info) = &row.state {
-        spans.push(Span::raw(format!("  {}", info.message)).red());
+        spans.push(Span::raw(format!("  {}", clean(&info.message))).red());
     }
     if row.has_draft {
         spans.push(Span::raw("  ✎ draft").dark_gray());
@@ -573,7 +571,7 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
         Span::raw("  "),
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        Span::raw(timeline::clean(&pending.workdir)),
+        Span::raw(clean(&pending.workdir)),
     ];
     if let Some(note) = adopting_note(pending) {
         spans.push(Span::raw(format!("  · {note}")).cyan());
@@ -1314,9 +1312,5 @@ pub(crate) fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
 
 /// A rule as listed: its label, then how far it reaches.
 pub(crate) fn rule_text(rule: &RuleSuggestion) -> String {
-    format!(
-        "{} ({})",
-        timeline::clean(&rule.label),
-        scope_label(rule.scope)
-    )
+    format!("{} ({})", clean(&rule.label), scope_label(rule.scope))
 }

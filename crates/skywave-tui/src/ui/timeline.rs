@@ -31,6 +31,7 @@ use skywave_present::format::{
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
 };
+use skywave_present::text::clean;
 use unicode_width::UnicodeWidthChar;
 
 use super::outgoing_badge;
@@ -1262,18 +1263,4 @@ fn context_divider(mut lead: Vec<Span<'static>>, what: &str) -> Vec<Line<'static
 
 pub(super) fn device_label(device: &DeviceRef) -> String {
     clean(&device.label())
-}
-
-/// Text made safe for a terminal cell grid: tabs become spaces, other
-/// control characters go.
-pub(super) fn clean(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    for c in line.chars() {
-        match c {
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
 }
