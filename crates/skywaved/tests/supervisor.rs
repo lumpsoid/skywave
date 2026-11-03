@@ -23,7 +23,9 @@ use skywaved::agent::fake::{
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED};
 use skywaved::config::AgentConfig;
-use skywaved::supervisor::{AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, TURN_LOST};
+use skywaved::supervisor::{
+    AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, MESSAGE_LOST, TURN_LOST,
+};
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
 
@@ -843,6 +845,93 @@ async fn interrupt_accepted_while_down_ends_idle_on_restart() {
     supervisor.shutdown().await.unwrap();
     // The replayed interrupt reached no agent.
     assert!(!agent.inputs(f.session_id).contains(&FakeInput::Interrupt));
+}
+
+/// Stores `seq` as the supervisor's cursor, as a daemon that handled the
+/// log up to it and stopped would have left it.
+fn set_cursor(f: &Fixture, seq: Seq) {
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+            [i64::try_from(seq.0).unwrap()],
+        )
+        .unwrap();
+}
+
+fn message_lost() -> EventKind {
+    state(SessionState::Errored {
+        message: MESSAGE_LOST.into(),
+    })
+}
+
+#[tokio::test]
+async fn a_message_the_daemon_stopped_before_delivering_errors_once_on_restart() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    // The daemon stored the cursor on the message and died before the agent
+    // got it.
+    let seq = f.send("lost");
+    set_cursor(&f, seq);
+
+    let supervisor = f.start(&agent).await;
+    // Settled by the time `start` returns, in the message's context.
+    assert_eq!(f.stamped_after(seq), [(message_lost(), f.first())]);
+    supervisor.shutdown().await.unwrap();
+    // Never redelivered.
+    assert!(agent.inputs(f.session_id).is_empty());
+
+    // A second restart finds it settled.
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(f.stamped_after(seq), [(message_lost(), f.first())]);
+    assert!(agent.inputs(f.session_id).is_empty());
+}
+
+#[tokio::test]
+async fn a_message_whose_turn_ran_is_not_errored_on_restart() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    let seq = f.send("answered");
+    f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    // As if the daemon died right after the turn, before the cursor moved.
+    set_cursor(&f, seq);
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    let kinds = f.kinds();
+    assert!(kinds.contains(&state(SessionState::AgentWorking)));
+    assert!(!kinds.iter().any(is_errored), "log: {kinds:#?}");
+}
+
+#[tokio::test]
+async fn a_message_whose_turn_was_lost_errors_once_as_a_lost_turn() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    let seq = f.send("hang");
+    f.wait_for("working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    supervisor.shutdown().await.unwrap();
+    set_cursor(&f, seq);
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    let errored: Vec<EventKind> = f.kinds().into_iter().filter(is_errored).collect();
+    assert_eq!(
+        errored,
+        [state(SessionState::Errored {
+            message: TURN_LOST.into()
+        })]
+    );
 }
 
 #[tokio::test]

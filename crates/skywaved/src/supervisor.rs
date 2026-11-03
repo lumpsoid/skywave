@@ -125,9 +125,9 @@
 //! handled when the daemon stopped reaches the agent after the restart. A
 //! `UserMessage`'s seq is stored *before* the message is given to the agent:
 //! delivery is **at most once**. A crash between the two loses that message
-//! (the user sees it in the log with no reply and can resend) rather than
-//! running an instruction twice, which an agent with side effects could not
-//! undo. Answers and interrupts need no such care: after a restart their
+//! rather than running an instruction twice, which an agent with side
+//! effects could not undo; the next start says so with `Errored` (below), so
+//! the user can resend it. Answers and interrupts need no such care: after a restart their
 //! approvals and turns are already settled (below), so replaying them does
 //! nothing.
 //!
@@ -159,6 +159,19 @@
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
 //!   Both are stamped with the context of the state event they settle;
+//! - when the event at the stored cursor is a `UserMessage` that no agent
+//!   took (nothing after it in its session and context is
+//!   `SessionStateChanged` to `AgentWorking` or `Errored`), its session gets
+//!   `SessionStateChanged(Errored)` ([`MESSAGE_LOST`]) stamped with the
+//!   message's context. The cursor is stored on a message just before it is
+//!   handed over, so a crash in between leaves it there. Only that event is
+//!   looked at: once a later one is handled (a `SessionStopped`, say), the
+//!   message is past the cursor and left as it is. It is
+//!   decided after the turn above, whose `Errored` already covers a message
+//!   queued behind a lost turn, and the `Errored` it logs keeps a later
+//!   start from logging it again. A clean shutdown that stopped an agent
+//!   before it began the message's turn loses the message too, and is
+//!   settled the same way;
 //! - a mode, model or effort request still open whose event the supervisor had
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
 //!   handed to is gone. One after the cursor is handled as usual. Settings
@@ -223,6 +236,9 @@ pub const DAEMON_RESTARTED: &str = "daemon restarted";
 /// `Errored` message for a session whose turn was running when the daemon
 /// stopped.
 pub const TURN_LOST: &str = "daemon restarted during a turn";
+/// `Errored` message for a message the cursor had passed but no agent took
+/// before the daemon stopped (at-most-once delivery).
+pub const MESSAGE_LOST: &str = "message lost when the server stopped; send it again";
 /// Why a task stop is refused when the session has no agent running.
 pub const AGENT_NOT_RUNNING: &str = "agent not running";
 /// Why a bypass request is refused by the supervisor itself: one accepted
@@ -451,6 +467,19 @@ impl<A: AgentAdapter> Supervisor<A> {
                 session.id,
                 context,
                 EventKind::SessionStateChanged(settle),
+            )?;
+        }
+        // After the turns above: a turn lost with the daemon already took
+        // the message, and its `Errored` says so.
+        if let Some((session_id, context)) = lost_message(db, load_cursor(db)?)? {
+            tracing::info!(session = %session_id.0, "erroring a message lost with the daemon");
+            self.log.append(
+                db,
+                session_id,
+                context,
+                EventKind::SessionStateChanged(SessionState::Errored {
+                    message: MESSAGE_LOST.to_owned(),
+                }),
             )?;
         }
         for session in self.log.sessions(db)? {
@@ -1290,6 +1319,31 @@ fn last_work_context(db: &Db, session_id: SessionId) -> Result<Option<ContextId>
         .query_row([session_id.0.to_string()], |r| r.get(0))
         .optional()?;
     context.map(|c| parse_id(&c)).transpose()
+}
+
+/// The session and context of the `UserMessage` at `cursor`, if no agent
+/// took it: nothing logged after it in its session and context is a
+/// `SessionStateChanged` to `AgentWorking` (a turn started) or `Errored`
+/// (its delivery failed, its agent died owing it, its turn was lost, or a
+/// previous recovery already settled it). `Idle` is no proof: it can end the
+/// turn the message was queued behind.
+fn lost_message(db: &Db, cursor: Seq) -> Result<Option<(SessionId, ContextId)>> {
+    let cursor = i64::try_from(cursor.0)
+        .map_err(|_| Error::Corrupt(format!("seq {} too large", cursor.0)))?;
+    let row: Option<(String, String)> = db
+        .conn()
+        .prepare_cached(
+            "SELECT m.session_id, m.context FROM events m \
+             WHERE m.seq = ?1 AND json_extract(m.kind, '$.type') = 'user_message' \
+             AND NOT EXISTS (SELECT 1 FROM events e \
+                 WHERE e.seq > m.seq AND e.session_id = m.session_id AND e.context = m.context \
+                 AND json_extract(e.kind, '$.type') = 'session_state_changed' \
+                 AND json_extract(e.kind, '$.state') IN ('agent_working', 'errored'))",
+        )?
+        .query_row([cursor], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(session, context)| Ok((parse_id(&session)?, parse_id(&context)?)))
+        .transpose()
 }
 
 fn load_cursor(db: &Db) -> Result<Seq> {

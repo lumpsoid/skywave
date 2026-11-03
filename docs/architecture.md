@@ -197,7 +197,12 @@ not migrated). A database from before the stamp takes the current version.
   ("agent did not answer the interrupt; stopped it") and the next
   message resumes the agent. On daemon start every pending approval gets
   `ApprovalCancelled { reason: "daemon restarted" }` and every call left
-  without a result is named in a `CallsUnanswered`. If the supervisor
+  without a result is named in a `CallsUnanswered`. Messages are delivered
+  at most once (the supervisor's cursor is stored before the agent gets
+  one); a message at the stored cursor that no agent took (no
+  `AgentWorking` or `Errored` after it in its context) gets `Errored`
+  ("message lost when the server stopped; send it again") on the next
+  start, once. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
