@@ -177,11 +177,14 @@ first line of its first message until you name it: `r` on the session list
 the default title back.
 
 `c` on the session list continues a Claude Code conversation you started
-outside Skywave: enter the directory `claude` ran in (under your `roots`),
-then paste the session id. The GUI's New session dialog has the same as an
-optional field. The session starts with the earlier history the server could
-read, imported once on every device and never unread; Skywave works on a copy
-(a fork), so the terminal's session is untouched and the two diverge.
+outside Skywave: it lists the conversations the server's `claude` keeps under
+your `roots`, newest first, and Enter continues the highlighted one in a new
+session (`o` opens the session already running one, `p` pastes an id
+instead: the directory `claude` ran in, then the session id). The GUI's New
+session dialog has the id as an optional field. The session starts with the
+earlier history the server could read, imported once on every device, dimmed
+and marked "imported", and never unread; Skywave works on a copy (a fork), so
+the terminal's session is untouched and the two diverge.
 
 `a` on the session list archives the selected session on every device, and
 `A` switches between the active and the archived sessions (`a` there brings

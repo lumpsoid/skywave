@@ -19,6 +19,7 @@ pub use workdir::WORKDIR_SHOW_BYTES;
 use std::borrow::Cow;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -27,11 +28,15 @@ use ratatui::widgets::{
     Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use skywave_core::{
-    BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, Link, LinkRejection,
-    ListKind, Outgoing, PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen,
-    SessionListView, SessionRow, SessionState, SettingsView, WorkdirPane,
+    BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, ConversationPicker,
+    ConversationsStatus, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView,
+    PendingSession, RuleSuggestion, Screen, SessionId, SessionListView, SessionRow, SessionState,
+    SettingsView, WorkdirPane,
 };
-use skywave_present::format::{blob_size, bytes, dollars, fail_reason, scope_label};
+use skywave_present::format::{
+    IMPORTING_HISTORY, adopting_note, blob_size, bytes, conversation_detail, conversation_link,
+    conversation_title, conversations_unavailable, dollars, fail_reason, scope_label,
+};
 use skywave_present::sections::{discardable, wanted_blob};
 
 use crate::app::{App, Field, Focus, POPUP_ROWS, Picker, Prompt, PromptKind, dismissable};
@@ -69,7 +74,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
     } else {
         match &view.screen {
             Screen::Pairing(pairing) => render_pairing(frame, body, app, pairing),
-            Screen::SessionList(list) => render_session_list(frame, body, app, list),
+            Screen::SessionList(list) => render_session_list(frame, body, app, list, wall),
             Screen::Session(_) => {
                 if let Some((session, ui)) = app.session() {
                     session::render(frame, body, app, session, ui, wall);
@@ -251,7 +256,13 @@ fn render_pairing(frame: &mut Frame, area: Rect, app: &App, pairing: &PairingVie
     );
 }
 
-fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionListView) {
+fn render_session_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    list: &SessionListView,
+    wall: SystemTime,
+) {
     let prompt = app.ui().prompt.as_ref();
     let creating_height = if list.creating.is_empty() {
         0
@@ -299,6 +310,10 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
         );
     }
 
+    if let Some(picker) = &list.conversations {
+        render_conversations(frame, sessions_area, app, list, picker, wall);
+    }
+
     if !list.creating.is_empty() {
         let lines: Vec<Line> = list.creating.iter().map(pending_session_line).collect();
         let title = if dismissable(list).is_some() {
@@ -318,6 +333,83 @@ fn render_session_list(frame: &mut Frame, area: Rect, app: &App, list: &SessionL
             render_completion(frame, area, prompt_area, app, completion, selected);
         }
     }
+}
+
+/// The conversation picker over the session list: each conversation the
+/// server's agent keeps, newest first, two rows each (what it is, then
+/// where and how long), with where Skywave already has it.
+fn render_conversations(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    list: &SessionListView,
+    picker: &ConversationPicker,
+    wall: SystemTime,
+) {
+    let mut block = Block::bordered()
+        .title(" Continue a conversation from outside Skywave ")
+        .cyan();
+    let status = match &picker.status {
+        ConversationsStatus::Loading => Some("listing…"),
+        ConversationsStatus::Ready { truncated: true } => Some("only the newest are listed"),
+        ConversationsStatus::Ready { truncated: false } | ConversationsStatus::Unavailable(_) => {
+            None
+        }
+    };
+    if let Some(status) = status {
+        block = block.title_bottom(Line::from(format!(" {status} ")).dark_gray());
+    }
+    frame.render_widget(Clear, area);
+    if picker.items.is_empty() {
+        let lines = match &picker.status {
+            ConversationsStatus::Loading => {
+                vec![Line::from("Asking the server for its agent's conversations…").dark_gray()]
+            }
+            ConversationsStatus::Unavailable(reason) => vec![
+                Line::from(timeline::clean(&conversations_unavailable(reason))).yellow(),
+                Line::from("Press p to paste a conversation id instead.").dark_gray(),
+            ],
+            ConversationsStatus::Ready { .. } => vec![
+                Line::from("The server's agent has no conversations under the roots.").dark_gray(),
+                Line::from("Press p to paste a conversation id instead.").dark_gray(),
+            ],
+        };
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    let now = DateTime::<Utc>::from(wall);
+    let title = |id: SessionId| {
+        list.sessions
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.title.clone())
+    };
+    let items: Vec<ListItem> = picker
+        .items
+        .iter()
+        .map(|item| {
+            let mut head = vec![Span::raw(timeline::clean(conversation_title(item))).bold()];
+            if let Some(link) = conversation_link(item, title) {
+                head.push(Span::raw(format!("  · {}", timeline::clean(&link))).green());
+            }
+            let detail = Span::raw(format!(
+                "  {}",
+                timeline::clean(&conversation_detail(item, now))
+            ))
+            .dark_gray();
+            ListItem::new(vec![Line::from(head), Line::from(detail)])
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(app.conversation_index(picker));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+        area,
+        &mut state,
+    );
 }
 
 /// An open [`Prompt`] in `area`, three rows high, with the cursor at the end
@@ -428,6 +520,9 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     if let Some(workdir) = &row.workdir {
         spans.push(Span::raw(format!("  {}", timeline::clean(workdir))).dark_gray());
     }
+    if row.importing {
+        spans.push(Span::raw(format!("  {IMPORTING_HISTORY}")).cyan());
+    }
     // News since this device last looked.
     if row.unread > 0 {
         spans.push(Span::raw(format!("  ● {}", row.unread)).magenta().bold());
@@ -485,8 +580,12 @@ fn pending_session_line(pending: &PendingSession) -> Line<'static> {
         Span::raw("  "),
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        Span::raw(pending.workdir.clone()),
+        Span::raw(timeline::clean(&pending.workdir)),
     ];
+    if let Some(note) = adopting_note(pending) {
+        spans.push(Span::raw(format!("  · {note}")).cyan());
+        return Line::from(spans);
+    }
     match pending.outgoing {
         Outgoing::Queued => spans.push(Span::raw("  · waits for the server").dark_gray()),
         Outgoing::Sending => {}
@@ -670,6 +769,16 @@ fn footer_keys(app: &App) -> &'static str {
         }
         Screen::SessionList(_) if app.ui().prompt.is_some() => {
             "Tab complete · Enter create · Esc cancel · Ctrl-U clear · F1 help · Ctrl-C quit"
+        }
+        Screen::SessionList(_)
+            if app
+                .conversation_item()
+                .is_some_and(|item| item.session.is_some()) =>
+        {
+            "↑↓ choose · Enter continue in a new session · o open its session · p paste an id · r refresh · Esc close · ? help"
+        }
+        Screen::SessionList(_) if app.conversation_picker().is_some() => {
+            "↑↓ choose · Enter continue in a new session · p paste an id · r refresh · Esc close · ? help"
         }
         Screen::SessionList(list) if list.kind == ListKind::Archived => {
             // `↑↓ select` makes way for `D` in 100 columns.
@@ -874,6 +983,21 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("Ctrl-U", "clear"),
             key("Esc", "close the list, then cancel"),
         ]),
+        Screen::SessionList(_) if app.conversation_picker().is_some() => lines.extend([
+            section("Continue an outside conversation"),
+            key("↑↓ / k j", "choose a conversation the server's agent keeps"),
+            key(
+                "Enter",
+                "continue it in a new session; its history is imported",
+            ),
+            key("o", "open the session already running it"),
+            key("p", "paste a conversation id instead"),
+            key("r", "ask the server again"),
+            key("Esc", "close"),
+            Line::from(""),
+            Line::from("  Continuing one again makes another session; the row says"),
+            Line::from("  where it was continued before."),
+        ]),
         Screen::SessionList(_) => lines.extend([
             section("Sessions"),
             key("↑↓ / k j", "select"),
@@ -881,7 +1005,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("n", "new session in a server directory"),
             key(
                 "c",
-                "continue an agent conversation started outside Skywave (its id)",
+                "continue an agent conversation started outside Skywave",
             ),
             key("r", "rename the selected session"),
             key("a", "archive it (on the archived list: bring it back)"),

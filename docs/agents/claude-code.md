@@ -1055,8 +1055,9 @@ waiting on stays pending.
   1. In a dir under the roots, run `claude`, say "remember the word
      PELICAN", quit; note the id (`/status`, or the newest
      `~/.claude/projects/<dir>/*.jsonl`).
-  2. Adopt it (TUI `c`, or the GUI dialog's id field). The window shows
-     only the `Adopted` divider. Ask "what word did I ask you to
+  2. Adopt it (TUI `c`, pick it or `p` to paste its id; or the GUI
+     dialog's id field). The window shows the `Adopted` divider, the
+     imported history, then the fork-point divider. Ask "what word did I ask you to
      remember?": expect PELICAN.
   3. The outside transcript's line count is unchanged afterwards.
   4. Restart skywaved and send another message: the log shows `resumed`,

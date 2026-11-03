@@ -1207,9 +1207,12 @@ fn tab_fills_in_the_only_directory() {
 }
 
 #[test]
-fn continuing_an_outside_conversation_asks_the_workdir_then_the_id() {
+fn pasting_an_outside_conversation_asks_the_workdir_then_the_id() {
     let mut h = Harness::paired();
-    assert_eq!(h.key(KeyCode::Char('c')), None);
+    open_conversations(&mut h);
+    // `p` in the picker: the two-step prompt instead, and the picker goes.
+    assert_eq!(h.key(KeyCode::Char('p')), Some(Action::EndConversations));
+    assert!(h.app.conversation_picker().is_none());
     assert!(h.app.typing());
     assert_contains(
         &h.screen(),
@@ -1263,7 +1266,8 @@ fn continuing_an_outside_conversation_asks_the_workdir_then_the_id() {
 #[test]
 fn escape_at_the_id_step_cancels_without_creating() {
     let mut h = Harness::paired();
-    h.key(KeyCode::Char('c'));
+    open_conversations(&mut h);
+    h.key(KeyCode::Char('p'));
     h.type_text("/srv/x");
     h.key(KeyCode::Enter);
     h.type_text("some-id");
@@ -1274,6 +1278,223 @@ fn escape_at_the_id_step_cancels_without_creating() {
     // The session list takes keys again, and nothing was queued.
     assert_eq!(h.key(KeyCode::Char('n')), None);
     assert_contains(&h.screen(), "New session");
+}
+
+/// `c` on the session list: the core asks the engine for the server's
+/// conversations; the id of that request.
+fn open_conversations(h: &mut Harness) -> u64 {
+    assert_eq!(h.key(KeyCode::Char('c')), Some(Action::ListConversations));
+    assert!(h.app.conversation_picker().is_some(), "the picker opens");
+    match h.drain_requests().as_slice() {
+        [Request::ListConversations { req }] => *req,
+        other => panic!("expected one conversations request, got {other:?}"),
+    }
+}
+
+fn outside(
+    id: &str,
+    workdir: &str,
+    title: Option<&str>,
+    hours_ago: i64,
+    session: Option<SessionId>,
+) -> skywave_proto::OutsideConversation {
+    skywave_proto::OutsideConversation {
+        id: id.into(),
+        workdir: workdir.into(),
+        title: title.map(Into::into),
+        first_prompt: Some(format!("first prompt of {id}")),
+        last_active: mockup_now() - TimeDelta::hours(hours_ago),
+        messages: 42,
+        session,
+    }
+}
+
+fn answer_conversations(h: &mut Harness, req: u64, list: Vec<skywave_proto::OutsideConversation>) {
+    h.seam.conversations_listed(
+        req,
+        Ok(skywave_proto::ConversationsResult::Listed {
+            conversations: list,
+            truncated: false,
+        }),
+    );
+    h.sync();
+}
+
+#[test]
+fn c_lists_the_servers_conversations_and_enter_continues_one() {
+    let mut h = Harness::paired();
+    let req = open_conversations(&mut h);
+    let screen = h.screen();
+    assert_contains(&screen, "Continue a conversation from outside Skywave");
+    assert_contains(&screen, "listing…");
+    assert_contains(&screen, "p paste an id");
+
+    answer_conversations(
+        &mut h,
+        req,
+        vec![
+            outside(
+                "c-new",
+                "/home/me/src/api",
+                Some("Fix the flaky test"),
+                3,
+                None,
+            ),
+            outside("c-old", "/srv/web", None, 30, None),
+        ],
+    );
+    let screen = h.screen();
+    assert!(!screen.contains("listing…"), "{screen}");
+    // The agent's title, else the first prompt; where, how long ago, how long.
+    assert_contains(&line_with(&screen, "Fix the flaky test"), "> ");
+    assert_contains(&screen, "…/src/api · 3 h ago · 42 messages");
+    assert_contains(&screen, "first prompt of c-old");
+    assert_contains(&screen, "/srv/web · 1 d ago · 42 messages");
+    // The list's own keys are the picker's now: no `o` for a row with no
+    // session.
+    assert!(!screen.contains("o open its session"), "{screen}");
+
+    assert_eq!(h.key(KeyCode::Down), None);
+    assert_contains(&line_with(&h.screen(), "first prompt of c-old"), "> ");
+    assert_eq!(
+        h.key(KeyCode::Enter),
+        Some(Action::CreateSession {
+            workdir: "/srv/web".into(),
+            conversation: Some("c-old".into()),
+        })
+    );
+    assert!(h.app.conversation_picker().is_none(), "the core closes it");
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
+
+    // The pending creation says it imports.
+    let command = last_command(&h);
+    assert_contains(
+        &line_with(&h.screen(), "/srv/web"),
+        "will import when online",
+    );
+    h.seam.command_sending(command).unwrap();
+    h.sync();
+    assert_contains(
+        &line_with(&h.screen(), "/srv/web"),
+        "Importing conversation history…",
+    );
+    h.seam
+        .command_result(command, &CommandResult::Accepted { seq: Seq(1) })
+        .unwrap();
+    h.sync();
+    let row = line_with(&h.screen(), "/srv/web");
+    assert_contains(&row, "created, syncing…");
+    assert!(!row.contains("import"), "{row}");
+}
+
+#[test]
+fn a_listed_conversation_already_in_a_session_opens_it() {
+    use skywave_proto::SessionOrigin;
+    let mut h = Harness::paired();
+    let (running, adopted) = (SessionId::new(), SessionId::new());
+    pull(
+        &mut h,
+        vec![
+            created(running, 0, "/srv/run"),
+            event(
+                adopted,
+                1,
+                EventKind::SessionCreated {
+                    workdir: "/srv/twice".into(),
+                    context_name: "start".into(),
+                    from: Some(SessionOrigin::Agent {
+                        conversation: "c-twice".into(),
+                    }),
+                },
+            ),
+            event(
+                adopted,
+                1,
+                EventKind::ImportFinished {
+                    outcome: skywave_proto::ImportOutcome::NotFound,
+                },
+            ),
+        ],
+    );
+    let req = open_conversations(&mut h);
+    answer_conversations(
+        &mut h,
+        req,
+        vec![
+            outside("c-run", "/srv/run", Some("Running here"), 1, Some(running)),
+            outside("c-twice", "/srv/twice", Some("Continued before"), 2, None),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(
+        &line_with(&screen, "Running here"),
+        "already in Skywave: “run”",
+    );
+    assert_contains(
+        &line_with(&screen, "Continued before"),
+        "continued in “twice”",
+    );
+    assert_contains(&screen, "o open its session");
+
+    // Positive control first: the second row runs in no session.
+    h.key(KeyCode::Down);
+    assert!(!h.screen().contains("o open its session"));
+    assert_eq!(h.key(KeyCode::Char('o')), None);
+    assert_eq!(
+        h.app.ui().notice.as_deref(),
+        Some("no session runs this conversation")
+    );
+    h.key(KeyCode::Up);
+    assert_eq!(
+        h.key(KeyCode::Char('o')),
+        Some(Action::OpenSession(running))
+    );
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+}
+
+#[test]
+fn the_picker_says_when_it_cannot_list() {
+    let mut h = Harness::paired();
+    // Offline: nothing is asked for, the picker says why at once.
+    h.seam.set_link(Link::Reconnecting {
+        attempt: 1,
+        retry_at: mockup_now(),
+        offline_since: mockup_now(),
+    });
+    h.sync();
+    assert_eq!(h.key(KeyCode::Char('c')), Some(Action::ListConversations));
+    assert!(h.drain_requests().is_empty());
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        "offline · the server lists its conversations once connected",
+    );
+    assert_contains(&screen, "Press p to paste a conversation id instead.");
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::EndConversations));
+    assert!(h.app.conversation_picker().is_none());
+    assert!(!h.screen().contains("offline · the server lists"));
+
+    // An agent that cannot list them.
+    h.seam.set_link(Link::Online { latency_ms: 20 });
+    h.sync();
+    let req = open_conversations(&mut h);
+    h.seam
+        .conversations_listed(req, Ok(skywave_proto::ConversationsResult::Unavailable));
+    h.sync();
+    assert_contains(
+        &h.screen(),
+        "can't list conversations: the server's agent cannot list its conversations",
+    );
+    // `r` asks again; an empty answer says so.
+    assert_eq!(h.key(KeyCode::Char('r')), Some(Action::ListConversations));
+    let [Request::ListConversations { req }] = h.drain_requests()[..] else {
+        panic!("expected a new conversations request");
+    };
+    answer_conversations(&mut h, req, Vec::new());
+    assert_contains(
+        &h.screen(),
+        "The server's agent has no conversations under the roots.",
+    );
 }
 
 #[test]
@@ -2057,10 +2278,195 @@ fn an_adopted_session_starts_with_a_divider_naming_the_conversation() {
         )],
     );
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(new)));
+    let screen = h.screen();
     assert_contains(
-        &h.screen(),
+        &screen,
         "Continues agent conversation 3f2a-91bc from outside Skywave",
     );
+    assert!(!screen.contains("not shown"), "{screen}");
+}
+
+/// An adopted session `/srv/work` whose import brought a prompt, an answer,
+/// a shell call with its result and a result of a call not on the
+/// branch, all at 09:1x by the agent's clock; then `outcome`, then a live
+/// message at 12:05. Its row on the session list is selected.
+fn imported_session(outcome: skywave_proto::ImportOutcome) -> (Harness, SessionId, DeviceId) {
+    use skywave_proto::{ImportedItem, SessionOrigin};
+    let mut h = Harness::paired();
+    let me = h.seam.identity().unwrap().device_id();
+    let id = SessionId::new();
+    let agent_at = |minute| Some(Utc.with_ymd_and_hms(2026, 10, 29, 9, minute, 0).unwrap());
+    let imported = |minute, item| {
+        event(
+            id,
+            1,
+            EventKind::Imported {
+                at: agent_at(minute),
+                item,
+            },
+        )
+    };
+    let (shell, stray) = (CallId::new(), CallId::new());
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::SessionCreated {
+                    workdir: "/srv/work".into(),
+                    context_name: "start".into(),
+                    from: Some(SessionOrigin::Agent {
+                        conversation: "3f2a".into(),
+                    }),
+                },
+            ),
+            imported(
+                10,
+                ImportedItem::UserMessage {
+                    text: "why is the build red".into(),
+                },
+            ),
+            imported(
+                11,
+                ImportedItem::ToolCall(call(shell, "Bash", ToolKind::Shell, "$ cargo build")),
+            ),
+            imported(
+                12,
+                ImportedItem::ToolResult(result(shell, false, "exit 0", "Finished dev")),
+            ),
+            imported(
+                13,
+                ImportedItem::ToolResult(result(stray, false, "", "stray output")),
+            ),
+            imported(
+                14,
+                ImportedItem::AgentMessage {
+                    text: "it builds now".into(),
+                },
+            ),
+            event(id, 1, EventKind::ImportFinished { outcome }),
+            message(id, 5, CommandId::new(), me, "live question"),
+        ],
+    );
+    (h, id, me)
+}
+
+/// Whether every cell of the screen row holding `needle` is dimmed.
+fn dimmed(h: &Harness, needle: &str) -> bool {
+    use ratatui::style::Modifier;
+    let buffer = h.frame(100, 24, mockup_now());
+    let screen = text(&buffer);
+    let y = screen
+        .lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"));
+    let line = screen.lines().nth(y).unwrap();
+    // One char per cell: `text` joins the cells' symbols.
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    let cell = &buffer[(x as u16, y as u16)];
+    cell.modifier.contains(Modifier::DIM)
+}
+
+#[test]
+fn imported_history_is_marked_dimmed_and_ends_at_a_divider() {
+    let (mut h, id, _) = imported_session(skywave_proto::ImportOutcome::Imported { items: 5 });
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    let screen = h.screen();
+    // By the agent's clock, marked, in the order the agent had them.
+    assert_contains(&screen, "09:10 imported you: why is the build red");
+    assert_contains(
+        &line_with(&screen, "cargo build"),
+        "09:11 imported ❯ Bash $ cargo build",
+    );
+    assert_contains(&line_with(&screen, "cargo build"), "exit 0");
+    assert_contains(&screen, "Finished dev");
+    assert_contains(&screen, "09:13 imported ↳ result");
+    assert_contains(&screen, "stray output");
+    assert_contains(&screen, "09:14 imported agent: it builds now");
+    assert_contains(&screen, "── Continued in Skywave from here ──");
+    // The session's own items are not imported.
+    let live = line_with(&screen, "live question");
+    assert!(!live.contains("imported"), "{live}");
+    assert_contains(&live, "12:05");
+    // The header is titled by the imported prompt, so look past it.
+    assert!(dimmed(&h, "you: why is the build red"));
+    assert!(dimmed(&h, "it builds now"));
+    assert!(dimmed(&h, "Bash $ cargo build"));
+    assert!(!dimmed(&h, "live question"), "positive control");
+
+    // Imported rows select and copy like live ones.
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_eq!(h.key(KeyCode::Char('y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("it builds now".into())));
+    for _ in 0..2 {
+        h.key(KeyCode::Up);
+    }
+    assert_eq!(h.key(KeyCode::Char('Y')), None);
+    assert_eq!(clip(&h), Some(Clip::Text("cargo build".into())));
+}
+
+#[test]
+fn every_import_outcome_draws_its_divider() {
+    use skywave_proto::ImportOutcome;
+    let cases = [
+        (
+            ImportOutcome::NotFound,
+            "── history not found · continued in Skywave from here ──",
+        ),
+        (
+            ImportOutcome::Failed {
+                reason: "bad line 3".into(),
+            },
+            "── history could not be read: bad line 3 · continued in Skywave from here ──",
+        ),
+        (
+            ImportOutcome::Unavailable,
+            "history not imported: the server's agent cannot read it",
+        ),
+    ];
+    for (outcome, divider) in cases {
+        let (mut h, id, _) = imported_session(outcome);
+        h.key(KeyCode::Enter);
+        assert_eq!(h.app.session().map(|(view, _)| view.id), Some(id));
+        assert_contains(&h.screen(), divider);
+    }
+}
+
+#[test]
+fn an_adopted_session_says_it_imports_until_its_history_is_in() {
+    use skywave_proto::SessionOrigin;
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            0,
+            EventKind::SessionCreated {
+                workdir: "/srv/work".into(),
+                context_name: "start".into(),
+                from: Some(SessionOrigin::Agent {
+                    conversation: "3f2a".into(),
+                }),
+            },
+        )],
+    );
+    assert_contains(&line_with(&h.screen(), "/srv/work"), "importing history…");
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            0,
+            EventKind::ImportFinished {
+                outcome: skywave_proto::ImportOutcome::Imported { items: 0 },
+            },
+        )],
+    );
+    let row = line_with(&h.screen(), "/srv/work");
+    assert!(!row.contains("importing"), "{row}");
 }
 
 /// A session whose first context ("start") holds "alpha question" and

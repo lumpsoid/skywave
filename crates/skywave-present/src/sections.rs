@@ -5,8 +5,8 @@
 //! and what a copy takes is what it shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, Outgoing, Query, Seq,
-    SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, ImportedEntry, Outgoing,
+    Query, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -31,7 +31,7 @@ impl ItemKey {
 }
 
 /// Messages (any device's, logged or pending), tool items and agent messages
-/// can be selected; tool items expand.
+/// can be selected, imported ones too; tool items expand.
 pub fn selectable(item: &TimelineItem) -> Option<ItemKey> {
     match item {
         TimelineItem::Pending { .. }
@@ -42,7 +42,8 @@ pub fn selectable(item: &TimelineItem) -> Option<ItemKey> {
                 | Entry::ToolCall { .. }
                 | Entry::ToolResult { .. }
                 | Entry::Approval { .. }
-                | Entry::AgentMessage { .. },
+                | Entry::AgentMessage { .. }
+                | Entry::Imported { .. },
             ..
         } => Some(ItemKey::of(item)),
         _ => None,
@@ -182,10 +183,19 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
             }
             out.extend(input.as_ref().map(Section::input));
         }
-        Entry::ToolResult { summary, output } => out.push(Section {
+        Entry::ToolResult { summary, output }
+        | Entry::Imported {
+            entry: ImportedEntry::ToolResult { summary, output },
+            ..
+        } => out.push(Section {
             blob: output.as_ref(),
             ..Section::text(summary)
         }),
+        // An imported call shows like a live one.
+        Entry::Imported {
+            entry: ImportedEntry::Tool(view),
+            ..
+        } => return tool_sections(view),
         _ => {}
     }
     out
@@ -271,7 +281,11 @@ pub fn gated_item(view: &SessionView) -> Option<(usize, &TimelineItem)> {
 pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
     let first_line = |text: &str| text.split('\n').next().unwrap_or_default().to_owned();
     let mut head: Vec<String> = match entry {
-        Entry::Tool(view) => {
+        Entry::Tool(view)
+        | Entry::Imported {
+            entry: ImportedEntry::Tool(view),
+            ..
+        } => {
             let mut head = vec![view.name.clone(), first_line(&view.title)];
             head.extend(view.detail.as_deref().map(first_line));
             if let ToolOutcome::Done {
@@ -289,7 +303,11 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
             summary,
             ..
         } => vec![name.clone(), first_line(summary)],
-        Entry::ToolResult { .. } => Vec::new(),
+        Entry::ToolResult { .. }
+        | Entry::Imported {
+            entry: ImportedEntry::ToolResult { .. },
+            ..
+        } => Vec::new(),
         _ => return false,
     };
     for section in sections(entry).iter().filter(|s| !s.hidden) {
@@ -340,12 +358,19 @@ impl Content {
 /// `ToolDisplay::title`); a copied command goes without it.
 const PROMPT: &str = "$ ";
 
-/// A message's text, logged or pending.
+/// A message's text, logged, pending or imported.
 fn message(item: &TimelineItem) -> Option<&str> {
     match item {
         TimelineItem::Pending { text, .. }
         | TimelineItem::Logged {
-            entry: Entry::UserMessage { text, .. } | Entry::AgentMessage { text },
+            entry:
+                Entry::UserMessage { text, .. }
+                | Entry::AgentMessage { text }
+                | Entry::Imported {
+                    entry:
+                        ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text },
+                    ..
+                },
             ..
         } => Some(text),
         _ => None,
@@ -381,26 +406,41 @@ pub fn call_content(item: &TimelineItem) -> Option<Content> {
     let TimelineItem::Logged { entry, .. } = item else {
         return None;
     };
-    let unprompted = |text: &str| text.strip_prefix(PROMPT).unwrap_or(text).to_owned();
     match entry {
-        // Decided on the kind, never the tool's name (D3).
-        Entry::Tool(view) if view.kind == ToolKind::Shell => Some(match &view.body {
-            Some(BodyView {
-                full: Some(blob), ..
-            }) => Content::Blob {
-                blob: blob.clone(),
-                strip: Some(PROMPT),
-            },
-            Some(body) => Content::Text(unprompted(&body.preview)),
-            None => Content::Text(unprompted(&view.title)),
-        }),
-        Entry::Tool(view) => Some(Content::Text(match &view.detail {
-            Some(detail) => format!("{}\n{detail}", view.title),
-            None => view.title.clone(),
-        })),
+        Entry::Tool(view)
+        | Entry::Imported {
+            entry: ImportedEntry::Tool(view),
+            ..
+        } => Some(tool_call_content(view)),
         Entry::ToolCall { summary, .. }
         | Entry::Approval { summary, .. }
-        | Entry::ToolResult { summary, .. } => Some(Content::Text(summary.clone())),
+        | Entry::ToolResult { summary, .. }
+        | Entry::Imported {
+            entry: ImportedEntry::ToolResult { summary, .. },
+            ..
+        } => Some(Content::Text(summary.clone())),
         _ => None,
+    }
+}
+
+/// [`call_content`] of a grouped call, live or imported.
+fn tool_call_content(view: &ToolView) -> Content {
+    let unprompted = |text: &str| text.strip_prefix(PROMPT).unwrap_or(text).to_owned();
+    // Decided on the kind, never the tool's name (D3).
+    if view.kind != ToolKind::Shell {
+        return Content::Text(match &view.detail {
+            Some(detail) => format!("{}\n{detail}", view.title),
+            None => view.title.clone(),
+        });
+    }
+    match &view.body {
+        Some(BodyView {
+            full: Some(blob), ..
+        }) => Content::Blob {
+            blob: blob.clone(),
+            strip: Some(PROMPT),
+        },
+        Some(body) => Content::Text(unprompted(&body.preview)),
+        None => Content::Text(unprompted(&view.title)),
     }
 }

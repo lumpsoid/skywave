@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
@@ -23,10 +23,10 @@ use skywave_core::{
     ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
-    adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes, context_moved_line,
-    context_started_line, context_switched_line, decision_label, delivery_label, dollars,
-    fail_reason, moved_from_line, outgoing_label, percent, seconds, subagent_status, took_label,
-    turn_time,
+    IMPORTED_MARK, adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes,
+    context_moved_line, context_started_line, context_switched_line, decision_label,
+    delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
+    percent, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -218,7 +218,13 @@ impl Layout<'_> {
             Span::raw("  ")
         };
         let time = match item {
-            TimelineItem::Logged { at, .. } => {
+            // Imported history shows when the agent had it, not when the
+            // server logged it.
+            TimelineItem::Logged {
+                entry: Entry::Imported { at, .. },
+                ..
+            }
+            | TimelineItem::Logged { at, .. } => {
                 let this = at.format("%Y-%m-%d %H:%M").to_string();
                 if minute.as_ref() == Some(&this) {
                     Span::raw("      ")
@@ -235,6 +241,15 @@ impl Layout<'_> {
             TimelineItem::Pending { text, outgoing, .. } => {
                 self.message(lead, you(Some(outgoing)), text, mark)
             }
+            // Dimmed: it happened outside Skywave.
+            TimelineItem::Logged {
+                entry: entry @ Entry::Imported { .. },
+                ..
+            } => self
+                .entry(lead, entry, expanded, mark)
+                .into_iter()
+                .map(|line| line.patch_style(Modifier::DIM))
+                .collect(),
             TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded, mark),
         });
         if let Some(row) = self.matched.get() {
@@ -265,6 +280,45 @@ impl Layout<'_> {
                 content.push(Span::raw(format!(" · {aside}")).dark_gray());
             }
             content
+        };
+        // A grouped call's head, live or imported.
+        let tool_head = |lead: Vec<Span<'static>>, view: &ToolView| {
+            let (mut state, style) = tool_state(view, self.wall_ms);
+            if let Some(note) = view
+                .approval
+                .as_ref()
+                .and_then(|a| unapplied(&a.status, a.answer.as_ref()))
+            {
+                state = format!("{state} · {note}");
+            }
+            let mut out = head_lines(
+                lead,
+                Span::styled(glyph(view.kind), style),
+                titled(marked(title_spans(&view.name, &view.title), mark)),
+                marked(vec![Span::styled(state, style)], mark),
+                width,
+            );
+            if let Some(detail) = &view.detail {
+                out.extend(detail_lines(detail, TITLE, width, mark));
+            }
+            (out, style)
+        };
+        let result_head = |lead: Vec<Span<'static>>| {
+            (
+                head_lines(
+                    lead,
+                    Span::raw("↳"),
+                    titled(vec![Span::raw("result").bold()]),
+                    Vec::new(),
+                    width,
+                ),
+                Style::new().dark_gray(),
+            )
+        };
+        // Imported rows say so between the time and what they are.
+        let imported = |mut lead: Vec<Span<'static>>| {
+            lead.push(Span::raw(format!("{IMPORTED_MARK} ")).italic());
+            lead
         };
         let (mut out, gutter) = match entry {
             Entry::UserMessage {
@@ -313,20 +367,31 @@ impl Layout<'_> {
             Entry::Adopted { conversation } => {
                 return context_divider(lead, &adopted_line(conversation));
             }
-            // Plain rows until imported history gets its own rendering.
-            Entry::Imported { entry, .. } => {
-                let (label, text) = match entry {
-                    ImportedEntry::UserMessage { text } => ("imported you: ", text.clone()),
-                    ImportedEntry::AgentMessage { text } => ("imported agent: ", text.clone()),
-                    ImportedEntry::Tool(view) => ("imported tool: ", view.title.clone()),
-                    ImportedEntry::ToolResult { summary, .. } => {
-                        ("imported result: ", summary.clone())
-                    }
-                };
-                return self.message(lead, vec![Span::raw(label).dark_gray()], &text, mark);
+            // The outside conversation's user wrote it, not a device.
+            Entry::Imported {
+                entry: ImportedEntry::UserMessage { text },
+                ..
+            } => {
+                let label = vec![Span::raw("you").blue().bold(), Span::raw(": ")];
+                return self.message(imported(lead), label, text, mark);
             }
-            Entry::ImportFinished { .. } => {
-                return context_divider(lead, "imported history ends here");
+            Entry::Imported {
+                entry: ImportedEntry::AgentMessage { text },
+                ..
+            } => {
+                let label = vec![Span::raw("agent: ").green().bold()];
+                return self.message(imported(lead), label, text, mark);
+            }
+            Entry::Imported {
+                entry: ImportedEntry::Tool(view),
+                ..
+            } => tool_head(imported(lead), view),
+            Entry::Imported {
+                entry: ImportedEntry::ToolResult { .. },
+                ..
+            } => result_head(imported(lead)),
+            Entry::ImportFinished { outcome } => {
+                return context_divider(lead, &import_finished_line(outcome));
             }
             Entry::Renamed { name, by } => {
                 let who = if by.me {
@@ -397,27 +462,7 @@ impl Layout<'_> {
                     mark,
                 );
             }
-            Entry::Tool(view) => {
-                let (mut state, style) = tool_state(view, self.wall_ms);
-                if let Some(note) = view
-                    .approval
-                    .as_ref()
-                    .and_then(|a| unapplied(&a.status, a.answer.as_ref()))
-                {
-                    state = format!("{state} · {note}");
-                }
-                let mut out = head_lines(
-                    lead,
-                    Span::styled(glyph(view.kind), style),
-                    titled(marked(title_spans(&view.name, &view.title), mark)),
-                    marked(vec![Span::styled(state, style)], mark),
-                    width,
-                );
-                if let Some(detail) = &view.detail {
-                    out.extend(detail_lines(detail, TITLE, width, mark));
-                }
-                (out, style)
-            }
+            Entry::Tool(view) => tool_head(lead, view),
             Entry::ToolCall { name, summary, .. } => (
                 head_lines(
                     lead,
@@ -428,16 +473,7 @@ impl Layout<'_> {
                 ),
                 Style::new().dark_gray(),
             ),
-            Entry::ToolResult { .. } => (
-                head_lines(
-                    lead,
-                    Span::raw("↳"),
-                    titled(vec![Span::raw("result").bold()]),
-                    Vec::new(),
-                    width,
-                ),
-                Style::new().dark_gray(),
-            ),
+            Entry::ToolResult { .. } => result_head(lead),
             Entry::Approval {
                 tool,
                 summary,
