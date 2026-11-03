@@ -2077,3 +2077,274 @@ fn a_long_run_of_this_device_alerts_once_wherever_it_finished() {
         "open in agent mode, exactly 10 s"
     );
 }
+
+/// What [`replica_to_reset`] stored: the log it applied, its session and
+/// blob, and the device it paired as.
+struct ToReset {
+    dir: tempfile::TempDir,
+    log: EventBatch,
+    sid: SessionId,
+    blob: BlobId,
+    device: DeviceId,
+}
+
+/// A paired replica with one archived session whose tool output is a
+/// downloaded blob, a draft for that session and a snippet; closed.
+fn replica_to_reset() -> ToReset {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, seam, _requests, device) = paired_core(dir.path());
+    let sid = SessionId::new();
+    let blob = BlobRef {
+        id: BlobId::new(),
+        size: 3,
+    };
+    let log = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                sid,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/a".into(),
+                    context_name: "start".into(),
+                    from: None,
+                },
+            ),
+            event(
+                sid,
+                1,
+                EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "log".into(),
+                    lines: 1,
+                    output: Some(blob.clone()),
+                }),
+            ),
+            event(
+                sid,
+                2,
+                EventKind::SessionArchived {
+                    archived: true,
+                    by: DeviceId::new(),
+                },
+            ),
+        ],
+    };
+    seam.apply_events(&log).unwrap();
+    let file = skywave_core::blob_dir(dir.path()).join(blob.id.0.to_string());
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "abc").unwrap();
+    seam.blob_status(blob.id, BlobStatus::Available { path: file })
+        .unwrap();
+    core.dispatch(Action::SaveDraft {
+        session_id: sid,
+        mode: ComposerMode::Agent,
+        text: "unsent".into(),
+        cursor: 0,
+        when: RunWhen::Always,
+    })
+    .unwrap();
+    core.dispatch(Action::SaveSnippet {
+        name: String::new(),
+        text: "make test".into(),
+        kind: ComposerMode::Shell,
+    })
+    .unwrap();
+    drop((core, seam));
+    ToReset {
+        dir,
+        log,
+        sid,
+        blob: blob.id,
+        device,
+    }
+}
+
+fn sql(dir: &Path, statements: &str) {
+    rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE))
+        .unwrap()
+        .execute_batch(statements)
+        .unwrap();
+}
+
+fn unreadable_reason(dir: &Path) -> String {
+    match Core::open_detached(dir) {
+        Err(CoreError::ReplicaUnreadable { reason }) => reason,
+        Err(other) => panic!("expected an unreadable replica, got {other}"),
+        Ok(_) => panic!("expected an unreadable replica, but it opened"),
+    }
+}
+
+#[test]
+fn a_replica_of_another_protocol_version_is_reset_keeping_what_is_this_devices() {
+    let r = replica_to_reset();
+    let dir = r.dir.path();
+    let blob_file = skywave_core::blob_dir(dir).join(r.blob.0.to_string());
+    // Positive control: as written, it opens.
+    drop(Core::open_detached(dir).unwrap());
+
+    let other = skywave_core::PROTOCOL_VERSION + 1;
+    sql(dir, &format!("UPDATE protocol_stamp SET version = {other}"));
+    let reason = unreadable_reason(dir);
+    assert!(
+        reason.contains(&format!("protocol version {other}")),
+        "{reason}"
+    );
+    assert!(blob_file.exists(), "refused untouched");
+
+    // Not beside an open core.
+    sql(
+        dir,
+        &format!(
+            "UPDATE protocol_stamp SET version = {}",
+            skywave_core::PROTOCOL_VERSION
+        ),
+    );
+    let open = Core::open_detached(dir).unwrap();
+    assert!(matches!(
+        Core::reset_replica(dir),
+        Err(CoreError::Lock(skywave_core::LockError::InUse { .. }))
+    ));
+    drop(open);
+    sql(dir, &format!("UPDATE protocol_stamp SET version = {other}"));
+
+    Core::reset_replica(dir).unwrap();
+    assert!(!blob_file.exists(), "the blob files go");
+    let store = Store::open(dir).unwrap();
+    let kept = store.load().unwrap();
+    assert_eq!(kept.cursor, Seq::ZERO);
+    assert!(kept.sessions.is_empty() && kept.blobs.is_empty() && kept.outbox.is_empty());
+    assert!(store.session_events(r.sid).unwrap().is_empty());
+    assert_eq!(kept.drafts.len(), 1, "drafts stay");
+    assert_eq!(kept.snippets.len(), 1, "snippets stay");
+    assert_eq!(kept.settings.server_address.as_deref(), Some("srv:7443"));
+    drop(store);
+
+    // It opens paired, and syncs the log again from the start.
+    let core = Core::open_detached(dir).unwrap();
+    let seam = core.seam();
+    assert_eq!(seam.identity().unwrap().device_id(), r.device);
+    assert_eq!(seam.apply_events(&r.log).unwrap().cursor, Seq(3));
+    core.dispatch(Action::Navigate(Route::ArchivedSessions))
+        .unwrap();
+    let Screen::SessionList(list) = core.view().screen else {
+        panic!("expected the session list");
+    };
+    assert_eq!(list.sessions.len(), 1);
+    assert_eq!(list.sessions[0].id, r.sid);
+    assert!(list.sessions[0].has_draft, "its draft is back with it");
+    assert_eq!(
+        seam.blob(r.blob).unwrap().map(|b| b.status),
+        Some(BlobStatus::NotDownloaded)
+    );
+}
+
+#[test]
+fn a_stored_row_that_no_longer_decodes_makes_the_replica_unreadable() {
+    let r = replica_to_reset();
+    let dir = r.dir.path();
+    sql(dir, "UPDATE sessions SET state = '\"no_such_state\"'");
+    let reason = unreadable_reason(dir);
+    assert!(!reason.is_empty());
+    Core::reset_replica(dir).unwrap();
+    let core = Core::open_detached(dir).unwrap();
+    assert_eq!(core.seam().identity().unwrap().device_id(), r.device);
+}
+
+#[test]
+fn a_setting_this_build_cannot_read_is_dropped_in_place_and_the_rest_kept() {
+    let r = replica_to_reset();
+    let dir = r.dir.path();
+    sql(
+        dir,
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('blob_policy', 'sometimes');
+         INSERT OR REPLACE INTO settings (key, value) VALUES ('shell_enabled', 'maybe');
+         INSERT OR REPLACE INTO settings (key, value) VALUES ('from_a_newer_build', 'x');",
+    );
+    unreadable_reason(dir);
+    Core::reset_replica(dir).unwrap();
+    let core = Core::open_detached(dir).unwrap();
+    let seam = core.seam();
+    let settings = seam.settings().unwrap();
+    assert_eq!(settings.server_address.as_deref(), Some("srv:7443"));
+    assert_eq!(settings.blob_policy, skywave_core::BlobPolicy::default());
+    assert!(!settings.shell_enabled);
+    drop((core, seam));
+    let store = Store::open(dir).unwrap();
+    let kept = store.load().unwrap();
+    assert_eq!(kept.drafts.len(), 1, "reset in place: drafts stay");
+    assert_eq!(kept.snippets.len(), 1, "reset in place: snippets stay");
+    let other: String = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE))
+        .unwrap()
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'from_a_newer_build'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(other, "x", "a newer build's key stays");
+}
+
+#[test]
+fn a_replica_that_cannot_be_reset_in_place_is_created_again_with_its_settings() {
+    // A newer schema: nothing of it can be trusted but the plain settings,
+    // and of those only what this build reads.
+    let r = replica_to_reset();
+    let dir = r.dir.path();
+    sql(
+        dir,
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('blob_policy', 'sometimes');
+         PRAGMA user_version = 999;",
+    );
+    // A new database a crashed reset left behind, and its hot journal.
+    std::fs::write(dir.join("core.db.new"), b"half").unwrap();
+    std::fs::write(dir.join("core.db.new-journal"), b"half").unwrap();
+    unreadable_reason(dir);
+    Core::reset_replica(dir).unwrap();
+    assert!(!dir.join("core.db.new").exists() && !dir.join("core.db.new-journal").exists());
+    let core = Core::open_detached(dir).unwrap();
+    let seam = core.seam();
+    assert_eq!(seam.identity().unwrap().device_id(), r.device);
+    assert_eq!(
+        seam.settings().unwrap().server_address.as_deref(),
+        Some("srv:7443")
+    );
+    drop((core, seam));
+    assert!(Store::open(dir).unwrap().drafts().unwrap().is_empty());
+
+    // Not a database at all: created again from nothing.
+    std::fs::write(dir.join(skywave_core::store::DB_FILE), b"not sqlite").unwrap();
+    for wal in ["core.db-wal", "core.db-shm"] {
+        let _ = std::fs::remove_file(dir.join(wal));
+    }
+    unreadable_reason(dir);
+    Core::reset_replica(dir).unwrap();
+    let core = Core::open_detached(dir).unwrap();
+    assert_eq!(core.seam().identity().unwrap().device_id(), r.device);
+}
+
+#[test]
+fn a_session_with_an_event_that_no_longer_decodes_can_be_deleted() {
+    let r = replica_to_reset();
+    let dir = r.dir.path();
+    // The tool result, which names the blob, no longer decodes.
+    sql(
+        dir,
+        "UPDATE events SET event = '{\"bogus\": 1}' WHERE seq = 2",
+    );
+    let core = Core::open_detached(dir).unwrap();
+    let requests = core.seam().take_requests().unwrap();
+    core.dispatch(Action::OpenSession(r.sid)).unwrap_err();
+    core.dispatch(Action::Navigate(Route::ArchivedSessions))
+        .unwrap();
+    core.dispatch(Action::DeleteSessionLocally { session_id: r.sid })
+        .unwrap();
+    // Its blob is unknown without the event: it stays, until a reset.
+    assert_eq!(drain(&requests), vec![Request::BlobsPurged(vec![])]);
+    let store = Store::open(dir).unwrap();
+    assert!(store.session(r.sid).unwrap().is_none());
+    assert!(store.session_events(r.sid).unwrap().is_empty());
+    assert!(store.load().unwrap().deleted.contains(&r.sid));
+}

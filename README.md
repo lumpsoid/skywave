@@ -254,6 +254,12 @@ any of `bell`, `osc9`, `osc777` separated by commas; `osc9` / `osc777` send a
 desktop notification naming the session (never the tool's input). Inside tmux
 those two need `set -g allow-passthrough on`; the bell always works.
 
+If the local data cannot be read (written by another skywave version, or
+damaged), the TUI says so and exits. `skywave-tui --reset-replica` drops the
+local copy of the sessions, queued commands and downloaded blobs and syncs
+everything again from the server, keeping the pairing, settings, drafts and
+snippets. The GUI offers the same as "Reset local data".
+
 ### Managing devices
 
 ```sh

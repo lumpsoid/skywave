@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/app.dart';
+import 'package:skywave_gui/boot/boot_failure_page.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -36,6 +37,35 @@ void main() {
     );
   });
 
+  test('BootFailed keeps whether the data is unreadable', () {
+    expect(
+      (BootHolder()..fail('x')).status,
+      isA<BootError>().having((s) => s.unreadable, 'unreadable', false),
+    );
+    expect(
+      (BootHolder()..fail('x', unreadable: true)).status,
+      isA<BootError>().having((s) => s.unreadable, 'unreadable', true),
+    );
+  });
+
+  testWidgets('Reset local data and Retry call their own callbacks', (
+    tester,
+  ) async {
+    final taps = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BootFailurePage(
+          message: 'unreadable',
+          onRetry: () => taps.add('retry'),
+          onReset: () => taps.add('reset'),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Reset local data'));
+    await tester.tap(find.text('Retry'));
+    expect(taps, ['reset', 'retry']);
+  });
+
   test('Booted after a failure clears it', () {
     final holder = BootHolder()
       ..fail('Cannot open the data: locked')
@@ -66,6 +96,12 @@ void main() {
     await tester.pump();
     expect(find.text('Cannot open the data: disk full'), findsOneWidget);
     expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Reset local data'), findsNothing);
+
+    holder.fail('Cannot open the data: from another build', unreadable: true);
+    await tester.pump();
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Reset local data'), findsOneWidget);
 
     holder.booted();
     await tester.pump();

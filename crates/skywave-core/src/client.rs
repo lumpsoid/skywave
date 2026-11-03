@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as async_mpsc, watch};
 
 use crate::action::Action;
-use crate::blobs::remove_blob_files;
+use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::engine::{Engine, EngineConfig};
 use crate::identity::{FileIdentity, IdentityError};
 use crate::lock::{DataDirLock, LockError};
@@ -40,6 +40,26 @@ pub enum CoreError {
     /// the old server's replica, which is gone.
     #[error("the device paired with another server; this work belongs to the old one")]
     Superseded,
+    /// [`Core::open`] found a replica this build cannot read: written for
+    /// another protocol or schema version, or a stored row that no longer
+    /// decodes ([`StoreError::unreadable`]). Heads offer
+    /// [`Core::reset_replica`].
+    #[error("the local data cannot be read ({reason}); reset it to sync again from the server")]
+    ReplicaUnreadable { reason: String },
+}
+
+impl CoreError {
+    /// A store error, as [`CoreError::ReplicaUnreadable`] when it says the
+    /// replica cannot be read.
+    fn opening(err: StoreError) -> CoreError {
+        if err.unreadable() {
+            CoreError::ReplicaUnreadable {
+                reason: err.to_string(),
+            }
+        } else {
+            CoreError::Store(err)
+        }
+    }
 }
 
 /// Why [`Core::shutdown`] could not close the store.
@@ -259,6 +279,24 @@ impl Core {
         })
     }
 
+    /// Starts the replica in `data_dir` again for the same server, after
+    /// [`open`](Core::open) failed with [`CoreError::ReplicaUnreadable`]:
+    /// the replicated log, cursor, sessions, outbox and blobs (rows and
+    /// files) go, while the device identity, settings, drafts and snippets
+    /// stay ([`Store::reset_replica`]). The next open syncs from seq 0.
+    ///
+    /// Needs no open core, but takes the data dir's lock, so it fails with
+    /// [`LockError::InUse`] while a core has the dir open. Works on a
+    /// readable replica too.
+    pub fn reset_replica(data_dir: &Path) -> Result<(), CoreError> {
+        let _lock = DataDirLock::take(data_dir)?;
+        Store::reset_replica(data_dir)?;
+        // Once the rows are gone, as when pairing with another server.
+        remove_all_blob_files(data_dir);
+        tracing::info!(dir = %data_dir.display(), "replica reset");
+        Ok(())
+    }
+
     /// Pauses the sync engine's network loops, e.g. while an Android app is
     /// in the background. Nothing is lost: actions still persist and queue,
     /// and an unanswered command is resent with its id later. No-op for a
@@ -445,9 +483,10 @@ impl Shared {
         request_rx: Option<Receiver<Request>>,
     ) -> Result<Arc<Shared>, CoreError> {
         let lock = DataDirLock::take(data_dir)?;
-        let store = Store::open(data_dir)?;
+        let store = Store::open(data_dir).map_err(CoreError::opening)?;
         let identity = FileIdentity::load(data_dir)?.map(Arc::new);
-        let model = Model::new(store.load()?, identity.as_deref().map(Paired::of));
+        let snapshot = store.load().map_err(CoreError::opening)?;
+        let model = Model::new(snapshot, identity.as_deref().map(Paired::of));
         Ok(Arc::new(Shared {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State {
