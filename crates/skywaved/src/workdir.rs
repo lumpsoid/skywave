@@ -160,8 +160,30 @@
 //! database lock, then inserts its `blobs` and `workdir_blobs` rows in one
 //! short transaction (removing the file if that fails). Only workdir content is ever looked up: event blobs (tool
 //! output) keep their own random ids, so the core's per-session blob
-//! deletion can never delete a blob a snapshot still names. Nothing deletes
-//! workdir blobs (no GC yet).
+//! deletion can never delete a blob a snapshot still names, and no event
+//! ever names a workdir blob.
+//!
+//! **Garbage.** A workdir blob is live while the latest answer to some
+//! read names it, whatever the session: `workdir_answer_blobs` keeps, per
+//! read (session, `changes` or `file`, the path as requested, `''` for
+//! changes), the blobs its latest answer named, the key and the rule the
+//! core keeps its stored answers by. A changes or file answer replaces
+//! the read's rows, except `ChangesResult::Failed`, which the core never
+//! stores either; a list names no blob. In the same transaction, every
+//! `workdir_blobs` row no answer names goes with its `blobs` row; the
+//! files are removed after the commit. So a refresh deletes the content
+//! the answer before it named and nothing else names, and a snapshot that
+//! stored blobs and then failed leaves them to the next answer's pass.
+//! [`collect_garbage`] runs the same pass at startup. A device that still
+//! holds a replaced answer (another device refreshed the read, or the reply
+//! was lost) gets a 404 for its blob and shows the download failed until
+//! it refreshes.
+//! This never loses a live blob to a concurrent store: every lookup,
+//! registration, answer and collection runs on this module's connection
+//! under the snapshot mutex, and a snapshot records its answer before it
+//! lets go, so no pass can run between a store reusing a blob and the
+//! answer naming it. (The startup pass runs before the reader exists.)
+//! Event blobs are never in `workdir_blobs`, so never collected.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -173,7 +195,7 @@ use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use skywave_proto::{
-    BlobRef, DirEntry, EntryKind, FileBody, FileResult, LinkTarget, ListResult, SessionId,
+    BlobId, BlobRef, DirEntry, EntryKind, FileBody, FileResult, LinkTarget, ListResult, SessionId,
     WorkdirQuery, limits,
 };
 
@@ -371,8 +393,22 @@ impl Snapshot<'_> {
         })
     }
 
-    /// `GET /v1/workdir/file` (module docs, "Files").
+    /// `GET /v1/workdir/file` (module docs, "Files"), recorded as the read's
+    /// latest answer (module docs, "Garbage").
     pub fn file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
+        let answer = self.read_file(query)?;
+        let blobs = match &answer {
+            FileResult::File {
+                content: FileBody::Blob(blob),
+                ..
+            } => vec![blob.id],
+            _ => Vec::new(),
+        };
+        self.answered(query.session, AnswerKind::File, &query.path, &blobs)?;
+        Ok(answer)
+    }
+
+    fn read_file(&mut self, query: &WorkdirQuery) -> Result<FileResult> {
         let (target, path) = match self.locate(query)? {
             Located::Found { target, path, .. } => (target, path),
             Located::UnknownSession => return Ok(FileResult::UnknownSession),
@@ -496,6 +532,107 @@ impl Snapshot<'_> {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Records `blobs` as all that the latest answer to the read
+    /// (`session`, `kind`, `path`) names, replacing what the answer before
+    /// named, then deletes every workdir blob no answer names (module docs,
+    /// "Garbage"). One short transaction; the files go after it.
+    pub(crate) fn answered(
+        &mut self,
+        session: SessionId,
+        kind: AnswerKind,
+        path: &str,
+        blobs: &[BlobId],
+    ) -> Result<()> {
+        let tx = self
+            .db
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = params![session.0.to_string(), kind.as_str(), path];
+        tx.execute(
+            "DELETE FROM workdir_answer_blobs
+             WHERE session_id = ?1 AND kind = ?2 AND path = ?3",
+            key,
+        )?;
+        for blob in blobs {
+            tx.execute(
+                "INSERT OR IGNORE INTO workdir_answer_blobs (session_id, kind, path, blob_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    session.0.to_string(),
+                    kind.as_str(),
+                    path,
+                    blob.0.to_string()
+                ],
+            )?;
+        }
+        let unnamed = delete_unnamed(&tx)?;
+        tx.commit()?;
+        remove_files(self.blobs, &unnamed);
+        Ok(())
+    }
+}
+
+/// The reads whose answers name blobs, as `workdir_answer_blobs.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerKind {
+    Changes,
+    File,
+}
+
+impl AnswerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            AnswerKind::Changes => "changes",
+            AnswerKind::File => "file",
+        }
+    }
+}
+
+/// Deletes every workdir blob no stored answer names, as after an answer
+/// (module docs, "Garbage"); returns how many. For startup, before a
+/// [`WorkdirReader`] exists: run beside one, a blob it just stored but has
+/// not yet named in an answer would go.
+pub fn collect_garbage(db: &mut Db, blobs: &BlobStore) -> Result<usize> {
+    let tx = db
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let unnamed = delete_unnamed(&tx)?;
+    tx.commit()?;
+    remove_files(blobs, &unnamed);
+    Ok(unnamed.len())
+}
+
+/// Deletes the `workdir_blobs` and `blobs` rows of every workdir blob no
+/// answer names, within the caller's transaction; returns their ids, whose
+/// files go once it commits.
+fn delete_unnamed(tx: &rusqlite::Transaction<'_>) -> Result<Vec<BlobId>> {
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT blob_id FROM workdir_blobs w WHERE NOT EXISTS
+               (SELECT 1 FROM workdir_answer_blobs a WHERE a.blob_id = w.blob_id)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut unnamed = Vec::with_capacity(ids.len());
+    for id in ids {
+        tx.execute("DELETE FROM workdir_blobs WHERE blob_id = ?1", [&id])?;
+        tx.execute("DELETE FROM blobs WHERE id = ?1", [&id])?;
+        unnamed.push(parse_id(&id)?);
+    }
+    Ok(unnamed)
+}
+
+/// Removes the files of blobs whose rows were deleted. A file left behind
+/// (a crash before this) is never served, and the startup sweep removes it.
+fn remove_files(blobs: &BlobStore, ids: &[BlobId]) {
+    for &id in ids {
+        blobs.discard(id);
+    }
+    if !ids.is_empty() {
+        tracing::debug!(blobs = ids.len(), "deleted workdir blobs no answer names");
     }
 }
 
@@ -675,6 +812,47 @@ mod tests {
                 .conn()
                 .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
                 .unwrap()
+        }
+
+        /// Whether blob `id` is still stored: its row, checked against its
+        /// file (a row without its file, or the reverse, fails the test).
+        pub(super) fn stored(&self, id: BlobId) -> bool {
+            let row = self.storage.open_blob(id).unwrap().is_some();
+            let file = self.storage.dir.blobs_dir().join(id.0.to_string()).exists();
+            assert_eq!(row, file, "blob {} has a row xor a file", id.0);
+            row
+        }
+
+        /// The blob of the file answer to `path` read in `session`.
+        fn blob_in(&self, session: SessionId, path: &str) -> BlobId {
+            let query = WorkdirQuery {
+                session,
+                path: path.to_owned(),
+            };
+            match self.reader.snapshot(Tree::later(), |s| s.file(&query)) {
+                Ok(FileResult::File {
+                    content: FileBody::Blob(blob),
+                    ..
+                }) => blob.id,
+                other => panic!("expected a file blob, got {other:?}"),
+            }
+        }
+
+        /// Another session in the same workdir.
+        fn second_session(&mut self) -> SessionId {
+            let log = EventLog::open(&self.storage.db, vec![self.root.clone()]).unwrap();
+            let create = Command {
+                id: CommandId::new(),
+                kind: CommandKind::CreateSession {
+                    workdir: self.workdir.to_str().unwrap().to_owned(),
+                    conversation: None,
+                },
+            };
+            log.handle(&mut self.storage.db, DeviceId::new(), &create)
+                .unwrap();
+            let sessions = log.sessions(&self.storage.db).unwrap();
+            let other = sessions.iter().find(|s| s.id != self.session).unwrap();
+            other.id
         }
 
         pub(super) fn blob_content(&self, blob: &BlobRef) -> Vec<u8> {
@@ -904,6 +1082,132 @@ mod tests {
         assert_ne!(changed.id, first.id);
         assert_eq!(t.blob_rows(), rows + 1);
         assert_eq!(t.blob_content(&changed), b"other bytes");
+    }
+
+    #[test]
+    fn a_replaced_answer_deletes_the_blobs_nothing_else_names() {
+        let mut t = Tree::new();
+        let other = t.second_session();
+        let mine = t.session;
+        // An event blob with content a workdir file will have too.
+        let tool_output = t.storage.put_blob(&b"shared"[..]).unwrap();
+        std::fs::write(t.workdir.join("f"), "shared").unwrap();
+        std::fs::write(t.workdir.join("g"), "alone").unwrap();
+        let shared = t.blob_in(mine, "f");
+        assert_eq!(t.blob_in(other, "f"), shared, "one blob for both sessions");
+        let alone = t.blob_in(mine, "g");
+
+        // Replacing the only answer naming a blob deletes it.
+        std::fs::write(t.workdir.join("g"), "alone, changed").unwrap();
+        let changed = t.blob_in(mine, "g");
+        assert!(!t.stored(alone), "the replaced answer's blob is gone");
+        assert!(t.stored(changed));
+        assert!(matches!(t.file("g"), FileResult::File { .. }));
+        // An answer that names no blob replaces one that did.
+        std::fs::remove_file(t.workdir.join("g")).unwrap();
+        assert_eq!(t.file("g"), FileResult::NotFound);
+        assert!(!t.stored(changed));
+
+        // Another session's answer keeps a shared blob.
+        std::fs::write(t.workdir.join("f"), "mine now").unwrap();
+        t.blob_in(mine, "f");
+        assert!(t.stored(shared), "the other session still names it");
+        t.blob_in(other, "f");
+        assert!(!t.stored(shared), "no answer names it any more");
+
+        // Event blobs are never collected, whatever their content.
+        assert!(t.stored(tool_output.id));
+    }
+
+    #[test]
+    fn the_startup_pass_sweeps_stray_files_and_collects_unnamed_blobs() {
+        let mut t = Tree::new();
+        let event = t.storage.put_blob(&b"tool output"[..]).unwrap();
+        std::fs::write(t.workdir.join("f"), "named").unwrap();
+        let named = t.blob_in(t.session, "f");
+        // Stored by a snapshot that then failed: no answer names it.
+        let stray = t
+            .reader
+            .snapshot(Tree::later(), |s| s.store(b"stray"))
+            .unwrap();
+        let dir = t.storage.dir.blobs_dir();
+        std::fs::write(dir.join(".tmp-interrupted"), "partial").unwrap();
+        let orphan = BlobId::new();
+        std::fs::write(dir.join(orphan.0.to_string()), "renamed, never recorded").unwrap();
+        std::fs::write(dir.join("not-a-blob"), "left alone").unwrap();
+        assert!(t.stored(stray.id), "control: a store alone keeps it");
+
+        t.storage.collect_blobs().unwrap();
+        assert!(!t.stored(stray.id));
+        assert!(!dir.join(".tmp-interrupted").exists());
+        assert!(!dir.join(orphan.0.to_string()).exists());
+        assert!(dir.join("not-a-blob").exists());
+        assert!(t.stored(event.id));
+        assert!(t.stored(named));
+        // The named blob is still the one its content reuses.
+        assert_eq!(t.blob_in(t.session, "f"), named);
+    }
+
+    #[test]
+    fn a_pass_waits_for_the_snapshot_that_reused_a_blob_to_name_it() {
+        let t = Tree::new();
+        std::fs::write(t.workdir.join("f"), "content").unwrap();
+        let first = t.blob_in(t.session, "f");
+        // Refreshing `f` now leaves `first` unnamed, unless the snapshot
+        // below has named it for `copy` first.
+        std::fs::write(t.workdir.join("f"), "changed").unwrap();
+        let (calling, called) = mpsc::channel();
+        let refreshed = AtomicBool::new(false);
+        let (reader, query) = (&t.reader, t.query("f"));
+        std::thread::scope(|scope| {
+            let refresh = reader
+                .snapshot(Tree::later(), |s| {
+                    let reused = s.store(b"content")?;
+                    assert_eq!(reused.id, first);
+                    let refresh = scope.spawn(|| {
+                        calling.send(()).unwrap();
+                        let answer = reader.snapshot(Tree::later(), |s| s.file(&query)).unwrap();
+                        refreshed.store(true, Ordering::SeqCst);
+                        answer
+                    });
+                    called.recv().unwrap();
+                    // The refresh, and its pass, wait for this snapshot.
+                    assert!(!refreshed.load(Ordering::SeqCst));
+                    s.answered(t.session, AnswerKind::File, "copy", &[reused.id])?;
+                    Ok(refresh)
+                })
+                .unwrap();
+            assert!(matches!(refresh.join().unwrap(), FileResult::File { .. }));
+        });
+        assert!(t.stored(first), "named by `copy` before the pass ran");
+    }
+
+    #[test]
+    fn a_pass_outside_the_snapshot_lock_would_lose_a_reused_blob() {
+        // Why `collect_garbage` is for startup only: run beside a snapshot
+        // it deletes a blob a store just reused, and naming it then fails.
+        let t = Tree::new();
+        // Stored by a snapshot that then failed: unnamed, not yet collected.
+        let first = t
+            .reader
+            .snapshot(Tree::later(), |s| s.store(b"content"))
+            .unwrap()
+            .id;
+        t.reader
+            .snapshot(Tree::later(), |s| {
+                let reused = s.store(b"content")?;
+                assert_eq!(reused.id, first);
+                let mut beside = Db::open(&t.storage.dir.db_path()).unwrap();
+                assert_eq!(collect_garbage(&mut beside, &t.storage.blobs).unwrap(), 1);
+                assert!(
+                    s.answered(t.session, AnswerKind::File, "copy", &[reused.id])
+                        .is_err(),
+                    "the answer names a blob that is gone"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(!t.stored(first));
     }
 
     #[test]

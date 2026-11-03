@@ -74,6 +74,19 @@ impl Storage {
     pub fn open_blob(&self, id: BlobId) -> Result<Option<BlobFile>> {
         self.blobs.open(self.db.conn(), id)
     }
+
+    /// `serve`'s startup pass over the blobs, once its address is bound and
+    /// before anything that writes them starts: deletes the workdir blobs no
+    /// answer names ([`workdir::collect_garbage`]), then sweeps the files no
+    /// row records ([`BlobStore::sweep`]). Only one `serve` may run on a data
+    /// dir: there is no lock, and binding first stops only a second daemon
+    /// on the same address.
+    pub fn collect_blobs(&mut self) -> Result<()> {
+        let collected = workdir::collect_garbage(&mut self.db, &self.blobs)?;
+        let swept = self.blobs.sweep(self.db.conn())?;
+        tracing::info!(collected, swept, "collected unused blobs");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

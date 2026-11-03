@@ -81,7 +81,7 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     let config = Config::load(cli.config.as_deref(), &ProcessEnv)?;
     skywaved::logging::init(config.log_file.as_deref())?;
     // Every subcommand works on the data dir, so open (and migrate) it first.
-    let storage = Storage::open(&config.data_dir)?;
+    let mut storage = Storage::open(&config.data_dir)?;
     tracing::debug!(data_dir = %storage.dir.root().display(), "opened data dir");
 
     let hostname = local_hostname();
@@ -106,7 +106,7 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                     context: "starting the async runtime".into(),
                     source,
                 })?;
-            runtime.block_on(serve(&config, &storage, identity))?;
+            runtime.block_on(serve(&config, &mut storage, identity))?;
         }
         Command::Pair { ttl } => {
             let identity = bootstrap()?;
@@ -154,7 +154,7 @@ fn run(cli: Cli) -> skywaved::Result<()> {
 /// Runs the daemon until Ctrl-C or SIGTERM.
 async fn serve(
     config: &Config,
-    storage: &Storage,
+    storage: &mut Storage,
     identity: ServerIdentity,
 ) -> skywaved::Result<()> {
     // The one event log of the process: every writer shares it so appends
@@ -163,18 +163,6 @@ async fn serve(
     let log = EventLog::open(&storage.db, config.roots.clone())?
         .with_shell(config.shell.enabled)
         .with_bypass(config.agent.allow_bypass);
-    let adapter = ClaudeCodeAdapter::new(config.agent.clone());
-    let mut supervisor = Supervisor::start(
-        adapter,
-        config.data_dir.clone(),
-        log.clone(),
-        SupervisorConfig::default(),
-    )
-    .await?;
-    // Always started: disabled, it still settles runs an enabled daemon
-    // left, then ends.
-    let mut shell =
-        ShellRunner::start(config.data_dir.clone(), log.clone(), config.shell.clone()).await?;
     // The agent's own conversations, read from the environment the CLI the
     // adapter spawns inherits.
     let outside: Arc<dyn OutsideConversations> = match transcripts::projects_dir() {
@@ -188,14 +176,32 @@ async fn serve(
         outside,
         ..ServerOptions::default()
     };
+    // Bound first, so a second `serve` on the same address fails here,
+    // before its startup blob pass could delete what a running daemon is
+    // writing. Binding accepts nothing until `serve`, and nothing below
+    // writes blobs before the pass. This narrows the risk but is no data
+    // dir lock: a second daemon listening elsewhere still runs the pass.
     let server = Server::bind_with(
         config.listen,
         &storage.dir,
         Arc::new(identity),
-        log,
+        log.clone(),
         options,
     )
     .await?;
+    // Before the supervisor, shell runner and API can write blobs.
+    storage.collect_blobs()?;
+    let adapter = ClaudeCodeAdapter::new(config.agent.clone());
+    let mut supervisor = Supervisor::start(
+        adapter,
+        config.data_dir.clone(),
+        log.clone(),
+        SupervisorConfig::default(),
+    )
+    .await?;
+    // Always started: disabled, it still settles runs an enabled daemon
+    // left, then ends.
+    let mut shell = ShellRunner::start(config.data_dir.clone(), log, config.shell.clone()).await?;
     tracing::info!(
         addr = %server.local_addr(),
         protocol_version = skywave_proto::PROTOCOL_VERSION,

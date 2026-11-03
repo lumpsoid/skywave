@@ -274,6 +274,21 @@ const MIGRATIONS: &[&str] = &[
         version INTEGER NOT NULL
     ) STRICT;
     "#,
+    // v14: workdir blob GC (D36). Additive: workdir blobs registered before
+    // it are named by no answer, so the first collection removes them.
+    r#"
+    -- The blobs the latest answer to each workdir read names, as the core
+    -- keeps them: `path` as requested, '' for changes. A workdir blob no row
+    -- names is deleted (workdir.rs, "Garbage").
+    CREATE TABLE workdir_answer_blobs (
+        session_id TEXT NOT NULL,
+        kind       TEXT NOT NULL CHECK (kind IN ('changes', 'file')),
+        path       TEXT NOT NULL,
+        blob_id    TEXT NOT NULL REFERENCES blobs (id),
+        PRIMARY KEY (session_id, kind, path, blob_id)
+    ) STRICT;
+    CREATE INDEX workdir_answer_blobs_by_blob ON workdir_answer_blobs (blob_id);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
