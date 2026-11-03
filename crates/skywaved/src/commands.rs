@@ -67,7 +67,8 @@
 //!
 //! **SendMessage.** `ContextChanged` when its `context` is no longer the
 //! session's current one: the message was written for a conversation the
-//! agent has left.
+//! agent has left. Then `MessageTooLong` when its text is over
+//! [`limits::MESSAGE_MAX_BYTES`]: logged verbatim or not at all, never cut.
 //!
 //! **ClearContext.** The new context's id is the client's, so an offline
 //! device can address it before the server answers; one that is already a
@@ -318,6 +319,9 @@ impl EventLog {
                 };
                 if session.context != *context {
                     return Ok(Err(RejectReason::ContextChanged));
+                }
+                if text.len() > limits::MESSAGE_MAX_BYTES {
+                    return Ok(Err(RejectReason::MessageTooLong));
                 }
                 let kind = EventKind::UserMessage {
                     device_id: device,

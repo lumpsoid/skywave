@@ -25,7 +25,7 @@ use skywave_proto::{
     DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, Event, EventBatch, EventKind, FileBody,
     FileChange, FileResult, HelloResponse, LinkTarget, ListResult, ModelChoice, PermissionMode,
     RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ShellEnd, ToolCall,
-    ToolDisplay, ToolKind, ToolResult, TurnUsage,
+    ToolDisplay, ToolKind, ToolResult, TurnUsage, limits,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -3481,6 +3481,44 @@ fn failed_send_keeps_the_text() {
     h.key(KeyCode::Enter);
     assert_eq!(h.app.composer().unwrap().text(), "");
     assert_eq!(h.core_draft(), None);
+}
+
+#[test]
+fn a_message_over_the_cap_is_refused_before_queuing() {
+    let mut h = Harness::paired();
+    let id = SessionId::new();
+    pull(&mut h, vec![created(id, 0, "/srv/work")]);
+    // Pasted in another session of this head: the saved draft fills the
+    // composer, typing that much key by key would take long.
+    let long = "x".repeat(limits::MESSAGE_MAX_BYTES);
+    h.core
+        .dispatch(Action::SaveDraft {
+            session_id: id,
+            mode: ComposerMode::Agent,
+            text: long.clone(),
+            cursor: long.len(),
+            when: RunWhen::Always,
+        })
+        .unwrap();
+    assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
+    h.key(KeyCode::End);
+    h.type_text("y");
+
+    assert_eq!(h.key(KeyCode::Enter), None, "refused here");
+    assert_eq!(
+        h.app.ui().notice.as_deref(),
+        Some("message too long: the limit is 256.0 KiB")
+    );
+    assert_eq!(h.app.composer().unwrap().text().len(), long.len() + 1);
+    assert_eq!(h.drain_requests(), vec![], "nothing queued");
+
+    // Positive control: cut back to the cap, it goes.
+    h.key(KeyCode::Backspace);
+    assert!(matches!(
+        h.key(KeyCode::Enter),
+        Some(Action::SendMessage { text, .. }) if text == long
+    ));
+    assert_eq!(h.drain_requests(), vec![Request::OutboxChanged]);
 }
 
 #[test]

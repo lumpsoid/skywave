@@ -5,6 +5,22 @@
 use std::time::{Duration, Instant};
 
 use skywave_core::{Action, ComposerMode, RunWhen, SessionId, SessionView};
+use skywave_proto::limits;
+
+use crate::format;
+
+/// Why the composer's `text` cannot be sent as a message, in words for a
+/// notice, or `None` when it can. Over [`limits::MESSAGE_MAX_BYTES`] the
+/// server would refuse it as `MessageTooLong`, so a head refuses it before
+/// dispatching and keeps the text in the composer to cut down.
+pub fn message_refusal(text: &str) -> Option<String> {
+    (text.len() > limits::MESSAGE_MAX_BYTES).then(|| {
+        format!(
+            "message too long: the limit is {}",
+            format::bytes(limits::MESSAGE_MAX_BYTES as u64),
+        )
+    })
+}
 
 /// How old the first unsaved composer edit gets before the draft is saved
 /// anyway: at most this much typing is lost to a crash. Saves are durable
@@ -275,5 +291,19 @@ mod tests {
         assert!(saver.refill(&view));
         assert!(!saver.unsaved());
         assert!(!saver.refill(&view), "once per rewrite");
+    }
+
+    #[test]
+    fn a_message_over_the_cap_is_refused_in_bytes() {
+        let longest = "x".repeat(limits::MESSAGE_MAX_BYTES);
+        assert_eq!(message_refusal(&longest), None);
+        assert_eq!(message_refusal(""), None);
+        assert_eq!(
+            message_refusal(&format!("{longest}x")).as_deref(),
+            Some("message too long: the limit is 256.0 KiB")
+        );
+        // Bytes, not chars: two-byte chars past half the cap are over it.
+        let wide = "é".repeat(limits::MESSAGE_MAX_BYTES / 2 + 1);
+        assert!(message_refusal(&wide).is_some());
     }
 }

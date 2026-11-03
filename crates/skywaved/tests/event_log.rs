@@ -17,7 +17,8 @@ use skywaved::agent::{
     store_resume_handle,
 };
 use skywaved::event_log::{
-    DEFAULT_BATCH_LIMIT, PendingApproval, ShellAppended, ShellRun, ShellStatus,
+    BATCH_MAX_BYTES, DEFAULT_BATCH_LIMIT, MAX_BATCH_LIMIT, PendingApproval, ShellAppended,
+    ShellRun, ShellStatus,
 };
 use skywaved::{Error, EventLog, Storage};
 use tempfile::TempDir;
@@ -244,6 +245,74 @@ fn events_round_trip_unchanged() {
     let again = f.log.read(&f.connection().db, Seq::ZERO, 10).unwrap();
     assert_eq!(first, again);
     assert!(first.events.iter().all(|e| e.session_id == session));
+}
+
+/// Reads every event after `after` batch by batch, checking each batch
+/// starts where the last ended, and returns the batch sizes and the events.
+fn read_all(f: &Fixture, after: Seq) -> (Vec<usize>, Vec<Event>) {
+    let (mut sizes, mut events, mut cursor) = (Vec::new(), Vec::new(), after);
+    loop {
+        let batch = f.log.read(&f.storage.db, cursor, MAX_BATCH_LIMIT).unwrap();
+        assert_eq!(batch.from, cursor.next(), "contiguous with the last batch");
+        let Some(last) = batch.last() else {
+            return (sizes, events);
+        };
+        cursor = last;
+        sizes.push(batch.events.len());
+        events.extend(batch.events);
+    }
+}
+
+fn agent_text(event: &Event) -> &str {
+    match &event.kind {
+        EventKind::AgentMessage { text, .. } => text,
+        other => panic!("expected an agent message, got {other:?}"),
+    }
+}
+
+#[test]
+fn reads_stop_at_the_byte_budget() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let start = f.log.head();
+    const SIZE: usize = 512 * 1024;
+    let count = 2 * BATCH_MAX_BYTES / SIZE + 2;
+    for i in 0..count {
+        let text = format!("{i:04}{}", "x".repeat(SIZE - 4));
+        f.agent(session, EventKind::AgentMessage { parent: None, text });
+    }
+    let (sizes, events) = read_all(&f, start);
+    // Far under the count limit, the budget alone cuts the batches: each
+    // holds as many as fit, the next one more would not.
+    let fit = BATCH_MAX_BYTES / (SIZE + 200);
+    assert!(sizes.len() > 1, "{sizes:?}");
+    assert!(
+        sizes[..sizes.len() - 1].iter().all(|&n| n == fit),
+        "{sizes:?}"
+    );
+    assert_eq!(sizes.iter().sum::<usize>(), count);
+    // Every event once, in order.
+    for (i, event) in events.iter().enumerate() {
+        assert!(agent_text(event).starts_with(&format!("{i:04}")));
+    }
+}
+
+#[test]
+fn an_event_over_the_byte_budget_goes_alone() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let start = f.log.head();
+    let huge = "x".repeat(BATCH_MAX_BYTES + 1);
+    for text in ["before", huge.as_str(), "after", "last"] {
+        let text = text.to_owned();
+        f.agent(session, EventKind::AgentMessage { parent: None, text });
+    }
+    let (sizes, events) = read_all(&f, start);
+    // The small one first, as it would not fit beside the huge one; the
+    // huge one alone, never refused; the rest together.
+    assert_eq!(sizes, [1, 1, 2]);
+    let texts: Vec<&str> = events.iter().map(agent_text).collect();
+    assert_eq!(texts, ["before", huge.as_str(), "after", "last"]);
 }
 
 #[test]
@@ -2639,6 +2708,48 @@ fn a_message_for_a_context_left_behind_is_refused() {
     let message = f.last_event();
     assert!(matches!(message.kind, EventKind::UserMessage { .. }));
     assert_eq!(message.context, second);
+}
+
+#[test]
+fn a_message_over_the_cap_is_refused_and_logs_nothing() {
+    let mut f = Fixture::new();
+    let session = f.create_session();
+    let context = ContextId::first_of(session);
+    let send = |text: &str| CommandKind::SendMessage {
+        session_id: session,
+        context,
+        text: text.into(),
+    };
+    let head = f.log.head();
+    let too_long = "x".repeat(limits::MESSAGE_MAX_BYTES + 1);
+    assert_eq!(
+        f.handle(send(&too_long)),
+        rejected(RejectReason::MessageTooLong)
+    );
+    // Bytes, not chars: two-byte chars past half the cap are over it.
+    let wide = "é".repeat(limits::MESSAGE_MAX_BYTES / 2 + 1);
+    assert_eq!(
+        f.handle(send(&wide)),
+        rejected(RejectReason::MessageTooLong)
+    );
+    // The context is checked first: a stale long message is reported stale.
+    assert_eq!(
+        f.handle(CommandKind::SendMessage {
+            session_id: session,
+            context: ContextId::new(),
+            text: too_long.clone(),
+        }),
+        rejected(RejectReason::ContextChanged)
+    );
+    assert_eq!(f.log.head(), head, "a rejected message logs nothing");
+
+    // Positive control: the longest message goes in whole.
+    let longest = "x".repeat(limits::MESSAGE_MAX_BYTES);
+    accepted(f.handle(send(&longest)));
+    assert!(matches!(
+        f.last_event().kind,
+        EventKind::UserMessage { text, .. } if text == longest
+    ));
 }
 
 #[test]

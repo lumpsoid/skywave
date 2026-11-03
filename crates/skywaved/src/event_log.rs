@@ -50,6 +50,12 @@ use crate::error::{Error, Result};
 pub const DEFAULT_BATCH_LIMIT: u32 = 500;
 /// Largest batch [`EventLog::read`] returns, whatever the caller asks for.
 pub const MAX_BATCH_LIMIT: u32 = 5000;
+/// Most bytes of stored events in one batch [`EventLog::read`] returns, so a
+/// response stays bounded in memory on the server and the device whatever
+/// the events hold. The stored size (the kind's JSON and the row's ids and
+/// time) is within a few hundred bytes per event of the wire size. An event
+/// larger than this still goes, alone, so a reader always gets past it.
+pub const BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Highest seq the log can hold: seqs are SQLite integers. A cursor past it
 /// names no position in any log, so `GET /v1/events` refuses it.
 pub const MAX_SEQ: Seq = Seq(i64::MAX as u64);
@@ -241,8 +247,9 @@ impl EventLog {
     }
 
     /// Events with seq greater than `after`, at most `limit` of them (capped
-    /// at [`MAX_BATCH_LIMIT`], at least 1). An empty batch has
-    /// `from = after + 1`.
+    /// at [`MAX_BATCH_LIMIT`], at least 1), and only as many as fit in
+    /// [`BATCH_MAX_BYTES`], but always the first. A batch is a contiguous
+    /// run from `after + 1`; an empty one has `from = after + 1`.
     pub fn read(&self, db: &Db, after: Seq, limit: u32) -> Result<EventBatch> {
         let limit = limit.clamp(1, MAX_BATCH_LIMIT);
         let mut stmt = db.conn().prepare_cached(
@@ -261,8 +268,18 @@ impl EventLog {
         })?;
         let from = after.next();
         let mut events = Vec::new();
+        let mut bytes = 0;
         for row in rows {
             let (seq, session_id, at, command_id, context, kind) = row?;
+            let size = session_id.len()
+                + at.len()
+                + command_id.as_ref().map_or(0, String::len)
+                + context.len()
+                + kind.len();
+            bytes += size;
+            if !events.is_empty() && bytes > BATCH_MAX_BYTES {
+                break;
+            }
             let expected = from.0 + events.len() as u64;
             if seq_from_sql(seq)? != Seq(expected) {
                 return Err(Error::Corrupt(format!(

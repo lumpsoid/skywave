@@ -854,6 +854,26 @@ fn the_composer_clears_only_once_the_send_is_taken() {
 }
 
 #[test]
+fn a_message_over_the_cap_is_refused_here_and_kept() {
+    let mut rig = Rig::new();
+    let longest = "x".repeat(skywave_proto::limits::MESSAGE_MAX_BYTES);
+    rig.edit(&format!("{longest}y"));
+    let outs = rig.submit();
+    assert!(rig.actions.is_empty(), "{:?}", rig.kinds());
+    assert!(outs.iter().any(|o| matches!(
+        o,
+        Out::Effect(PlatformEffect::Notice { text })
+            if text == "message too long: the limit is 256.0 KiB"
+    )));
+    assert_eq!(rig.text().len(), longest.len() + 1, "the text stays");
+
+    // Positive control: at the cap it goes.
+    rig.edit(&longest);
+    rig.submit();
+    assert_eq!(rig.kinds(), ["send"]);
+}
+
+#[test]
 fn a_refused_send_keeps_the_text_and_is_not_resent() {
     let mut rig = Rig::new();
     rig.edit("hello");
