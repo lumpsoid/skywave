@@ -92,6 +92,9 @@ fn run(cli: Cli) -> skywaved::Result<()> {
 
     match cli.command {
         Command::Serve => {
+            // Held until the process exits; first, so a second `serve` on
+            // this dir fails before it touches the identity or the blobs.
+            let _serve_lock = storage.dir.lock_for_serve()?;
             let identity = bootstrap()?;
             tracing::info!(
                 server_id = %identity.server_id().0,
@@ -178,11 +181,9 @@ async fn serve(
     };
     #[cfg(unix)]
     skywaved::server::raise_open_files_limit();
-    // Bound first, so a second `serve` on the same address fails here,
-    // before its startup blob pass could delete what a running daemon is
-    // writing. Binding accepts nothing until `serve`, and nothing below
-    // writes blobs before the pass. This narrows the risk but is no data
-    // dir lock: a second daemon listening elsewhere still runs the pass.
+    // Binding accepts nothing until `serve`, and nothing below writes blobs
+    // before the startup blob pass. The serve lock `run` holds keeps a
+    // second daemon on this data dir from running the pass at all.
     let server = Server::bind_with(
         config.listen,
         &storage.dir,
