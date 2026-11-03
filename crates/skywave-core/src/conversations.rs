@@ -13,12 +13,9 @@ use skywave_proto::{ConversationsResult, OutsideConversation};
 use crate::projection::SessionSummary;
 use crate::seam::Request;
 use crate::transport::TransportError;
-use crate::view::{ConversationItem, ConversationPicker, ConversationsStatus};
-
-/// Why the picker shows nothing while the link is down.
-const NOT_CONNECTED: &str = "not connected";
-/// Why the picker shows nothing for an agent that cannot list.
-const AGENT_CANNOT_LIST: &str = "the server's agent cannot list its conversations";
+use crate::view::{
+    ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable,
+};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Conversations {
@@ -44,7 +41,7 @@ impl Conversations {
         if !online {
             self.open = Some(Listing {
                 req: None,
-                status: ConversationsStatus::Unavailable(NOT_CONNECTED.into()),
+                status: ConversationsStatus::Unavailable(ConversationsUnavailable::Offline),
                 items: Vec::new(),
             });
             return None;
@@ -68,21 +65,21 @@ impl Conversations {
         let Some(listing) = self.open.as_mut().filter(|l| l.req == Some(req)) else {
             return;
         };
+        let unavailable = |why| (ConversationsStatus::Unavailable(why), Vec::new());
         (listing.status, listing.items) = match result {
             Ok(ConversationsResult::Listed {
                 conversations,
                 truncated,
             }) => (ConversationsStatus::Ready { truncated }, conversations),
-            Ok(ConversationsResult::Unavailable) => (
-                ConversationsStatus::Unavailable(AGENT_CANNOT_LIST.into()),
-                Vec::new(),
-            ),
+            Ok(ConversationsResult::Unavailable) => {
+                unavailable(ConversationsUnavailable::AgentCannotList)
+            }
+            // The engine's answer while the link is down, or a server that
+            // could not be reached.
+            Err(TransportError::Unreachable(_)) => unavailable(ConversationsUnavailable::Offline),
             Err(error) => {
                 tracing::debug!(%error, "listing conversations failed");
-                (
-                    ConversationsStatus::Unavailable(error.to_string()),
-                    Vec::new(),
-                )
+                unavailable(ConversationsUnavailable::Failed(error.to_string()))
             }
         };
     }

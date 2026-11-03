@@ -7678,7 +7678,7 @@ mod tests {
         assert_eq!(f.list_view().completion, None);
     }
 
-    use crate::view::ConversationsStatus;
+    use crate::view::{ConversationsStatus, ConversationsUnavailable};
     use skywave_proto::OutsideConversation;
 
     /// Opens the conversation picker; the request it sends, if any.
@@ -7793,31 +7793,33 @@ mod tests {
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
         });
+        let offline = ConversationsStatus::Unavailable(ConversationsUnavailable::Offline);
         assert_eq!(list_conversations(&mut f), None, "nothing is asked offline");
-        assert_eq!(
-            picker(&f).status,
-            ConversationsStatus::Unavailable("not connected".into())
-        );
+        assert_eq!(picker(&f).status, offline);
         // Nothing was queued for later: coming back online asks nothing.
         f.model.set_link(Link::Online { latency_ms: 5 });
-        assert_eq!(
-            picker(&f).status,
-            ConversationsStatus::Unavailable("not connected".into())
-        );
+        assert_eq!(picker(&f).status, offline);
         // Asking again online does.
         let req = list_conversations(&mut f).expect("asked online");
         f.model
             .conversations_listed(req, Ok(ConversationsResult::Unavailable));
-        assert!(matches!(
+        assert_eq!(
             picker(&f).status,
-            ConversationsStatus::Unavailable(reason) if reason.contains("cannot list")
-        ));
+            ConversationsStatus::Unavailable(ConversationsUnavailable::AgentCannotList)
+        );
+        // The engine answers so while the link is down.
+        let req = list_conversations(&mut f).unwrap();
+        f.model
+            .conversations_listed(req, Err(crate::workdir::not_connected()));
+        assert_eq!(picker(&f).status, offline);
         let req = list_conversations(&mut f).unwrap();
         f.model
             .conversations_listed(req, Err(TransportError::BadStatus(503)));
         assert_eq!(
             picker(&f).status,
-            ConversationsStatus::Unavailable(TransportError::BadStatus(503).to_string())
+            ConversationsStatus::Unavailable(ConversationsUnavailable::Failed(
+                TransportError::BadStatus(503).to_string()
+            ))
         );
     }
 

@@ -326,14 +326,15 @@ then pushed as a new `ViewState`.
   list asks `GET /v1/conversations` on the side transport within
   `CONVERSATIONS_TIMEOUT` (12 s, above the server's 10 s) and shows
   `SessionListView::conversations` as `Loading`, then `Ready { truncated }`
-  or `Unavailable(reason)`. Each item carries `continued_in`, the replica's
-  sessions whose `SessionCreated` adopted it (`sessions.adopted`, the
+  or `Unavailable(why)`: `Offline`, `AgentCannotList` or `Failed(reason)`,
+  typed so heads word it without matching text. Each item carries
+  `continued_in`, the replica's sessions whose `SessionCreated` adopted it (`sessions.adopted`, the
   conversation an `Agent` origin names; adopting twice is allowed), and the
   server's `session` only while that session is in the replica (not
   deleted here, already pulled). Only the latest request's answer is kept;
-  offline it is `Unavailable("not connected")` at once and nothing is
-  asked later. Continuing is `CreateSession { workdir, conversation }`,
-  which ends the picker, as do `EndConversations` and leaving the list.
+  offline (or with the server unreachable) it is `Unavailable(Offline)`,
+  at once when the link is down, and nothing is asked later. Continuing is
+  `CreateSession { workdir, conversation }`, which ends the picker, as do `EndConversations` and leaving the list.
   Nothing is stored: the listing goes stale at once.
 - **Workdir snapshots** (`Screen::Workdir`): `OpenWorkdir` shows a session's
   changes; `ShowWorkdir` switches between the changes, one file's diff (a

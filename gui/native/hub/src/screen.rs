@@ -15,10 +15,11 @@ use skywave_present::format::{
     StopAction, TRAIL_SEPARATOR, adopting_note, agent_effort_label, agent_mode_label,
     agent_model_label, answer_words, approval_origin, background_rows, blob_size, bytes,
     context_moved_label, context_row, conversation_detail, conversation_link, conversation_title,
-    conversations_unavailable, delivery_label, dollars, effort_label, effort_refusal, fail_reason,
-    mode_detail, mode_label, mode_needs_confirmation, mode_refusal, model_refusal, move_refusal,
-    outgoing_label, repeat_word, scope_label, stop_heading, stop_warning, subagent_status,
-    task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
+    conversations_empty, conversations_status, delivery_label, dollars, effort_label,
+    effort_refusal, fail_reason, mode_detail, mode_label, mode_needs_confirmation, mode_refusal,
+    model_refusal, move_refusal, outgoing_label, repeat_word, scope_label, stop_heading,
+    stop_warning, subagent_status, task_kind_word, tokens, trail, turn_time, viewing_hint,
+    work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
@@ -175,20 +176,6 @@ fn conversations_view(
             .find(|row| row.id == id)
             .map(|row| row.title.clone())
     };
-    let empty = picker.items.is_empty();
-    let (status_label, empty_label) = match &picker.status {
-        ConversationsStatus::Loading => (
-            Some("listing…".to_owned()),
-            empty.then(|| "Asking the server for its agent's conversations…".to_owned()),
-        ),
-        ConversationsStatus::Ready { truncated } => (
-            truncated.then(|| "only the newest are listed".to_owned()),
-            empty.then(|| "The server's agent has no conversations under the roots.".to_owned()),
-        ),
-        ConversationsStatus::Unavailable(reason) => {
-            (None, Some(clean_line(&conversations_unavailable(reason))))
-        }
-    };
     ConversationsView {
         rows: picker
             .items
@@ -201,9 +188,9 @@ fn conversations_view(
                 session_id: item.session.map(|id| id.0.to_string()),
             })
             .collect(),
-        status_label,
+        status_label: conversations_status(&picker.status).map(str::to_owned),
         unavailable: matches!(picker.status, ConversationsStatus::Unavailable(_)),
-        empty_label,
+        empty_label: conversations_empty(picker).map(|text| clean_line(&text)),
     }
 }
 

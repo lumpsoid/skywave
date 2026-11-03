@@ -438,9 +438,21 @@ pub enum ConversationsStatus {
     Loading,
     /// The server answered; `truncated` when it listed only the newest.
     Ready { truncated: bool },
-    /// No listing, and why: offline (nothing is asked for later), an agent
-    /// that cannot list its conversations, a refused or timed-out request.
-    Unavailable(String),
+    /// No listing, and why.
+    Unavailable(ConversationsUnavailable),
+}
+
+/// Why the conversation picker has no listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationsUnavailable {
+    /// The link was down when it opened, or the server could not be
+    /// reached; nothing is asked for later.
+    Offline,
+    /// The server's agent cannot list its conversations.
+    AgentCannotList,
+    /// The request failed otherwise (refused, timed out, broken), as the
+    /// transport words it.
+    Failed(String),
 }
 
 /// One conversation the server's agent had, in or outside Skywave. Texts
