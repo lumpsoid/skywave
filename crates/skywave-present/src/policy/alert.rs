@@ -4,7 +4,7 @@
 //! the session, never what the agent wants to run. A shell alert names the
 //! command the user ran themselves.
 
-use skywave_core::{Attention, RunWhen};
+use skywave_core::{Attention, RunWhen, SessionId};
 
 use crate::format::shell_end_label;
 use crate::text::bidi_escape;
@@ -42,6 +42,21 @@ pub struct Alert {
     /// The newest pending approval's session title, [`sanitise`]d; `None`
     /// when none is pending any more.
     pub title: Option<String>,
+    /// The newest pending approval's session; `None` when none is pending
+    /// any more.
+    pub session_id: Option<SessionId>,
+}
+
+/// What a new snapshot changed about approvals waiting on the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlertUpdate {
+    /// New approvals came in: alert once.
+    pub alert: Option<Alert>,
+    /// Sessions that had approvals pending in the last snapshot and have
+    /// none now (answered or cancelled from any device, or the session is
+    /// gone), in the order they were waiting: a head that keeps an alert
+    /// per session takes it down. A head that only rings a bell ignores it.
+    pub cleared: Vec<SessionId>,
 }
 
 impl Alert {
@@ -54,29 +69,59 @@ impl Alert {
     }
 }
 
-/// Watches [`Attention::alerts`] for growth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Watches [`Attention::alerts`] for growth, and which sessions have
+/// approvals pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertWatcher {
     /// The count last seen.
     seen: u64,
+    /// The sessions with approvals pending in the last snapshot, each once,
+    /// in the order of their oldest one.
+    waiting: Vec<SessionId>,
 }
 
 impl AlertWatcher {
     /// Starts from the head's `first` snapshot: what it already counts
-    /// needs no alert.
+    /// needs no alert. Its waiting sessions are tracked, so one answered
+    /// later is [cleared](AlertUpdate::cleared) even though this head never
+    /// alerted on it (an earlier process may have).
     pub fn new(first: &Attention) -> AlertWatcher {
-        AlertWatcher { seen: first.alerts }
+        AlertWatcher {
+            seen: first.alerts,
+            waiting: waiting(first),
+        }
     }
 
-    /// The alert a new snapshot's `attention` asks for: one whenever the
-    /// count grew past what was seen.
-    pub fn observe(&mut self, attention: &Attention) -> Option<Alert> {
+    /// What a new snapshot's `attention` asks for: an alert whenever the
+    /// count grew past what was seen, and the sessions no longer waiting.
+    pub fn observe(&mut self, attention: &Attention) -> AlertUpdate {
         let grew = attention.alerts > self.seen;
         self.seen = self.seen.max(attention.alerts);
-        grew.then(|| Alert {
-            title: attention.approvals.last().map(|a| sanitise(&a.title)),
-        })
+        let now = waiting(attention);
+        let cleared = std::mem::replace(&mut self.waiting, now)
+            .into_iter()
+            .filter(|id| !self.waiting.contains(id))
+            .collect();
+        let newest = attention.approvals.last();
+        AlertUpdate {
+            alert: grew.then(|| Alert {
+                title: newest.map(|a| sanitise(&a.title)),
+                session_id: newest.map(|a| a.session_id),
+            }),
+            cleared,
+        }
     }
+}
+
+/// The sessions `attention` has approvals pending in, each once.
+fn waiting(attention: &Attention) -> Vec<SessionId> {
+    let mut out: Vec<SessionId> = Vec::new();
+    for approval in &attention.approvals {
+        if !out.contains(&approval.session_id) {
+            out.push(approval.session_id);
+        }
+    }
+    out
 }
 
 /// A long shell run of this device's finished.
@@ -178,7 +223,7 @@ mod tests {
         assert_eq!(watcher.observe(&first), None, "once");
         // The approval watcher does start from its first snapshot; the
         // shell one must not.
-        assert_eq!(AlertWatcher::new(&first).observe(&first), None);
+        assert_eq!(AlertWatcher::new(&first).observe(&first).alert, None);
     }
 
     #[test]
@@ -212,31 +257,98 @@ mod tests {
     fn the_first_snapshot_never_alerts() {
         let first = attention(2, &["old"]);
         let mut watcher = AlertWatcher::new(&first);
-        assert_eq!(watcher.observe(&first), None);
+        assert_eq!(watcher.observe(&first), AlertUpdate::default());
     }
 
     #[test]
     fn alerts_once_per_growth_naming_the_newest() {
         let mut watcher = AlertWatcher::new(&attention(0, &[]));
-        let alert = watcher.observe(&attention(1, &["a", "/srv/we\u{1b}]0;ird\u{9b};x"]));
+        let snapshot = attention(1, &["a", "/srv/we\u{1b}]0;ird\u{9b};x"]);
+        let alert = watcher.observe(&snapshot).alert;
         assert_eq!(
             alert,
             Some(Alert {
-                title: Some("/srv/we]0irdx".into())
+                title: Some("/srv/we]0irdx".into()),
+                session_id: Some(snapshot.approvals[1].session_id),
             })
         );
         assert_eq!(
             alert.map(|a| a.notice()),
             Some("approval needed · /srv/we]0irdx".into())
         );
-        assert_eq!(watcher.observe(&attention(1, &["a"])), None, "once");
+        assert_eq!(watcher.observe(&snapshot).alert, None, "once");
         // Resolved during a catch-up: the count did not grow.
-        assert_eq!(watcher.observe(&attention(1, &[])), None);
+        assert_eq!(watcher.observe(&attention(1, &[])).alert, None);
 
-        let alert = watcher.observe(&attention(2, &[]));
+        let alert = watcher.observe(&attention(2, &[])).alert;
         assert_eq!(
             alert.as_ref().map(Alert::notice),
             Some("approval needed".into())
+        );
+        assert_eq!(alert.and_then(|a| a.session_id), None);
+    }
+
+    fn pending(session_id: SessionId, alerted_at: u64) -> PendingApprovalRef {
+        PendingApprovalRef {
+            id: ApprovalId::new(),
+            session_id,
+            title: "t".into(),
+            alerted_at,
+        }
+    }
+
+    fn waiting_on(alerts: u64, approvals: Vec<PendingApprovalRef>) -> Attention {
+        Attention {
+            approvals,
+            alerts,
+            ..Attention::default()
+        }
+    }
+
+    #[test]
+    fn a_session_is_cleared_once_when_its_last_approval_goes() {
+        let (a, b) = (SessionId::new(), SessionId::new());
+        let a1 = pending(a, 1);
+        let a2 = pending(a, 1);
+        let b1 = pending(b, 2);
+        let mut watcher = AlertWatcher::new(&Attention::default());
+        let update = watcher.observe(&waiting_on(1, vec![a1.clone(), a2.clone()]));
+        assert_eq!(update.alert.and_then(|a| a.session_id), Some(a));
+        assert_eq!(update.cleared, []);
+        let update = watcher.observe(&waiting_on(2, vec![a1.clone(), a2.clone(), b1.clone()]));
+        assert_eq!(update.alert.and_then(|a| a.session_id), Some(b));
+        assert_eq!(update.cleared, [], "nothing answered yet");
+
+        // One of `a`'s two answered: it still waits.
+        let update = watcher.observe(&waiting_on(2, vec![a2.clone(), b1.clone()]));
+        assert_eq!(update, AlertUpdate::default());
+        // Its last answered: `a` alone is cleared, `b` still waits.
+        let update = watcher.observe(&waiting_on(2, vec![b1.clone()]));
+        assert_eq!(update.alert, None);
+        assert_eq!(update.cleared, [a]);
+        assert_eq!(
+            watcher.observe(&waiting_on(2, vec![b1])).cleared,
+            [],
+            "once"
+        );
+        assert_eq!(watcher.observe(&waiting_on(2, vec![])).cleared, [b]);
+        assert_eq!(watcher.observe(&waiting_on(2, vec![])).cleared, []);
+    }
+
+    #[test]
+    fn the_first_snapshot_clears_nothing_but_its_sessions_clear_later() {
+        let (a, b) = (SessionId::new(), SessionId::new());
+        let first = waiting_on(0, vec![pending(a, 0), pending(b, 0)]);
+        let mut watcher = AlertWatcher::new(&first);
+        assert_eq!(watcher.observe(&first), AlertUpdate::default());
+        // Both went in one snapshot (say, during a catch-up): both cleared,
+        // in the order they waited, with no alert.
+        assert_eq!(
+            watcher.observe(&Attention::default()),
+            AlertUpdate {
+                alert: None,
+                cleared: vec![a, b],
+            }
         );
     }
 
@@ -251,7 +363,9 @@ mod tests {
             sanitise("fix \u{202E}gnp.exe;\u{2066}x\u{2069}"),
             "fix <U+202E>gnp.exe<U+2066>x<U+2069>"
         );
-        let alert = AlertWatcher::new(&attention(0, &[])).observe(&attention(1, &["a\u{202E}b"]));
+        let alert = AlertWatcher::new(&attention(0, &[]))
+            .observe(&attention(1, &["a\u{202E}b"]))
+            .alert;
         assert_eq!(
             alert.map(|a| a.notice()).as_deref(),
             Some("approval needed · a<U+202E>b")

@@ -1442,8 +1442,9 @@ impl App {
         }
         self.observe_shell_alerts(&view);
         // After the shell's: an approval waits on the user, so it wins the
-        // one notification.
-        if let Some(alert) = self.ui.alerts.observe(&view.attention) {
+        // one notification. A bell cannot be taken back, so a session no
+        // longer waiting (`cleared`) needs nothing here.
+        if let Some(alert) = self.ui.alerts.observe(&view.attention).alert {
             self.ui.notice = Some(alert.notice());
             self.ui.alert = Some(notify::message(alert.title.as_deref()));
         }

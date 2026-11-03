@@ -9,7 +9,13 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Carries out platform effects; one method per [PlatformEffect] variant.
 abstract interface class EffectSink {
-  void notify({required String title, required String body, String? sessionId});
+  void notify({
+    required int id,
+    required String title,
+    required String body,
+    String? sessionId,
+  });
+  void dismiss(int id);
   void copy(String text);
   void openFile(String path);
   void notice(String text);
@@ -34,10 +40,13 @@ class EffectsListener {
   void apply(PlatformEffect effect) {
     if (effect is PlatformEffectNotify) {
       sink.notify(
+        id: effect.id,
         title: effect.title,
         body: effect.body,
         sessionId: effect.sessionId,
       );
+    } else if (effect is PlatformEffectDismiss) {
+      sink.dismiss(effect.id);
     } else if (effect is PlatformEffectCopyToClipboard) {
       sink.copy(effect.text);
     } else if (effect is PlatformEffectOpenFile) {
@@ -62,12 +71,16 @@ class AppEffectSink implements EffectSink {
 
   @override
   void notify({
+    required int id,
     required String title,
     required String body,
     String? sessionId,
   }) => unawaited(
-    notifications.show(title: title, body: body, sessionId: sessionId),
+    notifications.show(id: id, title: title, body: body, sessionId: sessionId),
   );
+
+  @override
+  void dismiss(int id) => unawaited(notifications.dismiss(id));
 
   @override
   void copy(String text) =>

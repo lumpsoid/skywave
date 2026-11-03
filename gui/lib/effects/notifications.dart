@@ -6,17 +6,16 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// System notifications, through flutter_local_notifications on every
-/// platform. Rust has decided that an alert is due; this only shows it, and
-/// a tap on one opens the session it names.
+/// platform. Rust has decided that an alert is due, or no longer is, and
+/// under which id (one per session); this only shows or cancels it, and a
+/// tap on one opens the session it names.
 class SystemNotifications {
-  SystemNotifications(this.send);
+  SystemNotifications(this.send, {FlutterLocalNotificationsPlugin? plugin})
+    : _plugin = plugin ?? FlutterLocalNotificationsPlugin();
 
   final SendIntent send;
-  final _plugin = FlutterLocalNotificationsPlugin();
+  final FlutterLocalNotificationsPlugin _plugin;
   bool _ready = false;
-
-  /// One notification at a time: a newer approval replaces the last.
-  static const _id = 0;
 
   static const _settings = InitializationSettings(
     // Android asks for POST_NOTIFICATIONS itself, in MainActivity.
@@ -61,20 +60,28 @@ class SystemNotifications {
     await _openLaunching();
   }
 
-  /// Shows [body] under [title]; a tap opens [sessionId].
+  /// Shows [body] under [title] as notification [id], replacing the one
+  /// up under it; a tap opens [sessionId].
   Future<void> show({
+    required int id,
     required String title,
     required String body,
     String? sessionId,
   }) async {
     if (!_ready) return;
     await _plugin.show(
-      id: _id,
+      id: id,
       title: title,
       body: body,
       notificationDetails: _details,
       payload: sessionId,
     );
+  }
+
+  /// Takes notification [id] down, if it is up.
+  Future<void> dismiss(int id) async {
+    if (!_ready) return;
+    await _plugin.cancel(id: id);
   }
 
   /// A tap on a notification launched the app (mobile, macOS, Windows):

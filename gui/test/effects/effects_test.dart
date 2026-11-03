@@ -12,18 +12,21 @@ void main() {
     EffectsListener(sink)
       ..apply(
         const PlatformEffectNotify(
+          id: 6,
           title: 'work',
           body: 'approval needed · work',
           sessionId: 's1',
         ),
       )
+      ..apply(const PlatformEffectDismiss(id: 6))
       ..apply(const PlatformEffectCopyToClipboard(text: 'cargo test'))
       ..apply(const PlatformEffectOpenFile(path: '/tmp/blob'))
       ..apply(const PlatformEffectNotice(text: 'copied 10 B'))
       ..apply(const PlatformEffectError(text: 'disk full'));
 
     expect(sink.done, [
-      'notify: approval needed · work (s1)',
+      'notify 6: approval needed · work (s1)',
+      'dismiss 6',
       'copy: cargo test',
       'open: /tmp/blob',
       'notice: copied 10 B',
