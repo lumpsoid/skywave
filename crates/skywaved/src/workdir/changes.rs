@@ -1,7 +1,8 @@
 //! `GET /v1/workdir/changes` (the parent module's docs, "Changes"): what
 //! changed in a session's workdir against `HEAD`, with a diff per file.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -22,6 +23,11 @@ use crate::error::Result;
 const SECTION: &[u8] = b"diff --git ";
 /// A longer section header is not paired with any entry.
 const HEADER_LINE_MAX: usize = 64 * 1024;
+/// A longer path in git's `-z` output is left out (and not counted), like
+/// one that is not UTF-8.
+const PATH_MAX: usize = 32 * 1024;
+/// Bytes of one `-z` record held: a numstat record is two counts and a path.
+const RECORD_MAX: usize = PATH_MAX + 64;
 /// Flags of both diffs: limited to the workdir's subtree and named relative
 /// to it, renames found, nothing configurable runs, the repo's order file
 /// and prefix settings ignored (headers must be predictable).
@@ -48,9 +54,12 @@ struct Entry {
 }
 
 enum Source {
-    /// From `git diff`; `binary` by its numstat.
+    /// From `git diff`; `binary` by its numstat. `sections`: how many its
+    /// raw record gives in the full patch (two for a type change), `0` for a
+    /// conflict no raw record lists.
     Tracked {
         binary: bool,
+        sections: u32,
     },
     Untracked(Untracked),
 }
@@ -130,7 +139,8 @@ trait Sections {
 
 /// Routes sections to the entries whose expected header they carry.
 struct Pairing<'c> {
-    slots: &'c HashMap<Vec<u8>, usize>,
+    /// An entry's index, and how many sections it may take, by header.
+    slots: &'c HashMap<Vec<u8>, (usize, u32)>,
     collected: &'c mut [Collected],
     kept: &'c mut Kept,
     current: Option<usize>,
@@ -142,13 +152,14 @@ impl Sections for Pairing<'_> {
     fn header(&mut self, line: &[u8]) {
         self.seq += 1;
         self.current = None;
-        let Some(&i) = self.slots.get(line) else {
+        let Some(&(i, allowed)) = self.slots.get(line) else {
             return;
         };
         let c = &mut self.collected[i];
         // A type change is two consecutive sections with one header; the
-        // same header again later cannot be trusted.
-        if c.sections > 0 && c.last + 1 != self.seq {
+        // same header again later, or once more than the entry gives (an
+        // entry past the cap that shares it), cannot be trusted.
+        if c.sections == allowed || (c.sections > 0 && c.last + 1 != self.seq) {
             c.broken = true;
             self.kept.release(c);
             return;
@@ -269,100 +280,124 @@ impl<'a> Snapshot<'a> {
             }
         };
 
+        // Both listings stream: only the entries that sort first are held.
+        let unmerged = repo.output(&["ls-files", "--unmerged", "-z"])?.ok()?;
+        let unmerged = unmerged_paths(&unmerged);
+        let mut firsts = Firsts::default();
         let mut args = vec!["diff", base.as_str()];
         args.extend(DIFF_FLAGS);
         args.extend(["-z", "--raw", "--numstat"]);
-        let raw = repo.output(&args)?.ok()?;
-        let unmerged = repo.output(&["ls-files", "--unmerged", "-z"])?.ok()?;
-        let unmerged = unmerged_paths(&unmerged);
-        let mut entries = tracked(&raw, &unmerged)
+        let mut parser = TrackedParser::new(&unmerged, &mut firsts);
+        repo.run(&args, |out| records(out, |r, whole| parser.feed(r, whole)))?
+            .ok()?;
+        let listed = parser
+            .finish()
             .ok_or_else(|| GitError::Failed("unexpected git diff output".into()))?;
         // An unmerged path whose worktree equals `HEAD` (a modify/delete
         // conflict with ours kept, say) is in no raw record, but still
         // conflicted. Its diff comes from the per-file call (normally empty).
-        let listed: HashSet<&str> = entries.iter().map(|e| e.file.path.as_str()).collect();
-        let mut missing: Vec<String> = unmerged
+        let mut missing: Vec<&str> = unmerged
             .iter()
+            .filter(|p| !listed.contains(*p))
             .filter_map(|p| std::str::from_utf8(p).ok())
-            .filter(|p| !listed.contains(p))
-            .map(str::to_owned)
             .collect();
-        missing.sort();
+        missing.sort_unstable();
         for path in missing {
-            entries.push(Entry {
-                file: ChangedFile {
-                    path,
-                    from: None,
-                    change: FileChange::Conflicted,
-                    added: Some(0),
-                    removed: Some(0),
-                    diff: DiffBody::Omitted,
+            firsts.offer(
+                Entry {
+                    file: ChangedFile {
+                        path: path.to_owned(),
+                        from: None,
+                        change: FileChange::Conflicted,
+                        added: Some(0),
+                        removed: Some(0),
+                        diff: DiffBody::Omitted,
+                    },
+                    source: Source::Tracked {
+                        binary: false,
+                        sections: 0,
+                    },
                 },
-                source: Source::Tracked { binary: false },
-            });
+                None,
+            );
         }
-        // Every tracked header, capped or not, counts towards a collision.
+
+        let others = ["ls-files", "--others", "--exclude-standard", "-z"];
+        repo.run(&others, |out| {
+            records(out, |path, whole| {
+                // A trailing `/` is a nested repository.
+                if !whole || path.len() > PATH_MAX || path.ends_with(b"/") {
+                    return;
+                }
+                let Ok(path) = std::str::from_utf8(path) else {
+                    return;
+                };
+                // Only an entry that will be kept is `lstat`ed.
+                if !firsts.admits(path, true) {
+                    firsts.count();
+                    return;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(workdir.join(path)) else {
+                    return;
+                };
+                let kind = if meta.file_type().is_symlink() {
+                    Untracked::Link
+                } else if meta.is_file() {
+                    Untracked::File {
+                        size: meta.len(),
+                        executable: meta.permissions().mode() & 0o100 != 0,
+                    }
+                } else {
+                    return;
+                };
+                firsts.offer(
+                    Entry {
+                        file: ChangedFile {
+                            path: path.to_owned(),
+                            from: None,
+                            change: FileChange::Untracked,
+                            added: None,
+                            removed: None,
+                            diff: DiffBody::Omitted,
+                        },
+                        source: Source::Untracked(kind),
+                    },
+                    None,
+                );
+            })
+        })?
+        .ok()?;
+        self.check_deadline()?;
+
+        let mut total = firsts.offered;
+        let entries = firsts.into_sorted();
+
+        // Patches of the tracked entries kept, paired by exact header. An
+        // entry past the cap with the same header makes one section too many.
         let mut headers: HashMap<Vec<u8>, u32> = HashMap::new();
         for e in &entries {
-            *headers.entry(expected_header(&e.file)).or_default() += 1;
+            if let Source::Tracked { .. } = e.source {
+                *headers.entry(expected_header(&e.file)).or_default() += 1;
+            }
         }
-
-        let others = repo
-            .output(&["ls-files", "--others", "--exclude-standard", "-z"])?
-            .ok()?;
-        for path in nul_split(&others) {
-            self.check_deadline()?;
-            let Ok(path) = std::str::from_utf8(path) else {
-                continue;
-            };
-            let Ok(meta) = std::fs::symlink_metadata(workdir.join(path)) else {
-                continue;
-            };
-            let kind = if meta.file_type().is_symlink() {
-                Untracked::Link
-            } else if meta.is_file() {
-                Untracked::File {
-                    size: meta.len(),
-                    executable: meta.permissions().mode() & 0o100 != 0,
-                }
-            } else {
-                continue;
-            };
-            entries.push(Entry {
-                file: ChangedFile {
-                    path: path.to_owned(),
-                    from: None,
-                    change: FileChange::Untracked,
-                    added: None,
-                    removed: None,
-                    diff: DiffBody::Omitted,
-                },
-                source: Source::Untracked(kind),
-            });
-        }
-
-        entries.sort_by(|a, b| {
-            let untracked = |e: &Entry| matches!(e.source, Source::Untracked(_));
-            (&a.file.path, untracked(a)).cmp(&(&b.file.path, untracked(b)))
-        });
-        let mut total = entries.len();
-        entries.truncate(limits::WORKDIR_CHANGES_MAX);
-
-        // Patches of the tracked entries kept, paired by exact header.
         let mut collected: Vec<Collected> = entries.iter().map(|_| Collected::default()).collect();
         let mut slots = HashMap::new();
         for (i, e) in entries.iter().enumerate() {
-            let Source::Tracked { binary: false } = e.source else {
+            let Source::Tracked {
+                binary: false,
+                sections,
+            } = e.source
+            else {
                 continue;
             };
             let header = expected_header(&e.file);
             let quoted =
                 needs_quote(&e.file.path) || e.file.from.as_deref().is_some_and(needs_quote);
-            if !quoted && headers.get(&header) == Some(&1) {
-                slots.insert(header, i);
+            if sections > 0 && !quoted && headers.get(&header) == Some(&1) {
+                slots.insert(header, (i, sections));
             }
         }
-        let wants_patch = |e: &Entry| matches!(e.source, Source::Tracked { binary: false });
+        let wants_patch = |e: &Entry| matches!(e.source, Source::Tracked { binary: false, .. });
         if entries.iter().any(wants_patch) {
             let mut args = vec!["diff", base.as_str()];
             args.extend(DIFF_FLAGS);
@@ -406,20 +441,20 @@ impl<'a> Snapshot<'a> {
         for (mut e, mut c) in entries.into_iter().zip(collected) {
             self.check_deadline()?;
             let text = match e.source {
-                Source::Tracked { binary: true } => {
+                Source::Tracked { binary: true, .. } => {
                     e.file.diff = DiffBody::Binary;
                     None
                 }
-                Source::Tracked { binary: false } if c.too_large => {
+                Source::Tracked { .. } if c.too_large => {
                     e.file.diff = DiffBody::TooLarge { bytes: c.bytes };
                     None
                 }
-                Source::Tracked { binary: false } if c.omitted => {
+                Source::Tracked { .. } if c.omitted => {
                     e.file.diff = DiffBody::Omitted;
                     out_of_budget = true;
                     None
                 }
-                Source::Tracked { binary: false } => {
+                Source::Tracked { .. } => {
                     kept.held -= c.text.len() as u64;
                     Some(std::mem::take(&mut c.text))
                 }
@@ -613,42 +648,246 @@ fn unmerged_paths(out: &[u8]) -> HashSet<Vec<u8>> {
         .collect()
 }
 
-/// The entries of `git diff -z --raw --numstat`: every raw record, then
-/// every numstat record in the same order. `None` when the two disagree.
-/// Paths that are not UTF-8 are left out.
-fn tracked(out: &[u8], unmerged: &HashSet<Vec<u8>>) -> Option<Vec<Entry>> {
-    struct Raw<'o> {
+/// The entries that sort first (by path, tracked before untracked on a tie,
+/// then in the order offered), at most [`limits::WORKDIR_CHANGES_MAX`], and
+/// how many were offered in all. Memory is bounded by the cap, not by the
+/// workdir.
+#[derive(Default)]
+struct Firsts {
+    /// A max-heap: the entry to drop next is on top.
+    heap: BinaryHeap<Ranked>,
+    offered: usize,
+}
+
+/// An entry held by [`Firsts`].
+struct Ranked {
+    entry: Entry,
+    /// Offer order, which breaks ties.
+    seq: usize,
+    /// The number of its raw record, to find its numstat record by.
+    raw: Option<usize>,
+}
+
+impl Ranked {
+    fn key(&self) -> (&str, bool, usize) {
+        let untracked = matches!(self.entry.source, Source::Untracked(_));
+        (&self.entry.file.path, untracked, self.seq)
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Ranked) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Ranked) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Ranked) -> Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl Firsts {
+    /// Whether an entry at `path` offered now would be held (for now).
+    fn admits(&self, path: &str, untracked: bool) -> bool {
+        self.heap.len() < limits::WORKDIR_CHANGES_MAX
+            || self.heap.peek().is_some_and(|last| {
+                let (p, u, _) = last.key();
+                (path, untracked) < (p, u)
+            })
+    }
+
+    /// Counts an entry [`Firsts::admits`] refused, without building it.
+    fn count(&mut self) {
+        self.offered += 1;
+    }
+
+    /// Counts `entry`, and holds it while it sorts among the first.
+    fn offer(&mut self, entry: Entry, raw: Option<usize>) {
+        let untracked = matches!(entry.source, Source::Untracked(_));
+        let admitted = self.admits(&entry.file.path, untracked);
+        self.offered += 1;
+        if admitted {
+            self.heap.push(Ranked {
+                entry,
+                seq: self.offered,
+                raw,
+            });
+            if self.heap.len() > limits::WORKDIR_CHANGES_MAX {
+                self.heap.pop();
+            }
+        }
+    }
+
+    /// The entries held, in order.
+    fn into_sorted(self) -> Vec<Entry> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| r.entry)
+            .collect()
+    }
+}
+
+/// What [`TrackedParser`] expects next.
+enum Expect {
+    Raw,
+    RawFrom {
         status: u8,
-        from: Option<&'o [u8]>,
-        path: &'o [u8],
+    },
+    /// `from` is `None` when it was left out.
+    RawPath {
+        status: u8,
+        from: Option<Option<String>>,
+    },
+    Numstat,
+    NumFrom {
+        counts: (Option<u32>, Option<u32>),
+    },
+    NumPath {
+        counts: (Option<u32>, Option<u32>),
+        from: Option<Vec<u8>>,
+    },
+}
+
+/// `git diff -z --raw --numstat` as it streams (every raw record, then every
+/// numstat record in the same order), offering each entry to [`Firsts`]. A
+/// numstat record is checked against its raw record's path only for the
+/// entries held: the others are not kept to compare.
+struct TrackedParser<'a> {
+    unmerged: &'a HashSet<Vec<u8>>,
+    firsts: &'a mut Firsts,
+    /// Unmerged paths some raw record lists.
+    listed: HashSet<Vec<u8>>,
+    expect: Expect,
+    raws: usize,
+    numstats: usize,
+    /// Once numstat records start: the entries held, and the index among
+    /// them of each held raw record number.
+    numbered: Option<(Vec<Ranked>, HashMap<usize, usize>)>,
+    bad: bool,
+}
+
+impl<'a> TrackedParser<'a> {
+    fn new(unmerged: &'a HashSet<Vec<u8>>, firsts: &'a mut Firsts) -> TrackedParser<'a> {
+        TrackedParser {
+            unmerged,
+            firsts,
+            listed: HashSet::new(),
+            expect: Expect::Raw,
+            raws: 0,
+            numstats: 0,
+            numbered: None,
+            bad: false,
+        }
     }
-    let mut fields = nul_split(out).peekable();
-    let mut raws = Vec::new();
-    while let Some(record) = fields.next_if(|f| f.starts_with(b":")) {
-        let status = *record.rsplit(|&b| b == b' ').next()?.first()?;
-        let from = match status {
-            b'R' | b'C' => Some(fields.next()?),
-            _ => None,
+
+    /// Takes the next record ([`records`]).
+    fn feed(&mut self, record: &[u8], whole: bool) {
+        if !self.bad && self.step(record, whole).is_none() {
+            self.bad = true;
+        }
+    }
+
+    /// `None` when the output is not what git prints.
+    fn step(&mut self, record: &[u8], whole: bool) -> Option<()> {
+        match std::mem::replace(&mut self.expect, Expect::Numstat) {
+            Expect::Raw if record.starts_with(b":") => {
+                if !whole {
+                    return None;
+                }
+                let status = *record.rsplit(|&b| b == b' ').next()?.first()?;
+                self.expect = match status {
+                    b'R' | b'C' => Expect::RawFrom { status },
+                    _ => Expect::RawPath {
+                        status,
+                        from: Some(None),
+                    },
+                };
+            }
+            Expect::Raw => {
+                let held = std::mem::take(&mut self.firsts.heap).into_vec();
+                let at = held
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| Some((r.raw?, i)))
+                    .collect();
+                self.numbered = Some((held, at));
+                return self.numstat(record, whole);
+            }
+            Expect::RawFrom { status } => {
+                self.expect = Expect::RawPath {
+                    status,
+                    from: name(record, whole).map(Some),
+                };
+            }
+            Expect::RawPath { status, from } => {
+                self.expect = Expect::Raw;
+                self.raw(status, from, record, whole);
+            }
+            Expect::Numstat => return self.numstat(record, whole),
+            Expect::NumFrom { counts } => {
+                self.expect = Expect::NumPath {
+                    counts,
+                    from: whole.then(|| record.to_vec()),
+                };
+            }
+            Expect::NumPath { counts, from } => {
+                return self.fill(counts, from.as_deref(), record, whole);
+            }
+        }
+        Some(())
+    }
+
+    /// Raw record number `self.raws` names `path`.
+    fn raw(&mut self, status: u8, from: Option<Option<String>>, path: &[u8], whole: bool) {
+        let n = self.raws;
+        self.raws += 1;
+        let (Some(from), Some(path)) = (from, name(path, whole)) else {
+            return;
         };
-        raws.push(Raw {
-            status,
-            from,
-            path: fields.next()?,
-        });
+        let conflicted = self.unmerged.contains(path.as_bytes());
+        if conflicted {
+            self.listed.insert(path.as_bytes().to_vec());
+        }
+        let change = match status {
+            _ if conflicted => FileChange::Conflicted,
+            b'A' | b'C' => FileChange::Added,
+            b'D' => FileChange::Deleted,
+            b'R' => FileChange::Renamed,
+            b'T' => FileChange::TypeChanged,
+            b'U' => FileChange::Conflicted,
+            _ => FileChange::Modified,
+        };
+        let entry = Entry {
+            file: ChangedFile {
+                path,
+                from: from.filter(|_| status == b'R'),
+                change,
+                added: None,
+                removed: None,
+                diff: DiffBody::Omitted,
+            },
+            source: Source::Tracked {
+                binary: false,
+                sections: if status == b'T' { 2 } else { 1 },
+            },
+        };
+        self.firsts.offer(entry, Some(n));
     }
-    let mut entries = Vec::with_capacity(raws.len());
-    for raw in raws {
-        let record = fields.next()?;
+
+    /// A numstat record's first field: its counts and maybe its path.
+    fn numstat(&mut self, record: &[u8], whole: bool) -> Option<()> {
         let mut parts = record.splitn(3, |&b| b == b'\t');
         let (added, removed, rest) = (parts.next()?, parts.next()?, parts.next()?);
-        let (from, path) = if rest.is_empty() {
-            (Some(fields.next()?), fields.next()?)
-        } else {
-            (None, rest)
-        };
-        if path != raw.path || (from.is_some() && from != raw.from) {
-            return None;
-        }
         let count = |n: &[u8]| -> Option<u32> {
             std::str::from_utf8(n)
                 .ok()?
@@ -656,45 +895,107 @@ fn tracked(out: &[u8], unmerged: &HashSet<Vec<u8>>) -> Option<Vec<Entry>> {
                 .ok()
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
         };
-        let (added, removed) = (count(added), count(removed));
-        let change = if unmerged.contains(raw.path) {
-            FileChange::Conflicted
-        } else {
-            match raw.status {
-                b'A' | b'C' => FileChange::Added,
-                b'D' => FileChange::Deleted,
-                b'R' => FileChange::Renamed,
-                b'T' => FileChange::TypeChanged,
-                b'U' => FileChange::Conflicted,
-                _ => FileChange::Modified,
-            }
-        };
-        let Ok(path) = String::from_utf8(raw.path.to_vec()) else {
-            continue;
-        };
-        let from = match raw.from.map(|f| String::from_utf8(f.to_vec())) {
-            Some(Ok(from)) if raw.status == b'R' => Some(from),
-            Some(Err(_)) => continue,
-            _ => None,
-        };
-        entries.push(Entry {
-            file: ChangedFile {
-                path,
-                from,
-                change,
-                added,
-                removed,
-                diff: DiffBody::Omitted,
-            },
-            source: Source::Tracked {
-                binary: added.is_none() || removed.is_none(),
-            },
-        });
+        let counts = (count(added), count(removed));
+        if rest.is_empty() {
+            self.expect = Expect::NumFrom { counts };
+            return Some(());
+        }
+        self.expect = Expect::Numstat;
+        self.fill(counts, None, rest, whole)
     }
-    if fields.next().is_some() {
+
+    /// Numstat record number `self.numstats`, of `from` (a rename or copy)
+    /// to `path`.
+    fn fill(
+        &mut self,
+        counts: (Option<u32>, Option<u32>),
+        from: Option<&[u8]>,
+        path: &[u8],
+        whole: bool,
+    ) -> Option<()> {
+        self.expect = Expect::Numstat;
+        let n = self.numstats;
+        self.numstats += 1;
+        if n >= self.raws {
+            return None;
+        }
+        let (held, at) = self.numbered.as_mut()?;
+        let Some(&i) = at.get(&n) else {
+            return Some(());
+        };
+        let e = &mut held[i].entry;
+        let from_differs = match (from, &e.file.from) {
+            (Some(from), Some(raw)) => from != raw.as_bytes(),
+            _ => false,
+        };
+        if !whole || path != e.file.path.as_bytes() || from_differs {
+            return None;
+        }
+        (e.file.added, e.file.removed) = counts;
+        if let Source::Tracked { binary, .. } = &mut e.source {
+            *binary = counts.0.is_none() || counts.1.is_none();
+        }
+        Some(())
+    }
+
+    /// The unmerged paths some raw record lists; `None` when the output was
+    /// not what git prints.
+    fn finish(self) -> Option<HashSet<Vec<u8>>> {
+        if self.bad || !matches!(self.expect, Expect::Raw | Expect::Numstat) {
+            return None;
+        }
+        if self.numstats != self.raws {
+            return None;
+        }
+        if let Some((held, _)) = self.numbered {
+            self.firsts.heap = BinaryHeap::from(held);
+        }
+        Some(self.listed)
+    }
+}
+
+/// A path from a `-z` record; `None` (left out) when it was cut, is longer
+/// than [`PATH_MAX`] or is not UTF-8.
+fn name(record: &[u8], whole: bool) -> Option<String> {
+    if !whole || record.len() > PATH_MAX {
         return None;
     }
-    Some(entries)
+    String::from_utf8(record.to_vec()).ok()
+}
+
+/// Feeds each record of `-z` output `out` to `each`, holding one read chunk
+/// and at most [`RECORD_MAX`] bytes of one record: a longer one arrives cut
+/// there, with `false`.
+fn records(out: &mut dyn Read, mut each: impl FnMut(&[u8], bool)) -> io::Result<()> {
+    let mut chunk = vec![0u8; READ_CHUNK];
+    let mut record = Vec::new();
+    let mut whole = true;
+    loop {
+        let n = match out.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        for piece in chunk[..n].split_inclusive(|&b| b == 0) {
+            let (bytes, ends) = match piece.split_last() {
+                Some((0, bytes)) => (bytes, true),
+                _ => (piece, false),
+            };
+            let room = RECORD_MAX - record.len();
+            whole &= bytes.len() <= room;
+            record.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            if ends {
+                each(&record, whole);
+                record.clear();
+                whole = true;
+            }
+        }
+    }
+    if !record.is_empty() || !whole {
+        each(&record, whole);
+    }
+    Ok(())
 }
 
 /// The records of `-z` output.
@@ -1276,6 +1577,156 @@ mod tests {
                 .iter()
                 .all(|f| matches!(f.diff, DiffBody::Blob(_)))
         );
+    }
+
+    #[test]
+    fn untracked_files_past_the_cap_are_counted_not_kept() {
+        let t = Tree::new();
+        let wd = &t.workdir;
+        init(wd);
+        let n = limits::WORKDIR_CHANGES_MAX + 100;
+        // Created in reverse, so no order but the sort's can pass.
+        for i in (0..n).rev() {
+            write(wd.join(format!("u{i:04}")), "c\n");
+        }
+        // A nested repository is listed as `nested/` and is no entry.
+        write(wd.join("nested/inner"), "x\n");
+        init(&wd.join("nested"));
+        let set = change_set(&t);
+        assert_eq!(set.total as usize, n);
+        assert_eq!(set.files.len(), limits::WORKDIR_CHANGES_MAX);
+        let paths: Vec<String> = set.files.iter().map(|f| f.path.clone()).collect();
+        let expected: Vec<String> = (0..limits::WORKDIR_CHANGES_MAX)
+            .map(|i| format!("u{i:04}"))
+            .collect();
+        assert_eq!(paths, expected);
+        assert!(
+            set.files
+                .iter()
+                .all(|f| f.change == FileChange::Untracked && matches!(f.diff, DiffBody::Blob(_)))
+        );
+    }
+
+    #[test]
+    fn tracked_entries_past_the_cap_are_counted_and_the_kept_keep_their_numstat() {
+        let t = Tree::new();
+        let wd = &t.workdir;
+        init(wd);
+        let tracked = 400;
+        let loose = 300;
+        for i in 0..tracked {
+            write(wd.join(format!("t{i:03}")), "a\n");
+        }
+        let renamed: String = (0..8).map(|i| format!("r {i}\n")).collect();
+        write(wd.join("old"), &renamed);
+        write(wd.join("bin"), b"\0\x01");
+        commit_all(wd);
+        // A different line count each, so a numstat paired with the wrong
+        // entry shows.
+        for i in 0..tracked {
+            let lines: String = (0..=i % 7).map(|l| format!("{l}\n")).collect();
+            write(wd.join(format!("t{i:03}")), lines);
+        }
+        git(wd, &["mv", "old", "t-new"]);
+        write(wd.join("t-new"), renamed + "r end\n");
+        write(wd.join("bin"), b"\0\x02");
+        // Untracked entries sort first, pushing tracked ones past the cap.
+        for i in 0..loose {
+            write(wd.join(format!("a{i:03}")), "c\n");
+        }
+
+        let set = change_set(&t);
+        assert_eq!(set.total as usize, tracked + loose + 2);
+        assert_eq!(set.files.len(), limits::WORKDIR_CHANGES_MAX);
+        let kept_tracked = limits::WORKDIR_CHANGES_MAX - loose - 2;
+        let mut expected: Vec<String> = (0..loose).map(|i| format!("a{i:03}")).collect();
+        expected.push("bin".into());
+        expected.push("t-new".into());
+        expected.extend((0..kept_tracked).map(|i| format!("t{i:03}")));
+        let paths: Vec<&str> = set.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, expected);
+
+        let counts = numstat(wd);
+        for file in set
+            .files
+            .iter()
+            .filter(|f| f.change != FileChange::Untracked)
+        {
+            assert_eq!(
+                counts[&file.path],
+                (file.added, file.removed),
+                "{}",
+                file.path
+            );
+        }
+        assert_eq!(entry(&set, "bin", false).diff, DiffBody::Binary);
+        let new = entry(&set, "t-new", false);
+        assert_eq!(
+            (new.from.as_deref(), new.change),
+            (Some("old"), FileChange::Renamed)
+        );
+        assert!(diff_text(&t, new).contains("+r end\n"));
+        let k = kept_tracked - 1;
+        let last = diff_text(&t, entry(&set, &format!("t{k:03}"), false));
+        let added: String = (0..=k % 7).map(|l| format!("+{l}\n")).collect();
+        assert!(last.ends_with(&format!("-a\n{added}")), "{last}");
+    }
+
+    #[test]
+    fn a_header_shared_with_an_entry_past_the_cap_is_not_trusted() {
+        let t = Tree::new();
+        let wd = &t.workdir;
+        init(wd);
+        // `a-r` (renamed from `p b/q`) and `q b/a-r` (renamed from `p`) both
+        // print `diff --git a/p b/q b/a-r`, in consecutive sections;
+        // untracked `m…` push `q b/a-r` past the cap, so only `a-r` is kept.
+        let lines = |tag: &str| (0..8).map(|i| format!("{tag} {i}\n")).collect::<String>();
+        write(wd.join("p b/q"), lines("first"));
+        write(wd.join("p"), lines("second"));
+        commit_all(wd);
+        git(wd, &["mv", "p b/q", "a-r"]);
+        std::fs::create_dir(wd.join("q b")).unwrap();
+        git(wd, &["mv", "p", "q b/a-r"]);
+        write(wd.join("a-r"), lines("first") + "first end\n");
+        write(wd.join("q b/a-r"), lines("second") + "second end\n");
+        git(wd, &["add", "-A"]);
+        for i in 0..limits::WORKDIR_CHANGES_MAX - 1 {
+            write(wd.join(format!("m{i:03}")), "c\n");
+        }
+
+        let set = change_set(&t);
+        assert_eq!(set.total as usize, limits::WORKDIR_CHANGES_MAX + 1);
+        let first = entry(&set, "a-r", false);
+        assert_eq!(first.from.as_deref(), Some("p b/q"));
+        assert!(set.files.iter().all(|f| f.path != "q b/a-r"));
+        let first = diff_text(&t, first);
+        assert!(
+            first.contains("rename from p b/q\n") && first.contains("+first end\n"),
+            "{first}"
+        );
+        assert!(!first.contains("second"), "{first}");
+    }
+
+    #[test]
+    fn records_split_at_nul_and_cut_a_long_one() {
+        let long = vec![b'x'; RECORD_MAX + 10];
+        let mut out = b"a\0".to_vec();
+        out.extend_from_slice(&long);
+        out.extend_from_slice(b"\0b\0last");
+        for whole in [true, false] {
+            let mut got: Vec<(Vec<u8>, bool)> = Vec::new();
+            let mut each = |r: &[u8], w: bool| got.push((r.to_vec(), w));
+            if whole {
+                records(&mut &out[..], &mut each).unwrap();
+            } else {
+                records(&mut Trickle(&out), &mut each).unwrap();
+            }
+            assert_eq!(got.len(), 4);
+            assert_eq!(got[0], (b"a".to_vec(), true));
+            assert_eq!(got[1], (long[..RECORD_MAX].to_vec(), false));
+            assert_eq!(got[2], (b"b".to_vec(), true));
+            assert_eq!(got[3], (b"last".to_vec(), true));
+        }
     }
 
     #[test]

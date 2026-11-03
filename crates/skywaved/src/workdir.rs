@@ -89,7 +89,8 @@
 //!    --verify`, `None` when unborn); the base is `HEAD`, or the empty tree
 //!    by `hash-object -t tree /dev/null` (so a sha256 repo works).
 //! 4. Entries from `diff <base> -z --raw --numstat` (raw records, then
-//!    numstat records in the same order, checked to name the same paths),
+//!    numstat records in the same order, counted to match, and checked to
+//!    name the same paths for the entries kept),
 //!    with the shared diff flags: `--relative` (the workdir's subtree, in its
 //!    own terms), `-M`, `--no-ext-diff --no-textconv --no-color
 //!    --ignore-submodules=dirty --submodule=short`, `-O/dev/null` and
@@ -105,19 +106,27 @@
 //!    modify/delete conflict with ours kept, or `checkout --ours` without
 //!    `add`) is still a `Conflicted` entry, counted `0`/`0`, with the
 //!    per-file diff (normally empty, so an empty blob). Untracked ones come from `ls-files --others --exclude-standard`,
-//!    `lstat`ed: a symlink or a regular file, anything else skipped. Paths
-//!    that are not UTF-8 are left out (and not counted).
+//!    `lstat`ed: a symlink or a regular file, anything else skipped (a
+//!    nested repository, listed `dir/`, without a call). Paths that are not
+//!    UTF-8, or longer than 32 KiB, are left out (and not counted).
 //! 5. Sorted by path (tracked before untracked on a tie: `git rm --cached f`
 //!    with `f` on disk is both), capped at [`limits::WORKDIR_CHANGES_MAX`];
-//!    `total` counts all.
+//!    `total` counts all. Both listings are read as they stream, NUL by NUL,
+//!    into a max-heap holding only the entries that sort first, so memory is
+//!    bounded by the cap, not by the workdir; git still runs to the end so
+//!    `total` is exact. Only an untracked path the heap would take is
+//!    `lstat`ed: one past the cap is counted as listed (so a FIFO or a file
+//!    gone since the listing counts there).
 //! 6. **Patches**: one streamed `diff <base>`, split at lines starting
 //!    `diff --git ` (a body line starts with ` `, `+`, `-`, `\` or `@@`, and
 //!    a path holding a newline is quoted). A section goes to the entry whose
 //!    exact expected header `diff --git a/<from or path> b/<path>` it
 //!    carries, never by position; consecutive sections with one header are a
 //!    type change and concatenate. An entry with a path git quotes, a header
-//!    shared with any other entry, a header seen again non-consecutively, or
-//!    no section takes its own `diff <base> -- :(literal)<from>
+//!    shared with another kept entry, a header seen again non-consecutively
+//!    or more often than its raw record gives sections (one, two for a type
+//!    change: an entry past the cap may share the header), no section, or
+//!    no raw record (the conflict above) takes its own `diff <base> -- :(literal)<from>
 //!    :(literal)<path>`, keeping only the sections whose header is the
 //!    entry's own as git prints it (quoted or not): `:(literal)p` also
 //!    matches everything under a directory `p/`. A section keeps at most
