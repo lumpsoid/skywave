@@ -103,7 +103,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId, TaskKind};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Barrier, mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -131,6 +131,7 @@ pub struct FakeScript {
     refused_efforts: Vec<Effort>,
     models: Vec<ModelChoice>,
     refuse_stops: bool,
+    shutdown_barrier: Option<Arc<Barrier>>,
 }
 
 impl FakeScript {
@@ -159,6 +160,13 @@ impl FakeScript {
     /// Refuses every task stop.
     pub fn refuse_stops(mut self) -> FakeScript {
         self.refuse_stops = true;
+        self
+    }
+
+    /// Holds every session's shutdown until `sessions` shutdowns are under
+    /// way at once: shutdowns that run one after another never return.
+    pub fn shutdowns_wait_for_each_other(mut self, sessions: usize) -> FakeScript {
+        self.shutdown_barrier = Some(Arc::new(Barrier::new(sessions)));
         self
     }
 
@@ -773,6 +781,9 @@ impl AgentSession for FakeSession {
     async fn shutdown(self) -> Result<(), AgentError> {
         // Already exited on its own: nothing to stop.
         let _ = self.request(FakeInput::Shutdown);
+        if let Some(barrier) = &self.script.shutdown_barrier {
+            barrier.wait().await;
+        }
         drop(self.answers);
         self.task
             .await

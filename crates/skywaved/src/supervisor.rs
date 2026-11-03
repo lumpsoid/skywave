@@ -163,7 +163,10 @@
 //! approvals stay as they are in the log, and the next start settles them the
 //! same way whether the daemon stopped cleanly or crashed. A pending approval
 //! cannot outlive the daemon: the agent's request for it lives only in the
-//! agent process (D8).
+//! agent process (D8). The agents stop concurrently, so shutdown takes about
+//! one agent's grace period however many run (systemd's stop timeout is a
+//! bound on the whole of it); what each reported while stopping is logged
+//! once all have stopped.
 //!
 //! **Failure.** An error while following the log (the database full or
 //! gone, say) ends the supervisor: its agent sessions are dropped, which
@@ -185,6 +188,7 @@ use std::path::PathBuf;
 use std::task::Poll;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use rusqlite::OptionalExtension;
 use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
@@ -528,9 +532,12 @@ impl<A: AgentAdapter> Supervisor<A> {
                 Wake::Idle => self.stop_idle().await?,
             }
         }
-        let ids: Vec<SessionId> = self.running.keys().copied().collect();
-        for id in ids {
-            self.stop_session(id, false).await?;
+        // All at once: one by one, each agent's grace would add up.
+        let halts = std::mem::take(&mut self.running)
+            .into_iter()
+            .map(|(id, running)| async move { (id, halt(id, running).await) });
+        for (id, halted) in join_all(halts).await {
+            self.record_stop(id, halted, false)?;
         }
         Ok(())
     }
@@ -1011,33 +1018,23 @@ impl<A: AgentAdapter> Supervisor<A> {
     /// With `map_exit` false (daemon shutdown) its final `Exited` is not
     /// recorded, leaving open turns and approvals for the next start.
     async fn stop_session(&mut self, id: SessionId, map_exit: bool) -> Result<()> {
-        let Some(mut running) = self.running.remove(&id) else {
+        let Some(running) = self.running.remove(&id) else {
             return Ok(());
         };
-        // Drain while it stops: an agent may block on a full event channel.
-        let drain = async {
-            let mut events = Vec::new();
-            while let Some(event) = running.events.recv().await {
-                let exited = matches!(event, AdapterEvent::Exited { .. });
-                events.push(event);
-                if exited {
-                    break;
-                }
-            }
-            events
-        };
-        let (stopped, mut events) = tokio::join!(running.session.shutdown(), drain);
-        if let Err(error) = stopped {
-            tracing::warn!(session = %id.0, %error, "agent shutdown failed");
-        }
-        if !matches!(events.last(), Some(AdapterEvent::Exited { .. })) {
-            events.push(AdapterEvent::Exited { error: None });
-        }
+        let halted = halt(id, running).await;
+        self.record_stop(id, halted, map_exit)
+    }
+
+    /// Records what session `id`'s agent reported while it stopped; with
+    /// `map_exit` false, all but its final `Exited`.
+    fn record_stop(&mut self, id: SessionId, halted: Halted, map_exit: bool) -> Result<()> {
+        let Halted {
+            mut mapper,
+            mut events,
+        } = halted;
         if !map_exit {
             events.pop();
         }
-        // Put the mapper back for `map`; the session itself is gone.
-        let mut mapper = running.mapper;
         for event in events {
             if let AdapterEvent::ModelsOffered(models) = event {
                 let context = mapper.context();
@@ -1187,6 +1184,47 @@ fn offer_models(
     )?;
     *known = Some(models);
     Ok(())
+}
+
+/// A stopped agent's mapper and what it reported while stopping, ending
+/// with `Exited`.
+struct Halted {
+    mapper: EventMapper,
+    events: Vec<AdapterEvent>,
+}
+
+/// Shuts session `id`'s agent down. Needs nothing of the supervisor, so
+/// several can stop at once.
+async fn halt<S: AgentSession>(id: SessionId, running: Running<S>) -> Halted {
+    let Running {
+        session,
+        mut events,
+        mapper,
+        ..
+    } = running;
+    // Drain while it stops: an agent may block on a full event channel.
+    let drain = async {
+        let mut reported = Vec::new();
+        while let Some(event) = events.recv().await {
+            let exited = matches!(event, AdapterEvent::Exited { .. });
+            reported.push(event);
+            if exited {
+                break;
+            }
+        }
+        reported
+    };
+    let (stopped, mut reported) = tokio::join!(session.shutdown(), drain);
+    if let Err(error) = stopped {
+        tracing::warn!(session = %id.0, %error, "agent shutdown failed");
+    }
+    if !matches!(reported.last(), Some(AdapterEvent::Exited { .. })) {
+        reported.push(AdapterEvent::Exited { error: None });
+    }
+    Halted {
+        mapper,
+        events: reported,
+    }
 }
 
 /// The next event from any running agent session. Pending while none runs.
