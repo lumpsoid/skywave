@@ -19,8 +19,8 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandResult, DirsResult, EventBatch, EventsQuery, FileResult,
-    HelloResponse, ListResult, PROTOCOL_VERSION, WorkdirQuery, path,
+    BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
+    EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, WorkdirQuery, path,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -339,6 +339,20 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `GET /v1/conversations`, which takes no query.
+    async fn list_conversations(&self) -> Result<ConversationsResult, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::GET,
+                path::CONVERSATIONS,
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET <endpoint>?session=<id>&path=<path>`, bounded by
     /// [`WORKDIR_TIMEOUT`] rather than the request timeout: the server may
     /// take its full 20 s.
@@ -481,6 +495,10 @@ impl Transport for HttpsTransport {
 
     fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
         Box::pin(HttpsTransport::list_dirs(self, dir))
+    }
+
+    fn list_conversations(&self) -> BoxFuture<'_, Result<ConversationsResult, TransportError>> {
+        Box::pin(HttpsTransport::list_conversations(self))
     }
 
     fn workdir_changes<'a>(

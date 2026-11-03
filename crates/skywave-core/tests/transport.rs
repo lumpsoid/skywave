@@ -5,19 +5,22 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, BlobDownload, Core, FileIdentity, HttpsTransport, Identity, PairError, PairingStatus,
     Request, Screen, Transport, TransportConfig, TransportError, pair, pair_and_report,
 };
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId, DirEntry,
-    DirsResult, EntryKind, EventKind, EventsQuery, FileBody, FileResult, HelloResponse, ListResult,
-    PROTOCOL_VERSION, Seq, SessionId, WorkdirQuery,
+    BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
+    ConversationsResult, DirEntry, DirsResult, EntryKind, EventKind, EventsQuery, FileBody,
+    FileResult, HelloResponse, ListResult, OutsideConversation, PROTOCOL_VERSION, Seq, SessionId,
+    WorkdirQuery,
 };
+use skywaved::agent::fake::FakeOutside;
+use skywaved::agent::{self, Listed};
 use skywaved::identity::ServerIdentity;
 use skywaved::pairing::{self, IssuedCode};
-use skywaved::server::Server;
+use skywaved::server::{Server, ServerOptions};
 use skywaved::{EventLog, Storage, devices};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -44,17 +47,31 @@ impl Fixture {
 
     /// A server whose certificate covers `names`.
     async fn start_with(names: &[&str]) -> Fixture {
+        Fixture::start_with_options(names, ServerOptions::default()).await
+    }
+
+    /// A server whose agent lists its conversations from `outside`.
+    async fn start_with_outside(outside: FakeOutside) -> Fixture {
+        let options = ServerOptions {
+            outside: Arc::new(outside),
+            ..ServerOptions::default()
+        };
+        Fixture::start_with_options(&["localhost", "127.0.0.1"], options).await
+    }
+
+    async fn start_with_options(names: &[&str], options: ServerOptions) -> Fixture {
         let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("root/project")).unwrap();
         let storage = Storage::open(tmp.path().join("server")).unwrap();
         let identity = Arc::new(ServerIdentity::bootstrap(&storage.dir, &names).unwrap());
         let log = EventLog::open(&storage.db, vec![tmp.path().join("root")]).unwrap();
-        let server = Server::bind(
+        let server = Server::bind_with(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
             identity.clone(),
             log,
+            options,
         )
         .await
         .unwrap();
@@ -348,6 +365,73 @@ impl Transport for Old {
 #[tokio::test]
 async fn list_dirs_defaults_to_not_found() {
     assert_eq!(Old.list_dirs("/").await, Err(TransportError::NotFound));
+}
+
+/// A transport that cannot list conversations answers `NotFound`, as a
+/// server without `GET /v1/conversations` would.
+#[tokio::test]
+async fn list_conversations_defaults_to_not_found() {
+    assert_eq!(
+        Old.list_conversations().await,
+        Err(TransportError::NotFound)
+    );
+}
+
+/// `GET /v1/conversations` against a real server with a paired device: the
+/// listing decodes field for field, and a server whose agent cannot list
+/// answers `Unavailable`, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn conversations_are_listed_by_a_real_server() {
+    let conversation = OutsideConversation {
+        id: "0d6b2c1e-1b1a-4c1e-9f0e-6a2b8c3d4e5f".into(),
+        workdir: "/srv/my project".into(),
+        title: Some("Fix the flaky test".into()),
+        first_prompt: Some("why does ci fail".into()),
+        last_active: Utc.with_ymd_and_hms(2026, 11, 2, 9, 30, 0).unwrap(),
+        messages: 12,
+        session: None,
+    };
+    let outside = FakeOutside::new();
+    outside.listing(Ok(Listed {
+        conversations: vec![agent::OutsideConversation {
+            id: conversation.id.clone(),
+            workdir: conversation.workdir.clone(),
+            title: conversation.title.clone(),
+            first_prompt: conversation.first_prompt.clone(),
+            last_active: conversation.last_active,
+            messages: conversation.messages,
+            session: None,
+        }],
+        truncated: true,
+    }));
+    let fx = Fixture::start_with_outside(outside).await;
+    let transport = paired_transport(&fx).await;
+    assert_eq!(
+        transport.list_conversations().await.unwrap(),
+        ConversationsResult::Listed {
+            conversations: vec![conversation],
+            truncated: true,
+        }
+    );
+
+    // The default server's agent reads no conversations.
+    let fx = Fixture::start().await;
+    let transport = paired_transport(&fx).await;
+    assert_eq!(
+        transport.list_conversations().await.unwrap(),
+        ConversationsResult::Unavailable
+    );
+}
+
+/// A transport for a device freshly paired with `fx`.
+async fn paired_transport(fx: &Fixture) -> HttpsTransport {
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&fx.addr, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
+    HttpsTransport::new(&paired.address, &identity, config()).unwrap()
 }
 
 /// A transport that cannot read workdirs answers `NotFound`, as a server

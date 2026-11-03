@@ -10,8 +10,8 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use skywave_proto::{
-    BlobId, ChangesResult, Command, CommandResult, DirsResult, EventBatch, EventsQuery, FileResult,
-    HelloResponse, ListResult, WorkdirQuery,
+    BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
+    EventsQuery, FileResult, HelloResponse, ListResult, WorkdirQuery,
 };
 
 use crate::view::LinkRejection;
@@ -47,6 +47,14 @@ pub trait Transport: Send + Sync {
     /// transport that cannot list returns by default.
     fn list_dirs<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<DirsResult, TransportError>> {
         let _ = dir;
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/conversations`: the conversations the server's agent keeps
+    /// for workdirs under the roots, for the conversation picker. Defaults
+    /// to [`TransportError::NotFound`] like
+    /// [`list_dirs`](Transport::list_dirs).
+    fn list_conversations(&self) -> BoxFuture<'_, Result<ConversationsResult, TransportError>> {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

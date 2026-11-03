@@ -30,6 +30,7 @@ mod backoff;
 mod blobs;
 mod client;
 mod completion;
+mod conversations;
 mod engine;
 mod https;
 pub mod identity;
@@ -51,7 +52,8 @@ pub use backoff::{Backoff, Jitter};
 pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
-    Connector, DEFAULT_WAIT_SECS, EngineConfig, WALL_CHECK, WallClock, default_device_name,
+    CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, WALL_CHECK, WallClock,
+    default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
@@ -72,15 +74,16 @@ pub use view::{
     AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
     Attention, BackgroundTask, BlobId, BlobState, BlobView, BodyFormat, BodyView, CallId,
     Candidate, CandidateSource, CommandId, Completion, CompletionStatus, ComposerMode, ContextId,
-    ContextView, Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo,
-    FailReason, ImportOutcome, ImportedEntry, Link, LinkRejection, ListKind, ModelChoice, Outgoing,
-    PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, PermissionMode,
-    Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule,
-    ScheduleId, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState,
-    SessionView, SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem,
-    ToolApproval, ToolKind, ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState,
-    WorkdirBody, WorkdirFetch, WorkdirPane, WorkdirView,
+    ContextView, ConversationItem, ConversationPicker, ConversationsStatus, Decision, Delivery,
+    DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, ImportOutcome, ImportedEntry,
+    Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason, RuleScope,
+    RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
+    ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirFetch, WorkdirPane, WorkdirView,
 };
 pub use view::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,

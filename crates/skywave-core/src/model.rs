@@ -10,14 +10,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
-    BackgroundTask, BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event,
-    EventBatch, EventKind, Fingerprint, ImportedItem, RejectReason, RuleSuggestion, SessionOrigin,
-    SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult,
+    BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ConversationsResult, DeviceInfo,
+    DirsResult, Event, EventBatch, EventKind, Fingerprint, ImportedItem, RejectReason,
+    RuleSuggestion, SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind,
+    ToolResult,
 };
 
 use crate::action::{Action, Route};
 use crate::address::ServerAddress;
 use crate::completion::Completer;
+use crate::conversations::Conversations;
 use crate::identity::Identity;
 use crate::projection::{
     FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
@@ -194,6 +196,8 @@ pub(crate) struct Model {
     last_shell: Option<ShellAlert>,
     /// Workdir completion in the new-session prompt; in memory only.
     completer: Completer,
+    /// The conversation picker on the session list; in memory only.
+    conversations: Conversations,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
     /// new session is not in the replica yet: its command, and the session
     /// it was asked from, still on screen. In memory only.
@@ -253,6 +257,7 @@ impl Model {
             shell_alerts: 0,
             last_shell: None,
             completer: Completer::default(),
+            conversations: Conversations::default(),
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
@@ -351,6 +356,7 @@ impl Model {
                     return Vec::new();
                 }
                 self.completer.end();
+                self.conversations.end();
                 // No local id check: dispatch has no failure channel, and a
                 // silent drop would lose what the user typed. The server's
                 // `BadConversation` shows as a failed pending session.
@@ -395,6 +401,21 @@ impl Model {
             }
             Action::EndCompletion => {
                 self.completer.end();
+                Vec::new()
+            }
+            Action::ListConversations => {
+                if self.device().is_none() || self.place != Place::SessionList {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.conversations
+                    .list(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
+            }
+            Action::EndConversations => {
+                self.conversations.end();
                 Vec::new()
             }
             Action::SendMessage { session_id, text } => {
@@ -612,6 +633,7 @@ impl Model {
                 self.viewing = None;
                 self.subagent = None;
                 self.completer.end();
+                self.conversations.end();
                 vec![Effect::LoadSession(id)]
             }
             Action::OpenNextApproval => match self.next_approval() {
@@ -631,6 +653,7 @@ impl Model {
                 self.viewing = None;
                 self.subagent = None;
                 self.completer.end();
+                self.conversations.end();
                 self.last_dir = String::new();
                 self.show_workdir(session_id, WorkdirPane::Changes)
             }
@@ -686,6 +709,7 @@ impl Model {
                 self.viewing = None;
                 self.subagent = None;
                 self.completer.end();
+                self.conversations.end();
                 Vec::new()
             }
             Action::Back => {
@@ -1436,6 +1460,14 @@ impl Model {
         self.completer.listed(req, result);
     }
 
+    pub(crate) fn conversations_listed(
+        &mut self,
+        req: u64,
+        result: Result<ConversationsResult, TransportError>,
+    ) {
+        self.conversations.listed(req, result);
+    }
+
     /// Whether `req` is the request `ask` still waits on: anything else is
     /// stale and must touch neither the replica nor the model.
     pub(crate) fn workdir_awaited(&self, req: u64, ask: &WorkdirAsk) -> bool {
@@ -1498,6 +1530,9 @@ impl Model {
         self.alerted.clear();
         self.alerted_at.clear();
         self.completer = Completer::default();
+        // Ended, not reset: the request ids stay unused, so an answer from
+        // the old server cannot match a later request.
+        self.conversations.end();
         self.workdirs.reset();
         if had_drafts {
             self.draft_rev += 1;
@@ -1708,6 +1743,7 @@ impl Model {
                 other_count: other.len(),
                 creating: Vec::new(),
                 completion: None,
+                conversations: None,
             };
         }
         let creating = self
@@ -1739,6 +1775,7 @@ impl Model {
             other_count: other.len(),
             creating,
             completion,
+            conversations: self.conversations.view(&self.sessions),
         }
     }
 
@@ -3545,6 +3582,7 @@ mod tests {
                 other_count: 0,
                 creating: Vec::new(),
                 completion: None,
+                conversations: None,
             })
         );
 
@@ -7638,6 +7676,230 @@ mod tests {
             workdir: "/srv/x".into(),
         }));
         assert_eq!(f.list_view().completion, None);
+    }
+
+    use crate::view::ConversationsStatus;
+    use skywave_proto::OutsideConversation;
+
+    /// Opens the conversation picker; the request it sends, if any.
+    fn list_conversations(f: &mut Fixture) -> Option<u64> {
+        match f.dispatch(Action::ListConversations).as_slice() {
+            [] => None,
+            [Effect::Request(Request::ListConversations { req })] => Some(*req),
+            other => panic!("expected a conversations request, got {other:?}"),
+        }
+    }
+
+    fn picker(f: &Fixture) -> crate::view::ConversationPicker {
+        f.list_view().conversations.expect("an open picker")
+    }
+
+    fn outside(id: &str, workdir: &str, session: Option<SessionId>) -> OutsideConversation {
+        OutsideConversation {
+            id: id.into(),
+            workdir: workdir.into(),
+            title: Some(format!("title of {id}")),
+            first_prompt: Some("fix the build".into()),
+            last_active: Utc.with_ymd_and_hms(2026, 11, 2, 9, 0, 0).unwrap(),
+            messages: 4,
+            session,
+        }
+    }
+
+    fn conversations(
+        list: Vec<OutsideConversation>,
+        truncated: bool,
+    ) -> Result<ConversationsResult, TransportError> {
+        Ok(ConversationsResult::Listed {
+            conversations: list,
+            truncated,
+        })
+    }
+
+    /// Logs a session that adopted `conversation`.
+    fn adopting_session(f: &mut Fixture, conversation: &str) -> SessionId {
+        let id = SessionId::new();
+        f.log(
+            id,
+            vec![EventKind::SessionCreated {
+                workdir: "/srv/a".into(),
+                context_name: "start".into(),
+                from: Some(SessionOrigin::Agent {
+                    conversation: conversation.into(),
+                }),
+            }],
+        );
+        id
+    }
+
+    #[test]
+    fn the_picker_asks_on_open_and_shows_the_latest_answer() {
+        let mut f = Fixture::paired();
+        assert_eq!(f.list_view().conversations, None);
+        let old = list_conversations(&mut f).expect("asked on open");
+        assert_eq!(picker(&f).status, ConversationsStatus::Loading);
+        assert_eq!(picker(&f).items, Vec::new());
+
+        // Opening it again asks again; the older answer is then stale.
+        let new = list_conversations(&mut f).unwrap();
+        assert!(new > old);
+        f.model.conversations_listed(
+            old,
+            conversations(vec![outside("old", "/srv/a", None)], false),
+        );
+        assert_eq!(picker(&f).status, ConversationsStatus::Loading, "stale");
+        assert_eq!(picker(&f).items, Vec::new());
+
+        f.model.conversations_listed(
+            new,
+            conversations(vec![outside("c1", "/srv/b", None)], true),
+        );
+        let shown = picker(&f);
+        assert_eq!(shown.status, ConversationsStatus::Ready { truncated: true });
+        assert_eq!(
+            shown.items,
+            vec![crate::view::ConversationItem {
+                id: "c1".into(),
+                workdir: "/srv/b".into(),
+                title: Some("title of c1".into()),
+                first_prompt: Some("fix the build".into()),
+                last_active: Utc.with_ymd_and_hms(2026, 11, 2, 9, 0, 0).unwrap(),
+                messages: 4,
+                session: None,
+                continued_in: Vec::new(),
+            }]
+        );
+
+        // A stale answer after a good one changes nothing either.
+        f.model
+            .conversations_listed(old, Err(TransportError::Timeout));
+        assert_eq!(picker(&f), shown);
+
+        // Closing forgets the listing, and a late answer does not reopen it.
+        assert!(f.dispatch(Action::EndConversations).is_empty());
+        assert_eq!(f.list_view().conversations, None);
+        f.model.conversations_listed(
+            new,
+            conversations(vec![outside("c1", "/srv/b", None)], false),
+        );
+        assert_eq!(f.list_view().conversations, None);
+    }
+
+    #[test]
+    fn the_picker_offline_is_unavailable_at_once_and_asks_nothing() {
+        let mut f = Fixture::paired();
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
+        });
+        assert_eq!(list_conversations(&mut f), None, "nothing is asked offline");
+        assert_eq!(
+            picker(&f).status,
+            ConversationsStatus::Unavailable("not connected".into())
+        );
+        // Nothing was queued for later: coming back online asks nothing.
+        f.model.set_link(Link::Online { latency_ms: 5 });
+        assert_eq!(
+            picker(&f).status,
+            ConversationsStatus::Unavailable("not connected".into())
+        );
+        // Asking again online does.
+        let req = list_conversations(&mut f).expect("asked online");
+        f.model
+            .conversations_listed(req, Ok(ConversationsResult::Unavailable));
+        assert!(matches!(
+            picker(&f).status,
+            ConversationsStatus::Unavailable(reason) if reason.contains("cannot list")
+        ));
+        let req = list_conversations(&mut f).unwrap();
+        f.model
+            .conversations_listed(req, Err(TransportError::BadStatus(503)));
+        assert_eq!(
+            picker(&f).status,
+            ConversationsStatus::Unavailable(TransportError::BadStatus(503).to_string())
+        );
+    }
+
+    #[test]
+    fn the_picker_needs_a_paired_device_on_the_session_list() {
+        let mut model = Model::new(empty_snapshot(), None);
+        assert!(model.dispatch(Action::ListConversations).is_empty());
+
+        let mut f = Fixture::paired();
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(list_conversations(&mut f), None);
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert!(list_conversations(&mut f).is_some());
+        // Leaving the list ends the picker.
+        f.dispatch(Action::Navigate(Route::Settings));
+        f.dispatch(Action::Navigate(Route::SessionList));
+        assert_eq!(f.list_view().conversations, None);
+    }
+
+    #[test]
+    fn picker_items_resolve_against_the_replica() {
+        let mut f = Fixture::paired();
+        let first = adopting_session(&mut f, "c1");
+        let other = adopting_session(&mut f, "c2");
+        let again = adopting_session(&mut f, "c1");
+        let running = f.session("/srv/run");
+        let deleted = f.session("/srv/gone");
+        f.model.session_deleted(deleted, &[]);
+        let unpulled = SessionId::new();
+
+        let req = list_conversations(&mut f).unwrap();
+        f.model.conversations_listed(
+            req,
+            conversations(
+                vec![
+                    outside("c1", "/srv/a", Some(running)),
+                    outside("c2", "/srv/a", Some(deleted)),
+                    outside("c3", "/srv/a", Some(unpulled)),
+                ],
+                false,
+            ),
+        );
+        let items = picker(&f).items;
+        let links: Vec<_> = items
+            .iter()
+            .map(|i| (i.id.as_str(), i.session, i.continued_in.clone()))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                // Both adopters, most recently active first.
+                ("c1", Some(running), vec![again, first]),
+                // A session deleted here shows no link.
+                ("c2", None, vec![other]),
+                // Nor does one not pulled yet.
+                ("c3", None, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn continuing_a_pick_ends_the_picker_and_sends_it_verbatim() {
+        let mut f = Fixture::paired();
+        let req = list_conversations(&mut f).unwrap();
+        let workdir = "/srv/my project";
+        let id = "0d6b2c1e-1b1a-4c1e-9f0e-6a2b8c3d4e5f";
+        f.model
+            .conversations_listed(req, conversations(vec![outside(id, workdir, None)], false));
+        let pick = picker(&f).items.remove(0);
+
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: pick.workdir,
+            conversation: Some(pick.id),
+        }));
+        assert_eq!(
+            command.kind,
+            CommandKind::CreateSession {
+                workdir: workdir.into(),
+                conversation: Some(id.into()),
+            }
+        );
+        assert_eq!(f.list_view().conversations, None);
     }
 
     /// What a view shows, for the back tests: the screen and which list.

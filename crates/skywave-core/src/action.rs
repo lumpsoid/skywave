@@ -27,7 +27,8 @@ pub enum Action {
     ///
     /// `conversation` is the agent's own id of a conversation it had
     /// outside Skywave, which the session continues; blank is `None`.
-    /// Whether it is usable is the server's and the agent's call.
+    /// Whether it is usable is the server's and the agent's call. Ends the
+    /// conversation picker and the workdir completion.
     CreateSession {
         workdir: String,
         conversation: Option<String>,
@@ -48,6 +49,14 @@ pub enum Action {
     /// The new-session prompt closed: forget the completion and its
     /// listing.
     EndCompletion,
+    /// Open the conversation picker on the session list (paired only): ask
+    /// the server for its agent's conversations, which the list's
+    /// [`conversations`](crate::SessionListView::conversations) shows.
+    /// Sending it again asks again; an older answer is then ignored.
+    /// Offline it is `Unavailable` at once and nothing is asked later.
+    ListConversations,
+    /// The conversation picker closed: forget its listing.
+    EndConversations,
     /// Queue a message, written for the session view's
     /// [`context`](crate::SessionView::context).
     SendMessage {

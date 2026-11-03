@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use chrono::Utc;
-use skywave_proto::{ChangesResult, CommandResult, DirsResult, EventBatch, HelloResponse};
+use skywave_proto::{
+    ChangesResult, CommandResult, ConversationsResult, DirsResult, EventBatch, HelloResponse,
+};
 
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, lock};
@@ -57,6 +59,13 @@ pub enum Request {
     ListDirs {
         req: u64,
         dir: String,
+    },
+    /// List the conversations the server's agent keeps, for the
+    /// conversation picker, within
+    /// [`CONVERSATIONS_TIMEOUT`](crate::CONVERSATIONS_TIMEOUT).
+    /// Answer with [`Seam::conversations_listed`], naming `req`.
+    ListConversations {
+        req: u64,
     },
     /// Read the session's workdir as `ask` says, within
     /// [`WORKDIR_TIMEOUT`](crate::workdir::WORKDIR_TIMEOUT). Answer with
@@ -340,6 +349,23 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state| {
                 state.model.dirs_listed(req, result);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::ListConversations`] `req`. Kept in memory
+    /// only; an answer to an older request than the latest, or one that
+    /// arrives after the picker closed, is ignored.
+    pub fn conversations_listed(
+        &self,
+        req: u64,
+        result: Result<ConversationsResult, TransportError>,
+    ) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.conversations_listed(req, result);
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});
