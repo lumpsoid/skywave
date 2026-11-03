@@ -7,18 +7,33 @@
 use skywave_core::{Attention, RunWhen};
 
 use crate::format::shell_end_label;
+use crate::text::bidi_escape;
 
 /// Longest session title an alert or notice names, in `char`s.
 pub const TITLE_MAX: usize = 100;
 
 /// `text` safe to name in an alert, a terminal escape sequence included,
-/// and on one line: control characters (C0, DEL, C1) and `;` dropped, at
-/// most [`TITLE_MAX`] `char`s kept.
+/// and on one line: control characters (C0, DEL, C1) and `;` dropped, a
+/// bidirectional formatting character escaped as [`clean`](crate::text::clean) does
+/// (`<U+202E>`), at most [`TITLE_MAX`] `char`s kept. The cap counts the
+/// escapes and never cuts one in half: one that would not fit ends the
+/// title.
 pub fn sanitise(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() && *c != ';')
-        .take(TITLE_MAX)
-        .collect()
+    let mut out = String::new();
+    let mut len = 0;
+    for c in text.chars().filter(|c| !c.is_control() && *c != ';') {
+        let escape = bidi_escape(c);
+        let width = escape.as_ref().map_or(1, |e| e.chars().count());
+        if len + width > TITLE_MAX {
+            break;
+        }
+        len += width;
+        match escape {
+            Some(escape) => out.push_str(&escape),
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// New approvals came in.
@@ -228,5 +243,32 @@ mod tests {
     #[test]
     fn titles_are_capped() {
         assert_eq!(sanitise(&"é".repeat(150)).chars().count(), TITLE_MAX);
+    }
+
+    #[test]
+    fn bidi_controls_in_titles_show_as_escapes() {
+        assert_eq!(
+            sanitise("fix \u{202E}gnp.exe;\u{2066}x\u{2069}"),
+            "fix <U+202E>gnp.exe<U+2066>x<U+2069>"
+        );
+        let alert = AlertWatcher::new(&attention(0, &[])).observe(&attention(1, &["a\u{202E}b"]));
+        assert_eq!(
+            alert.map(|a| a.notice()).as_deref(),
+            Some("approval needed · a<U+202E>b")
+        );
+    }
+
+    #[test]
+    fn the_cap_counts_escapes_and_never_splits_one() {
+        // 95 chars, then an 8-char escape that would end at 103: it is left
+        // out whole rather than cut to `<U+2`.
+        let title = format!("{}\u{202E}tail", "a".repeat(TITLE_MAX - 5));
+        assert_eq!(sanitise(&title), "a".repeat(TITLE_MAX - 5));
+        // One that fits exactly is kept.
+        let title = format!("{}\u{2066}tail", "a".repeat(TITLE_MAX - 8));
+        let kept = sanitise(&title);
+        assert_eq!(kept, format!("{}<U+2066>", "a".repeat(TITLE_MAX - 8)));
+        assert_eq!(kept.chars().count(), TITLE_MAX);
+        assert_eq!(sanitise(&"\u{202E}".repeat(50)).chars().count(), 96);
     }
 }
