@@ -18,8 +18,9 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
-    Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, DeviceRef, Entry, Outgoing,
-    Query, RuleSuggestion, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
+    Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, DeviceRef, Entry,
+    ImportedEntry, Outgoing, Query, RuleSuggestion, SessionView, TimelineItem, ToolKind,
+    ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
     adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes, context_moved_line,
@@ -311,6 +312,21 @@ impl Layout<'_> {
             }
             Entry::Adopted { conversation } => {
                 return context_divider(lead, &adopted_line(conversation));
+            }
+            // Plain rows until imported history gets its own rendering.
+            Entry::Imported { entry, .. } => {
+                let (label, text) = match entry {
+                    ImportedEntry::UserMessage { text } => ("imported you: ", text.clone()),
+                    ImportedEntry::AgentMessage { text } => ("imported agent: ", text.clone()),
+                    ImportedEntry::Tool(view) => ("imported tool: ", view.title.clone()),
+                    ImportedEntry::ToolResult { summary, .. } => {
+                        ("imported result: ", summary.clone())
+                    }
+                };
+                return self.message(lead, vec![Span::raw(label).dark_gray()], &text, mark);
+            }
+            Entry::ImportFinished { .. } => {
+                return context_divider(lead, "imported history ends here");
             }
             Entry::Renamed { name, by } => {
                 let who = if by.me {

@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, Seq, SessionId,
-    SessionState, ToolCall, ToolResult, TurnUsage,
+    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, ImportedItem, Seq,
+    SessionId, SessionOrigin, SessionState, ToolCall, ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -54,6 +54,10 @@ pub struct SessionSummary {
     /// The session's current context: its first (which has the session's
     /// id) until a `ContextStarted` or `ContextSwitched` names another.
     pub context: ContextId,
+    /// The session adopted an outside conversation (`SessionCreated` from
+    /// `SessionOrigin::Agent`) and its `ImportFinished` is not in the
+    /// replica yet: an import too long for one pull is still arriving.
+    pub importing: bool,
 }
 
 /// What a session's turns took: the newest turn's figures and the sums over
@@ -154,6 +158,7 @@ impl SessionSummary {
             agent: AgentSettings::default(),
             work: AgentWork::default(),
             context: ContextId::first_of(event.session_id),
+            importing: false,
         };
         summary.apply(seq, event);
         summary
@@ -165,7 +170,8 @@ impl SessionSummary {
     /// mode or model event only the agent settings, a change of background
     /// tasks or schedules only the agent's work, a context cleared or
     /// switched only the current context, and the models an agent offers
-    /// or a context moved away nothing here: none is activity, so they move
+    /// or a context moved away nothing here, imported history only an unset
+    /// `first_prompt`: none is activity, so they move
     /// neither `last_seq` nor `last_activity` and the session keeps its
     /// place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
@@ -199,9 +205,22 @@ impl SessionSummary {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. }
-            | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => return,
+            | EventKind::ShellFinished { .. } => return,
+            EventKind::ImportFinished { .. } => {
+                self.importing = false;
+                return;
+            }
+            // Imported history is a record, not activity; but its first
+            // prompt titles the session, as the import precedes every
+            // message sent through Skywave.
+            EventKind::Imported { item, .. } => {
+                if let ImportedItem::UserMessage { text } = item
+                    && self.first_prompt.is_none()
+                {
+                    self.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
+                }
+                return;
+            }
             _ => {}
         }
         self.last_seq = seq;
@@ -210,9 +229,10 @@ impl SessionSummary {
             self.notable += 1;
         }
         match &event.kind {
-            EventKind::SessionCreated { workdir, .. } => {
+            EventKind::SessionCreated { workdir, from, .. } => {
                 self.workdir = Some(workdir.clone());
                 self.context = event.context;
+                self.importing = matches!(from, Some(SessionOrigin::Agent { .. }));
             }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
             EventKind::ApprovalRequested { id, .. } => {
@@ -365,7 +385,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
 
 /// The blobs an event references: a tool call's input and the whole of its
 /// display body, a result's output, an approval's input, a finished shell
-/// run's whole output.
+/// run's whole output; the same for an imported call or result, so a
+/// policy that fetches everything fetches imported history too.
 pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
     let (first, second) = match kind {
         EventKind::ToolCall(ToolCall { input, display, .. }) => (
@@ -409,8 +430,14 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ShellStarted { .. }
         | EventKind::ShellOutput { .. }
         | EventKind::ImportFinished { .. } => (None, None),
-        // Not fetched yet: the replica does not fold imported history.
-        EventKind::Imported { .. } => (None, None),
+        EventKind::Imported { item, .. } => match item {
+            ImportedItem::ToolCall(ToolCall { input, display, .. }) => (
+                input.as_ref(),
+                display.body.as_ref().and_then(|body| body.full.as_ref()),
+            ),
+            ImportedItem::ToolResult(ToolResult { output, .. }) => (output.as_ref(), None),
+            ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. } => (None, None),
+        },
     };
     first.into_iter().chain(second)
 }

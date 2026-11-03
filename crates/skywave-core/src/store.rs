@@ -291,6 +291,12 @@ CREATE TABLE workdir_blob_refs (
 );
 CREATE INDEX workdir_blob_refs_by_blob ON workdir_blob_refs (blob_id);
 "#,
+    r#"
+-- `SessionSummary::importing` (protocol v16): an adopted session whose
+-- `ImportFinished` is not stored yet. A replica from before this holds no
+-- events of v16, so no session is mid-import: nothing to backfill.
+ALTER TABLE sessions ADD COLUMN importing INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// Highest schema version this build understands.
@@ -1607,7 +1613,7 @@ fn when_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<RunWhen> {
 }
 
 const SESSION_COLUMNS: &str = "id, workdir, state, pending_approvals, last_activity, last_seq, \
-    stopped, notable, name, first_prompt, archived, usage, agent, context, work";
+    stopped, notable, name, first_prompt, archived, usage, agent, context, work, importing";
 
 fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummary>, StoreError> {
     Ok(conn
@@ -1622,7 +1628,7 @@ fn read_session(conn: &Connection, id: SessionId) -> Result<Option<SessionSummar
 fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), StoreError> {
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+            "INSERT OR REPLACE INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
         ),
         params![
             summary.id.0.to_string(),
@@ -1640,6 +1646,7 @@ fn write_session(tx: &Transaction<'_>, summary: &SessionSummary) -> Result<(), S
             to_json(&summary.agent)?,
             summary.context.0.to_string(),
             to_json(&summary.work)?,
+            summary.importing,
         ],
     )?;
     Ok(())
@@ -1662,6 +1669,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
         agent: opt_json_col(row, 12)?.unwrap_or_default(),
         context: ContextId(uuid_col(row, 13)?),
         work: opt_json_col(row, 14)?.unwrap_or_default(),
+        importing: row.get(15)?,
     })
 }
 

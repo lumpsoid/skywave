@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, DeviceInfo, DirsResult, Event,
-    EventBatch, EventKind, Fingerprint, RejectReason, RuleSuggestion, SessionOrigin,
+    EventBatch, EventKind, Fingerprint, ImportedItem, RejectReason, RuleSuggestion, SessionOrigin,
     SessionState as LogState, TaskId, ToolCall, ToolKind, ToolResult,
 };
 
@@ -34,8 +34,8 @@ use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
     BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode,
     ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry,
-    ErrorInfo, FailReason, FileBody, FileChange, FileResult, Link, LinkRejection, ListKind,
-    ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
+    ErrorInfo, FailReason, FileBody, FileChange, FileResult, ImportedEntry, Link, LinkRejection,
+    ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
     PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView,
     SessionRef, SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert,
     ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
@@ -1301,6 +1301,13 @@ impl Model {
                     }
                     return first.or(Some(*seq));
                 }
+                // Imported history is never news, and a read mark cannot
+                // pass it (it is not activity, so `last_seq` stays before
+                // it). An adopted session's creation and its history are
+                // one unit: the divider goes after its `ImportFinished`,
+                // never at or inside it.
+                EventKind::Imported { .. } => {}
+                EventKind::ImportFinished { .. } => first = None,
                 kind => {
                     let at = *first.get_or_insert(*seq);
                     if is_notable(kind) {
@@ -1690,6 +1697,7 @@ impl Model {
                     },
                     cost_usd: s.usage.as_ref().and_then(|u| u.total.cost_usd),
                     deletable: self.deletable(s),
+                    importing: s.importing,
                 }
             })
             .collect();
@@ -1706,11 +1714,15 @@ impl Model {
             .outbox
             .iter()
             .filter_map(|e| match &e.command.kind {
-                CommandKind::CreateSession { workdir, .. } => {
+                CommandKind::CreateSession {
+                    workdir,
+                    conversation,
+                } => {
                     let outgoing = Outgoing::from(&e.status);
                     (!self.in_replica(outgoing)).then(|| PendingSession {
                         command_id: e.command.id,
                         workdir: workdir.clone(),
+                        conversation: conversation.clone(),
                         outgoing,
                         discardable: e.discardable(),
                     })
@@ -1828,7 +1840,8 @@ impl Model {
                         | Entry::ContextSwitched { .. }
                         | Entry::ContextMoved { .. }
                         | Entry::MovedFrom { .. }
-                        | Entry::Adopted { .. },
+                        | Entry::Adopted { .. }
+                        | Entry::ImportFinished { .. },
                     ..
                 } => false,
                 TimelineItem::Logged { context, .. } | TimelineItem::Pending { context, .. } => {
@@ -2308,9 +2321,23 @@ impl Model {
             if let EventKind::ContextMoved { to, .. } = &event.kind {
                 context.moved_to = Some(self.session_ref(*to));
             }
+            // When the server logged it: imported history, logged with the
+            // session's creation, moves it no further than that.
             context.last_activity = Some(event.at);
-            if let EventKind::UserMessage { text, .. } = &event.kind {
-                logged.extend(event.command_id);
+            // An adopted conversation's imported prompts are the first
+            // context's messages too, so it is labelled like the session.
+            let text = match &event.kind {
+                EventKind::UserMessage { text, .. } => {
+                    logged.extend(event.command_id);
+                    Some(text)
+                }
+                EventKind::Imported {
+                    item: ImportedItem::UserMessage { text },
+                    ..
+                } => Some(text),
+                _ => None,
+            };
+            if let Some(text) = text {
                 context.messages += 1;
                 if context.first_prompt.is_none() {
                     context.first_prompt = first_line(text, FIRST_PROMPT_MAX_CHARS);
@@ -2415,6 +2442,9 @@ impl Model {
         let mut logged = HashSet::new();
         let mut items = Vec::with_capacity(events.len());
         let mut tools = ToolIndex::default();
+        // Each imported call's item and time: kept apart from `tools`, so no
+        // approval, unanswered list or subagent status reaches them.
+        let mut imported_calls: HashMap<CallId, (usize, Option<DateTime<Utc>>)> = HashMap::new();
         // The device behind each mode or model request, by its command.
         let mut asked_by: HashMap<CommandId, DeviceId> = HashMap::new();
         // Each context's name, and the context current at this point.
@@ -2451,31 +2481,14 @@ impl Model {
                 EventKind::AgentMessage { text, .. } => {
                     Some(Entry::AgentMessage { text: text.clone() })
                 }
-                EventKind::ToolCall(ToolCall {
-                    call: Some(call),
-                    name,
-                    display,
-                    input,
-                    ..
-                }) if !tools.calls.contains_key(call) => {
+                EventKind::ToolCall(
+                    tool @ ToolCall {
+                        call: Some(call), ..
+                    },
+                ) if !tools.calls.contains_key(call) => {
                     tools.calls.insert(*call, (items.len(), event.at));
-                    Some(Entry::Tool(Box::new(ToolView {
-                        call: *call,
-                        name: name.clone(),
-                        kind: display.kind,
-                        title: display.title.clone(),
-                        detail: display.detail.clone(),
-                        body: display.body.as_ref().map(|body| BodyView {
-                            format: body.format,
-                            preview: body.preview.clone(),
-                            lines: body.lines,
-                            full: body.full.as_ref().map(|b| self.blob_view(b)),
-                        }),
-                        input: input.as_ref().map(|b| self.blob_view(b)),
-                        approval: None,
-                        outcome: ToolOutcome::Running { since: event.at },
-                        subagent: None,
-                    })))
+                    let running = ToolOutcome::Running { since: event.at };
+                    Some(Entry::Tool(Box::new(self.tool_view(*call, tool, running))))
                 }
                 // No call id (v1), or one already taken.
                 EventKind::ToolCall(ToolCall {
@@ -2613,8 +2626,15 @@ impl Model {
                 | EventKind::ShellStarted { .. }
                 | EventKind::ShellOutput { .. }
                 | EventKind::ShellFinished { .. } => None,
-                // Not shown yet: the timeline does not fold imported history.
-                EventKind::Imported { .. } | EventKind::ImportFinished { .. } => None,
+                EventKind::Imported { at, item } => self
+                    .imported(&mut items, &mut imported_calls, *at, item)
+                    .map(|entry| Entry::Imported {
+                        at: at.unwrap_or(event.at),
+                        entry,
+                    }),
+                EventKind::ImportFinished { outcome } => Some(Entry::ImportFinished {
+                    outcome: outcome.clone(),
+                }),
                 EventKind::PermissionModeRequested { by, .. }
                 | EventKind::ModelRequested { by, .. }
                 | EventKind::EffortRequested { by, .. } => {
@@ -2772,6 +2792,90 @@ impl Model {
             _ => None,
         }));
         (items, tools.granted)
+    }
+
+    /// The view of the linked call `call` as `tool` logged it, with
+    /// `outcome` and nothing folded in yet.
+    fn tool_view(&self, call: CallId, tool: &ToolCall, outcome: ToolOutcome) -> ToolView {
+        let ToolCall {
+            name,
+            display,
+            input,
+            ..
+        } = tool;
+        ToolView {
+            call,
+            name: name.clone(),
+            kind: display.kind,
+            title: display.title.clone(),
+            detail: display.detail.clone(),
+            body: display.body.as_ref().map(|body| BodyView {
+                format: body.format,
+                preview: body.preview.clone(),
+                lines: body.lines,
+                full: body.full.as_ref().map(|b| self.blob_view(b)),
+            }),
+            input: input.as_ref().map(|b| self.blob_view(b)),
+            approval: None,
+            outcome,
+            subagent: None,
+        }
+    }
+
+    /// The timeline entry of one imported `item` the agent recorded `at`
+    /// (`None`: it did not say); `None` for a result folded into its
+    /// imported call in `items`, found through `calls`. An imported call
+    /// starts with no result, never running: nothing will ever answer it.
+    /// What a folded call took is known only when the agent timed both the
+    /// call and the result: the log's time is another clock, so a pair
+    /// missing either one took zero.
+    fn imported(
+        &self,
+        items: &mut [TimelineItem],
+        calls: &mut HashMap<CallId, (usize, Option<DateTime<Utc>>)>,
+        at: Option<DateTime<Utc>>,
+        item: &ImportedItem,
+    ) -> Option<ImportedEntry> {
+        match item {
+            ImportedItem::UserMessage { text } => {
+                Some(ImportedEntry::UserMessage { text: text.clone() })
+            }
+            ImportedItem::AgentMessage { text } => {
+                Some(ImportedEntry::AgentMessage { text: text.clone() })
+            }
+            // The server gives every imported call a fresh id, so neither
+            // a missing nor a repeated one occurs; such a call is not shown.
+            ImportedItem::ToolCall(tool) => {
+                let call = tool.call.filter(|call| !calls.contains_key(call))?;
+                calls.insert(call, (items.len(), at));
+                let view = self.tool_view(call, tool, ToolOutcome::NoResult);
+                Some(ImportedEntry::Tool(Box::new(view)))
+            }
+            ImportedItem::ToolResult(result) => {
+                let call = result.call.and_then(|call| calls.get(&call).copied());
+                if let Some((item, called)) = call
+                    && let Some(view) = imported_tool_at(items, item)
+                    && matches!(view.outcome, ToolOutcome::NoResult)
+                {
+                    view.outcome = ToolOutcome::Done {
+                        is_error: result.is_error,
+                        status: result.status.clone(),
+                        preview: result.preview.clone(),
+                        lines: result.lines,
+                        output: result.output.as_ref().map(|b| self.blob_view(b)),
+                        took: match (called, at) {
+                            (Some(called), Some(at)) => (at - called).to_std().unwrap_or_default(),
+                            _ => std::time::Duration::ZERO,
+                        },
+                    };
+                    return None;
+                }
+                Some(ImportedEntry::ToolResult {
+                    summary: result.preview.clone(),
+                    output: result.output.as_ref().map(|b| self.blob_view(b)),
+                })
+            }
+        }
     }
 
     /// This device's latest answer to an approval, its rule read from what
@@ -3085,6 +3189,20 @@ fn tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
     }
 }
 
+fn imported_tool_at(items: &mut [TimelineItem], item: usize) -> Option<&mut ToolView> {
+    match items.get_mut(item)? {
+        TimelineItem::Logged {
+            entry:
+                Entry::Imported {
+                    entry: ImportedEntry::Tool(view),
+                    ..
+                },
+            ..
+        } => Some(view.as_mut()),
+        _ => None,
+    }
+}
+
 /// How many names [`fresh_context_name`] draws before it numbers one.
 const CONTEXT_NAME_ROLLS: usize = 64;
 
@@ -3170,7 +3288,8 @@ mod tests {
 
     use chrono::{TimeDelta, TimeZone, Utc};
     use skywave_proto::{
-        BlobRef, Decision, Effort, RejectReason, RuleScope, ToolDisplay, ToolKind, ToolResult,
+        BlobRef, Decision, Effort, ImportOutcome, RejectReason, RuleScope, ToolDisplay, ToolKind,
+        ToolResult,
     };
 
     use super::*;
@@ -5557,6 +5676,7 @@ mod tests {
             vec![PendingSession {
                 command_id: command.id,
                 workdir: "/srv/new".into(),
+                conversation: None,
                 outgoing: Outgoing::Queued,
                 discardable: true,
             }]
@@ -5828,6 +5948,448 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Adopted { .. } | Entry::MovedFrom { .. }))
         );
+    }
+
+    fn adopted_created() -> EventKind {
+        EventKind::SessionCreated {
+            workdir: "/srv/a".into(),
+            context_name: "start".into(),
+            from: Some(SessionOrigin::Agent {
+                conversation: "conv-1".into(),
+            }),
+        }
+    }
+
+    /// An imported item the agent recorded at `minute` past 08:00 on
+    /// 2026-11-01, or with no time.
+    fn imported(minute: Option<u32>, item: ImportedItem) -> EventKind {
+        EventKind::Imported {
+            at: minute.map(|m| Utc.with_ymd_and_hms(2026, 11, 1, 8, m, 0).unwrap()),
+            item,
+        }
+    }
+
+    fn imported_text(user: bool, text: &str) -> ImportedItem {
+        let text = text.to_owned();
+        if user {
+            ImportedItem::UserMessage { text }
+        } else {
+            ImportedItem::AgentMessage { text }
+        }
+    }
+
+    fn imported_call(call: CallId, title: &str, input: Option<BlobRef>) -> ImportedItem {
+        let EventKind::ToolCall(mut tool) = tool_call(Some(call), ToolKind::Shell, title) else {
+            unreachable!()
+        };
+        tool.input = input;
+        ImportedItem::ToolCall(tool)
+    }
+
+    fn imported_result(call: CallId, preview: &str, output: Option<BlobRef>) -> ImportedItem {
+        let EventKind::ToolResult(mut result) = tool_result(Some(call), false, preview) else {
+            unreachable!()
+        };
+        result.output = output;
+        ImportedItem::ToolResult(result)
+    }
+
+    /// Logs an adopted session as the server does: its `SessionCreated`
+    /// and imported `items` naming no command, then the `ImportFinished`
+    /// naming `command`, all in the first context.
+    fn log_adopted(
+        f: &mut Fixture,
+        session: SessionId,
+        command: CommandId,
+        items: Vec<EventKind>,
+    ) -> Seq {
+        let first = ContextId::first_of(session);
+        let outcome = ImportOutcome::Imported {
+            items: items.len() as u32,
+        };
+        let mut events = vec![(None, first, adopted_created())];
+        events.extend(items.into_iter().map(|kind| (None, first, kind)));
+        events.push((Some(command), first, EventKind::ImportFinished { outcome }));
+        f.log_stamped(session, events);
+        Seq(f.events.len() as u64)
+    }
+
+    #[test]
+    fn an_adopted_timeline_shows_the_imported_history_then_the_sessions_own() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let (done, open) = (CallId::new(), CallId::new());
+        let output = BlobRef {
+            id: BlobId::new(),
+            size: 9000,
+        };
+        let finished = log_adopted(
+            &mut f,
+            adopted,
+            CommandId::new(),
+            vec![
+                imported(Some(0), imported_text(true, "fix the build")),
+                imported(None, imported_text(false, "looking")),
+                imported(Some(2), imported_call(done, "cargo build", None)),
+                imported(Some(5), imported_result(done, "ok", Some(output.clone()))),
+                imported(Some(6), imported_call(open, "sleep 100", None)),
+            ],
+        );
+        f.log(adopted, vec![message("go on"), agent("on it")]);
+        f.open(adopted);
+        let view = f.session_view();
+        let logged: Vec<(Seq, DateTime<Utc>, Entry)> = view
+            .timeline
+            .into_iter()
+            .map(|item| match item {
+                TimelineItem::Logged { seq, at, entry, .. } => (seq, at, entry),
+                pending => panic!("nothing pending: {pending:?}"),
+            })
+            .collect();
+        let at = |minute| Utc.with_ymd_and_hms(2026, 11, 1, 8, minute, 0).unwrap();
+        let tool = |call, title: &str, outcome| {
+            let EventKind::ToolCall(tool) = tool_call(Some(call), ToolKind::Shell, title) else {
+                unreachable!()
+            };
+            ImportedEntry::Tool(Box::new(f.model.tool_view(call, &tool, outcome)))
+        };
+        let shown: Vec<&Entry> = logged.iter().map(|(_, _, e)| e).collect();
+        assert_eq!(
+            shown,
+            vec![
+                &Entry::Adopted {
+                    conversation: "conv-1".into()
+                },
+                &Entry::Imported {
+                    at: at(0),
+                    entry: ImportedEntry::UserMessage {
+                        text: "fix the build".into()
+                    },
+                },
+                // No time recorded: when the server logged it.
+                &Entry::Imported {
+                    at: logged[2].1,
+                    entry: ImportedEntry::AgentMessage {
+                        text: "looking".into()
+                    },
+                },
+                // The call and its result are one row, timed by the agent.
+                &Entry::Imported {
+                    at: at(2),
+                    entry: tool(
+                        done,
+                        "cargo build",
+                        ToolOutcome::Done {
+                            is_error: false,
+                            status: None,
+                            preview: "ok".into(),
+                            lines: 1,
+                            output: Some(BlobView {
+                                id: output.id,
+                                state: BlobState::NotDownloaded { size: 9000 },
+                            }),
+                            took: Duration::from_secs(180),
+                        },
+                    ),
+                },
+                // Never answered, and never running: nothing waits on it.
+                &Entry::Imported {
+                    at: at(6),
+                    entry: tool(open, "sleep 100", ToolOutcome::NoResult),
+                },
+                &Entry::ImportFinished {
+                    outcome: ImportOutcome::Imported { items: 5 }
+                },
+                shown[6],
+                &Entry::AgentMessage {
+                    text: "on it".into()
+                },
+            ]
+        );
+        assert!(
+            matches!(shown[6], Entry::UserMessage { text, .. } if text == "go on"),
+            "{shown:?}"
+        );
+        assert_eq!(logged[5].0, finished);
+        // The item is placed at the log's time; the agent's sits in the entry.
+        assert_ne!(logged[1].1, at(0));
+        // Searched like the session's own.
+        let timeline = f.session_view().timeline;
+        let hits = |text: &str| -> Vec<usize> {
+            crate::search::find(&timeline, &crate::search::Query::new(text), &mut |_| None)
+                .hits
+                .iter()
+                .map(|hit| hit.index)
+                .collect()
+        };
+        assert_eq!(hits("fix the"), [1]);
+        assert_eq!(hits("looking"), [2]);
+        assert_eq!(hits("cargo"), [3]);
+        assert_eq!(hits("sleep"), [4]);
+        assert_eq!(hits("go on"), [6], "positive control: a live message");
+
+        // Narrowed to the first context: the imported history stays, its
+        // divider goes with the others.
+        f.dispatch(Action::ViewContext {
+            session_id: adopted,
+            context: Some(ContextId::first_of(adopted)),
+        });
+        let narrowed = entries(&f);
+        assert_eq!(narrowed.len(), 6, "{narrowed:?}");
+        assert!(matches!(narrowed[0], Entry::Imported { .. }));
+        assert!(
+            !narrowed
+                .iter()
+                .any(|e| matches!(e, Entry::ImportFinished { .. } | Entry::Adopted { .. }))
+        );
+    }
+
+    #[test]
+    fn imported_history_is_not_news_and_does_not_move_the_session() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let mut items = Vec::new();
+        for i in 0..250 {
+            let call = CallId::new();
+            items.push(imported(
+                Some(0),
+                imported_text(true, &format!("prompt {i}")),
+            ));
+            items.push(imported(
+                Some(1),
+                imported_text(false, &format!("answer {i}")),
+            ));
+            items.push(imported(Some(2), imported_call(call, "ls", None)));
+            items.push(imported(Some(3), imported_result(call, "a.txt", None)));
+        }
+        assert_eq!(items.len(), 1000);
+        log_adopted(&mut f, adopted, CommandId::new(), items);
+        let summary = f.model.summary(adopted).unwrap().clone();
+        assert_eq!(summary.notable, 0);
+        assert_eq!(summary.last_seq, Seq(1), "the SessionCreated's");
+        assert_eq!(summary.last_activity, f.events[0].at);
+        assert!(!summary.importing);
+        assert_eq!(unread(&f, adopted), 0);
+        f.open(adopted);
+        assert_eq!(f.session_view().unread_from, None);
+        // Read to the end: the mark stops at the last activity, before the
+        // imported history.
+        f.dispatch(Action::MarkRead {
+            session_id: adopted,
+            through: Seq(1002),
+        });
+        assert_eq!(f.model.read_marks[&adopted].seq, Seq(1));
+        f.dispatch(Action::Back);
+
+        // The session's own news after it is unread, and its divider comes
+        // after the imported history, not inside it.
+        f.log(adopted, vec![agent("back")]);
+        let summary = f.model.summary(adopted).unwrap().clone();
+        assert_eq!(summary.notable, 1);
+        assert_eq!(summary.last_seq, Seq(1003));
+        assert_eq!(unread(&f, adopted), 1);
+        f.open(adopted);
+        assert_eq!(f.session_view().unread_from, Some(Seq(1003)));
+    }
+
+    #[test]
+    fn a_never_read_adopted_session_shows_news_after_its_import() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let items = (0..10)
+            .map(|i| imported(None, imported_text(i % 2 == 0, &format!("item {i}"))))
+            .collect();
+        let finished = log_adopted(&mut f, adopted, CommandId::new(), items);
+        f.log(adopted, vec![message("go on"), agent("back")]);
+        assert!(!f.model.read_marks.contains_key(&adopted));
+        f.open(adopted);
+        // The first live item after the import, not the `Adopted` row.
+        assert_eq!(f.session_view().unread_from, Some(Seq(finished.0 + 1)));
+        // Positive control: a plain session never read is new from its start.
+        f.dispatch(Action::Back);
+        let plain = f.session("/srv/b");
+        f.log(plain, vec![agent("hello")]);
+        f.open(plain);
+        assert_eq!(f.session_view().unread_from, Some(Seq(finished.0 + 3)));
+    }
+
+    #[test]
+    fn an_imported_call_took_only_what_the_agent_timed() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let (both, no_result_time, no_call_time) = (CallId::new(), CallId::new(), CallId::new());
+        log_adopted(
+            &mut f,
+            adopted,
+            CommandId::new(),
+            vec![
+                imported(Some(1), imported_call(both, "a", None)),
+                imported(Some(4), imported_result(both, "ok", None)),
+                // Only one side timed: the other would be the log's clock.
+                // A month before the log's time, so the mix would not be
+                // cut to zero by being negative.
+                EventKind::Imported {
+                    at: Some(Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap()),
+                    item: imported_call(no_result_time, "b", None),
+                },
+                imported(None, imported_result(no_result_time, "ok", None)),
+                imported(None, imported_call(no_call_time, "c", None)),
+                imported(Some(59), imported_result(no_call_time, "ok", None)),
+            ],
+        );
+        f.open(adopted);
+        let took: Vec<(CallId, Duration)> = entries(&f)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Imported {
+                    entry: ImportedEntry::Tool(view),
+                    ..
+                } => match view.outcome {
+                    ToolOutcome::Done { took, .. } => Some((view.call, took)),
+                    other => panic!("{other:?}"),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            took,
+            [
+                (both, Duration::from_secs(180)),
+                (no_result_time, Duration::ZERO),
+                (no_call_time, Duration::ZERO),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_imported_prompt_titles_the_session_and_its_first_context() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        log_adopted(
+            &mut f,
+            adopted,
+            CommandId::new(),
+            vec![
+                imported(Some(0), imported_text(false, "hello, how can I help")),
+                imported(Some(1), imported_text(true, "\n  fix the build\nplease")),
+                imported(Some(2), imported_text(true, "and the tests")),
+            ],
+        );
+        f.log(adopted, vec![message("now the docs")]);
+        assert_eq!(row(&f, adopted).title, "fix the build");
+        f.open(adopted);
+        let view = f.session_view();
+        assert_eq!(view.title, "fix the build");
+        let [context] = view.contexts.as_slice() else {
+            panic!("{:?}", view.contexts)
+        };
+        assert_eq!(context.first_prompt.as_deref(), Some("fix the build"));
+        assert_eq!(context.messages, 3, "two imported prompts and one sent");
+        f.dispatch(Action::Back);
+        // Positive control: a plain session's title is its first message.
+        let plain = f.session("/srv/b");
+        f.log(plain, vec![message("hi there")]);
+        assert_eq!(row(&f, plain).title, "hi there");
+    }
+
+    #[test]
+    fn imported_blobs_are_in_the_replica_like_live_ones() {
+        let mut f = Fixture::paired();
+        let adopted = SessionId::new();
+        let call = CallId::new();
+        let (input, output) = (
+            BlobRef {
+                id: BlobId::new(),
+                size: 5000,
+            },
+            BlobRef {
+                id: BlobId::new(),
+                size: 7000,
+            },
+        );
+        log_adopted(
+            &mut f,
+            adopted,
+            CommandId::new(),
+            vec![
+                imported(Some(0), imported_call(call, "ls", Some(input.clone()))),
+                imported(
+                    Some(1),
+                    imported_result(call, "a.txt", Some(output.clone())),
+                ),
+            ],
+        );
+        assert!(f.model.blobs.contains_key(&input.id));
+        assert!(f.model.blobs.contains_key(&output.id));
+    }
+
+    #[test]
+    fn an_adopting_creation_is_pending_with_its_conversation_until_its_import_is_in() {
+        let mut f = Fixture::paired();
+        let command = queued(&f.dispatch(Action::CreateSession {
+            workdir: "/srv/a".into(),
+            conversation: Some("conv-1".into()),
+        }));
+        let creating = |f: &Fixture| f.list_view().creating;
+        assert_eq!(
+            creating(&f),
+            vec![PendingSession {
+                command_id: command.id,
+                workdir: "/srv/a".into(),
+                conversation: Some("conv-1".into()),
+                outgoing: Outgoing::Queued,
+                discardable: true,
+            }]
+        );
+        f.model.command_sending(command.id, Utc::now());
+        assert_eq!(creating(&f)[0].outgoing, Outgoing::Sending);
+
+        // A long import: the first pull brings the session and part of its
+        // history, the command's `ImportFinished` comes in the next.
+        let adopted = SessionId::new();
+        let first = ContextId::first_of(adopted);
+        let items: Vec<_> = (0..600)
+            .map(|i| {
+                (
+                    None,
+                    first,
+                    imported(None, imported_text(true, &format!("p {i}"))),
+                )
+            })
+            .collect();
+        let finished = Seq(602);
+        f.model.command_result(
+            command.id,
+            CommandResult::Accepted { seq: finished },
+            Utc::now(),
+        );
+        let mut head = vec![(None, first, adopted_created())];
+        head.extend(items[..499].iter().cloned());
+        f.log_stamped(adopted, head);
+        let list = f.list_view();
+        assert_eq!(list.creating.len(), 1, "its seq is not in yet");
+        let [listed] = list.sessions.as_slice() else {
+            panic!("{list:?}")
+        };
+        assert!(listed.importing, "{listed:?}");
+        assert_eq!(listed.title, "p 0");
+
+        let mut rest = items[499..].to_vec();
+        rest.push((
+            Some(command.id),
+            first,
+            EventKind::ImportFinished {
+                outcome: ImportOutcome::Imported { items: 600 },
+            },
+        ));
+        f.log_stamped(adopted, rest);
+        assert_eq!(f.events.len() as u64, finished.0);
+        let list = f.list_view();
+        assert_eq!(list.creating, Vec::new());
+        assert!(!list.sessions[0].importing);
+        // Positive control: a fresh session never imports.
+        let plain = f.session("/srv/b");
+        assert!(!row(&f, plain).importing);
     }
 
     #[test]

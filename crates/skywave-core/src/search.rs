@@ -2,7 +2,7 @@
 //! and where in a text. Heads keep the query and which match is current;
 //! the rules are here so every head matches alike.
 //!
-//! What the view holds is searched: messages (pending ones too), errors,
+//! What the view holds is searched: messages (pending and imported ones too), errors,
 //! tool names, titles, details, statuses and the bounded previews. So is
 //! the content of the blobs behind the timeline that are already
 //! downloaded, as far as the head reads them ([`BlobText`]); a search
@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use crate::blobs::read_head;
 use crate::view::{
-    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, TimelineItem, ToolOutcome,
+    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, ImportedEntry, TimelineItem,
+    ToolOutcome, ToolView,
 };
 
 /// Most of a downloaded blob a search reads: the head of a longer one.
@@ -215,27 +216,51 @@ pub fn find(
 /// (the input is then all there is to see).
 pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
     match entry {
-        Entry::Tool(view) => {
-            let mut out: Vec<&BlobView> = Vec::new();
-            out.extend(view.body.as_ref().and_then(|body| body.full.as_ref()));
-            if let ToolOutcome::Done {
-                output: Some(output),
-                ..
-            } = &view.outcome
-            {
-                out.push(output);
-            }
-            if out.is_empty() {
-                out.extend(view.input.as_ref());
-            }
-            out
-        }
+        Entry::Tool(view)
+        | Entry::Imported {
+            entry: ImportedEntry::Tool(view),
+            ..
+        } => tool_blobs(view),
         Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => {
             input.as_ref().into_iter().collect()
         }
-        Entry::ToolResult { output, .. } => output.as_ref().into_iter().collect(),
+        Entry::ToolResult { output, .. }
+        | Entry::Imported {
+            entry: ImportedEntry::ToolResult { output, .. },
+            ..
+        } => output.as_ref().into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn tool_blobs(view: &ToolView) -> Vec<&BlobView> {
+    let mut out: Vec<&BlobView> = Vec::new();
+    out.extend(view.body.as_ref().and_then(|body| body.full.as_ref()));
+    if let ToolOutcome::Done {
+        output: Some(output),
+        ..
+    } = &view.outcome
+    {
+        out.push(output);
+    }
+    if out.is_empty() {
+        out.extend(view.input.as_ref());
+    }
+    out
+}
+
+fn tool_texts(view: &ToolView) -> Vec<&str> {
+    let mut out = vec![view.name.as_str(), view.title.as_str()];
+    out.extend(view.detail.as_deref());
+    out.extend(view.body.as_ref().map(|body| body.preview.as_str()));
+    if let ToolOutcome::Done {
+        status, preview, ..
+    } = &view.outcome
+    {
+        out.extend(status.as_deref());
+        out.push(preview);
+    }
+    out
 }
 
 /// The texts of an item a search looks through.
@@ -247,19 +272,14 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
     match entry {
         Entry::UserMessage { text, .. } | Entry::AgentMessage { text } => vec![text],
         Entry::AgentErrored { message } => vec![message],
-        Entry::Tool(view) => {
-            let mut out = vec![view.name.as_str(), view.title.as_str()];
-            out.extend(view.detail.as_deref());
-            out.extend(view.body.as_ref().map(|body| body.preview.as_str()));
-            if let ToolOutcome::Done {
-                status, preview, ..
-            } = &view.outcome
-            {
-                out.extend(status.as_deref());
-                out.push(preview);
+        Entry::Tool(view) => tool_texts(view),
+        Entry::Imported { entry, .. } => match entry {
+            ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text } => {
+                vec![text]
             }
-            out
-        }
+            ImportedEntry::Tool(view) => tool_texts(view),
+            ImportedEntry::ToolResult { summary, .. } => vec![summary],
+        },
         Entry::ToolCall { name, summary, .. } => vec![name, summary],
         Entry::ToolResult { summary, .. } => vec![summary],
         Entry::Approval { tool, summary, .. } => vec![tool, summary],
@@ -288,9 +308,11 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
             out.extend(refused.as_deref());
             out
         }
-        Entry::Interrupted | Entry::Stopped | Entry::Archived { .. } | Entry::TurnUsage(_) => {
-            Vec::new()
-        }
+        Entry::Interrupted
+        | Entry::Stopped
+        | Entry::Archived { .. }
+        | Entry::TurnUsage(_)
+        | Entry::ImportFinished { .. } => Vec::new(),
     }
 }
 

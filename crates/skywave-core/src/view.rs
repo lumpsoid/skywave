@@ -15,9 +15,9 @@ use uuid::Uuid;
 pub use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, ChangeSet, ChangedFile,
     ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
-    FileBody, FileChange, FileResult, LinkTarget, ListResult, ModelChoice, PermissionMode, Refusal,
-    RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId,
-    ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
+    FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, ModelChoice,
+    PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
+    ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 
 pub use crate::projection::{SessionUsage, TurnRecord};
@@ -520,6 +520,11 @@ pub struct SessionRow {
     /// would remove it: it is archived, has no pending approval, no running
     /// turn and no command from this device still unanswered.
     pub deletable: bool,
+    /// The session adopted an outside conversation whose imported history
+    /// is not all in the replica yet (its `ImportFinished` has not been
+    /// pulled): a long import arrives over several pulls. Its
+    /// [`PendingSession`] may show beside it until then.
+    pub importing: bool,
 }
 
 /// What the usage screen totals: every turn in the replica that reported
@@ -552,6 +557,10 @@ pub struct UsageSession {
 pub struct PendingSession {
     pub command_id: CommandId,
     pub workdir: String,
+    /// The outside conversation it adopts, by the agent's own id: the
+    /// server imports its history when the command arrives. `None`: a
+    /// fresh conversation.
+    pub conversation: Option<String>,
     pub outgoing: Outgoing,
     /// [`Action::Discard`](crate::Action::Discard) takes it back: the server
     /// never saw it, or refused it.
@@ -1112,10 +1121,25 @@ pub enum Entry {
         name: String,
     },
     /// The session's first item when it was made by adopting the agent's
-    /// outside conversation `conversation`; its earlier history is not
-    /// shown here.
+    /// outside conversation `conversation`. What the server could read of
+    /// that conversation follows as [`Entry::Imported`] items, then one
+    /// [`Entry::ImportFinished`]; the session's own entries come after.
     Adopted {
         conversation: String,
+    },
+    /// One item of an adopted conversation's history, as the agent kept it
+    /// outside Skywave: a record, never unread news and never running.
+    /// `at` is when the agent recorded it, or when the server logged it if
+    /// the agent did not say. Part of the session's first context.
+    Imported {
+        at: DateTime<Utc>,
+        entry: ImportedEntry,
+    },
+    /// Where an adopted conversation's imported history ends and the
+    /// session's own begins, and how the import went. Not shown when the
+    /// timeline is narrowed to one context.
+    ImportFinished {
+        outcome: ImportOutcome,
     },
     /// The session was renamed; `None` restored its default title.
     Renamed {
@@ -1143,6 +1167,28 @@ pub enum Entry {
         setting: AgentSetting,
         by: Option<DeviceRef>,
         refused: Option<String>,
+    },
+}
+
+/// What an [`Entry::Imported`] holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportedEntry {
+    /// A prompt the user gave the agent outside Skywave; no device sent it.
+    UserMessage {
+        text: String,
+    },
+    AgentMessage {
+        text: String,
+    },
+    /// An imported call with its imported result folded in. Without a
+    /// result its outcome is [`ToolOutcome::NoResult`], never `Running`:
+    /// nothing is waiting on it. It has no approval and no subagent status.
+    Tool(Box<ToolView>),
+    /// An imported result no imported call links to (the agent's own call
+    /// was not on the imported branch), or a second one for a call.
+    ToolResult {
+        summary: String,
+        output: Option<BlobView>,
     },
 }
 
@@ -1237,7 +1283,8 @@ pub enum ToolOutcome {
     /// No result yet, possibly waiting on its approval; `since` is the
     /// call's time.
     Running { since: DateTime<Utc> },
-    /// The tool finished; `took` runs from the call to its result.
+    /// The tool finished; `took` runs from the call to its result. For an
+    /// imported call it is zero (unknown) unless the agent timed both.
     Done {
         is_error: bool,
         /// Short outcome, e.g. `exit 1`.

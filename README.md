@@ -179,9 +179,9 @@ the default title back.
 `c` on the session list continues a Claude Code conversation you started
 outside Skywave: enter the directory `claude` ran in (under your `roots`),
 then paste the session id. The GUI's New session dialog has the same as an
-optional field. The session shows none of the earlier history, but the agent
-has it; Skywave works on a copy (a fork), so the terminal's session is
-untouched and the two diverge.
+optional field. The session starts with the earlier history the server could
+read, imported once on every device and never unread; Skywave works on a copy
+(a fork), so the terminal's session is untouched and the two diverge.
 
 `a` on the session list archives the selected session on every device, and
 `A` switches between the active and the archived sessions (`a` there brings
