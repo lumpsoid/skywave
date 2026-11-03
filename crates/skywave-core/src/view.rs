@@ -881,7 +881,8 @@ pub struct ContextView {
     pub discard_move: Option<CommandId>,
     /// [`Action::MoveContext`](crate::Action::MoveContext) is worth
     /// offering: its agent has worked in it (so there is a conversation to
-    /// fork), it is not moved nor is this device's move of it on its way,
+    /// fork; history imported by an adoption is not enough, D32), it is not
+    /// moved nor is this device's move of it on its way,
     /// and no message of this device to it is still outside the replica
     /// (it would go out before the clear that comes with moving the
     /// current context, and the clear would interrupt the turn it starts).

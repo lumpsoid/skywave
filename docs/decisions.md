@@ -498,7 +498,11 @@ divider, `Entry::Adopted`.
 **Not carried:** mode, model, effort and grants (as D30). The outside
 conversation's cumulative spend shows in the fork's `total_cost_usd`;
 per-turn cost is unaffected. An adopted first context that never ran
-(cleared before its first message) cannot be moved (`NoConversation`).
+(cleared before its first message) cannot be moved (`NoConversation`): its
+only handle is stored at its agent's first start, and imported history (D37)
+is not its agent's work, so the core does not offer the move either
+(decided 2026-11-03). Adopting the same conversation again from the picker
+continues it in a new session instead.
 **Deferred:** showing the outside history and listing adoptable
 conversations / picking from a list in a head, both since taken up by
 D37; handing a conversation back to the
