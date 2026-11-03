@@ -1455,6 +1455,11 @@ void main() {
       sent.last,
       const GuiIntentAct(action: ActionIntentInterrupt(sessionId: 's1')),
     );
+    await tester.tap(find.byTooltip('Workdir'));
+    expect(
+      sent.last,
+      const GuiIntentAct(action: ActionIntentOpenWorkdir(sessionId: 's1')),
+    );
     await tester.tap(find.byTooltip('More'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Rename'));

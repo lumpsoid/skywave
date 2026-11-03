@@ -2543,3 +2543,453 @@ fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
         )
     );
 }
+
+mod workdir {
+    use skywave_core::{
+        BlobId, BlobState, BlobView, ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry,
+        EntryKind, FileBody, FileChange, FileResult, LinkTarget, ListResult, Screen, WorkdirBody,
+        WorkdirFetch, WorkdirPane, WorkdirView,
+    };
+    use skywave_present::workdir::NOT_FETCHED;
+    use skywave_proto::BlobRef;
+
+    use super::*;
+    use crate::signals::{
+        BlobStateKind, WorkdirChangeKind, WorkdirLine, WorkdirLineKind, WorkdirPaneKind,
+        WorkdirScreen,
+    };
+
+    fn taken() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap()
+    }
+
+    /// The workdir screen the head sends for `body` on `pane`, the clock
+    /// an hour after [`taken`].
+    fn shown(
+        rig: &mut Rig,
+        pane: WorkdirPane,
+        fetch: WorkdirFetch,
+        body: WorkdirBody,
+    ) -> WorkdirScreen {
+        rig.clock.wall_ms = (taken() + chrono::Duration::hours(1)).timestamp_millis();
+        let mut view = rig.core.view();
+        view.screen = Screen::Workdir(WorkdirView {
+            session: rig.session,
+            title: "fix the build".into(),
+            workdir: Some("/srv/work".into()),
+            pane,
+            last_dir: "src".into(),
+            fetch,
+            body,
+        });
+        let outs = rig.head.on_view(view, rig.clock);
+        rig.apply(outs);
+        match &rig.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Workdir { workdir } => workdir.clone(),
+            other => panic!("not the workdir screen: {other:?}"),
+        }
+    }
+
+    fn file(path: &str, change: FileChange, diff: DiffBody) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            from: None,
+            change,
+            added: Some(1),
+            removed: Some(1),
+            diff,
+        }
+    }
+
+    /// A downloaded blob holding `text`, in the rig's directory.
+    fn available(rig: &Rig, text: &str) -> BlobView {
+        let path = rig._dir.path().join(format!("blob-{}", BlobId::new().0));
+        std::fs::write(&path, text).unwrap();
+        BlobView {
+            id: BlobId::new(),
+            state: BlobState::Available { path },
+        }
+    }
+
+    fn line(kind: WorkdirLineKind, text: &str) -> WorkdirLine {
+        WorkdirLine {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn the_workdir_changes_pane_lists_files_and_carries_no_content() {
+        let mut rig = Rig::new();
+        let set = ChangeSet {
+            at: taken(),
+            branch: Some("main".into()),
+            head: Some("1a2b3c4".into()),
+            files: vec![
+                file("a.txt", FileChange::Modified, DiffBody::Omitted),
+                file("new.txt", FileChange::Untracked, DiffBody::Binary),
+            ],
+            total: 3,
+        };
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Changes(ChangesResult::Changes(set)),
+        );
+        assert_eq!(screen.pane, WorkdirPaneKind::Changes);
+        assert_eq!(screen.title, "fix the build");
+        assert_eq!(screen.last_dir, "src");
+        assert_eq!(screen.header, "main @ 1a2b3c4 · taken 12:00:00");
+        assert_eq!(screen.wording, None);
+        assert_eq!(screen.fetch_label, None);
+        assert_eq!(screen.notes, ["Showing 2 of 3 changed files."]);
+        let rows: Vec<_> = screen
+            .changes
+            .iter()
+            .map(|r| {
+                (
+                    r.change,
+                    r.mark.as_str(),
+                    r.path.as_str(),
+                    r.counts_label.as_deref(),
+                    r.untracked,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    WorkdirChangeKind::Modified,
+                    "M",
+                    "a.txt",
+                    Some("+1 \u{2212}1"),
+                    false
+                ),
+                (
+                    WorkdirChangeKind::Untracked,
+                    "?",
+                    "new.txt",
+                    Some("binary"),
+                    true
+                ),
+            ]
+        );
+        assert!(screen.entries.is_empty());
+        assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_screen_words_not_git_never_read_and_a_failed_read() {
+        let mut rig = Rig::new();
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Failed("offline".into()),
+            WorkdirBody::Changes(ChangesResult::NotGit),
+        );
+        assert_eq!(
+            screen.wording.as_deref(),
+            Some("Not a git repository. Browse the files under Files.")
+        );
+        assert_eq!(screen.header, "Changes");
+        assert_eq!(
+            screen.fetch_label.as_deref(),
+            Some("Refresh failed: offline")
+        );
+        assert!(screen.fetch_failed);
+
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Idle,
+            WorkdirBody::Nothing,
+        );
+        assert_eq!(screen.wording.as_deref(), Some(NOT_FETCHED));
+        assert!(!screen.fetch_failed);
+
+        // Loading says so in the fetch label, not as the wording.
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Changes,
+            WorkdirFetch::Loading,
+            WorkdirBody::Nothing,
+        );
+        assert_eq!(screen.wording, None);
+        assert_eq!(screen.fetch_label.as_deref(), Some("Loading\u{2026}"));
+    }
+
+    #[test]
+    fn the_workdir_diff_carries_its_lines_with_kinds_from_the_whole_diff() {
+        let mut rig = Rig::new();
+        let blob = available(
+            &rig,
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n---x\n+++y\n same\n",
+        );
+        let changed = file(
+            "a.txt",
+            FileChange::Modified,
+            DiffBody::Blob(BlobRef {
+                id: blob.id,
+                size: 80,
+            }),
+        );
+        let pane = WorkdirPane::Diff {
+            path: "a.txt".into(),
+            untracked: false,
+        };
+        let screen = shown(
+            &mut rig,
+            pane.clone(),
+            WorkdirFetch::Idle,
+            WorkdirBody::Diff {
+                file: Some(changed.clone()),
+                blob: Some(blob.clone()),
+            },
+        );
+        assert_eq!(screen.pane, WorkdirPaneKind::Diff);
+        assert_eq!(screen.path, "a.txt");
+        assert_eq!(screen.header, "M a.txt  +1 \u{2212}1");
+        assert_eq!(screen.wording, None);
+        let content = screen.content.unwrap();
+        assert_eq!(content.blob.state, BlobStateKind::Available);
+        assert_eq!(content.blob.blob_id, blob.id.0.to_string());
+        assert_eq!(content.cut, None);
+        assert_eq!(
+            content.lines,
+            [
+                line(WorkdirLineKind::FileHeader, "diff --git a/a.txt b/a.txt"),
+                line(WorkdirLineKind::FileHeader, "--- a/a.txt"),
+                line(WorkdirLineKind::FileHeader, "+++ b/a.txt"),
+                line(WorkdirLineKind::Hunk, "@@ -1,2 +1,2 @@"),
+                // Inside a hunk these are content, not headers.
+                line(WorkdirLineKind::Removed, "---x"),
+                line(WorkdirLineKind::Added, "+++y"),
+                line(WorkdirLineKind::Context, " same"),
+            ]
+        );
+
+        // Before it is here: its download, no lines.
+        let waiting = BlobView {
+            id: blob.id,
+            state: BlobState::Failed {
+                size: 80,
+                reason: "offline".into(),
+            },
+        };
+        let screen = shown(
+            &mut rig,
+            pane.clone(),
+            WorkdirFetch::Idle,
+            WorkdirBody::Diff {
+                file: Some(changed),
+                blob: Some(waiting),
+            },
+        );
+        let content = screen.content.unwrap();
+        assert!(content.blob.can_download);
+        assert!(content.lines.is_empty());
+
+        // A file gone from the changes says so, with no content.
+        let screen = shown(
+            &mut rig,
+            pane,
+            WorkdirFetch::Idle,
+            WorkdirBody::Diff {
+                file: None,
+                blob: None,
+            },
+        );
+        assert!(screen.wording.unwrap().contains("no longer in the changes"));
+        assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_dir_lists_entries_with_their_paths_and_no_content() {
+        let mut rig = Rig::new();
+        let entry = |name: &str, kind, size| DirEntry {
+            name: name.into(),
+            kind,
+            size,
+        };
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Dir { path: "src".into() },
+            WorkdirFetch::Idle,
+            WorkdirBody::Dir(ListResult::Listed {
+                at: taken(),
+                path: "src".into(),
+                entries: vec![
+                    entry("b.rs", EntryKind::File, Some(812)),
+                    entry(
+                        "l",
+                        EntryKind::Link {
+                            to: LinkTarget::Dir,
+                        },
+                        None,
+                    ),
+                    entry("a", EntryKind::Dir, None),
+                ],
+                truncated: false,
+            }),
+        );
+        assert_eq!(screen.pane, WorkdirPaneKind::Dir);
+        assert_eq!(screen.header, "./src · taken 12:00:00");
+        assert!(screen.can_go_up);
+        let rows: Vec<_> = screen
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.name.as_str(),
+                    e.detail.as_deref(),
+                    e.opens,
+                    e.path.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("a/", None, WorkdirPaneKind::Dir, "src/a"),
+                (
+                    "l",
+                    Some("\u{2192} directory"),
+                    WorkdirPaneKind::Dir,
+                    "src/l"
+                ),
+                ("b.rs", Some("812 B"), WorkdirPaneKind::File, "src/b.rs"),
+            ]
+        );
+        assert!(screen.changes.is_empty());
+        assert_eq!(screen.content, None);
+
+        // The workdir itself has no way up.
+        let screen = shown(
+            &mut rig,
+            WorkdirPane::Dir {
+                path: String::new(),
+            },
+            WorkdirFetch::Idle,
+            WorkdirBody::Dir(ListResult::NotFound),
+        );
+        assert!(!screen.can_go_up);
+        assert!(screen.wording.unwrap().starts_with("Not found"));
+    }
+
+    #[test]
+    fn the_workdir_file_shows_plain_lines_and_opens_whole() {
+        let mut rig = Rig::new();
+        let blob = available(&rig, "fn main() {}\n-not a diff\n");
+        let pane = WorkdirPane::File {
+            path: "src/main.rs".into(),
+        };
+        let screen = shown(
+            &mut rig,
+            pane.clone(),
+            WorkdirFetch::Idle,
+            WorkdirBody::File {
+                result: FileResult::File {
+                    at: taken(),
+                    path: "src/main.rs".into(),
+                    size: 25,
+                    content: FileBody::Blob(BlobRef {
+                        id: blob.id,
+                        size: 25,
+                    }),
+                },
+                blob: Some(blob.clone()),
+            },
+        );
+        assert_eq!(screen.header, "src/main.rs  25 B · taken 12:00:00");
+        assert_eq!(
+            screen.content.unwrap().lines,
+            [
+                line(WorkdirLineKind::Plain, "fn main() {}"),
+                line(WorkdirLineKind::Plain, "-not a diff"),
+            ]
+        );
+
+        let outs = rig.intent(GuiIntent::OpenFull {
+            blob_id: blob.id.0.to_string(),
+        });
+        let BlobState::Available { path } = &blob.state else {
+            unreachable!()
+        };
+        assert!(
+            outs.iter().any(|out| matches!(
+                out,
+                Out::Effect(PlatformEffect::OpenFile { path: p }) if *p == path.display().to_string()
+            )),
+            "{outs:?}"
+        );
+
+        let screen = shown(
+            &mut rig,
+            pane,
+            WorkdirFetch::Idle,
+            WorkdirBody::File {
+                result: FileResult::NotAFile,
+                blob: None,
+            },
+        );
+        assert_eq!(
+            screen.wording.as_deref(),
+            Some("A FIFO, socket or device: not opened.")
+        );
+        assert_eq!(screen.content, None);
+    }
+
+    #[test]
+    fn the_workdir_intents_dispatch_their_actions() {
+        let mut rig = Rig::new();
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::OpenWorkdir {
+                session_id: rig.session.0.to_string(),
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::ShowWorkdir {
+                pane: WorkdirPaneKind::Diff,
+                path: "a.txt".into(),
+                untracked: true,
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::ShowWorkdir {
+                pane: WorkdirPaneKind::Dir,
+                path: "src".into(),
+                untracked: false,
+            },
+        });
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::RefreshWorkdir,
+        });
+        let workdir: Vec<_> = rig
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::OpenWorkdir { .. } | Action::ShowWorkdir(_) | Action::RefreshWorkdir
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            workdir,
+            [
+                Action::OpenWorkdir {
+                    session_id: rig.session
+                },
+                Action::ShowWorkdir(WorkdirPane::Diff {
+                    path: "a.txt".into(),
+                    untracked: true
+                }),
+                Action::ShowWorkdir(WorkdirPane::Dir { path: "src".into() }),
+                Action::RefreshWorkdir,
+            ]
+        );
+    }
+}

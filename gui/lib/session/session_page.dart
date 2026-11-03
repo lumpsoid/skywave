@@ -284,6 +284,17 @@ class _SessionPageState extends State<SessionPage> {
                           ),
                         ),
                     IconButton(
+                      tooltip: 'Workdir',
+                      onPressed: screen.workdir == null
+                          ? null
+                          : () => widget.send.act(
+                              ActionIntentOpenWorkdir(
+                                sessionId: screen.sessionId,
+                              ),
+                            ),
+                      icon: const Icon(Icons.folder_open),
+                    ),
+                    IconButton(
                       tooltip: 'Search (Ctrl+F)',
                       onPressed: _openSearch,
                       icon: const Icon(Icons.search),

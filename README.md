@@ -69,7 +69,14 @@ queued like any other command.
 Large tool inputs and outputs become **blobs**: you get a short preview in the timeline
 and fetch the full content only when you open it. Downloads resume where they
 stopped. Prefer everything up front on a good link? Switch the blob policy
-from `OnDemand` to `Eager`.
+from `OnDemand` to `Eager`. Workdir diffs and files still download only when
+you open them.
+
+### 📂 See the workdir
+Check what the agent actually changed without a shell on the server. Open a
+session's workdir to see its net git changes, with a diff per file, or browse
+its files. It is read-only and fetched only when you ask, and what you read
+stays on the device, so you can still read it offline.
 
 ### 📡 You always know where you stand
 A link banner is always on screen: `Online · 120 ms`, `Catching up`, or

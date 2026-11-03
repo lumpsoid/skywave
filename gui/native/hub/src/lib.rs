@@ -26,6 +26,7 @@ mod search;
 mod shell;
 mod signals;
 mod timeline;
+mod workdir;
 
 use rinf::{dart_shutdown, write_interface};
 use tokio::sync::oneshot;

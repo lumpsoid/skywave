@@ -11,6 +11,7 @@
 //! - [`timeline`]: the open session's timeline, snapshot then keyed diffs.
 //! - [`search`]: the timeline search (`SearchUpdate`).
 //! - [`shell`]: the open session's shell runs, snapshot then keyed diffs.
+//! - [`workdir`]: the workdir screen's data (`ScreenView::Workdir`).
 //! - [`effects`]: one-shot platform effects (`PlatformEffect`).
 
 mod boot;
@@ -21,6 +22,7 @@ mod screen;
 mod search;
 mod shell;
 mod timeline;
+mod workdir;
 
 pub use boot::{Boot, BootFailed, Booted};
 pub use effects::PlatformEffect;
@@ -39,4 +41,8 @@ pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};
 pub use timeline::{
     BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
     SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+};
+pub use workdir::{
+    WorkdirChangeKind, WorkdirChangeRow, WorkdirContent, WorkdirEntryRow, WorkdirLine,
+    WorkdirLineKind, WorkdirPaneKind, WorkdirScreen,
 };

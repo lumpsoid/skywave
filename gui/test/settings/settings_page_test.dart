@@ -9,6 +9,11 @@ void main() {
   testWidgets('settings shows the device and the toggle sets the policy', (
     tester,
   ) async {
+    // Tall enough that the fingerprint, under the blob wording, is built.
+    tester.view
+      ..physicalSize = const Size(800, 900)
+      ..devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     final sent = <GuiIntent>[];
     await tester.pumpWidget(
       MaterialApp(
@@ -35,6 +40,10 @@ void main() {
     ]) {
       expect(find.text(text), findsOneWidget, reason: text);
     }
+    expect(
+      find.textContaining('Workdir diffs and files download only when opened'),
+      findsOneWidget,
+    );
     await tester.tap(find.text('Eager'));
     await tester.drag(find.byType(ListView), const Offset(0, -300));
     await tester.pump();

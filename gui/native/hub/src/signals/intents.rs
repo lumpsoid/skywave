@@ -2,6 +2,7 @@ use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
 use super::screen::{EffortView, PermissionModeView, UsageGroupingView, UsageSpanView};
+use super::workdir::WorkdirPaneKind;
 
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
 /// signals only within a type, and the order matters (an edit before the
@@ -118,8 +119,8 @@ pub enum GuiIntent {
     DownloadItem {
         key: String,
     },
-    /// Open a downloaded blob's whole file (a section's `blob`), past the
-    /// display cap.
+    /// Open a downloaded blob's whole file (a section's `blob`, or the
+    /// workdir diff or file shown), past the display cap.
     OpenFull {
         blob_id: String,
     },
@@ -311,6 +312,20 @@ pub enum ActionIntent {
     OpenSession {
         session_id: String,
     },
+    /// The session's workdir screen, at its changes; it reads them.
+    OpenWorkdir {
+        session_id: String,
+    },
+    /// A pane of the workdir screen: `path` names the diff's file, the
+    /// directory or the file (ignored for `Changes`); `untracked` tells a
+    /// diff's two entries for one path apart.
+    ShowWorkdir {
+        pane: WorkdirPaneKind,
+        path: String,
+        untracked: bool,
+    },
+    /// Read the workdir pane shown again.
+    RefreshWorkdir,
     OpenNextApproval,
     DownloadBlob {
         blob_id: String,
