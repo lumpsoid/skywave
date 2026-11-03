@@ -28,3 +28,11 @@ pub struct BootFailed {
     pub message: String,
     pub unreadable: bool,
 }
+
+/// The hub task panicked: `message` is the panic's. The core is closed and
+/// nothing the GUI sends is acted on until Dart sends [`Boot`] again, which
+/// opens the core afresh and answers [`Booted`] (or [`BootFailed`]).
+#[derive(Debug, Serialize, RustSignal)]
+pub struct HubFailed {
+    pub message: String,
+}

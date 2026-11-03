@@ -4,7 +4,8 @@
 //! `rinf gen` reads every signal type in the crate into one flat namespace,
 //! so names are unique across files and avoid Flutter's own.
 //!
-//! - [`boot`]: `Boot` in, `Booted`/`BootFailed` out.
+//! - [`boot`]: `Boot` in, `Booted`/`BootFailed` out, `HubFailed` on a
+//!   panic.
 //! - [`intents`]: every GUI intent after boot, as one ordered `GuiIntent`.
 //! - [`link`]: the banner (`LinkUpdate`).
 //! - [`screen`]: the screen and its data but the timeline (`ScreenUpdate`).
@@ -24,7 +25,7 @@ mod shell;
 mod timeline;
 mod workdir;
 
-pub use boot::{Boot, BootFailed, Booted};
+pub use boot::{Boot, BootFailed, Booted, HubFailed};
 pub use effects::PlatformEffect;
 pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, RouteView};
 pub use link::{LinkState, LinkUpdate};

@@ -20,20 +20,27 @@ final class BootReady extends BootStatus {
   const BootReady();
 }
 
-/// Rust could not open the core; [message] says why. [unreadable]: the
-/// local data is from another build or damaged, so a retry alone fails
-/// again and resetting it is offered.
+/// Rust could not open the core, or its hub stopped; [message] says why.
+/// [unreadable]: the local data is from another build or damaged, so a
+/// retry alone fails again and resetting it is offered. [crashed]: the hub
+/// panicked after booting ([HubFailed]); booting again restarts it.
 final class BootError extends BootStatus {
-  const BootError(this.message, {this.unreadable = false});
+  const BootError(
+    this.message, {
+    this.unreadable = false,
+    this.crashed = false,
+  });
 
   final String message;
   final bool unreadable;
+  final bool crashed;
 }
 
 /// Whether Rust has booted. Created at start, lives for the app's lifetime.
 class BootHolder extends ChangeNotifier {
   StreamSubscription<void>? _booted;
   StreamSubscription<void>? _failed;
+  StreamSubscription<void>? _crashed;
 
   BootStatus get status => _status;
   BootStatus _status = const BootPending();
@@ -43,6 +50,9 @@ class BootHolder extends ChangeNotifier {
     _booted = Booted.rustSignalStream.listen((_) => booted());
     _failed = BootFailed.rustSignalStream.listen(
       (pack) => fail(pack.message.message, unreadable: pack.message.unreadable),
+    );
+    _crashed = HubFailed.rustSignalStream.listen(
+      (pack) => crashed(pack.message.message),
     );
     await boot();
   }
@@ -71,6 +81,12 @@ class BootHolder extends ChangeNotifier {
   void fail(String message, {bool unreadable = false}) =>
       _set(BootError(message, unreadable: unreadable));
 
+  /// Rust answered [HubFailed]: its hub panicked with [panic] and closed
+  /// the core; nothing sent reaches it until the next [Boot].
+  void crashed(String panic) => _set(
+    BootError('Skywave stopped after an internal error: $panic', crashed: true),
+  );
+
   void _set(BootStatus status) {
     _status = status;
     notifyListeners();
@@ -80,6 +96,7 @@ class BootHolder extends ChangeNotifier {
   void dispose() {
     unawaited(_booted?.cancel());
     unawaited(_failed?.cancel());
+    unawaited(_crashed?.cancel());
     super.dispose();
   }
 }

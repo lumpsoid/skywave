@@ -110,6 +110,34 @@ void main() {
     expect(sent, [const GuiIntentAppReady()]);
   });
 
+  testWidgets('a hub crash shows the failure with Restart, which boots', (
+    tester,
+  ) async {
+    final holder = BootHolder();
+    await tester.pumpWidget(
+      SkywaveApp(boot: holder, holders: fakeHolders(), send: (_) {}),
+    );
+    holder.booted();
+    await tester.pump();
+    expect(find.byType(ScreenNavigator), findsOneWidget);
+
+    holder.crashed('index out of bounds');
+    await tester.pump();
+    expect(find.byType(ScreenNavigator), findsNothing);
+    expect(
+      find.text('Skywave stopped after an internal error: index out of bounds'),
+      findsOneWidget,
+    );
+    expect(find.text('Restart'), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+    expect(find.text('Reset local data'), findsNothing);
+
+    // Restart sends Boot again: the spinner until Rust answers.
+    await tester.tap(find.text('Restart'));
+    await tester.pump();
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+  });
+
   testWidgets('leaving and returning to the screen is reported once each', (
     tester,
   ) async {

@@ -583,6 +583,11 @@ skywave-core                 all logic, sync, replica
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.
+  A panic in the hub task is caught around its future (`catch_unwind` per
+  poll): the core is closed (queued actions applied, no stop-time draft
+  save), Dart gets `HubFailed` with the panic's message and shows the boot
+  failure page with Restart, which sends `Boot` and opens the core afresh
+  with a new head. Panics on the dispatch or core threads are not caught.
 - **Boot:** Dart sends its application support directory and device name;
   the hub opens the core in `<dir>/skywave`. The GUI is its own device with
   its own data (D25). A hot restart reruns Rust's `main` and reopens the

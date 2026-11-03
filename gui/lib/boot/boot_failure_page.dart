@@ -1,17 +1,20 @@
 import 'package:flutter/material.dart';
 
-/// Rust's boot failure with a Retry, and "Reset local data" when [onReset]
-/// is given (the local data cannot be read, so a retry alone fails again).
+/// Rust's boot failure with a Retry (worded [retryLabel]: "Restart" after
+/// the hub crashed), and "Reset local data" when [onReset] is given (the
+/// local data cannot be read, so a retry alone fails again).
 class BootFailurePage extends StatelessWidget {
   const BootFailurePage({
     required this.message,
     required this.onRetry,
+    this.retryLabel = 'Retry',
     this.onReset,
     super.key,
   });
 
   final String message;
   final VoidCallback onRetry;
+  final String retryLabel;
   final VoidCallback? onReset;
 
   @override
@@ -31,10 +34,7 @@ class BootFailurePage extends StatelessWidget {
                 runSpacing: 8,
                 alignment: WrapAlignment.center,
                 children: [
-                  ElevatedButton(
-                    onPressed: onRetry,
-                    child: const Text('Retry'),
-                  ),
+                  ElevatedButton(onPressed: onRetry, child: Text(retryLabel)),
                   if (onReset != null)
                     OutlinedButton(
                       onPressed: onReset,
