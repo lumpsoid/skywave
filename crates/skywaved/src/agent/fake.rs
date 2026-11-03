@@ -90,9 +90,15 @@
 //! set the fake reported without that task (nothing when it was not in
 //! the set, as the CLI acks an unknown id). [`FakeScript::refuse_stops`]
 //! makes it answer every stop `TaskStopRefused` instead.
+//!
+//! **Outside conversations.** [`FakeOutside`] is a scripted
+//! [`OutsideConversations`] source, apart from [`FakeAgent`]: its listing
+//! and histories are set by the test, and a history read can be held on a
+//! [`Gate`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -103,8 +109,9 @@ use uuid::Uuid;
 
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
-    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, ModelChoice,
-    PermissionMode, ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, TurnOutcome,
+    AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, HistoryRead, Listed,
+    ModelChoice, OutsideConversations, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
+    RuleSuggestion, SourceError, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -412,18 +419,54 @@ impl Step {
     }
 }
 
-/// A latch a test opens to let a [`Step::Wait`] continue. Clones share it.
+/// A latch a test opens to let a [`Step::Wait`] (or a blocked
+/// [`FakeOutside::history`]) continue. Clones share it.
 #[derive(Debug, Clone)]
-pub struct Gate(Arc<watch::Sender<bool>>);
+pub struct Gate(Arc<GateState>);
+
+#[derive(Debug)]
+struct GateState {
+    /// For async waiters.
+    open: watch::Sender<bool>,
+    /// For blocking waiters, set together with `open`.
+    blocking: (Mutex<bool>, Condvar),
+}
 
 impl Gate {
     pub fn new() -> Gate {
-        Gate(Arc::new(watch::Sender::new(false)))
+        Gate(Arc::new(GateState {
+            open: watch::Sender::new(false),
+            blocking: (Mutex::new(false), Condvar::new()),
+        }))
     }
 
     /// Opens the gate for good; every waiting and later `Wait` passes.
     pub fn open(&self) {
-        self.0.send_replace(true);
+        let (opened, changed) = &self.0.blocking;
+        *lock(opened) = true;
+        changed.notify_all();
+        self.0.open.send_replace(true);
+    }
+
+    /// Whether the gate is open.
+    pub fn is_open(&self) -> bool {
+        *self.0.open.borrow()
+    }
+
+    /// Waits until the gate opens.
+    pub async fn opened(&self) {
+        let mut rx = self.0.open.subscribe();
+        // The sender lives in `self`, so this waits.
+        let _ = rx.wait_for(|open| *open).await;
+    }
+
+    /// Blocks the thread until the gate opens.
+    pub fn wait_blocking(&self) {
+        let (opened, changed) = &self.0.blocking;
+        let mut open = lock(opened);
+        while !*open {
+            open = changed.wait(open).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -1011,7 +1054,7 @@ impl Runner {
 
     /// Blocks until `gate` opens; with no gate, until the turn is stopped.
     async fn wait_gate(&mut self, gate: Option<&Gate>) -> Result<(), Stop> {
-        let mut gate = gate.map(|g| g.0.subscribe());
+        let mut gate = gate.map(|g| g.0.open.subscribe());
         loop {
             let opened = async {
                 match gate.as_mut() {
@@ -1068,6 +1111,111 @@ impl Runner {
     }
 }
 
+/// A scripted [`OutsideConversations`] source. Clones share it.
+///
+/// [`FakeOutside::list`] answers what [`FakeOutside::listing`] set, with
+/// `session` filled in from `own` the way a real source does (default: an
+/// empty listing). [`FakeOutside::history`] answers what
+/// [`FakeOutside::conversation`] set for that workdir and id, else
+/// `NotFound`. [`FakeOutside::block_history`] holds every history read
+/// until its gate opens; [`FakeOutside::history_entered`] opens once a read
+/// has begun, so a test knows one is in flight. Reads are counted
+/// ([`FakeOutside::history_calls`]).
+#[derive(Debug, Clone, Default)]
+pub struct FakeOutside {
+    state: Arc<Mutex<OutsideState>>,
+    entered: Gate,
+}
+
+#[derive(Debug, Default)]
+struct OutsideState {
+    listing: Option<std::result::Result<Listed, SourceError>>,
+    histories: HashMap<(PathBuf, String), HistoryRead>,
+    block: Option<Gate>,
+    history_calls: usize,
+    lists: usize,
+}
+
+impl FakeOutside {
+    pub fn new() -> FakeOutside {
+        FakeOutside::default()
+    }
+
+    /// What every later `list` answers.
+    pub fn listing(&self, listing: std::result::Result<Listed, SourceError>) -> &FakeOutside {
+        lock(&self.state).listing = Some(listing);
+        self
+    }
+
+    /// What `history(workdir, id)` answers.
+    pub fn conversation(&self, workdir: &Path, id: &str, read: HistoryRead) -> &FakeOutside {
+        lock(&self.state)
+            .histories
+            .insert((workdir.to_path_buf(), id.to_owned()), read);
+        self
+    }
+
+    /// Holds every later history read until `gate` opens.
+    pub fn block_history(&self, gate: Gate) -> &FakeOutside {
+        lock(&self.state).block = Some(gate);
+        self
+    }
+
+    /// Opens once a history read has begun (before any block).
+    pub fn history_entered(&self) -> Gate {
+        self.entered.clone()
+    }
+
+    /// History reads begun so far.
+    pub fn history_calls(&self) -> usize {
+        lock(&self.state).history_calls
+    }
+
+    /// Listings asked so far.
+    pub fn lists(&self) -> usize {
+        lock(&self.state).lists
+    }
+}
+
+impl OutsideConversations for FakeOutside {
+    fn list(
+        &self,
+        _roots: &[PathBuf],
+        own: &HashMap<String, SessionId>,
+        max: usize,
+        _deadline: std::time::Instant,
+    ) -> std::result::Result<Listed, SourceError> {
+        let mut state = lock(&self.state);
+        state.lists += 1;
+        let mut listed = state.listing.clone().unwrap_or(Ok(Listed::default()))?;
+        if listed.conversations.len() > max {
+            listed.conversations.truncate(max);
+            listed.truncated = true;
+        }
+        for conversation in &mut listed.conversations {
+            conversation.session = own.get(&conversation.id).copied();
+        }
+        Ok(listed)
+    }
+
+    fn history(&self, workdir: &Path, id: &str, _deadline: std::time::Instant) -> HistoryRead {
+        let block = {
+            let mut state = lock(&self.state);
+            state.history_calls += 1;
+            state.block.clone()
+        };
+        self.entered.open();
+        if let Some(gate) = block {
+            gate.wait_blocking();
+        }
+        lock(&self.state)
+            .histories
+            .get(&(workdir.to_path_buf(), id.to_owned()))
+            .cloned()
+            .unwrap_or(HistoryRead::NotFound)
+    }
+}
+
 /// Sleeps until `deadline`; with none, forever.
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
@@ -1081,4 +1229,117 @@ fn lock<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
     shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc as std_mpsc;
+
+    use super::*;
+    use crate::agent::{HistoryItem, OutsideConversation};
+
+    fn conversation(id: &str) -> OutsideConversation {
+        OutsideConversation {
+            id: id.to_owned(),
+            workdir: "/w".to_owned(),
+            title: None,
+            first_prompt: Some("hi".to_owned()),
+            last_active: chrono::DateTime::UNIX_EPOCH,
+            messages: 1,
+            session: None,
+        }
+    }
+
+    fn deadline() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn fake_outside_lists_what_it_was_given_with_own_sessions() {
+        let fake = FakeOutside::new();
+        assert_eq!(
+            fake.list(&[], &HashMap::new(), 10, deadline()),
+            Ok(Listed::default())
+        );
+        fake.listing(Ok(Listed {
+            conversations: vec![conversation("a"), conversation("b"), conversation("c")],
+            truncated: false,
+        }));
+        let session = SessionId::new();
+        let own = HashMap::from([("b".to_owned(), session)]);
+        let listed = fake.list(&[], &own, 2, deadline()).unwrap();
+        assert!(listed.truncated);
+        let sessions: Vec<_> = listed
+            .conversations
+            .iter()
+            .map(|c| (c.id.as_str(), c.session))
+            .collect();
+        assert_eq!(sessions, [("a", None), ("b", Some(session))]);
+        fake.listing(Err(SourceError::Unavailable));
+        assert_eq!(
+            fake.list(&[], &own, 2, deadline()),
+            Err(SourceError::Unavailable)
+        );
+        assert_eq!(fake.lists(), 3);
+    }
+
+    #[test]
+    fn fake_outside_answers_history_by_workdir_and_id() {
+        let fake = FakeOutside::new();
+        let read = HistoryRead::Read {
+            items: vec![HistoryItem::User {
+                at: None,
+                text: "hi".to_owned(),
+            }],
+        };
+        fake.conversation(Path::new("/w"), "a", read.clone());
+        assert_eq!(fake.history(Path::new("/w"), "a", deadline()), read);
+        assert_eq!(
+            fake.history(Path::new("/other"), "a", deadline()),
+            HistoryRead::NotFound
+        );
+        assert_eq!(fake.history_calls(), 2);
+    }
+
+    #[test]
+    fn a_blocked_history_read_waits_for_its_gate() {
+        let fake = FakeOutside::new();
+        let gate = Gate::new();
+        fake.block_history(gate.clone()).conversation(
+            Path::new("/w"),
+            "a",
+            HistoryRead::Unavailable,
+        );
+        let entered = fake.history_entered();
+        assert!(!entered.is_open());
+        let (tx, rx) = std_mpsc::channel();
+        let reader = fake.clone();
+        let thread = std::thread::spawn(move || {
+            tx.send(reader.history(Path::new("/w"), "a", deadline()))
+                .unwrap();
+        });
+        entered.wait_blocking();
+        assert_eq!(fake.history_calls(), 1);
+        // Still held: no answer until the gate opens.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        );
+        gate.open();
+        assert_eq!(rx.recv().unwrap(), HistoryRead::Unavailable);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_gate_wakes_async_and_blocking_waiters() {
+        let gate = Gate::new();
+        let waiter = gate.clone();
+        let task = tokio::spawn(async move { waiter.opened().await });
+        let blocking = gate.clone();
+        let thread = std::thread::spawn(move || blocking.wait_blocking());
+        gate.open();
+        task.await.unwrap();
+        thread.join().unwrap();
+        assert!(gate.is_open());
+    }
 }

@@ -893,44 +893,12 @@ impl Protocol {
 
     fn on_assistant(&mut self, message: &Value, out: &mut Output) {
         let parent = subagent_parent(message);
-        let Some(blocks) = content_blocks(message) else {
-            return;
+        let tools = if parent.is_some() {
+            &mut self.sub_tools
+        } else {
+            &mut self.tools
         };
-        for block in blocks {
-            match str_field(block, "type") {
-                "text" => {
-                    let text = str_field(block, "text");
-                    if !text.is_empty() {
-                        out.events.push(AdapterEvent::Text {
-                            text: text.to_owned(),
-                            parent: parent.clone(),
-                        });
-                    }
-                }
-                "tool_use" => {
-                    let name = str_field(block, "name").to_owned();
-                    let input = block.get("input").cloned().unwrap_or(Value::Null);
-                    let id = block.get("id").and_then(Value::as_str);
-                    if let Some(id) = id {
-                        let tools = if parent.is_some() {
-                            &mut self.sub_tools
-                        } else {
-                            &mut self.tools
-                        };
-                        tools.insert(id.to_owned(), name.clone());
-                    }
-                    out.events.push(AdapterEvent::ToolCall {
-                        call: id.map(AgentCallId::from),
-                        parent: parent.clone(),
-                        display: display::call_display(&name, &input),
-                        name,
-                        input,
-                    });
-                }
-                // thinking blocks are opaque.
-                _ => {}
-            }
-        }
+        assistant_events(message, parent, tools, &mut out.events);
     }
 
     fn on_user(&mut self, message: &Value, out: &mut Output) {
@@ -938,37 +906,21 @@ impl Protocol {
         // Text blocks here are the CLI's own markers ("[Request interrupted
         // by user]"), or a foreground subagent's prompt, which its `Agent`
         // call already shows; only tool results matter.
-        let Some(blocks) = content_blocks(message) else {
-            return;
-        };
-        let results: Vec<&Value> = blocks
-            .iter()
-            .filter(|b| str_field(b, "type") == "tool_result")
-            .collect();
-        // The structured result sits beside the content, so it is only
-        // unambiguous for a message with one result (as the CLI sends them).
-        let structured = match results.as_slice() {
-            [_] => message.get("tool_use_result"),
-            _ => None,
-        };
-        for block in results {
-            let output = tool_output(block.get("content"));
-            let is_error = block
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let tool_use_id = block.get("tool_use_id").and_then(Value::as_str);
+        let results = tool_results(message);
+        let structured = single_structured(&results, message.get("tool_use_result"));
+        for result in results {
             // A result for a call still awaiting approval: the CLI gave up on
             // the approval (stdin closed, or a timeout of its own). Only that
             // call's: a subagent's result leaves the turn's approvals be.
-            if let Some(tool_use_id) = tool_use_id
+            if let Some(tool_use_id) = result.tool_use_id
                 && let Some(index) = self
                     .pending
                     .iter()
                     .position(|p| p.tool_use_id.as_deref() == Some(tool_use_id))
             {
                 let pending = self.pending.remove(index);
-                let reason = output
+                let reason = result
+                    .output
                     .lines()
                     .map(str::trim)
                     .find(|l| !l.is_empty())
@@ -984,14 +936,12 @@ impl Protocol {
             } else {
                 &mut self.tools
             };
-            let tool = tool_use_id.and_then(|id| tools.remove(id));
-            if tool.as_deref() == Some("CronCreate") && !is_error {
+            let tool = result.tool_use_id.and_then(|id| tools.remove(id));
+            if tool.as_deref() == Some("CronCreate") && !result.is_error {
                 self.note_durable(structured);
             }
-            out.events.push(AdapterEvent::ToolResult {
-                call: tool_use_id.map(AgentCallId::from),
-                result: display::result_display(tool.as_deref(), structured, output, is_error),
-            });
+            out.events
+                .push(result.into_event(tool.as_deref(), structured));
         }
     }
 
@@ -1367,8 +1317,107 @@ impl Protocol {
     }
 }
 
+/// The events of an `assistant` line's content blocks, in order, appended
+/// to `events`: each non-empty `text` block as `Text`, each `tool_use` as
+/// `ToolCall` with the display the adapter knows for its tool; thinking
+/// blocks are opaque and dropped. Each call's tool name is kept in `tools`
+/// by its id, for [`ToolResultBlock::into_event`] to read the result by.
+/// The live stream and stored transcripts share it, so a call looks the
+/// same either way.
+pub(super) fn assistant_events(
+    message: &Value,
+    parent: Option<AgentCallId>,
+    tools: &mut HashMap<String, String>,
+    events: &mut Vec<AdapterEvent>,
+) {
+    let Some(blocks) = content_blocks(message) else {
+        return;
+    };
+    for block in blocks {
+        match str_field(block, "type") {
+            "text" => {
+                let text = str_field(block, "text");
+                if !text.is_empty() {
+                    events.push(AdapterEvent::Text {
+                        text: text.to_owned(),
+                        parent: parent.clone(),
+                    });
+                }
+            }
+            "tool_use" => {
+                let name = str_field(block, "name").to_owned();
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                let id = block.get("id").and_then(Value::as_str);
+                if let Some(id) = id {
+                    tools.insert(id.to_owned(), name.clone());
+                }
+                events.push(AdapterEvent::ToolCall {
+                    call: id.map(AgentCallId::from),
+                    parent: parent.clone(),
+                    display: display::call_display(&name, &input),
+                    name,
+                    input,
+                });
+            }
+            // thinking blocks are opaque.
+            _ => {}
+        }
+    }
+}
+
+/// One `tool_result` block of a `user` line.
+pub(super) struct ToolResultBlock<'a> {
+    pub(super) tool_use_id: Option<&'a str>,
+    pub(super) output: String,
+    pub(super) is_error: bool,
+}
+
+impl ToolResultBlock<'_> {
+    /// The `ToolResult` for this block, read by `tool`, the name of the
+    /// call it answers (if known), and the line's `structured` result.
+    pub(super) fn into_event(self, tool: Option<&str>, structured: Option<&Value>) -> AdapterEvent {
+        AdapterEvent::ToolResult {
+            call: self.tool_use_id.map(AgentCallId::from),
+            result: display::result_display(tool, structured, self.output, self.is_error),
+        }
+    }
+}
+
+/// The `tool_result` blocks of a `user` line, in order.
+pub(super) fn tool_results(message: &Value) -> Vec<ToolResultBlock<'_>> {
+    let Some(blocks) = content_blocks(message) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| str_field(b, "type") == "tool_result")
+        .map(|block| ToolResultBlock {
+            tool_use_id: block.get("tool_use_id").and_then(Value::as_str),
+            output: tool_output(block.get("content")),
+            is_error: block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect()
+}
+
+/// The line's structured result (`tool_use_result` on the stream,
+/// `toolUseResult` in a transcript) for `results`. It sits beside the
+/// content, so it is only unambiguous for a line with one result (as the
+/// CLI writes them).
+pub(super) fn single_structured<'a>(
+    results: &[ToolResultBlock<'_>],
+    structured: Option<&'a Value>,
+) -> Option<&'a Value> {
+    match results {
+        [_] => structured,
+        _ => None,
+    }
+}
+
 /// `message.content` when it is an array of blocks.
-fn content_blocks(message: &Value) -> Option<&Vec<Value>> {
+pub(super) fn content_blocks(message: &Value) -> Option<&Vec<Value>> {
     message
         .get("message")
         .and_then(|m| m.get("content"))
@@ -1420,7 +1469,7 @@ fn applied_effort(raw: Option<&Value>) -> Option<Option<Effort>> {
     }
 }
 
-fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
+pub(super) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 

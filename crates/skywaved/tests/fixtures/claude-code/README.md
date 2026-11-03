@@ -1,5 +1,8 @@
 # Claude Code stream-json fixtures
 
+(Stored transcripts, a different format, are in `transcripts/` with their
+own README.)
+
 Real recordings of Claude Code CLI **2.1.310**, made for T07 on 2026-10-29.
 The protocol notes that go with them are in `docs/agents/claude-code.md`.
 

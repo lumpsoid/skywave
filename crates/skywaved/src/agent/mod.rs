@@ -84,17 +84,28 @@
 //! - The stream ends with [`AdapterEvent::Exited`] when the agent stops, on
 //!   [`AgentSession::shutdown`] or on its own.
 //!
+//! **Outside conversations.** What the agent keeps on this machine, for a
+//! session to adopt, is read through [`OutsideConversations`], apart from
+//! the adapter: a listing of the conversations under the roots, and one
+//! conversation's history as [`HistoryItem`]s (the same [`AdapterEvent`]s a
+//! live session reports, uncut). [`NoOutsideConversations`] is the source
+//! of an agent that keeps none Skywave can read.
+//!
 //! The scripted [`fake::FakeAgent`] implements the trait for deterministic
-//! tests; [`claude_code`] holds the real adapter, the only module that names
-//! the agent it drives (D3).
+//! tests (and [`fake::FakeOutside`] the source); [`claude_code`] holds the
+//! real adapter and source, the only module that names the agent it drives
+//! (D3).
 
 pub mod claude_code;
 pub mod fake;
 mod mapper;
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{ContextId, Decision, SessionId, SessionOrigin};
@@ -473,6 +484,124 @@ pub trait AgentSession: Send + 'static {
     /// without an interrupt is abandoned, not ended, and its approvals are
     /// left for the caller.
     fn shutdown(self) -> impl Future<Output = Result<(), AgentError>> + Send;
+}
+
+/// The conversations an agent keeps on this machine, those had outside
+/// Skywave included, for a session to adopt (`Conversation::Adopt`), and
+/// what was said in one before it was adopted.
+///
+/// Separate from [`AgentAdapter`]: the adapter lives on the supervisor's
+/// runtime, while a listing or a history read is served to the API and to
+/// command handling, so this is a shared, blocking reader (`Send + Sync`;
+/// call it off the async runtime). Every read stays under the server's
+/// roots and on the agent's own files, and gives up at its `deadline`.
+pub trait OutsideConversations: Send + Sync + 'static {
+    /// The newest conversations whose workdir is under `roots`, at most
+    /// `max`, newest first, stopping at `deadline` with what it has
+    /// (`truncated`). `own` maps the ids of the conversations Skywave's
+    /// contexts run to their session, which each listed item carries as
+    /// [`OutsideConversation::session`].
+    fn list(
+        &self,
+        roots: &[PathBuf],
+        own: &HashMap<String, SessionId>,
+        max: usize,
+        deadline: Instant,
+    ) -> std::result::Result<Listed, SourceError>;
+
+    /// The conversation `id` kept for `workdir` (exactly; the caller has
+    /// checked it against the roots), as history items, oldest first.
+    fn history(&self, workdir: &Path, id: &str, deadline: Instant) -> HistoryRead;
+}
+
+/// One conversation in a [`Listed`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutsideConversation {
+    /// The agent's own id, what [`Conversation::Adopt`] names.
+    pub id: String,
+    /// The directory the conversation ran in, canonical and under a root.
+    pub workdir: String,
+    /// The title the agent gave it, if any.
+    pub title: Option<String>,
+    /// The first line of the first prompt, uncut.
+    pub first_prompt: Option<String>,
+    pub last_active: DateTime<Utc>,
+    /// The prompts and the agent's texts in it.
+    pub messages: u32,
+    /// The Skywave session one of whose contexts runs this conversation.
+    pub session: Option<SessionId>,
+}
+
+/// What [`OutsideConversations::list`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Listed {
+    pub conversations: Vec<OutsideConversation>,
+    /// More conversations may exist: the cap or the deadline was reached.
+    pub truncated: bool,
+}
+
+/// Why [`OutsideConversations::list`] has no listing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SourceError {
+    /// This agent cannot list its conversations.
+    #[error("the agent's conversations cannot be listed")]
+    Unavailable,
+    #[error("listing the agent's conversations failed: {0}")]
+    Failed(String),
+}
+
+/// One step of a conversation's history, as [`OutsideConversations::history`]
+/// reads it. `at` is when the agent recorded it, if it did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryItem {
+    /// A message the user sent, verbatim.
+    User {
+        at: Option<DateTime<Utc>>,
+        text: String,
+    },
+    /// What the agent did: only [`AdapterEvent::Text`],
+    /// [`AdapterEvent::ToolCall`] and [`AdapterEvent::ToolResult`], uncut,
+    /// with no `parent` (a subagent's own steps are not read).
+    Agent {
+        at: Option<DateTime<Utc>>,
+        event: AdapterEvent,
+    },
+}
+
+/// The answer of [`OutsideConversations::history`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryRead {
+    /// The conversation, oldest first.
+    Read { items: Vec<HistoryItem> },
+    /// The agent keeps no conversation with this id for this workdir.
+    NotFound,
+    /// It exists but could not be read (too large, an I/O error, the
+    /// deadline).
+    Failed(String),
+    /// This agent cannot read its conversations.
+    Unavailable,
+}
+
+/// A source for an agent that keeps no conversations Skywave can read:
+/// listing is [`SourceError::Unavailable`], history
+/// [`HistoryRead::Unavailable`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOutsideConversations;
+
+impl OutsideConversations for NoOutsideConversations {
+    fn list(
+        &self,
+        _roots: &[PathBuf],
+        _own: &HashMap<String, SessionId>,
+        _max: usize,
+        _deadline: Instant,
+    ) -> std::result::Result<Listed, SourceError> {
+        Err(SourceError::Unavailable)
+    }
+
+    fn history(&self, _workdir: &Path, _id: &str, _deadline: Instant) -> HistoryRead {
+        HistoryRead::Unavailable
+    }
 }
 
 /// Persists `handle` as session context `context`'s resume handle.

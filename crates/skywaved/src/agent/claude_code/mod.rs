@@ -43,6 +43,10 @@
 //! for the process, like the fake agent's; their effects arrive as events.
 //! stderr lines go to the daemon log.
 //!
+//! The CLI's stored transcripts, outside conversations included, are read
+//! by [`transcripts::ClaudeTranscripts`]; [`own_conversations`] names the
+//! ones Skywave's contexts run.
+//!
 //! **Shutdown.** [`AgentSession::shutdown`] with a turn that was interrupted
 //! waits up to the grace period for its `result`. A turn still running
 //! without an interrupt is abandoned: the process is killed at once, without
@@ -67,8 +71,10 @@
 pub mod display;
 pub mod protocol;
 pub mod rules;
+pub mod transcripts;
 pub mod usage;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -91,6 +97,30 @@ use super::{
 };
 use crate::config::AgentConfig;
 use crate::process::{self, DEFAULT_TERM_GRACE, Group};
+
+/// The CLI conversation ids Skywave's contexts run, each with its
+/// session: every stored resume handle of this adapter. A handle this
+/// adapter did not make is left out, and so is a moved context's: it is
+/// never started again (the session it moved to runs a fork of it), so its
+/// conversation is no session's.
+pub fn own_conversations(
+    conn: &rusqlite::Connection,
+) -> crate::error::Result<HashMap<String, SessionId>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT session_id, agent_state FROM contexts
+         WHERE agent_state IS NOT NULL AND moved_to IS NULL",
+    )?;
+    let rows = statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut own = HashMap::new();
+    for row in rows {
+        let (session, state) = row?;
+        let handle = super::ResumeHandle(serde_json::from_str(&state)?);
+        if let Ok(id) = protocol::parse_resume_handle(&handle) {
+            own.insert(id.to_string(), crate::event_log::parse_id(&session)?);
+        }
+    }
+    Ok(own)
+}
 
 /// Flags every CLI process gets, before the session flag and `agent.args`.
 pub const REQUIRED_ARGS: [&str; 8] = [
