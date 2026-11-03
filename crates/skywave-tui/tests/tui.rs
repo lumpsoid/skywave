@@ -139,12 +139,22 @@ impl Harness {
         h
     }
 
-    /// Takes the snapshots the core pushed, as the event loop does.
+    /// Takes the snapshots the core pushed, then asks for what expanded
+    /// items need, as the event loop does; until a fetch brings no new
+    /// snapshot.
     fn sync(&mut self) {
+        let mut fetched = false;
         loop {
             match self.views.try_recv() {
-                Ok(view) => self.app.set_view(view),
-                Err(TryRecvError::Empty) => return,
+                Ok(view) => {
+                    self.app.set_view(view);
+                    fetched = false;
+                }
+                Err(TryRecvError::Empty) if fetched => return,
+                Err(TryRecvError::Empty) => {
+                    skywave_tui::fetch_expanded(&mut self.app, &self.core);
+                    fetched = true;
+                }
                 Err(TryRecvError::Disconnected) => panic!("core gone"),
             }
         }
@@ -4680,6 +4690,47 @@ fn v_reveals_gated_call() {
         Some(ItemKey::Logged(seq))
     );
     assert_contains(&screen, ">       ± Edit src/lib.rs");
+}
+
+#[test]
+fn a_call_revealed_before_its_result_downloads_the_output_when_it_comes() {
+    let id_call = CallId::new();
+    let mut edit = call(id_call, "Edit", ToolKind::FileEdit, "src/lib.rs");
+    edit.display.body = body(BodyFormat::Diff, "+added\n");
+    let (mut h, id, approval, _) = gated(Vec::new(), edit);
+    h.key(KeyCode::Esc);
+    assert_eq!(h.key(KeyCode::Char('v')), None, "nothing to download yet");
+    assert_eq!(h.drain_requests(), vec![]);
+
+    // Approved; its result logs with an output blob under the open call.
+    let (blob_id, output) = blob(10_000);
+    let mut done = result(id_call, false, "", "edited");
+    done.output = Some(output);
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                2,
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: DeviceId::new(),
+                    rule: None,
+                },
+            ),
+            event(id, 2, EventKind::ToolResult(done)),
+        ],
+    );
+    assert_eq!(h.drain_requests(), vec![Request::DownloadBlob(blob_id)]);
+    let screen = h.screen();
+    assert!(!screen.contains("not downloaded"), "{screen}");
+    assert_contains(&screen, "requested");
+
+    // Asked for once, not on every snapshot while it is in flight.
+    pull(&mut h, vec![event(id, 3, agent("still here"))]);
+    h.sync();
+    assert_eq!(h.drain_requests(), vec![]);
 }
 
 /// The scroll state of the open session: `None` follows.

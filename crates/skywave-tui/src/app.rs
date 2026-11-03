@@ -23,7 +23,7 @@ use skywave_present::format::{
     offered_modes,
 };
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, DraftSaver, PromptHistory, ReadMarker, Recall,
+    AlertWatcher, CompletionSettle, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
     ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, shell_stop, stop_needs_confirmation,
     unanswered,
 };
@@ -409,6 +409,8 @@ pub struct ViewUi {
     pub selected: Option<ItemKey>,
     /// Items whose full content is shown; only logged items expand.
     pub expanded: HashSet<Seq>,
+    /// What the expanded items download.
+    pub fetch: ExpandFetch,
     pub geometry: RefCell<Geometry>,
     /// The session opened with news and where to scroll is not settled: it
     /// needs the first frame's geometry ([`Geometry::opening`]). Until then
@@ -430,6 +432,7 @@ impl ViewUi {
             scroll: None,
             selected: None,
             expanded: HashSet::new(),
+            fetch: ExpandFetch::new(),
             geometry: RefCell::default(),
             opening,
             search: None,
@@ -1745,6 +1748,29 @@ impl App {
         }
     }
 
+    /// The downloads the open view's expanded items need and nobody asked
+    /// for yet ([`ExpandFetch`]): also a blob that arrived while its item
+    /// was open, e.g. the output of an edit expanded with `v` before its
+    /// result logged. Each blob once. Report each outcome with
+    /// [`App::fetched`].
+    pub fn expanded_fetches(&mut self) -> Vec<Action> {
+        let Screen::Session(view) = &self.view.screen else {
+            return Vec::new();
+        };
+        let Some(session) = self.ui.session.as_mut().filter(|s| s.id == view.id) else {
+            return Vec::new();
+        };
+        session.shown.fetch.due(view, &session.shown.expanded)
+    }
+
+    /// Records the outcome of dispatching an [`App::expanded_fetches`]
+    /// action; only an error matters.
+    pub fn fetched(&mut self, result: Result<(), CoreError>) {
+        if let Err(err) = result {
+            self.ui.error = Some(err.to_string());
+        }
+    }
+
     /// The session list on screen, if that is the current screen.
     pub fn session_list(&self) -> Option<&SessionListView> {
         match &self.view.screen {
@@ -2962,7 +2988,9 @@ impl SessionUi {
     }
 
     /// Expands or collapses the selected item. Expanding a blob that is not
-    /// here yet asks for it.
+    /// here yet asks for it, again if it was asked for before; one that
+    /// arrives while the item is open is asked for by
+    /// [`App::expanded_fetches`].
     fn toggle(&mut self, view: &SessionView) -> Option<Action> {
         let Some(ItemKey::Logged(seq)) = self.shown.selected else {
             return None;
@@ -2975,8 +3003,6 @@ impl SessionUi {
             return None;
         }
         self.shown.expanded.insert(seq);
-        let blob = wanted_blob(entry)?;
-        matches!(blob.state, BlobState::NotDownloaded { .. })
-            .then_some(Action::DownloadBlob(blob.id))
+        self.shown.fetch.expand(entry)
     }
 }
