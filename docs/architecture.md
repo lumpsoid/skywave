@@ -172,6 +172,32 @@ commands refuse one written by another version, before reading it, with an
 error telling the operator to delete the data directory (alpha: old data is
 not migrated). A database from before the stamp takes the current version.
 
+- **Connections** (`ConnectionLimits`): at most 512 open at once and 32 per
+  source, an IPv4 address or an IPv6 /64 (an IPv4-mapped address counts as
+  its IPv4 one). One past either cap is closed as soon as it is accepted,
+  before TLS. Every time limit is on *no progress*, never on total
+  duration, so a 60 s long-poll and a slow blob download stay up:
+  - 10 s for the TLS handshake.
+  - 30 s idle: no request in flight (from its parsed head until hyper
+    drops its response body), no write waiting on the socket, and (checked
+    when the clock runs out, on Linux and Android) nothing left
+    unacknowledged in the kernel's send queue. This bounds a slow request
+    head and a keep-alive connection between requests, and never runs out
+    while a response is still on its way.
+    Hyper's own header timeout is off because it starts as soon as a
+    response is encoded and cut slow downloads on kept connections.
+  - 30 s without a byte of a request body: 408 (which devices retry; the
+    400 the JSON extractor would make of it they take as final), and the
+    connection closes after the reply.
+  - 60 s in which the peer acknowledges none of what was sent
+    (`TCP_USER_TIMEOUT`, so a slow link that keeps acknowledging is never
+    cut, while one gone or stuck at a zero window is). Linux and Android
+    only; elsewhere only the OS's own retransmission limit applies, and a
+    peer advertising a zero window can hold its connection.
+
+  Accepted sockets use TCP keepalive (probes after 60 s of silence, every
+  15 s, 4 times). `serve` raises its soft open-files limit to the hard
+  limit at start.
 - **Commands** are deduplicated, validated and appended in one transaction;
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,

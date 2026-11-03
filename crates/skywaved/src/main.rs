@@ -176,6 +176,8 @@ async fn serve(
         outside,
         ..ServerOptions::default()
     };
+    #[cfg(unix)]
+    skywaved::server::raise_open_files_limit();
     // Bound first, so a second `serve` on the same address fails here,
     // before its startup blob pass could delete what a running daemon is
     // writing. Binding accepts nothing until `serve`, and nothing below

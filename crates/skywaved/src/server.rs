@@ -29,6 +29,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -36,7 +37,8 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::{StatusCode, header};
+use hyper_util::rt::TokioIo;
 use rustls::RootCertStore;
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::pem::PemObject;
@@ -59,10 +61,13 @@ use crate::identity::ServerIdentity;
 use crate::pairing::{self, PairService, RateLimit, SystemClock};
 use crate::workdir::Git;
 
+mod limits;
+
+pub use limits::ConnectionLimits;
+use limits::{Activity, Admission, Admissions, IdleIo, Responding, StalledBody, tune_socket};
+
 /// A client gets this long to finish the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// And this long to send a request's headers.
-const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// On shutdown, in-flight requests get this long before connections are
 /// dropped. Long-polls end at once on shutdown, so this is plenty.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -82,6 +87,9 @@ pub struct ServerOptions {
     /// How long a conversations listing may take before the reply is a
     /// 503; tests shorten it.
     pub conversations_timeout: Duration,
+    /// How many connections the server holds and how long a stalled peer
+    /// keeps one.
+    pub limits: ConnectionLimits,
 }
 
 impl Default for ServerOptions {
@@ -91,6 +99,7 @@ impl Default for ServerOptions {
             outside: Arc::new(NoOutsideConversations),
             import_deadline: IMPORT_DEADLINE,
             conversations_timeout: CONVERSATIONS_TIMEOUT,
+            limits: ConnectionLimits::DEFAULT,
         }
     }
 }
@@ -102,6 +111,7 @@ pub struct Server {
     tls: TlsAcceptor,
     app: Router,
     stop: watch::Sender<bool>,
+    limits: ConnectionLimits,
 }
 
 impl Server {
@@ -145,6 +155,7 @@ impl Server {
         options: ServerOptions,
     ) -> Result<Server> {
         let tls = TlsAcceptor::from(tls_config(&identity)?);
+        let limits = options.limits;
         let (stop, stopped) = watch::channel(false);
         let api = Api::new(
             Db::open(&dir.db_path())?,
@@ -174,6 +185,7 @@ impl Server {
             tls,
             app,
             stop,
+            limits,
         })
     }
 
@@ -191,8 +203,10 @@ impl Server {
             tls,
             app,
             stop,
+            limits,
             ..
         } = self;
+        let admissions = Admissions::new(&limits);
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
         loop {
@@ -200,11 +214,20 @@ impl Server {
                 () = &mut shutdown => break,
                 accepted = listener.accept() => match accepted {
                     Ok((tcp, peer)) => {
+                        // Over a cap: dropping the socket closes it at once,
+                        // before any TLS work.
+                        let Some(admission) = admissions.admit(peer.ip()) else {
+                            tracing::debug!(%peer, "connection over the cap; closed");
+                            continue;
+                        };
+                        tune_socket(&tcp, peer, &limits);
                         connections.spawn(connection(
                             tcp,
                             peer,
+                            admission,
                             tls.clone(),
                             app.clone(),
+                            limits,
                             stop.subscribe(),
                         ));
                     }
@@ -235,15 +258,54 @@ impl Server {
     }
 }
 
+/// Raises this process's soft limit on open files to its hard limit, so the
+/// connection cap, not the descriptor table, is what turns peers away.
+/// Failing leaves the limit as it was, with a warning.
+#[cfg(unix)]
+pub fn raise_open_files_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for the call to fill in or read.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == -1 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, "cannot read the open files limit");
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let wanted = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) } == -1 {
+        // E.g. macOS, whose hard limit may be unlimited but whose soft one
+        // stops at OPEN_MAX.
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, soft = limit.rlim_cur, "cannot raise the open files limit");
+    }
+}
+
 /// Serves one TCP connection: TLS handshake, then HTTP/1.1 with the peer's
-/// certificate and address attached to every request.
+/// certificate and address attached to every request. `admission` holds
+/// the connection's place under the caps until it ends.
 async fn connection(
     tcp: TcpStream,
     peer: SocketAddr,
+    admission: Admission,
     tls: TlsAcceptor,
     app: Router,
+    limits: ConnectionLimits,
     mut stop: watch::Receiver<bool>,
 ) {
+    let _admission = admission;
+    let activity = Arc::new(Activity::default());
+    // The idle clock also runs during the handshake, which has its own
+    // shorter timeout.
+    let tcp = IdleIo::new(tcp, limits.idle_timeout, activity.clone());
     let stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(tcp)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
@@ -265,12 +327,32 @@ async fn connection(
     let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
         req.extensions_mut().insert(peer_cert.clone());
         req.extensions_mut().insert(ConnectInfo(peer));
+        let request = activity.start();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let req =
+            req.map(|body| Body::new(StalledBody::new(body, limits.body_stall, stalled.clone())));
         let mut app = app.clone();
-        async move { app.call(req.map(Body::new)).await }
+        async move {
+            let Ok(response) = app.call(req).await;
+            // Whatever the handler made of the failed body (axum's
+            // extractors answer 400, which devices take as final), a stall
+            // is the peer's to retry.
+            if stalled.load(Ordering::SeqCst) {
+                return Ok(hyper::Response::builder()
+                    .status(StatusCode::REQUEST_TIMEOUT)
+                    .header(header::CONNECTION, "close")
+                    .body(Body::new(Responding::new(Body::empty(), request)))
+                    .expect("a valid response"));
+            }
+            Ok::<_, std::convert::Infallible>(
+                response.map(|body| Body::new(Responding::new(body, request))),
+            )
+        }
     });
+    // Hyper's header timeout stays off: `IdleIo` does its job without
+    // cutting a response that is still being flushed.
     let conn = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
+        .header_read_timeout(None)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(conn);
     let result = tokio::select! {
