@@ -153,7 +153,11 @@ every version.
   `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
   `/v1/conversations` and `/v1/workdir/*` answer 503 when they run out of
-  time.
+  time, or when 8 of their file-system reads are already running (a wait
+  of at most 0.5 s first). Each read holds its permit until its blocking
+  thread returns, even after its request gave up, so reads stuck on a hung
+  mount stay capped at 8 and never exhaust the blocking threads that
+  authentication, commands and events need.
 
 ## Server
 
@@ -260,8 +264,10 @@ not migrated). A database from before the stamp takes the current version.
   file before it is opened (a FIFO would block). Reads run on their own
   connection, one snapshot at a time behind a mutex, so they never hold the
   API's connection and a refresh storm costs one snapshot at a time. Each
-  request's deadline (15 s) starts with its handler: a request that gets the
-  lock past it does nothing (a 503), and work in progress stops at it (a
+  request's deadline (15 s) starts with its handler: a request that has not
+  got the lock by then (it polls the lock, so a snapshot stuck on a hung
+  mount does not keep waiters forever) does nothing (a 503), and work in
+  progress stops at it (a
   503 for list and file; changes answers `Failed { "timed out" }`, its git
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file

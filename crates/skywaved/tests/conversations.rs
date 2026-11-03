@@ -28,7 +28,7 @@ use skywaved::agent::import::{DEADLINE_EVERY, TIMED_OUT};
 use skywaved::agent::{
     self, AdapterEvent, AgentCallId, HistoryItem, HistoryRead, Listed, ResultDisplay, SourceError,
 };
-use skywaved::api::CONVERSATIONS_TIMEOUT;
+use skywaved::api::{CONVERSATIONS_TIMEOUT, FS_PERMITS};
 use skywaved::identity::ServerIdentity;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::{EventLog, Storage, pairing};
@@ -764,4 +764,49 @@ async fn a_listing_slower_than_the_timeout_is_a_503() {
             })
         )
     );
+}
+
+/// A source stuck on a hung mount strands a blocking thread per call; the
+/// file-system permits cap those, while authentication, commands and events
+/// (which need blocking threads too) go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn stuck_file_system_reads_are_capped_and_never_stall_other_routes() {
+    let timeout = Duration::from_millis(300);
+    let f = Fixture::start_with_listing_timeout(FakeOutside::new(), timeout).await;
+    let gate = Gate::new();
+    let _open = OpenOnDrop(gate.clone());
+    f.outside.block_list(gate.clone());
+    let mut device = f.device().await;
+
+    // Each listing gives up with a 503 and leaves its thread stuck, holding
+    // its permit.
+    for _ in 0..FS_PERMITS {
+        assert_eq!(
+            list(&mut device).await,
+            (StatusCode::SERVICE_UNAVAILABLE, None)
+        );
+    }
+    let roots = format!("{}?dir=", path::DIRS);
+    let started = Instant::now();
+    let (status, _) = device.send(Method::GET, &roots, Bytes::new()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "no permit is left");
+    assert!(started.elapsed() < SOON);
+    assert_eq!(f.outside.lists(), FS_PERMITS, "only the stuck ones listed");
+
+    // Authentication, hello, commands and events still answer.
+    let (status, _) = device.send(Method::GET, path::HELLO, Bytes::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    device.command(&f.create(&f.workdir, None)).await;
+    let session = device.events().await[0].session_id;
+    let workdir = format!("{}?session={}&path=", path::WORKDIR_LIST, session.0);
+    let (status, _) = device.send(Method::GET, &workdir, Bytes::new()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "workdir reads too");
+
+    // Once the mount answers, the stuck threads return their permits.
+    gate.open();
+    let (status, _) = device.send(Method::GET, &roots, Bytes::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = device.send(Method::GET, &workdir, Bytes::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list(&mut device).await.0, StatusCode::OK);
 }

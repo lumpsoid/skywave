@@ -10,8 +10,12 @@
 //! request that gets the lock past its deadline returns
 //! [`Error::WorkdirDeadline`] at once, without touching the database or the
 //! file system: its client already got a 503, and running it anyway would
-//! make N refreshes cost N snapshots. Work inside a snapshot checks the
-//! deadline between steps (directory entries, file chunks).
+//! make N refreshes cost N snapshots. The lock is waited for with
+//! `try_lock` every [`LOCK_POLL`], not `lock`, so a request whose deadline
+//! passes while a snapshot stuck on a hung file system still holds the lock
+//! returns the same error and frees its blocking thread, rather than waiting
+//! as long as the stuck one. Work inside a snapshot checks the deadline
+//! between steps (directory entries, file chunks).
 //!
 //! **Resolution**, in this order; the first failing step answers:
 //! 1. The session's stored `workdir` must exist: else `UnknownSession`.
@@ -188,7 +192,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -204,7 +208,6 @@ use crate::db::Db;
 use crate::dirs;
 use crate::error::{Error, IoContext, Result};
 use crate::event_log::{self, parse_id};
-use crate::lock;
 
 mod changes;
 mod git;
@@ -222,6 +225,8 @@ pub const SCAN_CAP: usize = dirs::SCAN_CAP;
 pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// Read size for file contents; the deadline is checked between reads.
 const READ_CHUNK: usize = 64 * 1024;
+/// How often a snapshot waiting for the lock tries it again.
+const LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// Reads sessions' workdirs over its own database connection, one snapshot
 /// at a time. See the module docs.
@@ -252,14 +257,25 @@ impl WorkdirReader {
 
     /// Runs `f` as one snapshot, holding the workdir connection. Blocking.
     ///
-    /// [`Error::WorkdirDeadline`] without running `f` when the lock was got
-    /// at or past `deadline`.
+    /// [`Error::WorkdirDeadline`] without running `f` when the lock is still
+    /// held by another snapshot at `deadline`, or was got at or past it.
     pub fn snapshot<T>(
         &self,
         deadline: Instant,
         f: impl FnOnce(&mut Snapshot<'_>) -> Result<T>,
     ) -> Result<T> {
-        let mut db = lock(&self.db);
+        let mut db = loop {
+            match self.db.try_lock() {
+                Ok(db) => break db,
+                Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::WorkdirDeadline);
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+            }
+        };
         let mut snapshot = Snapshot {
             db: &mut db,
             blobs: &self.blobs,
@@ -1239,6 +1255,37 @@ mod tests {
         );
         // Positive control: in time, the same request does the work.
         assert_eq!(t.list(""), ListResult::WorkdirGone);
+    }
+
+    #[test]
+    fn a_request_stops_waiting_for_a_stuck_lock_at_its_deadline() {
+        let t = Tree::new();
+        let query = t.query("");
+        let ran = AtomicBool::new(false);
+        let (answered, answer) = mpsc::channel();
+        std::thread::scope(|scope| {
+            // Held for the whole wait, like a snapshot stuck on a hung mount;
+            // dropped on unwind before the scope joins, so a failure
+            // cannot deadlock the test.
+            let held = t.reader.db.lock().unwrap();
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_millis(100);
+                answered
+                    .send(t.reader.snapshot(deadline, |s| {
+                        ran.store(true, Ordering::SeqCst);
+                        s.list(&query)
+                    }))
+                    .unwrap();
+            });
+            let answer = answer
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the request waited past its deadline");
+            assert!(matches!(answer, Err(Error::WorkdirDeadline)));
+            drop(held);
+        });
+        assert!(!ran.load(Ordering::SeqCst), "the snapshot ran");
+        // Positive control: with the lock free, the same request answers.
+        assert!(matches!(t.list(""), ListResult::Listed { .. }));
     }
 
     #[test]

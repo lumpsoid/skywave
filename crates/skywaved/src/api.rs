@@ -52,6 +52,16 @@
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
 //! future, and the deadline is what stops the abandoned work.
 //!
+//! **Blocking file-system work** (dirs, the conversations scan and workdir
+//! reads) first takes one of [`FS_PERMITS`] permits, waiting at most
+//! [`FS_PERMIT_WAIT`], else the reply is a 503. A timeout drops only the
+//! future, never the blocking thread, so a root on a hung mount would strand
+//! one thread per call until tokio's blocking pool is full and
+//! [`authenticate`], itself on a blocking thread, stops every request. The
+//! permit moves into the blocking closure and is released only when the
+//! work returns: stuck threads hold theirs, so at most [`FS_PERMITS`] can
+//! pile up. Hello, commands, events and blobs never take one.
+//!
 //! **Adopting creates** (`CreateSession` with a `conversation`, D37): the
 //! conversation's history is read and bounded first, on a blocking thread
 //! and off the API's connection, then handed to
@@ -89,7 +99,7 @@ use skywave_proto::{
     PROTOCOL_VERSION, ServerId, WorkdirQuery, check_conversation_id, limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
@@ -119,6 +129,11 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer than [`workdir::SNAPSHOT_DEADLINE`], which stops the snapshot
 /// itself; this only stops waiting for it.
 pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Blocking file-system work (dirs, conversations and workdir reads) that
+/// may run at once; see the module docs, "Blocking file-system work".
+pub const FS_PERMITS: usize = 8;
+/// Longest such a request waits for a permit before the reply is a 503.
+pub const FS_PERMIT_WAIT: Duration = Duration::from_millis(500);
 /// Read size when streaming a blob.
 const BLOB_CHUNK: usize = 64 * 1024;
 
@@ -151,6 +166,9 @@ pub(crate) struct Api {
     /// The adopting creates whose import is being prepared, by command id:
     /// each answers with the command's reply once it has one.
     importing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
+    /// [`FS_PERMITS`] permits; blocking file-system work holds one until it
+    /// returns.
+    fs: Arc<Semaphore>,
 }
 
 /// A command's reply: its result, or the status of a request that failed.
@@ -179,6 +197,21 @@ impl Api {
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
             importing: Mutex::new(HashMap::new()),
+            fs: Arc::new(Semaphore::new(FS_PERMITS)),
+        }
+    }
+
+    /// A permit for blocking file-system work, waiting at most
+    /// [`FS_PERMIT_WAIT`]; past it a 503. Move it into the blocking closure,
+    /// so a thread stuck on a hung mount keeps it.
+    async fn fs_permit(&self) -> std::result::Result<OwnedSemaphorePermit, StatusCode> {
+        match tokio::time::timeout(FS_PERMIT_WAIT, self.fs.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // The semaphore is never closed; only the wait can end it.
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!("every file-system permit is held; answering 503");
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            }
         }
     }
 
@@ -490,8 +523,15 @@ async fn list_dirs(
         return StatusCode::BAD_REQUEST.into_response();
     };
     // Not `Api::blocking`: a slow file system must not hold the database.
+    let permit = match api.fs_permit().await {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
     let roots = api.log.roots().to_vec();
-    let listing = tokio::task::spawn_blocking(move || dirs::list_dirs(&roots, &query.dir));
+    let listing = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        dirs::list_dirs(&roots, &query.dir)
+    });
     match tokio::time::timeout(DIRS_TIMEOUT, listing).await {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(e)) => {
@@ -516,11 +556,13 @@ async fn list_conversations(State(api): State<Arc<Api>>) -> Response {
     let timeout = api.conversations_timeout;
     let deadline = Instant::now() + listing_deadline(timeout);
     let listing = async {
+        let permit = api.fs_permit().await?;
         let own = api.blocking(|api, db| api.outside.own(db)).await?;
         // Not `Api::blocking`: a slow file system must not hold the database.
         let outside = api.outside.clone();
         let roots = api.log.roots().to_vec();
         let listed = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             outside.list(&roots, &own, limits::CONVERSATIONS_MAX, deadline)
         })
         .await;
@@ -599,15 +641,22 @@ async fn workdir_file(
 }
 
 /// Runs `f` as one workdir snapshot on a blocking thread (module docs,
-/// "Workdir"): its answer is a 200, a passed deadline or [`WORKDIR_TIMEOUT`]
-/// a 503, any other error a 500.
+/// "Workdir"): its answer is a 200, a passed deadline, [`WORKDIR_TIMEOUT`]
+/// or no file-system permit a 503, any other error a 500.
 async fn workdir_snapshot<T: serde::Serialize + Send + 'static>(
     api: &Arc<Api>,
     deadline: Instant,
     f: impl FnOnce(&mut Snapshot<'_>) -> Result<T> + Send + 'static,
 ) -> Response {
+    let permit = match api.fs_permit().await {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
     let api = api.clone();
-    let work = tokio::task::spawn_blocking(move || api.workdir.snapshot(deadline, f));
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        api.workdir.snapshot(deadline, f)
+    });
     match tokio::time::timeout(WORKDIR_TIMEOUT, work).await {
         Ok(Ok(Ok(answer))) => Json(answer).into_response(),
         Ok(Ok(Err(Error::WorkdirDeadline))) => {
