@@ -292,7 +292,6 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use rusqlite::OptionalExtension;
 use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
     SessionOrigin, SessionState, TaskId,
@@ -723,7 +722,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
             // Stamped like the work it ends: the context of the agent that
             // reported it, not one switched to since.
-            let Some(context) = last_work_context(db, session.id)? else {
+            let Some(context) = event_log::last_work_context_in(db.conn(), session.id)? else {
                 continue;
             };
             for kind in ended {
@@ -1977,20 +1976,14 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-/// The context of the session's newest `BackgroundTasksChanged` or
-/// `SchedulesChanged`.
-fn last_work_context(db: &Db, session_id: SessionId) -> Result<Option<ContextId>> {
-    let context: Option<String> = db
-        .conn()
-        .prepare_cached(
-            "SELECT context FROM events WHERE session_id = ?1 \
-             AND json_extract(kind, '$.type') IN ('background_tasks_changed', 'schedules_changed') \
-             ORDER BY seq DESC LIMIT 1",
-        )?
-        .query_row([session_id.0.to_string()], |r| r.get(0))
-        .optional()?;
-    context.map(|c| parse_id(&c)).transpose()
-}
+/// The session's `AgentWorking` and `Errored` after the owed rows were
+/// stored ([`lost_messages`]): a range of its newest events, read through
+/// `events_session_type`.
+pub(crate) const OWED_STATES_SQL: &str = "SELECT context, json_extract(kind, '$.state') FROM events \
+     WHERE session_id = ?1 AND seq > ?2 \
+     AND json_extract(kind, '$.type') = 'session_state_changed' \
+     AND json_extract(kind, '$.state') IN ('agent_working', 'errored') \
+     ORDER BY seq";
 
 /// The messages of `progress.owed` no agent took, by session and context,
 /// each in handing order. The rows are as the previous run last stored
@@ -2021,13 +2014,7 @@ fn lost_messages(
             .filter(|owed| handled.is_none_or(|handled| owed.seq <= handled))
             .partition(|owed| owed.settling);
         let mut errored = HashSet::new();
-        let mut states = db.conn().prepare_cached(
-            "SELECT context, json_extract(kind, '$.state') FROM events \
-             WHERE session_id = ?1 AND seq > ?2 \
-             AND json_extract(kind, '$.type') = 'session_state_changed' \
-             AND json_extract(kind, '$.state') IN ('agent_working', 'errored') \
-             ORDER BY seq",
-        )?;
+        let mut states = db.conn().prepare_cached(OWED_STATES_SQL)?;
         let mut states = states.query(rusqlite::params![session.0.to_string(), accounted])?;
         while let Some(row) = states.next()? {
             let context: ContextId = parse_id(&row.get::<_, String>(0)?)?;

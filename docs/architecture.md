@@ -228,6 +228,19 @@ the daemon's appends, which would otherwise stop `serve` (below).
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,
   `shell_runs`) updated in the transaction that appends the event.
+- **Restart cost**: nothing prunes the log yet, so what a daemon start
+  reads must not grow with it. Each lookup it makes, per session or over
+  the log, reads a projection (`open_calls`: a `ToolCall` adds its call,
+  a `ToolResult` or `CallsUnanswered` removes it), a partial index over
+  what is not over (pending approvals, unfinished shell runs), or a
+  session's newest event of one type through the `events_session_type`
+  expression index (one `MAX(seq)` per type; an `IN` over types would read
+  every match). The supervisor's held and owed events are re-read from
+  their stored seqs on. A start thus costs the sessions and what is open,
+  not the history: 100k events recovered in about 150 ms before, 3 ms
+  after, and 3 ms at 1M (`recovery_on_a_large_log`, by hand). The
+  per-append cost is the index and projection writes in the same
+  transaction.
 - **Importing an outside conversation** (D37): for an adopting
   `CreateSession` the API first reads the conversation's history from the
   agent's source (built next to the adapter) on a blocking thread, off its

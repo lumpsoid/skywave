@@ -3,8 +3,14 @@
 //! Every event goes through [`append_in`], inside a write transaction begun
 //! with `BEGIN IMMEDIATE`. It takes the next seq as `max(seq) + 1` under the
 //! database write lock, so seqs are contiguous however many connections
-//! write, and it updates the `sessions` / `approvals` projections in the same
-//! transaction, so they never disagree with the log.
+//! write, and it updates the `sessions` / `approvals` / `open_calls`
+//! projections in the same transaction, so they never disagree with the log.
+//!
+//! What a daemon start reads per session costs what is open, not the log's
+//! length: a projection, or a session's newest event of one type through
+//! the `events_session_type` index (`MAX(seq)` over one type, which reads
+//! one index entry; an `IN` over two types would read them all). The
+//! queries are named constants so a test checks their plans.
 //!
 //! Two writers share one [`EventLog`] per process, each on its own [`Db`]
 //! connection:
@@ -39,7 +45,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, DeviceId, Event,
     EventBatch, EventKind, LogId, LogRun, ModelChoice, RunId, RunWhen, RunsSince, Seq, SessionId,
-    SessionState, ShellEnd, limits,
+    SessionState, ShellEnd, ToolCall, ToolResult, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -546,9 +552,7 @@ impl EventLog {
     pub fn unfinished_shell_runs(&self, db: &Db) -> Result<ShellRecovery> {
         let tx = db.conn().unchecked_transaction()?;
         let head = head_in(&tx)?;
-        let mut stmt = tx.prepare_cached(&format!(
-            "{SHELL_RUN_SELECT} WHERE r.finished_seq IS NULL ORDER BY r.seq"
-        ))?;
+        let mut stmt = tx.prepare_cached(&unfinished_runs_sql())?;
         let runs = stmt
             .query_map([], ShellRunSql::from_row)?
             .map(|row| Ok(row?.parse()?.run))
@@ -642,22 +646,9 @@ impl EventLog {
     /// A logged `ToolCall` is open until a `ToolResult` links to it or a
     /// `CallsUnanswered` names it, the mapper's definition of answered. On
     /// daemon start the supervisor names them (architecture.md "Server").
+    /// Read from the `open_calls` projection, so it costs the calls open.
     pub fn open_calls(&self, db: &Db, id: SessionId) -> Result<Vec<(ContextId, Vec<CallId>)>> {
-        let mut stmt = db.conn().prepare_cached(
-            "WITH answered (call) AS (
-                 SELECT json_extract(kind, '$.call') FROM events
-                 WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_result'
-                 UNION
-                 SELECT calls.value FROM events, json_each(events.kind, '$.calls') AS calls
-                 WHERE session_id = ?1
-                   AND json_extract(events.kind, '$.type') = 'calls_unanswered'
-             )
-             SELECT json_extract(kind, '$.call'), context FROM events
-             WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_call'
-               AND json_extract(kind, '$.call') NOT IN
-                   (SELECT call FROM answered WHERE call IS NOT NULL)
-             ORDER BY seq",
-        )?;
+        let mut stmt = db.conn().prepare_cached(OPEN_CALLS_SQL)?;
         let rows = stmt.query_map([id.0.to_string()], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -677,7 +668,7 @@ impl EventLog {
     pub fn command_seq(&self, db: &Db, id: CommandId) -> Result<Option<Seq>> {
         let seq: Option<i64> = db
             .conn()
-            .prepare_cached("SELECT seq FROM events WHERE command_id = ?1")?
+            .prepare_cached(COMMAND_SEQ_SQL)?
             .query_row([id.0.to_string()], |r| r.get(0))
             .optional()?;
         seq.map(seq_from_sql).transpose()
@@ -687,10 +678,7 @@ impl EventLog {
     pub fn offered_models(&self, db: &Db) -> Result<Option<Vec<ModelChoice>>> {
         let kind: Option<String> = db
             .conn()
-            .prepare_cached(
-                "SELECT kind FROM events WHERE json_extract(kind, '$.type') = 'models_offered' \
-                 ORDER BY seq DESC LIMIT 1",
-            )?
+            .prepare_cached(OFFERED_MODELS_SQL)?
             .query_row([], |r| r.get(0))
             .optional()?;
         match kind.as_deref().map(serde_json::from_str).transpose()? {
@@ -852,10 +840,30 @@ pub(crate) fn append_in(
         // A stopped turn ends with the state change the agent reports. No
         // archived flag is kept: nothing on the server reads it, clients
         // fold `EventKind::archived_effect` themselves.
+        // A call is open from its `ToolCall` until its session answers it.
+        // A repeated `ToolCall` keeps the first; an answer logged before
+        // its call (no mapper does) closes nothing.
+        EventKind::ToolCall(ToolCall {
+            call: Some(call), ..
+        }) => {
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO open_calls (session_id, call, context, seq)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![session, call.0.to_string(), context, sql_seq])?;
+        }
+        EventKind::ToolResult(ToolResult {
+            call: Some(call), ..
+        }) => close_call(conn, &session, *call)?,
+        EventKind::CallsUnanswered { calls } => {
+            for call in calls {
+                close_call(conn, &session, *call)?;
+            }
+        }
         EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
-        | EventKind::ToolCall { .. }
-        | EventKind::ToolResult { .. }
+        | EventKind::ToolCall(_)
+        | EventKind::ToolResult(_)
         | EventKind::SessionStopped
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
@@ -864,10 +872,8 @@ pub(crate) fn append_in(
         | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
-        | EventKind::CallsUnanswered { .. }
         | EventKind::ShellOutput { .. } => {}
-        // Imported history is a record: an imported call opens nothing, and
-        // `open_calls` never sees it, as it selects on the top-level `type`.
+        // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
         // The run's id is the command's: a `ShellRequested` naming none
         // has no run to track.
@@ -915,6 +921,57 @@ pub(crate) fn append_in(
     Ok(seq)
 }
 
+/// Removes `call` from the session's open calls, if it is one.
+fn close_call(conn: &Connection, session: &str, call: CallId) -> Result<()> {
+    conn.prepare_cached("DELETE FROM open_calls WHERE session_id = ?1 AND call = ?2")?
+        .execute(params![session, call.0.to_string()])?;
+    Ok(())
+}
+
+/// [`EventLog::open_calls`]: the session's open calls in log order.
+const OPEN_CALLS_SQL: &str =
+    "SELECT call, context FROM open_calls WHERE session_id = ?1 ORDER BY seq";
+
+/// [`EventLog::command_seq`], through `events_command`.
+const COMMAND_SEQ_SQL: &str = "SELECT seq FROM events WHERE command_id = ?1";
+
+/// [`EventLog::offered_models`]: each session's newest `ModelsOffered`,
+/// then the newest of those, so it reads an index entry per session.
+const OFFERED_MODELS_SQL: &str = "SELECT kind FROM events WHERE seq = (
+     SELECT MAX((SELECT MAX(seq) FROM events
+                 WHERE session_id = sessions.id
+                   AND json_extract(kind, '$.type') = 'models_offered'))
+     FROM sessions)";
+
+/// [`last_state_event_in`]: the newer of the session's newest
+/// `SessionStateChanged` and newest `TurnInterrupted`. Seqs start at 1, so
+/// 0 stands in for none (a two-argument `MAX` is NULL if either is).
+const LAST_STATE_EVENT_SQL: &str = "SELECT kind, context FROM events WHERE seq = MAX(
+     COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
+               AND json_extract(kind, '$.type') = 'session_state_changed'), 0),
+     COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
+               AND json_extract(kind, '$.type') = 'turn_interrupted'), 0))";
+
+/// [`last_work_context_in`], as [`LAST_STATE_EVENT_SQL`] for its types.
+const LAST_WORK_CONTEXT_SQL: &str = "SELECT context FROM events WHERE seq = MAX(
+     COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
+               AND json_extract(kind, '$.type') = 'background_tasks_changed'), 0),
+     COALESCE((SELECT MAX(seq) FROM events WHERE session_id = ?1
+               AND json_extract(kind, '$.type') = 'schedules_changed'), 0))";
+
+/// The context of the session's newest `BackgroundTasksChanged` or
+/// `SchedulesChanged`.
+pub(crate) fn last_work_context_in(
+    conn: &Connection,
+    session_id: SessionId,
+) -> Result<Option<ContextId>> {
+    let context: Option<String> = conn
+        .prepare_cached(LAST_WORK_CONTEXT_SQL)?
+        .query_row([session_id.0.to_string()], |r| r.get(0))
+        .optional()?;
+    context.map(|c| parse_id(&c)).transpose()
+}
+
 fn when_to_sql(when: RunWhen) -> &'static str {
     match when {
         RunWhen::Always => "always",
@@ -939,6 +996,11 @@ const SHELL_RUN_SELECT: &str = "SELECT r.command_id, r.session_id, r.seq, r.run_
         r.stop_seq, r.started_seq, r.finished_seq, s.at
      FROM shell_runs r JOIN events e ON e.seq = r.seq
      LEFT JOIN events s ON s.seq = r.started_seq";
+
+/// [`EventLog::unfinished_shell_runs`], through `shell_runs_unfinished`.
+fn unfinished_runs_sql() -> String {
+    format!("{SHELL_RUN_SELECT} WHERE r.finished_seq IS NULL ORDER BY r.seq")
+}
 
 /// A `shell_runs` row's columns before its ids are parsed.
 struct ShellRunSql {
@@ -1076,11 +1138,7 @@ pub(crate) fn last_state_event_in(
     session_id: SessionId,
 ) -> Result<Option<(EventKind, ContextId)>> {
     let row: Option<(String, String)> = conn
-        .prepare_cached(
-            "SELECT kind, context FROM events WHERE session_id = ?1 \
-             AND json_extract(kind, '$.type') IN ('session_state_changed', 'turn_interrupted') \
-             ORDER BY seq DESC LIMIT 1",
-        )?
+        .prepare_cached(LAST_STATE_EVENT_SQL)?
         .query_row([session_id.0.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let Some((kind, context)) = row else {
@@ -1279,4 +1337,223 @@ fn parse_time(text: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|e| Error::Corrupt(format!("timestamp {text:?}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use skywave_proto::{ToolDisplay, ToolKind};
+
+    use super::*;
+
+    /// A log whose one session has `history` answered calls and finished
+    /// shell runs behind the few events each recovery query looks for: an
+    /// open call, an unfinished run, and a state, work, models and command
+    /// event, all logged before the history. Returns the session and the
+    /// command.
+    fn seeded(db: &mut Db, history: usize) -> (SessionId, CommandId) {
+        let session = SessionId::new();
+        let context = ContextId(session.0);
+        let command = CommandId::new();
+        let tx = begin(db).unwrap();
+        let log = |command: Option<CommandId>, kind: EventKind| {
+            append_in(&tx, session, context, command, &kind).unwrap();
+        };
+        let call = |call| {
+            EventKind::ToolCall(ToolCall {
+                call: Some(call),
+                parent: None,
+                name: "exec".into(),
+                display: ToolDisplay {
+                    kind: ToolKind::Shell,
+                    title: "$ true".into(),
+                    detail: None,
+                    body: None,
+                },
+                input: None,
+            })
+        };
+        let shell = || EventKind::ShellRequested {
+            command: "true".into(),
+            when: RunWhen::Always,
+            by: DeviceId::new(),
+        };
+        log(
+            Some(command),
+            EventKind::SessionCreated {
+                workdir: "/w".into(),
+                context_name: "start".into(),
+                from: None,
+            },
+        );
+        log(
+            None,
+            EventKind::SessionStateChanged(SessionState::AgentWorking),
+        );
+        log(
+            None,
+            EventKind::BackgroundTasksChanged { tasks: Vec::new() },
+        );
+        log(None, EventKind::ModelsOffered { models: Vec::new() });
+        log(None, call(CallId::new()));
+        log(Some(CommandId::new()), shell());
+        for _ in 0..history {
+            let id = CallId::new();
+            log(None, call(id));
+            log(
+                None,
+                EventKind::ToolResult(ToolResult {
+                    call: Some(id),
+                    is_error: false,
+                    status: None,
+                    preview: "ok".into(),
+                    lines: 1,
+                    output: None,
+                }),
+            );
+            let run = CommandId::new();
+            log(Some(run), shell());
+            log(
+                None,
+                EventKind::ShellFinished {
+                    run,
+                    by: DeviceId::new(),
+                    started_at: None,
+                    command_line: "true".into(),
+                    end: ShellEnd::Exited { code: 0 },
+                    cwd: None,
+                    preview: String::new(),
+                    lines: 0,
+                    output: None,
+                    truncated: false,
+                },
+            );
+        }
+        tx.commit().unwrap();
+        (session, command)
+    }
+
+    /// Every query a daemon start makes per session or over the log, with
+    /// its parameters. `owed states` reads the events after seq 1, the
+    /// `SessionCreated`, as `supervisor_cursor.accounted` bounds it.
+    fn recovery_queries(
+        session: SessionId,
+        command: CommandId,
+    ) -> Vec<(&'static str, String, Vec<String>)> {
+        let s = session.0.to_string();
+        vec![
+            ("open calls", OPEN_CALLS_SQL.into(), vec![s.clone()]),
+            ("last state", LAST_STATE_EVENT_SQL.into(), vec![s.clone()]),
+            ("last work", LAST_WORK_CONTEXT_SQL.into(), vec![s.clone()]),
+            ("offered models", OFFERED_MODELS_SQL.into(), vec![]),
+            (
+                "command seq",
+                COMMAND_SEQ_SQL.into(),
+                vec![command.0.to_string()],
+            ),
+            ("unfinished runs", unfinished_runs_sql(), vec![]),
+            (
+                "owed states",
+                crate::supervisor::OWED_STATES_SQL.into(),
+                vec![s, "1".into()],
+            ),
+        ]
+    }
+
+    /// The VM steps SQLite took to run `sql` to its end, and the rows it
+    /// returned: a count of the work done, deterministic where a timing is
+    /// not.
+    fn steps(db: &Db, sql: &str, params: &[String]) -> (i32, usize) {
+        let mut stmt = db.conn().prepare(sql).unwrap();
+        let mut rows = stmt.query(rusqlite::params_from_iter(params)).unwrap();
+        let mut count = 0;
+        while rows.next().unwrap().is_some() {
+            count += 1;
+        }
+        drop(rows);
+        (stmt.get_status(rusqlite::StatementStatus::VmStep), count)
+    }
+
+    fn plan(db: &Db, sql: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let unbound = vec![rusqlite::types::Null; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(unbound), |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Whether a query plan reads a table that grows with the history end
+    /// to end: a `SCAN`, not a `SEARCH`, unless through the partial index
+    /// that holds only what is not over.
+    fn scans_history(plan: &[String]) -> bool {
+        plan.iter().any(|step| {
+            let Some(table) = step.strip_prefix("SCAN ") else {
+                return false;
+            };
+            let table = table.split(' ').next().unwrap_or_default();
+            // `e`, `s` and `r` are the aliases `SHELL_RUN_SELECT` gives them.
+            ["events", "e", "s", "shell_runs", "r", "open_calls"].contains(&table)
+                && !step.ends_with("USING INDEX shell_runs_unfinished")
+        })
+    }
+
+    #[test]
+    fn recovery_queries_use_an_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let (session, command) = seeded(&mut db, 1);
+        for (name, sql, _) in recovery_queries(session, command) {
+            let plan = plan(&db, &sql);
+            assert!(!scans_history(&plan), "{name} scans: {plan:#?}");
+        }
+        // Positive control: the scan `offered_models` made before v18.
+        let old = plan(
+            &db,
+            "SELECT kind FROM events WHERE json_extract(kind, '$.type') = 'models_offered' \
+             ORDER BY seq DESC LIMIT 1",
+        );
+        assert!(scans_history(&old), "{old:#?}");
+    }
+
+    /// Each recovery query does the same work, and finds the same row, over
+    /// a log a thousand times longer behind what it looks for.
+    #[test]
+    fn recovery_queries_cost_the_same_whatever_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut short = Db::open(&tmp.path().join("short.db")).unwrap();
+        let mut long = Db::open(&tmp.path().join("long.db")).unwrap();
+        let (s_session, s_command) = seeded(&mut short, 2);
+        let (l_session, l_command) = seeded(&mut long, 2000);
+        let short_queries = recovery_queries(s_session, s_command);
+        let long_queries = recovery_queries(l_session, l_command);
+        for ((name, sql, s_params), (_, _, l_params)) in short_queries.iter().zip(&long_queries) {
+            let (s_steps, s_rows) = steps(&short, sql, s_params);
+            let (l_steps, l_rows) = steps(&long, sql, l_params);
+            assert_eq!((s_rows, l_rows), (1, 1), "{name} finds its row");
+            assert_eq!(l_steps, s_steps, "{name} steps");
+        }
+        // Positive control: the log scan `open_calls` made before v18 reads
+        // every call and answer in the session, even with the index.
+        let old = "WITH answered (call) AS (
+                 SELECT json_extract(kind, '$.call') FROM events
+                 WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_result'
+                 UNION
+                 SELECT calls.value FROM events, json_each(events.kind, '$.calls') AS calls
+                 WHERE session_id = ?1
+                   AND json_extract(events.kind, '$.type') = 'calls_unanswered'
+             )
+             SELECT json_extract(kind, '$.call'), context FROM events
+             WHERE session_id = ?1 AND json_extract(kind, '$.type') = 'tool_call'
+               AND json_extract(kind, '$.call') NOT IN
+                   (SELECT call FROM answered WHERE call IS NOT NULL)
+             ORDER BY seq";
+        let (s_steps, _) = steps(&short, old, &[s_session.0.to_string()]);
+        let (l_steps, _) = steps(&long, old, &[l_session.0.to_string()]);
+        assert!(l_steps > s_steps * 100, "{s_steps} then {l_steps}");
+    }
 }
