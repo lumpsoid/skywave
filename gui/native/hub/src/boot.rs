@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use skywave_core::{Core, CoreError, EngineConfig, ShutdownError, SubscriptionId, ViewState};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, oneshot};
 
 use crate::dispatcher::{Dispatcher, Report};
 use crate::signals::{Boot, BootFailed};
@@ -26,12 +26,14 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 static CORE_SLOT: Mutex<()> = Mutex::const_new(());
 
 /// An open core, wired to the hub task: snapshots arrive on `views`,
-/// actions go through `dispatcher`, their outcomes arrive on `results`.
+/// actions go through `dispatcher`, their outcomes arrive on `results`, and
+/// the core's own failure ([`Core::on_failure`]) on `failed`.
 pub struct Running {
     pub core: Core,
     pub dispatcher: Dispatcher,
     pub views: UnboundedReceiver<ViewState>,
     pub results: UnboundedReceiver<Report>,
+    pub failed: oneshot::Receiver<String>,
     subscription: SubscriptionId,
     slot: MutexGuard<'static, ()>,
 }
@@ -96,6 +98,11 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
     let subscription = core.subscribe(move |view| {
         let _ = views_tx.send(view);
     });
+    // Runs on the thread that failed; a send never blocks.
+    let (core_failed_tx, core_failed) = oneshot::channel();
+    core.on_failure(move |message| {
+        let _ = core_failed_tx.send(message);
+    });
     #[cfg(test)]
     tests::panic_if_asked();
     let Some(dispatcher) = opening.disarm() else {
@@ -108,6 +115,7 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         dispatcher,
         views,
         results,
+        failed: core_failed,
         subscription,
         slot,
     })
@@ -152,10 +160,11 @@ impl Running {
             dispatcher,
             views,
             results,
+            failed,
             subscription,
             slot,
         } = self;
-        drop((views, results));
+        drop((views, results, failed));
         log_closed(close_core(core, Some(dispatcher), Some(subscription)));
         // Only now may another runtime in this process open the core.
         drop(slot);

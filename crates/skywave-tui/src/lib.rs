@@ -9,7 +9,8 @@
 //! - [`notify`]: alerts for new approvals (bell, OSC 9/777).
 //! - [`run`]: the terminal event loop; [`handle_key`], [`copy`], [`alert`],
 //!   [`save_draft`] and [`mark_read`] are its steps, and [`shut_down`] its
-//!   one exit, for quit, SIGHUP/SIGTERM/SIGINT and a failed terminal read.
+//!   one exit, for quit, SIGHUP/SIGTERM/SIGINT, a failed terminal read and
+//!   a failed core.
 
 pub mod app;
 pub mod clipboard;
@@ -41,13 +42,42 @@ enum Msg {
     TermFailed(io::Error),
     /// SIGHUP, SIGTERM or SIGINT: leave as quitting does.
     Signal,
+    /// The core's engine or delivery thread panicked ([`Core::on_failure`]).
+    CoreFailed(String),
 }
 
-/// Runs the TUI over `core` until the user quits or a SIGHUP, SIGTERM or
-/// SIGINT arrives, alerting to new approvals as `notify` says. Every exit
-/// (quit, signal, a failed terminal read) goes through [`shut_down`] and
-/// restores the terminal; a panic restores it too.
-pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
+/// Why [`run`] ended other than by quitting.
+#[derive(Debug)]
+pub enum RunError {
+    Terminal(io::Error),
+    /// Sync or snapshots may have stopped for good; carrying on would show
+    /// a screen that silently never changes.
+    CoreFailed(String),
+}
+
+impl From<io::Error> for RunError {
+    fn from(err: io::Error) -> RunError {
+        RunError::Terminal(err)
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Terminal(err) => write!(f, "terminal: {err}"),
+            RunError::CoreFailed(message) => write!(f, "the client core failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+/// Runs the TUI over `core` until the user quits, a SIGHUP, SIGTERM or
+/// SIGINT arrives or the core fails, alerting to new approvals as `notify`
+/// says. Every exit (quit, signal, a failed terminal read, a failed core)
+/// goes through [`shut_down`] and restores the terminal; a panic restores
+/// it too.
+pub fn run(core: &Core, notify: Notify) -> Result<(), RunError> {
     let tmux = notify::in_tmux();
     let (tx, rx) = mpsc::channel();
 
@@ -64,6 +94,11 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
 
     // Only after the first snapshot, which the line above expects first.
     let signals = signals::forward(tx.clone(), || Msg::Signal)?;
+    // On the thread that failed: forwarding never blocks.
+    let failed = tx.clone();
+    core.on_failure(move |message| {
+        let _ = failed.send(Msg::CoreFailed(message));
+    });
 
     // Terminal input on its own thread; it ends with the process.
     thread::spawn(move || {
@@ -126,8 +161,9 @@ pub fn run(core: &Core, notify: Notify) -> io::Result<()> {
                     }
                     Msg::Term(Event::Paste(text)) => app.on_paste(&text),
                     Msg::Term(_) => {}
-                    Msg::TermFailed(err) => return Err(err),
+                    Msg::TermFailed(err) => return Err(err.into()),
                     Msg::Signal => return Ok(()),
+                    Msg::CoreFailed(message) => return Err(RunError::CoreFailed(message)),
                 }
                 if app.ui().quit {
                     return Ok(());

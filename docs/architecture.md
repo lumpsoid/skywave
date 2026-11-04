@@ -457,6 +457,16 @@ D9. The server owns a CA; every device holds a certificate it signed.
 receiving `Request`s and reporting results, and every report is persisted,
 then pushed as a new `ViewState`.
 
+The core runs its engine (and every task it spawns: link, blob
+downloader, listings, pairing) on its runtime, and subscriber callbacks on
+its delivery thread, `skywave-deliver`. A panic in a callback is logged
+and skipped. A panic anywhere else on those threads would stop sync or
+snapshots for good with nothing to show for it, so it is caught and
+*fails the core*: `Core::on_failure(watcher)` calls the watcher once, with
+what panicked. A task cancelled by `Core::shutdown` or a drop never
+fails it. The GUI hub answers `HubFailed` and reopens the core on Restart;
+the TUI exits with "the client core failed: ...".
+
 One core per data dir: an open core holds an exclusive OS lock (`flock`)
 on `core.lock` in it, released when its last handle goes (`Core::shutdown`
 for a deterministic close) or the process exits. A second core on the same
@@ -765,8 +775,9 @@ skywave-core                 all logic, sync, replica
   data dir in use. `HubFailed` carries an epoch, and Dart answers it at
   once with `HubFailedSeen` on the intent channel: the hub drops every
   intent queued before that marker, as meant for the head that failed.
-  Panics on the core's own threads (its engine runtime, `skywave-deliver`)
-  are not caught by the hub.
+  A panic on the core's own threads (any task on its engine runtime,
+  `skywave-deliver` outside a callback) reaches the hub through
+  `Core::on_failure`, and the hub fails the same way.
 - **Boot:** Dart sends its application support directory and device name;
   the hub opens the core in `<dir>/skywave`. The GUI is its own device with
   its own data (D25). A hot restart reruns Rust's `main` and reopens the

@@ -2,11 +2,15 @@
 //! pure [`Model`] and pushes a full [`ViewState`] to subscribers after every
 //! change.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
+use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -83,6 +87,8 @@ pub struct SubscriptionId(u64);
 
 type Callback = Box<dyn FnMut(ViewState) + Send>;
 
+type Watcher = Box<dyn FnOnce(String) + Send>;
+
 /// The client core. Cheap to clone; every clone is the same core. The sync
 /// engine stops when the last clone is dropped, in the background; use
 /// [`shutdown`](Core::shutdown) to wait for it.
@@ -101,6 +107,7 @@ pub(crate) struct Shared {
     /// A detached core's receiver, for [`Seam::take_requests`].
     pub(crate) request_rx: Mutex<Option<Receiver<Request>>>,
     delivery: Delivery,
+    failure: Mutex<Failure>,
     /// Last, so it is released only once the store above has closed.
     _lock: DataDirLock,
 }
@@ -166,7 +173,10 @@ impl Deliverer {
     /// Name of the delivery thread, for logs and debuggers.
     const NAME: &str = "skywave-deliver";
 
-    fn start(shared: &Arc<Shared>) -> std::io::Result<Deliverer> {
+    /// Starts the thread running `body`, [`Shared::deliver_until_stopped`]
+    /// but in tests. A panic in it (outside a callback, which is contained)
+    /// fails the core: nothing delivers any more.
+    fn start(shared: &Arc<Shared>, body: fn(&Shared)) -> std::io::Result<Deliverer> {
         lock(&shared.delivery.pending).threaded = true;
         let (alive, exited) = mpsc::channel::<()>();
         let run = shared.clone();
@@ -174,7 +184,12 @@ impl Deliverer {
             .name(Deliverer::NAME.into())
             .spawn(move || {
                 let _alive = alive;
-                run.deliver_until_stopped();
+                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| body(&run))) {
+                    run.fail(format!(
+                        "the delivery thread panicked: {}",
+                        panic_reason(panic.as_ref())
+                    ));
+                }
             });
         match spawned {
             Ok(thread) => Ok(Deliverer {
@@ -200,7 +215,7 @@ impl Deliverer {
             return;
         }
         if let Err(RecvTimeoutError::Disconnected) = self.exited.recv_timeout(timeout) {
-            // A callback's panic was contained, so this is always `Ok`.
+            // Every panic was caught on the thread, so this is always `Ok`.
             let _ = self.thread.join();
         }
     }
@@ -238,6 +253,23 @@ impl Core {
 
     /// [`open`](Core::open) with an engine tuned by `config`.
     pub fn open_with(data_dir: &Path, config: EngineConfig) -> Result<Core, CoreError> {
+        Core::open_running(
+            data_dir,
+            |seam, requests, suspended| Engine::new(seam, config, requests, suspended).run(),
+            Shared::deliver_until_stopped,
+        )
+    }
+
+    /// [`open_with`](Core::open_with) with the engine `engine` builds and
+    /// the delivery thread running `deliver`: the real ones but in tests.
+    fn open_running<E>(
+        data_dir: &Path,
+        engine: impl FnOnce(Seam, async_mpsc::UnboundedReceiver<Request>, watch::Receiver<bool>) -> E,
+        deliver: fn(&Shared),
+    ) -> Result<Core, CoreError>
+    where
+        E: Future<Output = ()> + Send + 'static,
+    {
         let (requests, request_rx) = async_mpsc::unbounded_channel();
         let shared = Shared::open(data_dir, Requests::Engine(requests), None)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -246,13 +278,17 @@ impl Core {
             .enable_all()
             .build()
             .map_err(CoreError::Runtime)?;
-        let deliverer = Deliverer::start(&shared).map_err(CoreError::Runtime)?;
+        let deliverer = Deliverer::start(&shared, deliver).map_err(CoreError::Runtime)?;
         let (suspended, suspended_rx) = watch::channel(false);
         let seam = Seam::new(Core {
             shared: shared.clone(),
             engine: None,
         });
-        runtime.spawn(Engine::new(seam, config, request_rx, suspended_rx).run());
+        runtime.spawn(failing_on_panic(
+            Arc::downgrade(&shared),
+            "the sync engine",
+            engine(seam, request_rx, suspended_rx),
+        ));
         Ok(Core {
             shared,
             engine: Some(Arc::new(EngineHandle {
@@ -439,6 +475,30 @@ impl Core {
         lock(&self.shared.state).model.view()
     }
 
+    /// Calls `watcher` if the core fails: a panic in its sync engine (any
+    /// task on its runtime: the engine, the link, the blob downloader, a
+    /// listing or a pairing) or on its delivery thread outside a callback.
+    /// From then on sync, or snapshots, may have stopped for good, so a
+    /// head should close the core and say so rather than carry on.
+    ///
+    /// `watcher` gets what panicked and why. It is called at most once, on
+    /// the thread that failed, or here at once if the core has failed
+    /// already; it must not block. Only the first failure is reported.
+    /// [`shutdown`](Core::shutdown), dropping the core and a detached core
+    /// never fail: the watcher is dropped uncalled when the core's last
+    /// handle goes.
+    pub fn on_failure(&self, watcher: impl FnOnce(String) + Send + 'static) {
+        let mut failure = lock(&self.shared.failure);
+        match &failure.message {
+            Some(message) => {
+                let message = message.clone();
+                drop(failure);
+                watcher(message);
+            }
+            None => failure.watchers.push(Box::new(watcher)),
+        }
+    }
+
     /// Stops the core for good and closes its store, so the same data dir
     /// can be opened again at once. Blocks until every engine task and the
     /// delivery thread have stopped — at most `timeout` in all for work in
@@ -514,8 +574,26 @@ impl Shared {
             requests,
             request_rx: Mutex::new(request_rx),
             delivery: Delivery::default(),
+            failure: Mutex::default(),
             _lock: lock,
         }))
+    }
+
+    /// The core failed ([`Core::on_failure`]): tells every watcher, once.
+    fn fail(&self, message: String) {
+        let watchers = {
+            let mut failure = lock(&self.failure);
+            if failure.message.is_some() {
+                tracing::error!(%message, "the core failed again");
+                return;
+            }
+            failure.message = Some(message.clone());
+            std::mem::take(&mut failure.watchers)
+        };
+        tracing::error!(%message, "the core failed");
+        for watcher in watchers {
+            watcher(message.clone());
+        }
     }
 
     /// Runs `change` under the state lock, hands its requests to the engine
@@ -644,11 +722,7 @@ impl Shared {
             if !contain {
                 call();
             } else if let Err(panic) = catch_unwind(call) {
-                let reason = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
+                let reason = panic_reason(panic.as_ref());
                 tracing::error!(reason, "subscriber callback panicked");
             }
         }
@@ -716,6 +790,48 @@ struct Pending {
     due: bool,
     /// A delivery thread runs and alone delivers.
     threaded: bool,
+}
+
+/// Whether the core failed, and who to tell when it does.
+#[derive(Default)]
+struct Failure {
+    /// The first failure's message; `None` while the core works.
+    message: Option<String>,
+    watchers: Vec<Watcher>,
+}
+
+/// Runs `work`, failing the core `shared` (if it is still there) when it
+/// panics, as `what` panicked. Tokio would only drop such a task's panic in
+/// its `JoinHandle`. A task cancelled (aborted, or its runtime shut down)
+/// is never polled again and fails nothing.
+pub(crate) async fn failing_on_panic(
+    shared: Weak<Shared>,
+    what: &'static str,
+    work: impl Future<Output = ()>,
+) {
+    let mut work = pin!(work);
+    let panicked = poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| work.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(())) => Poll::Ready(None),
+            Err(panic) => Poll::Ready(Some(panic_reason(panic.as_ref()).to_owned())),
+        },
+    )
+    .await;
+    if let Some(reason) = panicked
+        && let Some(shared) = shared.upgrade()
+    {
+        shared.fail(format!("{what} panicked: {reason}"));
+    }
+}
+
+/// A panic's message, if it has one.
+fn panic_reason(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
 }
 
 /// Locks a mutex, carrying on after a panic elsewhere: every critical
@@ -1068,6 +1184,97 @@ mod tests {
         eventually("a later snapshot", || views.count() > before);
         views.caught_up(&core);
         assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    /// A watcher on `core`'s failure: the message arrives on the receiver,
+    /// which disconnects if the watcher is dropped uncalled.
+    fn watch_failure(core: &Core) -> Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        core.on_failure(move |message| {
+            let _ = tx.send(message);
+        });
+        rx
+    }
+
+    fn real_engine(
+        seam: Seam,
+        requests: async_mpsc::UnboundedReceiver<Request>,
+        suspended: watch::Receiver<bool>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        Engine::new(seam, EngineConfig::default(), requests, suspended).run()
+    }
+
+    #[test]
+    fn a_panicking_engine_fails_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_running(
+            dir.path(),
+            |_, _, _| async { panic!("engine blew up") },
+            Shared::deliver_until_stopped,
+        )
+        .unwrap();
+        let failed = watch_failure(&core);
+        assert_eq!(
+            failed.recv_timeout(TIMEOUT).unwrap(),
+            "the sync engine panicked: engine blew up"
+        );
+        // A watcher that comes late hears of it at once.
+        assert!(watch_failure(&core).try_recv().is_ok());
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn a_panic_in_a_task_the_engine_spawned_fails_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open_running(
+            dir.path(),
+            |seam, requests, suspended| async move {
+                let link = seam.spawn("the link", async { panic!("link blew up") });
+                // The engine itself carries on.
+                let _ = link.await;
+                let _alive = (requests, suspended);
+                std::future::pending::<()>().await;
+            },
+            Shared::deliver_until_stopped,
+        )
+        .unwrap();
+        let failed = watch_failure(&core);
+        assert_eq!(
+            failed.recv_timeout(TIMEOUT).unwrap(),
+            "the link panicked: link blew up"
+        );
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn a_panic_on_the_delivery_thread_fails_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            Core::open_running(dir.path(), real_engine, |_| panic!("delivery blew up")).unwrap();
+        let failed = watch_failure(&core);
+        assert_eq!(
+            failed.recv_timeout(TIMEOUT).unwrap(),
+            "the delivery thread panicked: delivery blew up"
+        );
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn a_shutdown_does_not_fail_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            Core::open_running(dir.path(), real_engine, Shared::deliver_until_stopped).unwrap();
+        let failed = watch_failure(&core);
+        let (views, _) = Views::subscribe(&core);
+        navigate(&core);
+        views.caught_up(&core);
+        assert_eq!(core.shutdown(TIMEOUT), Ok(()));
+        // The engine task was cancelled and the delivery thread stopped:
+        // the watcher went with the core, uncalled.
+        assert_eq!(
+            failed.recv_timeout(TIMEOUT),
+            Err(RecvTimeoutError::Disconnected)
+        );
     }
 
     #[test]
