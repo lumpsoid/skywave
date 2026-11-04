@@ -21,6 +21,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The v1 API as seen by a paired device.
 pub trait Transport: Send + Sync {
+    /// From now on, every request names `run` as the run of the server it
+    /// is meant for ([`RUN_HEADER`](skywave_proto::RUN_HEADER)), except a
+    /// `hello` asking about a run: a server in another run refuses it as
+    /// [`TransportError::RunChanged`]. The link calls it once a
+    /// connection's `hello` found the log still holds the replica. A
+    /// transport that wraps another must pass it on.
+    fn expect_run(&self, run: RunId);
+
     /// `GET /v1/hello`, asking what became of run `since` of the server
     /// ([`HelloQuery`](skywave_proto::HelloQuery)). A server speaking another
     /// protocol version is [`TransportError::ProtocolMismatch`].
@@ -153,6 +161,12 @@ pub enum TransportError {
     /// blob's size when the server said it.
     #[error("range not satisfiable (416)")]
     RangeNotSatisfiable { size: Option<u64> },
+    /// 412: the server is in another run than the one the request named
+    /// ([`Transport::expect_run`]): it restarted, or was rolled back under
+    /// a connection that never closed. It did nothing with the request.
+    /// The next connection's `hello` tells which.
+    #[error("the server is in another run than this device expects (412)")]
+    RunChanged,
     /// Any other non-2xx status.
     #[error("unexpected HTTP status {0}")]
     BadStatus(u16),
@@ -172,7 +186,8 @@ impl TransportError {
             TransportError::Unreachable(_)
             | TransportError::Tls(_)
             | TransportError::Timeout
-            | TransportError::Io(_) => true,
+            | TransportError::Io(_)
+            | TransportError::RunChanged => true,
             TransportError::BadStatus(status) => *status >= 500,
             TransportError::Unauthorized
             | TransportError::Revoked
@@ -263,6 +278,12 @@ mod tests {
         assert!(!TransportError::NotFound.refuses_command());
         assert!(!TransportError::Revoked.refuses_command());
         assert!(!TransportError::Timeout.refuses_command());
+        // Another run: the connection ends and its `hello` decides; the
+        // command was not refused, nor the device.
+        assert!(TransportError::RunChanged.is_retryable());
+        assert!(!TransportError::RunChanged.refuses_command());
+        assert!(!TransportError::RunChanged.is_server_error());
+        assert_eq!(TransportError::RunChanged.rejection(), None);
         assert!(TransportError::BadStatus(500).is_server_error());
         assert!(TransportError::BadStatus(503).is_server_error());
         assert!(!TransportError::BadStatus(429).is_server_error());

@@ -21,8 +21,8 @@ use skywave_proto::{
     BlobId, BlobRef, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
     ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind,
     EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse, ImportOutcome,
-    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RejectReason, RunId, RunsSince, Seq,
-    SessionId, SessionOrigin, path,
+    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason, RunId,
+    RunsSince, Seq, SessionId, SessionOrigin, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -473,6 +473,78 @@ async fn hello_reports_the_log_and_what_became_of_a_run() {
         .unwrap();
     assert_ne!(other.log, first.log.log, "another database");
     assert_eq!(other.since, Some(RunsSince::Unknown));
+}
+
+/// A request naming the run it expects ([`RUN_HEADER`]) goes through when
+/// that is this run, and is refused with 412 when it is another, before
+/// its handler: a command is not handled, so a resend later is not a
+/// duplicate. Without the header nothing is checked; a malformed one is a
+/// 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_for_another_run_is_refused_untouched() {
+    let f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut client = f.client(&creds).await;
+    let run = f.log.run_id();
+    let this = run.0.to_string();
+    let other = RunId::new().0.to_string();
+    fn named(run: &str) -> [(header::HeaderName, &str); 1] {
+        [(header::HeaderName::from_static(RUN_HEADER), run)]
+    }
+
+    let hello = client
+        .send(Method::GET, path::HELLO, &named(&this), Bytes::new())
+        .await;
+    assert_eq!(hello.status, StatusCode::OK);
+    assert_eq!(hello.json::<HelloResponse>().log.run, run);
+    let command = f.create_session_command();
+    let refused = client
+        .send(Method::POST, path::COMMANDS, &named(&other), json(&command))
+        .await;
+    assert_eq!(refused.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(f.log.head(), Seq::ZERO, "not handled");
+    let taken = client
+        .send(Method::POST, path::COMMANDS, &named(&this), json(&command))
+        .await;
+    assert_eq!(taken.status, StatusCode::OK);
+    assert_eq!(
+        taken.json::<CommandResult>(),
+        CommandResult::Accepted { seq: Seq(1) },
+        "the first time it is handled"
+    );
+    for uri in [path::HELLO.to_owned(), events_uri(Seq::ZERO, 0)] {
+        let reply = client
+            .send(Method::GET, &uri, &named(&other), Bytes::new())
+            .await;
+        assert_eq!(reply.status, StatusCode::PRECONDITION_FAILED, "{uri}");
+    }
+    let since = format!("{}?since={}", path::HELLO, run.0);
+    let asked = client
+        .send(Method::GET, &since, &named(&other), Bytes::new())
+        .await;
+    assert_eq!(
+        asked.status,
+        StatusCode::PRECONDITION_FAILED,
+        "checked whatever the query"
+    );
+    let bare = client.get(&events_uri(Seq::ZERO, 0)).await;
+    assert_eq!(bare.status, StatusCode::OK, "no header, no check");
+    let bad = client
+        .send(Method::GET, path::HELLO, &named("nope"), Bytes::new())
+        .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+    let mut stranger = Client::connect(f.addr, f.identity.ca_cert_der(), None)
+        .await
+        .unwrap();
+    let unauthenticated = stranger
+        .send(Method::GET, path::HELLO, &named(&other), Bytes::new())
+        .await;
+    assert_eq!(
+        unauthenticated.status,
+        StatusCode::UNAUTHORIZED,
+        "authentication first"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

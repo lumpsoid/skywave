@@ -46,7 +46,12 @@
 //! no part: metadata synced counts as synced (D6). A `hello` whose log lost
 //! events the replica holds ([`Seam::log_checked`]) shows
 //! `Rejected(HistoryLost)` before anything is pulled or sent, and stops the
-//! link until the user resets the replica. Any other failure ends
+//! link until the user resets the replica. Every later request names the
+//! run that `hello` reached ([`Transport::expect_run`]), so a server in
+//! another run (restarted, or rolled back under a connection that never
+//! closed) refuses it with [`TransportError::RunChanged`]: that ends the
+//! connection like any failure, and the next one's `hello` tells a clean
+//! restart from a lost log. Any other failure ends
 //! the connection: a rejection (401/403, protocol mismatch) shows
 //! `Rejected(..)` and stops the link until the next `Connect`; anything
 //! else shows `Reconnecting { attempt, retry_at, offline_since }`, waits
@@ -778,6 +783,11 @@ async fn connection(
         }
         Err(error) => return LinkError::from(error).into(),
     }
+    // Every request from here on, on whatever connection the pool opens,
+    // reaches this run or is refused: one rolled back under a connection
+    // that never closed cannot take a command or serve a batch, and the
+    // next connection's `hello` says what became of this run.
+    transport.expect_run(hello.log.run);
     if let Err(error) = ctx.seam.hello_received(&hello) {
         return LinkError::from(error).into();
     }
@@ -1003,6 +1013,8 @@ mod tests {
     }
 
     impl Transport for FlakyServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1415,6 +1427,8 @@ mod tests {
     }
 
     impl Transport for CuttingServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1679,6 +1693,8 @@ mod tests {
     }
 
     impl Transport for RecordingServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1823,6 +1839,8 @@ mod tests {
     }
 
     impl Transport for RefusingServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -2015,6 +2033,8 @@ mod tests {
     }
 
     impl Transport for LogServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,

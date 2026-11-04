@@ -1506,6 +1506,8 @@ fn wire_format_snapshot() {
         protocol_version: u32,
         hello: HelloResponse,
         hello_query: HelloQuery,
+        /// The header naming the expected run, and a value of it.
+        run_header: (&'static str, String),
         runs_since: Vec<Option<RunsSince>>,
         pair_request: PairRequest,
         pair_response: PairResponse,
@@ -1525,6 +1527,7 @@ fn wire_format_snapshot() {
         hello_query: HelloQuery {
             since: Some(run_id()),
         },
+        run_header: (RUN_HEADER, run_id().0.to_string()),
         runs_since: vec![
             None,
             Some(RunsSince::Unknown),

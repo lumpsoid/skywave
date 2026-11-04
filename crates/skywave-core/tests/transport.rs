@@ -335,6 +335,8 @@ async fn pair_then_talk_to_the_server_until_revoked() {
 struct Old;
 
 impl Transport for Old {
+    fn expect_run(&self, _: skywave_proto::RunId) {}
+
     fn hello(
         &self,
         _: Option<skywave_proto::RunId>,
