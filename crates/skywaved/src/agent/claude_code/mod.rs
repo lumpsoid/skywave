@@ -206,7 +206,7 @@ const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const GROUP_POLL: Duration = Duration::from_millis(50);
 /// What the CLI says when `--resume` names a session it does not have, with
 /// or without `--fork-session` (docs/agents/claude-code.md §5).
-const UNKNOWN_SESSION: &str = "No conversation found";
+pub const UNKNOWN_SESSION: &str = "No conversation found";
 
 /// Starts Claude Code CLI sessions with the configured command.
 #[derive(Debug, Clone)]
@@ -332,7 +332,7 @@ impl CliSession {
 
     /// The handle naming [`Self::id`] is stored already: only a resumed
     /// process runs as a conversation the context had.
-    fn handle_stored(self) -> bool {
+    pub fn handle_stored(self) -> bool {
         matches!(self, CliSession::Resume(_))
     }
 
