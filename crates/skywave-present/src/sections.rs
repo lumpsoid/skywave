@@ -5,8 +5,9 @@
 //! and what a copy takes is what it shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, FullView, ImportedEntry,
-    Outgoing, Query, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    ApprovalPrompt, BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry,
+    FullView, ImportedEntry, Outgoing, Query, Seq, SessionView, TimelineItem, ToolKind,
+    ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -203,6 +204,17 @@ pub fn lost(sections: &[Section]) -> Option<&'static str> {
     sections.iter().find_map(Section::lost)
 }
 
+/// What an approval prompt says up front when the server could not keep
+/// some of what the user decides on: the request's own input first (it
+/// can differ from its call's, which `sections`, the gated call's, show),
+/// else the first lost section.
+pub fn approval_lost(prompt: &ApprovalPrompt, sections: &[Section]) -> Option<&'static str> {
+    match prompt.input {
+        Some(FullView::Lost) => Some(INPUT_LOST),
+        _ => lost(sections),
+    }
+}
+
 /// The sections under an item's title, in display order. Empty for items
 /// that are only a line of text.
 pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
@@ -236,7 +248,8 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
 /// A grouped call: its body (e.g. the file written or the diff), then its
 /// output. Output beside a body is shown only when it is an error or the
 /// body is a shell command; the rest waits for the item to expand. The
-/// whole input is offered when nothing else has a blob.
+/// whole input is offered when nothing else has a blob, and a lost input
+/// always stands, so the loss is said.
 pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     let mut out = Vec::new();
     if let Some(body) = &view.body {
@@ -274,8 +287,10 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             input: false,
         });
     }
-    if out.iter().all(|s| s.blob().is_none())
-        && let Some(input) = &view.input
+    // A lost input always stands, so the loss is said: no other section's
+    // blob holds the input.
+    if let Some(input) = &view.input
+        && (*input == FullView::Lost || out.iter().all(|s| s.blob().is_none()))
     {
         out.push(Section::input(input));
     }
@@ -534,6 +549,13 @@ mod tests {
             }),
             Some(Content::Text("x".into()))
         );
+
+        // A lost input beside a kept body still stands, and says so: the
+        // body's blob is not the input.
+        let view = call(Some(kept.clone()), Some(FullView::Lost));
+        let shown = tool_sections(&view);
+        assert!(shown[0].blob().is_some());
+        assert_eq!(lost(&shown), Some(INPUT_LOST));
 
         // Control: kept content is a blob and nothing is said.
         let view = call(Some(kept.clone()), Some(kept));
