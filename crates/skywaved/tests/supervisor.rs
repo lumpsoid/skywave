@@ -1787,6 +1787,88 @@ async fn a_daemon_restart_names_open_calls_per_context() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// Times a daemon restart's recovery over a large log; run by hand
+/// (`cargo test --release -p skywaved --test supervisor -- --ignored --nocapture
+/// recovery_on_a_large_log`). Each session's turn started at the beginning
+/// of its history and the daemon died in it with one call open, so every
+/// per-session lookup recovery makes has the whole history behind it. What
+/// keeps that cost off the history is checked by the query plans
+/// (`event_log::tests::recovery_queries_use_an_index`); this only reports.
+#[tokio::test]
+#[ignore = "timing, not a check: run by hand"]
+async fn recovery_on_a_large_log() {
+    const SESSIONS: usize = 10;
+    const PAIRS: usize = 5_000;
+    let mut f = Fixture::new();
+    let mut sessions = vec![f.session_id];
+    sessions.extend((1..SESSIONS).map(|_| f.create_session()));
+    let seeding = std::time::Instant::now();
+    let mut open = Vec::new();
+    for &session in &sessions {
+        let context = f
+            .log
+            .session(&f.storage.db, session)
+            .unwrap()
+            .unwrap()
+            .context;
+        let mut log = |kind| {
+            f.log
+                .append(&mut f.storage.db, session, context, kind)
+                .unwrap();
+        };
+        log(state(SessionState::AgentWorking));
+        for i in 0..=PAIRS {
+            let call = CallId::new();
+            log(EventKind::ToolCall(ToolCall {
+                call: Some(call),
+                parent: None,
+                name: "exec".into(),
+                display: ToolDisplay {
+                    kind: ToolKind::Shell,
+                    title: "$ true".into(),
+                    detail: None,
+                    body: None,
+                },
+                input: None,
+            }));
+            if i == PAIRS {
+                open.push(call);
+                break;
+            }
+            log(EventKind::ToolResult(ToolResult {
+                call: Some(call),
+                is_error: false,
+                status: None,
+                preview: "ok".into(),
+                lines: 1,
+                output: None,
+            }));
+        }
+    }
+    let head = f.log.head();
+    eprintln!("seeded {} events in {:?}", head.0, seeding.elapsed());
+
+    f.reopen_log();
+    let agent = FakeAgent::new(FakeScript::new());
+    let timing = std::time::Instant::now();
+    let supervisor = f.start(&agent).await;
+    let elapsed = timing.elapsed();
+    eprintln!(
+        "recovery over {} events in {SESSIONS} sessions: {elapsed:?}",
+        head.0
+    );
+    let after = f.log.read(&f.storage.db, head, 5000).unwrap().events;
+    let named: Vec<CallId> = (after.into_iter())
+        .filter_map(|event| match event.kind {
+            EventKind::CallsUnanswered { calls } => Some(calls),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(named, open);
+    supervisor.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Stopping one task
 

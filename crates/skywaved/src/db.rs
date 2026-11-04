@@ -350,6 +350,43 @@ const MIGRATIONS: &[&str] = &[
         settling   INTEGER NOT NULL CHECK (settling IN (0, 1))
     ) STRICT;
     "#,
+    // v18: restart recovery that costs what is open, not the log's length
+    // (architecture.md "Event log"). Every lookup a daemon start makes per
+    // session reads an index or a projection; none scans the history.
+    r#"
+    -- A session's newest event of one type, without reading the others.
+    -- A query uses it only with the expression written exactly so.
+    CREATE INDEX events_session_type ON events (session_id, json_extract(kind, '$.type'), seq);
+    -- The event a command logged (`EventLog::command_seq`).
+    CREATE INDEX events_command ON events (command_id) WHERE command_id IS NOT NULL;
+    -- The shell runner's starting point: the runs not over yet.
+    CREATE INDEX shell_runs_unfinished ON shell_runs (seq) WHERE finished_seq IS NULL;
+
+    -- The calls still open in the log: a ToolCall naming a call adds its
+    -- row, a ToolResult or CallsUnanswered naming it deletes it, in the
+    -- append's transaction. Filled here from the log as `open_calls` read
+    -- it before: a call is open unless its session answers it anywhere.
+    CREATE TABLE open_calls (
+        session_id TEXT NOT NULL,
+        call       TEXT NOT NULL,
+        -- The context and seq of the ToolCall that opened it.
+        context    TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        PRIMARY KEY (session_id, call)
+    ) STRICT;
+    INSERT OR IGNORE INTO open_calls (session_id, call, context, seq)
+        SELECT session_id, json_extract(kind, '$.call'), context, seq FROM events
+        WHERE json_extract(kind, '$.type') = 'tool_call'
+          AND json_extract(kind, '$.call') IS NOT NULL
+        ORDER BY seq;
+    DELETE FROM open_calls WHERE (session_id, call) IN (
+        SELECT session_id, json_extract(kind, '$.call') FROM events
+        WHERE json_extract(kind, '$.type') = 'tool_result'
+        UNION
+        SELECT events.session_id, calls.value
+        FROM events, json_each(events.kind, '$.calls') AS calls
+        WHERE json_extract(events.kind, '$.type') = 'calls_unanswered');
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -547,13 +584,14 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 14] = [
+    const TABLES: [&str; 15] = [
         "approvals",
         "blobs",
         "commands",
         "contexts",
         "devices",
         "events",
+        "open_calls",
         "pair_codes",
         "protocol_stamp",
         "sessions",
@@ -1165,6 +1203,68 @@ mod tests {
         // Positive control, then the same content again.
         assert!(insert("h", 1, "b").is_ok());
         assert!(insert("h", 1, "b").is_err());
+    }
+
+    /// A v17 database gains `open_calls` filled from its log as the old
+    /// scan read it: a call answered by a result or named unanswered in its
+    /// own session is closed; one answered only in another session, or
+    /// never, stays open.
+    #[test]
+    fn v18_fills_open_calls_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..17] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 17).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, ?1)",
+                [PROTOCOL_VERSION],
+            )
+            .unwrap();
+            conn.execute_batch(
+                r#"
+                INSERT INTO log_identity (id, log_id)
+                    VALUES (1, '01920000-0000-7000-8000-000000000001');
+                INSERT INTO events (seq, session_id, at, context, kind) VALUES
+                    (1, 'a', 't', 'ca', '{"type":"tool_call","call":"open"}'),
+                    (2, 'a', 't', 'ca', '{"type":"tool_call","call":"result"}'),
+                    (3, 'a', 't', 'ca', '{"type":"tool_call","call":"named"}'),
+                    (4, 'a', 't', 'ca', '{"type":"tool_call","call":null}'),
+                    (5, 'b', 't', 'cb', '{"type":"tool_call","call":"elsewhere"}'),
+                    (6, 'a', 't', 'cx', '{"type":"tool_result","call":"result"}'),
+                    (7, 'a', 't', 'ca', '{"type":"calls_unanswered","calls":["named"]}'),
+                    (8, 'a', 't', 'ca', '{"type":"tool_result","call":"elsewhere"}'),
+                    (9, 'a', 't', 'ca', '{"type":"tool_call","call":"late"}'),
+                    (10, 'a', 't', 'ca', '{"type":"tool_result","call":null}');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT session_id, call, context, seq FROM open_calls ORDER BY seq")
+            .unwrap();
+        let rows: Vec<(String, String, String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let row = |s: &str, call: &str, context: &str, seq| {
+            (s.to_owned(), call.to_owned(), context.to_owned(), seq)
+        };
+        assert_eq!(
+            rows,
+            [
+                row("a", "open", "ca", 1),
+                row("b", "elsewhere", "cb", 5),
+                row("a", "late", "ca", 9),
+            ]
+        );
     }
 
     #[test]
