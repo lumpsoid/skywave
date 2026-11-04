@@ -876,14 +876,15 @@ async fn interrupt_accepted_while_down_ends_idle_on_restart() {
     assert!(!agent.inputs(f.session_id).contains(&FakeInput::Interrupt));
 }
 
-/// Stores `seq` as the supervisor's cursor, as a daemon that handled the
-/// log up to it and stopped would have left it.
+/// Stores `seq` as the supervisor's cursor and the message it last handed
+/// over, as a daemon that handled the log up to a message at `seq` and
+/// stopped would have left them.
 fn set_cursor(f: &Fixture, seq: Seq) {
     f.storage
         .db
         .conn()
         .execute(
-            "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+            "UPDATE supervisor_cursor SET seq = ?1, handed = ?1 WHERE id = 1",
             [i64::try_from(seq.0).unwrap()],
         )
         .unwrap();
@@ -4078,4 +4079,418 @@ async fn the_daemon_stops_when_its_supervisor_fails() {
         "{logged}"
     );
     f.disk_has_room();
+}
+
+// Starts and stops run off the supervisor's loop: one session's slow agent
+// holds up only that session's events, which wait in order.
+
+/// Waits until session `session`'s fake inputs satisfy `done`.
+async fn wait_inputs(
+    agent: &FakeAgent,
+    session: SessionId,
+    what: &str,
+    done: impl Fn(&[FakeInput]) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let inputs = agent.inputs(session);
+        if done(&inputs) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}; inputs: {inputs:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Waits until the supervisor has stored a cursor at or past `seq`: it has
+/// read the event there, and handled it or held it for its session.
+async fn wait_read(f: &Fixture, seq: Seq) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let stored: i64 = f
+            .storage
+            .db
+            .conn()
+            .query_row("SELECT seq FROM supervisor_cursor WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        if stored >= i64::try_from(seq.0).unwrap() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the supervisor did not read {seq:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The fake's record of a fresh start of session `session`'s first context.
+fn started_fresh(session: SessionId) -> FakeInput {
+    started_as(ContextId::first_of(session), FakeConversation::Fresh)
+}
+
+#[tokio::test]
+async fn a_slow_start_holds_up_no_other_sessions_answer_or_interrupt() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(approval_script().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    let slow = f.session_id;
+    let other = f.create_session();
+    f.session_id = other;
+    f.send("write");
+    f.wait_count("the other session's approval", 1, is_approval_requested)
+        .await;
+
+    let started = Gate::new();
+    agent.hold_start(slow, started.clone());
+    send_in(&mut f, slow, "slow");
+    wait_inputs(&agent, slow, "the slow start", |i| !i.is_empty()).await;
+
+    // Logged after the slow session's message, and carried out while its
+    // agent still starts.
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Approve));
+    f.wait_count("the answered turn's end", 1, is_idle).await;
+    f.send("hang");
+    f.wait_count("the hanging turn", 2, |k| {
+        *k == state(SessionState::AgentWorking)
+    })
+    .await;
+    accepted(f.interrupt());
+    f.wait_count("the interrupted turn's end", 2, is_idle).await;
+    assert_eq!(agent.inputs(slow), [started_fresh(slow)]);
+
+    // The slow session's message goes out once its agent has started.
+    started.open();
+    f.session_id = slow;
+    f.wait_count("the slow session's approval", 1, is_approval_requested)
+        .await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(slow),
+        [started_fresh(slow), message("slow"), FakeInput::Shutdown]
+    );
+}
+
+#[tokio::test]
+async fn a_slow_stop_holds_up_no_other_session_and_a_message_meanwhile_starts_the_agent_after_it() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(approval_script());
+    let supervisor = f.start(&agent).await;
+    let slow = f.session_id;
+    f.send("one");
+    f.wait_count("the first approval", 1, is_approval_requested)
+        .await;
+    let first = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), first, Decision::Approve));
+    f.wait_count("the first turn's end", 1, is_idle).await;
+    let other = f.create_session();
+    f.session_id = other;
+    f.send("write");
+    f.wait_count("the other session's approval", 1, is_approval_requested)
+        .await;
+
+    let stopped = Gate::new();
+    agent.hold_shutdown(slow, stopped.clone());
+    f.session_id = slow;
+    accepted(f.stop());
+    wait_inputs(&agent, slow, "the slow stop", |i| {
+        i.last() == Some(&FakeInput::Shutdown)
+    })
+    .await;
+    f.send("two");
+
+    // The other session's answer reaches its agent while the stop runs; the
+    // message waits for the stop.
+    f.session_id = other;
+    let id = f.approval_id();
+    accepted(f.resolve(DeviceId::new(), id, Decision::Approve));
+    f.wait_count("the other turn's end", 1, is_idle).await;
+    let answered = FakeInput::Answer("req-1".into(), Decision::Approve, None);
+    assert_eq!(
+        agent.inputs(slow),
+        [
+            started_fresh(slow),
+            message("one"),
+            answered.clone(),
+            FakeInput::Shutdown,
+        ]
+    );
+
+    stopped.open();
+    f.session_id = slow;
+    f.wait_count("the message after the stop", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(slow),
+        [
+            started_fresh(slow),
+            message("one"),
+            answered,
+            FakeInput::Shutdown,
+            f.started(true),
+            message("two"),
+            FakeInput::Shutdown,
+        ]
+    );
+    let kinds = f.kinds();
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+}
+
+#[tokio::test]
+async fn a_stop_while_the_agent_starts_stops_it_once_it_has_started() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    let started = Gate::new();
+    agent.hold_start(f.session_id, started.clone());
+    f.send("hang");
+    wait_inputs(&agent, f.session_id, "the start", |i| !i.is_empty()).await;
+    let stop = accepted(f.stop());
+    wait_read(&f, stop).await;
+
+    started.open();
+    wait_shutdown(&agent, &f, 1).await;
+    let kinds = f.wait_count("the interrupted turn's end", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    // Given the message it started for, then stopped: no second start.
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("hang"),
+            FakeInput::Interrupt,
+            FakeInput::Shutdown,
+        ]
+    );
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+}
+
+#[tokio::test]
+async fn a_clear_while_the_agent_starts_stops_it_and_the_new_context_starts_fresh() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    let started = Gate::new();
+    agent.hold_start(f.session_id, started.clone());
+    f.send("hang");
+    wait_inputs(&agent, f.session_id, "the start", |i| !i.is_empty()).await;
+    let next = ContextId::new();
+    let marker = f.clear(next);
+    wait_read(&f, marker).await;
+
+    started.open();
+    f.wait_count("the interrupted turn's end", 1, is_idle).await;
+    f.send("next");
+    f.wait_count("the new context's reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("hang"),
+            FakeInput::Interrupt,
+            FakeInput::Shutdown,
+            started_as(next, FakeConversation::Fresh),
+            message("next"),
+            FakeInput::Shutdown,
+        ]
+    );
+    // The first context's turn ran and ended in it, after the clear.
+    assert_eq!(
+        f.stamped_after(marker)[..2],
+        [
+            (state(SessionState::AgentWorking), f.first()),
+            (state(SessionState::Idle), f.first()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_message_during_an_idle_shutdown_resumes_the_agent_after_it() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let config = SupervisorConfig {
+        idle_timeout: Duration::ZERO,
+    };
+    let supervisor = f.start_with(&agent, config).await;
+    let stopped = Gate::new();
+    agent.hold_shutdown(f.session_id, stopped.clone());
+    f.send("one");
+    f.wait_count("the first reply", 1, is_idle).await;
+    wait_shutdown(&agent, &f, 1).await;
+    let two = f.send("two");
+    wait_read(&f, two).await;
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [f.started(false), message("one"), FakeInput::Shutdown]
+    );
+
+    stopped.open();
+    f.wait_count("the second reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id)[..5],
+        [
+            f.started(false),
+            message("one"),
+            FakeInput::Shutdown,
+            f.started(true),
+            message("two"),
+        ]
+    );
+}
+
+/// A daemon shutdown drops a start under way (which kills its agent) rather
+/// than wait for it; the message it was for was not handed over, so the
+/// next run delivers it.
+#[tokio::test]
+async fn a_daemon_shutdown_drops_a_start_under_way_and_the_next_run_delivers_its_message() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    // Never opened.
+    agent.hold_start(f.session_id, Gate::new());
+    f.send("held");
+    wait_inputs(&agent, f.session_id, "the start", |i| !i.is_empty()).await;
+    tokio::time::timeout(WAIT, supervisor.shutdown())
+        .await
+        .expect("the shutdown waited for the start")
+        .unwrap();
+    assert!(held_row(&f, f.session_id).is_some());
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("the reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            f.started(false),
+            message("held"),
+            FakeInput::Shutdown,
+        ]
+    );
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+    assert_eq!(held_row(&f, f.session_id), None);
+}
+
+/// A stop under way when the daemon shuts down runs alongside the warm
+/// agents' stops: the fake holds each shutdown until both are under way.
+#[tokio::test]
+async fn a_daemon_shutdown_stops_the_warm_agents_alongside_a_stop_under_way() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().shutdowns_wait_for_each_other(2));
+    let supervisor = f.start(&agent).await;
+    let stopping = f.session_id;
+    f.send("one");
+    f.wait_count("the first session's reply", 1, is_idle).await;
+    let warm = f.create_session();
+    f.session_id = warm;
+    f.send("two");
+    f.wait_count("the second session's reply", 1, is_idle).await;
+    let before = f.kinds();
+
+    f.session_id = stopping;
+    accepted(f.stop());
+    wait_shutdown(&agent, &f, 1).await;
+    tokio::time::timeout(WAIT, supervisor.shutdown())
+        .await
+        .expect("the agents stopped one after another")
+        .unwrap();
+    assert_eq!(agent.inputs(warm).last(), Some(&FakeInput::Shutdown));
+    // The warm agent's exit is left unrecorded for the next start.
+    f.session_id = warm;
+    assert_eq!(f.kinds(), before);
+}
+
+/// Session `session`'s row in `supervisor_held`, if it has one.
+fn held_row(f: &Fixture, session: SessionId) -> Option<i64> {
+    let row = f.storage.db.conn().query_row(
+        "SELECT seq FROM supervisor_held WHERE session_id = ?1",
+        [session.0.to_string()],
+        |r| r.get(0),
+    );
+    match row {
+        Ok(seq) => Some(seq),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// Events the previous run read but held for their session's agent are
+/// handled by the next run; a message the cursor passed with no hold is
+/// not.
+#[tokio::test]
+async fn a_message_held_when_the_daemon_stopped_is_delivered_by_the_next_run() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let held = f.session_id;
+    let held_seq = f.send("held");
+    let other = f.create_session();
+    let passed = send_in(&mut f, other, "passed");
+    let conn = f.storage.db.conn();
+    conn.execute(
+        "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+        [i64::try_from(passed.0).unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO supervisor_held (session_id, seq) VALUES (?1, ?2)",
+        rusqlite::params![held.0.to_string(), i64::try_from(held_seq.0).unwrap() - 1],
+    )
+    .unwrap();
+
+    let supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("the held message's reply", 1, is_idle).await;
+    assert!(!kinds.iter().any(is_errored), "{kinds:#?}");
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(held),
+        [f.started(false), message("held"), FakeInput::Shutdown]
+    );
+    assert_eq!(held_row(&f, held), None);
+    // The other session's message was past the cursor with no hold.
+    assert!(agent.inputs(other).is_empty());
+}
+
+/// A new session's start forks a moved context only once its origin
+/// session settles: the clear before the move stops the origin's agent,
+/// which may still be writing the conversation.
+#[tokio::test]
+async fn a_fork_waits_for_its_origin_sessions_stop() {
+    let mut f = Fixture::new();
+    let a = f.first();
+    let agent = FakeAgent::new(FakeScript::new());
+    let supervisor = f.start(&agent).await;
+    f.send("one");
+    f.wait_count("the reply", 1, is_idle).await;
+
+    let stopped = Gate::new();
+    agent.hold_shutdown(f.session_id, stopped.clone());
+    f.clear(ContextId::new());
+    wait_shutdown(&agent, &f, 1).await;
+    let (_, new) = move_context(&mut f, a);
+    let to_new = send_in(&mut f, new, "in new");
+    wait_read(&f, to_new).await;
+    assert_eq!(starts_in(&agent, new), []);
+    assert!(held_row(&f, new).is_some());
+
+    stopped.open();
+    wait_idle_in(&f, new, 1).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        agent.inputs(new),
+        [
+            started_as(ContextId::first_of(new), FakeConversation::Fork(a)),
+            message("in new"),
+            FakeInput::Shutdown,
+        ]
+    );
 }

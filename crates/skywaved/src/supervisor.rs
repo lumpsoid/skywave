@@ -76,6 +76,22 @@
 //!   next task set; the busy count and idle clock follow that set as for
 //!   any other change.
 //!
+//! **Starts and stops.** An agent start (the adapter's handshake can take
+//! up to a minute) and a stop (the grace periods, tens of seconds) run as
+//! tasks beside the supervisor's loop, which goes on following the log and
+//! the other agents meanwhile: one session's slow agent never delays
+//! another session's answers, interrupts or events. The session is *held*
+//! until the start or stop completes: its events read meanwhile wait, in
+//! log order, and are handled once the completion is in, as if the start
+//! or stop had been awaited where it began. So a stop requested while the
+//! agent starts stops it once it has started (and been given the message it
+//! started for), a message sent while it stops starts it again after the
+//! stop, and a clear, switch or move waits like any other event. The
+//! outcome is decided by the completion itself (the agent runs, or the
+//! start failed and its trigger is answered with why), never by a timer. A
+//! message the agent refuses as closed waits for that agent's stop and goes
+//! to a new one, once.
+//!
 //! **Conversations.** A context starts in its own conversation, resumed
 //! with its stored [`ResumeHandle`](crate::agent::ResumeHandle), once it has
 //! one. Before that, the first context of a session a context was moved
@@ -84,11 +100,12 @@
 //! before any message forks again; any other context starts fresh. An
 //! origin with no handle refuses the start, logged like any failed start,
 //! rather than starting fresh. The fork reads a finished conversation: the
-//! clear or switch before the move stopped the source's agent and waited
-//! for its exit (`stop_session` drains to `Exited`), and the supervisor
-//! handles one log event at a time, so that agent is gone before any event
-//! of the new session is handled. Its late events (the interrupted turn's
-//! `Idle`, its exit) stay in the source, stamped with the moved context.
+//! clear or switch before the move stops the source's agent, and a start
+//! that would fork waits (holding its session) while the source session is
+//! held, so that agent has exited (its stop drains to `Exited`) and nothing
+//! queued in the source still reaches it. Its late events (the interrupted
+//! turn's `Idle`, its exit) stay in the source, stamped with the moved
+//! context.
 //!
 //! Likewise the first context of a session created by adoption starts as
 //! [`Conversation::Adopt`] with the agent's own id of the outside
@@ -126,16 +143,21 @@
 //! are reported, never redelivered: delivery is at most once (below), and
 //! after a stop the user chose to end the work.
 //!
-//! **Cursor and delivery.** The cursor (`supervisor_cursor`, the seq of the
-//! last event handled) is persisted, so a message accepted but not yet
-//! handled when the daemon stopped reaches the agent after the restart. A
-//! `UserMessage`'s seq is stored *before* the message is given to the agent:
-//! delivery is **at most once**. A crash between the two loses that message
-//! rather than running an instruction twice, which an agent with side
-//! effects could not undo; the next start says so with `Errored` (below), so
-//! the user can resend it. Answers and interrupts need no such care: after a restart their
-//! approvals and turns are already settled (below), so replaying them does
-//! nothing.
+//! **Cursor and delivery.** The cursor (`supervisor_cursor.seq`, the seq of
+//! the last event read) is persisted, so a message accepted but not yet
+//! read when the daemon stopped reaches the agent after the restart. So is
+//! each held session's last handled event (`supervisor_held`): its events
+//! after that one, up to the cursor, were read but waited for a start or
+//! stop, and the next run handles them first, in order. A message whose
+//! agent was still starting is one of them. A `UserMessage`'s seq is stored
+//! as handed over (`supervisor_cursor.handed`, with the cursor) *before*
+//! the message is given to the agent: delivery is **at most once**. A crash
+//! between the two loses that message rather than running an instruction
+//! twice, which an agent with side effects could not undo; the next start
+//! says so with `Errored` (below), so the user can resend it. All three are
+//! written in one transaction. Answers and interrupts need no such care:
+//! after a restart their approvals and turns are already settled (below),
+//! so replaying them does nothing.
 //!
 //! **Lifecycle.** An agent session is started on the first message and kept
 //! while it has work: a turn open (also one the agent started on its own,
@@ -165,14 +187,11 @@
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
 //!   Both are stamped with the context of the state event they settle;
-//! - when the event at the stored cursor is a `UserMessage` that no agent
-//!   took (nothing after it in its session and context is
-//!   `SessionStateChanged` to `AgentWorking` or `Errored`), its session gets
-//!   `SessionStateChanged(Errored)` ([`MESSAGE_LOST`]) stamped with the
-//!   message's context. The cursor is stored on a message just before it is
-//!   handed over, so a crash in between leaves it there. Only that event is
-//!   looked at: once a later one is handled (a `SessionStopped`, say), the
-//!   message is past the cursor and left as it is. It is
+//! - when the last message handed to an agent (stored just before it is
+//!   handed over) is one no agent took (nothing after it in its session and
+//!   context is `SessionStateChanged` to `AgentWorking` or `Errored`), its
+//!   session gets `SessionStateChanged(Errored)` ([`MESSAGE_LOST`]) stamped
+//!   with the message's context. Only that message is looked at. It is
 //!   decided after the turn above, whose `Errored` already covers a message
 //!   queued behind a lost turn, and the `Errored` it logs keeps a later
 //!   start from logging it again. A clean shutdown that stopped an agent
@@ -180,9 +199,9 @@
 //!   settled the same way;
 //! - a mode, model or effort request still open whose event the supervisor had
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
-//!   handed to is gone. One after the cursor is handled as usual. Settings
-//!   belong to the session, so the refusal is stamped with the current
-//!   context;
+//!   handed to is gone. One after the cursor, or held for its session's
+//!   agent, is handled as usual. Settings belong to the session, so the
+//!   refusal is stamped with the current context;
 //! - a session whose logged background tasks or schedules are not empty gets
 //!   the empty set(s), `BackgroundTasksChanged` and/or `SchedulesChanged`:
 //!   its agent died with the daemon, and its work with it. They are stamped
@@ -196,10 +215,13 @@
 //! that `Exited` carries is dropped with it, so a message queued behind
 //! such a turn is not reported. A pending approval
 //! cannot outlive the daemon: the agent's request for it lives only in the
-//! agent process (D8). The agents stop concurrently, so shutdown takes about
-//! one agent's grace period however many run (systemd's stop timeout is a
-//! bound on the whole of it); what each reported while stopping is logged
-//! once all have stopped.
+//! agent process (D8). The agents stop concurrently, together with the stops
+//! already under way (recorded as they were requested), so shutdown takes
+//! about one agent's grace period however many run (systemd's stop timeout
+//! is a bound on the whole of it); what each reported while stopping is
+//! logged once all have stopped. A start under way is dropped, which kills
+//! its agent: the event it was for, and what waited behind it, stay held
+//! for the next run.
 //!
 //! **Failure.** An error while following the log (the database full or
 //! gone, say) ends the supervisor: its agent sessions are dropped, which
@@ -221,11 +243,14 @@
 //! own thread with a current-thread runtime and its own [`Storage`]; agent
 //! sessions (and any tasks their adapter spawns) live on that runtime. All
 //! work is serialized there: agent requests are awaited one at a time, so an
-//! adapter must return from them promptly (they only tell the agent).
+//! adapter must return from them promptly (they only tell the agent). Starts
+//! and shutdowns are the exception, run as tasks on the same runtime (see
+//! **Starts and stops**); a panic in one ends the supervisor like an error.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -236,11 +261,12 @@ use skywave_proto::{
     SessionOrigin, SessionState, TaskId,
 };
 use tokio::sync::oneshot;
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
 use crate::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentSession, Conversation, EventMapper, StartSpec,
-    bounded_models, load_grants, load_origin, load_resume_handle,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
+    StartSpec, bounded_models, load_grants, load_origin, load_resume_handle,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -330,17 +356,93 @@ impl SupervisorHandle {
 
 /// The agent supervisor; see the [module docs](self).
 pub struct Supervisor<A: AgentAdapter> {
-    adapter: A,
+    adapter: Arc<A>,
     log: EventLog,
     storage: Storage,
     config: SupervisorConfig,
-    /// Seq of the last log event handled.
+    /// Seq of the last log event read: handled, or waiting in [`Held`].
     cursor: Seq,
-    /// The cursor as last persisted.
-    stored_cursor: Seq,
+    /// Seq of the last `UserMessage` handed to an agent.
+    handed: Seq,
+    /// The progress as last persisted.
+    stored: Progress,
     running: HashMap<SessionId, Running<A::Session>>,
+    /// Sessions whose agent is starting or stopping, and what waits for it.
+    held: HashMap<SessionId, Held>,
+    /// Agent starts under way.
+    starts: JoinSet<(SessionId, Started<A::Session>)>,
+    /// Agent stops under way, each with whether its exit is recorded.
+    stops: JoinSet<(SessionId, Halted, bool)>,
     /// The models of the newest `ModelsOffered` in the log.
     models: Option<Vec<ModelChoice>>,
+}
+
+/// What [`AgentAdapter::start`] returned.
+type Started<S> = Result<(S, AdapterEvents), AgentError>;
+
+/// What the supervisor persists of where it is, besides the log
+/// (`supervisor_cursor` and `supervisor_held`).
+#[derive(Debug, Clone, PartialEq)]
+struct Progress {
+    cursor: Seq,
+    handed: Seq,
+    /// [`Held::handled`] of every held session.
+    held: HashMap<SessionId, Seq>,
+}
+
+/// A session whose agent is starting or stopping. Its events read
+/// meanwhile wait here, in log order, and are handled once the start or
+/// stop has completed, so one session's slow agent holds up only its own
+/// events.
+struct Held {
+    /// Seq of the session's last event handled: its events after it, up to
+    /// the cursor, are the start's trigger or wait in `queue`. Persisted,
+    /// so a restart handles them rather than losing them.
+    handled: Seq,
+    /// What is under way; `None` while the queue is being handled.
+    op: Option<Op>,
+    queue: VecDeque<Queued>,
+}
+
+impl Held {
+    /// Puts `item` back first in line, not handled.
+    fn requeue(&mut self, item: Queued) {
+        self.handled = self.handled.min(before(item.seq));
+        self.queue.push_front(item);
+    }
+}
+
+/// What a held session waits for.
+enum Op {
+    /// Its agent starts.
+    Starting(Box<Starting>),
+    /// Its agent stops.
+    Stopping,
+    /// Another session to settle (nothing under way or waiting), before
+    /// one of this session's contexts forks a conversation of it.
+    After(SessionId),
+}
+
+/// An agent start under way for `trigger`, a message or setting request,
+/// in `trigger`'s context; `mapper` and `asked` are the new agent's.
+struct Starting {
+    trigger: Queued,
+    mapper: EventMapper,
+    asked: HashSet<Option<CommandId>>,
+}
+
+/// A log event the supervisor handles.
+struct Queued {
+    seq: Seq,
+    event: Event,
+    /// A message an agent refused as closed, once already: it goes to a
+    /// new agent, and errors if that one refuses it too.
+    retried: bool,
+}
+
+/// The seq just before `seq`.
+fn before(seq: Seq) -> Seq {
+    Seq(seq.0.saturating_sub(1))
 }
 
 /// One running agent session: at most one per Skywave session, for one of
@@ -396,12 +498,19 @@ impl<S> Running<S> {
     }
 }
 
-enum Wake {
+enum Wake<S> {
     Stop,
     Log,
     /// Boxed: an event is far larger than the other wakes.
     Agent(SessionId, Option<Box<AdapterEvent>>),
     Idle,
+    Started(Box<Result<(SessionId, Started<S>), JoinError>>),
+    Stopped(Box<Result<(SessionId, Halted, bool), JoinError>>),
+}
+
+/// The error for an agent start or stop task that panicked.
+fn panicked(error: JoinError) -> Error {
+    Error::Supervisor(format!("agent start or stop panicked: {error}"))
 }
 
 impl<A: AgentAdapter> Supervisor<A> {
@@ -485,9 +594,19 @@ impl<A: AgentAdapter> Supervisor<A> {
                 EventKind::SessionStateChanged(settle),
             )?;
         }
+        let progress = load_progress(db)?;
+        // Read but not handled yet: it waited for its session's agent.
+        let queued = |session: SessionId, seq: Seq| {
+            progress
+                .held
+                .get(&session)
+                .is_some_and(|&handled| seq > handled)
+        };
         // After the turns above: a turn lost with the daemon already took
         // the message, and its `Errored` says so.
-        if let Some((session_id, context)) = lost_message(db, load_cursor(db)?)? {
+        if let Some((session_id, context)) = lost_message(db, progress.handed)?
+            && !queued(session_id, progress.handed)
+        {
             tracing::info!(session = %session_id.0, "erroring a message lost with the daemon");
             self.log.append(
                 db,
@@ -522,15 +641,15 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.log.append(db, session.id, context, kind)?;
             }
         }
-        self.cursor = load_cursor(db)?;
-        self.stored_cursor = self.cursor;
+        self.cursor = progress.cursor;
+        self.handed = progress.handed;
         for session in self.log.sessions(db)? {
             let settings = self.log.agent_settings(db, session.id)?;
             let handled = |command| -> Result<bool> {
                 Ok(self
                     .log
                     .command_seq(db, command)?
-                    .is_some_and(|seq| seq <= self.cursor))
+                    .is_some_and(|seq| seq <= self.cursor && !queued(session.id, seq)))
             };
             let mut lost = Vec::new();
             if let Some(request) = &settings.mode.requested
@@ -567,11 +686,67 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
         }
         self.models = self.log.offered_models(db)?;
+        self.held = self.held_events(&progress)?;
+        self.stored = progress;
         Ok(())
+    }
+
+    /// The events each session held when the previous run last stored its
+    /// progress, read again from the log; [`Supervisor::run`] handles them
+    /// first.
+    fn held_events(&self, progress: &Progress) -> Result<HashMap<SessionId, Held>> {
+        let mut held: HashMap<SessionId, Held> = (progress.held.iter())
+            .map(|(&id, &handled)| {
+                let queue = VecDeque::new();
+                (
+                    id,
+                    Held {
+                        handled,
+                        op: None,
+                        queue,
+                    },
+                )
+            })
+            .collect();
+        let Some(&from) = progress.held.values().min() else {
+            return Ok(held);
+        };
+        let mut after = from;
+        while after < progress.cursor {
+            let batch = self.log.read(&self.storage.db, after, BATCH)?;
+            if batch.events.is_empty() {
+                break;
+            }
+            let mut seq = batch.from;
+            for event in batch.events {
+                if seq > progress.cursor {
+                    return Ok(held);
+                }
+                if let Some(session) = held.get_mut(&event.session_id)
+                    && seq > session.handled
+                    && reacts(&event.kind)
+                {
+                    let retried = false;
+                    session.queue.push_back(Queued {
+                        seq,
+                        event,
+                        retried,
+                    });
+                }
+                after = seq;
+                seq = seq.next();
+            }
+        }
+        Ok(held)
     }
 
     async fn run(mut self, mut stop: oneshot::Receiver<()>) -> Result<()> {
         let mut head = self.log.subscribe();
+        // What the previous run left waiting, before anything newer.
+        let replayed: Vec<SessionId> = self.held.keys().copied().collect();
+        for id in replayed {
+            self.drain(id).await?;
+        }
         loop {
             head.borrow_and_update();
             if self.log.head() > self.cursor {
@@ -582,6 +757,8 @@ impl<A: AgentAdapter> Supervisor<A> {
             let wake = tokio::select! {
                 biased;
                 _ = &mut stop => Wake::Stop,
+                Some(started) = self.starts.join_next() => Wake::Started(Box::new(started)),
+                Some(stopped) = self.stops.join_next() => Wake::Stopped(Box::new(stopped)),
                 (id, event) = next_event(&mut self.running) => Wake::Agent(id, event.map(Box::new)),
                 _ = head.changed() => Wake::Log,
                 () = sleep_until(deadline) => Wake::Idle,
@@ -590,17 +767,48 @@ impl<A: AgentAdapter> Supervisor<A> {
                 Wake::Stop => break,
                 Wake::Log => {}
                 Wake::Agent(id, event) => self.on_agent_event(id, event.map(|e| *e)).await?,
-                Wake::Idle => self.stop_idle().await?,
+                Wake::Idle => self.stop_idle(),
+                Wake::Started(started) => {
+                    let (id, started) = started.map_err(panicked)?;
+                    self.on_started(id, started).await?;
+                }
+                Wake::Stopped(stopped) => {
+                    let (id, halted, map_exit) = stopped.map_err(panicked)?;
+                    self.on_stopped(id, halted, map_exit).await?;
+                }
             }
+            self.store_progress()?;
         }
+        self.shut_down().await
+    }
+
+    /// Stops every agent, those stopping already included, without
+    /// interrupting them; see the module docs.
+    async fn shut_down(mut self) -> Result<()> {
+        // Dropping a start under way kills its agent. Its trigger and what
+        // waited behind it stay unhandled, for the next run.
+        self.starts.shutdown().await;
         // All at once: one by one, each agent's grace would add up.
         let halts = std::mem::take(&mut self.running)
             .into_iter()
-            .map(|(id, running)| async move { (id, halt(id, running).await) });
-        for (id, halted) in join_all(halts).await {
-            self.record_stop(id, halted, false)?;
+            .map(|(id, running)| async move { (id, halt(id, running).await, false) });
+        let mut stops = std::mem::take(&mut self.stops);
+        let under_way = async move {
+            let mut stopped = Vec::new();
+            while let Some(joined) = stops.join_next().await {
+                stopped.push(joined);
+            }
+            stopped
+        };
+        let (halted, stopped) = tokio::join!(join_all(halts), under_way);
+        for joined in stopped {
+            let (id, halted, map_exit) = joined.map_err(panicked)?;
+            self.record_stop(id, halted, map_exit)?;
         }
-        Ok(())
+        for (id, halted, map_exit) in halted {
+            self.record_stop(id, halted, map_exit)?;
+        }
+        self.store_progress()
     }
 
     /// Handles one batch of log events after the cursor.
@@ -608,24 +816,55 @@ impl<A: AgentAdapter> Supervisor<A> {
         let batch = self.log.read(&self.storage.db, self.cursor, BATCH)?;
         let mut seq = batch.from;
         for event in batch.events {
-            self.on_log_event(seq, event).await?;
             self.cursor = seq;
+            self.on_log_event(seq, event).await?;
             seq = seq.next();
         }
-        self.store_cursor()
+        self.store_progress()
     }
 
+    /// Handles the event at `seq`, the cursor, or holds it while its
+    /// session's agent starts or stops.
     async fn on_log_event(&mut self, seq: Seq, event: Event) -> Result<()> {
-        let session_id = event.session_id;
-        match event.kind {
-            EventKind::UserMessage { text, .. } => {
-                // At most once: the cursor passes the message before the
-                // agent gets it.
-                self.cursor = seq;
-                self.store_cursor()?;
-                self.deliver(session_id, event.context, text).await?;
-            }
-            EventKind::ApprovalResolved {
+        if !reacts(&event.kind) {
+            return Ok(());
+        }
+        let item = Queued {
+            seq,
+            event,
+            retried: false,
+        };
+        match self.held.get_mut(&item.event.session_id) {
+            Some(held) => held.queue.push_back(item),
+            None => self.handle(item).await?,
+        }
+        Ok(())
+    }
+
+    /// Handles `item`, an event for a session no start or stop holds.
+    async fn handle(&mut self, item: Queued) -> Result<()> {
+        let session_id = item.event.session_id;
+        if starts_agent(&item.event.kind)
+            && self
+                .running
+                .get(&session_id)
+                .is_some_and(|running| running.context() != item.event.context)
+        {
+            // Cannot happen while command handling validates stamps and a
+            // context change stops the agent (both before the supervisor
+            // reaches the event); if it does, the event goes to its own
+            // context's agent, once this one has stopped, not silently to
+            // another's.
+            tracing::warn!(session = %session_id.0, "agent runs another context; stopping it");
+            self.stop_on_request(session_id).await?;
+            self.held_mut(session_id)?.requeue(item);
+            return Ok(());
+        }
+        let context = item.event.context;
+        let command = item.event.command_id;
+        match &item.event.kind {
+            EventKind::UserMessage { .. } => self.deliver(item).await?,
+            &EventKind::ApprovalResolved {
                 id, decision, rule, ..
             } => {
                 let Some(running) = self.running.get_mut(&session_id) else {
@@ -649,7 +888,10 @@ impl<A: AgentAdapter> Supervisor<A> {
                     return Ok(());
                 };
                 // Aimed at an earlier turn, or before this one began.
-                if running.turn_started.is_none_or(|started| started >= seq) {
+                if running
+                    .turn_started
+                    .is_none_or(|started| started >= item.seq)
+                {
                     return Ok(());
                 }
                 let sent = if running.interrupted {
@@ -674,7 +916,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                 if self
                     .running
                     .get(&session_id)
-                    .is_some_and(|running| running.context() != event.context)
+                    .is_some_and(|running| running.context() != context)
                 {
                     tracing::info!(session = %session_id.0, "stopping agent: context changed");
                     self.stop_on_request(session_id).await?;
@@ -688,34 +930,100 @@ impl<A: AgentAdapter> Supervisor<A> {
                 if self
                     .running
                     .get(&session_id)
-                    .is_some_and(|running| running.context() == event.context)
+                    .is_some_and(|running| running.context() == context)
                 {
                     tracing::warn!(session = %session_id.0, "agent runs a moved context; stopping it");
                     self.stop_on_request(session_id).await?;
                 }
             }
-            EventKind::PermissionModeRequested { mode, .. } => {
-                let setting = Setting::Mode(mode);
-                self.set(session_id, event.context, event.command_id, setting)
-                    .await?;
+            &EventKind::PermissionModeRequested { mode, .. } => {
+                self.set(item, Setting::Mode(mode)).await?;
             }
             EventKind::ModelRequested { model, .. } => {
-                let setting = Setting::Model(model);
-                self.set(session_id, event.context, event.command_id, setting)
-                    .await?;
+                let setting = Setting::Model(model.clone());
+                self.set(item, setting).await?;
             }
-            EventKind::EffortRequested { effort, .. } => {
-                let setting = Setting::Effort(effort);
-                self.set(session_id, event.context, event.command_id, setting)
-                    .await?;
+            &EventKind::EffortRequested { effort, .. } => {
+                self.set(item, Setting::Effort(effort)).await?;
             }
             EventKind::TaskStopRequested { task, .. } => {
-                self.stop_task(session_id, event.context, event.command_id, task)
-                    .await?;
+                let task = task.clone();
+                self.stop_task(session_id, context, command, task).await?;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// The held session `id`, which a start or stop just held.
+    fn held_mut(&mut self, id: SessionId) -> Result<&mut Held> {
+        self.held
+            .get_mut(&id)
+            .ok_or_else(|| Error::Supervisor(format!("session {} is not held", id.0)))
+    }
+
+    /// Holds session `id` for `op`. A session held first now has handled
+    /// everything read so far; the caller lowers that for an event it
+    /// puts back.
+    fn hold(&mut self, id: SessionId, op: Op) -> &mut Held {
+        let cursor = self.cursor;
+        let held = self.held.entry(id).or_insert_with(|| Held {
+            handled: cursor,
+            op: None,
+            queue: VecDeque::new(),
+        });
+        held.op = Some(op);
+        held
+    }
+
+    /// Handles what waited for session `first`'s start or stop, in order,
+    /// until none is left or another start or stop holds the session
+    /// again; then what waited for that session to settle.
+    async fn drain(&mut self, first: SessionId) -> Result<()> {
+        let mut todo = vec![first];
+        while let Some(id) = todo.pop() {
+            loop {
+                let Some(held) = self.held.get_mut(&id) else {
+                    break;
+                };
+                if held.op.is_some() {
+                    break;
+                }
+                let Some(item) = held.queue.pop_front() else {
+                    self.held.remove(&id);
+                    for (&waiter, held) in &mut self.held {
+                        if matches!(held.op, Some(Op::After(origin)) if origin == id) {
+                            held.op = None;
+                            todo.push(waiter);
+                        }
+                    }
+                    break;
+                };
+                let seq = item.seq;
+                self.handle(item).await?;
+                if !self.holds(id, seq)
+                    && let Some(held) = self.held.get_mut(&id)
+                {
+                    held.handled = held.handled.max(seq);
+                }
+            }
+        }
+        self.store_progress()
+    }
+
+    /// Whether session `id` still holds its event at `seq`, unhandled.
+    fn holds(&self, id: SessionId, seq: Seq) -> bool {
+        self.held.get(&id).is_some_and(|held| {
+            held.queue.front().is_some_and(|item| item.seq == seq)
+                || matches!(&held.op, Some(Op::Starting(start)) if start.trigger.seq == seq)
+        })
+    }
+
+    /// Records that session `id` handled its event at `seq`, if it is held.
+    fn mark_handled(&mut self, id: SessionId, seq: Seq) {
+        if let Some(held) = self.held.get_mut(&id) {
+            held.handled = held.handled.max(seq);
+        }
     }
 
     /// Asks the session's agent to stop background `task` on behalf of
@@ -759,40 +1067,17 @@ impl<A: AgentAdapter> Supervisor<A> {
         {
             tracing::warn!(session = %session_id.0, %error, "cannot interrupt agent");
         }
-        self.stop_session(session_id, true).await
-    }
-
-    /// Stops the session's agent if it runs for another context than
-    /// `context`, the stamp of the event being handled. Cannot happen while
-    /// command handling validates stamps and a context change stops the
-    /// agent (both before the supervisor reaches the event); if it does, the
-    /// event goes to its own context's agent, not silently to another's.
-    async fn leave_other_context(
-        &mut self,
-        session_id: SessionId,
-        context: ContextId,
-    ) -> Result<()> {
-        if let Some(running) = self.running.get(&session_id)
-            && running.context() != context
-        {
-            tracing::warn!(session = %session_id.0, "agent runs another context; stopping it");
-            self.stop_on_request(session_id).await?;
-        }
+        self.begin_stop(session_id, true);
         Ok(())
     }
 
-    /// Asks the session's agent for `setting` on behalf of `command`, made
-    /// in `context`. An agent that is not running is started for
-    /// `context`, and the start asks for what the log wants, this request
-    /// included.
-    async fn set(
-        &mut self,
-        session_id: SessionId,
-        context: ContextId,
-        command: Option<CommandId>,
-        setting: Setting,
-    ) -> Result<()> {
-        self.leave_other_context(session_id, context).await?;
+    /// Asks the session's agent for `setting`, the request `item`. An agent
+    /// that is not running is started for the request's context, and the
+    /// start asks for what the log wants, this request included.
+    async fn set(&mut self, item: Queued, setting: Setting) -> Result<()> {
+        let session_id = item.event.session_id;
+        let context = item.event.context;
+        let command = item.event.command_id;
         if matches!(setting, Setting::Mode(PermissionMode::Bypass)) && !self.log.bypass_allowed() {
             // Refused from the config, not left to the agent: only the open
             // request is answered (a replaced one needs no answer), and no
@@ -804,30 +1089,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             return Ok(());
         }
         if !self.running.contains_key(&session_id) {
-            if let Err(message) = self.start_session(session_id, context).await? {
-                tracing::warn!(session = %session_id.0, %message, "agent did not start for a setting");
-                let reason = format!("agent did not start: {message}");
-                let kind = match setting {
-                    Setting::Mode(mode) => EventKind::PermissionModeRefused {
-                        mode,
-                        reason,
-                        answers: command,
-                    },
-                    Setting::Model(model) => EventKind::ModelRefused {
-                        model,
-                        reason,
-                        answers: command,
-                    },
-                    Setting::Effort(effort) => EventKind::EffortRefused {
-                        effort,
-                        reason,
-                        answers: command,
-                    },
-                };
-                self.log
-                    .append(&mut self.storage.db, session_id, context, kind)?;
-            }
-            return Ok(());
+            return self.begin_start(item);
         }
         // Only the open request is carried out, once: a newer one replaced
         // it (and goes out after it), or the start already asked for it.
@@ -886,62 +1148,176 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Gives `text`, a message sent in `context`, to the session's agent,
-    /// starting it for `context` if needed. A session found closed is
-    /// reaped and restarted once.
-    async fn deliver(
+    /// Gives the message `item` to the session's agent, starting one for
+    /// the message's context first if none runs.
+    async fn deliver(&mut self, item: Queued) -> Result<()> {
+        if self.running.contains_key(&item.event.session_id) {
+            self.hand_over(item).await
+        } else {
+            self.begin_start(item)
+        }
+    }
+
+    /// Hands the message `item` to the session's running agent. One the
+    /// agent refuses as closed waits for that agent to stop and goes to a
+    /// new one, once.
+    async fn hand_over(&mut self, item: Queued) -> Result<()> {
+        let session_id = item.event.session_id;
+        let EventKind::UserMessage { text, .. } = &item.event.kind else {
+            return Err(Error::Supervisor("only a message is handed over".into()));
+        };
+        let text = text.clone();
+        // At most once: stored as handed over before the agent gets it.
+        let handed = self.handed;
+        self.handed = item.seq;
+        self.mark_handled(session_id, item.seq);
+        self.store_progress()?;
+        let Some(running) = self.running.get_mut(&session_id) else {
+            return Err(Error::Supervisor("no agent to hand a message to".into()));
+        };
+        let error = match running.session.send_message(text).await {
+            Ok(()) => {
+                running.owed_turns += 1;
+                running.settle_idle();
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        if !item.retried {
+            // The agent did not take it: it is not handed over.
+            tracing::warn!(session = %session_id.0, %error, "cannot send message; restarting agent");
+            self.handed = handed;
+            self.begin_stop(session_id, true);
+            let retried = true;
+            self.held_mut(session_id)?
+                .requeue(Queued { retried, ..item });
+            return Ok(());
+        }
+        let message = format!("cannot deliver message: {error}");
+        self.message_failed(session_id, item.event.context, message)
+    }
+
+    /// Logs that the message sent in `context` was not delivered.
+    fn message_failed(
         &mut self,
         session_id: SessionId,
         context: ContextId,
-        text: String,
+        message: String,
     ) -> Result<()> {
-        self.leave_other_context(session_id, context).await?;
-        let mut failure = String::new();
-        for _ in 0..2 {
-            if !self.running.contains_key(&session_id)
-                && let Err(message) = self.start_session(session_id, context).await?
-            {
-                failure = message;
-                break;
-            }
-            let Some(running) = self.running.get_mut(&session_id) else {
-                break;
-            };
-            match running.session.send_message(text.clone()).await {
-                Ok(()) => {
-                    running.owed_turns += 1;
-                    running.settle_idle();
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::warn!(session = %session_id.0, %error, "cannot send message; restarting agent");
-                    failure = format!("cannot deliver message: {error}");
-                    self.stop_session(session_id, true).await?;
-                }
-            }
-        }
-        tracing::warn!(session = %session_id.0, %failure, "message not delivered");
+        tracing::warn!(session = %session_id.0, %message, "message not delivered");
         self.log.append(
             &mut self.storage.db,
             session_id,
             context,
-            EventKind::SessionStateChanged(SessionState::Errored { message: failure }),
+            EventKind::SessionStateChanged(SessionState::Errored { message }),
         )?;
         Ok(())
     }
 
-    /// Starts the session's agent for `context`, in its [`Conversation`]
-    /// (see `conversation`). `Err` carries why the agent could not start, for
-    /// the log.
+    /// Logs that the agent did not start for `trigger`, a message or
+    /// setting request, answering it in its context.
+    fn start_failed(&mut self, trigger: &Queued, message: String) -> Result<()> {
+        let session_id = trigger.event.session_id;
+        let context = trigger.event.context;
+        let answers = trigger.event.command_id;
+        let Some(setting) = Setting::of(&trigger.event.kind) else {
+            return self.message_failed(session_id, context, message);
+        };
+        tracing::warn!(session = %session_id.0, %message, "agent did not start for a setting");
+        let reason = format!("agent did not start: {message}");
+        let kind = match setting {
+            Setting::Mode(mode) => EventKind::PermissionModeRefused {
+                mode,
+                reason,
+                answers,
+            },
+            Setting::Model(model) => EventKind::ModelRefused {
+                model,
+                reason,
+                answers,
+            },
+            Setting::Effort(effort) => EventKind::EffortRefused {
+                effort,
+                reason,
+                answers,
+            },
+        };
+        self.log
+            .append(&mut self.storage.db, session_id, context, kind)?;
+        Ok(())
+    }
+
+    /// Starts the session's agent for `trigger`, a message or setting
+    /// request, in the trigger's context and that context's
+    /// [`Conversation`] (see `conversation`). The start runs in the
+    /// background and holds the session until it completes
+    /// ([`Supervisor::on_started`]); one that cannot begin is logged as a
+    /// failed start of `trigger` now.
     ///
-    /// `context` is the stamp of the event the start is for, not the
-    /// session's current context: a switch logged after that event, and not
-    /// handled yet, must not hand the event to the new context.
-    async fn start_session(
+    /// The context is the stamp of the trigger, not the session's current
+    /// context: a switch logged after it, and not handled yet, must not hand
+    /// it to the new context.
+    fn begin_start(&mut self, trigger: Queued) -> Result<()> {
+        let session_id = trigger.event.session_id;
+        if let Some(origin) = self.forks_from_held(session_id, trigger.event.context)? {
+            // It would fork a conversation an agent may still write.
+            tracing::info!(session = %session_id.0, origin = %origin.0, "start waits for the session it forks from");
+            self.hold(session_id, Op::After(origin)).requeue(trigger);
+            return Ok(());
+        }
+        match self.prepare_start(session_id, trigger.event.context)? {
+            Err(message) => self.start_failed(&trigger, message),
+            Ok(Prepared {
+                spec,
+                mapper,
+                asked,
+            }) => {
+                let adapter = Arc::clone(&self.adapter);
+                self.starts
+                    .spawn(async move { (session_id, adapter.start(spec).await) });
+                let seq = trigger.seq;
+                let start = Starting {
+                    trigger,
+                    mapper,
+                    asked,
+                };
+                let held = self.hold(session_id, Op::Starting(Box::new(start)));
+                held.handled = held.handled.min(before(seq));
+                Ok(())
+            }
+        }
+    }
+
+    /// The session another context of which `context` forks, if that
+    /// session is held: the fork must read a finished conversation, so it
+    /// waits until nothing is under way or waiting in that session (the
+    /// clear or switch before the move stops the source's agent).
+    fn forks_from_held(
+        &self,
+        session_id: SessionId,
+        context: ContextId,
+    ) -> Result<Option<SessionId>> {
+        if load_resume_handle(&self.storage.db, context)?.is_some() {
+            return Ok(None);
+        }
+        Ok(match load_origin(&self.storage.db, context)? {
+            Some(SessionOrigin::Context(origin))
+                if origin.session != session_id && self.held.contains_key(&origin.session) =>
+            {
+                Some(origin.session)
+            }
+            _ => None,
+        })
+    }
+
+    /// What starting the session's agent for `context` takes: the adapter's
+    /// spec, and the new agent's mapper and the setting requests the start
+    /// asks for. `Err` carries why the agent cannot start, for the log.
+    fn prepare_start(
         &mut self,
         session_id: SessionId,
         context: ContextId,
-    ) -> Result<Result<(), String>> {
+    ) -> Result<Result<Prepared, String>> {
         let Some(info) = self.log.session(&self.storage.db, session_id)? else {
             return Ok(Err(format!("unknown session {}", session_id.0)));
         };
@@ -958,6 +1334,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             Conversation::Fork(_) => "forked",
             Conversation::Adopt(_) => "adopted",
         };
+        tracing::info!(session = %session_id.0, context = %context.0, conversation = how, "starting agent");
         let grants = load_grants(&self.storage.db, session_id)?;
         let mut settings = self.log.agent_settings(&self.storage.db, session_id)?;
         // Bypass is never asked for while the server does not allow it: an
@@ -989,26 +1366,49 @@ impl<A: AgentAdapter> Supervisor<A> {
             model: model.clone(),
             effort,
         };
-        match self.adapter.start(spec).await {
+        let mut mapper = EventMapper::new(session_id, context, settings.clone(), work);
+        let mut asked = HashSet::new();
+        if let Some(mode) = mode {
+            let command = settings.mode.requested.as_ref().map(|r| r.command);
+            mapper.asked_mode(mode, command);
+            asked.insert(command);
+        }
+        if let Some(model) = model {
+            let command = settings.model.requested.as_ref().map(|r| r.command);
+            mapper.asked_model(model, command);
+            asked.insert(command);
+        }
+        if let Some(effort) = effort {
+            let command = settings.effort.requested_effort().map(|r| r.command);
+            mapper.asked_effort(effort, command);
+            asked.insert(command);
+        }
+        Ok(Ok(Prepared {
+            spec,
+            mapper,
+            asked,
+        }))
+    }
+
+    /// Session `id`'s agent start completed: the agent runs and gets the
+    /// message it was started for, or the start's trigger is answered with
+    /// the failure. Then what waited for the start is handled.
+    async fn on_started(&mut self, id: SessionId, started: Started<A::Session>) -> Result<()> {
+        let op = self.held_mut(id)?.op.take();
+        let Some(Op::Starting(start)) = op else {
+            return Err(Error::Supervisor(format!(
+                "session {} completed a start it was not making",
+                id.0
+            )));
+        };
+        let Starting {
+            trigger,
+            mapper,
+            asked,
+        } = *start;
+        match started {
             Ok((session, events)) => {
-                tracing::info!(session = %session_id.0, context = %context.0, conversation = how, "agent started");
-                let mut mapper = EventMapper::new(session_id, context, settings.clone(), work);
-                let mut asked = HashSet::new();
-                if let Some(mode) = mode {
-                    let command = settings.mode.requested.as_ref().map(|r| r.command);
-                    mapper.asked_mode(mode, command);
-                    asked.insert(command);
-                }
-                if let Some(model) = model {
-                    let command = settings.model.requested.as_ref().map(|r| r.command);
-                    mapper.asked_model(model, command);
-                    asked.insert(command);
-                }
-                if let Some(effort) = effort {
-                    let command = settings.effort.requested_effort().map(|r| r.command);
-                    mapper.asked_effort(effort, command);
-                    asked.insert(command);
-                }
+                tracing::info!(session = %id.0, "agent started");
                 let mut running = Running {
                     session,
                     events,
@@ -1022,14 +1422,41 @@ impl<A: AgentAdapter> Supervisor<A> {
                 };
                 // Nothing to do until a message comes, if one does.
                 running.settle_idle();
-                self.running.insert(session_id, running);
-                Ok(Ok(()))
+                self.running.insert(id, running);
+                if matches!(trigger.event.kind, EventKind::UserMessage { .. }) {
+                    self.hand_over(trigger).await?;
+                } else {
+                    // The start asked for the setting.
+                    self.mark_handled(id, trigger.seq);
+                }
             }
             Err(error) => {
-                tracing::warn!(session = %session_id.0, %error, "agent did not start");
-                Ok(Err(error.to_string()))
+                tracing::warn!(session = %id.0, %error, "agent did not start");
+                self.start_failed(&trigger, error.to_string())?;
+                self.mark_handled(id, trigger.seq);
             }
         }
+        self.drain(id).await
+    }
+
+    /// Stops session `id`'s agent in the background, holding the session
+    /// until it has stopped ([`Supervisor::on_stopped`]). With `map_exit`
+    /// false its final `Exited` is not recorded.
+    fn begin_stop(&mut self, id: SessionId, map_exit: bool) {
+        let Some(running) = self.running.remove(&id) else {
+            return;
+        };
+        self.stops
+            .spawn(async move { (id, halt(id, running).await, map_exit) });
+        self.hold(id, Op::Stopping);
+    }
+
+    /// Session `id`'s agent stopped: records what it reported meanwhile,
+    /// then handles what waited for the stop.
+    async fn on_stopped(&mut self, id: SessionId, halted: Halted, map_exit: bool) -> Result<()> {
+        self.record_stop(id, halted, map_exit)?;
+        self.held_mut(id)?.op = None;
+        self.drain(id).await
     }
 
     async fn on_agent_event(&mut self, id: SessionId, event: Option<AdapterEvent>) -> Result<()> {
@@ -1089,19 +1516,9 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    /// Shuts down session `id`'s agent and records what it still reports.
-    /// With `map_exit` false (daemon shutdown) its final `Exited` is not
-    /// recorded, leaving open turns and approvals for the next start.
-    async fn stop_session(&mut self, id: SessionId, map_exit: bool) -> Result<()> {
-        let Some(running) = self.running.remove(&id) else {
-            return Ok(());
-        };
-        let halted = halt(id, running).await;
-        self.record_stop(id, halted, map_exit)
-    }
-
     /// Records what session `id`'s agent reported while it stopped; with
-    /// `map_exit` false, all but its final `Exited`.
+    /// `map_exit` false (daemon shutdown), all but its final `Exited`,
+    /// leaving open turns and approvals for the next start.
     fn record_stop(&mut self, id: SessionId, halted: Halted, map_exit: bool) -> Result<()> {
         let Halted {
             mut mapper,
@@ -1129,7 +1546,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         Ok(())
     }
 
-    async fn stop_idle(&mut self) -> Result<()> {
+    fn stop_idle(&mut self) {
         let now = Instant::now();
         let timeout = self.config.idle_timeout;
         let idle: Vec<SessionId> = self
@@ -1139,9 +1556,8 @@ impl<A: AgentAdapter> Supervisor<A> {
             .map(|(id, _)| *id)
             .collect();
         for id in idle {
-            self.stop_session(id, true).await?;
+            self.begin_stop(id, true);
         }
-        Ok(())
     }
 
     fn next_idle_deadline(&self) -> Option<Instant> {
@@ -1151,13 +1567,53 @@ impl<A: AgentAdapter> Supervisor<A> {
             .min()
     }
 
-    fn store_cursor(&mut self) -> Result<()> {
-        if self.cursor != self.stored_cursor {
-            store_cursor(&self.storage.db, self.cursor)?;
-            self.stored_cursor = self.cursor;
+    /// Persists the cursor, the message last handed over and what each held
+    /// session has handled, together, if any changed.
+    fn store_progress(&mut self) -> Result<()> {
+        let progress = Progress {
+            cursor: self.cursor,
+            handed: self.handed,
+            held: (self.held.iter())
+                .map(|(&id, held)| (id, held.handled))
+                .collect(),
+        };
+        if progress != self.stored {
+            store_progress(&mut self.storage.db, &progress)?;
+            self.stored = progress;
         }
         Ok(())
     }
+}
+
+/// Whether the supervisor acts on an event of this kind.
+fn reacts(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::UserMessage { .. }
+            | EventKind::ApprovalResolved { .. }
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. }
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::ModelRequested { .. }
+            | EventKind::EffortRequested { .. }
+            | EventKind::TaskStopRequested { .. }
+    )
+}
+
+/// Whether an event of this kind starts the session's agent, if none runs.
+fn starts_agent(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::UserMessage { .. }) || Setting::of(kind).is_some()
+}
+
+/// What starting an agent takes: the adapter's spec, and the new agent's
+/// mapper and the setting requests the start asks for, by command.
+struct Prepared {
+    spec: StartSpec,
+    mapper: EventMapper,
+    asked: HashSet<Option<CommandId>>,
 }
 
 fn run_thread<A: AgentAdapter>(
@@ -1174,13 +1630,21 @@ fn run_thread<A: AgentAdapter>(
             .build()
             .map_err(|e| Error::Supervisor(format!("cannot build runtime: {e}")))?;
         let mut supervisor = Supervisor {
-            adapter,
+            adapter: Arc::new(adapter),
             log,
             storage: Storage::open(data_dir)?,
             config,
             cursor: Seq::ZERO,
-            stored_cursor: Seq::ZERO,
+            handed: Seq::ZERO,
+            stored: Progress {
+                cursor: Seq::ZERO,
+                handed: Seq::ZERO,
+                held: HashMap::new(),
+            },
             running: HashMap::new(),
+            held: HashMap::new(),
+            starts: JoinSet::new(),
+            stops: JoinSet::new(),
             models: None,
         };
         supervisor.recover()?;
@@ -1232,6 +1696,18 @@ enum Setting {
     Mode(PermissionMode),
     Model(String),
     Effort(Effort),
+}
+
+impl Setting {
+    /// The setting an event of this kind requests, if it is a request.
+    fn of(kind: &EventKind) -> Option<Setting> {
+        match kind {
+            &EventKind::PermissionModeRequested { mode, .. } => Some(Setting::Mode(mode)),
+            EventKind::ModelRequested { model, .. } => Some(Setting::Model(model.clone())),
+            &EventKind::EffortRequested { effort, .. } => Some(Setting::Effort(effort)),
+            _ => None,
+        }
+    }
 }
 
 /// Logs `models`, offered by session `id`'s agent running in `context`, as
@@ -1367,22 +1843,49 @@ fn lost_message(db: &Db, cursor: Seq) -> Result<Option<(SessionId, ContextId)>> 
         .transpose()
 }
 
-fn load_cursor(db: &Db) -> Result<Seq> {
-    let seq: i64 =
-        db.conn()
-            .query_row("SELECT seq FROM supervisor_cursor WHERE id = 1", [], |r| {
-                r.get(0)
-            })?;
-    u64::try_from(seq)
-        .map(Seq)
-        .map_err(|_| Error::Corrupt(format!("negative supervisor cursor {seq}")))
+fn load_progress(db: &Db) -> Result<Progress> {
+    let (cursor, handed): (i64, i64) = db.conn().query_row(
+        "SELECT seq, handed FROM supervisor_cursor WHERE id = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut held = HashMap::new();
+    let mut rows = db
+        .conn()
+        .prepare_cached("SELECT session_id, seq FROM supervisor_held")?;
+    let mut rows = rows.query([])?;
+    while let Some(row) = rows.next()? {
+        let session: String = row.get(0)?;
+        held.insert(parse_id(&session)?, from_sql(row.get(1)?)?);
+    }
+    Ok(Progress {
+        cursor: from_sql(cursor)?,
+        handed: from_sql(handed)?,
+        held,
+    })
 }
 
-fn store_cursor(db: &Db, seq: Seq) -> Result<()> {
-    let seq =
-        i64::try_from(seq.0).map_err(|_| Error::Corrupt(format!("seq {} too large", seq.0)))?;
-    db.conn()
-        .prepare_cached("UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1")?
-        .execute([seq])?;
+/// Writes `progress` in one transaction: a held session's row is never
+/// without the cursor that read its events, nor left behind one.
+fn store_progress(db: &mut Db, progress: &Progress) -> Result<()> {
+    let tx = event_log::begin(db)?;
+    tx.prepare_cached("UPDATE supervisor_cursor SET seq = ?1, handed = ?2 WHERE id = 1")?
+        .execute([to_sql(progress.cursor)?, to_sql(progress.handed)?])?;
+    tx.execute("DELETE FROM supervisor_held", [])?;
+    for (session, &seq) in &progress.held {
+        tx.prepare_cached("INSERT INTO supervisor_held (session_id, seq) VALUES (?1, ?2)")?
+            .execute(rusqlite::params![session.0.to_string(), to_sql(seq)?])?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+fn from_sql(seq: i64) -> Result<Seq> {
+    u64::try_from(seq)
+        .map(Seq)
+        .map_err(|_| Error::Corrupt(format!("negative supervisor seq {seq}")))
+}
+
+fn to_sql(seq: Seq) -> Result<i64> {
+    i64::try_from(seq.0).map_err(|_| Error::Corrupt(format!("seq {} too large", seq.0)))
 }

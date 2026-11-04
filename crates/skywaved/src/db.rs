@@ -315,6 +315,22 @@ const MIGRATIONS: &[&str] = &[
         start    INTEGER NOT NULL
     ) STRICT;
     "#,
+    // v16: the agent supervisor's progress beside its cursor: the message
+    // it last handed over, and the sessions whose events wait for their
+    // agent to start or stop. Additive.
+    r#"
+    -- Seq of the last UserMessage the supervisor gave an agent, stored
+    -- before the agent gets it (delivery is at most once).
+    ALTER TABLE supervisor_cursor ADD COLUMN
+        handed INTEGER NOT NULL DEFAULT 0 CHECK (handed >= 0);
+    UPDATE supervisor_cursor SET handed = seq;
+    -- A session whose agent was starting or stopping: its events after
+    -- `seq`, up to the cursor, are not handled yet.
+    CREATE TABLE supervisor_held (
+        session_id TEXT PRIMARY KEY,
+        seq        INTEGER NOT NULL CHECK (seq >= 0)
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -512,7 +528,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 12] = [
+    const TABLES: [&str; 13] = [
         "approvals",
         "blobs",
         "commands",
@@ -524,6 +540,7 @@ mod tests {
         "sessions",
         "shell_runs",
         "supervisor_cursor",
+        "supervisor_held",
         "workdir_blobs",
     ];
 
