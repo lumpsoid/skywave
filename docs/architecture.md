@@ -255,12 +255,21 @@ the daemon's appends, which would otherwise stop `serve` (below).
   ("agent did not answer the interrupt; stopped it") and the next
   message resumes the agent. On daemon start every pending approval gets
   `ApprovalCancelled { reason: "daemon restarted" }` and every call left
-  without a result is named in a `CallsUnanswered`. Messages are delivered
-  at most once (the supervisor's cursor is stored before the agent gets
-  one); a message at the stored cursor that no agent took (no
-  `AgentWorking` or `Errored` after it in its context) gets `Errored`
-  ("message lost when the server stopped; send it again") on the next
-  start, once. Messages an agent accepted but never began (queued behind a
+  without a result is named in a `CallsUnanswered`. Agent starts (a
+  handshake of up to a minute) and stops (tens of seconds of grace) run
+  beside the supervisor's loop, so one session's slow agent never delays
+  another session's answers, interrupts or events. While one runs, that
+  session's own events wait in log order and are handled once it
+  completes, decided by the completion (started or failed, stopped), never
+  by a timer; a start that forks a moved context waits until the source
+  session has settled. Those waiting events are persisted with the cursor,
+  so a restart handles them rather than losing them, and a daemon shutdown
+  drops a start under way (killing its agent) and leaves its message for
+  the next run. Messages are delivered at most once (the supervisor stores
+  a message as handed over before the agent gets it); the last message
+  handed over, if no agent took it (no `AgentWorking` or `Errored` after it
+  in its context), gets `Errored` ("message lost when the server stopped;
+  send it again") on the next start, once. Messages an agent accepted but never began (queued behind a
   turn when it is stopped, killed or crashes) are counted by the adapter's
   `Exited`; the one `Errored` its exit logs ends with "N queued messages were
   not sent to the agent; send them again". They are reported, not

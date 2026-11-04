@@ -91,6 +91,10 @@
 //! the set, as the CLI acks an unknown id). [`FakeScript::refuse_stops`]
 //! makes it answer every stop `TaskStopRefused` instead.
 //!
+//! **Slow starts and stops.** [`FakeAgent::hold_start`] and
+//! [`FakeAgent::hold_shutdown`] hold one session's next start or shutdown
+//! on a [`Gate`], like a CLI slow to answer its handshake or to exit.
+//!
 //! **Outside conversations.** [`FakeOutside`] is a scripted
 //! [`OutsideConversations`] source, apart from [`FakeAgent`]: its listing
 //! and histories are set by the test, and a history read can be held on a
@@ -527,6 +531,14 @@ pub struct FakeAgent {
     shared: Arc<Mutex<HashMap<SessionId, Progress>>>,
     /// Ids of conversations that exist outside Skywave, shared by clones.
     outside: Arc<Mutex<HashSet<String>>>,
+    /// Gates the next start or shutdown of a session waits on.
+    holds: Arc<Mutex<Holds>>,
+}
+
+#[derive(Debug, Default)]
+struct Holds {
+    starts: HashMap<SessionId, Gate>,
+    shutdowns: HashMap<SessionId, Gate>,
 }
 
 #[derive(Debug, Default)]
@@ -545,7 +557,22 @@ impl FakeAgent {
             script: Arc::new(script),
             shared: Arc::default(),
             outside: Arc::default(),
+            holds: Arc::default(),
         }
+    }
+
+    /// Holds the next start of session `session_id` until `gate` opens,
+    /// like an agent slow to start. The start is recorded
+    /// ([`FakeInput::Started`]) before it waits.
+    pub fn hold_start(&self, session_id: SessionId, gate: Gate) {
+        lock(&self.holds).starts.insert(session_id, gate);
+    }
+
+    /// Holds the next shutdown of session `session_id` until `gate` opens,
+    /// like an agent slow to stop. The agent itself stops (and reports
+    /// `Exited`) at once; only [`AgentSession::shutdown`] waits.
+    pub fn hold_shutdown(&self, session_id: SessionId, gate: Gate) {
+        lock(&self.holds).shutdowns.insert(session_id, gate);
     }
 
     /// Makes `id` name a conversation outside Skywave that a start may
@@ -637,6 +664,10 @@ impl AgentAdapter for FakeAgent {
                 grants: spec.grants.clone(),
             });
         }
+        let hold = lock(&self.holds).starts.remove(&spec.session_id);
+        if let Some(gate) = hold {
+            gate.opened().await;
+        }
 
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -686,6 +717,7 @@ impl AgentAdapter for FakeAgent {
             commands,
             answers,
             task,
+            holds: Arc::clone(&self.holds),
         };
         Ok((session, events_rx))
     }
@@ -701,6 +733,7 @@ pub struct FakeSession {
     /// Answers to mode and model requests go straight out, idle or not.
     answers: mpsc::Sender<AdapterEvent>,
     task: tokio::task::JoinHandle<()>,
+    holds: Arc<Mutex<Holds>>,
 }
 
 impl FakeSession {
@@ -790,6 +823,10 @@ impl AgentSession for FakeSession {
         let _ = self.request(FakeInput::Shutdown);
         if let Some(barrier) = &self.script.shutdown_barrier {
             barrier.wait().await;
+        }
+        let hold = lock(&self.holds).shutdowns.remove(&self.session_id);
+        if let Some(gate) = hold {
+            gate.opened().await;
         }
         drop(self.answers);
         self.task
