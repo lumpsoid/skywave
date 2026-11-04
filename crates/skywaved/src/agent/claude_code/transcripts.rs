@@ -420,13 +420,10 @@ impl Transcript {
 
     fn summary(&self) -> Option<Summary> {
         let cwd = self.cwd()?.to_owned();
+        // The user's own name (`/rename`) wins over the CLI's.
         let title = self
-            .lines
-            .iter()
-            .rev()
-            .filter(|line| str_field(line, "type") == "ai-title")
-            .map(|line| str_field(line, "aiTitle"))
-            .find(|title| !title.is_empty())
+            .last("custom-title", "customTitle")
+            .or_else(|| self.last("ai-title", "aiTitle"))
             .map(str::to_owned);
         let last_active = self.lines.iter().rev().find_map(timestamp);
         let items = self.items();
@@ -458,6 +455,16 @@ impl Transcript {
             last_active,
             messages: u32::try_from(messages).unwrap_or(u32::MAX),
         })
+    }
+
+    /// The `key` of the last `kind` line where it is not empty.
+    fn last(&self, kind: &str, key: &str) -> Option<&str> {
+        self.lines
+            .iter()
+            .rev()
+            .filter(|line| str_field(line, "type") == kind)
+            .map(|line| str_field(line, key))
+            .find(|value| !value.is_empty())
     }
 
     /// The active branch's messages translated, oldest first.
@@ -1181,6 +1188,7 @@ mod tests {
 
     #[test]
     fn a_listing_has_title_first_prompt_count_and_last_activity() {
+        // Caching is by (len, mtime): every rewrite below grows the file.
         let env = Env::new();
         let workdir = env.dir("root/project");
         let (id, path) = env.place("transcripts/two_turn.jsonl", &workdir);
@@ -1217,6 +1225,28 @@ mod tests {
         assert_eq!(
             env.list(10).conversations[0].title.as_deref(),
             Some("Say hi")
+        );
+
+        // `/rename`'s lines, as CLI 2.1.310 writes them (under `-p` too):
+        // the last name wins, and it wins over an `ai-title` written after it.
+        let mut text = fs::read_to_string(&path).unwrap();
+        for name in ["Morning bake", "Second batch"] {
+            for line in [
+                json!({ "type": "custom-title", "customTitle": name, "sessionId": id }),
+                json!({ "type": "agent-name", "agentName": name, "sessionId": id }),
+            ] {
+                text.push_str(&line.to_string());
+                text.push('\n');
+            }
+        }
+        text.push_str(
+            &json!({ "type": "ai-title", "aiTitle": "Later title", "sessionId": id }).to_string(),
+        );
+        text.push('\n');
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            env.list(10).conversations[0].title.as_deref(),
+            Some("Second batch")
         );
     }
 

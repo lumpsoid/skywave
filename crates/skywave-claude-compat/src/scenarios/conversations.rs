@@ -6,7 +6,8 @@
 //! with `num_turns: 0` and no cost) yet is kept in the transcript as a
 //! `<command-name>` user line. Resume and fork are then read back through
 //! the adapter's own transcript reader ([`ClaudeTranscripts`]), so a check
-//! holds only if skywaved would see the same.
+//! holds only if skywaved would see the same. `/rename` also writes the
+//! `custom-title` line the listing takes its title from.
 //!
 //! Not covered: `ai-title`, which `-p` never writes, and a model turn's
 //! lines in a transcript (the stored-transcript fixtures cover those).
@@ -258,10 +259,13 @@ pub fn transcript(ctx: &mut Ctx) -> Result<(), Stop> {
                 .ok_or_else(|| "not listed".to_owned())
         });
     ctx.checks.contract(
-        "the listing names it, under its cwd, with its first prompt",
+        "the listing names it, under its cwd, with its first prompt and its /rename title",
         listed.and_then(|c| {
             ensure(
-                c.workdir == cwd && c.first_prompt.is_some() && c.messages >= 1,
+                c.workdir == cwd
+                    && c.first_prompt.is_some()
+                    && c.messages >= 1
+                    && c.title.as_deref() == Some("Morning bake"),
                 || format!("{c:?}"),
             )
         }),

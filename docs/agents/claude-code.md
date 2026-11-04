@@ -1381,8 +1381,17 @@ skills, date, …), `system` (`compact_boundary`, `local_command`, …),
 `queue-operation`, `last-prompt`, `mode`, `atis-latch`, `cost-state`,
 `api-request*` (whole request bodies, the user's context included),
 `ai-title` (`aiTitle`, interactive sessions only: `-p` writes none),
-`custom-title` and `agent-name` (`/rename`, also under `-p`; not read).
-Every
+`custom-title` and `agent-name` (`/rename`, also under `-p`).
+**[C]** (2.1.310, `-p "/rename Morning bake"` then `-p --resume <id>
+"/rename Second batch"`.) Each `/rename` appends, ahead of its `user`
+lines, `{"type":"custom-title","customTitle":"<name>","sessionId":"<id>"}`
+then `{"type":"agent-name","agentName":"<name>","sessionId":"<id>"}`: no
+`uuid`, `parentUuid` or `timestamp`, so off the branch. It also writes
+`<id>/custom-title.json` (`{"customTitle":"<name>"}`, the latest only).
+The reader takes the title from the `custom-title` lines, not the side
+file: they are in the transcript it already reads and caches by length
+and mtime, and the side file would need its own read and cache key.
+`agent-name` (the same name) is not read. Every
 `user`/`assistant`/`attachment`/`system` line carries `uuid`,
 `parentUuid`, `isSidechain`, `cwd`, `timestamp`, `sessionId`, `version`.
 A tool result's structured form is the line's `toolUseResult` (the stream's
@@ -1414,7 +1423,8 @@ which is the stream's order. Where a parent is missing (or a cycle), the reader 
 file order minus sidechain lines. Rewound or edited branches were not
 recorded **[U]**; a test builds one.
 
-**Listing.** Title: the last `ai-title`. First prompt: the first line of the
+**Listing.** Title: the last `custom-title` (the user's own name wins),
+else the last `ai-title`. First prompt: the first line of the
 first user text on the branch. Messages: user texts plus agent texts on the
 branch. Last active: the last line's `timestamp`, else the file's mtime.
 A project dir or transcript that is a symlink is skipped, by listing and
