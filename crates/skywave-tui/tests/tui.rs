@@ -1981,6 +1981,59 @@ fn an_approval_whose_input_was_lost_warns_in_its_prompt() {
     assert!(!screen.contains("could not store"), "{screen}");
 }
 
+/// An approval of a logged call, asking with an input other than the
+/// call's, warns when that input was lost, though the call's own was kept;
+/// and a call whose body was kept but whose input was lost warns too.
+#[test]
+fn an_approval_of_a_call_warns_of_its_own_lost_input() {
+    let ask = |call_input: Option<Full>, body: Option<Full>, input: Option<Full>| {
+        let (mut h, id, _) = open_session();
+        let call_id = CallId::new();
+        let mut tool = call(call_id, "Edit", ToolKind::FileEdit, "src/lib.rs");
+        tool.input = call_input;
+        tool.display.body = Some(Body {
+            format: BodyFormat::Diff,
+            preview: "-a\n+b".into(),
+            lines: 400,
+            full: body,
+        });
+        pull(
+            &mut h,
+            vec![
+                event(id, 1, EventKind::ToolCall(tool)),
+                event(
+                    id,
+                    2,
+                    EventKind::ApprovalRequested {
+                        id: ApprovalId::new(),
+                        call: Some(call_id),
+                        tool: "Edit".into(),
+                        summary: "src/lib.rs".into(),
+                        input,
+                        suggestions: Vec::new(),
+                    },
+                ),
+            ],
+        );
+        h.screen()
+    };
+    let kept = || Some(Full::Blob(blob(6000).1));
+
+    // The request's own input differs from the call's and was lost.
+    let screen = ask(None, kept(), Some(Full::Lost));
+    assert_contains(&screen, "Approval needed");
+    assert_contains(&screen, "! the server could not store the full input");
+
+    // The body was stored, the call's input was not.
+    let screen = ask(Some(Full::Lost), kept(), None);
+    assert_contains(&screen, "! the server could not store the full input");
+
+    // Control: all kept, nothing said.
+    let screen = ask(kept(), kept(), kept());
+    assert_contains(&screen, "Approval needed");
+    assert!(!screen.contains("could not store"), "{screen}");
+}
+
 /// A cut result whose output the server could not keep says so under its
 /// preview, where a kept one says where its blob stands.
 #[test]

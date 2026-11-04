@@ -22,7 +22,9 @@ use skywave_present::format::{
     outgoing_label, repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status,
     task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
-use skywave_present::sections::{ItemKey, Section, gated_item, lost, sections, tool_sections};
+use skywave_present::sections::{
+    ItemKey, Section, approval_lost, gated_item, sections, tool_sections,
+};
 use skywave_present::text::clean;
 
 use super::timeline::{
@@ -344,7 +346,7 @@ fn approval_lines(
             },
         )) => (
             gated_call(view, width),
-            gated_content(&tool_sections(view), width, max_rows),
+            gated_content(prompt, &tool_sections(view), width, max_rows),
         ),
         _ => {
             let (_, style) = approval_state(&ApprovalStatus::Pending);
@@ -365,7 +367,7 @@ fn approval_lines(
                 status: ApprovalStatus::Pending,
                 answer: None,
             };
-            let content = gated_content(&sections(&entry), width, max_rows);
+            let content = gated_content(prompt, &sections(&entry), width, max_rows);
             (lines, content)
         }
     };
@@ -471,8 +473,13 @@ fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
 /// so: the user decides on what is shown. Then the first section shown
 /// while collapsed, capped to `max_rows`; with none, where to see the whole
 /// input if there is one.
-fn gated_content(sections: &[Section], width: usize, max_rows: usize) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = lost(sections)
+fn gated_content(
+    prompt: &ApprovalPrompt,
+    sections: &[Section],
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = approval_lost(prompt, sections)
         .map(|lost| {
             let warning = Span::raw(lost).yellow().bold();
             wrap(

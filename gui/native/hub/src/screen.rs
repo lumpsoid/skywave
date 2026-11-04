@@ -22,7 +22,9 @@ use skywave_present::format::{
     viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
-use skywave_present::sections::{ItemKey, Section, gated_item, lost, sections, tool_sections};
+use skywave_present::sections::{
+    ItemKey, Section, approval_lost, gated_item, sections, tool_sections,
+};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
 use crate::link::count;
@@ -776,7 +778,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
         detail,
         preview,
         input_label,
-        lost: lost(&sections).map(str::to_owned),
+        lost: approval_lost(prompt, &sections).map(str::to_owned),
         can_answer,
         suggestions: prompt
             .suggestions
@@ -988,6 +990,74 @@ mod tests {
         let panel = approval_panel(&prompt(kept), &session);
         assert_eq!(panel.lost, None);
         assert_eq!(panel.input_label.as_deref(), Some("full input 2.0 KiB"));
+    }
+
+    /// The panel shows the gated call, but the request's own input (other
+    /// than the call's) is what was lost; and a call whose body was kept
+    /// but whose input was lost warns too.
+    #[test]
+    fn an_approval_of_a_call_warns_of_its_own_lost_input() {
+        let kept = || {
+            Some(FullView::Blob(skywave_core::BlobView {
+                id: skywave_core::BlobId::new(),
+                state: skywave_core::BlobState::NotDownloaded { size: 2048 },
+            }))
+        };
+        let panel = |call_input: Option<FullView>, asked: Option<FullView>| {
+            let call = skywave_core::CallId::new();
+            let mut session = session_view(AgentWork::default(), Vec::new());
+            session.timeline = vec![TimelineItem::Logged {
+                parent: None,
+                seq: Seq(1),
+                at: chrono::Utc::now(),
+                context: session.context,
+                entry: Entry::Tool(Box::new(skywave_core::ToolView {
+                    call,
+                    name: "Edit".into(),
+                    kind: skywave_core::ToolKind::FileEdit,
+                    title: "src/lib.rs".into(),
+                    detail: None,
+                    body: Some(skywave_core::BodyView {
+                        format: skywave_core::BodyFormat::Diff,
+                        preview: "-a\n+b".into(),
+                        lines: 400,
+                        full: kept(),
+                    }),
+                    input: call_input,
+                    approval: None,
+                    outcome: skywave_core::ToolOutcome::Running {
+                        since: chrono::Utc::now(),
+                    },
+                    subagent: None,
+                })),
+            }];
+            let prompt = ApprovalPrompt {
+                id: skywave_core::ApprovalId::new(),
+                call: Some(call),
+                from: None,
+                tool: "Edit".into(),
+                summary: "src/lib.rs".into(),
+                input: asked,
+                suggestions: Vec::new(),
+                answer: None,
+            };
+            // The gated call is found through the session's pending prompt.
+            session.pending_approval = Some(prompt.clone());
+            let panel = approval_panel(&prompt, &session);
+            assert_eq!(panel.title, "src/lib.rs", "the gated call shows");
+            assert!(panel.gated_key.is_some(), "the gated call shows");
+            panel.lost
+        };
+        assert_eq!(
+            panel(kept(), Some(FullView::Lost)).as_deref(),
+            Some(INPUT_LOST)
+        );
+        assert_eq!(
+            panel(Some(FullView::Lost), None).as_deref(),
+            Some(INPUT_LOST)
+        );
+        // Control: all kept, nothing said.
+        assert_eq!(panel(kept(), kept()), None);
     }
 
     #[test]
