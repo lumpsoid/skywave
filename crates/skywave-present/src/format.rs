@@ -521,6 +521,16 @@ pub fn agent_setting_line(setting: &AgentSetting, refused: Option<&str>) -> Stri
     }
 }
 
+/// A timeline warning that the agent runs a version the server was not
+/// checked against: `agent 2.2.0 is not the version the server was checked
+/// against (2.1.310) · turns may misbehave`. Heads show it as a warning.
+pub fn agent_version_line(version: &str, confirmed: &str) -> String {
+    format!(
+        "agent {version} is not the version the server was checked against ({confirmed}) · \
+         turns may misbehave"
+    )
+}
+
 /// Who asked for a setting change, for after [`agent_setting_line`]: `by
 /// laptop`, `by this device`, or nothing when the agent changed on its own.
 pub fn asked_by(by: Option<&DeviceRef>) -> Option<String> {

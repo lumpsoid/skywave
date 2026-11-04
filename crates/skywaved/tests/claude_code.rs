@@ -8,6 +8,7 @@
 //! reads, so they are deterministic.
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,7 +16,9 @@ use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId};
 use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
 use skywaved::agent::claude_code::rules;
-use skywaved::agent::claude_code::{ALLOW_BYPASS_ARG, ClaudeCodeAdapter, REQUIRED_ARGS};
+use skywaved::agent::claude_code::{
+    ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, NO_AUTOUPDATE_ENV, REQUIRED_ARGS,
+};
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
     AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants,
@@ -311,6 +314,9 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 format!("effort refused {effort:?}: {}", cut(reason))
             }
             AdapterEvent::ModelsOffered(models) => format!("models offered: {}", models.len()),
+            AdapterEvent::VersionUnconfirmed { version, confirmed } => {
+                format!("version {version}, confirmed {confirmed}")
+            }
             // Filtered out above: [`timeline`] lists the task sets.
             AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
             AdapterEvent::Schedules(schedules) => format!("schedules: {}", schedules.len()),
@@ -1507,6 +1513,31 @@ fn a_failed_turn_and_unknown_messages() {
     );
 }
 
+#[test]
+fn a_version_named_only_by_system_init_is_reported_too() {
+    // A CLI whose handshake names no version still reports it in its init.
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    let id = protocol.start().writes[0]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ready = protocol.on_line(&format!(
+        r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{}}}}}}"#
+    ));
+    assert!(protocol.ready());
+    assert_eq!(unconfirmed(&ready.events), []);
+    protocol.send_message("go".to_owned());
+    let init = r#"{"type":"system","subtype":"init","claude_code_version":"3.0.0"}"#;
+    let first = protocol.on_line(init);
+    assert_eq!(
+        unconfirmed(&first.events),
+        [("3.0.0".to_owned(), PINNED_VERSION.to_owned())]
+    );
+    assert_eq!(protocol.version(), Some("3.0.0"));
+    // The next turn's init repeats it: nothing more.
+    assert_eq!(unconfirmed(&protocol.on_line(init).events), []);
+}
+
 fn exit_status(code: i32) -> Option<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
     Some(std::process::ExitStatus::from_raw(code << 8))
@@ -2131,6 +2162,84 @@ async fn a_fresh_process_stopped_before_any_message_reports_no_handle() {
     session.send_message("hello".to_owned()).await.unwrap();
     assert_eq!(handle_then_turn(&mut events).await, second);
     session.shutdown().await.unwrap();
+}
+
+/// Every event of a process started by `adapter` that is sent one message
+/// and shut down, through its `Exited`.
+async fn one_turn_events(adapter: ClaudeCodeAdapter, workdir: &Path) -> Vec<AdapterEvent> {
+    let (mut session, mut events) = adapter
+        .start(spec(workdir, Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("hello".to_owned()).await.unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let event = next_raw(&mut events).await;
+        let ended = matches!(event, AdapterEvent::TurnEnded(_));
+        seen.push(event);
+        if ended {
+            break;
+        }
+    }
+    session.shutdown().await.unwrap();
+    while let Some(event) = events.recv().await {
+        seen.push(event);
+    }
+    seen
+}
+
+fn unconfirmed(events: &[AdapterEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::VersionUnconfirmed { version, confirmed } => {
+                Some((version.clone(), confirmed.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn another_cli_version_is_reported_once() {
+    // The handshake and the turn's `system/init` both name the version; it
+    // is reported once, from the handshake, before the turn.
+    let tmp = tempfile::tempdir().unwrap();
+    let drifted = ClaudeCodeAdapter::new(AgentConfig {
+        command: fake_cli(),
+        args: vec!["--fake-version".to_owned(), "2.2.0".to_owned()],
+        allow_bypass: false,
+    })
+    .with_grace_period(Duration::from_secs(5));
+    let events = one_turn_events(drifted, tmp.path()).await;
+    assert_eq!(
+        unconfirmed(&events),
+        [("2.2.0".to_owned(), PINNED_VERSION.to_owned())]
+    );
+    let at = |want: fn(&AdapterEvent) -> bool| events.iter().position(want).unwrap();
+    assert!(
+        at(|e| matches!(e, AdapterEvent::VersionUnconfirmed { .. }))
+            < at(|e| matches!(e, AdapterEvent::TurnStarted))
+    );
+
+    // Positive control: the pinned version reports nothing.
+    let pinned = tempfile::tempdir().unwrap();
+    let events = one_turn_events(adapter(), pinned.path()).await;
+    assert!(events.contains(&AdapterEvent::TurnStarted));
+    assert_eq!(unconfirmed(&events), []);
+}
+
+#[test]
+fn every_process_is_started_with_the_auto_updater_off() {
+    // Read from the command, not the process: the variable may be set in
+    // the environment the tests run in, which the process inherits.
+    let command = adapter().command(Path::new("/"), CliSession::New(Uuid::new_v4()), &[]);
+    let set: Vec<_> = command.as_std().get_envs().collect();
+    assert_eq!(
+        set,
+        [(OsStr::new("DISABLE_AUTOUPDATER"), Some(OsStr::new("1")))]
+    );
+    assert_eq!(NO_AUTOUPDATE_ENV, ("DISABLE_AUTOUPDATER", "1"));
 }
 
 #[tokio::test]

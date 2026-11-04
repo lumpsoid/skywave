@@ -13,8 +13,8 @@ use skywave_core::{
     ToolView, read_head,
 };
 use skywave_present::format::{
-    IMPORTED_MARK, adopted_line, agent_setting_line, answer_words, asked_by, bytes,
-    context_moved_line, context_started_line, context_switched_line, decision_label,
+    IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
+    bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
     delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
     percent, seconds, subagent_status, took_label, turn_time,
 };
@@ -230,6 +230,11 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
             set(&mut row, RowKind::AgentError, clean_text(message));
             row.author = Some("agent error".to_owned());
         }
+        Entry::AgentVersionUnconfirmed { version, confirmed } => set(
+            &mut row,
+            RowKind::AgentVersion,
+            clean_line(&agent_version_line(version, confirmed)),
+        ),
         Entry::Interrupted => set(
             &mut row,
             RowKind::Interrupted,

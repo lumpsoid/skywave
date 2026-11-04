@@ -113,6 +113,9 @@ pub enum RowKind {
     AgentSetting,
     /// The agent refused a switch and kept what it had: a warning.
     SettingRefused,
+    /// The agent runs a version the server was not checked against: a
+    /// warning.
+    AgentVersion,
     /// History of an adopted conversation, from before it came to
     /// Skywave: a record, shown apart from the session's own items and
     /// marked with `mark`. A user message of it.

@@ -8,8 +8,23 @@ Recorded on 2026-10-29 on Linux. The fixtures are in
 each file.
 
 This protocol is what the Agent SDKs use internally. It is **not** a
-documented stable API (see spec §11). T09 must check `claude_code_version`
-at startup and log a warning when it differs from the pinned version.
+documented stable API (see spec §11). The adapter reads `claude_code_version`
+from the `initialize` answer (or the first `system/init`), and once per
+process, when it differs from the pinned version, logs a warning and
+reports `VersionUnconfirmed`. The session log gets an
+`AgentVersionUnconfirmed` event, so every head shows the drift in the
+session's timeline.
+
+**No self-updates.** Every CLI process is spawned with
+`DISABLE_AUTOUPDATER=1`, so an overnight auto-update cannot change the
+protocol under a running server (a changed `result` or `control_response`
+shape would be skipped as unknown, and a turn would stay open until
+Stop). **[C]** with 2.1.310, from the binary
+(`~/.local/share/claude/versions/2.1.310`): the updater's check reads
+`process.env.DISABLE_AUTOUPDATER` and reports "set by env:
+DISABLE_AUTOUPDATER". It stops only the automatic updater; `claude update`
+by hand still works. `DISABLE_UPDATES` would block that too, which is the
+operator's call, so the adapter does not set it.
 
 **Checking a new CLI.** After every CLI upgrade, run
 `cargo run -p skywave-claude-compat` (`--quick`, the default: no model

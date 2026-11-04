@@ -272,6 +272,7 @@ fn texts(item: &TimelineItem) -> Vec<&str> {
     match entry {
         Entry::UserMessage { text, .. } | Entry::AgentMessage { text } => vec![text],
         Entry::AgentErrored { message } => vec![message],
+        Entry::AgentVersionUnconfirmed { version, .. } => vec![version],
         Entry::Tool(view) => tool_texts(view),
         Entry::Imported { entry, .. } => match entry {
             ImportedEntry::UserMessage { text } | ImportedEntry::AgentMessage { text } => {

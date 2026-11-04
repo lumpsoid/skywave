@@ -101,7 +101,8 @@ use crate::agent::{
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
-/// is logged as a warning, not refused.
+/// is reported as `VersionUnconfirmed` (devices show it) and logged as a
+/// warning, not refused.
 pub const PINNED_VERSION: &str = "2.1.310";
 
 /// The message sent with a denial; the CLI hands it to the model.
@@ -840,24 +841,36 @@ impl Protocol {
         out
     }
 
-    fn check_version(&mut self, version: Option<&str>) {
+    /// Keeps the `version` the CLI reported. One that is not
+    /// [`PINNED_VERSION`] is reported as `VersionUnconfirmed`, once per
+    /// process: the handshake and every `system/init` repeat it.
+    fn check_version(&mut self, version: Option<&str>, out: &mut Output) {
         let Some(version) = version else { return };
         if self.version.as_deref() == Some(version) {
             return;
         }
-        if version != PINNED_VERSION {
-            tracing::warn!(
-                version,
-                pinned = PINNED_VERSION,
-                "agent CLI version differs from the one the adapter was confirmed against; \
-                 run skywave-claude-compat to check it"
-            );
-        }
+        let first = self.version.is_none();
         self.version = Some(version.to_owned());
+        if version == PINNED_VERSION || !first {
+            return;
+        }
+        tracing::warn!(
+            version,
+            pinned = PINNED_VERSION,
+            "agent CLI version differs from the one the adapter was confirmed against; \
+             run skywave-claude-compat to check it"
+        );
+        out.events.push(AdapterEvent::VersionUnconfirmed {
+            version: version.to_owned(),
+            confirmed: PINNED_VERSION.to_owned(),
+        });
     }
 
     fn on_init(&mut self, message: &Value, out: &mut Output) {
-        self.check_version(message.get("claude_code_version").and_then(Value::as_str));
+        self.check_version(
+            message.get("claude_code_version").and_then(Value::as_str),
+            out,
+        );
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = Some(model.to_owned());
             out.events.push(AdapterEvent::Model(model.to_owned()));
@@ -1324,7 +1337,7 @@ impl Protocol {
             // The reply also holds the account (email, org): never log it.
             let body = response.get("response").unwrap_or(&Value::Null);
             let version = body.get("claude_code_version").and_then(Value::as_str);
-            self.check_version(version);
+            self.check_version(version, out);
             if let Some(mode) = body
                 .get("current_permission_mode")
                 .and_then(Value::as_str)

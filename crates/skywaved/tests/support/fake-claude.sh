@@ -5,7 +5,8 @@
 # every run is the same.
 #
 # It writes its argv to ./argv.txt and its pid to ./pid.txt (the session
-# workdir). A user message containing "approve" asks for a Write permission;
+# workdir). It reports version 2.1.310, or the one `--fake-version <v>`
+# names. A user message containing "approve" asks for a Write permission;
 # one containing "hang" streams until interrupted; one containing "crash"
 # exits 3 with a stderr line; one containing "deaf" gets the text "deaf",
 # then the CLI stops reading stdin (a wedged CLI); any other message gets the text "echo". One containing
@@ -45,11 +46,13 @@ effort="medium"
 resume=""
 fork=""
 allow_bypass=""
+version="2.1.310"
 prev=""
 for arg in "$@"; do
   case "$prev" in
     --session-id) sid="$arg" ;;
     --resume) resume="$arg" ;;
+    --fake-version) version="$arg" ;;
   esac
   case "$arg" in
     --fork-session) fork=1 ;;
@@ -91,7 +94,7 @@ tool_result() {
 while IFS= read -r line; do
   case "$line" in
     *'"subtype":"initialize"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"2.1.310","account":{"email":"user@example.com"},"session_state":"idle"}}}\n' "$(reqid "$line")"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":{"email":"user@example.com"},"session_state":"idle"}}}\n' "$(reqid "$line")" "$version"
       ;;
     *'"subtype":"interrupt"'*)
       ack "$line"
@@ -126,9 +129,9 @@ while IFS= read -r line; do
       ;;
     *'"type":"user"'*)
       if [ -n "$model" ]; then
-        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310","model":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$model" "$mode"
+        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"%s","model":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$version" "$model" "$mode"
       else
-        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"2.1.310","permissionMode":"%s"}\n' "$PWD" "$sid" "$mode"
+        printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$version" "$mode"
       fi
       case "$line" in
         *stubborn*)
