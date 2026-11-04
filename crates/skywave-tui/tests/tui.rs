@@ -1724,7 +1724,14 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
 
 fn blob(size: u64) -> (BlobId, BlobRef) {
     let id = BlobId::new();
-    (id, BlobRef { id, size })
+    (
+        id,
+        BlobRef {
+            id,
+            size,
+            sha256: skywave_proto::ContentHash::of(b""),
+        },
+    )
 }
 
 #[test]

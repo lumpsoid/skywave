@@ -717,6 +717,7 @@ mod tests {
         skywave_proto::BlobRef {
             id: uuid::Uuid::from_u128(5).into(),
             size: 10,
+            sha256: skywave_proto::ContentHash::of(b""),
         }
     }
 

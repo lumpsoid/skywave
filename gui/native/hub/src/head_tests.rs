@@ -1774,6 +1774,7 @@ fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
             input: Some(BlobRef {
                 id: BlobId::new(),
                 size: 180,
+                sha256: skywave_proto::ContentHash::of(b""),
             }),
         }),
         EventKind::ToolResult(ToolResult {
@@ -1785,6 +1786,7 @@ fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
             output: Some(BlobRef {
                 id: output,
                 size: 70,
+                sha256: skywave_proto::ContentHash::of(b""),
             }),
         }),
     ];
@@ -3110,7 +3112,11 @@ fn an_expanded_run_carries_its_whole_downloaded_output_stripped() {
     let mut rig = Rig::new();
     rig.switch_to_shell();
     let blob = skywave_proto::BlobId::new();
-    let output = skywave_proto::BlobRef { id: blob, size: 40 };
+    let output = skywave_proto::BlobRef {
+        id: blob,
+        size: 40,
+        sha256: skywave_proto::ContentHash::of(b""),
+    };
     let run = rig.finished_run("make test", "line 3\nline 4", 4, Some(output));
     let row = rig.runs()[0].clone();
     assert!(!row.expanded && row.whole.is_none(), "{row:?}");
@@ -3377,6 +3383,7 @@ mod workdir {
             DiffBody::Blob(BlobRef {
                 id: blob.id,
                 size: 80,
+                sha256: skywave_proto::ContentHash::of(b""),
             }),
         );
         let pane = WorkdirPane::Diff {
@@ -3541,6 +3548,7 @@ mod workdir {
                     content: FileBody::Blob(BlobRef {
                         id: blob.id,
                         size: 25,
+                        sha256: skywave_proto::ContentHash::of(b""),
                     }),
                 },
                 blob: Some(blob.clone()),

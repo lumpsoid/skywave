@@ -148,6 +148,11 @@ impl Fixture {
             .read_to_string(&mut content)
             .unwrap();
         assert_eq!(content.len() as u64, blob.size);
+        assert_eq!(
+            blob.sha256,
+            skywave_proto::ContentHash::of(content.as_bytes()),
+            "the reference carries the stored content's hash"
+        );
         content
     }
 

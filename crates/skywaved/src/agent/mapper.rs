@@ -1204,6 +1204,7 @@ mod tests {
         let blob = BlobRef {
             id: proto::BlobId::new(),
             size: 0,
+            sha256: proto::ContentHash::of(b""),
         };
         let mut put = |bytes: &[u8]| {
             stored.push(bytes.to_vec());

@@ -308,6 +308,11 @@ impl Fixture {
             .expect("the blob exists")
             .read_to_end(&mut content)
             .unwrap();
+        assert_eq!(
+            blob.sha256,
+            skywave_proto::ContentHash::of(&content),
+            "the reference carries the stored content's hash"
+        );
         content
     }
 

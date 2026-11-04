@@ -1243,6 +1243,7 @@ impl Model {
                 self.blobs.entry(blob.id).or_insert_with(|| BlobRecord {
                     id: blob.id,
                     size: blob.size,
+                    sha256: blob.sha256,
                     status: BlobStatus::NotDownloaded,
                     workdir: false,
                 });
@@ -1523,6 +1524,7 @@ impl Model {
                     BlobRecord {
                         id: blob.id,
                         size: blob.size,
+                        sha256: blob.sha256,
                         status: BlobStatus::NotDownloaded,
                         workdir: true,
                     },
@@ -3885,6 +3887,7 @@ mod tests {
         let input = BlobRef {
             id: BlobId::new(),
             size: 5000,
+            sha256: skywave_proto::ContentHash::of(b""),
         };
         f.log(
             sid,
@@ -5412,6 +5415,7 @@ mod tests {
         let output = BlobRef {
             id: BlobId::new(),
             size: 10_000,
+            sha256: skywave_proto::ContentHash::of(b""),
         };
         f.log(
             sid,
@@ -6087,6 +6091,7 @@ mod tests {
         let output = BlobRef {
             id: BlobId::new(),
             size: 9000,
+            sha256: skywave_proto::ContentHash::of(b""),
         };
         let finished = log_adopted(
             &mut f,
@@ -6366,10 +6371,12 @@ mod tests {
             BlobRef {
                 id: BlobId::new(),
                 size: 5000,
+                sha256: skywave_proto::ContentHash::of(b""),
             },
             BlobRef {
                 id: BlobId::new(),
                 size: 7000,
+                sha256: skywave_proto::ContentHash::of(b""),
             },
         );
         log_adopted(
@@ -6708,10 +6715,12 @@ mod tests {
             BlobRef {
                 id: BlobId::new(),
                 size: 9000,
+                sha256: skywave_proto::ContentHash::of(b""),
             },
             BlobRef {
                 id: BlobId::new(),
                 size: 7000,
+                sha256: skywave_proto::ContentHash::of(b""),
             },
         );
         f.log(
@@ -9255,6 +9264,7 @@ mod tests {
             BlobRef {
                 id: ProtoBlobId::new(),
                 size,
+                sha256: skywave_proto::ContentHash::of(b""),
             }
         }
 

@@ -87,7 +87,10 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 - **Ordering:** concurrent sends from several devices are ordered by server
   acceptance.
 - **Payloads:** event metadata is small; large content (tool outputs, file
-  contents, logs) is a blob referenced by id and fetched separately.
+  contents, logs) is a blob referenced by id and fetched separately. The
+  reference (`BlobRef`) carries the content's size and SHA-256, which the
+  server computes as it stores the blob; a device accepts no bytes that do
+  not hash to it.
 - **Transport** sits behind a `Transport` trait: HTTPS today, QUIC later.
 - **Slowest link:** an event batch or blob body is timed per chunk, not as
   a whole, so a slow link that keeps delivering bytes finishes. A chunk is
@@ -525,8 +528,13 @@ logs) an event that no longer decodes rather than failing.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
   link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
   the recorded progress (each progress report follows an fsync, so a
-  power loss never resumes past durable bytes), verified by size and
-  renamed when complete; `Link` ignores them (synced
+  power loss never resumes past durable bytes), verified by size and by
+  the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
+  renamed when complete. A wrong hash deletes the file; the first one a
+  worker sees while it holds the blob refetches it from zero at once (the
+  bytes may be the device's own, kept from an earlier try), a second is
+  the server's (every byte came from it since) and leaves the blob
+  `Failed` until it is asked for again; `Link` ignores them (synced
   metadata counts as synced). Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server

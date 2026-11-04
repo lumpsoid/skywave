@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use skywave_proto::{BlobId, BlobRef};
+use skywave_proto::{BlobId, BlobRef, ContentHash};
 
 use crate::error::{Error, IoContext, Result};
 
@@ -29,8 +29,8 @@ use crate::error::{Error, IoContext, Result};
 pub struct BlobMeta {
     pub id: BlobId,
     pub size: u64,
-    /// Lowercase hex SHA-256 of the content.
-    pub sha256: String,
+    /// SHA-256 of the content; lowercase hex in the table.
+    pub sha256: ContentHash,
 }
 
 impl BlobMeta {
@@ -39,6 +39,7 @@ impl BlobMeta {
         BlobRef {
             id: self.id,
             size: self.size,
+            sha256: self.sha256,
         }
     }
 }
@@ -116,7 +117,11 @@ impl BlobStore {
     pub fn record(&self, conn: &Connection, meta: &BlobMeta) -> Result<()> {
         if let Err(e) = conn.execute(
             "INSERT INTO blobs (id, size, sha256) VALUES (?1, ?2, ?3)",
-            params![meta.id.0.to_string(), sql_size(meta.size), meta.sha256],
+            params![
+                meta.id.0.to_string(),
+                sql_size(meta.size),
+                meta.sha256.to_hex()
+            ],
         ) {
             self.discard(meta.id);
             return Err(e.into());
@@ -165,7 +170,11 @@ impl BlobStore {
         Ok(removed)
     }
 
-    fn write_atomically(&self, path: &Path, content: &mut impl Read) -> io::Result<(u64, String)> {
+    fn write_atomically(
+        &self,
+        path: &Path,
+        content: &mut impl Read,
+    ) -> io::Result<(u64, ContentHash)> {
         let mut tmp = tempfile::Builder::new()
             .prefix(".tmp-")
             .tempfile_in(&self.dir)?;
@@ -187,7 +196,7 @@ impl BlobStore {
         tmp.persist(path).map_err(|e| e.error)?;
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
-        Ok((size, hex::encode(hasher.finalize())))
+        Ok((size, ContentHash::from_digest(hasher.finalize().into())))
     }
 
     /// The recorded metadata of `id`, if it exists.
@@ -200,7 +209,13 @@ impl BlobStore {
                     Ok(BlobMeta {
                         id,
                         size: r.get::<_, i64>(0)?.unsigned_abs(), // CHECK (size >= 0)
-                        sha256: r.get(1)?,
+                        sha256: r.get::<_, String>(1)?.parse().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
                     })
                 },
             )
@@ -259,11 +274,33 @@ mod tests {
         let meta = storage.blobs.put(storage.db.conn(), &content[..]).unwrap();
         assert_eq!(meta.size, content.len() as u64);
         assert_eq!(
-            meta.sha256,
+            meta.sha256.to_hex(),
             hex::encode(Sha256::digest(content)),
-            "sha256 is lowercase hex of the content"
+            "sha256 is the content's SHA-256"
         );
-        assert_eq!(meta.blob_ref().size, meta.size);
+        assert_eq!(
+            meta.blob_ref(),
+            BlobRef {
+                id: meta.id,
+                size: meta.size,
+                sha256: meta.sha256
+            },
+            "the wire reference carries the stored hash"
+        );
+        let stored: String = storage
+            .db
+            .conn()
+            .query_row(
+                "SELECT sha256 FROM blobs WHERE id = ?1",
+                [meta.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            hex::encode(Sha256::digest(content)),
+            "lowercase hex in the table"
+        );
 
         let mut file = storage
             .blobs

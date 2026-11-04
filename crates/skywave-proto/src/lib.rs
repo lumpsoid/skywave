@@ -8,9 +8,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod content_hash;
 pub mod context_name;
 mod fingerprint;
 
+pub use content_hash::{ContentHash, InvalidContentHash};
 pub use fingerprint::{Fingerprint, InvalidFingerprint};
 
 /// Wire protocol version. Bump on any incompatible change to these types.
@@ -109,7 +111,8 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// other request, in the [`RUN_HEADER`] header (412 when it is not the
 /// server's). `EventKind::AgentVersionUnconfirmed` with
 /// [`limits::AGENT_VERSION_MAX_CHARS`]: an agent version the adapter was
-/// not checked against.
+/// not checked against. `sha256` on [`BlobRef`] ([`ContentHash`]): what a
+/// device checks a downloaded blob against before it is available.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 macro_rules! uuid_id {
@@ -245,6 +248,9 @@ impl Seq {
 pub struct BlobRef {
     pub id: BlobId,
     pub size: u64,
+    /// The content's hash: a device makes a download available only once
+    /// its bytes hash to this.
+    pub sha256: ContentHash,
 }
 
 /// One entry in the global event log.
