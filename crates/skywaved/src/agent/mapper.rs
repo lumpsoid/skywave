@@ -388,7 +388,7 @@ impl EventMapper {
                         let blob = if logged.input == input {
                             None
                         } else {
-                            Some(input_blob(&mut stored(storage), &input)?)
+                            input_blob(&mut stored(storage), &input)?
                         };
                         (Some(logged.id), logged.title.clone(), blob)
                     }
@@ -397,7 +397,7 @@ impl EventMapper {
                         let blob = if shown_whole {
                             None
                         } else {
-                            Some(input_blob(&mut stored(storage), &input)?)
+                            input_blob(&mut stored(storage), &input)?
                         };
                         (None, summary, blob)
                     }
@@ -829,19 +829,34 @@ impl EventMapper {
 
 // The bounding helpers below take a blob sink, `put`, for the content they
 // leave out of an event: it stores the bytes as a blob and returns the
-// reference the event carries. The live mapper's sink records each blob as
-// it is stored ([`Storage::put_blob`]); a caller that must record its blobs
-// later, in one transaction with its events, can collect them instead.
+// reference the event carries, or `None` when the content was not kept (the
+// event then has only its cut preview). The live mapper's sink records each
+// blob as it is stored ([`Storage::put_blob`]); a caller that must record
+// its blobs later, in one transaction with its events, can collect them
+// instead.
 
 /// The live mapper's blob sink: each blob recorded in `storage` as stored.
-fn stored(storage: &Storage) -> impl FnMut(&[u8]) -> Result<BlobRef> + '_ {
-    |bytes| storage.put_blob(bytes)
+///
+/// A blob that cannot be stored (a full disk, the `blobs` row refused) is
+/// left out, never fatal: the event is still logged, with its cut preview
+/// and no reference (its `lines` still counts all of it). Failing the
+/// supervisor instead would end every running turn for content a device
+/// fetches only on demand. The append that follows still fails, and is
+/// fatal, when the database itself cannot be written.
+fn stored(storage: &Storage) -> impl FnMut(&[u8]) -> Result<Option<BlobRef>> + '_ {
+    |bytes| match storage.put_blob(bytes) {
+        Ok(blob) => Ok(Some(blob)),
+        Err(error) => {
+            tracing::error!(%error, bytes = bytes.len(), "cannot keep content as a blob; logging the event without it");
+            Ok(None)
+        }
+    }
 }
 
 /// The bounded display for a call and, when it does not show all of the
 /// input, the input as a blob.
 pub(crate) fn call_display(
-    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    put: &mut impl FnMut(&[u8]) -> Result<Option<BlobRef>>,
     input: &Value,
     display: Option<ToolDisplay>,
 ) -> Result<(proto::ToolDisplay, Option<BlobRef>)> {
@@ -889,7 +904,7 @@ pub(crate) fn call_display(
     let blob = if shown_whole {
         None
     } else {
-        Some(input_blob(put, input)?)
+        input_blob(put, input)?
     };
     Ok((display, blob))
 }
@@ -897,7 +912,7 @@ pub(crate) fn call_display(
 /// The body standing in for a cut title: its whole text, so a long or
 /// multi-line title (a shell command) is never shown in part only.
 fn title_body(
-    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    put: &mut impl FnMut(&[u8]) -> Result<Option<BlobRef>>,
     title: &str,
     cut: bool,
 ) -> Result<Option<Body>> {
@@ -913,12 +928,12 @@ fn title_body(
 
 /// A body's preview, with its text as a blob when the preview is shorter.
 pub(crate) fn display_body(
-    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    put: &mut impl FnMut(&[u8]) -> Result<Option<BlobRef>>,
     body: DisplayBody,
 ) -> Result<Body> {
     let (preview, cut) = cut_preview(&body.text);
     let full = if cut {
-        Some(put(body.text.as_bytes())?)
+        put(body.text.as_bytes())?
     } else {
         None
     };
@@ -933,14 +948,14 @@ pub(crate) fn display_body(
 /// A result's preview (of the adapter's preview text, else of the output),
 /// with the output as a blob when the preview does not hold all of it.
 pub(crate) fn tool_result(
-    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    put: &mut impl FnMut(&[u8]) -> Result<Option<BlobRef>>,
     call: Option<CallId>,
     result: ResultDisplay,
 ) -> Result<ToolResult> {
     let shown = result.preview.as_deref().unwrap_or(&result.output);
     let (preview, cut) = cut_preview(shown);
     let output = if cut || shown != result.output {
-        Some(put(result.output.as_bytes())?)
+        put(result.output.as_bytes())?
     } else {
         None
     };
@@ -981,9 +996,9 @@ fn generic_text(input: &Value) -> (String, bool) {
 
 /// `input` stored whole: a string as itself, anything else pretty-printed.
 pub(crate) fn input_blob(
-    put: &mut impl FnMut(&[u8]) -> Result<BlobRef>,
+    put: &mut impl FnMut(&[u8]) -> Result<Option<BlobRef>>,
     input: &Value,
-) -> Result<BlobRef> {
+) -> Result<Option<BlobRef>> {
     let bytes = match input {
         Value::String(text) => text.clone().into_bytes(),
         _ => serde_json::to_vec_pretty(input)?,
@@ -1192,7 +1207,7 @@ mod tests {
         };
         let mut put = |bytes: &[u8]| {
             stored.push(bytes.to_vec());
-            Ok(blob.clone())
+            Ok(Some(blob.clone()))
         };
 
         let long: String = (0..=PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();

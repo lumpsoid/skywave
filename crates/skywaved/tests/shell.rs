@@ -354,6 +354,19 @@ impl Fixture {
             .execute_batch("DROP TRIGGER disk_full;")
             .unwrap();
     }
+
+    /// Makes recording any blob fail as a full disk would, for every
+    /// connection to the database, until [`Fixture::disk_has_room`].
+    fn blobs_full(&self) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER disk_full BEFORE INSERT ON blobs
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+    }
 }
 
 impl Drop for Fixture {
@@ -1140,6 +1153,30 @@ async fn the_blob_is_raw_and_the_preview_a_stripped_tail() {
     // The output file is gone once the blob holds it.
     let left: Vec<_> = std::fs::read_dir(f.data.join("shell")).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn output_whose_blob_cannot_be_stored_is_logged_truncated() {
+    let mut f = Fixture::new();
+    let mut runner = f.start().await;
+    f.blobs_full();
+    let run = f.run("seq 1 20");
+    let finished = f.finished(run).await;
+    assert_eq!(finished.end, exited(0));
+    assert_eq!(finished.output, None, "the blob could not be stored");
+    assert!(finished.truncated, "the event says it holds only the tail");
+    assert_eq!(finished.lines, 20);
+    assert_eq!(finished.preview, "13\n14\n15\n16\n17\n18\n19\n20");
+    let failed = tokio::time::timeout(Duration::from_millis(200), runner.failed()).await;
+    assert!(failed.is_err(), "a blob write is no runner failure");
+
+    // Control: the runner goes on, and with room the output is a blob.
+    f.disk_has_room();
+    let run = f.run("seq 1 20");
+    let finished = f.finished(run).await;
+    assert!(finished.output.is_some());
+    assert!(!finished.truncated);
     runner.shutdown().await.unwrap();
 }
 

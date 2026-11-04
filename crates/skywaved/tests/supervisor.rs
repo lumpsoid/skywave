@@ -353,6 +353,35 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Makes every blob write fail, as a full disk would, by putting a file
+    /// where `blobs/` was (refused even to root), until
+    /// [`Fixture::blobs_writable`].
+    fn blobs_unwritable(&self) {
+        let blobs = self.data.join("blobs");
+        std::fs::remove_dir(&blobs).unwrap();
+        std::fs::write(&blobs, b"").unwrap();
+    }
+
+    /// Makes recording any blob fail as a full disk would, for every
+    /// connection to the database; `blobs/` stays a directory, so the
+    /// daemon's storage still opens.
+    fn blob_rows_refused(&self) {
+        self.storage
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER blobs_full BEFORE INSERT ON blobs
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+    }
+
+    fn blobs_writable(&self) {
+        let blobs = self.data.join("blobs");
+        std::fs::remove_file(&blobs).unwrap();
+        std::fs::create_dir(&blobs).unwrap();
+    }
+
     fn first(&self) -> ContextId {
         ContextId::first_of(self.session_id)
     }
@@ -3834,6 +3863,179 @@ async fn a_running_supervisor_reports_no_failure() {
     let mut supervisor = f.start(&agent).await;
     let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
     assert!(failed.is_err(), "a running supervisor has not failed");
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The tool events of the session's log, in order.
+fn tool_events(kinds: &[EventKind]) -> (Vec<ToolCall>, Vec<ToolResult>) {
+    let calls = kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    let results = kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    (calls, results)
+}
+
+#[tokio::test]
+async fn a_blob_that_cannot_be_written_is_left_out_and_the_turn_goes_on() {
+    let mut f = Fixture::new();
+    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let turn = || {
+        [
+            Step::tool_call("shell", json!({ "command": long.clone() })),
+            Step::tool_result(long.clone()),
+            Step::text("done"),
+        ]
+    };
+    let agent = FakeAgent::new(FakeScript::new().turn(turn()).turn(turn()));
+    let mut supervisor = f.start(&agent).await;
+
+    f.blobs_unwritable();
+    f.send("one");
+    let kinds = f.wait_count("first turn", 1, is_idle).await;
+    let (calls, results) = tool_events(&kinds);
+    let body = calls[0].display.body.as_ref().expect("a cut title's body");
+    assert_eq!(body.full, None, "the body's blob could not be written");
+    assert_eq!(
+        calls[0].input, None,
+        "the input's blob could not be written"
+    );
+    assert_eq!(
+        results[0].output, None,
+        "the output's blob could not be written"
+    );
+    // The event is cut like any long one, and counts all of the output.
+    assert_eq!(results[0].lines, 100);
+    assert_eq!(
+        results[0].preview.lines().count(),
+        skywave_proto::limits::PREVIEW_MAX_LINES
+    );
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "done".into()
+    }));
+    let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
+    assert!(failed.is_err(), "a blob write is no supervisor failure");
+
+    // Control: with room again the same turn keeps its blobs.
+    f.blobs_writable();
+    f.send("two");
+    let kinds = f.wait_count("second turn", 2, is_idle).await;
+    let (calls, results) = tool_events(&kinds);
+    assert!(calls[1].display.body.as_ref().unwrap().full.is_some());
+    assert!(calls[1].input.is_some());
+    let blob = results[1].output.as_ref().expect("the output's blob");
+    assert_eq!(blob.size, long.len() as u64);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A write lock another connection holds past the old 5 s busy timeout (an
+/// admin command, an import) delays the supervisor's appends; it no longer
+/// ends it.
+#[tokio::test]
+async fn a_write_lock_held_for_seconds_only_delays_the_supervisor() {
+    const HELD: Duration = Duration::from_secs(6);
+    let mut f = Fixture::new();
+    let gate = Gate::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::text("before"),
+        Step::Wait(gate.clone()),
+        Step::text("after"),
+    ]));
+    let mut supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_for("the turn to block", |k| {
+        k.contains(&EventKind::AgentMessage {
+            parent: None,
+            text: "before".into(),
+        })
+    })
+    .await;
+
+    let (locked, lock_taken) = std::sync::mpsc::channel();
+    let data = f.data.clone();
+    let holder = std::thread::spawn(move || {
+        let mut other = Storage::open(&data).unwrap();
+        let tx = other
+            .db
+            .conn_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(HELD);
+        drop(tx);
+    });
+    lock_taken.recv().unwrap();
+    let blocked = std::time::Instant::now();
+    gate.open();
+
+    let kinds = f.wait_count("the turn's end", 1, is_idle).await;
+    assert!(
+        blocked.elapsed() >= Duration::from_secs(5),
+        "the append waited out the lock"
+    );
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "after".into()
+    }));
+    holder.join().unwrap();
+    let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
+    assert!(failed.is_err(), "a held lock is no supervisor failure");
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A daemon restarted while blobs still cannot be stored settles what its
+/// last run left and runs the next turn, rather than failing on the same
+/// error again (a service manager would restart it in a loop).
+#[tokio::test]
+async fn a_restart_while_blobs_cannot_be_stored_recovers_and_runs() {
+    let mut f = Fixture::new();
+    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let gate = Gate::new();
+    let agent = FakeAgent::new(
+        FakeScript::new()
+            .turn([
+                Step::tool_call("shell", json!({ "command": long.clone() })),
+                Step::Wait(gate.clone()),
+            ])
+            .turn([Step::tool_result(long.clone())]),
+    );
+    let supervisor = f.start(&agent).await;
+    f.blob_rows_refused();
+    f.send("one");
+    f.wait_count("the call", 1, |k| matches!(k, EventKind::ToolCall(_)))
+        .await;
+    // The daemon stops mid-turn, its call open.
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let mut supervisor = f.start(&agent).await;
+    let kinds = f.wait_count("the lost turn", 1, is_errored).await;
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::CallsUnanswered { calls } if calls.len() == 1)),
+        "{kinds:#?}"
+    );
+    f.send("two");
+    let kinds = f.wait_count("the next turn", 1, is_idle).await;
+    let (_, results) = tool_events(&kinds);
+    assert_eq!(results.len(), 1, "{kinds:#?}");
+    assert_eq!(
+        results[0].output, None,
+        "the blob still could not be stored"
+    );
+    let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
+    assert!(failed.is_err());
     supervisor.shutdown().await.unwrap();
 }
 

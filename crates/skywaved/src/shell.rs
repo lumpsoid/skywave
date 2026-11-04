@@ -102,7 +102,11 @@
 //! [`ShellHandle::failed`] then returns, and `serve` stops the daemon on it
 //! and exits non-zero: a daemon whose runner is gone would go on accepting
 //! `RunShell` for runs nothing starts and showing killed runs `Running`.
-//! The next start settles them from the log like any other.
+//! The next start settles them from the log like any other. Only an append
+//! that fails is such an error; a write lock another connection holds is
+//! waited out ([`crate::db::BUSY_TIMEOUT`]), and output that cannot become
+//! a blob (a full disk) is logged `truncated` with no blob, the runner going
+//! on.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};

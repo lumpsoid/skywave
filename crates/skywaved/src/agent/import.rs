@@ -223,11 +223,13 @@ impl Prepared {
         calls: &mut HashMap<AgentCallId, CallId>,
     ) -> Result<Option<Item>> {
         let Prepared { blobs, metas, .. } = self;
-        let mut put = |bytes: &[u8]| -> Result<BlobRef> {
+        // Unlike the live mapper's sink, a failed write fails the import:
+        // it is one command, answered `Failed`, and nothing runs on it.
+        let mut put = |bytes: &[u8]| -> Result<Option<BlobRef>> {
             let meta = blobs.write(bytes)?;
             let blob = meta.blob_ref();
             metas.push(meta);
-            Ok(blob)
+            Ok(Some(blob))
         };
         let (at, event) = match item {
             HistoryItem::User { at, text } => {
