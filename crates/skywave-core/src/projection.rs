@@ -203,6 +203,7 @@ impl SessionSummary {
             }
             EventKind::SessionArchived { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::ContextMoved { .. }
             | EventKind::TaskStopRequested { .. }
             | EventKind::TaskStopRefused { .. }
@@ -277,6 +278,7 @@ impl SessionSummary {
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
@@ -368,6 +370,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ModelChanged { .. }
         | EventKind::ModelRefused { .. }
         | EventKind::ModelsOffered { .. }
+        | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
         | EventKind::EffortRefused { .. }
@@ -423,6 +426,7 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ModelChanged { .. }
         | EventKind::ModelRefused { .. }
         | EventKind::ModelsOffered { .. }
+        | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::EffortRequested { .. }
         | EventKind::EffortChanged { .. }
         | EventKind::EffortRefused { .. }

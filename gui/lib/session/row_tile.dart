@@ -196,6 +196,13 @@ class RowTile extends StatelessWidget {
         hit: hit,
         mark: mark,
       ),
+      RowKind.agentVersion => _Notice(
+        row: row,
+        icon: Icons.warning_amber_outlined,
+        color: colors.warning,
+        hit: hit,
+        mark: mark,
+      ),
       RowKind.archived => _Notice(
         row: row,
         icon: Icons.inventory_2_outlined,

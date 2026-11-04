@@ -367,6 +367,7 @@ impl EventLog {
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
@@ -855,6 +856,7 @@ pub(crate) fn append_in(
         | EventKind::SessionArchived { .. }
         | EventKind::TurnUsage(_)
         | EventKind::ModelsOffered { .. }
+        | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::TaskStopRequested { .. }
         | EventKind::TaskStopRefused { .. }
         | EventKind::CallsUnanswered { .. }
@@ -1229,6 +1231,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ModelChanged { .. } => "ModelChanged",
         EventKind::ModelRefused { .. } => "ModelRefused",
         EventKind::ModelsOffered { .. } => "ModelsOffered",
+        EventKind::AgentVersionUnconfirmed { .. } => "AgentVersionUnconfirmed",
         EventKind::EffortRequested { .. } => "EffortRequested",
         EventKind::EffortChanged { .. } => "EffortChanged",
         EventKind::EffortRefused { .. } => "EffortRefused",

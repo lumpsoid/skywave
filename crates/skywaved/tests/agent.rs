@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
-    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES,
+    SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX,
+    TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
@@ -2489,6 +2490,30 @@ fn exit_drops_the_stops_left_unanswered() {
     mapper.asked_stop(TaskId("b".into()), Some(next));
     apply_all(&mut f, &mut mapper, vec![refuse("b")]);
     assert_eq!(f.kinds()[1..], [stop_refused("b", next)]);
+}
+
+// ---------------------------------------------------------------------------
+// Agent version
+
+#[test]
+fn an_unconfirmed_agent_version_is_logged_cut_to_its_cap() {
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let long = "9".repeat(AGENT_VERSION_MAX_CHARS + 5);
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![AdapterEvent::VersionUnconfirmed {
+            version: long,
+            confirmed: "2.1.310".into(),
+        }],
+    );
+    let [EventKind::AgentVersionUnconfirmed { version, confirmed }] = &f.kinds()[..] else {
+        panic!("expected one AgentVersionUnconfirmed: {:?}", f.kinds());
+    };
+    assert_eq!(confirmed, "2.1.310");
+    assert_eq!(version.chars().count(), AGENT_VERSION_MAX_CHARS);
+    assert!(version.ends_with('…'), "{version}");
 }
 
 // ---------------------------------------------------------------------------

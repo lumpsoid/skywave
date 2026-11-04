@@ -251,6 +251,12 @@ users did; the cost is one fsync of the WAL per commit.
   redelivered: the user stopped the work, or a crash leaves delivery at most
   once. A daemon shutdown does not report them yet. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
+  An agent process that reports a version other than the one its adapter
+  was checked against logs one `AgentVersionUnconfirmed` (neither notable
+  nor activity) in the context it was started for, and every head shows it
+  as a warning in the timeline. The Claude Code adapter also starts the CLI
+  with its auto-updater off (docs/agents/claude-code.md), so the version
+  changes only when the operator updates it.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob

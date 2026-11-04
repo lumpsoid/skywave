@@ -23,10 +23,10 @@ use skywave_core::{
     ToolOutcome, ToolView, read_head,
 };
 use skywave_present::format::{
-    IMPORTED_MARK, adopted_line, agent_setting_line, answer_words, asked_by, blob_size, bytes,
-    context_moved_line, context_started_line, context_switched_line, decision_label,
-    delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
-    percent, seconds, subagent_status, took_label, turn_time,
+    IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
+    blob_size, bytes, context_moved_line, context_started_line, context_switched_line,
+    decision_label, delivery_label, dollars, fail_reason, import_finished_line, moved_from_line,
+    outgoing_label, percent, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
@@ -656,6 +656,11 @@ impl Layout<'_> {
                     message,
                     mark,
                 );
+            }
+            Entry::AgentVersionUnconfirmed { version, confirmed } => {
+                let mut spans = lead;
+                spans.push(Span::raw(clean(&agent_version_line(version, confirmed))).yellow());
+                return vec![Line::from(spans)];
             }
             Entry::Tool(view) => tool_head(lead, view),
             Entry::ToolCall { name, summary, .. } => (

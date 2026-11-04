@@ -1238,6 +1238,12 @@ pub enum Entry {
     AgentErrored {
         message: String,
     },
+    /// The agent started as `version`, not `confirmed`, the version the
+    /// server was checked against: a warning that its turns may misbehave.
+    AgentVersionUnconfirmed {
+        version: String,
+        confirmed: String,
+    },
     /// A turn ended and its agent reported what it took. A figure the agent
     /// does not report is `None`.
     TurnUsage(TurnUsage),

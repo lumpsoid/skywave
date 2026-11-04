@@ -105,7 +105,9 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v18: bounded messages. [`limits::MESSAGE_MAX_BYTES`] and
 /// `RejectReason::MessageTooLong`. A log that went backwards: `log` on
 /// [`HelloResponse`] ([`LogRun`], [`LogId`], [`RunId`], [`RunsSince`]),
-/// asked about with [`HelloQuery`].
+/// asked about with [`HelloQuery`]. `EventKind::AgentVersionUnconfirmed`
+/// with [`limits::AGENT_VERSION_MAX_CHARS`]: an agent version the adapter
+/// was not checked against.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 macro_rules! uuid_id {
@@ -426,6 +428,17 @@ pub enum EventKind {
     ModelsOffered {
         models: Vec<ModelChoice>,
     },
+    /// The agent process just started runs `version`, not `confirmed`, the
+    /// version the server's adapter was checked against: the agent's
+    /// protocol may have changed under it, so a turn can misbehave (e.g.
+    /// stay working until stopped). Logged once per agent process that
+    /// reports such a version, in the context it was started for. Each is
+    /// at most [`limits::AGENT_VERSION_MAX_CHARS`]. A warning to show, not
+    /// notable, not activity.
+    AgentVersionUnconfirmed {
+        version: String,
+        confirmed: String,
+    },
     /// A `SetEffort` command asked the agent to reason at `effort`.
     EffortRequested {
         effort: Effort,
@@ -659,6 +672,7 @@ impl EventKind {
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
@@ -711,6 +725,7 @@ impl EventKind {
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
             | EventKind::BackgroundTasksChanged { .. }
@@ -751,6 +766,7 @@ impl EventKind {
             | EventKind::ModelChanged { .. }
             | EventKind::ModelRefused { .. }
             | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
             | EventKind::EffortRequested { .. }
             | EventKind::EffortChanged { .. }
             | EventKind::EffortRefused { .. }
@@ -806,6 +822,8 @@ pub mod limits {
     /// Longest [`ModelChoice::detail`](crate::ModelChoice::detail), in
     /// chars.
     pub const MODEL_DETAIL_MAX_CHARS: usize = 120;
+    /// Longest version in `AgentVersionUnconfirmed`, in chars.
+    pub const AGENT_VERSION_MAX_CHARS: usize = 40;
     /// Longest refusal reason (`PermissionModeRefused`, `ModelRefused`,
     /// `TaskStopRefused`), in chars.
     pub const REFUSAL_MAX_CHARS: usize = 200;

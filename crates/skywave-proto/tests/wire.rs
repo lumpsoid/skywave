@@ -289,6 +289,10 @@ fn all_event_kinds() -> Vec<EventKind> {
                 efforts: vec![Effort::Low, Effort::High, Effort::XHigh],
             }],
         },
+        EventKind::AgentVersionUnconfirmed {
+            version: "2.2.0".into(),
+            confirmed: "2.1.310".into(),
+        },
         EventKind::EffortRequested {
             effort: Effort::XHigh,
             by: device(),

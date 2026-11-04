@@ -12,6 +12,11 @@
 //!    --resume <parent> --fork-session --session-id <uuid>) <agent.args...>
 //! ```
 //!
+//! with `DISABLE_AUTOUPDATER=1` in its environment ([`NO_AUTOUPDATE_ENV`]),
+//! so the CLI never updates itself under the adapter. A CLI that still
+//! reports another version than [`protocol::PINNED_VERSION`] is reported as
+//! [`AdapterEvent::VersionUnconfirmed`](super::AdapterEvent::VersionUnconfirmed).
+//!
 //! A fresh context gets a new UUID as `--session-id`, reported with the first
 //! turn as the context's [`ResumeHandle`](super::ResumeHandle)
 //! `{"session_id": "<uuid>"}` (a process stopped before any message reports
@@ -190,6 +195,14 @@ pub fn bypass_arg(args: &[String]) -> Option<String> {
     })
 }
 
+/// The environment variable (name, value) every CLI process gets so it
+/// never updates itself: an update under a running server changes the
+/// protocol the adapter was confirmed against ([`protocol::PINNED_VERSION`]).
+/// It turns off only the automatic updater; `claude update` by hand still
+/// works (`DISABLE_UPDATES` would block that too). docs/agents/claude-code.md
+/// §1.
+pub const NO_AUTOUPDATE_ENV: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
+
 /// How long shutdown waits for a turn to end, and then for the exit.
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// How long start waits for the initialize handshake.
@@ -270,16 +283,26 @@ impl ClaudeCodeAdapter {
         args
     }
 
+    /// The command for a process taking up `session` in `workdir`: the
+    /// [`command_args`](Self::command_args) and [`NO_AUTOUPDATE_ENV`] on
+    /// top of the server's environment.
+    pub fn command(&self, workdir: &Path, session: CliSession, session_rules: &[Value]) -> Command {
+        let mut command = Command::new(&self.config.command);
+        command
+            .args(self.command_args(session, session_rules))
+            .env(NO_AUTOUPDATE_ENV.0, NO_AUTOUPDATE_ENV.1)
+            .current_dir(workdir);
+        command
+    }
+
     fn spawn(
         &self,
         workdir: &Path,
         session: CliSession,
         session_rules: &[Value],
     ) -> Result<Child, AgentError> {
-        let mut command = Command::new(&self.config.command);
+        let mut command = self.command(workdir, session, session_rules);
         command
-            .args(self.command_args(session, session_rules))
-            .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -2771,6 +2771,12 @@ impl Model {
                 }
                 // Shown in the header.
                 EventKind::ModelsOffered { .. } => None,
+                EventKind::AgentVersionUnconfirmed { version, confirmed } => {
+                    Some(Entry::AgentVersionUnconfirmed {
+                        version: version.clone(),
+                        confirmed: confirmed.clone(),
+                    })
+                }
                 EventKind::ContextMoved { to, by } => Some(Entry::ContextMoved {
                     name: names
                         .get(&event.context)
@@ -6646,6 +6652,36 @@ mod tests {
                 TimelineItem::Pending { .. } => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_unconfirmed_agent_version_shows_as_an_entry_but_is_no_news() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let before = row(&f, sid);
+        f.log(
+            sid,
+            vec![EventKind::AgentVersionUnconfirmed {
+                version: "2.2.0".into(),
+                confirmed: "2.1.310".into(),
+            }],
+        );
+        let after = row(&f, sid);
+        assert_eq!(
+            (after.last_activity, after.unread),
+            (before.last_activity, before.unread)
+        );
+        // Positive control: a message is activity.
+        f.log(sid, vec![message("hi")]);
+        assert!(row(&f, sid).last_activity > before.last_activity);
+        f.open(sid);
+        assert_eq!(
+            entries(&f)[0],
+            Entry::AgentVersionUnconfirmed {
+                version: "2.2.0".into(),
+                confirmed: "2.1.310".into(),
+            }
+        );
     }
 
     fn tools(f: &Fixture) -> Vec<ToolView> {

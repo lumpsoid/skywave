@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX,
-    PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
-    RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
-    TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS,
+    MODEL_MAX_CHARS, MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS,
+    RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
+    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, BlobRef, Body, BodyFormat,
@@ -51,6 +51,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `PermissionModeSet` / `ModelSet` / `EffortSet` | `PermissionModeChanged` / `ModelChanged` / `EffortChanged` answering the oldest request asked; for one asked under no command, only when it differs from what the log has |
 /// | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` | `PermissionModeRefused` / `ModelRefused` / `EffortRefused` answering the oldest request asked |
 /// | `ModelsOffered` | nothing: the supervisor logs it, comparing across sessions |
+/// | `VersionUnconfirmed` | `AgentVersionUnconfirmed`, each version cut to its cap |
 /// | `TaskStopAnswered` | nothing: retires the oldest stop asked (the task leaving the set is the outcome) |
 /// | `TaskStopRefused` | `TaskStopRefused` answering the oldest stop asked |
 /// | `BackgroundTasks` | `CallsUnanswered` for the open calls of the subagents whose task left, then `BackgroundTasksChanged` if the set changed, `call` linked to its call |
@@ -541,6 +542,13 @@ impl EventMapper {
             }
             AdapterEvent::ModelsOffered(_) => {
                 tracing::debug!("models offered reach the log through the supervisor");
+            }
+            AdapterEvent::VersionUnconfirmed { version, confirmed } => {
+                let kind = EventKind::AgentVersionUnconfirmed {
+                    version: cut_line(&version, AGENT_VERSION_MAX_CHARS).0,
+                    confirmed: cut_line(&confirmed, AGENT_VERSION_MAX_CHARS).0,
+                };
+                seqs.push(self.append(log, storage, kind)?);
             }
             AdapterEvent::BackgroundTasks(tasks) => {
                 // The whole report, not the cut set: a task cut from the

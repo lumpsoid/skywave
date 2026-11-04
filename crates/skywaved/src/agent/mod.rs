@@ -389,6 +389,9 @@ pub enum AdapterEvent {
     EffortRefused { effort: Effort, reason: String },
     /// The models the agent offers, uncut.
     ModelsOffered(Vec<ModelChoice>),
+    /// The agent runs `version`, not `confirmed`, the version the adapter
+    /// was checked against; uncut. At most once per process.
+    VersionUnconfirmed { version: String, confirmed: String },
     /// Every live background task, in the agent's order; replaces the set
     /// reported before. May repeat it.
     BackgroundTasks(Vec<AgentTask>),
