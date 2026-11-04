@@ -109,10 +109,7 @@ impl Fixture {
     fn config(&self) -> ShellConfig {
         ShellConfig {
             enabled: true,
-            progress: Progress {
-                marks: vec![],
-                every: Duration::from_secs(3600),
-            },
+            progress: Progress::every(Duration::from_secs(3600)),
             // This test binary is not `skywaved`; runs need it as their host.
             host: Some(PathBuf::from(env!("CARGO_BIN_EXE_skywaved"))),
             ..ShellConfig::default()
@@ -1218,10 +1215,7 @@ async fn progress_reports_the_tail_only_when_there_is_new_output() {
     let mut f = Fixture::new();
     let runner = f
         .start_with(ShellConfig {
-            progress: Progress {
-                marks: vec![],
-                every: Duration::from_millis(10),
-            },
+            progress: Progress::every(Duration::from_millis(10)),
             ..f.config()
         })
         .await;
@@ -1373,10 +1367,7 @@ async fn a_runner_error_kills_its_runs_and_surfaces() {
     let mut f = Fixture::new();
     let mut runner = f
         .start_with(ShellConfig {
-            progress: Progress {
-                marks: vec![],
-                every: Duration::from_millis(10),
-            },
+            progress: Progress::every(Duration::from_millis(10)),
             ..f.config()
         })
         .await;

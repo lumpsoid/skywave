@@ -331,8 +331,10 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `when` is matched against the session's last end (`Exited { code: 0 }`
   is success). A run ends when the shell exits; its process group is then
   killed, and on Linux a subreaper host reaps orphans. Output streams to a
-  file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s and
-  then every 60 s, and becomes a blob unless the preview holds all of it;
+  file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s,
+  then every minute up to 10 min, every 5 min up to 1 h and every 15 min
+  after (D39), only when the tail changed, and becomes a blob unless the
+  preview holds all of it;
   output that cannot become a blob is logged `truncated` without one.
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would

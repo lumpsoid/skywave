@@ -717,9 +717,10 @@ settles what an earlier enabled daemon left (`Lost`, `Stopped`, and
 `NotStarted { "shell disabled" }` for queued runs) and ends. Otherwise every
 device would show those runs queued or running forever.
 **Progress backs off.** `ShellOutput` is logged at 2 s, 5 s, 10 s and 30 s
-after the start, then every 60 s, and only when there is new output. Each
-one is kept in the log and copied to every device forever; a 2 s tick would
-be 1800 events an hour on exactly the links this product is for.
+after the start, then less and less often (D39), and only when there is new
+output. Each one is kept in the log and copied to every device forever; a
+2 s tick would be 1800 events an hour on exactly the links this product is
+for.
 **The agent never sees runs.** The supervisor ignores shell events, so a run
 neither reaches the agent nor disturbs its turn, and runs go on across
 `StopSession`, context changes and idle shutdowns. Agent-agnostic (D3): the
@@ -900,3 +901,18 @@ opt-in says what it allows, not which CLI flag it sets.
 agent (an option shown only to fail, and the agent's flag the only guard);
 never offering it (an operator who wants it would have to start every
 session in it through `agent.args`).
+
+## D39. A long shell run's progress backs off further, and skips repeats
+A run's `ShellOutput` checks (D35) are at 2, 5, 10 and 30 s, then every
+minute while the last check was before 10 min, every 5 min while it was
+before 1 h, and every 15 min after (`crates/skywaved/src/shell.rs`,
+`Progress`). With no timeouts (D35), a long-running command (`npm run dev`)
+at a flat 60 s logged ~1440 events a day, each kept forever and copied to
+every device; this caps it at ~115. A check also logs nothing when the
+tail equals the last one reported, even if bytes arrived (a line rewritten
+in place, a repeating status line), so its `lines` and `bytes` may lag
+until the next change or `ShellFinished`. No wire change: devices still see
+the latest tail, only less often.
+**Rejected:** progress that replaces rather than appends (a new event kind
+or log compaction, for a problem a plain schedule bounds); a cap on the
+event count (a run past it would go silent).
