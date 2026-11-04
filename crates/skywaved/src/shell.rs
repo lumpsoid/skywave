@@ -90,7 +90,7 @@
 //! stripped, trailing newlines dropped, within the preview caps), and it and
 //! the counts cover all output, also what the cap discarded. While the run
 //! goes on, `ShellOutput` reports the tail at the [`Progress`] cadence, only
-//! when there is new output.
+//! when there is new output and the tail differs from the last one reported.
 //!
 //! **Shutdown** ([`ShellHandle::shutdown`]) kills every running run's group
 //! and logs nothing, so the next start settles them `Lost`, as after a
@@ -178,35 +178,95 @@ impl Default for ShellConfig {
 }
 
 /// When a running shell's progress is checked: at each of `marks` after the
-/// start, then every `every`. A check logs a `ShellOutput` only when there
-/// is output it has not reported. Backs off because each one is kept in the
-/// log and copied to every device.
+/// start, then by `stages`, then every `every` with no end. A check logs a
+/// `ShellOutput` only when there is output it has not reported and the tail
+/// differs from the last one reported. Backs off because each one is kept
+/// in the log and copied to every device (D39).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
+    /// Offsets from the start, ascending.
     pub marks: Vec<Duration>,
+    /// After the marks, in order: a check every `every` while the last
+    /// check was before `until`.
+    pub stages: Vec<Stage>,
+    /// After the stages.
     pub every: Duration,
 }
 
+/// One step of the [`Progress`] back-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage {
+    pub every: Duration,
+    pub until: Duration,
+}
+
 impl Default for Progress {
-    /// 2 s, 5 s, 10 s and 30 s after the start, then every 60 s.
+    /// 2 s, 5 s, 10 s and 30 s after the start, then every minute up to
+    /// 10 min, every 5 min up to 1 h, and every 15 min after: about 115
+    /// checks a day.
     fn default() -> Self {
+        const MIN: u64 = 60;
         Progress {
             marks: [2, 5, 10, 30].map(Duration::from_secs).to_vec(),
-            every: Duration::from_secs(60),
+            stages: [(MIN, 10 * MIN), (5 * MIN, 60 * MIN)]
+                .map(|(every, until)| Stage {
+                    every: Duration::from_secs(every),
+                    until: Duration::from_secs(until),
+                })
+                .to_vec(),
+            every: Duration::from_secs(15 * MIN),
         }
     }
 }
 
 impl Progress {
-    /// When check `n` (from 0) is due, after the start.
-    fn after(&self, n: usize) -> Duration {
-        if let Some(mark) = self.marks.get(n) {
+    /// A check every `every` from the start, with no marks or stages.
+    pub fn every(every: Duration) -> Progress {
+        Progress {
+            marks: Vec::new(),
+            stages: Vec::new(),
+            every,
+        }
+    }
+
+    /// When the check after the one at `last` (after the start; zero for
+    /// none yet) is due, after the start.
+    fn next(&self, last: Duration) -> Duration {
+        if let Some(mark) = self.marks.iter().find(|mark| **mark > last) {
             return *mark;
         }
-        let last = self.marks.last().copied().unwrap_or_default();
-        let past = u32::try_from(n - self.marks.len() + 1).unwrap_or(u32::MAX);
-        let every = self.every.max(Duration::from_millis(1));
-        last.saturating_add(every.saturating_mul(past))
+        let every = self
+            .stages
+            .iter()
+            .find(|stage| last < stage.until)
+            .map_or(self.every, |stage| stage.every);
+        last.saturating_add(every.max(Duration::from_millis(1)))
+    }
+}
+
+/// What a running shell last reported, so a check that would repeat it
+/// reports nothing.
+#[derive(Debug, Default)]
+struct Reported {
+    bytes: u64,
+    tail: String,
+}
+
+impl Reported {
+    /// The tail to report for output of `bytes` bytes, if any: none when no
+    /// output arrived since the last report, or when its tail (`tail` is
+    /// called only if output arrived) is the one already reported.
+    fn fresh(&mut self, bytes: u64, tail: impl FnOnce() -> String) -> Option<String> {
+        if bytes == self.bytes {
+            return None;
+        }
+        self.bytes = bytes;
+        let tail = tail();
+        if tail == self.tail {
+            return None;
+        }
+        self.tail.clone_from(&tail);
+        Some(tail)
     }
 }
 
@@ -1257,12 +1317,12 @@ exit "$__skywave_status"
         let mut group = w.shell.group();
         let pgid = w.shell.pgid();
         let start = Instant::now();
-        let mut ticks = 0;
-        let mut reported = 0;
+        let mut checked = std::time::Duration::ZERO;
+        let mut reported = super::Reported::default();
         let mut buf = vec![0; 64 * 1024];
         let mut output_open = true;
         let (status, stopped) = loop {
-            let due = start + w.progress.after(ticks);
+            let due = start + w.progress.next(checked);
             let wake = tokio::select! {
                 biased;
                 changed = control.changed() => Wake::Control(match changed {
@@ -1286,12 +1346,11 @@ exit "$__skywave_status"
                 Wake::Read(Ok(0) | Err(_)) => output_open = false,
                 Wake::Read(Ok(n)) => w.capture.push(&buf[..n]),
                 Wake::Tick => {
-                    ticks += 1;
-                    if w.capture.bytes != reported {
-                        reported = w.capture.bytes;
+                    checked = w.progress.next(checked);
+                    if let Some(tail) = reported.fresh(w.capture.bytes, || w.capture.tail()) {
                         let _ = reports.send(Report::Output {
                             run: w.run,
-                            tail: w.capture.tail(),
+                            tail,
                             lines: w.capture.lines(),
                             bytes: w.capture.bytes,
                         });
@@ -1417,15 +1476,63 @@ mod tests {
 
     #[test]
     fn progress_backs_off_then_repeats() {
+        /// The checks `progress` makes in the first `span`, in seconds.
+        fn checks(progress: &Progress, span: Duration) -> Vec<u64> {
+            let mut at = Vec::new();
+            let mut last = Duration::ZERO;
+            loop {
+                last = progress.next(last);
+                if last > span {
+                    return at;
+                }
+                at.push(last.as_secs());
+            }
+        }
         let progress = Progress::default();
-        let at: Vec<u64> = (0..7).map(|n| progress.after(n).as_secs()).collect();
-        assert_eq!(at, [2, 5, 10, 30, 90, 150, 210]);
-        let tight = Progress {
-            marks: vec![],
-            every: Duration::from_millis(10),
-        };
-        assert_eq!(tight.after(0), Duration::from_millis(10));
-        assert_eq!(tight.after(2), Duration::from_millis(30));
+        let hour = checks(&progress, Duration::from_secs(5430));
+        let mut want = vec![2, 5, 10, 30];
+        // Every minute while the last check was before 10 min.
+        want.extend((90..=630).step_by(60));
+        // Every 5 min while it was before 1 h.
+        want.extend((930..=3630).step_by(300));
+        // Every 15 min after.
+        want.extend([4530, 5430]);
+        assert_eq!(hour, want);
+        let day = checks(&progress, Duration::from_secs(24 * 3600)).len();
+        assert_eq!(
+            day,
+            4 + 10 + 10 + 91,
+            "a day of checks, against 1440 before"
+        );
+
+        let tight = Progress::every(Duration::from_millis(10));
+        assert_eq!(tight.next(Duration::ZERO), Duration::from_millis(10));
+        assert_eq!(
+            tight.next(Duration::from_millis(20)),
+            Duration::from_millis(30)
+        );
+        let zero = Progress::every(Duration::ZERO);
+        assert!(
+            zero.next(Duration::ZERO) > Duration::ZERO,
+            "never a busy loop"
+        );
+    }
+
+    #[test]
+    fn progress_skips_a_check_that_would_repeat_the_last_report() {
+        let mut reported = Reported::default();
+        assert_eq!(reported.fresh(0, || unreachable!()), None, "no output yet");
+        assert_eq!(reported.fresh(2, || "a".into()), Some("a".into()));
+        assert_eq!(
+            reported.fresh(2, || unreachable!()),
+            None,
+            "no new output: the tail is not even rendered"
+        );
+        // New bytes, but the same tail (a line rewritten in place, say).
+        assert_eq!(reported.fresh(4, || "a".into()), None);
+        assert_eq!(reported.fresh(6, || "a\nb".into()), Some("a\nb".into()));
+        // A tail that returns to an earlier one is new against the last.
+        assert_eq!(reported.fresh(8, || "a".into()), Some("a".into()));
     }
 
     #[test]
