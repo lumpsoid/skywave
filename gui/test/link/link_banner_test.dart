@@ -17,7 +17,7 @@ LinkUpdate link(
   connectionLabel: '',
   canRetryNow: canRetryNow,
   rejected:
-      state == LinkState.revoked ||
+      state == LinkState.repairNeeded ||
       state == LinkState.protocolMismatch ||
       state == LinkState.historyLost,
   canResetReplica: state == LinkState.historyLost,
@@ -57,8 +57,14 @@ void main() {
       (LinkState.connecting, 'connecting…'),
       (LinkState.online, 'online · 2 queued'),
       (LinkState.catchingUp, 'syncing · 4/9'),
-      (LinkState.reconnecting, 'offline · retry in 07s (attempt 3)'),
-      (LinkState.revoked, 'device revoked · re-pair to reconnect'),
+      (
+        LinkState.reconnecting,
+        'offline · server unreachable · retry in 07s (attempt 3)',
+      ),
+      (
+        LinkState.repairNeeded,
+        'server identity changed · re-pair to reconnect',
+      ),
       (
         LinkState.protocolMismatch,
         'protocol mismatch · client v2, server v3 · update, then retry',

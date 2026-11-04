@@ -225,7 +225,9 @@ pub async fn pair(
         .await
         .map_err(|e| match e {
             _ if mismatch.load(Ordering::SeqCst) => PairError::FingerprintMismatch,
-            TransportError::Tls(reason) => PairError::BadServerCertificate(reason),
+            TransportError::Tls(reason)
+            | TransportError::UntrustedServer(reason)
+            | TransportError::ServerNameMismatch(reason) => PairError::BadServerCertificate(reason),
             TransportError::Timeout => PairError::Unreachable("timed out".into()),
             other => PairError::Unreachable(other.to_string()),
         })?;

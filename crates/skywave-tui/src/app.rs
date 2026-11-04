@@ -14,9 +14,9 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, LinkRejection, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq,
-    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
-    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq, ServerAddress,
+    SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId,
+    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
@@ -1263,6 +1263,11 @@ impl SessionUi {
     }
 }
 
+/// The link stopped for a reason only pairing again fixes.
+fn needs_repair(link: &Link) -> bool {
+    matches!(link, Link::Rejected(rejection) if rejection.needs_repair())
+}
+
 /// The download a run's output blob needs before it can be shown or
 /// copied: none while it is here or on its way.
 fn output_download(blob: &BlobView) -> Option<Action> {
@@ -1342,8 +1347,8 @@ pub struct UiState {
     pub usage: UsageUi,
     /// The workdir screen's selection, scroll and read blob text.
     pub workdir: WorkdirUi,
-    /// The user chose to browse local data behind the revoked screen.
-    pub revoked_dismissed: bool,
+    /// The user chose to browse local data behind the re-pair screen.
+    pub repair_dismissed: bool,
     /// The last failed dispatch, shown in the footer until the next key.
     pub error: Option<String>,
     /// What happened to the last key's request, e.g. a copy; shown in the
@@ -1391,7 +1396,7 @@ impl App {
                 session: None,
                 usage: UsageUi::default(),
                 workdir: WorkdirUi::default(),
-                revoked_dismissed: false,
+                repair_dismissed: false,
                 error: None,
                 notice: None,
                 copy: None,
@@ -1420,8 +1425,8 @@ impl App {
 
     /// Takes a new snapshot from the core.
     pub fn set_view(&mut self, view: ViewState) {
-        if !matches!(view.link, Link::Rejected(LinkRejection::Revoked)) {
-            self.ui.revoked_dismissed = false;
+        if !needs_repair(&view.link) {
+            self.ui.repair_dismissed = false;
         }
         match (
             matches!(self.view.screen, Screen::Pairing(_)),
@@ -1820,11 +1825,12 @@ impl App {
         self.ui.selected = Some(list.sessions[index].id);
     }
 
-    /// The revoked full-screen state covers the current screen.
-    pub fn revoked_screen(&self) -> bool {
-        matches!(self.view.link, Link::Rejected(LinkRejection::Revoked))
+    /// The re-pair full-screen state covers the current screen: the link
+    /// stopped for a reason only pairing again fixes.
+    pub fn repair_screen(&self) -> bool {
+        needs_repair(&self.view.link)
             && !matches!(self.view.screen, Screen::Pairing(_))
-            && !self.ui.revoked_dismissed
+            && !self.ui.repair_dismissed
     }
 
     /// The focused element takes text, so letters are input, not commands.
@@ -1840,7 +1846,7 @@ impl App {
     }
 
     pub fn typing(&self) -> bool {
-        !self.revoked_screen()
+        !self.repair_screen()
             && match self.view.screen {
                 Screen::Pairing(_) => true,
                 Screen::SessionList(_) => self.ui.prompt.is_some(),
@@ -1863,7 +1869,7 @@ impl App {
     /// search prompt while that is open, else into the composer, line
     /// breaks included.
     pub fn on_paste(&mut self, text: &str) {
-        if self.ui.help || self.revoked_screen() {
+        if self.ui.help || self.repair_screen() {
             return;
         }
         if let Some(prompt) = &mut self.ui.prompt {
@@ -1961,17 +1967,17 @@ impl App {
         }
         // Even while typing: the draft is saved on the way out.
         if ctrl && key.code == KeyCode::Char('g') {
-            if self.revoked_screen() || self.view.attention.elsewhere == 0 {
+            if self.repair_screen() || self.view.attention.elsewhere == 0 {
                 return None;
             }
             self.ui.jumped = true;
             return Some(Action::OpenNextApproval);
         }
-        if self.revoked_screen() {
+        if self.repair_screen() {
             return match key.code {
                 KeyCode::Char('p') | KeyCode::Enter => Some(Action::Navigate(Route::Pairing)),
                 KeyCode::Esc => {
-                    self.ui.revoked_dismissed = true;
+                    self.ui.repair_dismissed = true;
                     None
                 }
                 KeyCode::Char('q') => {

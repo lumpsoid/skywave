@@ -785,6 +785,50 @@ async fn server_certificate_must_cover_the_typed_address() {
     assert_eq!(paired.address, by_name);
 }
 
+/// A paired device tells the server's identity faults apart from a
+/// failure that may pass: an address the server certificate does not
+/// cover is `ServerNameMismatch`, a certificate from another CA is
+/// `UntrustedServer`, each a rejection; the name it was paired with
+/// still works.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paired_device_tells_identity_faults_from_transient_ones() {
+    let fx = Fixture::start_with(&["localhost"]).await;
+    let by_name = format!("localhost:{}", fx.port);
+    let code = fx.issue_code().code.to_string();
+    let paired = pair(&by_name, &code, &fx.fingerprint(), "laptop", &config())
+        .await
+        .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
+
+    let named = HttpsTransport::new(&by_name, &identity, config()).unwrap();
+    named.hello(None).await.unwrap();
+
+    let by_ip = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    let err = by_ip.hello(None).await.unwrap_err();
+    assert!(
+        matches!(err, TransportError::ServerNameMismatch(_)),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.rejection(),
+        Some(skywave_core::LinkRejection::NameMismatch)
+    );
+
+    let other = Fixture::start_with(&["localhost"]).await;
+    let elsewhere = format!("localhost:{}", other.port);
+    let err = HttpsTransport::new(&elsewhere, &identity, config())
+        .unwrap()
+        .hello(None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TransportError::UntrustedServer(_)), "{err:?}");
+    assert_eq!(
+        err.rejection(),
+        Some(skywave_core::LinkRejection::ServerChanged)
+    );
+}
+
 /// Wrong codes are 401 → a readable reason, then the server's rate limit
 /// (429 with Retry-After) is reported with the wait.
 #[tokio::test(flavor = "multi_thread")]

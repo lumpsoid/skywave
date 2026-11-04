@@ -153,7 +153,7 @@ class LinkBanner extends StatelessWidget {
       LinkState.online => Icons.cloud_done,
       LinkState.connecting || LinkState.catchingUp => Icons.cloud_sync,
       LinkState.reconnecting => Icons.cloud_off,
-      LinkState.revoked || LinkState.protocolMismatch => Icons.block,
+      LinkState.repairNeeded || LinkState.protocolMismatch => Icons.block,
       LinkState.historyLost => Icons.history_toggle_off,
       LinkState.unpaired => Icons.link_off,
     };

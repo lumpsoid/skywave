@@ -5,10 +5,10 @@
 use chrono::{DateTime, Local, Utc};
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
-    CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, LinkRejection,
-    ListKind, Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion,
-    Screen, SessionId, SessionListView, SessionRow, SessionState, SessionUsage, SessionView,
-    SettingsView, Snippet, SubagentHeader, TimelineItem, UsageView, ViewState,
+    CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
+    Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen,
+    SessionId, SessionListView, SessionRow, SessionState, SessionUsage, SessionView, SettingsView,
+    Snippet, SubagentHeader, TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -30,9 +30,10 @@ use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
     CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
-    PairForm, PairingState, PermissionModeView, RenamePrompt, RuleOption, ScheduleRow,
-    ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView, StopHeadings,
-    SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
+    PairForm, PairingState, PermissionModeView, RenamePrompt, RepairNotice, RuleOption,
+    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
+    StopHeadings, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
+    UsageSpanView,
 };
 use skywave_present::text::clean_line;
 
@@ -50,7 +51,7 @@ pub struct Ui<'a> {
     pub rename: Option<&'a RenamePrompt>,
     /// The open session's composer.
     pub composer: Option<&'a ComposerView>,
-    pub revoked_dismissed: bool,
+    pub repair_dismissed: bool,
     /// The usage screen's days and grouping.
     pub usage: (Span, Grouping),
     /// The wall clock in unix-epoch millis: the usage span ends on its day.
@@ -87,14 +88,25 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
     ScreenUpdate {
         screen,
         can_go_back: view.can_go_back,
-        revoked_full_screen: revoked(view) && !ui.revoked_dismissed,
+        repair: repair_notice(view).filter(|_| !ui.repair_dismissed),
     }
 }
 
-/// The revoked notice belongs over every screen but pairing.
-pub fn revoked(view: &ViewState) -> bool {
-    matches!(view.link, Link::Rejected(LinkRejection::Revoked))
-        && !matches!(view.screen, Screen::Pairing(_))
+/// The re-pair notice, over every screen but pairing, while the link
+/// stopped for a reason only pairing again fixes.
+pub fn repair_notice(view: &ViewState) -> Option<RepairNotice> {
+    let Link::Rejected(rejection) = view.link else {
+        return None;
+    };
+    if matches!(view.screen, Screen::Pairing(_)) {
+        return None;
+    }
+    let notice = skywave_present::link::repair_notice(rejection)?;
+    Some(RepairNotice {
+        title: notice.title.to_owned(),
+        body: notice.body.to_owned(),
+        can_retry: rejection.can_retry(),
+    })
 }
 
 fn pairing_view(pairing: &PairingView, form: &PairForm) -> ScreenView {
@@ -934,7 +946,7 @@ mod tests {
             create: None,
             rename: None,
             composer: None,
-            revoked_dismissed: false,
+            repair_dismissed: false,
             usage: Default::default(),
             wall_ms: 0,
             workdir_text: None,

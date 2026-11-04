@@ -38,6 +38,7 @@ use skywave_present::format::{
     conversation_title, conversations_empty, conversations_status, dollars, fail_reason,
     scope_label,
 };
+use skywave_present::link::{self, RepairNotice};
 use skywave_present::sections::{discardable, wanted_blob};
 use skywave_present::text::clean;
 
@@ -71,8 +72,12 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
         banner,
     );
 
-    if app.revoked_screen() {
-        render_revoked(frame, body);
+    if let Some(notice) = app
+        .repair_screen()
+        .then(|| repair_notice_of(&view.link))
+        .flatten()
+    {
+        render_repair(frame, body, notice, can_retry(&view.link));
     } else {
         match &view.screen {
             Screen::Pairing(pairing) => render_pairing(frame, body, app, pairing),
@@ -132,7 +137,10 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
             format!("syncing · {}/{}{queued_part}", have.0, server.0)
         }
         Link::Reconnecting {
-            attempt, retry_at, ..
+            attempt,
+            retry_at,
+            reason,
+            ..
         } => {
             let left_ms = retry_at.timestamp_millis().saturating_sub(wall_ms);
             let retry = if left_ms <= 0 {
@@ -145,10 +153,22 @@ fn link_text(link: &Link, queued: usize, wall_ms: i64) -> String {
                     left_ms.unsigned_abs().div_ceil(1000)
                 )
             };
-            format!("offline{queued_part} · {retry} (attempt {attempt})")
+            let reason = link::failure(*reason);
+            format!("offline · {reason}{queued_part} · {retry} (attempt {attempt})")
         }
-        Link::Rejected(LinkRejection::Revoked) => {
-            format!("device revoked · re-pair to reconnect{queued_part}")
+        Link::Rejected(
+            rejection @ (LinkRejection::Revoked
+            | LinkRejection::ServerChanged
+            | LinkRejection::NameMismatch
+            | LinkRejection::BadIdentity),
+        ) => {
+            let short = link::repair_notice(*rejection).map_or("", |n| n.short);
+            let retry = if rejection.can_retry() {
+                " · Ctrl-R retry"
+            } else {
+                ""
+            };
+            format!("{short} · re-pair to reconnect{retry}{queued_part}")
         }
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => format!(
             "protocol mismatch · client v{client}, server v{server} · update, then Ctrl-R{queued_part}"
@@ -173,20 +193,38 @@ fn banner_style(link: &Link) -> Style {
     Style::new().fg(fg).bg(bg)
 }
 
-fn render_revoked(frame: &mut Frame, area: Rect) {
-    let text = vec![
-        Line::from("This device was revoked.").bold(),
+/// The re-pair notice for `link`, if it stopped for a reason only pairing
+/// again fixes.
+fn repair_notice_of(link: &Link) -> Option<RepairNotice> {
+    match link {
+        Link::Rejected(rejection) => link::repair_notice(*rejection),
+        _ => None,
+    }
+}
+
+fn can_retry(link: &Link) -> bool {
+    matches!(link, Link::Rejected(rejection) if rejection.can_retry())
+}
+
+fn render_repair(frame: &mut Frame, area: Rect, notice: RepairNotice, can_retry: bool) {
+    let mut text = vec![
+        Line::from(notice.title).bold(),
         Line::from(""),
-        Line::from("The server no longer accepts this device. Local data stays readable."),
+        Line::from(notice.body),
         Line::from(""),
         Line::from("p / Enter  re-pair"),
+    ];
+    if can_retry {
+        text.push(Line::from("Ctrl-R     try again"));
+    }
+    text.extend([
         Line::from("Esc        browse local data"),
         Line::from("q          quit"),
-    ];
+    ]);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Revoked ").red()),
+            .block(Block::bordered().title(" Re-pair ").red()),
         area,
     );
 }
@@ -726,7 +764,7 @@ fn footer_keys(app: &App) -> &'static str {
     if app.ui().help {
         return "Esc close help";
     }
-    if app.revoked_screen() {
+    if app.repair_screen() {
         return "p re-pair · Esc browse local data · q quit · ? help";
     }
     match &app.view().screen {
@@ -899,9 +937,9 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         key("Ctrl-G", "open the next session waiting for an approval"),
         Line::from(""),
     ];
-    if app.revoked_screen() {
+    if app.repair_screen() {
         lines.extend([
-            section("Revoked"),
+            section("Re-pair"),
             key("p / Enter", "re-pair"),
             key("Esc", "browse local data"),
         ]);

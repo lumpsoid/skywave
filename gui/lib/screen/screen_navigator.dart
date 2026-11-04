@@ -4,7 +4,7 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/pairing/qr_scan.dart';
-import 'package:skywave_gui/screen/revoked_page.dart';
+import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
@@ -46,8 +46,9 @@ class ScreenNavigator extends StatelessWidget {
                     body: Center(child: CircularProgressIndicator()),
                   );
                 }
-                final revoked = update.revokedFullScreen;
-                final subagent = revoked ? null : _subagentCall(update);
+                final repair = update.repair;
+                final covered = repair != null;
+                final subagent = covered ? null : _subagentCall(update);
                 return PopScope(
                   canPop: !update.canGoBack,
                   onPopInvokedWithResult: (didPop, _) {
@@ -56,9 +57,9 @@ class ScreenNavigator extends StatelessWidget {
                   child: Navigator(
                     pages: [
                       MaterialPage<void>(
-                        key: ValueKey((kind, null, revoked)),
-                        child: revoked
-                            ? RevokedPage(send: send)
+                        key: ValueKey((kind, null, covered)),
+                        child: repair != null
+                            ? RepairPage(notice: repair, send: send)
                             : _page(update, top: subagent == null),
                       ),
                       // A subagent's view goes over its session's, which
@@ -66,7 +67,7 @@ class ScreenNavigator extends StatelessWidget {
                       // and back pops to it.
                       if (subagent != null)
                         MaterialPage<void>(
-                          key: ValueKey((kind, subagent, revoked)),
+                          key: ValueKey((kind, subagent, covered)),
                           child: _page(update, top: true),
                         ),
                     ],

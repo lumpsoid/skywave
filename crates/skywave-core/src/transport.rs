@@ -14,7 +14,7 @@ use skywave_proto::{
     EventsQuery, FileResult, HelloResponse, ListResult, RunId, WorkdirQuery,
 };
 
-use crate::view::LinkRejection;
+use crate::view::{LinkFailure, LinkRejection};
 
 /// A boxed, sendable future, so [`Transport`] stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -136,10 +136,19 @@ pub enum TransportError {
     /// No connection: DNS, TCP connect or a refused connection.
     #[error("server unreachable: {0}")]
     Unreachable(String),
-    /// The TLS handshake failed, e.g. the server presented a certificate
-    /// that does not chain to the pinned CA, or rejected ours.
+    /// The TLS handshake failed for a reason other than the server's
+    /// identity, e.g. the server rejected our certificate or the
+    /// connection broke mid-handshake.
     #[error("TLS handshake failed: {0}")]
     Tls(String),
+    /// The server presented a certificate that does not chain to the
+    /// pinned CA (rustls `UnknownIssuer`).
+    #[error("the server's certificate is not from the CA this device trusts: {0}")]
+    UntrustedServer(String),
+    /// The server's certificate chains to the pinned CA but does not
+    /// cover the address connected to (rustls `NotValidForName`).
+    #[error("the server's certificate does not cover this address: {0}")]
+    ServerNameMismatch(String),
     /// Connect, request or body read took too long.
     #[error("timed out")]
     Timeout,
@@ -191,11 +200,40 @@ impl TransportError {
             TransportError::BadStatus(status) => *status >= 500,
             TransportError::Unauthorized
             | TransportError::Revoked
+            | TransportError::UntrustedServer(_)
+            | TransportError::ServerNameMismatch(_)
             | TransportError::ProtocolMismatch { .. }
             | TransportError::NotFound
             | TransportError::RangeNotSatisfiable { .. }
             | TransportError::Decode(_)
             | TransportError::BadIdentity(_) => false,
+        }
+    }
+
+    /// What this error does to the link, decided from its kind alone: a
+    /// rejection stops it until the user acts; anything else is a failure
+    /// it retries, shown with the countdown.
+    pub fn link_verdict(&self) -> Result<LinkFailure, LinkRejection> {
+        match self {
+            TransportError::Unauthorized | TransportError::Revoked => Err(LinkRejection::Revoked),
+            TransportError::UntrustedServer(_) => Err(LinkRejection::ServerChanged),
+            TransportError::ServerNameMismatch(_) => Err(LinkRejection::NameMismatch),
+            TransportError::BadIdentity(_) => Err(LinkRejection::BadIdentity),
+            TransportError::ProtocolMismatch { client, server } => {
+                Err(LinkRejection::ProtocolMismatch {
+                    client: *client,
+                    server: *server,
+                })
+            }
+            TransportError::Unreachable(_) => Ok(LinkFailure::Unreachable),
+            TransportError::Tls(_) => Ok(LinkFailure::Handshake),
+            TransportError::Timeout => Ok(LinkFailure::TimedOut),
+            TransportError::Io(_) => Ok(LinkFailure::ConnectionLost),
+            TransportError::RunChanged => Ok(LinkFailure::ServerRestarted),
+            TransportError::NotFound => Ok(LinkFailure::ServerError(404)),
+            TransportError::RangeNotSatisfiable { .. } => Ok(LinkFailure::ServerError(416)),
+            TransportError::BadStatus(status) => Ok(LinkFailure::ServerError(*status)),
+            TransportError::Decode(_) => Ok(LinkFailure::BadResponse),
         }
     }
 
@@ -225,19 +263,11 @@ impl TransportError {
         matches!(self, TransportError::BadStatus(status) if (500..600).contains(status))
     }
 
-    /// The server refuses this device for good: the link becomes
-    /// [`Link::Rejected`](crate::Link::Rejected) until the user re-pairs.
+    /// No retry can succeed: the link becomes
+    /// [`Link::Rejected`](crate::Link::Rejected) until the user acts
+    /// ([`link_verdict`](Self::link_verdict)).
     pub fn rejection(&self) -> Option<LinkRejection> {
-        match self {
-            TransportError::Unauthorized | TransportError::Revoked => Some(LinkRejection::Revoked),
-            TransportError::ProtocolMismatch { client, server } => {
-                Some(LinkRejection::ProtocolMismatch {
-                    client: *client,
-                    server: *server,
-                })
-            }
-            _ => None,
-        }
+        self.link_verdict().err()
     }
 }
 
@@ -289,5 +319,59 @@ mod tests {
         assert!(!TransportError::BadStatus(429).is_server_error());
         assert!(!TransportError::Timeout.is_server_error());
         assert!(!TransportError::Io("x".into()).is_server_error());
+    }
+
+    /// An identity fault is a rejection from its kind alone; a handshake
+    /// that failed otherwise, and a restarted server, stay retryable and
+    /// say why.
+    #[test]
+    fn identity_faults_reject_and_transient_failures_say_why() {
+        let rejected = [
+            (
+                TransportError::UntrustedServer("x".into()),
+                LinkRejection::ServerChanged,
+            ),
+            (
+                TransportError::ServerNameMismatch("x".into()),
+                LinkRejection::NameMismatch,
+            ),
+            (
+                TransportError::BadIdentity("x".into()),
+                LinkRejection::BadIdentity,
+            ),
+        ];
+        for (error, rejection) in rejected {
+            assert!(!error.is_retryable(), "{error:?}");
+            assert_eq!(error.link_verdict(), Err(rejection), "{error:?}");
+            assert!(rejection.needs_repair(), "{rejection:?}");
+        }
+        let retried = [
+            (TransportError::Tls("x".into()), LinkFailure::Handshake),
+            (TransportError::RunChanged, LinkFailure::ServerRestarted),
+            (
+                TransportError::Unreachable("x".into()),
+                LinkFailure::Unreachable,
+            ),
+            (TransportError::Timeout, LinkFailure::TimedOut),
+            (TransportError::Io("x".into()), LinkFailure::ConnectionLost),
+            (
+                TransportError::BadStatus(503),
+                LinkFailure::ServerError(503),
+            ),
+        ];
+        for (error, failure) in retried {
+            assert_eq!(error.link_verdict(), Ok(failure), "{error:?}");
+        }
+        assert!(LinkRejection::ServerChanged.can_retry());
+        assert!(LinkRejection::NameMismatch.can_retry());
+        assert!(!LinkRejection::BadIdentity.can_retry());
+        assert!(!LinkRejection::Revoked.can_retry());
+        assert!(
+            !LinkRejection::ProtocolMismatch {
+                client: 1,
+                server: 2
+            }
+            .needs_repair()
+        );
     }
 }

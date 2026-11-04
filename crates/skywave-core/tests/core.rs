@@ -277,6 +277,7 @@ fn offline_send_is_persisted_first_and_appears_once() {
         attempt: 1,
         retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(2),
         offline_since: chrono::Utc::now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
 
     core.dispatch(Action::SendMessage {

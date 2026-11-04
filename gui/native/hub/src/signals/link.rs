@@ -6,25 +6,27 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, RustSignal)]
 pub struct LinkUpdate {
     pub state: LinkState,
-    /// The banner's text, e.g. `online · 2 queued`, `offline · 2 queued ·
-    /// retry in 07s (attempt 3)`, `device revoked · re-pair to reconnect`.
+    /// The banner's text, e.g. `online · 2 queued`, `offline · server
+    /// unreachable · 2 queued · retry in 07s (attempt 3)`, `device revoked
+    /// · re-pair to reconnect`.
     /// Empty when there is nothing to say, and the banner hides: while
     /// unpaired (the pairing screen says what to do), and while online
     /// with nothing queued and no approvals elsewhere. No key hints.
     pub label: String,
     /// The link for Settings, always said: `Connected · 12 ms`,
-    /// `Connecting…`, `Syncing · 4/9`, `Offline · retry in 07s`, `Device
-    /// revoked`, `Not paired`. Carries the round trip while online, so it
+    /// `Connecting…`, `Syncing · 4/9`, `Offline · server unreachable · retry
+    /// in 07s`, `Device revoked`, `Not paired`. Carries the round trip while online, so it
     /// changes on every ping: only the tile showing it should rebuild.
     pub connection_label: String,
     /// While reconnecting: whole seconds until the next attempt, rounded
     /// up; 0 once it is due. `None` in every other state.
     pub retry_in_s: Option<u32>,
     /// `RetryNow` would do something: skip the wait while reconnecting, or
-    /// ask the server again after a protocol mismatch.
+    /// ask the server again after a protocol mismatch or a server
+    /// certificate change.
     pub can_retry_now: bool,
-    /// The server refused this device for good (revoked, a protocol
-    /// mismatch, or its log lost history): retries have stopped.
+    /// The link stopped until the user acts (re-pair, a protocol
+    /// mismatch, or the server's log lost history): retries have stopped.
     pub rejected: bool,
     /// `ResetReplica` would do something: the server lost history this
     /// device holds. The reset drops the replica (and queued sends) for a
@@ -50,8 +52,11 @@ pub enum LinkState {
     CatchingUp,
     /// Down, waiting to try again ([`LinkUpdate::retry_in_s`]).
     Reconnecting,
-    /// This device's certificate was revoked: re-pair to reconnect.
-    Revoked,
+    /// Only pairing again brings the link back: this device was revoked,
+    /// the server's CA or names changed, or this device's identity is
+    /// damaged. [`ScreenUpdate::repair`](super::ScreenUpdate::repair) says
+    /// which.
+    RepairNeeded,
     /// Client and server speak different protocol versions.
     ProtocolMismatch,
     /// The server's log lost events this device holds; sync stopped until

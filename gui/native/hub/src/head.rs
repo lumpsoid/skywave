@@ -25,7 +25,7 @@ use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::{self, Call, Moved, Target};
 use crate::notify::{Kind, NotificationIds};
-use crate::screen::{CreateUi, Ui, rename_initial, revoked};
+use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
     RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, TimelineRow,
@@ -277,7 +277,7 @@ pub struct Head {
     create_tag: Option<Tag>,
     rename: Option<RenamePrompt>,
     rename_tag: Option<Tag>,
-    revoked_dismissed: bool,
+    repair_dismissed: bool,
     /// The usage screen's days and grouping (`UsageShow`).
     usage: (Span, Grouping),
     /// The text of the workdir diff or file shown.
@@ -329,8 +329,8 @@ impl Head {
                 session_id: Some(last.session_id.0.to_string()),
             }));
         }
-        if !revoked(&view) {
-            self.revoked_dismissed = false;
+        if repair_notice(&view).is_none() {
+            self.repair_dismissed = false;
         }
         let was_pairing = self
             .view
@@ -1067,7 +1067,7 @@ impl Head {
                 let uri = parse_pair_uri(&text).map_err(|err| err.to_string())?;
                 self.fill(uri);
             }
-            GuiIntent::RevokedDismiss => self.revoked_dismissed = true,
+            GuiIntent::RepairDismiss => self.repair_dismissed = true,
             GuiIntent::UsageShow { span, grouping } => {
                 self.usage = (
                     match span {
@@ -1285,7 +1285,7 @@ impl Head {
             create: self.create.as_ref(),
             rename: self.rename.as_ref(),
             composer: composer.as_ref(),
-            revoked_dismissed: self.revoked_dismissed,
+            repair_dismissed: self.repair_dismissed,
             usage: self.usage,
             wall_ms: clock.wall_ms,
             workdir_text,
