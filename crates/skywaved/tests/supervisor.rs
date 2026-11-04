@@ -4546,7 +4546,8 @@ async fn a_restart_while_blobs_cannot_be_stored_recovers_and_runs() {
     let (_, results) = tool_events(&kinds);
     assert_eq!(results.len(), 1, "{kinds:#?}");
     assert_eq!(
-        results[0].output, None,
+        results[0].output,
+        Some(Full::Lost),
         "the blob still could not be stored"
     );
     let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
