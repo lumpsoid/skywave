@@ -819,6 +819,8 @@ mod tests {
     }
 
     impl Transport for BlobServer {
+        fn expect_run(&self, _run: skywave_proto::RunId) {}
+
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,

@@ -11,6 +11,11 @@
 //! - otherwise the device's `last_seen` is updated (at most once every
 //!   [`TOUCH_INTERVAL`]) and the handler sees the caller's [`DeviceId`].
 //!
+//! **The expected run** is checked next, also per request ([`expected_run`]):
+//! a [`RUN_HEADER`] naming another run than this one (the device synced
+//! with a run this server is not, e.g. one rolled back under a connection
+//! that never closed) is a 412 and reaches no handler.
+//!
 //! **Long-poll** (`GET /v1/events`, D15): returns at once when events after
 //! `after` exist, else waits up to `wait` seconds, capped at [`MAX_WAIT`],
 //! for the next append. A timed-out wait returns an empty batch
@@ -75,7 +80,7 @@
 //! device resends.
 //!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
-//! 500 server fault.
+//! 412 another run expected, 500 server fault.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -96,7 +101,8 @@ use rustls_pki_types::CertificateDer;
 use skywave_proto::{
     BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
     DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
-    PROTOCOL_VERSION, ServerId, WorkdirQuery, check_conversation_id, limits, path,
+    PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, WorkdirQuery, check_conversation_id, limits,
+    path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -253,8 +259,32 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
         .route(path::BLOB_ROUTE, get(blob))
+        // The last layer added runs first: authentication, then the run.
+        .route_layer(middleware::from_fn_with_state(api.clone(), expected_run))
         .route_layer(middleware::from_fn_with_state(api.clone(), authenticate))
         .with_state(api)
+}
+
+/// Refuses a request whose [`RUN_HEADER`] names another run than this one
+/// with 412, before its handler sees it; a malformed header is a 400, and
+/// a request without one goes on.
+async fn expected_run(State(api): State<Arc<Api>>, req: Request, next: Next) -> Response {
+    if let Some(value) = req.headers().get(RUN_HEADER) {
+        let Some(expected) = value
+            .to_str()
+            .ok()
+            .and_then(|text| uuid::Uuid::parse_str(text).ok())
+            .map(RunId)
+        else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let run = api.log.run_id();
+        if expected != run {
+            tracing::info!(?expected, ?run, "refused a request meant for another run");
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn authenticate(State(api): State<Arc<Api>>, mut req: Request, next: Next) -> Response {

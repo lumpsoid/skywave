@@ -105,9 +105,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v18: bounded messages. [`limits::MESSAGE_MAX_BYTES`] and
 /// `RejectReason::MessageTooLong`. A log that went backwards: `log` on
 /// [`HelloResponse`] ([`LogRun`], [`LogId`], [`RunId`], [`RunsSince`]),
-/// asked about with [`HelloQuery`]. `EventKind::AgentVersionUnconfirmed`
-/// with [`limits::AGENT_VERSION_MAX_CHARS`]: an agent version the adapter
-/// was not checked against.
+/// asked about with [`HelloQuery`]; the run a device expects, on every
+/// other request, in the [`RUN_HEADER`] header (412 when it is not the
+/// server's). `EventKind::AgentVersionUnconfirmed` with
+/// [`limits::AGENT_VERSION_MAX_CHARS`]: an agent version the adapter was
+/// not checked against.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 macro_rules! uuid_id {
@@ -1824,6 +1826,21 @@ pub struct HelloQuery {
     /// answer can say what became of it ([`LogRun::since`]).
     pub since: Option<RunId>,
 }
+
+/// Request header naming the run of the server ([`LogRun::run`]) a device
+/// expects to reach, as a hyphenated UUID. A device sends it on every
+/// request once a `hello` told it the run, except the `hello` that asks
+/// about a run with [`HelloQuery::since`]: that one is how it learns the
+/// current run. The server answers a request whose header names another
+/// run with 412 Precondition Failed and does nothing else with it, so a
+/// request that reaches a server rolled back without the device noticing
+/// (its connection to the old run never closed) changes nothing there.
+/// Without the header nothing is checked; a malformed one is a 400.
+///
+/// A header rather than a query or body field: it applies to every
+/// endpoint alike, whatever its query or body, and a command's body stays
+/// the command the server dedups.
+pub const RUN_HEADER: &str = "skywave-run";
 
 /// The server's log as this run of the server serves it
 /// ([`HelloResponse::log`]).

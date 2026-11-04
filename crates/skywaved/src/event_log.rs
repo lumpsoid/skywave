@@ -259,6 +259,11 @@ impl EventLog {
         })
     }
 
+    /// This run of the server, minted when the log was opened.
+    pub fn run_id(&self) -> RunId {
+        self.inner.run
+    }
+
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
     pub fn head(&self) -> Seq {
         *self.inner.head.borrow()

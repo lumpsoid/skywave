@@ -383,6 +383,10 @@ struct Spied {
 }
 
 impl Transport for Spied {
+    fn expect_run(&self, run: skywave_proto::RunId) {
+        self.inner.expect_run(run);
+    }
+
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,

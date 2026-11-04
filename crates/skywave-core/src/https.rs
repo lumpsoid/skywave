@@ -20,7 +20,8 @@ use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, WorkdirQuery, path,
+    EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, RUN_HEADER, RunId,
+    WorkdirQuery, path,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -192,11 +193,12 @@ impl Http {
         &self,
         method: Method,
         uri: &str,
+        headers: &[(header::HeaderName, HeaderValue)],
         body: Bytes,
         timeout: Duration,
     ) -> Result<Reply, TransportError> {
         let exchange = async {
-            let head = self.head(method, uri, &[], body).await?;
+            let head = self.head(method, uri, headers, body).await?;
             let body = head
                 .body
                 .collect()
@@ -223,11 +225,13 @@ impl Http {
         &self,
         method: Method,
         uri: &str,
+        headers: &[(header::HeaderName, HeaderValue)],
         head_timeout: Duration,
     ) -> Result<Reply, TransportError> {
-        let head = tokio::time::timeout(head_timeout, self.head(method, uri, &[], Bytes::new()))
-            .await
-            .map_err(|_| TransportError::Timeout)??;
+        let head =
+            tokio::time::timeout(head_timeout, self.head(method, uri, headers, Bytes::new()))
+                .await
+                .map_err(|_| TransportError::Timeout)??;
         let mut body = TimedBody {
             body: Some(head.body),
             timeout: self.request_timeout(),
@@ -265,6 +269,7 @@ fn status_error(status: StatusCode, headers: &HeaderMap) -> TransportError {
         StatusCode::UNAUTHORIZED => TransportError::Unauthorized,
         StatusCode::FORBIDDEN => TransportError::Revoked,
         StatusCode::NOT_FOUND => TransportError::NotFound,
+        StatusCode::PRECONDITION_FAILED => TransportError::RunChanged,
         StatusCode::RANGE_NOT_SATISFIABLE => TransportError::RangeNotSatisfiable {
             size: header_str(headers, header::CONTENT_RANGE)
                 .and_then(|v| v.strip_prefix("bytes */"))
@@ -313,8 +318,14 @@ fn hello_from(reply: Reply) -> Result<HelloResponse, TransportError> {
 /// The [`Transport`] of a paired device: mTLS with the device certificate,
 /// trusting only the CA pinned at pairing. Cheap to share behind an `Arc`;
 /// requests may run concurrently.
+///
+/// Once told the run of the server the replica is synced with
+/// ([`Transport::expect_run`]), every request names it in
+/// [`RUN_HEADER`], except a `hello` that asks about a run.
 pub struct HttpsTransport {
     http: Http,
+    /// The [`RUN_HEADER`] value, once expected.
+    run: Mutex<Option<HeaderValue>>,
 }
 
 impl HttpsTransport {
@@ -330,20 +341,35 @@ impl HttpsTransport {
         let tls = tls::device_config(identity)?;
         Ok(HttpsTransport {
             http: Http::new(address, tls, config),
+            run: Mutex::new(None),
         })
     }
 
-    async fn hello(
-        &self,
-        since: Option<skywave_proto::RunId>,
-    ) -> Result<HelloResponse, TransportError> {
-        let uri = match since {
-            Some(run) => format!("{}?since={}", path::HELLO, run.0),
-            None => path::HELLO.to_owned(),
+    /// The headers every request but a `hello` asking about a run carries:
+    /// the expected run, once there is one.
+    fn run_header(&self) -> Vec<(header::HeaderName, HeaderValue)> {
+        let run = self.run.lock().unwrap_or_else(|p| p.into_inner());
+        run.iter()
+            .map(|value| (header::HeaderName::from_static(RUN_HEADER), value.clone()))
+            .collect()
+    }
+
+    async fn hello(&self, since: Option<RunId>) -> Result<HelloResponse, TransportError> {
+        // Asking about a run is how the device learns the current one, so
+        // that `hello` names none it expects.
+        let (uri, headers) = match since {
+            Some(run) => (format!("{}?since={}", path::HELLO, run.0), Vec::new()),
+            None => (path::HELLO.to_owned(), self.run_header()),
         };
         let reply = self
             .http
-            .request(Method::GET, &uri, Bytes::new(), self.http.request_timeout())
+            .request(
+                Method::GET,
+                &uri,
+                &headers,
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
             .await?;
         hello_from(reply)
     }
@@ -356,6 +382,7 @@ impl HttpsTransport {
             .request(
                 Method::POST,
                 path::COMMANDS,
+                &self.run_header(),
                 body.into(),
                 self.http.request_timeout(),
             )
@@ -378,7 +405,7 @@ impl HttpsTransport {
             self.http.request_timeout() + Duration::from_secs(u64::from(query.wait.unwrap_or(0)));
         let reply = self
             .http
-            .request_chunked(Method::GET, &uri, head_timeout)
+            .request_chunked(Method::GET, &uri, &self.run_header(), head_timeout)
             .await?;
         ok_json(reply)
     }
@@ -387,7 +414,13 @@ impl HttpsTransport {
         let uri = format!("{}?dir={}", path::DIRS, query_escape(dir));
         let reply = self
             .http
-            .request(Method::GET, &uri, Bytes::new(), self.http.request_timeout())
+            .request(
+                Method::GET,
+                &uri,
+                &self.run_header(),
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
             .await?;
         ok_json(reply)
     }
@@ -399,6 +432,7 @@ impl HttpsTransport {
             .request(
                 Method::GET,
                 path::CONVERSATIONS,
+                &self.run_header(),
                 Bytes::new(),
                 self.http.request_timeout(),
             )
@@ -421,26 +455,29 @@ impl HttpsTransport {
         );
         let reply = self
             .http
-            .request(Method::GET, &uri, Bytes::new(), WORKDIR_TIMEOUT)
+            .request(
+                Method::GET,
+                &uri,
+                &self.run_header(),
+                Bytes::new(),
+                WORKDIR_TIMEOUT,
+            )
             .await?;
         ok_json(reply)
     }
 
     async fn blob(&self, id: BlobId, from: u64) -> Result<BlobDownload, TransportError> {
-        let range;
-        let headers: &[(header::HeaderName, HeaderValue)] = if from > 0 {
-            range = [(
+        let mut headers = self.run_header();
+        if from > 0 {
+            headers.push((
                 header::RANGE,
                 HeaderValue::from_str(&format!("bytes={from}-")).expect("a valid header"),
-            )];
-            &range
-        } else {
-            &[]
-        };
+            ));
+        }
         let head = tokio::time::timeout(
             self.http.request_timeout(),
             self.http
-                .head(Method::GET, &path::blob(id), headers, Bytes::new()),
+                .head(Method::GET, &path::blob(id), &headers, Bytes::new()),
         )
         .await
         .map_err(|_| TransportError::Timeout)??;
@@ -529,10 +566,12 @@ impl BlobBody for TimedBody {
 }
 
 impl Transport for HttpsTransport {
-    fn hello(
-        &self,
-        since: Option<skywave_proto::RunId>,
-    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+    fn expect_run(&self, run: RunId) {
+        let value = HeaderValue::from_str(&run.0.to_string()).expect("a UUID is a valid header");
+        *self.run.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+    }
+
+    fn hello(&self, since: Option<RunId>) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
         Box::pin(HttpsTransport::hello(self, since))
     }
 

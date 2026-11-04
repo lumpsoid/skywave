@@ -104,12 +104,19 @@ impl Daemon {
     /// on. Sessions keep their old workdirs, which are gone.
     pub async fn restore(self, backup: TempDir, proxy: &LinkProxy, agent: FakeAgent) -> Daemon {
         drop(self);
-        let daemon = Daemon::start_in(backup, agent, false, FakeOutside::new()).await;
+        let daemon = Daemon::start_from(backup, agent).await;
         // Connections to the old server die with it, whatever it still
         // serves on them.
         proxy.retarget(daemon.addr);
         proxy.cut();
         daemon
+    }
+
+    /// Starts a server over `backup` ([`Daemon::backup`]), whether or not
+    /// the one it came from still runs: beside it, a rollback the device
+    /// has not noticed, its open connections still reaching the old one.
+    pub async fn start_from(backup: TempDir, agent: FakeAgent) -> Daemon {
+        Daemon::start_in(backup, agent, false, FakeOutside::new()).await
     }
 
     async fn start_in(tmp: TempDir, agent: FakeAgent, shell: bool, outside: FakeOutside) -> Daemon {

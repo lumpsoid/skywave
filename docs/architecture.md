@@ -143,12 +143,21 @@ every version.
   command ids cannot write more than that to the permanent log per request.
   The heads refuse an over-cap message before dispatching, keeping it in the
   composer; the server's refusal is the backstop.
+- **Every request names the run it is meant for** once the device knows
+  one: a `skywave-run: <RunId>` header (`RUN_HEADER`), on every request
+  but the `hello` that asks about a run with `?since=` (that is how the
+  device learns the current run). The server checks it right after
+  authentication and answers 412 when it names another run than its own,
+  before any handler runs: a command is not handled, a batch not served.
+  Without the header nothing is checked; a malformed one is a 400. A
+  header rather than a field because it applies to every endpoint alike,
+  and a command's body stays the command the server dedups.
 - **Errors are plain HTTP statuses** with no typed body. Pairing: 400
   malformed, 401 wrong, used or expired code (indistinguishable), 429 too
   many failures (`Retry-After`). Elsewhere: 401 no client certificate, 403 a
   device unknown or revoked (checked on every request, so a revocation
   applies to an open connection's next request), 400 malformed, 404 unknown
-  blob, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
+  blob, 412 another run expected, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations` and
   `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
@@ -470,6 +479,20 @@ logs) an event that no longer decodes rather than failing.
   in-memory watch, which is published after the commit), so it is never
   below an event a pull already got. The server id says nothing here: it
   lives outside the database, and a restored data dir keeps it.
+
+  The check holds past the `hello`: once it passes, the link's transport
+  names that run on every request (`Transport::expect_run`, the
+  `skywave-run` header). A server rolled back without closing the
+  device's sockets (a VM snapshot restored, a hard reboot) leaves the
+  long-poll hanging on a dead connection while the pool opens fresh ones
+  for the next command; that command reaches the rolled-back run, which
+  refuses it with 412 (`TransportError::RunChanged`) without handling it.
+  The connection ends like any failure, the command stays unanswered
+  (`Sending`, not given up on), and the next connection's `hello` decides:
+  a lost log stops the link as above, a clean restart carries on and the
+  command is sent again. The blob downloader and the side transport
+  (listings, workdir reads) send no header: they only read, and nothing
+  they fetch moves the cursor or settles a command.
 
   The link then stops with `Rejected(HistoryLost { have, server })`,
   writes nothing, and `RetryNow` does not get past it. The replica stays

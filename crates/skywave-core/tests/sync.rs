@@ -285,6 +285,10 @@ impl Counting {
 }
 
 impl Transport for Counting {
+    fn expect_run(&self, run: skywave_proto::RunId) {
+        self.inner.expect_run(run);
+    }
+
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,
@@ -1276,6 +1280,10 @@ struct ServerErrorFor {
 }
 
 impl Transport for ServerErrorFor {
+    fn expect_run(&self, run: skywave_proto::RunId) {
+        self.inner.expect_run(run);
+    }
+
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,
@@ -1717,4 +1725,110 @@ async fn a_restart_with_the_whole_log_carries_on() {
     assert_eq!(sessions.len(), 2, "{sessions:?}");
     assert!(sessions.contains(&first) && sessions.contains(&second));
     assert_same_log(&daemon.events(), &client.local_events());
+}
+
+/// A link whose every request opens a fresh connection, and whose
+/// long-poll waits as long as the server lets it: the one in flight stays
+/// on the server it reached while the next request goes wherever the proxy
+/// points.
+fn fresh_connections() -> EngineConfig {
+    let mut config = config();
+    config.transport.max_idle = 0;
+    config.wait_secs = 60;
+    config
+}
+
+/// Queues a session the device creates, without waiting for it, and
+/// returns its command.
+fn queue_session(client: &Client, daemon: &Daemon) -> CommandId {
+    client.dispatch(Action::CreateSession {
+        conversation: None,
+        workdir: daemon.workdir(),
+    });
+    client.outbox().last().unwrap().command.id
+}
+
+/// The server is rolled back under a connection that never closed (a VM
+/// snapshot restored, say): the long-poll still hangs on the old run while
+/// a command goes out over a fresh connection to the rolled-back one. That
+/// run refuses it, as it names the run the replica is synced with, so the
+/// stale log never takes it; the link reconnects, and the connection's
+/// `hello` finds the lost history.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_reaching_a_rolled_back_run_is_refused_and_the_link_stops() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let old = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&old).await;
+    let client = Client::open(fresh_connections());
+    old.pair(&client, &proxy.address()).await;
+    client.create_session(&old).await;
+    old.settle(&[&client], SOON).await;
+    let backup = old.backup();
+    let backed_up = old.head();
+    client.create_session(&old).await;
+    old.settle(&[&client], SOON).await;
+    let have = client.cursor();
+    let before = client.local_events();
+
+    // The old server runs on, so the long-poll on it neither ends nor fails.
+    let rolled_back = Daemon::start_from(backup, agent.clone()).await;
+    proxy.retarget(rolled_back.addr);
+    let command = queue_session(&client, &rolled_back);
+    let view = client
+        .wait("the link to stop on the lost history", |_, view| {
+            history_lost(&view.link).is_some()
+        })
+        .await;
+    assert_eq!(history_lost(&view.link), Some((have, backed_up)));
+    assert_eq!(rolled_back.head(), backed_up, "the stale log took nothing");
+    assert!(!rolled_back.command_results().contains_key(&command));
+    assert!(!old.command_results().contains_key(&command));
+    let entry = client
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == command)
+        .unwrap();
+    // Sent, and refused as meant for another run: not given up on.
+    assert_eq!(
+        (entry.status, entry.tries),
+        (OutboxStatus::Sending, 1),
+        "{command:?}"
+    );
+    assert_eq!(client.local_events(), before, "nothing stacked");
+}
+
+/// As above, but the server restarted with its whole log: the refused
+/// command is a reconnect like any other, whose `hello` finds the log goes
+/// on, and the command is sent again and taken once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_reaching_a_restarted_run_is_sent_again_after_its_hello() {
+    let agent = FakeAgent::new(FakeScript::new());
+    let old = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&old).await;
+    let client = Client::open(fresh_connections());
+    old.pair(&client, &proxy.address()).await;
+    client.create_session(&old).await;
+    old.settle(&[&client], SOON).await;
+    let backup = old.backup();
+
+    let restarted = Daemon::start_from(backup, agent.clone()).await;
+    proxy.retarget(restarted.addr);
+    let command = queue_session(&client, &restarted);
+    client
+        .wait("the session in the replica", |c, _| {
+            c.created_session(command).is_some()
+        })
+        .await;
+    restarted.settle(&[&client], SOON).await;
+    let entry = client
+        .outbox()
+        .into_iter()
+        .find(|e| e.command.id == command)
+        .unwrap();
+    assert_eq!(entry.tries, 2, "refused once, then taken");
+    assert!(restarted.command_results().contains_key(&command));
+    assert!(!old.command_results().contains_key(&command));
+    let link = client.core.view().link;
+    assert!(matches!(link, Link::Online { .. }), "{link:?}");
+    assert_same_log(&restarted.events(), &client.local_events());
 }

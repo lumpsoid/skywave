@@ -218,6 +218,7 @@ pub async fn pair(
         .request(
             Method::POST,
             path::PAIR,
+            &[],
             Bytes::from(body),
             config.request_timeout,
         )
