@@ -220,6 +220,12 @@ pub enum GuiIntent {
     AppBackgrounded,
     /// The app is on screen again (shown or resumed).
     AppForegrounded,
+    /// Dart got `HubFailed` with this `epoch`: every intent sent before
+    /// this one was for the head that failed. Sent once per `HubFailed`,
+    /// before anything else; never reaches a head.
+    HubFailedSeen {
+        epoch: u32,
+    },
 }
 
 /// A core action the GUI asks for directly.

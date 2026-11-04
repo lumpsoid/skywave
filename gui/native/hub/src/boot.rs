@@ -13,7 +13,7 @@ use skywave_core::{Core, CoreError, EngineConfig, ShutdownError, SubscriptionId,
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::dispatcher::{Dispatched, Dispatcher};
+use crate::dispatcher::{Dispatcher, Report};
 use crate::signals::{Boot, BootFailed};
 
 /// The core's data dir under the directory Dart sends.
@@ -31,7 +31,7 @@ pub struct Running {
     pub core: Core,
     pub dispatcher: Dispatcher,
     pub views: UnboundedReceiver<ViewState>,
-    pub results: UnboundedReceiver<Dispatched>,
+    pub results: UnboundedReceiver<Report>,
     subscription: SubscriptionId,
     slot: MutexGuard<'static, ()>,
 }
@@ -45,6 +45,10 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         unreadable: false,
     };
     let slot = CORE_SLOT.lock().await;
+    let mut opening = Opening {
+        core: None,
+        dispatcher: None,
+    };
     let dir = Path::new(&boot.dir).join(DATA_DIR);
     let config = EngineConfig {
         device_name: Some(boot.device_name),
@@ -60,8 +64,14 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         }
         Core::open_with(&dir, config)
     })
-    .await
-    .map_err(|err| failed(format!("Opening the data failed: {err}")))?;
+    .await;
+    let opened = match opened {
+        Ok(opened) => opened,
+        // A panic is the hub's, not the data's: it goes on to the caller,
+        // which answers `HubFailed`.
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => return Err(failed(format!("Opening the data failed: {err}"))),
+    };
     let core = match opened {
         Ok(core) => core,
         Err(err @ CoreError::ReplicaUnreadable { .. }) => {
@@ -73,22 +83,25 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         Err(err) => return Err(failed(format!("Cannot open the data: {err}"))),
     };
 
+    // From here on, leaving early (an error, or a panic unwinding) closes
+    // the core: `opening` drops after every other local but `slot`.
+    opening.core = Some(core.clone());
     let (results_tx, results) = unbounded_channel();
-    let dispatcher = match Dispatcher::start(core.clone(), results_tx) {
-        Ok(dispatcher) => dispatcher,
-        Err(err) => {
-            if let Err(close) = shutdown_core(core, SHUTDOWN_TIMEOUT) {
-                tracing::error!("closing the core after a failed boot: {close}");
-            }
-            return Err(failed(format!("Cannot start the dispatcher: {err}")));
-        }
-    };
+    let dispatcher = Dispatcher::start(core.clone(), results_tx)
+        .map_err(|err| failed(format!("Cannot start the dispatcher: {err}")))?;
+    opening.dispatcher = Some(dispatcher);
     let (views_tx, views) = unbounded_channel();
     // Runs on the core's `skywave-deliver` thread: hand the snapshot on and
     // nothing else. Once the hub task is gone the send fails, harmlessly.
     let subscription = core.subscribe(move |view| {
         let _ = views_tx.send(view);
     });
+    #[cfg(test)]
+    tests::panic_if_asked();
+    let Some(dispatcher) = opening.disarm() else {
+        // Not reached: it was set above.
+        return Err(failed("Cannot start the dispatcher".into()));
+    };
     tracing::info!("core open");
     Ok(Running {
         core,
@@ -98,6 +111,35 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         subscription,
         slot,
     })
+}
+
+/// What [`open`] has built so far, closed if dropped before it is handed on
+/// to [`Running`]: a failed open, or a panic in it, must not leave the data
+/// dir locked by a core nobody closes (dropping a `Core` only stops it in
+/// the background), or the next `Boot` fails with "in use".
+struct Opening {
+    core: Option<Core>,
+    dispatcher: Option<Dispatcher>,
+}
+
+impl Opening {
+    /// Hands the dispatcher on and lets go of the core: closing both is
+    /// [`Running::close`]'s job from now on. `None`, and still armed, if
+    /// there is no dispatcher yet.
+    fn disarm(&mut self) -> Option<Dispatcher> {
+        let dispatcher = self.dispatcher.take()?;
+        self.core = None;
+        Some(dispatcher)
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if let Some(core) = self.core.take() {
+            tracing::warn!("closing a core that did not finish opening");
+            log_closed(close_core(core, self.dispatcher.take(), None));
+        }
+    }
 }
 
 impl Running {
@@ -114,18 +156,36 @@ impl Running {
             slot,
         } = self;
         drop((views, results));
-        let closed = on_plain_thread(move || {
-            core.unsubscribe(subscription);
-            dispatcher.stop();
-            core.shutdown(SHUTDOWN_TIMEOUT)
-        });
-        match closed {
-            Ok(Ok(())) => tracing::info!("core closed"),
-            Ok(Err(err)) => tracing::error!("closing the core: {}", CloseError::Core(err)),
-            Err(err) => tracing::error!("closing the core: {err}"),
-        }
+        log_closed(close_core(core, Some(dispatcher), Some(subscription)));
         // Only now may another runtime in this process open the core.
         drop(slot);
+    }
+}
+
+/// Stops `subscription`'s snapshots, lets `dispatcher` apply what is still
+/// queued, then shuts `core` down, on a plain thread: `Core::shutdown`
+/// refuses runtime threads. Blocks until done.
+fn close_core(
+    core: Core,
+    dispatcher: Option<Dispatcher>,
+    subscription: Option<SubscriptionId>,
+) -> Result<(), CloseError> {
+    on_plain_thread(move || {
+        if let Some(subscription) = subscription {
+            core.unsubscribe(subscription);
+        }
+        if let Some(dispatcher) = dispatcher {
+            dispatcher.stop();
+        }
+        core.shutdown(SHUTDOWN_TIMEOUT)
+    })?
+    .map_err(CloseError::Core)
+}
+
+fn log_closed(closed: Result<(), CloseError>) {
+    match closed {
+        Ok(()) => tracing::info!("core closed"),
+        Err(err) => tracing::error!("closing the core: {err}"),
     }
 }
 
@@ -150,12 +210,6 @@ impl std::fmt::Display for CloseError {
     }
 }
 
-/// `Core::shutdown` on a fresh plain thread, waited for; safe to call from
-/// a runtime thread, where `shutdown` itself returns `InsideRuntime`.
-pub fn shutdown_core(core: Core, timeout: Duration) -> Result<(), CloseError> {
-    on_plain_thread(move || core.shutdown(timeout))?.map_err(CloseError::Core)
-}
-
 /// Runs `work` on a new thread outside any runtime and waits for it. A
 /// blocking-pool thread would not do: it counts as inside the runtime.
 fn on_plain_thread<T: Send + 'static>(
@@ -171,8 +225,22 @@ fn on_plain_thread<T: Send + 'static>(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// Makes the next [`open`] on this thread panic once the core, the
+        /// dispatcher and the subscription are all up.
+        pub(crate) static PANIC_WHILE_OPENING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn panic_if_asked() {
+        if PANIC_WHILE_OPENING.with(|asked| asked.replace(false)) {
+            panic!("injected panic while opening");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_from_a_runtime_thread_closes_the_core() {
@@ -180,10 +248,10 @@ mod tests {
         let core = Core::open(dir.path()).unwrap();
         // Called here directly, shutdown would refuse.
         assert!(tokio::runtime::Handle::try_current().is_ok());
-        shutdown_core(core, SHUTDOWN_TIMEOUT).unwrap();
+        close_core(core, None, None).unwrap();
         // Closed for good: the same dir opens again at once.
         let again = Core::open(dir.path()).unwrap();
-        shutdown_core(again, SHUTDOWN_TIMEOUT).unwrap();
+        close_core(again, None, None).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

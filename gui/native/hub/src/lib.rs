@@ -22,6 +22,7 @@ mod lifecycle;
 mod link;
 mod logging;
 mod notify;
+mod panics;
 mod run;
 mod screen;
 mod search;

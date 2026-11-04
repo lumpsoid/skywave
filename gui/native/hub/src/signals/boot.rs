@@ -29,10 +29,17 @@ pub struct BootFailed {
     pub unreadable: bool,
 }
 
-/// The hub task panicked: `message` is the panic's. The core is closed and
-/// nothing the GUI sends is acted on until Dart sends [`Boot`] again, which
-/// opens the core afresh and answers [`Booted`] (or [`BootFailed`]).
+/// The hub panicked (its task, or the dispatch thread): `message` is the
+/// panic's. The core is closed and nothing the GUI sends is acted on until
+/// Dart sends [`Boot`] again, which opens the core afresh and answers
+/// [`Booted`] (or [`BootFailed`]).
+///
+/// `epoch` counts the failures in this process. Dart answers each at once
+/// with `GuiIntent::HubFailedSeen` of the same `epoch`: the intents it sent
+/// before that were meant for the head that failed, and the new head drops
+/// them.
 #[derive(Debug, Serialize, RustSignal)]
 pub struct HubFailed {
     pub message: String,
+    pub epoch: u32,
 }
