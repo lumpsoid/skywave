@@ -669,20 +669,24 @@ pub fn outgoing_view(outgoing: &Outgoing) -> OutgoingView {
 }
 
 /// While collapsed, the state of a blob no visible section shows: `input
-/// 4.2 KiB`, `output 1.0 MiB · requested`.
+/// 4.2 KiB`, `output 1.0 MiB · requested`; or that the server could not
+/// keep it: `input not stored`.
 fn unseen_blob(entry: &Entry) -> Option<String> {
     let sections = sections(entry);
     let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.blob.is_some()) {
+    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
         return None;
     }
-    let section = sections.iter().find(|s| s.blob.is_some())?;
+    let section = sections.iter().find(|s| s.full.is_some())?;
     let what = match (section.input, section.hidden) {
         (true, _) => "input",
         (false, true) => "output",
         (false, false) => "full",
     };
-    let state = match &section.blob?.state {
+    let Some(blob) = section.blob() else {
+        return Some(format!("{what} not stored"));
+    };
+    let state = match &blob.state {
         BlobState::NotDownloaded { size } => bytes(*size),
         BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
         BlobState::Downloading { got, size, paused } => format!(
@@ -705,7 +709,7 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
     let mut note = None;
     let mut cut_short = false;
     let lines: Vec<String> = if expanded {
-        match section.blob.map(|blob| (blob.id, &blob.state)) {
+        match section.blob().map(|blob| (blob.id, &blob.state)) {
             Some((id, BlobState::Available { path })) => match heads.get(id, path) {
                 Ok(head) => {
                     cut_short = head.cut.is_some();
@@ -718,7 +722,11 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
                 }
             },
             // Where its download stands is the blob's label.
-            Some(_) | None => preview.into_iter().map(clean_line).collect(),
+            Some(_) => preview.into_iter().map(clean_line).collect(),
+            None => {
+                note = section.lost().map(str::to_owned);
+                preview.into_iter().map(clean_line).collect()
+            }
         }
     } else {
         if preview.is_empty() {
@@ -730,7 +738,14 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             .take(PREVIEW_LINES)
             .map(|l| clean_line(l))
             .collect();
-        note = more_note(section, preview.len(), shown.len());
+        note = match (
+            more_note(section, preview.len(), shown.len()),
+            section.lost(),
+        ) {
+            (Some(more), Some(lost)) => Some(format!("{more} · {lost}")),
+            (None, Some(lost)) => Some(format!("… {lost}")),
+            (more, None) => more,
+        };
         shown
     };
     Some(view_of(section, lines, note, cut_short))
@@ -767,7 +782,7 @@ fn view_of(
             })
             .collect(),
         note,
-        blob: section.blob.map(blob_facts),
+        blob: section.blob().map(blob_facts),
         cut_short,
     }
 }
@@ -870,9 +885,10 @@ pub fn content_lines(text: &str) -> Vec<&str> {
 mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        AgentSetting, AgentView, CommandId, ContextId, DeviceId, PermissionMode, SessionId,
-        SessionState,
+        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, PermissionMode,
+        SessionId, SessionState,
     };
+    use skywave_present::sections::CONTENT_LOST;
 
     use super::*;
 
@@ -1158,14 +1174,14 @@ mod tests {
         };
         let text = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
         let shown = |state, expanded| {
-            let blob = blob(state);
+            let blob = FullView::Blob(blob(state));
             let section = Section {
                 text: &text,
                 lines: Some(40),
                 format: BodyFormat::Text,
                 numbered: false,
                 error: false,
-                blob: Some(&blob),
+                full: Some(&blob),
                 hidden: false,
                 input: false,
             };
@@ -1207,5 +1223,33 @@ mod tests {
         ] {
             assert_eq!(shown(state, true), (None, label.to_owned()));
         }
+    }
+
+    #[test]
+    fn a_section_the_server_could_not_keep_says_so_and_has_no_blob() {
+        let text = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
+        let lost = FullView::Lost;
+        let section = |full| Section {
+            text: &text,
+            lines: Some(40),
+            format: BodyFormat::Text,
+            numbered: false,
+            error: false,
+            full,
+            hidden: false,
+            input: false,
+        };
+        let view = |full, expanded| {
+            section_view(&section(full), expanded, &mut BlobHeads::default()).unwrap()
+        };
+        let collapsed = view(Some(&lost), false);
+        assert_eq!(
+            collapsed.note.as_deref(),
+            Some(format!("… +32 lines · {CONTENT_LOST}").as_str())
+        );
+        assert_eq!(collapsed.blob, None);
+        assert_eq!(view(Some(&lost), true).note.as_deref(), Some(CONTENT_LOST));
+        // Control: a preview that holds it all says nothing of the kind.
+        assert_eq!(view(None, true).note, None);
     }
 }

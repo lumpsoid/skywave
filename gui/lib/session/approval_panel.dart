@@ -140,6 +140,32 @@ class ApprovalPanelView extends StatelessWidget {
                   padding: const EdgeInsets.only(top: 2, left: 26),
                   child: Text(detail, style: small),
                 ),
+              // Before what the call will do: the user decides on it, and
+              // it is not all of it.
+              if (approval.lost case final lost?)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        size: 18,
+                        color: colors.warning,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          lost,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: colors.warning,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               if (approval.preview case final preview?)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),

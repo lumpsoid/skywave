@@ -308,7 +308,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
   skipped would leave the log without an event the mapper counts as
   logged); a session's own trouble (an agent that will not start, exits
   or refuses) is logged in that session, and a blob it cannot store is
-  left out of its event (Event mapper). Recovery stores no blobs, so a
+  marked lost in its event (Event mapper). Recovery stores no blobs, so a
   restart on a full blob disk does not fail the same way again.
   An agent process that reports a version other than the one its adapter
   was checked against logs one `AgentVersionUnconfirmed` (neither notable
@@ -319,10 +319,14 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
-  fetched on demand (D11). A blob it cannot store (a full disk, its row
-  refused) is logged at error and left out: the event keeps its cut
-  preview and whole `lines` count, with no blob reference, and the turn
-  goes on.
+  fetched on demand (D11). Each such field (`ToolCall::input`,
+  `Body::full`, `ToolResult::output`, `ApprovalRequested::input`) is a
+  `Full`: `None` when the preview holds it all, `Blob` with the reference,
+  or `Lost` when the blob could not be stored (a full disk, its row
+  refused). A lost one is logged at error; the event keeps its cut
+  preview and whole `lines` count, the turn goes on, and every head says
+  the rest is gone (`skywave_present::sections`), up front in an approval
+  prompt, since the user decides on the summary.
 - **Shell runner** (D35): a sibling of the supervisor that follows the log on
   its own thread and connection. One FIFO per session, one run at a time,
   sessions in parallel. A run is `<program> -c <wrapper>` in the session's

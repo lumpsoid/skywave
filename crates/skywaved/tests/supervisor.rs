@@ -11,7 +11,7 @@ use serde_json::json;
 use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, CallId, Command, CommandId, CommandKind, CommandResult, ContextId,
-    Decision, DeviceId, Effort, Event, EventKind, ModelChoice, PermissionMode, RejectReason,
+    Decision, DeviceId, Effort, Event, EventKind, Full, ModelChoice, PermissionMode, RejectReason,
     RuleScope, RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
     TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
 };
@@ -4345,7 +4345,7 @@ fn tool_events(kinds: &[EventKind]) -> (Vec<ToolCall>, Vec<ToolResult>) {
 }
 
 #[tokio::test]
-async fn a_blob_that_cannot_be_written_is_left_out_and_the_turn_goes_on() {
+async fn a_blob_that_cannot_be_written_is_marked_lost_and_the_turn_goes_on() {
     let mut f = Fixture::new();
     let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
     let turn = || {
@@ -4363,13 +4363,19 @@ async fn a_blob_that_cannot_be_written_is_left_out_and_the_turn_goes_on() {
     let kinds = f.wait_count("first turn", 1, is_idle).await;
     let (calls, results) = tool_events(&kinds);
     let body = calls[0].display.body.as_ref().expect("a cut title's body");
-    assert_eq!(body.full, None, "the body's blob could not be written");
     assert_eq!(
-        calls[0].input, None,
+        body.full,
+        Some(Full::Lost),
+        "the body's blob could not be written"
+    );
+    assert_eq!(
+        calls[0].input,
+        Some(Full::Lost),
         "the input's blob could not be written"
     );
     assert_eq!(
-        results[0].output, None,
+        results[0].output,
+        Some(Full::Lost),
         "the output's blob could not be written"
     );
     // The event is cut like any long one, and counts all of the output.
@@ -4390,10 +4396,60 @@ async fn a_blob_that_cannot_be_written_is_left_out_and_the_turn_goes_on() {
     f.send("two");
     let kinds = f.wait_count("second turn", 2, is_idle).await;
     let (calls, results) = tool_events(&kinds);
-    assert!(calls[1].display.body.as_ref().unwrap().full.is_some());
-    assert!(calls[1].input.is_some());
-    let blob = results[1].output.as_ref().expect("the output's blob");
-    assert_eq!(blob.size, long.len() as u64);
+    let blob = |full: &Option<Full>| full.as_ref().and_then(Full::blob).cloned();
+    assert!(blob(&calls[1].display.body.as_ref().unwrap().full).is_some());
+    assert!(blob(&calls[1].input).is_some());
+    let output = blob(&results[1].output).expect("the output's blob");
+    assert_eq!(output.size, long.len() as u64);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The user decides an approval on its summary: one whose input could not
+/// be kept says so, so the summary is never taken for all of it.
+#[tokio::test]
+async fn an_approval_whose_input_cannot_be_written_is_marked_lost() {
+    let mut f = Fixture::new();
+    let ask = |path: &str| {
+        Step::approval(
+            "req-1",
+            "write",
+            // The summary is the first string field, in either key order.
+            json!({ "file": path, "text": "x\n".repeat(100) }),
+        )
+        .on_approve([Step::text("Done.")])
+    };
+    let script = FakeScript::new().turn([ask("a.txt")]).turn([ask("b.txt")]);
+    let agent = FakeAgent::new(script);
+    let mut supervisor = f.start(&agent).await;
+    let input = |kinds: &[EventKind]| {
+        kinds
+            .iter()
+            .rev()
+            .find_map(|k| match k {
+                EventKind::ApprovalRequested { summary, input, .. } => {
+                    Some((summary.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .expect("an approval")
+    };
+
+    f.blobs_unwritable();
+    f.send("one");
+    let kinds = f.wait_count("approval", 1, is_approval_requested).await;
+    assert_eq!(input(&kinds), ("a.txt".into(), Some(Full::Lost)));
+    let failed = tokio::time::timeout(Duration::from_millis(200), supervisor.failed()).await;
+    assert!(failed.is_err(), "a blob write is no supervisor failure");
+    accepted(f.resolve(DeviceId::new(), f.approval_id(), Decision::Approve));
+    f.wait_count("first turn", 1, is_idle).await;
+
+    // Control: with room again the same request keeps its input.
+    f.blobs_writable();
+    f.send("two");
+    let kinds = f.wait_count("approval", 2, is_approval_requested).await;
+    let (summary, full) = input(&kinds);
+    assert_eq!(summary, "b.txt");
+    assert!(matches!(full, Some(Full::Blob(_))), "{full:?}");
     supervisor.shutdown().await.unwrap();
 }
 

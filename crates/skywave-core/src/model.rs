@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ConversationsResult, DeviceInfo,
-    DirsResult, Event, EventBatch, EventKind, Fingerprint, ImportedItem, RejectReason,
+    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, RejectReason,
     RuleSuggestion, SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind,
     ToolResult,
 };
@@ -36,13 +36,13 @@ use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
     BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode,
     ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry,
-    ErrorInfo, FailReason, FileBody, FileChange, FileResult, ImportedEntry, Link, LinkRejection,
-    ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef,
-    PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView,
-    SessionRef, SessionRow, SessionState, SessionView, SettingChange, SettingsView, ShellAlert,
-    ShellRun, ShellRunState, ShellView, Snippet, SnippetId, SubagentHeader, SubagentStatus,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState,
-    WorkdirBody, WorkdirPane, WorkdirView,
+    ErrorInfo, FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, Link,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
+    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -1842,7 +1842,7 @@ impl Model {
                         .map(|(_, view)| view.title.clone()),
                     tool: tool.clone(),
                     summary: summary.clone(),
-                    input: input.as_ref().map(|b| self.blob_view(b)),
+                    input: input.as_ref().map(|f| self.full_view(f)),
                     suggestions: suggestions.clone(),
                     answer: self.local_answer(*id, suggestions, true),
                 }),
@@ -2560,7 +2560,7 @@ impl Model {
                 }) => Some(Entry::ToolCall {
                     name: name.clone(),
                     summary: display.title.clone(),
-                    input: input.as_ref().map(|b| self.blob_view(b)),
+                    input: input.as_ref().map(|f| self.full_view(f)),
                 }),
                 EventKind::ToolResult(result) => {
                     match tools.call(&mut items, result.call) {
@@ -2578,7 +2578,7 @@ impl Model {
                                     status: result.status.clone(),
                                     preview: result.preview.clone(),
                                     lines: result.lines,
-                                    output: result.output.as_ref().map(|b| self.blob_view(b)),
+                                    output: result.output.as_ref().map(|f| self.full_view(f)),
                                     took: (event.at - called).to_std().unwrap_or_default(),
                                 };
                             }
@@ -2587,7 +2587,7 @@ impl Model {
                         // No call to fold into, or a second result for one.
                         _ => Some(Entry::ToolResult {
                             summary: result.preview.clone(),
-                            output: result.output.as_ref().map(|b| self.blob_view(b)),
+                            output: result.output.as_ref().map(|f| self.full_view(f)),
                         }),
                     }
                 }
@@ -2614,7 +2614,7 @@ impl Model {
                             id: *id,
                             tool: tool.clone(),
                             summary: summary.clone(),
-                            input: input.as_ref().map(|b| self.blob_view(b)),
+                            input: input.as_ref().map(|f| self.full_view(f)),
                             status: ApprovalStatus::Pending,
                             answer: None,
                         })
@@ -2880,9 +2880,9 @@ impl Model {
                 format: body.format,
                 preview: body.preview.clone(),
                 lines: body.lines,
-                full: body.full.as_ref().map(|b| self.blob_view(b)),
+                full: body.full.as_ref().map(|f| self.full_view(f)),
             }),
-            input: input.as_ref().map(|b| self.blob_view(b)),
+            input: input.as_ref().map(|f| self.full_view(f)),
             approval: None,
             outcome,
             subagent: None,
@@ -2929,7 +2929,7 @@ impl Model {
                         status: result.status.clone(),
                         preview: result.preview.clone(),
                         lines: result.lines,
-                        output: result.output.as_ref().map(|b| self.blob_view(b)),
+                        output: result.output.as_ref().map(|f| self.full_view(f)),
                         took: match (called, at) {
                             (Some(called), Some(at)) => (at - called).to_std().unwrap_or_default(),
                             _ => std::time::Duration::ZERO,
@@ -2939,7 +2939,7 @@ impl Model {
                 }
                 Some(ImportedEntry::ToolResult {
                     summary: result.preview.clone(),
-                    output: result.output.as_ref().map(|b| self.blob_view(b)),
+                    output: result.output.as_ref().map(|f| self.full_view(f)),
                 })
             }
         }
@@ -3006,6 +3006,13 @@ impl Model {
             BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
         BlobView { id: blob.id, state }
+    }
+
+    fn full_view(&self, full: &Full) -> FullView {
+        match full {
+            Full::Blob(blob) => FullView::Blob(self.blob_view(blob)),
+            Full::Lost => FullView::Lost,
+        }
     }
 }
 
@@ -3899,7 +3906,7 @@ mod tests {
                     call: None,
                     tool: "bash".into(),
                     summary: "rm -rf build".into(),
-                    input: Some(input.clone()),
+                    input: Some(Full::Blob(input.clone())),
                     suggestions: Vec::new(),
                 },
             ],
@@ -3911,10 +3918,10 @@ mod tests {
         f.open(sid);
         let view = f.session_view();
         assert_eq!(view.state, SessionState::AwaitingApproval(approval));
-        let blob = BlobView {
+        let blob = FullView::Blob(BlobView {
             id: input.id,
             state: BlobState::NotDownloaded { size: 5000 },
-        };
+        });
         assert_eq!(
             view.pending_approval,
             Some(ApprovalPrompt {
@@ -5439,7 +5446,7 @@ mod tests {
                     status: None,
                     preview: "40 passed".into(),
                     lines: 1,
-                    output: Some(output.clone()),
+                    output: Some(Full::Blob(output.clone())),
                 }),
             ],
         );
@@ -5448,7 +5455,8 @@ mod tests {
             Some(TimelineItem::Logged {
                 entry:
                     Entry::ToolResult {
-                        output: Some(blob), ..
+                        output: Some(FullView::Blob(blob)),
+                        ..
                     },
                 ..
             }) => blob.state.clone(),
@@ -6053,7 +6061,7 @@ mod tests {
         let EventKind::ToolCall(mut tool) = tool_call(Some(call), ToolKind::Shell, title) else {
             unreachable!()
         };
-        tool.input = input;
+        tool.input = input.map(Full::Blob);
         ImportedItem::ToolCall(tool)
     }
 
@@ -6061,7 +6069,7 @@ mod tests {
         let EventKind::ToolResult(mut result) = tool_result(Some(call), false, preview) else {
             unreachable!()
         };
-        result.output = output;
+        result.output = output.map(Full::Blob);
         ImportedItem::ToolResult(result)
     }
 
@@ -6156,10 +6164,10 @@ mod tests {
                             status: None,
                             preview: "ok".into(),
                             lines: 1,
-                            output: Some(BlobView {
+                            output: Some(FullView::Blob(BlobView {
                                 id: output.id,
                                 state: BlobState::NotDownloaded { size: 9000 },
-                            }),
+                            })),
                             took: Duration::from_secs(180),
                         },
                     ),
@@ -6751,10 +6759,10 @@ mod tests {
                             format: skywave_proto::BodyFormat::Diff,
                             preview: "+fn main() {}".into(),
                             lines: 300,
-                            full: Some(full.clone()),
+                            full: Some(Full::Blob(full.clone())),
                         }),
                     },
-                    input: Some(input.clone()),
+                    input: Some(Full::Blob(input.clone())),
                 }),
                 approval_requested(approval, Some(call)),
             ],
@@ -6765,9 +6773,11 @@ mod tests {
 
         let view = f.session_view();
         assert_eq!(view.pending_approval.as_ref().unwrap().call, Some(call));
-        let blob = |b: &BlobRef| BlobView {
-            id: b.id,
-            state: BlobState::NotDownloaded { size: b.size },
+        let blob = |b: &BlobRef| {
+            FullView::Blob(BlobView {
+                id: b.id,
+                state: BlobState::NotDownloaded { size: b.size },
+            })
         };
         let waiting = ToolView {
             subagent: None,
@@ -10095,7 +10105,7 @@ mod tests {
                     status: None,
                     preview: "out".into(),
                     lines: 1,
-                    output: Some(output.clone()),
+                    output: Some(Full::Blob(output.clone())),
                 })],
             );
             let content = blob(4);

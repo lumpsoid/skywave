@@ -22,11 +22,11 @@ use skywave_present::format::{
     outgoing_label, repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status,
     task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
 };
-use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
+use skywave_present::sections::{ItemKey, Section, gated_item, lost, sections, tool_sections};
 use skywave_present::text::clean;
 
 use super::timeline::{
-    approval_state, detail_lines, glyph, head_lines, preview_lines, rule_index, title_spans,
+    approval_state, detail_lines, glyph, head_lines, preview_lines, rule_index, title_spans, wrap,
 };
 use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
 use crate::app::{App, Focus, Geometry, Picker, SessionUi, StopKind};
@@ -467,18 +467,28 @@ fn gated_call(view: &ToolView, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The first section shown while collapsed, capped to `max_rows`; with none,
-/// where to see the whole input if there is one.
+/// First, that the server could not keep some of what the call will do, if
+/// so: the user decides on what is shown. Then the first section shown
+/// while collapsed, capped to `max_rows`; with none, where to see the whole
+/// input if there is one.
 fn gated_content(sections: &[Section], width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = lost(sections)
+        .map(|lost| {
+            let warning = Span::raw(lost).yellow().bold();
+            wrap(
+                vec![Span::raw("! ").yellow().bold()],
+                vec![Span::raw("  ")],
+                vec![warning],
+                width,
+            )
+        })
+        .unwrap_or_default();
     if let Some(section) = sections.iter().find(|s| !s.hidden) {
-        return preview_lines(section, width, max_rows);
+        out.extend(preview_lines(section, width, max_rows));
+        return out;
     }
-    sections
-        .iter()
-        .find_map(|s| s.blob)
-        .map(input_line)
-        .into_iter()
-        .collect()
+    out.extend(sections.iter().find_map(Section::blob).map(input_line));
+    out
 }
 
 /// Where the whole input of a gated call is, and its size if it is not here.

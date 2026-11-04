@@ -58,7 +58,7 @@ fn wanted(entry: &Entry) -> Option<BlobId> {
 
 #[cfg(test)]
 mod tests {
-    use skywave_core::BlobView;
+    use skywave_core::{BlobView, FullView};
 
     use super::*;
     use crate::policy::tests::{logged, message, session};
@@ -66,7 +66,7 @@ mod tests {
     fn result(id: BlobId, state: BlobState) -> Entry {
         Entry::ToolResult {
             summary: "out".into(),
-            output: Some(BlobView { id, state }),
+            output: Some(FullView::Blob(BlobView { id, state })),
         }
     }
 

@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use skywave_proto::limits::REFUSAL_MAX_CHARS;
 use skywave_proto::{
-    BlobRef, CallId, ContextId, EventKind, ImportOutcome, ImportedItem, SessionId, ToolCall,
+    CallId, ContextId, EventKind, Full, ImportOutcome, ImportedItem, SessionId, ToolCall,
 };
 
 use super::mapper::{call_display, cut_line, tool_result};
@@ -225,11 +225,11 @@ impl Prepared {
         let Prepared { blobs, metas, .. } = self;
         // Unlike the live mapper's sink, a failed write fails the import:
         // it is one command, answered `Failed`, and nothing runs on it.
-        let mut put = |bytes: &[u8]| -> Result<Option<BlobRef>> {
+        let mut put = |bytes: &[u8]| -> Result<Full> {
             let meta = blobs.write(bytes)?;
             let blob = meta.blob_ref();
             metas.push(meta);
-            Ok(Some(blob))
+            Ok(Full::Blob(blob))
         };
         let (at, event) = match item {
             HistoryItem::User { at, text } => {

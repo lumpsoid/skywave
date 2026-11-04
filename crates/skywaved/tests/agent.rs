@@ -16,8 +16,9 @@ use skywave_proto::limits::{
 };
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BackgroundTask, BodyFormat, CallId, Command, CommandId,
-    CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind, RejectReason, Schedule,
-    ScheduleId, Seq, SessionId, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
+    CommandKind, CommandResult, ContextId, Decision, DeviceId, EventKind, Full, RejectReason,
+    Schedule, ScheduleId, Seq, SessionId, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind,
+    ToolResult,
 };
 use skywaved::agent::fake::{
     FakeAgent, FakeConversation, FakeInput, FakeScript, Gate, INTERRUPT_REASON, Step,
@@ -138,7 +139,9 @@ impl Fixture {
             EventKind::ToolResult(ToolResult { output, .. }) => output,
             other => panic!("no blob in {other:?}"),
         }
-        .clone()
+        .as_ref()
+        .and_then(Full::blob)
+        .cloned()
         .expect("payload should be a blob");
         let mut content = String::new();
         self.storage
@@ -316,7 +319,10 @@ async fn full_turn_with_blob_output_and_approved_approval() {
     let head: Vec<&str> = big.lines().take(PREVIEW_MAX_LINES).collect();
     assert_eq!(*preview, head.join("\n"));
     assert_eq!(*lines, 400);
-    assert_eq!(output.as_ref().unwrap().size, big_output().len() as u64);
+    assert_eq!(
+        output.as_ref().and_then(Full::blob).unwrap().size,
+        big_output().len() as u64
+    );
     assert_eq!(f.blob(&kinds[4]), big_output());
     // Other fields left out of the generic title: the input is a blob.
     let write = call_id(&kinds[5]);
@@ -1355,6 +1361,7 @@ fn large_content_gives_small_events_and_blobs() {
     let full = body
         .full
         .as_ref()
+        .and_then(Full::blob)
         .expect("a cut body has its text as a blob");
     assert_eq!(full.size, huge.len() as u64);
     assert!(input.is_some(), "a cut display blobs the input");
@@ -1672,7 +1679,9 @@ fn a_huge_command_blobs_the_body() {
     assert_eq!(body.format, BodyFormat::Text);
     assert!(body.preview.len() <= PREVIEW_MAX_BYTES);
     assert_eq!(body.lines, 4001);
-    let full = body.full.expect("the body is a blob");
+    let Some(Full::Blob(full)) = body.full else {
+        panic!("the body is a blob: {:?}", body.full);
+    };
     assert_eq!(full.size, huge.trim().len() as u64);
 }
 

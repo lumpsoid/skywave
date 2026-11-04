@@ -5,8 +5,8 @@
 //! and what a copy takes is what it shows.
 
 use skywave_core::{
-    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, ImportedEntry, Outgoing,
-    Query, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
+    BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry, FullView, ImportedEntry,
+    Outgoing, Query, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome, ToolView,
 };
 
 /// Most preview lines an item shows while collapsed.
@@ -138,13 +138,22 @@ pub struct Section<'a> {
     pub numbered: bool,
     /// The tool failed and this is what it said.
     pub error: bool,
-    /// The whole content, when `text` does not hold all of it.
-    pub blob: Option<&'a BlobView>,
+    /// The whole content, when `text` does not hold all of it: its blob, or
+    /// word that the server could not keep it ([`Section::lost`]).
+    pub full: Option<&'a FullView>,
     /// Shown only while the item is expanded.
     pub hidden: bool,
     /// The call's whole input rather than what it did.
     pub input: bool,
 }
+
+/// What a head says of an input the server could not keep: the summary is
+/// all there is. Matters most on an approval, decided on that summary.
+pub const INPUT_LOST: &str = "the server could not store the full input: you are seeing a summary";
+
+/// What a head says of other content the server could not keep: the
+/// preview is all there is.
+pub const CONTENT_LOST: &str = "the server could not store the rest: you are seeing only its start";
 
 impl<'a> Section<'a> {
     fn text(text: &'a str) -> Section<'a> {
@@ -154,21 +163,44 @@ impl<'a> Section<'a> {
             format: BodyFormat::Text,
             numbered: false,
             error: false,
-            blob: None,
+            full: None,
             hidden: false,
             input: false,
         }
     }
 
     /// A whole input, shown only when expanded.
-    fn input(blob: &'a BlobView) -> Section<'a> {
+    fn input(full: &'a FullView) -> Section<'a> {
         Section {
-            blob: Some(blob),
+            full: Some(full),
             hidden: true,
             input: true,
             ..Section::text("")
         }
     }
+
+    /// The blob holding the whole content, unless there is none or it was
+    /// lost.
+    pub fn blob(&self) -> Option<&'a BlobView> {
+        self.full.and_then(FullView::blob)
+    }
+
+    /// What to say beside this section when the server could not keep its
+    /// whole content ([`INPUT_LOST`], [`CONTENT_LOST`]); `None` otherwise.
+    pub fn lost(&self) -> Option<&'static str> {
+        matches!(self.full, Some(FullView::Lost)).then_some(if self.input {
+            INPUT_LOST
+        } else {
+            CONTENT_LOST
+        })
+    }
+}
+
+/// The first of `sections` whose whole content the server could not keep,
+/// as [`Section::lost`] words it: what an approval prompt says up front,
+/// hidden section or not, since the user decides on what it shows.
+pub fn lost(sections: &[Section]) -> Option<&'static str> {
+    sections.iter().find_map(Section::lost)
 }
 
 /// The sections under an item's title, in display order. Empty for items
@@ -188,7 +220,7 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
             entry: ImportedEntry::ToolResult { summary, output },
             ..
         } => out.push(Section {
-            blob: output.as_ref(),
+            full: output.as_ref(),
             ..Section::text(summary)
         }),
         // An imported call shows like a live one.
@@ -214,7 +246,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             format: body.format,
             numbered: body.format == BodyFormat::Text && is_file(view.kind),
             error: false,
-            blob: body.full.as_ref(),
+            full: body.full.as_ref(),
             hidden: false,
             input: false,
         });
@@ -237,12 +269,12 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             format: BodyFormat::Text,
             numbered: view.kind == ToolKind::FileRead && view.body.is_none() && !is_error,
             error: *is_error,
-            blob: output.as_ref(),
+            full: output.as_ref(),
             hidden: !is_error && view.body.is_some() && view.kind != ToolKind::Shell,
             input: false,
         });
     }
-    if out.iter().all(|s| s.blob.is_none())
+    if out.iter().all(|s| s.blob().is_none())
         && let Some(input) = &view.input
     {
         out.push(Section::input(input));
@@ -321,7 +353,7 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
 pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
     sections(entry)
         .into_iter()
-        .filter_map(|s| s.blob)
+        .filter_map(|s| s.blob())
         .find(|blob| {
             matches!(
                 blob.state,
@@ -344,7 +376,7 @@ pub enum Content {
 
 impl Content {
     fn of(section: &Section) -> Content {
-        match section.blob {
+        match section.blob() {
             Some(blob) => Content::Blob {
                 blob: blob.clone(),
                 strip: None,
@@ -435,12 +467,78 @@ fn tool_call_content(view: &ToolView) -> Content {
     }
     match &view.body {
         Some(BodyView {
-            full: Some(blob), ..
+            full: Some(FullView::Blob(blob)),
+            ..
         }) => Content::Blob {
             blob: blob.clone(),
             strip: Some(PROMPT),
         },
         Some(body) => Content::Text(unprompted(&body.preview)),
         None => Content::Text(unprompted(&view.title)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use skywave_core::{BlobId, CallId};
+
+    use super::*;
+
+    fn call(body: Option<FullView>, input: Option<FullView>) -> ToolView {
+        ToolView {
+            call: CallId::new(),
+            name: "Write".into(),
+            kind: ToolKind::FileWrite,
+            title: "a.txt".into(),
+            detail: None,
+            body: Some(BodyView {
+                format: BodyFormat::Text,
+                preview: "x".into(),
+                lines: 40,
+                full: body,
+            }),
+            input,
+            approval: None,
+            outcome: ToolOutcome::Running { since: Utc::now() },
+            subagent: None,
+        }
+    }
+
+    #[test]
+    fn content_the_server_lost_is_said_and_never_a_blob() {
+        let kept = FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 10 },
+        });
+
+        // A lost input stands where a kept one would, hidden, saying so.
+        let view = call(None, Some(FullView::Lost));
+        let shown = tool_sections(&view);
+        assert_eq!(shown.len(), 2);
+        assert!(shown[1].input && shown[1].hidden);
+        assert_eq!(shown[1].blob(), None);
+        assert_eq!(lost(&shown), Some(INPUT_LOST));
+
+        // A lost body says so too; its preview is all there is.
+        let view = call(Some(FullView::Lost), None);
+        let shown = tool_sections(&view);
+        assert_eq!(shown[0].lost(), Some(CONTENT_LOST));
+        assert_eq!(
+            main_content(&TimelineItem::Logged {
+                parent: None,
+                seq: Seq(1),
+                at: Utc::now(),
+                context: skywave_core::ContextId::first_of(skywave_core::SessionId::new()),
+                entry: Entry::Tool(Box::new(view.clone())),
+            }),
+            Some(Content::Text("x".into()))
+        );
+
+        // Control: kept content is a blob and nothing is said.
+        let view = call(Some(kept.clone()), Some(kept));
+        let shown = tool_sections(&view);
+        assert!(shown[0].blob().is_some());
+        assert_eq!(lost(&shown), None);
     }
 }

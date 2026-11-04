@@ -18,11 +18,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use skywave_core::{
     Action, Backoff, BlobBody, BlobDownload, BlobPolicy, BlobState, BlobStatus, BoxFuture,
-    Connector, Core, EngineConfig, Entry, HttpsTransport, Jitter, Link, Screen, Seam, TimelineItem,
-    Transport, TransportConfig, TransportError, ViewState, blob_dir,
+    Connector, Core, EngineConfig, Entry, FullView, HttpsTransport, Jitter, Link, Screen, Seam,
+    TimelineItem, Transport, TransportConfig, TransportError, ViewState, blob_dir,
 };
 use skywave_proto::{
-    BlobId, Command, CommandResult, Event, EventBatch, EventKind, EventsQuery, HelloResponse,
+    BlobId, Command, CommandResult, Event, EventBatch, EventKind, EventsQuery, Full, HelloResponse,
     ImportedItem, Seq, SessionId,
 };
 use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript, Step};
@@ -526,7 +526,8 @@ impl Client {
                 TimelineItem::Logged {
                     entry:
                         Entry::ToolResult {
-                            output: Some(blob), ..
+                            output: Some(FullView::Blob(blob)),
+                            ..
                         },
                     ..
                 } => Some((blob.id, blob.state.clone())),
@@ -793,7 +794,7 @@ async fn imported_blobs_download_under_eager_and_wait_under_on_demand() {
             EventKind::Imported {
                 item: ImportedItem::ToolResult(result),
                 ..
-            } => result.output.clone(),
+            } => result.output.as_ref().and_then(Full::blob).cloned(),
             _ => None,
         })
         .expect("the imported output is a blob");

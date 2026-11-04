@@ -113,7 +113,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`limits::AGENT_VERSION_MAX_CHARS`]: an agent version the adapter was
 /// not checked against. `sha256` on [`BlobRef`] ([`ContentHash`]): what a
 /// device checks a downloaded blob against before it is available.
-pub const PROTOCOL_VERSION: u32 = 18;
+///
+/// v19: content the server could not keep. [`Full`] in place of a bare
+/// [`BlobRef`] on `ToolCall::input`, `Body::full`, `ToolResult::output`
+/// and `ApprovalRequested::input`: `Full::Lost` when the preview is cut and
+/// its whole content could not be stored.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -253,6 +258,29 @@ pub struct BlobRef {
     pub sha256: ContentHash,
 }
 
+/// The whole of some content a preview or summary does not hold all of.
+/// Where it is optional, `None` means there is nothing more: the preview
+/// holds it all.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Full {
+    /// Kept as a blob.
+    Blob(BlobRef),
+    /// The server could not store it (a full disk): only the preview or
+    /// summary is left, and heads say so.
+    Lost,
+}
+
+impl Full {
+    /// The blob holding the whole content, unless it was lost.
+    pub fn blob(&self) -> Option<&BlobRef> {
+        match self {
+            Full::Blob(blob) => Some(blob),
+            Full::Lost => None,
+        }
+    }
+}
+
 /// One entry in the global event log.
 ///
 /// Carries no seq on the wire: its seq follows from its position in an
@@ -340,7 +368,7 @@ pub enum EventKind {
         call: Option<CallId>,
         tool: String,
         summary: String,
-        input: Option<BlobRef>,
+        input: Option<Full>,
         /// Lasting rules the agent offers to grant with an approval, at most
         /// [`limits::RULE_SUGGESTIONS_MAX`]; an answer names one by its
         /// index. Empty in events from before v4.
@@ -1258,7 +1286,8 @@ pub enum RuleScope {
 ///
 /// `name` is the agent's own tool name, carried as data for display; clients
 /// must not branch on it, only on [`ToolDisplay::kind`]. `input` is the full
-/// input as a blob, when it is worth fetching.
+/// input, when the display does not show all of it ([`Full::Lost`] when the
+/// server could not keep it).
 ///
 /// `parent` is the `Agent` call that started the subagent making this call;
 /// `None` for the main agent. A nested subagent chains through the inner
@@ -1269,7 +1298,7 @@ pub struct ToolCall {
     pub parent: Option<CallId>,
     pub name: String,
     pub display: ToolDisplay,
-    pub input: Option<BlobRef>,
+    pub input: Option<Full>,
 }
 
 /// What a client shows for a tool call, decided by the server (D4).
@@ -1304,7 +1333,8 @@ pub enum ToolKind {
     Other,
 }
 
-/// A bounded preview of some content, with the full content as a blob.
+/// A bounded preview of some content, with the full content as a blob
+/// (or the word it was lost).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Body {
     pub format: BodyFormat,
@@ -1314,7 +1344,7 @@ pub struct Body {
     /// Line count of the whole content.
     pub lines: u32,
     /// The whole content, when `preview` does not hold all of it.
-    pub full: Option<BlobRef>,
+    pub full: Option<Full>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1341,7 +1371,7 @@ pub struct ToolResult {
     /// Line count of the whole output.
     pub lines: u32,
     /// The whole output, when `preview` does not hold all of it.
-    pub output: Option<BlobRef>,
+    pub output: Option<Full>,
 }
 
 /// What one turn took, as the agent reported it when the turn ended.

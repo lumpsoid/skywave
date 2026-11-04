@@ -13,7 +13,7 @@ use skywave_core::{
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
     Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId, Decision, DeviceId,
-    DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult,
+    DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, Full,
     ImportOutcome, ImportedItem, RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin,
     SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
 };
@@ -79,7 +79,7 @@ impl Log {
                     status: None,
                     preview: "ran tests".into(),
                     lines: 1,
-                    output: Some(blob.clone()),
+                    output: Some(Full::Blob(blob.clone())),
                 }),
             ),
             event(
@@ -3109,7 +3109,7 @@ fn adopted_log(session: SessionId, output: &BlobRef) -> Vec<Event> {
                     status: None,
                     preview: "ok".into(),
                     lines: 1,
-                    output: Some(output.clone()),
+                    output: Some(Full::Blob(output.clone())),
                 }),
             },
         ),

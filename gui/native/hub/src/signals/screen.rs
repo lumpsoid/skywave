@@ -577,6 +577,10 @@ pub struct ApprovalPanel {
     /// Where the whole input is when nothing else shows: `full input
     /// 4.0 KiB`.
     pub input_label: Option<String>,
+    /// The server could not keep some of what the call will do, so what
+    /// shows is only a summary or a start: said up front, since the user
+    /// decides on it. `None` when everything was kept.
+    pub lost: Option<String>,
     /// This device may answer (again).
     pub can_answer: bool,
     /// The lasting rules offered with an approval, by index.

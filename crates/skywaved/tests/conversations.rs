@@ -391,7 +391,12 @@ async fn an_adopting_create_logs_its_session_the_history_then_the_finish_naming_
         answer.call, call.call,
         "the result links to the imported call"
     );
-    let output = answer.output.clone().expect("the long output is a blob");
+    let output = answer
+        .output
+        .as_ref()
+        .and_then(skywave_proto::Full::blob)
+        .cloned()
+        .expect("the long output is a blob");
     assert_eq!(
         imported[3].1,
         ImportedItem::AgentMessage {

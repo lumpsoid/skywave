@@ -23,9 +23,9 @@ use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
     BlobRef, Body, BodyFormat, CallId, ChangeSet, ChangedFile, ChangesResult, CommandResult,
     DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, Event, EventBatch, EventKind, FileBody,
-    FileChange, FileResult, HelloResponse, LinkTarget, ListResult, ModelChoice, PermissionMode,
-    RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ShellEnd, ToolCall,
-    ToolDisplay, ToolKind, ToolResult, TurnUsage, limits,
+    FileChange, FileResult, Full, HelloResponse, LinkTarget, ListResult, ModelChoice,
+    PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ShellEnd,
+    ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage, limits,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -1842,7 +1842,7 @@ fn every_timeline_entry_renders_distinctly() {
                     status: None,
                     preview: "file-000".into(),
                     lines: 1,
-                    output: Some(output),
+                    output: Some(Full::Blob(output)),
                 }),
             ),
             event(id, 5, EventKind::TurnInterrupted),
@@ -1951,6 +1951,68 @@ fn own_messages_show_their_delivery_state() {
     assert_eq!(h.app.composer().unwrap().text(), "pasted\nlines");
 }
 
+/// An approval whose input the server could not keep says so in its
+/// prompt: the summary is all the user decides on.
+#[test]
+fn an_approval_whose_input_was_lost_warns_in_its_prompt() {
+    let approval = |full| EventKind::ApprovalRequested {
+        id: ApprovalId::new(),
+        call: None,
+        tool: "write".into(),
+        summary: "a.txt".into(),
+        input: Some(full),
+        suggestions: Vec::new(),
+    };
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, approval(Full::Lost))]);
+    let screen = h.screen();
+    assert_contains(&screen, "Approval needed");
+    assert_contains(&screen, "! the server could not store the full input");
+    assert!(!screen.contains("full input 5.9 KiB"), "{screen}");
+
+    // Control: a kept input offers itself and warns of nothing.
+    let (mut h, id, _) = open_session();
+    pull(
+        &mut h,
+        vec![event(id, 1, approval(Full::Blob(blob(6000).1)))],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "full input 5.9 KiB · v to see it");
+    assert!(!screen.contains("could not store"), "{screen}");
+}
+
+/// A cut result whose output the server could not keep says so under its
+/// preview, where a kept one says where its blob stands.
+#[test]
+fn a_lost_output_says_so_under_its_preview() {
+    let result = |full| {
+        EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: false,
+            status: None,
+            preview: "file-000".into(),
+            lines: 40,
+            output: Some(full),
+        })
+    };
+    let (mut h, id, _) = open_session();
+    pull(&mut h, vec![event(id, 1, result(Full::Lost))]);
+    let screen = h.screen();
+    assert_contains(&screen, "│ file-000 ");
+    assert_contains(&screen, "│ … the server could not store the rest");
+    assert!(!screen.contains("not downloaded"), "{screen}");
+
+    // Control: a kept output names its blob and warns of nothing.
+    let (mut h, id, _) = open_session();
+    pull(
+        &mut h,
+        vec![event(id, 1, result(Full::Blob(blob(10_000).1)))],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "│ … full 9.8 KiB · not downloaded");
+    assert!(!screen.contains("could not store"), "{screen}");
+}
+
 #[test]
 fn approval_prompt_answer_and_resolutions() {
     let (mut h, id, me) = open_session();
@@ -1966,7 +2028,7 @@ fn approval_prompt_answer_and_resolutions() {
                 call: None,
                 tool: "write".into(),
                 summary: "a.txt".into(),
-                input: Some(input),
+                input: Some(Full::Blob(input)),
                 suggestions: Vec::new(),
             },
         )],
@@ -2960,7 +3022,7 @@ fn tool_output_expands_through_every_blob_state() {
                     status: None,
                     preview: "file-000".into(),
                     lines: 1,
-                    output: Some(output),
+                    output: Some(Full::Blob(output)),
                 }),
             ),
         ],
@@ -3083,7 +3145,7 @@ fn footer_names_blob_size() {
                     detail: None,
                     body: None,
                 },
-                input: Some(input),
+                input: Some(Full::Blob(input)),
             }),
         )],
     );
@@ -3123,7 +3185,7 @@ fn large_blobs_are_cut_short_when_shown() {
                 status: None,
                 preview: "row 0".into(),
                 lines: 1,
-                output: Some(output),
+                output: Some(Full::Blob(output)),
             }),
         )],
     );
@@ -4044,7 +4106,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
         format: BodyFormat::Text,
         preview: "//! Says hello.\n\nuse std::io::Write;\n\nfn main() {\n    let mut out = std::io::stdout();\n    writeln!(out, \"Hello, world!\").unwrap();\n    out.flush().unwrap();\n".into(),
         lines: 10,
-        full: Some(file),
+        full: Some(Full::Blob(file)),
     });
     let mut bash = call(ids[1], "Bash", ToolKind::Shell, "$ cargo run --bin hello");
     bash.display.detail = Some("Build and run the new binary".into());
@@ -4151,7 +4213,7 @@ fn mockup() -> (Harness, DeviceId, BlobId, BlobId) {
                 14,
                 EventKind::ToolResult(ToolResult {
                     lines: 23,
-                    output: Some(output),
+                    output: Some(Full::Blob(output)),
                     ..result(
                         ids[3],
                         true,
@@ -4896,7 +4958,7 @@ fn a_call_revealed_before_its_result_downloads_the_output_when_it_comes() {
     // Approved; its result logs with an output blob under the open call.
     let (blob_id, output) = blob(10_000);
     let mut done = result(id_call, false, "", "edited");
-    done.output = Some(output);
+    done.output = Some(Full::Blob(output));
     pull(
         &mut h,
         vec![
@@ -5831,7 +5893,7 @@ fn shell_output(
 ) -> [Event; 2] {
     let shell = CallId::new();
     let mut done = result(shell, false, "exit 0", preview);
-    done.output = Some(output);
+    done.output = Some(Full::Blob(output));
     [
         event(
             id,
@@ -6057,7 +6119,7 @@ fn long_command(call_id: CallId, full: Option<BlobRef>) -> ToolCall {
         format: BodyFormat::Text,
         preview: "$ cargo test --workspace \\\n  --all-features".into(),
         lines: 2,
-        full,
+        full: full.map(Full::Blob),
     });
     tool
 }
@@ -6134,7 +6196,7 @@ fn y_on_undownloaded_blob_requests_it() {
     let (blob_id, output) = blob(1_258_291);
     let mut h = copy_session(|id| {
         let mut done = result(read, false, "", "line 1");
-        done.output = Some(output);
+        done.output = Some(Full::Blob(output));
         vec![
             event(
                 id,
@@ -6210,7 +6272,7 @@ fn y_over_cap_names_the_file() {
     let (blob_id, output) = blob(80 * 1024);
     let mut h = copy_session(|id| {
         let mut done = result(shell, false, "exit 0", "a");
-        done.output = Some(output);
+        done.output = Some(Full::Blob(output));
         vec![
             event(
                 id,
