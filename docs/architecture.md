@@ -568,9 +568,9 @@ logs) an event that no longer decodes rather than failing.
   below an event a pull already got. The server id says nothing here: it
   lives outside the database, and a restored data dir keeps it.
 
-  The check holds past the `hello`: once it passes, the link's transport
-  names that run on every request (`Transport::expect_run`, the
-  `skywave-run` header). A server rolled back without closing the
+  The check holds past the `hello`: once it passes, the link sets that run
+  in its `ExpectedRun`, and every request names it (the `skywave-run`
+  header). A server rolled back without closing the
   device's sockets (a VM snapshot restored, a hard reboot) leaves the
   long-poll hanging on a dead connection while the pool opens fresh ones
   for the next command; that command reaches the rolled-back run, which
@@ -579,8 +579,17 @@ logs) an event that no longer decodes rather than failing.
   (`Sending`, not given up on), and the next connection's `hello` decides:
   a lost log stops the link as above, a clean restart carries on and the
   command is sent again. The blob downloader and the side transport
-  (listings, workdir reads) send no header: they only read, and nothing
-  they fetch moves the cursor or settles a command.
+  (listings, workdir reads) build transports of their own, but every
+  transport the engine builds for one link (`Connector`) reads the run from
+  that link's one `ExpectedRun`, as each request leaves. So a rolled-back
+  run refuses their requests too, and one the link carried on from after a
+  clean restart is what they name from then on, never the run before it.
+  A refused blob is retried after a backoff like any retryable failure (by
+  then the link has met the new run, or stopped on the lost log, which
+  stops the downloader); a refused listing or workdir read fails with
+  `RunChanged`. Each link start makes a new `ExpectedRun`, empty until its
+  first `hello` passes, so a link to a newly paired server never names the
+  old server's run.
 
   The link then stops with `Rejected(HistoryLost { have, server })`,
   writes nothing, and `RetryNow` does not get past it. The replica stays

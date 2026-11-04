@@ -367,8 +367,8 @@ impl Spy {
 
     fn connector(&self) -> Connector {
         let spy = self.clone();
-        Connector::new(move |address, identity, config| {
-            let inner = HttpsTransport::new(address, identity, config.clone())?;
+        Connector::new(move |address, identity, config, run| {
+            let inner = HttpsTransport::new(address, identity, config.clone(), run.clone())?;
             Ok(Arc::new(Spied {
                 inner: Arc::new(inner),
                 spy: spy.clone(),
@@ -383,10 +383,6 @@ struct Spied {
 }
 
 impl Transport for Spied {
-    fn expect_run(&self, run: skywave_proto::RunId) {
-        self.inner.expect_run(run);
-    }
-
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,

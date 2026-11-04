@@ -16,13 +16,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use skywave_core::{
-    Action, ApprovalStatus, BlobDownload, BoxFuture, Connector, Core, Decision, EngineConfig,
-    Entry, FailReason, HttpsTransport, Link, LinkRejection, MAX_SERVER_ERRORS, OutboxStatus,
-    Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError, ViewState,
+    Action, ApprovalStatus, BlobDownload, BlobStatus, BoxFuture, Connector, Core, Decision,
+    EngineConfig, Entry, FailReason, HttpsTransport, Link, LinkRejection, MAX_SERVER_ERRORS,
+    OutboxStatus, Outgoing, Screen, SessionRow, TimelineItem, Transport, TransportError, ViewState,
 };
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
-    EventsQuery, HelloResponse, RejectReason, Seq, SessionState,
+    BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, Event, EventBatch,
+    EventKind, EventsQuery, HelloResponse, RejectReason, Seq, SessionState,
 };
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
@@ -285,10 +285,6 @@ impl Counting {
 }
 
 impl Transport for Counting {
-    fn expect_run(&self, run: skywave_proto::RunId) {
-        self.inner.expect_run(run);
-    }
-
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,
@@ -325,8 +321,8 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let client = Client::open(EngineConfig {
-        connector: Connector::new(move |address, identity, config| {
-            let inner = HttpsTransport::new(address, identity, config.clone())?;
+        connector: Connector::new(move |address, identity, config, run| {
+            let inner = HttpsTransport::new(address, identity, config.clone(), run.clone())?;
             Ok(Arc::new(Counting {
                 inner: Arc::new(inner),
                 calls: counter.clone(),
@@ -1356,10 +1352,6 @@ struct ServerErrorFor {
 }
 
 impl Transport for ServerErrorFor {
-    fn expect_run(&self, run: skywave_proto::RunId) {
-        self.inner.expect_run(run);
-    }
-
     fn hello(
         &self,
         since: Option<skywave_proto::RunId>,
@@ -1402,8 +1394,8 @@ fn server_error_for(
     hold: Option<(usize, Arc<tokio::sync::Semaphore>)>,
 ) -> Client {
     Client::open(EngineConfig {
-        connector: Connector::new(move |address, identity, config| {
-            let inner = HttpsTransport::new(address, identity, config.clone())?;
+        connector: Connector::new(move |address, identity, config, run| {
+            let inner = HttpsTransport::new(address, identity, config.clone(), run.clone())?;
             Ok(Arc::new(ServerErrorFor {
                 inner: Arc::new(inner),
                 text,
@@ -1907,4 +1899,228 @@ async fn a_command_reaching_a_restarted_run_is_sent_again_after_its_hello() {
     let link = client.core.view().link;
     assert!(matches!(link, Link::Online { .. }), "{link:?}");
     assert_same_log(&restarted.events(), &client.local_events());
+}
+
+/// How each blob download and conversation listing went, in the order
+/// answered: `("blob" | "conversations", outcome)`.
+type Answers = tokio::sync::watch::Sender<Vec<(&'static str, Result<(), TransportError>)>>;
+
+/// Holds the link's long-polls back on the device, before they leave, while
+/// `hold` is set; `held` counts the polls it has held.
+#[derive(Default)]
+struct PollHold {
+    hold: tokio::sync::watch::Sender<bool>,
+    held: tokio::sync::watch::Sender<usize>,
+}
+
+impl PollHold {
+    /// Holds every poll from now on and waits until one is held: from then
+    /// on the link has no request in flight anywhere until
+    /// [`release`](Self::release), as long as its outbox is empty.
+    async fn park(&self) {
+        let held = *self.held.borrow();
+        let mut seen = self.held.subscribe();
+        self.hold.send_replace(true);
+        tokio::time::timeout(SOON, seen.wait_for(|n| *n > held))
+            .await
+            .expect("timed out waiting for a poll to hold")
+            .unwrap();
+    }
+
+    fn release(&self) {
+        self.hold.send_replace(false);
+    }
+}
+
+/// Passes everything on, noting how every blob download and conversation
+/// listing went, and holding long-polls as `polls` says.
+struct Answered {
+    inner: Arc<dyn Transport>,
+    answers: Arc<Answers>,
+    polls: Arc<PollHold>,
+}
+
+impl Answered {
+    fn note<T>(&self, what: &'static str, result: &Result<T, TransportError>) {
+        let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        self.answers.send_modify(|all| all.push((what, outcome)));
+    }
+}
+
+impl Transport for Answered {
+    fn hello(
+        &self,
+        since: Option<skywave_proto::RunId>,
+    ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+        self.inner.hello(since)
+    }
+
+    fn send_command<'a>(
+        &'a self,
+        command: &'a Command,
+    ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+        self.inner.send_command(command)
+    }
+
+    fn events(&self, query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+        Box::pin(async move {
+            let mut released = self.polls.hold.subscribe();
+            if *released.borrow_and_update() {
+                self.polls.held.send_modify(|n| *n += 1);
+                let _ = released.wait_for(|hold| !*hold).await;
+            }
+            self.inner.events(query).await
+        })
+    }
+
+    fn blob(&self, id: BlobId, from: u64) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+        Box::pin(async move {
+            let result = self.inner.blob(id, from).await;
+            self.note("blob", &result);
+            result
+        })
+    }
+
+    fn list_conversations(&self) -> BoxFuture<'_, Result<ConversationsResult, TransportError>> {
+        Box::pin(async move {
+            let result = self.inner.list_conversations().await;
+            self.note("conversations", &result);
+            result
+        })
+    }
+}
+
+/// Waits until a `what` answer satisfies `answered`.
+async fn wait_answer(
+    answers: &Answers,
+    what: &'static str,
+    answered: impl Fn(&Result<(), TransportError>) -> bool,
+) {
+    let mut seen = answers.subscribe();
+    tokio::time::timeout(
+        SOON,
+        seen.wait_for(|all| all.iter().any(|(w, r)| *w == what && answered(r))),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for a {what} answer: {:?}",
+            answers.borrow()
+        )
+    })
+    .unwrap();
+}
+
+/// The blob downloader and the side transport (listings, workdir reads)
+/// name the run the link expects, from the one shared value the link sets.
+/// Restarted while the link has no request out (its long-poll held on the
+/// device), the new run refuses a blob download and a conversation listing
+/// that name the old run; once the released poll, refused the same way,
+/// has the link meet the new run, the blob, retried, comes down, and a
+/// listing goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn blobs_and_listings_follow_the_run_the_link_expects() {
+    let output = "a tool output line\n".repeat(20_000);
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::tool_call("bash", serde_json::json!({ "cmd": "cat big" })),
+        Step::tool_result(output.clone()),
+    ]));
+    let old = Daemon::start(agent.clone()).await;
+    let proxy = proxy(&old).await;
+    let answers = Arc::new(Answers::new(Vec::new()));
+    let polls = Arc::new(PollHold::default());
+    let (noted, holding) = (answers.clone(), polls.clone());
+    // Fresh connections: no request reaches the old server over a
+    // connection pooled before the restart.
+    let mut engine = config();
+    engine.transport.max_idle = 0;
+    let client = Client::open(EngineConfig {
+        connector: Connector::new(move |address, identity, config, run| {
+            let inner = HttpsTransport::new(address, identity, config.clone(), run.clone())?;
+            Ok(Arc::new(Answered {
+                inner: Arc::new(inner),
+                answers: noted.clone(),
+                polls: holding.clone(),
+            }) as Arc<dyn Transport>)
+        }),
+        ..engine
+    });
+    old.pair(&client, &proxy.address()).await;
+    let session = client.create_session(&old).await;
+    let idle = |events: &[Event]| {
+        count(events, |kind| {
+            matches!(kind, EventKind::SessionStateChanged(SessionState::Idle))
+        })
+    };
+    let idle_before = idle(&old.events());
+    client.dispatch(Action::SendMessage {
+        session_id: session,
+        text: "go".into(),
+    });
+    old.wait_log("the turn to end", |events| idle(events) > idle_before)
+        .await;
+    old.settle(&[&client], SOON).await;
+    let blobs = client.seam.blobs().unwrap();
+    assert_eq!(blobs.len(), 1, "{blobs:?}");
+    let id = blobs[0].id;
+    client.session_list().await;
+    assert!(answers.borrow().is_empty(), "nothing asked yet");
+
+    // The link parked with nothing out (the outbox is empty, the poll held
+    // before it leaves), so it still expects the old run whatever the proxy
+    // points at. Then a clean restart with the whole log and its blobs.
+    polls.park().await;
+    assert_eq!(client.core.view().queued, 0);
+    let backup = old.backup();
+    let blob_files = backup.path().join("server/blobs");
+    std::fs::create_dir_all(&blob_files).unwrap();
+    for file in std::fs::read_dir(old.tmp.path().join("server/blobs")).unwrap() {
+        let file = file.unwrap();
+        std::fs::copy(file.path(), blob_files.join(file.file_name())).unwrap();
+    }
+    let restarted = Daemon::start_from(backup, agent.clone()).await;
+    proxy.retarget(restarted.addr);
+
+    client.dispatch(Action::ListConversations);
+    client.dispatch(Action::DownloadBlob(id));
+    let run_changed = |r: &Result<(), TransportError>| r == &Err(TransportError::RunChanged);
+    wait_answer(&answers, "conversations", run_changed).await;
+    wait_answer(&answers, "blob", run_changed).await;
+    let refused = answers.borrow().clone();
+    assert!(
+        refused.iter().all(|(_, r)| run_changed(r)),
+        "nothing reached the new run naming the old one: {refused:?}"
+    );
+
+    // The released poll reaches the new run naming the old one, is
+    // refused, and the next connection's `hello` has the link meet the new
+    // run, which every transport then names.
+    polls.release();
+    let command = queue_session(&client, &restarted);
+    client
+        .wait("the session in the replica", |c, _| {
+            c.created_session(command).is_some()
+        })
+        .await;
+    let view = client
+        .wait("the blob downloaded", |c, _| {
+            matches!(
+                c.seam.blob(id).unwrap().unwrap().status,
+                BlobStatus::Available { .. }
+            )
+        })
+        .await;
+    assert!(matches!(view.link, Link::Online { .. }), "{view:?}");
+    let BlobStatus::Available { path } = client.seam.blob(id).unwrap().unwrap().status else {
+        unreachable!()
+    };
+    assert_eq!(std::fs::read(path).unwrap(), output.as_bytes());
+    client.dispatch(Action::ListConversations);
+    wait_answer(&answers, "conversations", Result::is_ok).await;
+    let all = answers.borrow().clone();
+    assert_eq!(
+        all.iter().rev().find(|(w, _)| *w == "blob"),
+        Some(&("blob", Ok(()))),
+        "{all:?}"
+    );
 }

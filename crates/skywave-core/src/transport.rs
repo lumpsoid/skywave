@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use skywave_proto::{
@@ -19,16 +20,35 @@ use crate::view::{LinkFailure, LinkRejection};
 /// A boxed, sendable future, so [`Transport`] stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The run of the server the replica is synced with, as every request of
+/// one link names it ([`RUN_HEADER`](skywave_proto::RUN_HEADER)), except a
+/// `hello` asking about a run: a server in another run refuses the request
+/// as [`TransportError::RunChanged`]. Unset, requests name none and nothing
+/// is checked (first contact).
+///
+/// One per link, shared by every transport the engine builds for it (the
+/// link's own, the blob downloader's and the side transport's for listings
+/// and workdir reads), each reading it per request. Only the link sets it,
+/// once a connection's `hello` found the log still holds the replica, so a
+/// clean restart the link has carried on from reaches every transport at
+/// once, and none of them is left naming a run that is gone.
+#[derive(Debug, Clone, Default)]
+pub struct ExpectedRun(Arc<Mutex<Option<RunId>>>);
+
+impl ExpectedRun {
+    /// From now on, every request names `run`.
+    pub fn expect(&self, run: RunId) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(run);
+    }
+
+    /// The run requests name now, if any.
+    pub fn get(&self) -> Option<RunId> {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 /// The v1 API as seen by a paired device.
 pub trait Transport: Send + Sync {
-    /// From now on, every request names `run` as the run of the server it
-    /// is meant for ([`RUN_HEADER`](skywave_proto::RUN_HEADER)), except a
-    /// `hello` asking about a run: a server in another run refuses it as
-    /// [`TransportError::RunChanged`]. The link calls it once a
-    /// connection's `hello` found the log still holds the replica. A
-    /// transport that wraps another must pass it on.
-    fn expect_run(&self, run: RunId);
-
     /// `GET /v1/hello`, asking what became of run `since` of the server
     /// ([`HelloQuery`](skywave_proto::HelloQuery)). A server speaking another
     /// protocol version is [`TransportError::ProtocolMismatch`].
@@ -171,7 +191,7 @@ pub enum TransportError {
     #[error("range not satisfiable (416)")]
     RangeNotSatisfiable { size: Option<u64> },
     /// 412: the server is in another run than the one the request named
-    /// ([`Transport::expect_run`]): it restarted, or was rolled back under
+    /// ([`ExpectedRun`]): it restarted, or was rolled back under
     /// a connection that never closed. It did nothing with the request.
     /// The next connection's `hello` tells which.
     #[error("the server is in another run than this device expects (412)")]

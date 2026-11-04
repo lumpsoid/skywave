@@ -31,7 +31,10 @@
 //! A retryable failure (D7) is retried after [`Backoff::delay`], the
 //! attempt count resetting whenever a try received some bytes; a rejection
 //! is retried the same way until the link, which sees it too, stops the
-//! downloader. The queue outlives the downloader, so a suspend, a
+//! downloader. Every request names the run the link expects
+//! ([`ExpectedRun`](crate::ExpectedRun)), so a server in another run
+//! refuses it ([`TransportError::RunChanged`], retryable): by a later try
+//! the link has met the new run, or stopped on a lost log. The queue outlives the downloader, so a suspend, a
 //! reconnect or a restart picks up where it left off.
 //!
 //! **Files.** `<data_dir>/blobs/<id>.part` while downloading, renamed to
@@ -104,7 +107,7 @@ use crate::engine::EngineConfig;
 use crate::identity::Identity;
 use crate::seam::Seam;
 use crate::store::{BlobPolicy, BlobRecord, BlobStatus};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::BlobId;
 
 /// How often a running download reports its progress, at most.
@@ -439,6 +442,8 @@ pub(crate) struct BlobCtx {
     pub(crate) config: Arc<EngineConfig>,
     pub(crate) address: String,
     pub(crate) identity: Arc<dyn Identity>,
+    /// The link's; the downloader only reads it.
+    pub(crate) run: ExpectedRun,
     pub(crate) queue: Arc<BlobQueue>,
 }
 
@@ -651,9 +656,12 @@ async fn fetch(
 
     let transport = transport
         .get_or_try_init(|| async {
-            ctx.config
-                .connector
-                .connect(&ctx.address, ctx.identity.as_ref(), &ctx.config.transport)
+            ctx.config.connector.connect(
+                &ctx.address,
+                ctx.identity.as_ref(),
+                &ctx.config.transport,
+                &ctx.run,
+            )
         })
         .await?;
     let mut download = match transport.blob(id, from).await {
@@ -861,8 +869,6 @@ mod tests {
     }
 
     impl Transport for BlobServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1023,13 +1029,14 @@ mod tests {
                         cap,
                         jitter: Jitter::fixed(1.0),
                     },
-                    connector: Connector::new(move |_, _, _| {
+                    connector: Connector::new(move |_, _, _, _| {
                         Ok(server.clone() as Arc<dyn Transport>)
                     }),
                     ..EngineConfig::default()
                 }),
                 address: "srv:7443".into(),
                 identity: self.seam.identity().unwrap(),
+                run: ExpectedRun::default(),
                 queue: self.queue.clone(),
             }
         }
