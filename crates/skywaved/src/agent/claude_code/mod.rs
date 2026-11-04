@@ -7,13 +7,16 @@
 //! ```text
 //! <agent.command> -p --input-format stream-json --output-format stream-json \
 //!   --verbose --permission-prompt-tool stdio \
+//!   --settings '{"cleanupPeriodDays":36500}' \
 //!   [--allow-dangerously-skip-permissions] [<session rules>] \
 //!   (--session-id <uuid> | --resume <uuid> |
 //!    --resume <parent> --fork-session --session-id <uuid>) <agent.args...>
 //! ```
 //!
 //! with `DISABLE_AUTOUPDATER=1` in its environment ([`NO_AUTOUPDATE_ENV`]),
-//! so the CLI never updates itself under the adapter. A CLI that still
+//! so the CLI never updates itself under the adapter. The `--settings`
+//! ([`KEEP_TRANSCRIPTS_SETTINGS`]) keeps the CLI's own retention sweep from
+//! deleting the transcripts a resume needs. A CLI that still
 //! reports another version than [`protocol::PINNED_VERSION`] is reported as
 //! [`AdapterEvent::VersionUnconfirmed`](super::AdapterEvent::VersionUnconfirmed).
 //!
@@ -35,8 +38,10 @@
 //! new context.
 //!
 //! [`AgentAdapter::start`] returns after the CLI answers the initialize
-//! handshake; a CLI that fails before that is a start error, or a resume
-//! error when it does not know the session resumed or forked. The mode,
+//! handshake; a CLI that fails before that is a start error, or
+//! [`AgentError::ConversationGone`](super::AgentError::ConversationGone)
+//! when it does not know the session resumed or forked (its transcript was
+//! deleted). The mode,
 //! model and effort the [`StartSpec`] names are then asked for, in that
 //! order, with control requests, like any later change
 //! (docs/agents/claude-code.md §3.7, §3.10), so each gets the CLI's own
@@ -152,7 +157,7 @@ pub fn own_conversations(
 }
 
 /// Flags every CLI process gets, before the session flag and `agent.args`.
-pub const REQUIRED_ARGS: [&str; 8] = [
+pub const REQUIRED_ARGS: [&str; 10] = [
     "-p",
     "--input-format",
     "stream-json",
@@ -161,7 +166,19 @@ pub const REQUIRED_ARGS: [&str; 8] = [
     "--verbose",
     "--permission-prompt-tool",
     "stdio",
+    "--settings",
+    KEEP_TRANSCRIPTS_SETTINGS,
 ];
+
+/// The `--settings` every CLI process gets: a retention far beyond any
+/// session's idle time. A CLI process sweeps transcripts older than
+/// `cleanupPeriodDays`, default 30, and `--resume` needs
+/// the transcript, so a context idle for a month could not be resumed.
+/// Flag settings outrank the user's `~/.claude/settings.json` (only managed
+/// policy outranks them) and are never written anywhere, so the user's own
+/// files stay untouched; a `claude` the user runs directly still sweeps with
+/// the user's value (docs/agents/claude-code.md §5).
+pub const KEEP_TRANSCRIPTS_SETTINGS: &str = r#"{"cleanupPeriodDays":36500}"#;
 
 /// The flag a process gets when the server allows bypass
 /// (`agent.allow_bypass`): `set_permission_mode` may then switch to
@@ -218,7 +235,8 @@ const STDERR_DRAIN: Duration = Duration::from_secs(1);
 /// How often a terminated group is checked for what is left in it.
 const GROUP_POLL: Duration = Duration::from_millis(50);
 /// What the CLI says when `--resume` names a session it does not have, with
-/// or without `--fork-session` (docs/agents/claude-code.md §5).
+/// or without `--fork-session` (docs/agents/claude-code.md §5): its
+/// transcript was deleted, or never existed.
 pub const UNKNOWN_SESSION: &str = "No conversation found";
 
 /// Starts Claude Code CLI sessions with the configured command.
@@ -360,7 +378,7 @@ impl CliSession {
     }
 
     /// The process takes up a conversation that must exist, so the CLI not
-    /// knowing it is a resume error.
+    /// knowing it means the conversation is gone.
     fn has_parent(self) -> bool {
         matches!(self, CliSession::Resume(_) | CliSession::Fork { .. })
     }
@@ -420,7 +438,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             process.kill().await;
             return Err(
                 if session.has_parent() && message.contains(UNKNOWN_SESSION) {
-                    AgentError::Resume(message)
+                    AgentError::ConversationGone(message)
                 } else {
                     AgentError::Start(message)
                 },

@@ -68,6 +68,7 @@ The spec needs no change.
 claude -p \
   --input-format stream-json --output-format stream-json --verbose \
   --permission-prompt-tool stdio \
+  --settings '{"cleanupPeriodDays":36500}' \
   [--allow-dangerously-skip-permissions] \
   [--session-id <uuid> | --resume <uuid> |
    --resume <parent> --fork-session --session-id <uuid>] \
@@ -90,6 +91,9 @@ skywaved starts a fresh context with `--session-id`, a restart with
   so the user's plugins, hooks and MCP servers stayed out of the transcript.
   Whether T09 does the same is a config question (`agent.args`). Without these
   flags, user hooks and MCP servers can add messages and prompts.
+- `--settings '{"cleanupPeriodDays":36500}'` keeps the CLI's retention
+  sweep from deleting the transcripts `--resume` needs (§5, Transcript
+  retention).
 - `--allow-dangerously-skip-permissions` is passed only when the server
   allows bypass (`agent.allow_bypass`, §3.6). **[C]** with 2.1.310: the
   session still starts in `default`, and `set_permission_mode
@@ -1090,7 +1094,7 @@ waiting on stays pending.
   stdin open and `initialize` written, an unknown id (resumed or forked)
   still fails before any initialize reply: stderr `No conversation found
   with session ID: <id>`, then the error `result` as the first stdout line,
-  exit 1, so the adapter's start reports a resume error. **[C]**
+  exit 1, so the adapter's start reports `ConversationGone`. **[C]**
   (`skywave-claude-compat --only resume_unknown`, 2.1.310, 2026-11-04.)
   Manual checks for the user, with the real CLI (none confirmed yet):
   1. In a dir under the roots, run `claude`, say "remember the word
@@ -1134,6 +1138,31 @@ waiting on stays pending.
   **[U]**. D14 already fixes the workdir per session, so this holds.
   `--no-session-persistence` would make resume impossible, so it must not be
   in `agent.args`.
+- **Transcript retention.** Every CLI process sweeps transcripts (assumed
+  of every project, not just its own cwd: **[U]**) last written more than `cleanupPeriodDays`
+  days ago; a context idle that long can then not be resumed (`No
+  conversation found`). **[C]** with 2.1.310, from the binary
+  (`~/.local/share/claude/versions/2.1.310`, 2026-11-04): the default is
+  30 (`m1t=30`; the schema says "default: 30. Minimum 1"); the value is read
+  as the first set of policy (managed) settings, flag settings
+  (`--settings <file-or-json>`), then user settings
+  (`~/.claude/settings.json`), so a `--settings` value outranks the user's
+  file and only managed policy outranks it; `0` is rejected by validation.
+  A probe in a scratch dir (`claude -p --no-session-persistence --settings
+  '{"cleanupPeriodDays":36500}' "Reply with just: ok"`) ran normally; that
+  the sweep then keeps a 31-day-old transcript is **[U]** (not probed: a
+  probe would risk the user's real transcripts). skywaved therefore passes
+  `--settings '{"cleanupPeriodDays":36500}'` to every process
+  (`KEEP_TRANSCRIPTS_SETTINGS`, in `REQUIRED_ARGS`) and never touches the
+  user's settings files. Two gaps remain: a `claude` the user runs directly
+  as the same OS user still sweeps with the user's own value (30 unless set),
+  deleting skywaved's old transcripts too, and a `--settings` in
+  `agent.args` replaces skywaved's (the last one wins, as for any repeated
+  commander option: **[U]**, not probed). The README's server
+  setup tells the operator to set `cleanupPeriodDays` in
+  `~/.claude/settings.json` in that case. A resume that fails anyway is
+  `AgentError::ConversationGone`, whose text tells the user to start a new
+  context (§6a).
 
 ## 6. Lifecycle details
 
@@ -1204,8 +1233,10 @@ notes above:
   is exactly one turn, and the [U] CLI-side queueing (§7) is never relied on.
 - **`start` waits for the initialize reply.** A CLI that exits or reports an
   error `result` before it is a start error; with `--resume` (a restart
-  or a fork) and `No conversation found` in the error text, a resume
-  error (§5). If a CLI
+  or a fork) and `No conversation found` in the error text,
+  `AgentError::ConversationGone` (§5): the session's `Errored` then says the
+  context's history is gone from the server and to start a new context
+  (`CONVERSATION_GONE`), and each later message tries the resume again. If a CLI
   ever reports the unknown id only after the handshake, it surfaces as
   `Exited { error }` instead, which still marks the session errored.
 - **An error `tool_result` for a call whose approval is pending** (stdin

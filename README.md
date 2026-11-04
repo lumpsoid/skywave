@@ -158,6 +158,16 @@ the other orphans reparented to PID 1.
 > only switch: `agent.args` that would enable bypass (such as
 > `--dangerously-skip-permissions`) are refused at startup.
 
+> **Old conversations need their transcripts.** Resuming a session needs the
+> agent's transcript under `~/.claude/projects/`. Claude Code deletes
+> transcripts older than `cleanupPeriodDays` (30 days by default). `skywaved`
+> runs its agents with a 100-year retention, so they never delete them, but
+> a `claude` you run yourself as the same user still sweeps them with your
+> own setting, and a `--settings` in `agent.args` replaces skywaved's. If you
+> do either, raise `cleanupPeriodDays` (in `~/.claude/settings.json`, or in
+> your `--settings`) yourself. A context whose transcript is gone anyway tells you so on the
+> next message; start a new context to go on.
+
 ### 2. Pair a device
 
 On the server:

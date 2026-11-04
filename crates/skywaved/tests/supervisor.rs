@@ -1763,6 +1763,9 @@ async fn agent_that_cannot_start_errors_the_session() {
         kinds.last(),
         Some(EventKind::SessionStateChanged(SessionState::Errored { message }))
             if message.starts_with("cannot start agent")
+                // Control: only a conversation that is gone tells the user
+                // to start over.
+                && !message.contains(skywaved::agent::CONVERSATION_GONE)
     ));
     supervisor.shutdown().await.unwrap();
 }
@@ -1807,6 +1810,54 @@ async fn start_claude(f: &Fixture) -> SupervisorHandle {
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn a_context_whose_conversation_is_gone_says_to_start_a_new_one() {
+    use skywaved::agent::CONVERSATION_GONE;
+    use skywaved::agent::claude_code::protocol::resume_handle;
+    let mut f = Fixture::new();
+    // The context ran a conversation whose transcript the CLI has since
+    // deleted: the fake CLI knows no session with the nil id.
+    skywaved::agent::store_resume_handle(
+        &f.storage.db,
+        f.first(),
+        &resume_handle(uuid::Uuid::nil()),
+    )
+    .unwrap();
+    let supervisor = start_claude(&f).await;
+    let gone = |kind: &EventKind| {
+        matches!(
+            kind,
+            EventKind::SessionStateChanged(SessionState::Errored { message })
+                if message.starts_with(CONVERSATION_GONE)
+                    && message.contains("No conversation found")
+        )
+    };
+
+    f.send("hello");
+    let kinds = f.wait_count("errored", 1, is_errored).await;
+    assert!(gone(kinds.last().unwrap()), "{:?}", kinds.last());
+    // Never started fresh behind the user's back.
+    assert!(argv_has_resume(&f), "the agent was not resumed");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::AgentMessage { .. }))
+    );
+
+    // Each message tries again and is told the same.
+    f.send("again");
+    let kinds = f.wait_count("errored", 2, is_errored).await;
+    assert!(gone(kinds.last().unwrap()), "{:?}", kinds.last());
+
+    // The way out the message names works: a new context starts fresh.
+    f.clear(ContextId::new());
+    f.send("hello again");
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(!argv_has_resume(&f), "the new context resumed");
+    assert_eq!(kinds.iter().filter(|k| is_errored(k)).count(), 2);
+    supervisor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
