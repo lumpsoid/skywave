@@ -147,7 +147,7 @@ async fn workdir_reads_on_request_and_shows_what_it_read_while_suspended() {
     let client = Client::open_in(
         dir,
         EngineConfig {
-            connector: Connector::new(|_, _, _| {
+            connector: Connector::new(|_, _, _, _| {
                 Err(TransportError::Unreachable("no network".into()))
             }),
             ..config()

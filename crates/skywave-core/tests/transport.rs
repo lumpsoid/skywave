@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use skywave_core::{
-    Action, BlobDownload, Core, FileIdentity, HttpsTransport, Identity, PairError, PairingStatus,
-    Request, Screen, Transport, TransportConfig, TransportError, pair, pair_and_report,
+    Action, BlobDownload, Core, ExpectedRun, FileIdentity, HttpsTransport, Identity, PairError,
+    PairingStatus, Request, Screen, Transport, TransportConfig, TransportError, pair,
+    pair_and_report,
 };
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
@@ -190,7 +191,7 @@ async fn pair_then_talk_to_the_server_until_revoked() {
     assert_eq!(address, fx.addr);
 
     let transport: Arc<dyn Transport> =
-        Arc::new(HttpsTransport::new(&address, &stored, config()).unwrap());
+        Arc::new(HttpsTransport::new(&address, &stored, config(), ExpectedRun::default()).unwrap());
     let hello = transport.hello(None).await.unwrap();
     assert_eq!(hello.device_id, stored.device_id());
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
@@ -335,8 +336,6 @@ async fn pair_then_talk_to_the_server_until_revoked() {
 struct Old;
 
 impl Transport for Old {
-    fn expect_run(&self, _: skywave_proto::RunId) {}
-
     fn hello(
         &self,
         _: Option<skywave_proto::RunId>,
@@ -431,7 +430,7 @@ async fn conversations_are_listed_by_a_real_server() {
 /// A transport for a device freshly paired with `fx`.
 async fn paired_transport(fx: &Fixture) -> HttpsTransport {
     let (_data, identity) = paired_identity(fx).await;
-    HttpsTransport::new(&fx.addr, &identity, config()).unwrap()
+    HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap()
 }
 
 /// The identity of a device freshly paired with `fx`, and the directory
@@ -566,7 +565,8 @@ async fn big_log(transport: &HttpsTransport, fx: &Fixture, messages: usize, len:
 async fn a_slow_events_body_arrives_whole() {
     let fx = Fixture::start().await;
     let (_data, identity) = paired_identity(&fx).await;
-    let direct = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    let direct =
+        HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     let last = big_log(&direct, &fx, 5, 20 * 1024).await;
 
     let link = SlowLink::start(fx.port, None).await;
@@ -575,7 +575,8 @@ async fn a_slow_events_body_arrives_whole() {
         request_timeout: SHORT,
         ..TransportConfig::default()
     };
-    let transport = HttpsTransport::new(&link.addr, &identity, slow).unwrap();
+    let transport =
+        HttpsTransport::new(&link.addr, &identity, slow, ExpectedRun::default()).unwrap();
     let started = tokio::time::Instant::now();
     let batch = transport
         .events(EventsQuery {
@@ -599,7 +600,8 @@ async fn a_slow_events_body_arrives_whole() {
 async fn a_stalled_events_body_times_out() {
     let fx = Fixture::start().await;
     let (_data, identity) = paired_identity(&fx).await;
-    let direct = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    let direct =
+        HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     big_log(&direct, &fx, 5, 20 * 1024).await;
 
     // Past the handshake and the response head, well short of the body.
@@ -609,7 +611,8 @@ async fn a_stalled_events_body_times_out() {
         request_timeout: SHORT,
         ..TransportConfig::default()
     };
-    let transport = HttpsTransport::new(&link.addr, &identity, slow).unwrap();
+    let transport =
+        HttpsTransport::new(&link.addr, &identity, slow, ExpectedRun::default()).unwrap();
     let started = tokio::time::Instant::now();
     let wait = 30;
     let result = transport
@@ -660,7 +663,8 @@ async fn workdir_reads_reach_a_real_server() {
         .unwrap();
     let data = tempfile::tempdir().unwrap();
     let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
-    let transport = HttpsTransport::new(&paired.address, &identity, config()).unwrap();
+    let transport =
+        HttpsTransport::new(&paired.address, &identity, config(), ExpectedRun::default()).unwrap();
 
     let create = Command {
         id: CommandId::new(),
@@ -801,10 +805,10 @@ async fn a_paired_device_tells_identity_faults_from_transient_ones() {
     let data = tempfile::tempdir().unwrap();
     let identity = FileIdentity::save(data.path(), paired.credentials).unwrap();
 
-    let named = HttpsTransport::new(&by_name, &identity, config()).unwrap();
+    let named = HttpsTransport::new(&by_name, &identity, config(), ExpectedRun::default()).unwrap();
     named.hello(None).await.unwrap();
 
-    let by_ip = HttpsTransport::new(&fx.addr, &identity, config()).unwrap();
+    let by_ip = HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
     let err = by_ip.hello(None).await.unwrap_err();
     assert!(
         matches!(err, TransportError::ServerNameMismatch(_)),
@@ -817,7 +821,7 @@ async fn a_paired_device_tells_identity_faults_from_transient_ones() {
 
     let other = Fixture::start_with(&["localhost"]).await;
     let elsewhere = format!("localhost:{}", other.port);
-    let err = HttpsTransport::new(&elsewhere, &identity, config())
+    let err = HttpsTransport::new(&elsewhere, &identity, config(), ExpectedRun::default())
         .unwrap()
         .hello(None)
         .await

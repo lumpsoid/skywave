@@ -47,11 +47,15 @@
 //! events the replica holds ([`Seam::log_checked`]) shows
 //! `Rejected(HistoryLost)` before anything is pulled or sent, and stops the
 //! link until the user resets the replica. Every later request names the
-//! run that `hello` reached ([`Transport::expect_run`]), so a server in
-//! another run (restarted, or rolled back under a connection that never
-//! closed) refuses it with [`TransportError::RunChanged`]: that ends the
+//! run that `hello` reached ([`ExpectedRun`]), so a server in another run
+//! (restarted, or rolled back under a connection that never closed)
+//! refuses it with [`TransportError::RunChanged`]: that ends the
 //! connection like any failure, and the next one's `hello` tells a clean
-//! restart from a lost log. Any other failure ends
+//! restart from a lost log. The blob downloader and the side transport
+//! name the same run, read from the one [`ExpectedRun`] each link start
+//! makes: a blob refused so is retried after a backoff, by when the link
+//! has met the new run or stopped on a lost log; a listing or workdir read
+//! fails with it. Any other failure ends
 //! the connection, and its kind alone decides what follows
 //! ([`TransportError::link_verdict`]), never a count or a timeout. A
 //! rejection shows `Rejected(..)` and stops the link until the next
@@ -112,7 +116,7 @@ use crate::identity::Identity;
 use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{LogCheck, OutboxEntry, StoreError};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::{CommandId, Link, LinkFailure, LinkRejection};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
 
@@ -171,24 +175,33 @@ impl Default for EngineConfig {
     }
 }
 
-type Connect = dyn Fn(&str, &dyn Identity, &TransportConfig) -> Result<Arc<dyn Transport>, TransportError>
+type Connect = dyn Fn(
+        &str,
+        &dyn Identity,
+        &TransportConfig,
+        &ExpectedRun,
+    ) -> Result<Arc<dyn Transport>, TransportError>
     + Send
     + Sync;
 
 /// Builds the [`Transport`] to the server at an address (`host:port`) for
-/// an identity. [`Connector::https`] by default; tests and the link harness
-/// wrap or replace it.
+/// an identity, naming the run an [`ExpectedRun`] holds on every request.
+/// [`Connector::https`] by default; tests and the link harness wrap or
+/// replace it. A connector that builds an [`HttpsTransport`] must hand it
+/// the [`ExpectedRun`] it was given, or the server's run goes unchecked.
 #[derive(Clone)]
 pub struct Connector(Arc<Connect>);
 
 impl Connector {
     /// [`HttpsTransport`].
     pub fn https() -> Connector {
-        Connector::new(|address, identity, config| {
-            Ok(
-                Arc::new(HttpsTransport::new(address, identity, config.clone())?)
-                    as Arc<dyn Transport>,
-            )
+        Connector::new(|address, identity, config, run| {
+            Ok(Arc::new(HttpsTransport::new(
+                address,
+                identity,
+                config.clone(),
+                run.clone(),
+            )?) as Arc<dyn Transport>)
         })
     }
 
@@ -197,6 +210,7 @@ impl Connector {
             &str,
             &dyn Identity,
             &TransportConfig,
+            &ExpectedRun,
         ) -> Result<Arc<dyn Transport>, TransportError>
         + Send
         + Sync
@@ -210,8 +224,9 @@ impl Connector {
         address: &str,
         identity: &dyn Identity,
         config: &TransportConfig,
+        run: &ExpectedRun,
     ) -> Result<Arc<dyn Transport>, TransportError> {
-        (self.0)(address, identity, config)
+        (self.0)(address, identity, config, run)
     }
 }
 
@@ -286,6 +301,10 @@ pub(crate) struct Engine {
     /// first; dropped whenever the link restarts, as the identity may have
     /// changed.
     side: Option<Arc<dyn Transport>>,
+    /// The run the current link expects, read by the link's, the
+    /// downloader's and the side transport. A new one per link start, so a
+    /// link to another server never inherits the last one's run.
+    run: ExpectedRun,
 }
 
 impl Engine {
@@ -312,6 +331,7 @@ impl Engine {
             rejected: watch::Sender::new(false),
             blobs: Arc::new(BlobQueue::restore(&seam)),
             side: None,
+            run: ExpectedRun::default(),
         }
     }
 
@@ -431,7 +451,12 @@ impl Engine {
         let transport = self
             .config
             .connector
-            .connect(&address, identity.as_ref(), &self.config.transport)
+            .connect(
+                &address,
+                identity.as_ref(),
+                &self.config.transport,
+                &self.run,
+            )
             .inspect_err(|error| tracing::debug!(%error, "no side transport"))
             .ok()?;
         self.side = Some(transport.clone());
@@ -443,6 +468,7 @@ impl Engine {
     fn start_link(&mut self) {
         self.stop_link();
         self.side = None;
+        self.run = ExpectedRun::default();
         if *self.suspended.borrow() || *self.rejected.borrow() {
             return;
         }
@@ -466,6 +492,7 @@ impl Engine {
             config: self.config.clone(),
             address: address.clone(),
             identity: identity.clone(),
+            run: self.run.clone(),
             queue: self.blobs.clone(),
         };
         let downloader = self.seam.spawn("the blob downloader", async move {
@@ -481,6 +508,7 @@ impl Engine {
             blobs: self.blobs.clone(),
             address,
             identity,
+            run: self.run.clone(),
         };
         let rejected = self.rejected.clone();
         self.link = Some(self.seam.spawn("the link", async move {
@@ -545,6 +573,8 @@ pub(crate) struct LinkCtx {
     pub(crate) blobs: Arc<BlobQueue>,
     pub(crate) address: String,
     pub(crate) identity: Arc<dyn Identity>,
+    /// Set once a connection's `hello` passes the log check.
+    pub(crate) run: ExpectedRun,
 }
 
 /// Why a connection ended.
@@ -676,6 +706,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
                     &ctx.address,
                     ctx.identity.as_ref(),
                     &ctx.config.transport,
+                    &ctx.run,
                 ) {
                     Ok(built) => {
                         transport = Some(built);
@@ -798,11 +829,12 @@ async fn connection(
         }
         Err(error) => return LinkError::from(error).into(),
     }
-    // Every request from here on, on whatever connection the pool opens,
-    // reaches this run or is refused: one rolled back under a connection
-    // that never closed cannot take a command or serve a batch, and the
-    // next connection's `hello` says what became of this run.
-    transport.expect_run(hello.log.run);
+    // Every request from here on, on whatever connection the pool opens and
+    // from whichever of this link's transports, reaches this run or is
+    // refused: one rolled back under a connection that never closed cannot
+    // take a command or serve a batch, a blob or a listing, and the next
+    // connection's `hello` says what became of this run.
+    ctx.run.expect(hello.log.run);
     if let Err(error) = ctx.seam.hello_received(&hello) {
         return LinkError::from(error).into();
     }
@@ -1028,8 +1060,6 @@ mod tests {
     }
 
     impl Transport for FlakyServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1199,7 +1229,7 @@ mod tests {
                 cap: Duration::from_secs(8),
                 jitter: Jitter::fixed(1.0),
             },
-            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
             wait_secs: 5,
             wall_clock,
             ..EngineConfig::default()
@@ -1212,6 +1242,7 @@ mod tests {
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
+            run: ExpectedRun::default(),
         };
         let link = tokio::spawn(run_link(ctx));
 
@@ -1330,7 +1361,7 @@ mod tests {
                 cap: Duration::from_secs(60),
                 jitter: Jitter::fixed(1.0),
             },
-            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
             ..EngineConfig::default()
         };
         let retry_now = Arc::new(Notify::new());
@@ -1342,6 +1373,7 @@ mod tests {
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
+            run: ExpectedRun::default(),
         };
         let link = tokio::spawn(run_link(ctx));
 
@@ -1454,8 +1486,6 @@ mod tests {
     }
 
     impl Transport for CuttingServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1535,7 +1565,7 @@ mod tests {
                 cap: Duration::from_secs(8),
                 jitter: Jitter::fixed(1.0),
             },
-            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
             wall_clock,
             ..EngineConfig::default()
         };
@@ -1592,7 +1622,7 @@ mod tests {
                 cap: Backoff::MAX,
                 jitter: Jitter::fixed(1.0),
             },
-            connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
             wall_clock,
             ..EngineConfig::default()
         };
@@ -1608,6 +1638,7 @@ mod tests {
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
+            run: ExpectedRun::default(),
         }
     }
 
@@ -1721,8 +1752,6 @@ mod tests {
     }
 
     impl Transport for RecordingServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -1773,6 +1802,7 @@ mod tests {
             blobs: Arc::new(BlobQueue::default()),
             address: "srv:7443".into(),
             identity: seam.identity().unwrap(),
+            run: ExpectedRun::default(),
         }
     }
 
@@ -1867,8 +1897,6 @@ mod tests {
     }
 
     impl Transport for RefusingServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -2061,8 +2089,6 @@ mod tests {
     }
 
     impl Transport for LogServer {
-        fn expect_run(&self, _run: skywave_proto::RunId) {}
-
         fn hello(
             &self,
             _since: Option<skywave_proto::RunId>,
@@ -2157,7 +2183,7 @@ mod tests {
                     cap: Duration::from_secs(8),
                     jitter: Jitter::fixed(1.0),
                 },
-                connector: Connector::new(move |_, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+                connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
                 wait_secs: 5,
                 wall_clock,
                 ..EngineConfig::default()

@@ -512,7 +512,19 @@ async fn a_request_for_another_run_is_refused_untouched() {
         CommandResult::Accepted { seq: Seq(1) },
         "the first time it is handled"
     );
-    for uri in [path::HELLO.to_owned(), events_uri(Seq::ZERO, 0)] {
+    // Every route, the read-only ones too: a blob that does not exist and
+    // queries their handlers would refuse are refused as another run's
+    // first.
+    for uri in [
+        path::HELLO.to_owned(),
+        events_uri(Seq::ZERO, 0),
+        path::blob(BlobId::new()),
+        path::DIRS.to_owned(),
+        path::CONVERSATIONS.to_owned(),
+        path::WORKDIR_CHANGES.to_owned(),
+        path::WORKDIR_LIST.to_owned(),
+        path::WORKDIR_FILE.to_owned(),
+    ] {
         let reply = client
             .send(Method::GET, &uri, &named(&other), Bytes::new())
             .await;

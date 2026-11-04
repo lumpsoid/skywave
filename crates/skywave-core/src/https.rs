@@ -29,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use crate::address::ServerAddress;
 use crate::identity::Identity;
 use crate::tls;
-use crate::transport::{BlobBody, BlobDownload, BoxFuture, Transport, TransportError};
+use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
 use crate::workdir::WORKDIR_TIMEOUT;
 
 /// Timeouts and pool size of an [`HttpsTransport`].
@@ -339,38 +339,44 @@ fn hello_from(reply: Reply) -> Result<HelloResponse, TransportError> {
 /// trusting only the CA pinned at pairing. Cheap to share behind an `Arc`;
 /// requests may run concurrently.
 ///
-/// Once told the run of the server the replica is synced with
-/// ([`Transport::expect_run`]), every request names it in
+/// Every request names the run `run` expects, read as it leaves, in
 /// [`RUN_HEADER`], except a `hello` that asks about a run.
 pub struct HttpsTransport {
     http: Http,
-    /// The [`RUN_HEADER`] value, once expected.
-    run: Mutex<Option<HeaderValue>>,
+    run: ExpectedRun,
 }
 
 impl HttpsTransport {
     /// A transport to `address` (`host:port`, as stored at pairing) that
-    /// authenticates with `identity`. Opens no connection yet.
+    /// authenticates with `identity` and names the run `run` expects.
+    /// Opens no connection yet.
     pub fn new(
         address: &str,
         identity: &dyn Identity,
         config: TransportConfig,
+        run: ExpectedRun,
     ) -> Result<HttpsTransport, TransportError> {
         let address = ServerAddress::parse(address)
             .map_err(|e| TransportError::Unreachable(e.to_string()))?;
         let tls = tls::device_config(identity)?;
         Ok(HttpsTransport {
             http: Http::new(address, tls, config),
-            run: Mutex::new(None),
+            run,
         })
     }
 
     /// The headers every request but a `hello` asking about a run carries:
     /// the expected run, once there is one.
     fn run_header(&self) -> Vec<(header::HeaderName, HeaderValue)> {
-        let run = self.run.lock().unwrap_or_else(|p| p.into_inner());
-        run.iter()
-            .map(|value| (header::HeaderName::from_static(RUN_HEADER), value.clone()))
+        self.run
+            .get()
+            .map(|run| {
+                (
+                    header::HeaderName::from_static(RUN_HEADER),
+                    HeaderValue::from_str(&run.0.to_string()).expect("a UUID is a valid header"),
+                )
+            })
+            .into_iter()
             .collect()
     }
 
@@ -586,11 +592,6 @@ impl BlobBody for TimedBody {
 }
 
 impl Transport for HttpsTransport {
-    fn expect_run(&self, run: RunId) {
-        let value = HeaderValue::from_str(&run.0.to_string()).expect("a UUID is a valid header");
-        *self.run.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
-    }
-
     fn hello(&self, since: Option<RunId>) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
         Box::pin(HttpsTransport::hello(self, since))
     }
