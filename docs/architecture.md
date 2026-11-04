@@ -189,7 +189,10 @@ minted with it), and every `serve` is a new run (`RunId`), recorded in
 `log_runs` with the head it started from, in one statement. The record is
 append-only, so a restored backup holds only the runs before it. It runs with `synchronous = FULL`: under WAL, `NORMAL` may
 drop the last commits on power loss, and the log is the only record of what
-users did; the cost is one fsync of the WAL per commit.
+users did; the cost is one fsync of the WAL per commit. A writer waits up
+to 60 s (`BUSY_TIMEOUT`) for another connection's write lock: an admin
+command, an import or a workdir answer holding it for seconds only delays
+the daemon's appends, which would otherwise stop `serve` (below).
 
 - **Connections** (`ConnectionLimits`): at most 512 open at once and 32 per
   source, an IPv4 address or an IPv6 /64 (an IPv4-mapped address counts as
@@ -260,6 +263,12 @@ users did; the cost is one fsync of the WAL per commit.
   redelivered: the user stopped the work, or a crash leaves delivery at most
   once. A daemon shutdown does not report them yet. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
+  It fails only when it cannot read or append to the log (an append it
+  skipped would leave the log without an event the mapper counts as
+  logged); a session's own trouble (an agent that will not start, exits
+  or refuses) is logged in that session, and a blob it cannot store is
+  left out of its event (Event mapper). Recovery stores no blobs, so a
+  restart on a full blob disk does not fail the same way again.
   An agent process that reports a version other than the one its adapter
   was checked against logs one `AgentVersionUnconfirmed` (neither notable
   nor activity) in the context it was started for, and every head shows it
@@ -269,7 +278,10 @@ users did; the cost is one fsync of the WAL per commit.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
-  fetched on demand (D11).
+  fetched on demand (D11). A blob it cannot store (a full disk, its row
+  refused) is logged at error and left out: the event keeps its cut
+  preview and whole `lines` count, with no blob reference, and the turn
+  goes on.
 - **Shell runner** (D35): a sibling of the supervisor that follows the log on
   its own thread and connection. One FIFO per session, one run at a time,
   sessions in parallel. A run is `<program> -c <wrapper>` in the session's
@@ -279,7 +291,8 @@ users did; the cost is one fsync of the WAL per commit.
   is success). A run ends when the shell exits; its process group is then
   killed, and on Linux a subreaper host reaps orphans. Output streams to a
   file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s and
-  then every 60 s, and becomes a blob unless the preview holds all of it.
+  then every 60 s, and becomes a blob unless the preview holds all of it;
+  output that cannot become a blob is logged `truncated` without one.
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would
   start.

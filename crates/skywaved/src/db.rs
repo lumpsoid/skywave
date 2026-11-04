@@ -26,7 +26,14 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 
 /// How long a writer waits for another connection's lock before failing.
-pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Long, because a busy error is fatal where it matters most: `serve`'s
+/// agent supervisor and shell runner stop the daemon on a failed append
+/// (architecture.md "Server"). An admin command, an adopting import or a
+/// workdir answer can hold the write lock for seconds; that must only
+/// delay the daemon's writes, never end it. A lock held for longer than
+/// this is a stuck writer, not contention.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 const MIGRATIONS: &[&str] = &[
     // v1: initial schema (architecture.md "Server").

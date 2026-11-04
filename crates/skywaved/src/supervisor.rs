@@ -207,7 +207,15 @@
 //! [`SupervisorHandle::failed`] then returns, and `serve` stops the daemon
 //! on it and exits non-zero: a daemon without its supervisor would go on
 //! accepting commands no agent hears. The next start settles what it left,
-//! as after a crash.
+//! as after a crash. What is not such an error: a write lock another
+//! connection holds (an admin command, an import) is waited out for
+//! [`BUSY_TIMEOUT`](crate::db::BUSY_TIMEOUT); content the mapper cannot
+//! store as a blob (a full disk) is left out of its event, which is logged
+//! with its cut preview and no blob; and what an agent refuses or fails is
+//! that session's error, logged in its log. A failed append stays fatal:
+//! skipping one would leave the log without an event the mapper's state
+//! counts as logged. Recovery stores no blobs, so a restart while they
+//! still cannot be stored settles the log and runs on.
 //!
 //! **Threading.** SQLite and the mapper block, so the supervisor runs on its
 //! own thread with a current-thread runtime and its own [`Storage`]; agent
