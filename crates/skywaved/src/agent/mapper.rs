@@ -299,7 +299,7 @@ impl EventMapper {
     ) -> Result<Vec<Seq>> {
         let mut seqs = Vec::new();
         match event {
-            AdapterEvent::TurnStarted => {
+            AdapterEvent::TurnStarted { .. } => {
                 if !self.turn_open {
                     self.turn_open = true;
                     seqs.push(self.append(

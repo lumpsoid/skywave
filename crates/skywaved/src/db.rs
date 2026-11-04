@@ -387,6 +387,19 @@ const MIGRATIONS: &[&str] = &[
         FROM events, json_each(events.kind, '$.calls') AS calls
         WHERE json_extract(events.kind, '$.type') = 'calls_unanswered');
     "#,
+    // v19: an owed message's turn is marked as about to start, as its
+    // `Errored` was: a restart settles a message only by the event marked
+    // for it, so a turn the agent started on its own settles none.
+    r#"
+    -- `state`: `waiting`; `starting`: its turn's AgentWorking is about to
+    -- be logged in its context; `settling`: an Errored about to be logged
+    -- in its context reports it.
+    ALTER TABLE supervisor_owed ADD COLUMN
+        state TEXT NOT NULL DEFAULT 'waiting'
+        CHECK (state IN ('waiting', 'starting', 'settling'));
+    UPDATE supervisor_owed SET state = 'settling' WHERE settling = 1;
+    ALTER TABLE supervisor_owed DROP COLUMN settling;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.

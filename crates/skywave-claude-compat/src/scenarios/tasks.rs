@@ -399,7 +399,7 @@ pub fn loop_tick(ctx: &mut Ctx) -> Result<(), Stop> {
     };
     let started = s.wait("a tick", TICK, end, lifecycle("started"))?;
     let (opened, ()) = s.wait_event("the tick's turn", 30, started, |e| {
-        matches!(e, AdapterEvent::TurnStarted).then_some(())
+        matches!(e, AdapterEvent::TurnStarted { message: false }).then_some(())
     })?;
     let (tick_end, _) = s.turn_end(opened, TURN)?;
     let done = s.wait(
@@ -475,7 +475,7 @@ const RECIPES: &[(&str, &str)] = &[
 /// with no message written), which must complete.
 fn self_started_turn(ctx: &mut Ctx, s: &mut Session, from: usize) -> Result<(), Stop> {
     let (opened, ()) = s.wait_event("a turn the CLI starts", TURN, from, |e| {
-        matches!(e, AdapterEvent::TurnStarted).then_some(())
+        matches!(e, AdapterEvent::TurnStarted { message: false }).then_some(())
     })?;
     let (_, outcome) = s.turn_end(opened, TURN)?;
     ctx.checks.contract(

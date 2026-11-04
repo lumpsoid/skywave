@@ -273,7 +273,8 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
                 )
         })
         .map(|event| match event {
-            AdapterEvent::TurnStarted => "turn started".to_owned(),
+            AdapterEvent::TurnStarted { message: true } => "turn started".to_owned(),
+            AdapterEvent::TurnStarted { message: false } => "turn started on its own".to_owned(),
             AdapterEvent::Text { text, .. } => format!("text: {}", cut(text)),
             AdapterEvent::ToolCall { name, .. } => format!("tool call: {name}"),
             AdapterEvent::ToolResult { result, .. } => {
@@ -336,7 +337,10 @@ fn timeline(events: &[AdapterEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
-            AdapterEvent::TurnStarted => Some("turn started".to_owned()),
+            AdapterEvent::TurnStarted { message: true } => Some("turn started".to_owned()),
+            AdapterEvent::TurnStarted { message: false } => {
+                Some("turn started on its own".to_owned())
+            }
             AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
             AdapterEvent::Text { text, .. } => {
                 Some(format!("text: {}", text.lines().next().unwrap_or("")))
@@ -1470,7 +1474,7 @@ fn a_message_during_a_turn_waits_for_its_result() {
     protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
     assert!(protocol.ready());
     let first = protocol.send_message("one".to_owned());
-    assert_eq!(first.events, [AdapterEvent::TurnStarted]);
+    assert_eq!(first.events, [AdapterEvent::TurnStarted { message: true }]);
     let queued = protocol.send_message("two".to_owned());
     assert_eq!(queued, Default::default());
     let end =
@@ -1479,7 +1483,7 @@ fn a_message_during_a_turn_waits_for_its_result() {
         end.events,
         [
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
-            AdapterEvent::TurnStarted
+            AdapterEvent::TurnStarted { message: true }
         ]
     );
     assert_eq!(end.writes, [protocol::user_message("two")]);
@@ -1716,16 +1720,19 @@ fn a_fresh_process_reports_its_handle_with_its_first_turn_only() {
     let mut protocol = Protocol::new(id, false);
     assert!(protocol.start().events.is_empty());
     let first = protocol.send_message("hi".into());
-    assert_eq!(first.events, [handle, AdapterEvent::TurnStarted]);
+    assert_eq!(
+        first.events,
+        [handle, AdapterEvent::TurnStarted { message: true }]
+    );
     protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
     let second = protocol.send_message("again".into());
-    assert_eq!(second.events, [AdapterEvent::TurnStarted]);
+    assert_eq!(second.events, [AdapterEvent::TurnStarted { message: true }]);
 
     // A resumed process has its handle stored already.
     let mut protocol = Protocol::new(id, true);
     assert!(protocol.start().events.is_empty());
     let first = protocol.send_message("hi".into());
-    assert_eq!(first.events, [AdapterEvent::TurnStarted]);
+    assert_eq!(first.events, [AdapterEvent::TurnStarted { message: true }]);
 }
 
 #[test]
@@ -1743,7 +1750,7 @@ fn a_session_id_change_reports_the_handle_once_with_the_new_id() {
         out.events,
         [
             AdapterEvent::ResumeHandle(protocol::resume_handle(other)),
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: false },
         ]
     );
 
@@ -1828,7 +1835,10 @@ async fn handle_then_turn(events: &mut AdapterEvents) -> Uuid {
         protocol::resume_handle(id),
         "a handle with more in it"
     );
-    assert_eq!(next(events).await, AdapterEvent::TurnStarted);
+    assert_eq!(
+        next(events).await,
+        AdapterEvent::TurnStarted { message: true }
+    );
     id
 }
 
@@ -1947,7 +1957,11 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, write_call(), write_approval()]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            write_call(),
+            write_approval()
+        ]
     );
     session.send_message("queued".to_owned()).await.unwrap();
     session
@@ -1964,7 +1978,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
             tool_result("written", false, None),
             text("done writing"),
             COMPLETED,
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             text("echo"),
             COMPLETED,
         ]
@@ -1977,7 +1991,11 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, write_call(), write_approval()]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            write_call(),
+            write_approval()
+        ]
     );
     session
         .answer_approval("perm-1".into(), Decision::Deny, None)
@@ -1999,7 +2017,11 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, write_call(), write_approval()]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            write_call(),
+            write_approval()
+        ]
     );
     session.interrupt().await.unwrap();
     assert_eq!(
@@ -2018,7 +2040,7 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
     session.send_message("hang".to_owned()).await.unwrap();
     assert_eq!(
         take(&mut events, 2).await,
-        [AdapterEvent::TurnStarted, text("working")]
+        [AdapterEvent::TurnStarted { message: true }, text("working")]
     );
     session.interrupt().await.unwrap();
     session.interrupt().await.unwrap();
@@ -2032,7 +2054,11 @@ async fn a_session_runs_turns_approvals_and_interrupts() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
 
     session.shutdown().await.unwrap();
@@ -2088,7 +2114,11 @@ async fn a_restart_resumes_with_the_handle_and_the_sessions_grants() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
     session.shutdown().await.unwrap();
     assert_eq!(
@@ -2120,7 +2150,11 @@ async fn a_fresh_start_gets_a_new_session_id_and_the_sessions_grants() {
     session.send_message("again".to_owned()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
     session.shutdown().await.unwrap();
     assert_eq!(
@@ -2220,13 +2254,13 @@ async fn another_cli_version_is_reported_once() {
     let at = |want: fn(&AdapterEvent) -> bool| events.iter().position(want).unwrap();
     assert!(
         at(|e| matches!(e, AdapterEvent::VersionUnconfirmed { .. }))
-            < at(|e| matches!(e, AdapterEvent::TurnStarted))
+            < at(|e| matches!(e, AdapterEvent::TurnStarted { message: true }))
     );
 
     // Positive control: the pinned version reports nothing.
     let pinned = tempfile::tempdir().unwrap();
     let events = one_turn_events(adapter(), pinned.path()).await;
-    assert!(events.contains(&AdapterEvent::TurnStarted));
+    assert!(events.contains(&AdapterEvent::TurnStarted { message: true }));
     assert_eq!(unconfirmed(&events), []);
 }
 
@@ -2682,7 +2716,11 @@ async fn bytes_that_are_not_utf8_and_an_over_long_line_do_not_end_the_turn() {
     session.send_message("again".to_owned()).await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
     session.shutdown().await.unwrap();
     assert_eq!(
@@ -2844,7 +2882,10 @@ async fn an_agent_that_stops_reading_is_killed_and_reported() {
     let pid = fake_pid(tmp.path());
     // More than a pipe holds, to a process that no longer reads.
     session.send_message("x".repeat(1 << 20)).await.unwrap();
-    assert_eq!(next(&mut events).await, AdapterEvent::TurnStarted);
+    assert_eq!(
+        next(&mut events).await,
+        AdapterEvent::TurnStarted { message: true }
+    );
     assert_eq!(
         next(&mut events).await,
         AdapterEvent::Exited {
@@ -2934,7 +2975,11 @@ async fn a_repeated_interrupt_the_agent_has_not_answered_stops_it() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
     session.shutdown().await.unwrap();
 }
@@ -3013,7 +3058,11 @@ async fn a_repeated_interrupt_after_the_answer_does_nothing() {
         .unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [AdapterEvent::TurnStarted, text("echo"), COMPLETED]
+        [
+            AdapterEvent::TurnStarted { message: true },
+            text("echo"),
+            COMPLETED
+        ]
     );
     session.shutdown().await.unwrap();
     assert_eq!(
@@ -3041,7 +3090,11 @@ async fn a_repeated_interrupt_leaves_the_turn_a_queued_message_started() {
     session.interrupt().await.unwrap();
     assert_eq!(
         take(&mut events, 3).await,
-        [INTERRUPTED, AdapterEvent::TurnStarted, text("working")]
+        [
+            INTERRUPTED,
+            AdapterEvent::TurnStarted { message: true },
+            text("working")
+        ]
     );
     // The repeat of the answered interrupt reaches the new turn: neither
     // stopped nor interrupted. Were it interrupted, the shutdown would wait
@@ -3159,7 +3212,7 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     assert_eq!(
         take_raw(&mut events, 6).await,
         [
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::Model("resolved-sonnet".to_owned()),
             AdapterEvent::PermissionMode(PermissionMode::Plan),
             text("echo"),
@@ -3721,7 +3774,7 @@ fn replay_background_bash_reports_the_shell_and_its_end() {
             "turn ended",
             // The shell ended; the CLI starts the next turn itself.
             "tasks: []",
-            "turn started",
+            "turn started on its own",
             "text: DONE",
             "turn ended",
         ]
@@ -3841,7 +3894,10 @@ fn steps(events: &[AdapterEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
-            AdapterEvent::TurnStarted => Some("turn started".to_owned()),
+            AdapterEvent::TurnStarted { message: true } => Some("turn started".to_owned()),
+            AdapterEvent::TurnStarted { message: false } => {
+                Some("turn started on its own".to_owned())
+            }
             AdapterEvent::TurnEnded(_) => Some("turn ended".to_owned()),
             AdapterEvent::Text { text, parent } => Some(format!(
                 "text: {}{}",
@@ -3940,7 +3996,7 @@ fn replay_subagent_reports_its_text_under_its_agent_call() {
             "turn ended",
             // After the main turn, outside any.
             "text: PONG @GKDTUq",
-            "turn started",
+            "turn started on its own",
             // The main agent's own text has no parent.
             "text: The subagent replied: **PONG**",
             "turn ended",
@@ -4012,17 +4068,17 @@ fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
             "call 9VhgWa Monitor @XRGPjR",
             "result 9VhgWa ok",
             "text: The background `sleep 120 && ech @XRGPjR",
-            "turn started",
+            "turn started on its own",
             "text: The subagent is not finished yet",
             "turn ended",
             // Woken by the first shell's end.
             "text: SLEPT @XRGPjR",
-            "turn started",
+            "turn started on its own",
             // Woken by the monitor, inside the turn the CLI started.
             "text: SLEPT @XRGPjR",
             "text: DONE",
             "turn ended",
-            "turn started",
+            "turn started on its own",
             "text: DONE",
             "turn ended",
         ]
@@ -4117,17 +4173,17 @@ fn replay_subagent_message_ctl_pairs_each_call_after_the_turn_with_its_result() 
             "call u9eSqe Bash @y3gna1",
             "result u9eSqe ok",
             "text: I could not complete the two `sl @y3gna1",
-            "turn started",
+            "turn started on its own",
             "text: The background agent finished, b",
             "turn ended",
             "call 1TR1XM Bash @y3gna1",
             "result 1TR1XM ok",
             "text: The first background `sleep 25`  @y3gna1",
-            "turn started",
+            "turn started on its own",
             "text: The agent sent an update that co",
             "turn ended",
             "text: Both background `sleep 25` runs  @y3gna1",
-            "turn started",
+            "turn started on its own",
             "text: The agent has now finished. It r",
             "turn ended",
         ]
@@ -4335,7 +4391,7 @@ fn replay_subagent_foreground_backgrounded_enters_the_set_with_its_call() {
             "call iSn3tT Read @gfrK32",
             "result iSn3tT ok",
             "text: 5 recipes read, in sorted path o @gfrK32",
-            "turn started",
+            "turn started on its own",
             "text: The helper finished and read all",
             "turn ended",
         ]
@@ -4644,7 +4700,11 @@ fn replay_a_subagent_approval_outlives_the_main_turns() {
     assert_eq!(ends.len(), 3, "{:?}", describe(&events));
     // Asked outside any turn, and still pending at the next turn's end.
     assert!(ends[0] < asked && asked < ends[1]);
-    assert!(!events[ends[0]..asked].contains(&AdapterEvent::TurnStarted));
+    assert!(
+        !events[ends[0]..asked]
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnStarted { .. }))
+    );
     assert!(
         !events
             .iter()
