@@ -19,7 +19,8 @@
 //! with, so a reissue that drops a name warns (and
 //! [`ServerIdentity::dropped_names`] lists them): such a device sees a
 //! name mismatch until the name is back or it moves to a listed one.
-//! Deleting `ca/` creates a new CA, which invalidates every paired device.
+//! Deleting `ca/` creates a new CA, which invalidates every paired device;
+//! [`ServerIdentity::new_ca_warning`] is what `serve` and `pair` print then.
 //!
 //! Bootstrap holds an exclusive lock on `<data_dir>/identity.lock`, so
 //! `serve` and `pair` running for the first time at the same moment agree
@@ -72,6 +73,7 @@ pub struct ServerIdentity {
     server_cert_der: Vec<u8>,
     server_names: Vec<String>,
     dropped_names: Vec<String>,
+    created_ca: bool,
 }
 
 impl ServerIdentity {
@@ -90,7 +92,8 @@ impl ServerIdentity {
 
     fn bootstrap_locked(dir: &DataDir, server_names: &[String]) -> Result<ServerIdentity> {
         let server_id = load_or_create_server_id(&dir.root().join(SERVER_ID_FILE))?;
-        let (ca, ca_cert_pem, ca_cert_der) = load_or_create_ca(&dir.ca_dir(), server_id)?;
+        let (ca, ca_cert_pem, ca_cert_der, created_ca) =
+            load_or_create_ca(&dir.ca_dir(), server_id)?;
         let names = normalize_names(server_names);
 
         let server_dir = dir.server_dir();
@@ -154,6 +157,7 @@ impl ServerIdentity {
             server_cert_der,
             server_names: names,
             dropped_names,
+            created_ca,
         })
     }
 
@@ -162,6 +166,26 @@ impl ServerIdentity {
     /// name was dropped. Bootstrap already warned about them (`tracing`).
     pub fn dropped_names(&self) -> &[String] {
         &self.dropped_names
+    }
+
+    /// Whether this bootstrap created the CA (`ca/` was missing).
+    pub fn created_ca(&self) -> bool {
+        self.created_ca
+    }
+
+    /// The warning for a CA this bootstrap created while `paired_devices`
+    /// (active, unrevoked) devices are registered: each pinned the old CA
+    /// and holds a certificate it signed, so none can connect until it
+    /// re-pairs. `None` when the CA was loaded or no device is paired (a
+    /// first run).
+    pub fn new_ca_warning(&self, paired_devices: usize) -> Option<String> {
+        (self.created_ca && paired_devices > 0).then(|| {
+            format!(
+                "created a new certificate authority, but {paired_devices} paired device(s) \
+                 trust the old one: every one of them must re-pair (`skywaved pair`). If `ca/` \
+                 was lost by mistake, stop skywaved and restore it from a backup instead"
+            )
+        })
     }
 
     pub fn server_id(&self) -> ServerId {
@@ -289,7 +313,7 @@ fn load_or_create_server_id(path: &Path) -> Result<ServerId> {
 fn load_or_create_ca(
     ca_dir: &Path,
     server_id: ServerId,
-) -> Result<(Issuer<'static, KeyPair>, String, Vec<u8>)> {
+) -> Result<(Issuer<'static, KeyPair>, String, Vec<u8>, bool)> {
     let (key_path, cert_path) = (ca_dir.join(KEY_FILE), ca_dir.join(CERT_FILE));
     // The certificate is written last, so its presence marks a complete CA.
     if let Some(cert_pem) = read_optional(&cert_path)? {
@@ -299,7 +323,7 @@ fn load_or_create_ca(
         let der = pem_to_der(&cert_path, &cert_pem)?;
         let issuer = Issuer::from_ca_cert_der(&der.as_slice().into(), key)
             .map_err(|e| bad(&cert_path, e))?;
-        return Ok((issuer, cert_pem, der));
+        return Ok((issuer, cert_pem, der, false));
     }
 
     tracing::info!("creating certificate authority");
@@ -319,7 +343,12 @@ fn load_or_create_ca(
     let cert = params.self_signed(&key)?;
     write_private(&key_path, key.serialize_pem().as_bytes())?;
     write_private(&cert_path, cert.pem().as_bytes())?;
-    Ok((Issuer::new(params, key), cert.pem(), cert.der().to_vec()))
+    Ok((
+        Issuer::new(params, key),
+        cert.pem(),
+        cert.der().to_vec(),
+        true,
+    ))
 }
 
 /// Whether the stored server certificate is signed by the CA and covers
@@ -596,6 +625,30 @@ mod tests {
         let cert = parse_cert(Path::new("t"), second.server_cert_der()).unwrap();
         let ca = parse_cert(Path::new("t"), second.ca_cert_der()).unwrap();
         cert.verify_signature(Some(ca.public_key())).unwrap();
+    }
+
+    /// Recreating the CA while devices are paired warns that they must
+    /// re-pair; a first run (no devices) and a loaded CA do not.
+    #[test]
+    fn a_new_ca_with_paired_devices_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DataDir::create(tmp.path().join("d")).unwrap();
+        let first = ServerIdentity::bootstrap(&dir, &names()).unwrap();
+        assert!(first.created_ca());
+        assert_eq!(first.new_ca_warning(0), None);
+
+        let loaded = ServerIdentity::bootstrap(&dir, &names()).unwrap();
+        assert!(!loaded.created_ca());
+        assert_eq!(loaded.new_ca_warning(3), None);
+
+        std::fs::remove_dir_all(dir.ca_dir()).unwrap();
+        std::fs::create_dir(dir.ca_dir()).unwrap();
+        let recreated = ServerIdentity::bootstrap(&dir, &names()).unwrap();
+        assert!(recreated.created_ca());
+        assert_ne!(recreated.ca_fingerprint(), first.ca_fingerprint());
+        let warning = recreated.new_ca_warning(3).expect("devices are paired");
+        assert!(warning.contains("3 paired device(s)"), "{warning}");
+        assert!(warning.contains("must re-pair"), "{warning}");
     }
 
     #[test]
