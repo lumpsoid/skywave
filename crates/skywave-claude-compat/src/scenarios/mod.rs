@@ -12,6 +12,7 @@
 //! else than asked, the scenario stops as inconclusive rather than failing.
 
 mod controls;
+mod conversations;
 mod tasks;
 mod turns;
 
@@ -21,7 +22,8 @@ use crate::session::{Session, Setup, Shared};
 /// How costly a scenario is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Control requests only, no user message: seconds, no tokens.
+    /// No model call: control requests, and local slash commands
+    /// (`/rename`) where a conversation must exist. Seconds, no tokens.
     Quick,
     /// Real turns on the cheap model; some wait on timers.
     Full,
@@ -46,6 +48,12 @@ impl Ctx {
     /// Starts a CLI process; it ends when dropped.
     pub fn session(&self, setup: Setup) -> Result<Session, Stop> {
         Session::start(&self.claude, self.recorder.clone(), setup)
+    }
+
+    /// Starts a CLI process that may fail before the handshake ends
+    /// ([`Session::start_or_refusal`]).
+    pub fn session_or_refusal(&self, setup: Setup) -> Result<Result<Session, String>, Stop> {
+        Session::start_or_refusal(&self.claude, self.recorder.clone(), setup)
     }
 }
 
@@ -92,6 +100,30 @@ pub const ALL: &[Scenario] = &[
         tier: Tier::Quick,
         about: "is send_task_message still a stub (D33, D34)",
         run: controls::send_task_message,
+    },
+    Scenario {
+        name: "resume",
+        tier: Tier::Quick,
+        about: "--resume: same session id, the transcript's branch continued",
+        run: conversations::resume,
+    },
+    Scenario {
+        name: "fork",
+        tier: Tier::Quick,
+        about: "--resume --fork-session --session-id: our id, the history copied, parent untouched",
+        run: conversations::fork,
+    },
+    Scenario {
+        name: "resume_unknown",
+        tier: Tier::Quick,
+        about: "resume or fork of an unknown id fails at start with UNKNOWN_SESSION's text",
+        run: conversations::resume_unknown,
+    },
+    Scenario {
+        name: "transcript",
+        tier: Tier::Quick,
+        about: "the transcript: where project_dir says (long cwd hashed), the fields transcripts.rs reads",
+        run: conversations::transcript,
     },
     Scenario {
         name: "basic",

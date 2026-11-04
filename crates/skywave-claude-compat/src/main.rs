@@ -33,7 +33,7 @@ use crate::session::Shared;
     about = "Checks a Claude Code CLI build against what skywaved's adapter relies on"
 )]
 struct Cli {
-    /// Control requests only: seconds, no tokens. The default.
+    /// No model call: seconds, no tokens. The default.
     #[arg(long, conflicts_with = "full")]
     quick: bool,
     /// Every scenario, real turns included: minutes, a few cents on haiku.

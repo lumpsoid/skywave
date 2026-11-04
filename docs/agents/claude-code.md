@@ -12,8 +12,10 @@ documented stable API (see spec §11). T09 must check `claude_code_version`
 at startup and log a warning when it differs from the pinned version.
 
 **Checking a new CLI.** After every CLI upgrade, run
-`cargo run -p skywave-claude-compat` (`--quick`, the default: control
-requests only, seconds, no tokens), then `-- --full` (real turns on haiku in
+`cargo run -p skywave-claude-compat` (`--quick`, the default: no model
+call, seconds, no tokens; control requests, plus `/rename`, a local
+command, where resume, fork and the transcript need a conversation to
+exist), then `-- --full` (real turns on haiku in
 a scratch dir, a few minutes, including a `/loop` tick and a background
 shell). It drives the real CLI through the adapter's own `Protocol`, so it
 writes exactly what skywaved writes, and checks every stdout line against
@@ -1069,11 +1071,12 @@ waiting on stays pending.
   outside transcript is never written. The id must be a session id the CLI
   keeps under the session's workdir (the lookup is per cwd, below): a
   symlinked or different cwd is "No conversation found". The adapter
-  rejects an id that is not a UUID before spawning. **[U]** §5's
-  unknown-parent probe ran with stdin closed; with stream-json stdin open
-  the CLI might report "No conversation found" only after the initialize
-  reply, surfacing as `Exited { error }` rather than a resume error (either
-  way the message errors).
+  rejects an id that is not a UUID before spawning. With stream-json
+  stdin open and `initialize` written, an unknown id (resumed or forked)
+  still fails before any initialize reply: stderr `No conversation found
+  with session ID: <id>`, then the error `result` as the first stdout line,
+  exit 1, so the adapter's start reports a resume error. **[C]**
+  (`skywave-claude-compat --only resume_unknown`, 2.1.310, 2026-11-04.)
   Manual checks for the user, with the real CLI (none confirmed yet):
   1. In a dir under the roots, run `claude`, say "remember the word
      PELICAN", quit; note the id (`/status`, or the newest
@@ -1331,7 +1334,9 @@ content block per line), `attachment` (context the CLI adds: environment,
 skills, date, …), `system` (`compact_boundary`, `local_command`, …),
 `queue-operation`, `last-prompt`, `mode`, `atis-latch`, `cost-state`,
 `api-request*` (whole request bodies, the user's context included),
-`ai-title` (`aiTitle`, interactive sessions only: `-p` writes none). Every
+`ai-title` (`aiTitle`, interactive sessions only: `-p` writes none),
+`custom-title` and `agent-name` (`/rename`, also under `-p`; not read).
+Every
 `user`/`assistant`/`attachment`/`system` line carries `uuid`,
 `parentUuid`, `isSidechain`, `cwd`, `timestamp`, `sessionId`, `version`.
 A tool result's structured form is the line's `toolUseResult` (the stream's

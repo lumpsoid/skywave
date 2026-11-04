@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use skywave_proto::Decision;
-use skywaved::agent::claude_code::REQUIRED_ARGS;
 use skywaved::agent::claude_code::protocol::{Output, Protocol};
+use skywaved::agent::claude_code::transcripts::{project_dir, projects_dir};
+use skywaved::agent::claude_code::{CliSession, REQUIRED_ARGS};
 use skywaved::agent::{AdapterEvent, TurnOutcome};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -31,15 +32,15 @@ use uuid::Uuid;
 use crate::report::Stop;
 use crate::shape::{self, Shape, clip};
 
-/// The flags every fixture was recorded with, after [`REQUIRED_ARGS`]: a
-/// cheap model, and none of the user's settings, hooks or MCP servers.
-const FIXTURE_ARGS: [&str; 6] = [
+/// The flags every fixture was recorded with, after [`REQUIRED_ARGS`] and
+/// before the session's flags ([`CliSession::args`]): a cheap model, and
+/// none of the user's settings, hooks or MCP servers.
+const FIXTURE_ARGS: [&str; 5] = [
     "--model",
     "haiku",
     "--setting-sources",
     "project",
     "--strict-mcp-config",
-    "--session-id",
 ];
 
 /// How long the handshake may take.
@@ -69,6 +70,64 @@ pub struct Setup {
     pub args: Vec<String>,
     /// Files to create in the scratch workdir: path, content.
     pub files: Vec<(&'static str, &'static str)>,
+    /// The conversation the process takes up; a new one by default.
+    pub session: Option<CliSession>,
+    /// The workdir, shared with another process of the scenario (a resume
+    /// must run where its conversation did); a fresh one by default.
+    pub workdir: Option<Rc<Workdir>>,
+}
+
+/// A scratch workdir. Dropped, it takes the CLI's project dir for it (the
+/// transcripts of its conversations) along: nothing could resume them once
+/// the dir is gone.
+#[derive(Debug)]
+pub struct Workdir {
+    root: TempDir,
+    /// The dir the CLI runs in, canonical: the `cwd` its transcripts carry.
+    cwd: PathBuf,
+}
+
+impl Workdir {
+    /// A fresh scratch dir; the CLI runs in its `subdir` when one is given.
+    pub fn new(subdir: Option<&str>) -> Result<Rc<Workdir>, Stop> {
+        let root = tempfile::Builder::new()
+            .prefix("skywave-bakery-")
+            .tempdir()
+            .map_err(|e| Stop::Stalled(format!("cannot make a scratch dir: {e}")))?;
+        let cwd = match subdir {
+            Some(sub) => root.path().join(sub),
+            None => root.path().to_owned(),
+        };
+        std::fs::create_dir_all(&cwd)
+            .and_then(|()| std::fs::canonicalize(&cwd))
+            .map(|cwd| Rc::new(Workdir { root, cwd }))
+            .map_err(|e| Stop::Stalled(format!("cannot make a scratch dir: {e}")))
+    }
+
+    /// The scratch dir itself, the root a listing looks under.
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Where the CLI keeps this workdir's transcripts, as the adapter
+    /// reckons it ([`project_dir`]).
+    pub fn project_dir(&self) -> Option<PathBuf> {
+        Some(projects_dir()?.join(project_dir(self.cwd.to_str()?)))
+    }
+}
+
+impl Drop for Workdir {
+    fn drop(&mut self) {
+        // The dir name holds the scratch dir's random suffix, so it is this
+        // workdir's alone.
+        if let Some(dir) = self.project_dir() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// One stdout message and the events the adapter made of it.
@@ -127,34 +186,47 @@ pub struct Session {
     recorder: Shared,
     t0: Instant,
     next_raw: u64,
-    workdir: TempDir,
+    workdir: Rc<Workdir>,
 }
 
 impl Session {
-    /// Starts `claude` in a fresh scratch workdir and completes the
-    /// handshake.
+    /// Starts `claude` in the setup's workdir and completes the handshake.
     pub fn start(claude: &str, recorder: Shared, setup: Setup) -> Result<Session, Stop> {
-        let workdir = tempfile::Builder::new()
-            .prefix("skywave-bakery-")
-            .tempdir()
-            .map_err(|e| Stop::Stalled(format!("cannot make a scratch dir: {e}")))?;
+        Session::start_or_refusal(claude, recorder, setup)?
+            .map_err(|why| Stop::Stalled(format!("the CLI refused to start: {why}")))
+    }
+
+    /// Starts `claude` as [`Session::start`] does; `Ok(Err)` when the CLI
+    /// fails before the handshake ends, with the error text the adapter's
+    /// start would get (an error `result`, or the exit's).
+    pub fn start_or_refusal(
+        claude: &str,
+        recorder: Shared,
+        setup: Setup,
+    ) -> Result<Result<Session, String>, Stop> {
+        let workdir = match setup.workdir {
+            Some(workdir) => workdir,
+            None => Workdir::new(None)?,
+        };
         for (path, content) in &setup.files {
-            let path = workdir.path().join(path);
+            let path = workdir.cwd().join(path);
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| Stop::Stalled(e.to_string()))?;
             }
             std::fs::write(&path, content).map_err(|e| Stop::Stalled(e.to_string()))?;
         }
-        let session_id = Uuid::new_v4();
+        let session = setup
+            .session
+            .unwrap_or_else(|| CliSession::New(Uuid::new_v4()));
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
         args.extend(FIXTURE_ARGS.iter().map(|a| (*a).to_owned()));
-        args.push(session_id.to_string());
+        args.extend(session.args());
         args.extend(setup.args);
 
         let mut command = Command::new(claude);
         command
             .args(&args)
-            .current_dir(workdir.path())
+            .current_dir(workdir.cwd())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -190,7 +262,7 @@ impl Session {
             lines,
             stdout_closed: false,
             stderr_tail: None,
-            protocol: Protocol::new(session_id, false),
+            protocol: Protocol::new(session.id(), session.handle_stored()),
             seen: Vec::new(),
             auto_approve: true,
             recorder,
@@ -204,7 +276,7 @@ impl Session {
         let deadline = Instant::now() + STARTUP;
         while !session.protocol.ready() {
             if let Some(error) = session.protocol.startup_error() {
-                return Err(Stop::Stalled(format!("the handshake failed: {error}")));
+                return Ok(Err(error.to_owned()));
             }
             match session.pump(deadline) {
                 Pumped::Timeout => {
@@ -213,20 +285,16 @@ impl Session {
                         STARTUP.as_secs()
                     )));
                 }
-                Pumped::Closed => {
-                    let why = session.exit_error();
-                    return Err(Stop::Stalled(format!(
-                        "the CLI exited during the handshake: {why}"
-                    )));
-                }
+                Pumped::Closed => return Ok(Err(session.exit_error())),
                 Pumped::Seen(_) | Pumped::Other => {}
             }
         }
-        Ok(session)
+        Ok(Ok(session))
     }
 
+    /// The dir the CLI runs in.
     pub fn workdir(&self) -> &Path {
-        self.workdir.path()
+        self.workdir.cwd()
     }
 
     /// A driver remark in the recording.
