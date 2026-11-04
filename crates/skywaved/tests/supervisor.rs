@@ -2457,13 +2457,18 @@ async fn a_message_sent_after_the_agent_left_between_turns_is_answered_once_by_a
     let echoed =
         |k: &&EventKind| matches!(k, EventKind::AgentMessage { text, .. } if text == "echo");
 
-    // The CLI answers, then closes its stdout and lingers a second before
-    // exiting 0: the message below reaches the supervisor while that
-    // agent is still running but will never read it.
-    f.send("leave");
+    // The CLI answers, its result's line ending only with its stdout, and
+    // lingers until cued: once the turn's end is logged its agent has seen
+    // stdout end, and the message below reaches the supervisor while that
+    // agent still runs but will never read it.
+    f.send("linger");
     f.wait_count("idle", 1, is_idle).await;
     let left = fake_cli_pid(&f);
-    f.send("hello");
+    let hello = f.send("hello");
+    // The supervisor stores its cursor at the message right before it
+    // hands it over, in the same step: only then may the CLI exit.
+    wait_read(&f, hello).await;
+    std::fs::write(f.root.join("project/linger.fifo"), "go\n").unwrap();
     let kinds = f.wait_count("idle again", 2, is_idle).await;
     assert_ne!(
         fake_cli_pid(&f),

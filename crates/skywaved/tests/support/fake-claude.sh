@@ -16,6 +16,10 @@
 # containing "quit" then exits 0, mid-turn and without a word.
 # One containing "leave" gets the text "echo" and its result, then the CLI
 # closes stdout and exits 0 a second later, between turns.
+# One containing "linger" leaves the same way, on cue instead of a timer:
+# the result's line ends with stdout itself, so a reader that has the
+# result has seen stdout end, and the CLI exits 0 only once a line is
+# written to ./linger.fifo.
 # One containing "run" starts the Write call and runs it until interrupted.
 # One containing "stuck" gets the text "working", then the CLI answers
 # nothing more, interrupts included (each one gets the text "ignored").
@@ -213,6 +217,19 @@ while IFS= read -r line; do
           ack "$req"
           printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"session_id":"%s"}\n' "$sid"
           result_aborted aborted_streaming
+          ;;
+        *linger*)
+          # Leaves between turns, as "leave", without timing: the result
+          # has no newline, so its line ends only with stdout (EOF), and
+          # the process lives until the test writes to the fifo, made
+          # before the result so it exists once the result is read.
+          rm -f linger.fifo
+          mkfifo linger.fifo
+          text "echo"
+          result_ok | tr -d '\n'
+          exec >&-
+          IFS= read -r cue < linger.fifo
+          exit 0
           ;;
         *leave*)
           # Ends the turn, then exits 0 between turns: stdout closes at
