@@ -41,13 +41,24 @@
 //! the file's length, if shorter; `Range: bytes=<from>-`) and truncates
 //! the file there: bytes written after the last report, or a length a
 //! power loss kept without its data, are fetched again rather than trusted.
-//! `BlobId` is no content hash, so the recorded count is the only check of
-//! the bytes before it. If the server sends the whole blob instead of the
-//! range, the file starts over. The content must have exactly the
-//! size the event's `BlobRef` gave, and the server must agree on it; a
-//! mismatch, an unknown blob or a local file error deletes the `.part`
-//! file, logs an error and leaves the blob `NotDownloaded`, failed with
-//! that reason, until it is asked for again. A blob that leaves the replica
+//! If the server sends the whole blob instead of the range, the file starts
+//! over. The content must have exactly the size the event's `BlobRef`
+//! gave, and the server must agree on it; a mismatch, an unknown blob or a
+//! local file error deletes the `.part` file, logs an error and leaves the
+//! blob `NotDownloaded`, failed with that reason, until it is asked for
+//! again.
+//!
+//! **Checked by hash.** The complete `.part` file must hash to the
+//! `BlobRef`'s `sha256` before it is renamed; nothing else checks the
+//! bytes a try resumed after (`BlobId` is no content hash). On a mismatch
+//! the file is deleted at once. The first mismatch a worker sees while it
+//! holds the blob may be the device's own (bytes kept from an earlier try
+//! or another run), so the blob is fetched again from zero straight away.
+//! A second one in the same hold is the server's: every byte hashed was
+//! fetched from it after the first was discarded. The blob then fails as
+//! above (`Failed` with the mismatch as its reason), never looping on a
+//! server that keeps serving the wrong bytes; asking for it again starts
+//! over with a fresh allowance. A blob that leaves the replica
 //! (its session deleted from this device, or no stored workdir answer
 //! naming it any more) loses both files; a download of it stops, without a
 //! retry, when its next report finds the blob unknown, and removes what it
@@ -84,6 +95,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use skywave_proto::ContentHash;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OnceCell};
 
@@ -447,6 +459,9 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
         let mut claim = ctx.queue.next(slot).await;
         let id = claim.item.id;
         let mut attempt = 0u32;
+        // A hash mismatch already seen in this hold (module docs, "Checked
+        // by hash").
+        let mut mismatched = false;
         loop {
             let mut progressed = false;
             let mut lease = None;
@@ -459,6 +474,12 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                 tracing::debug!(?id, "blob purged during its download");
                 remove_blob_files(&ctx.seam.data_dir(), id);
                 break claim.finish();
+            }
+            if matches!(error, FetchError::Hash { .. }) && !mismatched {
+                // `complete` deleted the file: the next try starts at zero.
+                tracing::warn!(?id, %error, "blob content mismatch: fetching it again");
+                mismatched = true;
+                continue;
             }
             if !error.is_retryable() {
                 give_up(ctx, id, lease, &error).await;
@@ -498,6 +519,11 @@ enum FetchError {
     Size { expected: u64, actual: u64 },
     #[error("asked for the blob from byte {asked}, the server sent it from {sent}")]
     Offset { asked: u64, sent: u64 },
+    #[error("blob content hash mismatch: expected {expected}, got {actual}")]
+    Hash {
+        expected: ContentHash,
+        actual: ContentHash,
+    },
 }
 
 impl FetchError {
@@ -519,7 +545,10 @@ impl FetchError {
             // A rejection is the link's to report; wait for it to stop us.
             FetchError::Transport(e) => e.is_retryable() || e.rejection().is_some(),
             FetchError::Core(_) => true,
-            FetchError::File(_) | FetchError::Size { .. } | FetchError::Offset { .. } => false,
+            FetchError::File(_)
+            | FetchError::Size { .. }
+            | FetchError::Offset { .. }
+            | FetchError::Hash { .. } => false,
         }
     }
 }
@@ -617,7 +646,7 @@ async fn fetch(
         file.set_len(size).await?;
         file.sync_all().await?;
         drop(file);
-        return complete(ctx, id, lease, &part, &done, size).await;
+        return complete(ctx, id, lease, &part, &done, &record).await;
     }
 
     let transport = transport
@@ -719,23 +748,36 @@ async fn fetch(
     }
     file.sync_all().await?;
     drop(file);
-    complete(ctx, id, lease, &part, &done, size).await
+    complete(ctx, id, lease, &part, &done, &record).await
 }
 
-/// The `.part` file holds the whole blob: check its size, move it in place
-/// and mark the blob available.
+/// The `.part` file holds the whole blob: check its size and hash, move it
+/// in place and mark the blob available. A file whose hash is wrong is
+/// deleted, so the next try starts from zero.
 async fn complete(
     ctx: &BlobCtx,
     id: BlobId,
     lease: BlobLease,
     part: &Path,
     done: &Path,
-    size: u64,
+    record: &BlobRecord,
 ) -> Result<(), FetchError> {
+    let size = record.size;
     let actual = tokio::fs::metadata(part).await?.len();
     if actual != size {
         return Err(FetchError::Size {
             expected: size,
+            actual,
+        });
+    }
+    let hashed = part.to_owned();
+    let actual = tokio::task::spawn_blocking(move || ContentHash::read(File::open(hashed)?))
+        .await
+        .map_err(std::io::Error::other)??;
+    if actual != record.sha256 {
+        tokio::fs::remove_file(part).await?;
+        return Err(FetchError::Hash {
+            expected: record.sha256,
             actual,
         });
     }
@@ -889,9 +931,17 @@ mod tests {
     }
 
     impl Fixture {
-        /// A paired replica with one blob of `size` bytes registered; the
-        /// server has `content` for it and claims `total` bytes.
+        /// A paired replica with one blob of `size` bytes registered, whose
+        /// hash is that of the first `size` bytes of `content`; the server
+        /// has `content` for it and claims `total` bytes.
         fn new(size: u64, content: Vec<u8>, total: u64) -> Fixture {
+            let hashed = &content[..content.len().min(size as usize)];
+            let sha256 = ContentHash::of(hashed);
+            Fixture::hashed(size, sha256, content, total)
+        }
+
+        /// As [`Fixture::new`], with the event's `BlobRef` promising `sha256`.
+        fn hashed(size: u64, sha256: ContentHash, content: Vec<u8>, total: u64) -> Fixture {
             let dir = tempfile::tempdir().unwrap();
             let core = Core::open_detached(dir.path()).unwrap();
             let seam = core.seam();
@@ -908,6 +958,7 @@ mod tests {
             let blob = BlobRef {
                 id: ProtoBlobId::new(),
                 size,
+                sha256,
             };
             let session_id = SessionId::new();
             let event = |kind: EventKind| Event {
@@ -1040,7 +1091,11 @@ mod tests {
                     status: None,
                     preview: "held".into(),
                     lines: 1,
-                    output: Some(BlobRef { id: *id, size: 10 }),
+                    output: Some(BlobRef {
+                        id: *id,
+                        size: 10,
+                        sha256: ContentHash::of(&[0; 10]),
+                    }),
                 }),
             });
             self.seam
@@ -1119,6 +1174,82 @@ mod tests {
         assert!(path.is_absolute());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(!f.part().exists());
+    }
+
+    /// Bytes inside the recorded range are only checked by the hash: a
+    /// part file whose kept bytes are wrong is caught at the end, deleted
+    /// and fetched again from zero, and the right content then renamed.
+    #[tokio::test]
+    async fn a_resumed_part_file_with_wrong_bytes_is_fetched_again_from_zero() {
+        let bytes = content(5000);
+        for kept in [2000u64, 5000] {
+            let f = Fixture::new(5000, bytes.clone(), 5000);
+            std::fs::create_dir_all(blob_dir(&f.seam.data_dir())).unwrap();
+            std::fs::write(f.part(), vec![7u8; kept as usize]).unwrap();
+            f.seam
+                .blob_status(
+                    f.blob.id,
+                    BlobStatus::Downloading {
+                        got: kept,
+                        path: f.part(),
+                    },
+                )
+                .unwrap();
+            f.queue.want(f.blob.id);
+            f.run_until(|s| matches!(s, BlobStatus::Available { .. }))
+                .await;
+            // A whole kept file needs no request before its check.
+            let froms: &[u64] = if kept == 5000 { &[0] } else { &[kept, 0] };
+            assert_eq!(*f.server.froms.lock().unwrap(), froms, "kept {kept}");
+            let BlobStatus::Available { path } = f.status() else {
+                unreachable!()
+            };
+            assert_eq!(std::fs::read(path).unwrap(), bytes, "kept {kept}");
+            assert!(!f.part().exists());
+        }
+    }
+
+    /// A server that keeps serving bytes other than the hash promises gets
+    /// two tries from zero, then the blob fails, with no file left.
+    #[tokio::test]
+    async fn content_that_keeps_hashing_wrong_fails_after_a_second_try() {
+        let promised = ContentHash::of(b"other content");
+        let f = Fixture::hashed(5000, promised, content(5000), 5000);
+        f.queue.want(f.blob.id);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.server.calls.load(Ordering::SeqCst) < 2
+                || !lock(&f.queue.queue).active.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the worker lets the blob go");
+        // Well past the backoff a retry would wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        downloader.abort();
+
+        assert_eq!(
+            *f.server.froms.lock().unwrap(),
+            [0, 0],
+            "two tries, no more"
+        );
+        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(!f.part().exists());
+        let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
+        assert!(!done.exists(), "never renamed");
+        let actual = ContentHash::of(&content(5000));
+        assert_eq!(
+            f.shown(),
+            BlobState::Failed {
+                size: 5000,
+                reason: format!("blob content hash mismatch: expected {promised}, got {actual}"),
+            }
+        );
+        // Asking again starts over with a fresh allowance.
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
     }
 
     #[tokio::test]
@@ -1238,6 +1369,7 @@ mod tests {
         let blob = BlobRef {
             id: ProtoBlobId::new(),
             size: 5000,
+            sha256: ContentHash::of(&bytes),
         };
         // Plays the engine for the requests waiting: answers every workdir
         // read (the file's with `content`), returns the downloads asked for.
@@ -1644,6 +1776,7 @@ mod tests {
         let record = |status| BlobRecord {
             id: ProtoBlobId::new(),
             size: 1,
+            sha256: ContentHash::of(b""),
             status,
             workdir: false,
         };
@@ -1690,6 +1823,7 @@ mod tests {
         let record = |workdir| BlobRecord {
             id: ProtoBlobId::new(),
             size: 1,
+            sha256: ContentHash::of(b""),
             status: BlobStatus::NotDownloaded,
             workdir,
         };
@@ -1713,14 +1847,17 @@ mod tests {
         let event_blob = BlobRef {
             id: ProtoBlobId::new(),
             size: 3,
+            sha256: ContentHash::of(b""),
         };
         let file_blob = BlobRef {
             id: ProtoBlobId::new(),
             size: 4,
+            sha256: ContentHash::of(b""),
         };
         let diff_blob = BlobRef {
             id: ProtoBlobId::new(),
             size: 5,
+            sha256: ContentHash::of(b""),
         };
         {
             let mut store = Store::open(dir.path()).unwrap();

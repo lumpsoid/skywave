@@ -581,6 +581,7 @@ fn blob_progress_is_persisted_and_shown() {
     let blob = BlobRef {
         id: BlobId::new(),
         size: 9000,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     seam.apply_events(&EventBatch {
         from: Seq(1),
@@ -759,6 +760,7 @@ fn deleted_session_stays_gone_after_restart() {
     let blob = BlobRef {
         id: BlobId::new(),
         size: 3,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     let created = |id, minute| {
         event(
@@ -1858,6 +1860,7 @@ fn shell_runs_fold_from_the_log_and_this_devices_outbox() {
     let blob = BlobRef {
         id: BlobId::new(),
         size: 9000,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     log.batch(vec![(
         40,
@@ -2097,6 +2100,7 @@ fn replica_to_reset() -> ToReset {
     let blob = BlobRef {
         id: BlobId::new(),
         size: 3,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     let log = EventBatch {
         from: Seq(1),

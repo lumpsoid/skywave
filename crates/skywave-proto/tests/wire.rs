@@ -36,6 +36,7 @@ fn blob() -> BlobRef {
     BlobRef {
         id: blob_id(),
         size: 48_213,
+        sha256: ContentHash::of(b"blob content"),
     }
 }
 fn at() -> DateTime<Utc> {
@@ -1431,6 +1432,22 @@ fn api_bodies_round_trip() {
         wait: None,
         limit: None,
     });
+}
+
+#[test]
+fn a_blob_ref_needs_its_content_hash() {
+    let json = serde_json::to_value(blob()).unwrap();
+    assert_eq!(
+        serde_json::from_value::<BlobRef>(json.clone()).unwrap(),
+        blob()
+    );
+    let mut without = json.clone();
+    without.as_object_mut().unwrap().remove("sha256");
+    assert!(serde_json::from_value::<BlobRef>(without).is_err());
+    let mut upper = json;
+    let hash = upper["sha256"].as_str().unwrap().to_uppercase();
+    upper["sha256"] = hash.into();
+    assert!(serde_json::from_value::<BlobRef>(upper).is_err());
 }
 
 #[test]

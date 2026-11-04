@@ -12,10 +12,10 @@ use skywave_core::{
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
-    Command, CommandId, CommandKind, CommandResult, ContextId, Decision, DeviceId, DeviceInfo,
-    DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, ImportOutcome,
-    ImportedItem, RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
-    TaskId, TaskKind, ToolResult, TurnUsage,
+    Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId, Decision, DeviceId,
+    DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult,
+    ImportOutcome, ImportedItem, RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin,
+    SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -44,6 +44,7 @@ impl Log {
         let blob = BlobRef {
             id: BlobId::new(),
             size: 10_000,
+            sha256: ContentHash::of(b"ran tests"),
         };
         let events = vec![
             event(
@@ -330,6 +331,50 @@ fn referenced_blobs_are_registered_and_track_state() {
         store.set_blob_status(unknown, &BlobStatus::NotDownloaded),
         Err(StoreError::UnknownBlob(id)) if id == unknown
     ));
+}
+
+/// Every blob keeps the hash its reference promised (event and workdir
+/// blobs alike, over a reopen), and loses it with its row; a row without
+/// one, as a replica from before hashes has, leaves the replica unreadable.
+#[test]
+fn a_blob_keeps_its_hash_until_its_row_goes() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let diff = diff_blob(7);
+    put(&mut store, &changes_ask(log.b), &changes(&[&diff]));
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    let hashes = |store: &Store| -> Vec<(BlobId, ContentHash)> {
+        store
+            .blobs()
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.id, b.sha256))
+            .collect()
+    };
+    let mut want = vec![(log.blob.id, log.blob.sha256), (diff.id, diff.sha256)];
+    want.sort_by_key(|(id, _)| *id);
+    assert_ne!(log.blob.sha256, diff.sha256);
+    assert_eq!(hashes(&store), want);
+    assert_eq!(store.blob(diff.id).unwrap().unwrap().sha256, diff.sha256);
+
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    let rows = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM blob_hashes", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(&conn), 2);
+    let mut store = store;
+    store.delete_session_locally(log.a, at(2)).unwrap();
+    assert_eq!(hashes(&store), [(diff.id, diff.sha256)]);
+    assert_eq!(rows(&conn), 1, "the event blob's hash went with its row");
+
+    conn.execute_batch("DELETE FROM blob_hashes").unwrap();
+    let err = store.blobs().unwrap_err();
+    assert!(err.unreadable(), "{err}");
 }
 
 #[test]
@@ -780,7 +825,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -909,7 +954,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1325,7 +1370,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2212,7 +2257,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2722,7 +2767,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -2773,6 +2818,7 @@ fn diff_blob(size: u64) -> BlobRef {
     BlobRef {
         id: BlobId::new(),
         size,
+        sha256: ContentHash::of(&size.to_le_bytes()),
     }
 }
 
@@ -3003,7 +3049,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -3078,6 +3124,7 @@ fn an_import_split_over_pulls_is_importing_until_its_finish_is_stored() {
     let output = BlobRef {
         id: BlobId::new(),
         size: 9000,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     let events = adopted_log(session, &output);
     let mut store = Store::open(&dir).unwrap();
@@ -3128,7 +3175,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -3141,6 +3188,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     let output = BlobRef {
         id: BlobId::new(),
         size: 9000,
+        sha256: skywave_proto::ContentHash::of(b""),
     };
     let log = Log::new();
     let mut store = Store::open(&dir).unwrap();
@@ -3166,7 +3214,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }

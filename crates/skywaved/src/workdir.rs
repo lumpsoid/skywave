@@ -197,10 +197,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
 use skywave_proto::{
-    BlobId, BlobRef, DirEntry, EntryKind, FileBody, FileResult, LinkTarget, ListResult, SessionId,
-    WorkdirQuery, limits,
+    BlobId, BlobRef, ContentHash, DirEntry, EntryKind, FileBody, FileResult, LinkTarget,
+    ListResult, SessionId, WorkdirQuery, limits,
 };
 
 use crate::blobs::{BlobMeta, BlobStore};
@@ -496,7 +495,7 @@ impl Snapshot<'_> {
     /// Stores workdir `content` as a blob, reusing the blob of identical
     /// content stored before (module docs, "Blobs"). Never for event blobs.
     pub fn store(&mut self, content: &[u8]) -> Result<BlobRef> {
-        let sha256 = hex::encode(Sha256::digest(content));
+        let sha256 = ContentHash::of(content);
         let size = content.len() as u64;
         let sql_size = i64::try_from(size).unwrap_or(i64::MAX);
         // A plain read, no write lock. Only this connection writes
@@ -508,7 +507,7 @@ impl Snapshot<'_> {
             .conn()
             .query_row(
                 "SELECT blob_id FROM workdir_blobs WHERE sha256 = ?1 AND size = ?2",
-                params![sha256, sql_size],
+                params![sha256.to_hex(), sql_size],
                 |r| r.get(0),
             )
             .optional()?;
@@ -516,6 +515,7 @@ impl Snapshot<'_> {
             return Ok(BlobRef {
                 id: parse_id(&id)?,
                 size,
+                sha256,
             });
         }
         // The file (up to the cap, plus its fsyncs) is written before the
@@ -541,7 +541,7 @@ impl Snapshot<'_> {
         tx.execute(
             "INSERT INTO workdir_blobs (sha256, size, blob_id) VALUES (?1, ?2, ?3)",
             params![
-                meta.sha256,
+                meta.sha256.to_hex(),
                 i64::try_from(meta.size).unwrap_or(i64::MAX),
                 meta.id.0.to_string()
             ],
@@ -1086,8 +1086,9 @@ mod tests {
         let first = blob(&t);
         assert_ne!(first.id, tool_output.id);
         let rows = t.blob_rows();
+        assert_eq!(first.sha256, ContentHash::of(b"same bytes"));
         let second = blob(&t);
-        assert_eq!(second, first);
+        assert_eq!(second, first, "a hit names the stored blob and its hash");
         assert_eq!(t.blob_rows(), rows, "a hit adds no blob");
         // A copy elsewhere in the workdir is the same content too.
         std::fs::write(t.workdir.join("src/copy"), "same bytes").unwrap();
@@ -1098,6 +1099,7 @@ mod tests {
         assert_ne!(changed.id, first.id);
         assert_eq!(t.blob_rows(), rows + 1);
         assert_eq!(t.blob_content(&changed), b"other bytes");
+        assert_eq!(changed.sha256, ContentHash::of(b"other bytes"));
     }
 
     #[test]

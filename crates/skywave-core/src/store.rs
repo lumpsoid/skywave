@@ -20,9 +20,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    ApprovalId, BlobId, Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId,
-    DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, PROTOCOL_VERSION, RunId,
-    RunsSince, Seq, SessionId,
+    ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice,
+    PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -336,6 +336,22 @@ CREATE TABLE IF NOT EXISTS server_log (
     run_id TEXT NOT NULL
 );
 "#,
+    r#"
+-- The content hash a blob's download is checked against
+-- (skywave_proto::BlobRef::sha256, lowercase hex): one row per `blobs` row,
+-- inserted with it and deleted with it by the trigger. A table, not a
+-- column, so this migration reruns over a current schema as the two above
+-- do. A blob row without one (a replica from before hashes, whose events no
+-- longer decode either) does not read, so the replica is reset.
+CREATE TABLE IF NOT EXISTS blob_hashes (
+    blob_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS blob_hashes_go_with_blobs AFTER DELETE ON blobs
+BEGIN
+    DELETE FROM blob_hashes WHERE blob_id = old.id;
+END;
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -590,6 +606,8 @@ pub enum BlobStatus {
 pub struct BlobRecord {
     pub id: BlobId,
     pub size: u64,
+    /// What the content must hash to before it is available.
+    pub sha256: ContentHash,
     pub status: BlobStatus,
     /// A stored workdir answer names it: it downloads only when asked for,
     /// whatever the [`BlobPolicy`].
@@ -954,12 +972,7 @@ impl Store {
                 }
             }
             for blob in blob_refs(&event.kind) {
-                let inserted = tx.execute(
-                    "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
-                     ON CONFLICT (id) DO NOTHING",
-                    params![blob.id.0.to_string(), u64_sql(blob.size)?],
-                )?;
-                if inserted > 0 {
+                if register_blob(&tx, blob)? {
                     blobs.push(blob.id);
                 }
             }
@@ -1433,12 +1446,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
                 params![session, ask.kind(), ask.path(), id],
             )?;
-            let inserted = tx.execute(
-                "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
-                 ON CONFLICT (id) DO NOTHING",
-                params![id, u64_sql(blob.size)?],
-            )?;
-            if inserted > 0 && !stored.registered.contains(&blob.id) {
+            if register_blob(&tx, blob)? && !stored.registered.contains(&blob.id) {
                 stored.registered.push(blob.id);
             }
         }
@@ -2151,9 +2159,29 @@ fn purge_workdir_blobs(
     Ok(purged)
 }
 
+/// Registers `blob` as `NotDownloaded`, with its hash, unless a blob with
+/// its id is known already; whether it was new.
+fn register_blob(tx: &Transaction<'_>, blob: &BlobRef) -> Result<bool, StoreError> {
+    let id = blob.id.0.to_string();
+    let inserted = tx.execute(
+        "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
+         ON CONFLICT (id) DO NOTHING",
+        params![id, u64_sql(blob.size)?],
+    )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO blob_hashes (blob_id, sha256) VALUES (?1, ?2)",
+        params![id, blob.sha256.to_hex()],
+    )?;
+    Ok(true)
+}
+
 /// Columns [`blob_from_row`] reads, from `blobs`.
 const BLOB_COLUMNS: &str = "id, size, state, got, path,
-    EXISTS (SELECT 1 FROM workdir_blob_refs r WHERE r.blob_id = blobs.id)";
+    EXISTS (SELECT 1 FROM workdir_blob_refs r WHERE r.blob_id = blobs.id),
+    (SELECT h.sha256 FROM blob_hashes h WHERE h.blob_id = blobs.id)";
 
 fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
     let state: String = row.get(2)?;
@@ -2175,9 +2203,11 @@ fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
         }
     };
     let size: i64 = row.get(1)?;
+    let sha256: String = row.get(6)?;
     Ok(BlobRecord {
         id: BlobId(uuid_col(row, 0)?),
         size: u64::try_from(size).map_err(|e| bad_value(1, Type::Integer, e))?,
+        sha256: sha256.parse().map_err(|e| bad_value(6, Type::Text, e))?,
         status,
         workdir: row.get(5)?,
     })

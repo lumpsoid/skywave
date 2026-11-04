@@ -843,6 +843,7 @@ mod tests {
         let output = BlobRef {
             id: skywave_proto::BlobId::new(),
             size: 9_000,
+            sha256: skywave_proto::ContentHash::of(b""),
         };
         let daemon = [
             EventKind::ShellStopRequested { run, by },
@@ -921,6 +922,7 @@ mod tests {
         let blob = |size| BlobRef {
             id: skywave_proto::BlobId::new(),
             size,
+            sha256: skywave_proto::ContentHash::of(b""),
         };
         let (input, full) = (blob(10), blob(20));
         let call = EventKind::ToolCall(ToolCall {
