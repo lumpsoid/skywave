@@ -886,20 +886,21 @@ fn set_cursor(f: &Fixture, seq: Seq) {
         [i64::try_from(seq.0).unwrap()],
     )
     .unwrap();
-    set_owed(f, &[seq], false);
+    set_owed(f, &[seq], "waiting");
 }
 
 /// Stores the messages at `seqs` as handed over with their turn not
-/// started (`settling`: an `Errored` reporting them was about to be
-/// logged), replacing what was stored.
-fn set_owed(f: &Fixture, seqs: &[Seq], settling: bool) {
+/// started, in `state`: `waiting`; `starting`: their turn's `AgentWorking`
+/// was about to be logged; `settling`: an `Errored` reporting them was
+/// about to be logged. Replaces what was stored.
+fn set_owed(f: &Fixture, seqs: &[Seq], state: &str) {
     let conn = f.storage.db.conn();
     conn.execute("DELETE FROM supervisor_owed", []).unwrap();
     for &seq in seqs {
         conn.execute(
-            "INSERT INTO supervisor_owed (seq, session_id, context, settling) \
+            "INSERT INTO supervisor_owed (seq, session_id, context, state) \
              SELECT seq, session_id, context, ?2 FROM events WHERE seq = ?1",
-            rusqlite::params![i64::try_from(seq.0).unwrap(), settling],
+            rusqlite::params![i64::try_from(seq.0).unwrap(), state],
         )
         .unwrap();
     }
@@ -967,8 +968,11 @@ async fn a_message_whose_turn_ran_is_not_errored_on_restart() {
     let seq = f.send("answered");
     f.wait_count("reply", 1, is_idle).await;
     supervisor.shutdown().await.unwrap();
-    // As if the daemon died right after the turn, before the cursor moved.
+    // As if the daemon died right after the turn, before the cursor moved:
+    // the message was marked starting, and stored, before its turn's
+    // `AgentWorking` was logged.
     set_cursor(&f, seq);
+    set_owed(&f, &[seq], "starting");
 
     f.reopen_log();
     let supervisor = f.start(&agent).await;
@@ -990,6 +994,7 @@ async fn a_message_whose_turn_was_lost_errors_once_as_a_lost_turn() {
     .await;
     supervisor.shutdown().await.unwrap();
     set_cursor(&f, seq);
+    set_owed(&f, &[seq], "starting");
 
     f.reopen_log();
     let supervisor = f.start(&agent).await;
@@ -1088,6 +1093,100 @@ async fn a_message_queued_behind_a_lost_turn_is_named_in_its_errored() {
     supervisor.shutdown().await.unwrap();
     assert_eq!(
         errored_after(&f, hang),
+        [(errored(&format!("{TURN_LOST}; {ONE_UNSENT}")), f.first())]
+    );
+}
+
+/// Runs a turn the agent starts on its own (a wakeup) with a message
+/// handed while the turn before it ran, so before the wakeup's turn
+/// began: the agent hangs in the wakeup's turn, the message queued behind
+/// it. Shuts the daemon down cleanly there. The first message's seq and
+/// the queued one's.
+async fn hand_a_message_before_a_wakeup(f: &mut Fixture) -> (FakeAgent, Seq, Seq) {
+    let first_ends = Gate::new();
+    // The wakeup is due before the first turn ends, so it runs before the
+    // message queued meanwhile, as a CLI's would.
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::wake(Duration::ZERO, [Step::Hang]),
+        Step::Wait(first_ends.clone()),
+    ]));
+    let supervisor = f.start(&agent).await;
+    let first = f.send("first");
+    let working = |k: &EventKind| *k == state(SessionState::AgentWorking);
+    f.wait_count("the first turn", 1, working).await;
+    let queued = f.send("queued");
+    wait_message(&agent, f.session_id, "queued").await;
+    first_ends.open();
+    f.wait_count("the wakeup's turn", 2, working).await;
+    supervisor.shutdown().await.unwrap();
+    assert!(errored_after(f, first).is_empty(), "{:#?}", f.kinds());
+    (agent, first, queued)
+}
+
+/// A turn the agent starts on its own answers no message: one handed
+/// before it began stays owed through it, and a clean shutdown during that
+/// turn names the message in the lost turn's one `Errored` on restart.
+#[tokio::test]
+async fn a_message_queued_behind_a_turn_the_agent_started_errors_once_after_a_shutdown() {
+    let mut f = Fixture::new();
+    let (agent, first, queued) = hand_a_message_before_a_wakeup(&mut f).await;
+    // The wakeup's turn did not take the message.
+    assert_eq!(owed_rows(&f), [i64::try_from(queued.0).unwrap()]);
+
+    let lost = errored(&format!("{TURN_LOST}; {ONE_UNSENT}"));
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, first), [(lost.clone(), f.first())]);
+    assert!(owed_rows(&f).is_empty());
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, first), [(lost, f.first())]);
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("first"),
+            message("queued"),
+            FakeInput::Shutdown,
+        ]
+    );
+}
+
+/// The same after a crash: the owed rows were last stored when the message
+/// was handed, so the wakeup's `AgentWorking`, logged after them, is read
+/// back on restart. It answers no message, so the message is still named
+/// in the lost turn's one `Errored`.
+#[tokio::test]
+async fn a_message_queued_behind_a_turn_the_agent_started_errors_once_after_a_crash() {
+    let mut f = Fixture::new();
+    let (agent, first, queued) = hand_a_message_before_a_wakeup(&mut f).await;
+    // As the run stored them when it handed the message over.
+    set_owed(&f, &[queued], "waiting");
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET accounted = ?1 WHERE id = 1",
+            [i64::try_from(queued.0).unwrap()],
+        )
+        .unwrap();
+    let working = |k: &(EventKind, ContextId)| k.0 == state(SessionState::AgentWorking);
+    assert_eq!(
+        f.stamped_after(queued)
+            .iter()
+            .filter(|k| working(k))
+            .count(),
+        1
+    );
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        errored_after(&f, first),
         [(errored(&format!("{TURN_LOST}; {ONE_UNSENT}")), f.first())]
     );
 }
@@ -1215,7 +1314,7 @@ async fn a_stopped_agents_late_errored_does_not_hide_a_message_handed_after_it()
         .conn()
         .execute("DELETE FROM supervisor_held", [])
         .unwrap();
-    set_owed(&f, &[during], false);
+    set_owed(&f, &[during], "waiting");
     set_accounted(&f);
 
     f.reopen_log();
@@ -1246,14 +1345,14 @@ async fn a_restart_reports_a_settling_message_only_if_its_errored_is_missing() {
     )
     .unwrap();
     // The `Errored` was not logged: the restart reports the message.
-    set_owed(&f, &[seq], true);
+    set_owed(&f, &[seq], "settling");
     set_accounted(&f);
     let supervisor = f.start(&agent).await;
     supervisor.shutdown().await.unwrap();
     assert_eq!(errored_after(&f, seq), [(message_lost(), f.first())]);
 
     // It was logged after the rows were stored: nothing more.
-    set_owed(&f, &[seq], true);
+    set_owed(&f, &[seq], "settling");
     f.storage
         .db
         .conn()

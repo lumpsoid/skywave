@@ -485,7 +485,7 @@ async fn interrupt_cancels_the_pending_approval_and_the_session_stays_usable() {
     assert_eq!(
         next,
         [
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::Text {
                 text: "Second turn.".into(),
                 parent: None,
@@ -527,7 +527,7 @@ async fn interrupt_stops_a_hanging_turn_and_a_gate_releases_a_waiting_one() {
     assert_eq!(tail, [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]);
 
     f.pump(&mut events, &mut mapper, |e| {
-        *e == AdapterEvent::TurnStarted
+        *e == AdapterEvent::TurnStarted { message: true }
     })
     .await;
     gate.open();
@@ -777,7 +777,10 @@ async fn a_fork_copies_a_conversation_of_another_session() {
         events.recv().await,
         Some(AdapterEvent::ResumeHandle(FakeAgent::resume_handle(forked)))
     );
-    assert_eq!(events.recv().await, Some(AdapterEvent::TurnStarted));
+    assert_eq!(
+        events.recv().await,
+        Some(AdapterEvent::TurnStarted { message: true })
+    );
     // Scripted turns run per session: the new session starts at the first.
     assert_eq!(
         events.recv().await,
@@ -940,7 +943,7 @@ fn rule_suggestions_are_cut_to_the_protocol_caps() {
         scope: RuleScope::Session,
     }));
     for event in [
-        AdapterEvent::TurnStarted,
+        AdapterEvent::TurnStarted { message: true },
         AdapterEvent::ApprovalRequested {
             request: "q".into(),
             call: None,
@@ -979,7 +982,7 @@ fn errored_messages_are_cut_like_refusals() {
     );
     let huge = "x".repeat(1 << 20);
     for event in [
-        AdapterEvent::TurnStarted,
+        AdapterEvent::TurnStarted { message: true },
         AdapterEvent::TurnEnded(TurnOutcome::Failed(format!("{huge}\nmore"))),
         AdapterEvent::Exited {
             error: Some(huge.clone()),
@@ -1032,7 +1035,7 @@ fn unsent_messages_are_named_in_the_one_errored_of_the_exit() {
     // A stop after the turn ended: only the notice.
     assert_eq!(
         errored_after(vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
             exited(None, 1),
         ]),
@@ -1040,26 +1043,35 @@ fn unsent_messages_are_named_in_the_one_errored_of_the_exit() {
     );
     // Cut short mid-turn, or crashed: the exit, then the notice.
     assert_eq!(
-        errored_after(vec![AdapterEvent::TurnStarted, exited(None, 2)]),
+        errored_after(vec![
+            AdapterEvent::TurnStarted { message: true },
+            exited(None, 2)
+        ]),
         [
             "agent exited during a turn; 2 queued messages were not sent to the agent; send them again"
         ]
     );
     assert_eq!(
-        errored_after(vec![AdapterEvent::TurnStarted, exited(Some("boom"), 1)]),
+        errored_after(vec![
+            AdapterEvent::TurnStarted { message: true },
+            exited(Some("boom"), 1)
+        ]),
         ["agent exited: boom; 1 queued message was not sent to the agent; send it again"]
     );
     // Nothing unsent: as before.
     assert_eq!(
         errored_after(vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
             exited(None, 0),
         ]),
         Vec::<String>::new()
     );
     assert_eq!(
-        errored_after(vec![AdapterEvent::TurnStarted, exited(Some("boom"), 0)]),
+        errored_after(vec![
+            AdapterEvent::TurnStarted { message: true },
+            exited(Some("boom"), 0)
+        ]),
         ["agent exited: boom"]
     );
 }
@@ -1070,7 +1082,7 @@ fn a_long_exit_reason_gives_way_to_the_unsent_notice() {
 
     let huge = "x".repeat(1 << 20);
     let messages = errored_after(vec![
-        AdapterEvent::TurnStarted,
+        AdapterEvent::TurnStarted { message: true },
         AdapterEvent::Exited {
             error: Some(huge),
             unsent: 3,
@@ -1106,7 +1118,7 @@ fn turn_usage_is_logged_before_the_turn_ends_and_only_within_one() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::TurnUsage(TurnUsage::default()),
             AdapterEvent::TurnUsage(usage.clone()),
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
@@ -1133,7 +1145,7 @@ async fn exit_with_a_pending_approval_cancels_it() {
         AgentWork::default(),
     );
     for event in [
-        AdapterEvent::TurnStarted,
+        AdapterEvent::TurnStarted { message: true },
         AdapterEvent::ToolCall {
             call: None,
             parent: None,
@@ -1256,7 +1268,7 @@ fn large_content_gives_small_events_and_blobs() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
                 parent: None,
@@ -1381,7 +1393,7 @@ fn content_shown_whole_makes_no_blob() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
                 parent: None,
@@ -1459,7 +1471,7 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
                 parent: None,
@@ -1527,7 +1539,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
                 parent: None,
@@ -1564,7 +1576,7 @@ fn call_approval_and_result_share_one_call_id_within_a_turn() {
                 result: ok("anonymous"),
             },
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             // Ids are only linked within their turn.
             AdapterEvent::ToolResult {
                 call: Some("c1".into()),
@@ -1622,7 +1634,7 @@ fn shell_call(f: &mut Fixture, title: &str) -> ToolDisplay {
         f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::ToolCall {
                 call: Some("c1".into()),
                 parent: None,
@@ -2115,7 +2127,7 @@ fn a_subagent_links_to_its_agent_call_across_turns_and_runs() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("agent", None),
             // A background subagent's call is answered at once.
             answer("agent"),
@@ -2189,7 +2201,7 @@ fn unknown_parents_and_task_calls_map_to_none() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("agent", None),
             answer("agent"),
             subagents(&[("t1", Some("agent")), ("t2", Some("ghost"))]),
@@ -2232,7 +2244,7 @@ fn a_turn_names_its_open_calls_and_a_task_its_own_when_it_leaves() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("agent", None),
             answer("agent"),
             subagents(&[("t1", Some("agent"))]),
@@ -2286,7 +2298,7 @@ fn a_turn_names_its_open_calls_and_a_task_its_own_when_it_leaves() {
             named_call("again", Some("agent")),
             answer("again"),
             subagents(&[]),
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("quiet", None),
             answer("quiet"),
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
@@ -2305,7 +2317,7 @@ fn a_task_leaving_in_a_turn_names_its_calls_once() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("agent", None),
             answer("agent"),
             subagents(&[("t1", Some("agent"))]),
@@ -2337,7 +2349,7 @@ fn a_backgrounded_foreground_subagent_leaves_the_turn() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("fg", None),
             named_call("fg-open", Some("fg")),
             named_call("main-open", None),
@@ -2366,7 +2378,7 @@ fn exit_names_every_open_call() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("agent", None),
             answer("agent"),
             subagents(&[("t1", Some("agent"))]),
@@ -2411,7 +2423,7 @@ fn exit_names_every_open_call() {
         &mut fresh,
         &mut idle,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             named_call("done", None),
             answer("done"),
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
@@ -2649,7 +2661,7 @@ fn a_tasks_approval_outlives_the_turn_and_exit_cancels_every_approval() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             asked("task", Some("sub")),
             asked("turn", None),
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
@@ -2667,9 +2679,9 @@ fn a_tasks_approval_outlives_the_turn_and_exit_cancels_every_approval() {
         &mut f,
         &mut mapper,
         vec![
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             AdapterEvent::TurnEnded(TurnOutcome::Interrupted),
-            AdapterEvent::TurnStarted,
+            AdapterEvent::TurnStarted { message: true },
             asked("next", None),
         ],
     );

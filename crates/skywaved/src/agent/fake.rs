@@ -4,7 +4,8 @@
 //! [`FakeScript`] is a list of turns; each user message runs the next unused
 //! turn of that session, and a message after the last scripted turn runs an
 //! echo turn (`Text("echo: <message>")`). Every turn is framed by
-//! `TurnStarted` and `TurnEnded`.
+//! `TurnStarted` and `TurnEnded`; a message's turn starts with
+//! `message: true`, a [`Step::Wake`] turn with `message: false`.
 //!
 //! A turn's [`Step`]s run in order without waiting, except:
 //! - [`Step::Approval`] emits `ApprovalRequested` and blocks until the
@@ -925,7 +926,11 @@ impl Runner {
                         continue;
                     }
                 };
-                if !self.emit(AdapterEvent::TurnStarted).await {
+                // A wakeup answers no message.
+                if !self
+                    .emit(AdapterEvent::TurnStarted { message: false })
+                    .await
+                {
                     return;
                 }
                 match self.run_turn(steps).await {
@@ -983,7 +988,7 @@ impl Runner {
                 }
             }
             let steps = self.next_turn(&text);
-            if !self.emit(AdapterEvent::TurnStarted).await {
+            if !self.emit(AdapterEvent::TurnStarted { message: true }).await {
                 return;
             }
             match self.run_turn(steps).await {

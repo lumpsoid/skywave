@@ -336,7 +336,7 @@ mod tests {
             result("t1", long(500)),
             HistoryItem::Agent {
                 at: None,
-                event: AdapterEvent::TurnStarted,
+                event: AdapterEvent::TurnStarted { message: true },
             },
             HistoryItem::Agent {
                 at: None,

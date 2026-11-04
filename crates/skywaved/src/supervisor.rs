@@ -169,26 +169,27 @@
 //! in one transaction.
 //!
 //! A message stays owed until the log shows it settled, per session: the
-//! agent's next `AgentWorking` settles its oldest owed message (an agent
-//! begins the turns of the messages it was handed in order), and an
+//! `AgentWorking` of a turn the adapter reports as a message's
+//! (`TurnStarted { message: true }`) settles its oldest owed message (an
+//! agent begins the turns of the messages it was handed in order), and an
 //! `Errored` reporting it (the agent's exit, a failed delivery) settles it
-//! too. The exception: a turn the agent starts on its own (a wakeup, or
-//! the Claude Code CLI's `system/init` with no turn open) reports the same
-//! `TurnStarted`, so a message queued behind it is settled as if its turn
-//! had begun. Should the daemon stop or crash during that turn, the
-//! restart logs only the lost turn's `Errored` (and a clean shutdown drops
-//! the exit's unsent count), so that message gets neither its turn nor an
-//! `Errored` of its own. Follow-up task c48616 ("Tie each agent turn to
-//! the message it answers") closes this. Such an `Errored` is tied to the messages it reports by position,
-//! never by merely following them: they are first stored as *settling*,
-//! with the log's last seq (`supervisor_cursor.accounted`), and only an
-//! `Errored` in their context after that seq settles them. So a stopped
-//! agent's exit, logged after a message that waited for the stop, does not
-//! answer that message. The rows are rewritten, stamped with the log's last
-//! seq, whenever they change; a state event the supervisor logged after
-//! the stamp but before the next write is read back from the log on
-//! restart (see `lost_messages`), so the gap between logging an event and
-//! storing what it settled neither loses nor double-reports a message.
+//! too. A turn the agent starts on its own (a wakeup, or the Claude Code
+//! CLI's `system/init` with no turn open) reports `message: false` and
+//! settles none, so a message queued behind it stays owed: should the
+//! daemon stop or crash during that turn, the restart names it in the lost
+//! turn's `Errored`. Each settling event is tied to the message it settles
+//! by position, never by merely following it: the message is first
+//! stored as *starting* (its turn's `AgentWorking` is next) or *settling*
+//! (an `Errored` reporting it is next), with the log's last seq
+//! (`supervisor_cursor.accounted`), and only such an event in its context
+//! after that seq settles it. So a stopped agent's exit, logged after a
+//! message that waited for the stop, does not answer that message, nor
+//! does a turn the agent started on its own. The rows are rewritten,
+//! stamped with the log's last seq, whenever they change; a state event
+//! the supervisor logged after the stamp but before the next write is read
+//! back from the log on restart (see `lost_messages`), so the gap between
+//! logging an event and storing what it settled neither loses nor
+//! double-reports a message.
 //! Nothing outlives its settlement: a message answered long ago is never
 //! reported by a later restart. Answers and interrupts need no such care:
 //! after a restart their approvals and turns are already settled (below),
@@ -435,10 +436,43 @@ struct Progress {
 struct Owed {
     seq: Seq,
     context: ContextId,
+    state: OwedState,
+}
+
+/// Where an [`Owed`] message is in being settled; stored with it, so a
+/// restart tells which of the supervisor's state events after the rows
+/// settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwedState {
+    /// Nothing about it is about to be logged.
+    Waiting,
+    /// Its turn's `AgentWorking` is about to be logged in its context (the
+    /// agent reported `TurnStarted { message: true }`): once that is in the
+    /// log, it is settled.
+    Starting,
     /// An `Errored` reporting it is about to be logged in its context (the
     /// agent's exit, a failed delivery, a restart's): once that is in the
     /// log, it is settled.
-    settling: bool,
+    Settling,
+}
+
+impl OwedState {
+    fn sql(self) -> &'static str {
+        match self {
+            OwedState::Waiting => "waiting",
+            OwedState::Starting => "starting",
+            OwedState::Settling => "settling",
+        }
+    }
+
+    fn from_sql(state: &str) -> Result<OwedState> {
+        match state {
+            "waiting" => Ok(OwedState::Waiting),
+            "starting" => Ok(OwedState::Starting),
+            "settling" => Ok(OwedState::Settling),
+            other => Err(Error::Corrupt(format!("unknown owed state {other:?}"))),
+        }
+    }
 }
 
 /// A session whose agent is starting or stopping. Its events read
@@ -508,7 +542,9 @@ struct Running<S> {
     /// The current turn was already handed an interrupt: a later
     /// `TurnInterrupted` escalates. Cleared when the turn ends.
     interrupted: bool,
-    /// Messages delivered whose turn has not ended yet.
+    /// Messages delivered whose turn has not started yet (an open one is
+    /// [`EventMapper::turn_open`]); a turn the agent started on its own
+    /// takes none.
     owed_turns: usize,
     /// The live background tasks the agent last reported that are not
     /// ambient, counted before the mapper cuts the set.
@@ -619,7 +655,7 @@ impl<A: AgentAdapter> Supervisor<A> {
                         seqs.iter().map(|&seq| Owed {
                             seq,
                             context: *context,
-                            settling: true,
+                            state: OwedState::Settling,
                         })
                     })
                     .collect();
@@ -1262,7 +1298,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         self.owed.entry(session_id).or_default().push(Owed {
             seq: item.seq,
             context: item.event.context,
-            settling: false,
+            state: OwedState::Waiting,
         });
         self.mark_handled(session_id, item.seq);
         self.store_progress()?;
@@ -1303,7 +1339,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let mut count = 0;
         for owed in owed.iter_mut().filter(|owed| which(owed)) {
-            owed.settling = true;
+            owed.state = OwedState::Settling;
             count += 1;
         }
         self.store_progress()?;
@@ -1321,44 +1357,52 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
     }
 
-    /// Session `id`'s agent logged `AgentWorking`: the turn of the oldest
-    /// message it owes has started (an agent begins the turns of the
-    /// messages it was handed in order).
-    fn turn_started(&mut self, id: SessionId) {
-        if let Some(owed) = self.owed.get_mut(&id)
-            && let Some(first) = owed.iter().position(|owed| !owed.settling)
-        {
-            owed.remove(first);
-            if owed.is_empty() {
-                self.owed.remove(&id);
+    /// Readies session `id`'s agent's `event` for its mapper, whose turn is
+    /// open as `turn_open` says. A message's turn about to open settles the
+    /// oldest message the agent owes (an agent begins the turns of the
+    /// messages it was handed in order): it is marked starting, and that
+    /// stored, before its `AgentWorking` is logged. A turn the agent
+    /// started on its own settles none. An exit reports every message the
+    /// agent still owes: they are marked settling, and their count goes
+    /// into its `unsent` when the agent counted fewer (an event stream that
+    /// ended without `Exited` counts none), so the exit's one `Errored`
+    /// names them all.
+    fn before_mapping(
+        &mut self,
+        id: SessionId,
+        event: AdapterEvent,
+        turn_open: bool,
+    ) -> Result<AdapterEvent> {
+        match event {
+            AdapterEvent::TurnStarted { message: true } if !turn_open => {
+                if let Some(owed) = self.owed.get_mut(&id)
+                    && let Some(first) =
+                        (owed.iter_mut()).find(|owed| owed.state == OwedState::Waiting)
+                {
+                    first.state = OwedState::Starting;
+                    self.store_progress()?;
+                }
+                Ok(event)
             }
+            AdapterEvent::Exited { error, unsent } => {
+                let owed = self.settling(id, |_| true)?;
+                Ok(AdapterEvent::Exited {
+                    error,
+                    unsent: unsent.max(owed),
+                })
+            }
+            event => Ok(event),
         }
-    }
-
-    /// Readies session `id`'s agent's `event` for its mapper. An exit
-    /// reports every message the agent still owes: they are marked
-    /// settling, and their count goes into its `unsent` when the agent
-    /// counted fewer (an event stream that ended without `Exited` counts
-    /// none), so the exit's one `Errored` names them all.
-    fn before_mapping(&mut self, id: SessionId, event: AdapterEvent) -> Result<AdapterEvent> {
-        let AdapterEvent::Exited { error, unsent } = event else {
-            return Ok(event);
-        };
-        let owed = self.settling(id, |_| true)?;
-        Ok(AdapterEvent::Exited {
-            error,
-            unsent: unsent.max(owed),
-        })
     }
 
     /// Keeps [`Supervisor::owed`] in step with what the mapper just logged
     /// for session `id`'s agent, `seqs`: an exit settled every message
-    /// owed, an `AgentWorking` the oldest.
-    fn after_mapping(&mut self, id: SessionId, exited: bool, started: bool, seqs: &[Seq]) {
+    /// owed, a message turn's `AgentWorking` the one marked starting.
+    fn after_mapping(&mut self, id: SessionId, exited: bool, message_turn: bool, seqs: &[Seq]) {
         if exited {
             self.forget_owed(id, |_| true);
-        } else if started && !seqs.is_empty() {
-            self.turn_started(id);
+        } else if message_turn && !seqs.is_empty() {
+            self.forget_owed(id, |owed| owed.state == OwedState::Starting);
         }
     }
 
@@ -1646,11 +1690,13 @@ impl<A: AgentAdapter> Supervisor<A> {
         if !self.running.contains_key(&id) {
             return Ok(());
         }
-        let event = self.before_mapping(id, event)?;
+        let turn_open = (self.running.get(&id)).is_some_and(|r| r.mapper.turn_open());
+        let event = self.before_mapping(id, event, turn_open)?;
         let Some(running) = self.running.get_mut(&id) else {
             return Ok(());
         };
-        let started = matches!(event, AdapterEvent::TurnStarted);
+        let started = matches!(event, AdapterEvent::TurnStarted { .. });
+        let message_turn = matches!(event, AdapterEvent::TurnStarted { message: true });
         let exited = matches!(event, AdapterEvent::Exited { .. });
         let ended = exited || matches!(event, AdapterEvent::TurnEnded(_));
         if let AdapterEvent::ModelsOffered(models) = event {
@@ -1673,14 +1719,17 @@ impl<A: AgentAdapter> Supervisor<A> {
             running.turn_started = Some(seq);
             running.interrupted = false;
         }
+        if message_turn {
+            // Open now: counted by `turn_open` until it ends.
+            running.owed_turns = running.owed_turns.saturating_sub(1);
+        }
         if ended {
             running.turn_started = None;
             running.interrupted = false;
-            running.owed_turns = running.owed_turns.saturating_sub(1);
         }
         // A turn the agent started on its own is work too, as is a task.
         running.settle_idle();
-        self.after_mapping(id, exited, started, &seqs);
+        self.after_mapping(id, exited, message_turn, &seqs);
         Ok(())
     }
 
@@ -1708,11 +1757,11 @@ impl<A: AgentAdapter> Supervisor<A> {
                     models,
                 )?;
             } else {
-                let event = self.before_mapping(id, event)?;
-                let started = matches!(event, AdapterEvent::TurnStarted);
+                let event = self.before_mapping(id, event, mapper.turn_open())?;
+                let message_turn = matches!(event, AdapterEvent::TurnStarted { message: true });
                 let exited = matches!(event, AdapterEvent::Exited { .. });
                 let seqs = mapper.apply(&self.log, &mut self.storage, event)?;
-                self.after_mapping(id, exited, started, &seqs);
+                self.after_mapping(id, exited, message_turn, &seqs);
             }
         }
         tracing::info!(session = %id.0, "agent stopped");
@@ -1989,15 +2038,18 @@ pub(crate) const OWED_STATES_SQL: &str = "SELECT context, json_extract(kind, '$.
 /// each in handing order. The rows are as the previous run last stored
 /// them, with `supervisor_cursor.accounted`, the log's last seq then: the
 /// supervisor's own `SessionStateChanged` logged after it in the session
-/// settle what the rows do not show yet. There, each `AgentWorking`
-/// settles the oldest message owed in its context that is not settling
-/// (an agent begins the turns of the messages it was handed in order; a
-/// turn it starts on its own is miscounted, see the module docs), and
-/// an `Errored` settles those settling in its context: it is the one they
-/// were marked for. Anything else is no proof: `Idle` can end the turn a
-/// message was queued behind, and an `Errored` logged before the rows were
-/// stored (a stopped agent's, say) answers older messages. A message its
-/// session still held unhandled is not lost: the next run hands it over.
+/// settle what the rows do not show yet, each only the rows marked for it.
+/// An `AgentWorking` in a context settles the message marked starting
+/// there: it was marked, and stored, right before its turn's `AgentWorking`
+/// was logged, with nothing logged between, so the first one after the
+/// rows is that one. An `Errored` settles those settling in its context:
+/// it is the one they were marked for. Anything else is no proof: an
+/// `AgentWorking` can open a turn the agent started on its own, `Idle` can
+/// end the turn a message was queued behind, and an `Errored` logged
+/// before the rows were stored (a stopped agent's, say) answers older
+/// messages. So a waiting message is lost whatever follows it. A message
+/// its session still held unhandled is not lost: the next run hands it
+/// over.
 fn lost_messages(
     db: &Db,
     progress: &Progress,
@@ -2010,10 +2062,8 @@ fn lost_messages(
     let mut lost = HashMap::new();
     for (&session, rows) in &progress.owed {
         let handled = progress.held.get(&session).copied();
-        let (settling, mut waiting): (Vec<&Owed>, Vec<&Owed>) = (rows.iter())
-            .filter(|owed| handled.is_none_or(|handled| owed.seq <= handled))
-            .partition(|owed| owed.settling);
         let mut errored = HashSet::new();
+        let mut working = HashSet::new();
         let mut states = db.conn().prepare_cached(OWED_STATES_SQL)?;
         let mut states = states.query(rusqlite::params![session.0.to_string(), accounted])?;
         while let Some(row) = states.next()? {
@@ -2021,13 +2071,17 @@ fn lost_messages(
             let state: String = row.get(1)?;
             if state == "errored" {
                 errored.insert(context);
-            } else if let Some(first) = waiting.iter().position(|owed| owed.context == context) {
-                waiting.remove(first);
+            } else {
+                working.insert(context);
             }
         }
-        let mut unsettled: Vec<&Owed> = (settling.into_iter())
-            .filter(|owed| !errored.contains(&owed.context))
-            .chain(waiting)
+        let mut unsettled: Vec<&Owed> = (rows.iter())
+            .filter(|owed| handled.is_none_or(|handled| owed.seq <= handled))
+            .filter(|owed| match owed.state {
+                OwedState::Waiting => true,
+                OwedState::Starting => !working.contains(&owed.context),
+                OwedState::Settling => !errored.contains(&owed.context),
+            })
             .collect();
         unsettled.sort_by_key(|owed| owed.seq);
         let contexts: &mut HashMap<ContextId, Vec<Seq>> = lost.entry(session).or_default();
@@ -2066,16 +2120,17 @@ fn load_progress(db: &Db) -> Result<Progress> {
     }
     let mut owed: HashMap<SessionId, Vec<Owed>> = HashMap::new();
     let mut rows = db.conn().prepare_cached(
-        "SELECT seq, session_id, context, settling FROM supervisor_owed ORDER BY seq",
+        "SELECT seq, session_id, context, state FROM supervisor_owed ORDER BY seq",
     )?;
     let mut rows = rows.query([])?;
     while let Some(row) = rows.next()? {
         let session: String = row.get(1)?;
         let context: String = row.get(2)?;
+        let state: String = row.get(3)?;
         owed.entry(parse_id(&session)?).or_default().push(Owed {
             seq: from_sql(row.get(0)?)?,
             context: parse_id(&context)?,
-            settling: row.get(3)?,
+            state: OwedState::from_sql(&state)?,
         });
     }
     Ok(Progress {
@@ -2123,14 +2178,14 @@ fn write_owed(tx: &rusqlite::Transaction<'_>, owed: &HashMap<SessionId, Vec<Owed
     for (session, rows) in owed {
         for row in rows {
             tx.prepare_cached(
-                "INSERT INTO supervisor_owed (seq, session_id, context, settling) \
+                "INSERT INTO supervisor_owed (seq, session_id, context, state) \
                  VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(rusqlite::params![
                 to_sql(row.seq)?,
                 session.0.to_string(),
                 row.context.0.to_string(),
-                row.settling,
+                row.state.sql(),
             ])?;
         }
     }

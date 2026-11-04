@@ -9,8 +9,10 @@
 //!
 //! **Turns.** The adapter, not the CLI, queues a message sent while a turn
 //! runs: the next user message is written only after the turn's `result`, so
-//! every written message is exactly one turn, framed by `TurnStarted` and
-//! exactly one `TurnEnded`. The `result` ending a turn also gives what the
+//! every written message is exactly one turn, framed by `TurnStarted
+//! { message: true }` and exactly one `TurnEnded`. A turn the CLI starts on
+//! its own (a `system/init` with no turn open: a wakeup, a background job's
+//! report) is framed the same, with `message: false`. The `result` ending a turn also gives what the
 //! turn took, reported just before as `TurnUsage` ([`usage::turn_usage`]).
 //!
 //! **Approvals.** A `can_use_tool` request is reported as `ApprovalRequested`
@@ -772,8 +774,9 @@ impl Protocol {
 
     /// Reports `TurnStarted`, after the resume handle when it is the first
     /// turn of a fresh process: from that message on the CLI has a
-    /// conversation to resume.
-    fn open_turn(&mut self, out: &mut Output) {
+    /// conversation to resume. `message`: the turn is the one of a message
+    /// just written, not one the CLI started on its own.
+    fn open_turn(&mut self, message: bool, out: &mut Output) {
         self.turn_open = true;
         self.interrupt_sent = false;
         // What went wrong before this turn does not explain a later exit.
@@ -784,7 +787,7 @@ impl Protocol {
             out.events
                 .push(AdapterEvent::ResumeHandle(resume_handle(self.session_id)));
         }
-        out.events.push(AdapterEvent::TurnStarted);
+        out.events.push(AdapterEvent::TurnStarted { message });
     }
 
     fn request_id(&mut self) -> String {
@@ -837,7 +840,7 @@ impl Protocol {
             writes: vec![user_message(text)],
             events: Vec::new(),
         };
-        self.open_turn(&mut out);
+        self.open_turn(true, &mut out);
         out
     }
 
@@ -897,8 +900,9 @@ impl Protocol {
             report_again = self.handle_reported;
         }
         if !self.turn_open {
-            // A turn the CLI started on its own; frame it all the same.
-            self.open_turn(out);
+            // A turn the CLI started on its own; frame it all the same. It
+            // answers no message: one written meanwhile waits in `queued`.
+            self.open_turn(false, out);
         }
         if report_again {
             out.events

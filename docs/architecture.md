@@ -287,13 +287,16 @@ the daemon's appends, which would otherwise stop `serve` (below).
   the next run. Messages are delivered at most once: the supervisor stores
   each message as owed (handed over, its turn not started) before the agent
   gets it, and drops it once the agent's `AgentWorking` for it, or an
-  `Errored` reporting it, is logged. Every message handed to an agent thus
-  ends with its turn or exactly one `Errored` in its context, and one the
-  agent answered is never errored, with one exception: a turn the agent
-  starts on its own (a wakeup) looks like a message's turn, so a message
-  queued behind it is taken as started; a daemon stop or crash during that
-  turn then reports only the lost turn, not the message (follow-up task
-  c48616, "Tie each agent turn to the message it answers"). Messages an agent accepted but never
+  `Errored` reporting it, is logged. The adapter says which turns are a
+  message's (`TurnStarted { message }`): a turn the agent starts on its
+  own (a wakeup, a background job's report) answers no message, so a
+  message queued behind it stays owed. Each settling event is tied to its
+  message by position: the message is stored as *starting* (or
+  *settling*, for an `Errored`) just before the event is logged, and a
+  restart counts only such an event, logged after the stored rows, as
+  settling it. Every message handed to an agent thus ends with its turn
+  or exactly one `Errored` in its context, and one the agent answered is
+  never errored. Messages an agent accepted but never
   began (queued behind a turn when it is stopped, killed or crashes) are
   named in the one `Errored` its exit logs, ending "N queued messages were
   not sent to the agent; send them again" (counted by the adapter's
