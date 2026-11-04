@@ -40,4 +40,6 @@ test's workdir.
 Not recorded, built by the tests from these files instead: a file whose
 name is not a UUID (two_turn under `x.jsonl`), sidechain lines inside a
 main file, an `ai-title` line (`-p` writes none; the shape is the one seen
-in interactive transcripts), a rewound branch, a cut-short last line.
+in interactive transcripts), `/rename`'s `custom-title` and `agent-name`
+lines (shape from a 2.1.310 `-p` probe, §6c), a rewound branch, a
+cut-short last line.
