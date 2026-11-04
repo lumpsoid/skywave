@@ -85,7 +85,7 @@ fn main() -> ExitCode {
     match skywave_tui::run(&core, notify) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("skywave-tui: terminal: {err}");
+            eprintln!("skywave-tui: {err}");
             ExitCode::FAILURE
         }
     }

@@ -18,7 +18,7 @@ use skywave_proto::{
 };
 
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
-use crate::client::{BlobLease, Core, CoreError, State, lock};
+use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
 use crate::store::{
@@ -103,6 +103,20 @@ impl Seam {
             epoch: Some(state.server_epoch),
         };
         Some((bound, identity))
+    }
+
+    /// Spawns `work`, as `what`, on the current runtime; a panic in it
+    /// fails the core ([`Core::on_failure`]).
+    pub(crate) fn spawn(
+        &self,
+        what: &'static str,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(failing_on_panic(
+            Arc::downgrade(&self.core.shared),
+            what,
+            work,
+        ))
     }
 
     /// Whether this handle may still write to `state`.

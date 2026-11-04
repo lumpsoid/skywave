@@ -277,7 +277,7 @@ pub(crate) struct Engine {
     retry_now: Arc<Notify>,
     link: Option<JoinHandle<()>>,
     /// The blob downloader, running while the link does.
-    downloader: Option<JoinHandle<Infallible>>,
+    downloader: Option<JoinHandle<()>>,
     /// The server refused the device; no link until the next `Connect`.
     rejected: watch::Sender<bool>,
     /// Blobs waiting for the downloader; outlives each downloader.
@@ -344,7 +344,7 @@ impl Engine {
                 let seam = self.seam.clone();
                 let config = self.config.clone();
                 let name = self.device_name.clone();
-                tokio::spawn(async move {
+                self.seam.spawn("pairing", async move {
                     pair_and_report(
                         &seam,
                         &address,
@@ -379,7 +379,7 @@ impl Engine {
                     seam.dirs_listed(req, Err(not_connected()));
                     return;
                 };
-                tokio::spawn(async move {
+                self.seam.spawn("a directory listing", async move {
                     let result = tokio::time::timeout(DIRS_TIMEOUT, transport.list_dirs(&dir))
                         .await
                         .unwrap_or(Err(TransportError::Timeout));
@@ -392,7 +392,7 @@ impl Engine {
                     seam.conversations_listed(req, Err(not_connected()));
                     return;
                 };
-                tokio::spawn(async move {
+                self.seam.spawn("a conversation listing", async move {
                     let result =
                         tokio::time::timeout(CONVERSATIONS_TIMEOUT, transport.list_conversations())
                             .await
@@ -406,7 +406,7 @@ impl Engine {
                     answer_workdir(&seam, req, ask, Err(not_connected()));
                     return;
                 };
-                tokio::spawn(async move {
+                self.seam.spawn("a workdir read", async move {
                     let result =
                         tokio::time::timeout(WORKDIR_TIMEOUT, read_workdir(&*transport, &ask))
                             .await
@@ -461,13 +461,16 @@ impl Engine {
         let Some(address) = address else {
             return;
         };
-        let downloader = tokio::spawn(run_downloader(BlobCtx {
+        let blobs = BlobCtx {
             seam: seam.clone(),
             config: self.config.clone(),
             address: address.clone(),
             identity: identity.clone(),
             queue: self.blobs.clone(),
-        }));
+        };
+        let downloader = self.seam.spawn("the blob downloader", async move {
+            match run_downloader(blobs).await {}
+        });
         let stop_downloader = downloader.abort_handle();
         self.downloader = Some(downloader);
         let ctx = LinkCtx {
@@ -480,7 +483,7 @@ impl Engine {
             identity,
         };
         let rejected = self.rejected.clone();
-        self.link = Some(tokio::spawn(async move {
+        self.link = Some(self.seam.spawn("the link", async move {
             let rejection = run_link(ctx).await;
             tracing::warn!(?rejection, "the server refused this device; sync stopped");
             stop_downloader.abort();

@@ -5,8 +5,9 @@
 //! each arm hands its input to the head and carries out what comes back.
 //!
 //! A panic in the task (an index out of range, an overflow: clippy denies
-//! only the explicit kinds), in opening the core, or on the dispatch thread
-//! is caught where it happens: the core is closed, Dart gets `HubFailed`,
+//! only the explicit kinds), in opening the core, on the dispatch thread or
+//! on the core's own threads ([`skywave_core::Core::on_failure`]) is caught
+//! where it happens: the core is closed, Dart gets `HubFailed`,
 //! and the task waits for the next `Boot` to open the core again with a
 //! fresh head. Intents Dart sent before it saw `HubFailed` never reach that
 //! head ([`Gate`]).
@@ -151,7 +152,7 @@ enum Served {
 }
 
 /// Runs the loop over `hub` until `stop` fires, then closes the core. A
-/// panic, in the loop or on the dispatch thread, ends the loop where it
+/// panic, in the loop, on the dispatch thread or on the core's own threads, ends the loop where it
 /// happens, and the core is closed all the same: actions dispatched before
 /// it are applied (on the dispatch thread, those before the one that
 /// panicked), but nothing is asked of the head, so the stop's last draft
@@ -169,7 +170,7 @@ async fn serve(
     match ran {
         Ok(Ok(())) => Served::Stopped,
         Ok(Err(message)) => {
-            tracing::error!("hub's dispatch thread failed: {message}");
+            tracing::error!("hub's dispatch thread or core failed: {message}");
             Served::Failed(message)
         }
         Err(message) => {
@@ -179,7 +180,8 @@ async fn serve(
     }
 }
 
-/// The loop. `Err`: the dispatch thread panicked with this message.
+/// The loop. `Err`: the dispatch thread or the core's own threads failed,
+/// with this message.
 async fn run(
     hub: &mut Running,
     boot: &SignalReceiver<DartSignalPack<Boot>>,
@@ -222,6 +224,10 @@ async fn run(
                 Some(Report::Panicked { message, .. }) => return Err(message),
                 None => return Err("the dispatch thread ended".to_owned()),
             },
+            // The core's engine or delivery thread panicked: sync or
+            // snapshots may have stopped for good. Closed only with the
+            // core, so this branch then just goes quiet.
+            Ok(message) = &mut hub.failed => return Err(message),
             () = sleep_until(wake.unwrap_or_else(TokioInstant::now)), if wake.is_some() => {
                 head.on_wake(Clock::read())
             }
@@ -401,6 +407,42 @@ mod tests {
         assert_eq!(message, "dispatch blew up");
 
         // Closed as after any panic: the core opens again at once.
+        let hub = reopen(dir.path()).await;
+        assert!(matches!(
+            serve(hub, &boot, &intents, &mut Gate::default(), &mut stopped()).await,
+            Served::Stopped
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_core_fails_the_hub_and_a_reboot_opens_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = Boot::get_dart_signal_receiver();
+        let intents = GuiIntent::get_dart_signal_receiver();
+        let (_running, never) = oneshot::channel();
+        let mut stop = Stop::new(never);
+
+        // The core reports a panic on its engine, as its watcher would.
+        let mut hub = reopen(dir.path()).await;
+        let (failing, failed) = oneshot::channel();
+        hub.failed = failed;
+        failing
+            .send("the sync engine panicked: engine blew up".to_owned())
+            .unwrap();
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(hub, &boot, &intents, &mut Gate::default(), &mut stop),
+        )
+        .await
+        .expect("the hub noticed the core's failure");
+        let Served::Failed(message) = served else {
+            panic!("the hub stopped without failing");
+        };
+        assert_eq!(message, "the sync engine panicked: engine blew up");
+
+        // Closed as after any panic: the core opens again at once, and a
+        // core that never fails serves until stopped.
         let hub = reopen(dir.path()).await;
         assert!(matches!(
             serve(hub, &boot, &intents, &mut Gate::default(), &mut stopped()).await,
