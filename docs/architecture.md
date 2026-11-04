@@ -268,16 +268,25 @@ the daemon's appends, which would otherwise stop `serve` (below).
   session has settled. Those waiting events are persisted with the cursor,
   so a restart handles them rather than losing them, and a daemon shutdown
   drops a start under way (killing its agent) and leaves its message for
-  the next run. Messages are delivered at most once (the supervisor stores
-  a message as handed over before the agent gets it); the last message
-  handed over, if no agent took it (no `AgentWorking` or `Errored` after it
-  in its context), gets `Errored` ("message lost when the server stopped;
-  send it again") on the next start, once. Messages an agent accepted but never began (queued behind a
-  turn when it is stopped, killed or crashes) are counted by the adapter's
-  `Exited`; the one `Errored` its exit logs ends with "N queued messages were
-  not sent to the agent; send them again". They are reported, not
-  redelivered: the user stopped the work, or a crash leaves delivery at most
-  once. A daemon shutdown does not report them yet. If the supervisor
+  the next run. Messages are delivered at most once: the supervisor stores
+  each message as owed (handed over, its turn not started) before the agent
+  gets it, and drops it once the agent's `AgentWorking` for it, or an
+  `Errored` reporting it, is logged. Every message handed to an agent thus
+  ends with its turn or exactly one `Errored` in its context, and one the
+  agent answered is never errored, with one exception: a turn the agent
+  starts on its own (a wakeup) looks like a message's turn, so a message
+  queued behind it is taken as started; a daemon stop or crash during that
+  turn then reports only the lost turn, not the message (follow-up task
+  c48616, "Tie each agent turn to the message it answers"). Messages an agent accepted but never
+  began (queued behind a turn when it is stopped, killed or crashes) are
+  named in the one `Errored` its exit logs, ending "N queued messages were
+  not sent to the agent; send them again" (counted by the adapter's
+  `Exited`, or by the supervisor when that is more). The messages still
+  owed when the daemon stopped, cleanly or not, in any session, are
+  reported on the next start, once: "message lost when the server stopped;
+  send it again", or, queued behind a turn lost with the daemon, in that
+  turn's `Errored`. They are reported, not redelivered: the user stopped
+  the work, or a crash leaves delivery at most once. If the supervisor
   fails, `serve` stops rather than accept messages no agent would hear.
   It fails only when it cannot read or append to the log (an append it
   skipped would leave the log without an event the mapper counts as

@@ -93,7 +93,9 @@
 //!
 //! **Slow starts and stops.** [`FakeAgent::hold_start`] and
 //! [`FakeAgent::hold_shutdown`] hold one session's next start or shutdown
-//! on a [`Gate`], like a CLI slow to answer its handshake or to exit.
+//! on a [`Gate`], like a CLI slow to answer its handshake or to exit. A
+//! shutdown abandons the running turn (no `TurnEnded`) unless
+//! [`FakeScript::end_turns_on_shutdown`] has it end the turn first.
 //!
 //! **Outside conversations.** [`FakeOutside`] is a scripted
 //! [`OutsideConversations`] source, apart from [`FakeAgent`]: its listing
@@ -136,6 +138,7 @@ pub struct FakeScript {
     models: Vec<ModelChoice>,
     refuse_stops: bool,
     shutdown_barrier: Option<Arc<Barrier>>,
+    end_turns_on_shutdown: bool,
 }
 
 impl FakeScript {
@@ -171,6 +174,14 @@ impl FakeScript {
     /// way at once: shutdowns that run one after another never return.
     pub fn shutdowns_wait_for_each_other(mut self, sessions: usize) -> FakeScript {
         self.shutdown_barrier = Some(Arc::new(Barrier::new(sessions)));
+        self
+    }
+
+    /// Ends a turn a shutdown stops `Interrupted` before exiting, like a
+    /// CLI that answers the interrupt it was sent, rather than abandoning
+    /// it. Messages queued behind it still never run.
+    pub fn end_turns_on_shutdown(mut self) -> FakeScript {
+        self.end_turns_on_shutdown = true;
         self
     }
 
@@ -840,6 +851,9 @@ enum Flow {
     Ended(TurnOutcome),
     /// The session is over; `Exited` was or must be emitted.
     Exit(Option<String>),
+    /// A shutdown stopped the turn; see
+    /// [`FakeScript::end_turns_on_shutdown`].
+    Shutdown,
 }
 
 /// Why a blocked or running turn stops early.
@@ -852,7 +866,7 @@ impl Stop {
     fn flow(self) -> Flow {
         match self {
             Stop::Interrupt => Flow::Ended(TurnOutcome::Interrupted),
-            Stop::Shutdown => Flow::Exit(None),
+            Stop::Shutdown => Flow::Shutdown,
         }
     }
 }
@@ -921,6 +935,7 @@ impl Runner {
                         }
                     }
                     Flow::Exit(error) => break error,
+                    Flow::Shutdown => break self.shut_down_in_turn().await,
                 }
                 continue;
             }
@@ -978,11 +993,22 @@ impl Runner {
                     }
                 }
                 Flow::Exit(error) => break error,
+                Flow::Shutdown => break self.shut_down_in_turn().await,
             }
         };
         // Messages queued behind the turn it stopped in never run.
         let unsent = self.queued.len();
         self.emit(AdapterEvent::Exited { error, unsent }).await;
+    }
+
+    /// A shutdown stopped the running turn: ends it, if the script says so.
+    /// The exit's error: none.
+    async fn shut_down_in_turn(&mut self) -> Option<String> {
+        if self.script.end_turns_on_shutdown {
+            let ended = AdapterEvent::TurnEnded(TurnOutcome::Interrupted);
+            self.emit(ended).await;
+        }
+        None
     }
 
     /// The earliest wakeup that is due, if one is; of those due at once,

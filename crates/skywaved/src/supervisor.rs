@@ -147,9 +147,12 @@
 //! Messages it accepted and never began a turn for (queued behind a turn it
 //! crashed or was killed in, or not read before it left) are counted by its
 //! `Exited` and named in the one `Errored` the mapper logs for the exit
-//! ("N queued messages were not sent to the agent; send them again"). They
-//! are reported, never redelivered: delivery is at most once (below), and
-//! after a stop the user chose to end the work.
+//! ("N queued messages were not sent to the agent; send them again"). The
+//! supervisor counts them too, as the messages it still owes (below), and
+//! the exit names that many when the agent counted fewer (an event stream
+//! that ended without `Exited` counts none). They are reported, never
+//! redelivered: delivery is at most once (below), and after a stop the user
+//! chose to end the work.
 //!
 //! **Cursor and delivery.** The cursor (`supervisor_cursor.seq`, the seq of
 //! the last event read) is persisted, so a message accepted but not yet
@@ -157,13 +160,37 @@
 //! each held session's last handled event (`supervisor_held`): its events
 //! after that one, up to the cursor, were read but waited for a start or
 //! stop, and the next run handles them first, in order. A message whose
-//! agent was still starting is one of them. A `UserMessage`'s seq is stored
-//! as handed over (`supervisor_cursor.handed`, with the cursor) *before*
-//! the message is given to the agent: delivery is **at most once**. A crash
-//! between the two loses that message rather than running an instruction
-//! twice, which an agent with side effects could not undo; the next start
-//! says so with `Errored` (below), so the user can resend it. All three are
-//! written in one transaction. Answers and interrupts need no such care:
+//! agent was still starting is one of them. A `UserMessage` is stored as
+//! *owed* (`supervisor_owed`, with the cursor) *before* the message is
+//! given to the agent: delivery is **at most once**. A crash between the
+//! two loses that message rather than running an instruction twice, which
+//! an agent with side effects could not undo; the next start says so with
+//! `Errored` (below), so the user can resend it. All of these are written
+//! in one transaction.
+//!
+//! A message stays owed until the log shows it settled, per session: the
+//! agent's next `AgentWorking` settles its oldest owed message (an agent
+//! begins the turns of the messages it was handed in order), and an
+//! `Errored` reporting it (the agent's exit, a failed delivery) settles it
+//! too. The exception: a turn the agent starts on its own (a wakeup, or
+//! the Claude Code CLI's `system/init` with no turn open) reports the same
+//! `TurnStarted`, so a message queued behind it is settled as if its turn
+//! had begun. Should the daemon stop or crash during that turn, the
+//! restart logs only the lost turn's `Errored` (and a clean shutdown drops
+//! the exit's unsent count), so that message gets neither its turn nor an
+//! `Errored` of its own. Follow-up task c48616 ("Tie each agent turn to
+//! the message it answers") closes this. Such an `Errored` is tied to the messages it reports by position,
+//! never by merely following them: they are first stored as *settling*,
+//! with the log's last seq (`supervisor_cursor.accounted`), and only an
+//! `Errored` in their context after that seq settles them. So a stopped
+//! agent's exit, logged after a message that waited for the stop, does not
+//! answer that message. The rows are rewritten, stamped with the log's last
+//! seq, whenever they change; a state event the supervisor logged after
+//! the stamp but before the next write is read back from the log on
+//! restart (see `lost_messages`), so the gap between logging an event and
+//! storing what it settled neither loses nor double-reports a message.
+//! Nothing outlives its settlement: a message answered long ago is never
+//! reported by a later restart. Answers and interrupts need no such care:
 //! after a restart their approvals and turns are already settled (below),
 //! so replaying them does nothing.
 //!
@@ -195,16 +222,18 @@
 //! - a session whose last state event is `TurnInterrupted` gets
 //!   `SessionStateChanged(Idle)`: its agent stopped with the daemon.
 //!   Both are stamped with the context of the state event they settle;
-//! - when the last message handed to an agent (stored just before it is
-//!   handed over) is one no agent took (nothing after it in its session and
-//!   context is `SessionStateChanged` to `AgentWorking` or `Errored`), its
-//!   session gets `SessionStateChanged(Errored)` ([`MESSAGE_LOST`]) stamped
-//!   with the message's context. Only that message is looked at. It is
-//!   decided after the turn above, whose `Errored` already covers a message
-//!   queued behind a lost turn, and the `Errored` it logs keeps a later
-//!   start from logging it again. A clean shutdown that stopped an agent
-//!   before it began the message's turn loses the message too, and is
-//!   settled the same way;
+//! - the messages still owed (above), in every session, were taken by no
+//!   agent: each session gets one `SessionStateChanged(Errored)` per context
+//!   they were sent in, stamped with it, naming them ([`MESSAGE_LOST`] for
+//!   one, "N messages lost…" for more). Messages queued behind a turn lost
+//!   with the daemon (above, in the same context) are named in that turn's
+//!   `Errored` instead ("…; N queued messages were not sent to the agent;
+//!   send them again"), so each gets exactly one. They are decided before
+//!   anything is logged and stored as settling before they are reported,
+//!   so a recovery that dies midway reports none twice. A clean shutdown
+//!   that stopped an agent before it began a message's turn leaves the
+//!   message owed, and it is settled the same way. A message its session
+//!   still held unhandled is not lost: the next run hands it over;
 //! - a mode, model or effort request still open whose event the supervisor had
 //!   already handled is refused ([`DAEMON_RESTARTED`]): the agent it was
 //!   handed to is gone. One after the cursor, or held for its session's
@@ -220,8 +249,8 @@
 //! none of its approvals) and does not record their exit. Open turns and
 //! approvals stay as they are in the log, and the next start settles them the
 //! same way whether the daemon stopped cleanly or crashed. The unsent count
-//! that `Exited` carries is dropped with it, so a message queued behind
-//! such a turn is not reported. A pending approval
+//! that `Exited` carries is dropped with it; the messages it counted stay
+//! owed, and the next start reports them (above). A pending approval
 //! cannot outlive the daemon: the agent's request for it lives only in the
 //! agent process (D8). The agents stop concurrently, together with the stops
 //! already under way (recorded as they were requested), so shutdown takes
@@ -274,7 +303,7 @@ use tokio::time::Instant;
 
 use crate::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentSession, Conversation, EventMapper,
-    StartSpec, bounded_models, load_grants, load_origin, load_resume_handle,
+    StartSpec, bounded_models, load_grants, load_origin, load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -286,8 +315,8 @@ pub const DAEMON_RESTARTED: &str = "daemon restarted";
 /// `Errored` message for a session whose turn was running when the daemon
 /// stopped.
 pub const TURN_LOST: &str = "daemon restarted during a turn";
-/// `Errored` message for a message the cursor had passed but no agent took
-/// before the daemon stopped (at-most-once delivery).
+/// `Errored` message for a message handed to an agent that did not begin
+/// its turn before the daemon stopped (at-most-once delivery).
 pub const MESSAGE_LOST: &str = "message lost when the server stopped; send it again";
 /// Why a task stop is refused when the session has no agent running.
 pub const AGENT_NOT_RUNNING: &str = "agent not running";
@@ -370,8 +399,9 @@ pub struct Supervisor<A: AgentAdapter> {
     config: SupervisorConfig,
     /// Seq of the last log event read: handled, or waiting in [`Held`].
     cursor: Seq,
-    /// Seq of the last `UserMessage` handed to an agent.
-    handed: Seq,
+    /// Each session's messages handed to its agent whose turn has not
+    /// started, in handing order; a session owing none has no entry.
+    owed: HashMap<SessionId, Vec<Owed>>,
     /// The progress as last persisted.
     stored: Progress,
     running: HashMap<SessionId, Running<A::Session>>,
@@ -389,13 +419,27 @@ pub struct Supervisor<A: AgentAdapter> {
 type Started<S> = Result<(S, AdapterEvents), AgentError>;
 
 /// What the supervisor persists of where it is, besides the log
-/// (`supervisor_cursor` and `supervisor_held`).
+/// (`supervisor_cursor`, `supervisor_held` and `supervisor_owed`).
 #[derive(Debug, Clone, PartialEq)]
 struct Progress {
     cursor: Seq,
-    handed: Seq,
     /// [`Held::handled`] of every held session.
     held: HashMap<SessionId, Seq>,
+    /// [`Supervisor::owed`].
+    owed: HashMap<SessionId, Vec<Owed>>,
+}
+
+/// A `UserMessage` handed to its session's agent whose turn has not
+/// started. It leaves [`Supervisor::owed`] once the agent's
+/// `AgentWorking` for it is logged, or an `Errored` naming it is.
+#[derive(Debug, Clone, PartialEq)]
+struct Owed {
+    seq: Seq,
+    context: ContextId,
+    /// An `Errored` reporting it is about to be logged in its context (the
+    /// agent's exit, a failed delivery, a restart's): once that is in the
+    /// log, it is settled.
+    settling: bool,
 }
 
 /// A session whose agent is starting or stopping. Its events read
@@ -563,6 +607,30 @@ impl<A: AgentAdapter> Supervisor<A> {
     /// Settles what the previous run left open; see the module docs.
     fn recover(&mut self) -> Result<()> {
         let db = &mut self.storage.db;
+        let progress = load_progress(db)?;
+        // Decided before anything below is logged: the log after the stored
+        // rows tells which of them an agent took.
+        let mut lost = lost_messages(db, &progress)?;
+        // Logged once even if this run dies before clearing them: a next
+        // run finds their `Errored` after the rows.
+        let settling: HashMap<SessionId, Vec<Owed>> = (lost.iter())
+            .map(|(&session, contexts)| {
+                let rows = (contexts.iter())
+                    .flat_map(|(context, seqs)| {
+                        seqs.iter().map(|&seq| Owed {
+                            seq,
+                            context: *context,
+                            settling: true,
+                        })
+                    })
+                    .collect();
+                (session, rows)
+            })
+            .collect();
+        let owed_any = !progress.owed.is_empty();
+        if owed_any {
+            store_owed(db, &settling)?;
+        }
         for approval in self.log.pending_approvals(db)? {
             self.log
                 .cancel_approval(db, approval.id, DAEMON_RESTARTED)?;
@@ -587,9 +655,17 @@ impl<A: AgentAdapter> Supervisor<A> {
             };
             let settle = match kind {
                 EventKind::SessionStateChanged(SessionState::AgentWorking) => {
-                    SessionState::Errored {
-                        message: TURN_LOST.to_owned(),
-                    }
+                    // Messages queued behind the lost turn are named in
+                    // its `Errored`, as an agent's exit names them.
+                    let queued = lost
+                        .get_mut(&session.id)
+                        .and_then(|contexts| contexts.remove(&context))
+                        .and_then(|seqs| unsent_notice(seqs.len()));
+                    let message = match queued {
+                        Some(notice) => format!("{TURN_LOST}; {notice}"),
+                        None => TURN_LOST.to_owned(),
+                    };
+                    SessionState::Errored { message }
                 }
                 EventKind::TurnInterrupted => SessionState::Idle,
                 _ => continue,
@@ -602,7 +678,28 @@ impl<A: AgentAdapter> Supervisor<A> {
                 EventKind::SessionStateChanged(settle),
             )?;
         }
-        let progress = load_progress(db)?;
+        // After the turns above, whose `Errored` named the messages queued
+        // behind them.
+        let mut lost: Vec<(SessionId, ContextId, Vec<Seq>)> = (lost.into_iter())
+            .flat_map(|(session, contexts)| {
+                (contexts.into_iter()).map(move |(context, seqs)| (session, context, seqs))
+            })
+            .collect();
+        lost.sort_by_key(|(_, _, seqs)| seqs.first().copied());
+        for (session_id, context, seqs) in lost {
+            tracing::info!(session = %session_id.0, ?seqs, "erroring messages lost with the daemon");
+            self.log.append(
+                db,
+                session_id,
+                context,
+                EventKind::SessionStateChanged(SessionState::Errored {
+                    message: messages_lost(seqs.len()),
+                }),
+            )?;
+        }
+        if owed_any {
+            store_owed(db, &HashMap::new())?;
+        }
         // Read but not handled yet: it waited for its session's agent.
         let queued = |session: SessionId, seq: Seq| {
             progress
@@ -610,21 +707,6 @@ impl<A: AgentAdapter> Supervisor<A> {
                 .get(&session)
                 .is_some_and(|&handled| seq > handled)
         };
-        // After the turns above: a turn lost with the daemon already took
-        // the message, and its `Errored` says so.
-        if let Some((session_id, context)) = lost_message(db, progress.handed)?
-            && !queued(session_id, progress.handed)
-        {
-            tracing::info!(session = %session_id.0, "erroring a message lost with the daemon");
-            self.log.append(
-                db,
-                session_id,
-                context,
-                EventKind::SessionStateChanged(SessionState::Errored {
-                    message: MESSAGE_LOST.to_owned(),
-                }),
-            )?;
-        }
         for session in self.log.sessions(db)? {
             let work = self.log.agent_work(db, session.id)?;
             let mut ended = Vec::new();
@@ -650,7 +732,6 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
         }
         self.cursor = progress.cursor;
-        self.handed = progress.handed;
         for session in self.log.sessions(db)? {
             let settings = self.log.agent_settings(db, session.id)?;
             let handled = |command| -> Result<bool> {
@@ -695,7 +776,10 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
         self.models = self.log.offered_models(db)?;
         self.held = self.held_events(&progress)?;
-        self.stored = progress;
+        self.stored = Progress {
+            owed: HashMap::new(),
+            ..progress
+        };
         Ok(())
     }
 
@@ -1176,8 +1260,11 @@ impl<A: AgentAdapter> Supervisor<A> {
         };
         let text = text.clone();
         // At most once: stored as handed over before the agent gets it.
-        let handed = self.handed;
-        self.handed = item.seq;
+        self.owed.entry(session_id).or_default().push(Owed {
+            seq: item.seq,
+            context: item.event.context,
+            settling: false,
+        });
         self.mark_handled(session_id, item.seq);
         self.store_progress()?;
         let Some(running) = self.running.get_mut(&session_id) else {
@@ -1194,7 +1281,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         if !item.retried {
             // The agent did not take it: it is not handed over.
             tracing::warn!(session = %session_id.0, %error, "cannot send message; restarting agent");
-            self.handed = handed;
+            self.forget_owed(session_id, |owed| owed.seq == item.seq);
             self.begin_stop(session_id, true);
             let retried = true;
             self.held_mut(session_id)?
@@ -1202,7 +1289,78 @@ impl<A: AgentAdapter> Supervisor<A> {
             return Ok(());
         }
         let message = format!("cannot deliver message: {error}");
-        self.message_failed(session_id, item.event.context, message)
+        self.settling(session_id, |owed| owed.seq == item.seq)?;
+        self.message_failed(session_id, item.event.context, message)?;
+        self.forget_owed(session_id, |owed| owed.seq == item.seq);
+        Ok(())
+    }
+
+    /// Marks session `id`'s owed messages that `which` picks as settling
+    /// and stores that, before the `Errored` reporting them is logged; how
+    /// many there are.
+    fn settling(&mut self, id: SessionId, which: impl Fn(&Owed) -> bool) -> Result<usize> {
+        let Some(owed) = self.owed.get_mut(&id) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for owed in owed.iter_mut().filter(|owed| which(owed)) {
+            owed.settling = true;
+            count += 1;
+        }
+        self.store_progress()?;
+        Ok(count)
+    }
+
+    /// Drops session `id`'s owed messages that `which` picks: settled, or
+    /// not handed over after all.
+    fn forget_owed(&mut self, id: SessionId, which: impl Fn(&Owed) -> bool) {
+        if let Some(owed) = self.owed.get_mut(&id) {
+            owed.retain(|owed| !which(owed));
+            if owed.is_empty() {
+                self.owed.remove(&id);
+            }
+        }
+    }
+
+    /// Session `id`'s agent logged `AgentWorking`: the turn of the oldest
+    /// message it owes has started (an agent begins the turns of the
+    /// messages it was handed in order).
+    fn turn_started(&mut self, id: SessionId) {
+        if let Some(owed) = self.owed.get_mut(&id)
+            && let Some(first) = owed.iter().position(|owed| !owed.settling)
+        {
+            owed.remove(first);
+            if owed.is_empty() {
+                self.owed.remove(&id);
+            }
+        }
+    }
+
+    /// Readies session `id`'s agent's `event` for its mapper. An exit
+    /// reports every message the agent still owes: they are marked
+    /// settling, and their count goes into its `unsent` when the agent
+    /// counted fewer (an event stream that ended without `Exited` counts
+    /// none), so the exit's one `Errored` names them all.
+    fn before_mapping(&mut self, id: SessionId, event: AdapterEvent) -> Result<AdapterEvent> {
+        let AdapterEvent::Exited { error, unsent } = event else {
+            return Ok(event);
+        };
+        let owed = self.settling(id, |_| true)?;
+        Ok(AdapterEvent::Exited {
+            error,
+            unsent: unsent.max(owed),
+        })
+    }
+
+    /// Keeps [`Supervisor::owed`] in step with what the mapper just logged
+    /// for session `id`'s agent, `seqs`: an exit settled every message
+    /// owed, an `AgentWorking` the oldest.
+    fn after_mapping(&mut self, id: SessionId, exited: bool, started: bool, seqs: &[Seq]) {
+        if exited {
+            self.forget_owed(id, |_| true);
+        } else if started && !seqs.is_empty() {
+            self.turn_started(id);
+        }
     }
 
     /// Logs that the message sent in `context` was not delivered.
@@ -1469,7 +1627,7 @@ impl<A: AgentAdapter> Supervisor<A> {
 
     async fn on_agent_event(&mut self, id: SessionId, event: Option<AdapterEvent>) -> Result<()> {
         // A stream that ends without `Exited` is an agent that went away.
-        // What it had queued is not known then.
+        // It counts nothing unsent; the messages it owes are named anyway.
         let event = event.unwrap_or_else(|| AdapterEvent::Exited {
             error: Some("event stream ended".into()),
             unsent: 0,
@@ -1486,14 +1644,16 @@ impl<A: AgentAdapter> Supervisor<A> {
 
     /// Records `event` from session `id`'s agent in the log.
     fn map(&mut self, id: SessionId, event: AdapterEvent) -> Result<()> {
+        if !self.running.contains_key(&id) {
+            return Ok(());
+        }
+        let event = self.before_mapping(id, event)?;
         let Some(running) = self.running.get_mut(&id) else {
             return Ok(());
         };
         let started = matches!(event, AdapterEvent::TurnStarted);
-        let ended = matches!(
-            event,
-            AdapterEvent::TurnEnded(_) | AdapterEvent::Exited { .. }
-        );
+        let exited = matches!(event, AdapterEvent::Exited { .. });
+        let ended = exited || matches!(event, AdapterEvent::TurnEnded(_));
         if let AdapterEvent::ModelsOffered(models) = event {
             let context = running.context();
             return offer_models(
@@ -1521,12 +1681,14 @@ impl<A: AgentAdapter> Supervisor<A> {
         }
         // A turn the agent started on its own is work too, as is a task.
         running.settle_idle();
+        self.after_mapping(id, exited, started, &seqs);
         Ok(())
     }
 
     /// Records what session `id`'s agent reported while it stopped; with
     /// `map_exit` false (daemon shutdown), all but its final `Exited`,
-    /// leaving open turns and approvals for the next start.
+    /// leaving open turns, approvals and the messages it owes for the next
+    /// start.
     fn record_stop(&mut self, id: SessionId, halted: Halted, map_exit: bool) -> Result<()> {
         let Halted {
             mut mapper,
@@ -1547,7 +1709,11 @@ impl<A: AgentAdapter> Supervisor<A> {
                     models,
                 )?;
             } else {
-                mapper.apply(&self.log, &mut self.storage, event)?;
+                let event = self.before_mapping(id, event)?;
+                let started = matches!(event, AdapterEvent::TurnStarted);
+                let exited = matches!(event, AdapterEvent::Exited { .. });
+                let seqs = mapper.apply(&self.log, &mut self.storage, event)?;
+                self.after_mapping(id, exited, started, &seqs);
             }
         }
         tracing::info!(session = %id.0, "agent stopped");
@@ -1575,15 +1741,15 @@ impl<A: AgentAdapter> Supervisor<A> {
             .min()
     }
 
-    /// Persists the cursor, the message last handed over and what each held
-    /// session has handled, together, if any changed.
+    /// Persists the cursor, what each held session has handled and the
+    /// messages owed, together, if any changed.
     fn store_progress(&mut self) -> Result<()> {
         let progress = Progress {
             cursor: self.cursor,
-            handed: self.handed,
             held: (self.held.iter())
                 .map(|(&id, held)| (id, held.handled))
                 .collect(),
+            owed: self.owed.clone(),
         };
         if progress != self.stored {
             store_progress(&mut self.storage.db, &progress)?;
@@ -1643,11 +1809,11 @@ fn run_thread<A: AgentAdapter>(
             storage: Storage::open(data_dir)?,
             config,
             cursor: Seq::ZERO,
-            handed: Seq::ZERO,
+            owed: HashMap::new(),
             stored: Progress {
                 cursor: Seq::ZERO,
-                handed: Seq::ZERO,
                 held: HashMap::new(),
+                owed: HashMap::new(),
             },
             running: HashMap::new(),
             held: HashMap::new(),
@@ -1826,37 +1992,82 @@ fn last_work_context(db: &Db, session_id: SessionId) -> Result<Option<ContextId>
     context.map(|c| parse_id(&c)).transpose()
 }
 
-/// The session and context of the `UserMessage` at `cursor`, if no agent
-/// took it: nothing logged after it in its session and context is a
-/// `SessionStateChanged` to `AgentWorking` (a turn started) or `Errored`
-/// (its delivery failed, its agent died owing it, its turn was lost, or a
-/// previous recovery already settled it). `Idle` is no proof: it can end the
-/// turn the message was queued behind.
-fn lost_message(db: &Db, cursor: Seq) -> Result<Option<(SessionId, ContextId)>> {
-    let cursor = i64::try_from(cursor.0)
-        .map_err(|_| Error::Corrupt(format!("seq {} too large", cursor.0)))?;
-    let row: Option<(String, String)> = db
-        .conn()
-        .prepare_cached(
-            "SELECT m.session_id, m.context FROM events m \
-             WHERE m.seq = ?1 AND json_extract(m.kind, '$.type') = 'user_message' \
-             AND NOT EXISTS (SELECT 1 FROM events e \
-                 WHERE e.seq > m.seq AND e.session_id = m.session_id AND e.context = m.context \
-                 AND json_extract(e.kind, '$.type') = 'session_state_changed' \
-                 AND json_extract(e.kind, '$.state') IN ('agent_working', 'errored'))",
-        )?
-        .query_row([cursor], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    row.map(|(session, context)| Ok((parse_id(&session)?, parse_id(&context)?)))
-        .transpose()
+/// The messages of `progress.owed` no agent took, by session and context,
+/// each in handing order. The rows are as the previous run last stored
+/// them, with `supervisor_cursor.accounted`, the log's last seq then: the
+/// supervisor's own `SessionStateChanged` logged after it in the session
+/// settle what the rows do not show yet. There, each `AgentWorking`
+/// settles the oldest message owed in its context that is not settling
+/// (an agent begins the turns of the messages it was handed in order; a
+/// turn it starts on its own is miscounted, see the module docs), and
+/// an `Errored` settles those settling in its context: it is the one they
+/// were marked for. Anything else is no proof: `Idle` can end the turn a
+/// message was queued behind, and an `Errored` logged before the rows were
+/// stored (a stopped agent's, say) answers older messages. A message its
+/// session still held unhandled is not lost: the next run hands it over.
+fn lost_messages(
+    db: &Db,
+    progress: &Progress,
+) -> Result<HashMap<SessionId, HashMap<ContextId, Vec<Seq>>>> {
+    let accounted: i64 = db.conn().query_row(
+        "SELECT accounted FROM supervisor_cursor WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut lost = HashMap::new();
+    for (&session, rows) in &progress.owed {
+        let handled = progress.held.get(&session).copied();
+        let (settling, mut waiting): (Vec<&Owed>, Vec<&Owed>) = (rows.iter())
+            .filter(|owed| handled.is_none_or(|handled| owed.seq <= handled))
+            .partition(|owed| owed.settling);
+        let mut errored = HashSet::new();
+        let mut states = db.conn().prepare_cached(
+            "SELECT context, json_extract(kind, '$.state') FROM events \
+             WHERE session_id = ?1 AND seq > ?2 \
+             AND json_extract(kind, '$.type') = 'session_state_changed' \
+             AND json_extract(kind, '$.state') IN ('agent_working', 'errored') \
+             ORDER BY seq",
+        )?;
+        let mut states = states.query(rusqlite::params![session.0.to_string(), accounted])?;
+        while let Some(row) = states.next()? {
+            let context: ContextId = parse_id(&row.get::<_, String>(0)?)?;
+            let state: String = row.get(1)?;
+            if state == "errored" {
+                errored.insert(context);
+            } else if let Some(first) = waiting.iter().position(|owed| owed.context == context) {
+                waiting.remove(first);
+            }
+        }
+        let mut unsettled: Vec<&Owed> = (settling.into_iter())
+            .filter(|owed| !errored.contains(&owed.context))
+            .chain(waiting)
+            .collect();
+        unsettled.sort_by_key(|owed| owed.seq);
+        let contexts: &mut HashMap<ContextId, Vec<Seq>> = lost.entry(session).or_default();
+        for owed in unsettled {
+            contexts.entry(owed.context).or_default().push(owed.seq);
+        }
+        if contexts.is_empty() {
+            lost.remove(&session);
+        }
+    }
+    Ok(lost)
+}
+
+/// The `Errored` message for `count` messages lost with the daemon.
+fn messages_lost(count: usize) -> String {
+    match count {
+        1 => MESSAGE_LOST.to_owned(),
+        n => format!("{n} messages lost when the server stopped; send them again"),
+    }
 }
 
 fn load_progress(db: &Db) -> Result<Progress> {
-    let (cursor, handed): (i64, i64) = db.conn().query_row(
-        "SELECT seq, handed FROM supervisor_cursor WHERE id = 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let cursor: i64 =
+        db.conn()
+            .query_row("SELECT seq FROM supervisor_cursor WHERE id = 1", [], |r| {
+                r.get(0)
+            })?;
     let mut held = HashMap::new();
     let mut rows = db
         .conn()
@@ -1866,25 +2077,76 @@ fn load_progress(db: &Db) -> Result<Progress> {
         let session: String = row.get(0)?;
         held.insert(parse_id(&session)?, from_sql(row.get(1)?)?);
     }
+    let mut owed: HashMap<SessionId, Vec<Owed>> = HashMap::new();
+    let mut rows = db.conn().prepare_cached(
+        "SELECT seq, session_id, context, settling FROM supervisor_owed ORDER BY seq",
+    )?;
+    let mut rows = rows.query([])?;
+    while let Some(row) = rows.next()? {
+        let session: String = row.get(1)?;
+        let context: String = row.get(2)?;
+        owed.entry(parse_id(&session)?).or_default().push(Owed {
+            seq: from_sql(row.get(0)?)?,
+            context: parse_id(&context)?,
+            settling: row.get(3)?,
+        });
+    }
     Ok(Progress {
         cursor: from_sql(cursor)?,
-        handed: from_sql(handed)?,
         held,
+        owed,
     })
 }
 
 /// Writes `progress` in one transaction: a held session's row is never
-/// without the cursor that read its events, nor left behind one.
+/// without the cursor that read its events, nor left behind one; nor an
+/// owed message without the cursor past it.
 fn store_progress(db: &mut Db, progress: &Progress) -> Result<()> {
     let tx = event_log::begin(db)?;
-    tx.prepare_cached("UPDATE supervisor_cursor SET seq = ?1, handed = ?2 WHERE id = 1")?
-        .execute([to_sql(progress.cursor)?, to_sql(progress.handed)?])?;
+    tx.prepare_cached("UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1")?
+        .execute([to_sql(progress.cursor)?])?;
     tx.execute("DELETE FROM supervisor_held", [])?;
     for (session, &seq) in &progress.held {
         tx.prepare_cached("INSERT INTO supervisor_held (session_id, seq) VALUES (?1, ?2)")?
             .execute(rusqlite::params![session.0.to_string(), to_sql(seq)?])?;
     }
+    write_owed(&tx, &progress.owed)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Writes the messages `owed` alone; see [`store_progress`].
+fn store_owed(db: &mut Db, owed: &HashMap<SessionId, Vec<Owed>>) -> Result<()> {
+    let tx = event_log::begin(db)?;
+    write_owed(&tx, owed)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replaces the owed rows with `owed`, stamped with the log's last seq:
+/// they reflect every state event the supervisor logged up to it, and
+/// none after.
+fn write_owed(tx: &rusqlite::Transaction<'_>, owed: &HashMap<SessionId, Vec<Owed>>) -> Result<()> {
+    tx.execute(
+        "UPDATE supervisor_cursor SET accounted = (SELECT COALESCE(MAX(seq), 0) FROM events) \
+         WHERE id = 1",
+        [],
+    )?;
+    tx.execute("DELETE FROM supervisor_owed", [])?;
+    for (session, rows) in owed {
+        for row in rows {
+            tx.prepare_cached(
+                "INSERT INTO supervisor_owed (seq, session_id, context, settling) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(rusqlite::params![
+                to_sql(row.seq)?,
+                session.0.to_string(),
+                row.context.0.to_string(),
+                row.settling,
+            ])?;
+        }
+    }
     Ok(())
 }
 

@@ -876,18 +876,57 @@ async fn interrupt_accepted_while_down_ends_idle_on_restart() {
     assert!(!agent.inputs(f.session_id).contains(&FakeInput::Interrupt));
 }
 
-/// Stores `seq` as the supervisor's cursor and the message it last handed
-/// over, as a daemon that handled the log up to a message at `seq` and
-/// stopped would have left them.
+/// Stores `seq` as the supervisor's cursor and the message there as handed
+/// over with its turn not started, as a daemon that handed it over and
+/// stopped before it heard more would have left them.
 fn set_cursor(f: &Fixture, seq: Seq) {
+    let conn = f.storage.db.conn();
+    conn.execute(
+        "UPDATE supervisor_cursor SET seq = ?1, accounted = ?1 WHERE id = 1",
+        [i64::try_from(seq.0).unwrap()],
+    )
+    .unwrap();
+    set_owed(f, &[seq], false);
+}
+
+/// Stores the messages at `seqs` as handed over with their turn not
+/// started (`settling`: an `Errored` reporting them was about to be
+/// logged), replacing what was stored.
+fn set_owed(f: &Fixture, seqs: &[Seq], settling: bool) {
+    let conn = f.storage.db.conn();
+    conn.execute("DELETE FROM supervisor_owed", []).unwrap();
+    for &seq in seqs {
+        conn.execute(
+            "INSERT INTO supervisor_owed (seq, session_id, context, settling) \
+             SELECT seq, session_id, context, ?2 FROM events WHERE seq = ?1",
+            rusqlite::params![i64::try_from(seq.0).unwrap(), settling],
+        )
+        .unwrap();
+    }
+}
+
+/// Stores the log's head as what the stored messages owed reflect.
+fn set_accounted(f: &Fixture) {
     f.storage
         .db
         .conn()
         .execute(
-            "UPDATE supervisor_cursor SET seq = ?1, handed = ?1 WHERE id = 1",
-            [i64::try_from(seq.0).unwrap()],
+            "UPDATE supervisor_cursor SET accounted = (SELECT MAX(seq) FROM events) WHERE id = 1",
+            [],
         )
         .unwrap();
+}
+
+/// The messages stored as owed, in seq order.
+fn owed_rows(f: &Fixture) -> Vec<i64> {
+    let conn = f.storage.db.conn();
+    let mut stmt = conn
+        .prepare("SELECT seq FROM supervisor_owed ORDER BY seq")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
 }
 
 fn message_lost() -> EventKind {
@@ -962,6 +1001,272 @@ async fn a_message_whose_turn_was_lost_errors_once_as_a_lost_turn() {
             message: TURN_LOST.into()
         })]
     );
+}
+
+/// The session's `Errored` events after `seq`, with their stamps.
+fn errored_after(f: &Fixture, seq: Seq) -> Vec<(EventKind, ContextId)> {
+    f.stamped_after(seq)
+        .into_iter()
+        .filter(|(kind, _)| is_errored(kind))
+        .collect()
+}
+
+fn errored(message: &str) -> EventKind {
+    state(SessionState::Errored {
+        message: message.into(),
+    })
+}
+
+/// Waits until the fake got the message `text` in session `session`.
+async fn wait_message(agent: &FakeAgent, session: SessionId, text: &str) {
+    let got = message(text);
+    wait_inputs(agent, session, text, |inputs| inputs.contains(&got)).await;
+}
+
+/// A clean shutdown whose agent ends its turn before it began the messages
+/// queued behind it: the next start reports them, once, and never
+/// redelivers them.
+#[tokio::test]
+async fn a_clean_shutdown_before_queued_messages_ran_errors_them_once_on_restart() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]).end_turns_on_shutdown());
+    let supervisor = f.start(&agent).await;
+    f.send("hang");
+    f.wait_for("working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    let one = f.send("one");
+    f.send("two");
+    wait_message(&agent, f.session_id, "two").await;
+    supervisor.shutdown().await.unwrap();
+    // The turn ended at the shutdown; nothing was reported yet.
+    assert!(errored_after(&f, one).is_empty());
+    assert_eq!(owed_rows(&f).len(), 2);
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    let lost = errored("2 messages lost when the server stopped; send them again");
+    assert_eq!(errored_after(&f, one), [(lost.clone(), f.first())]);
+    assert!(owed_rows(&f).is_empty());
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, one), [(lost, f.first())]);
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [
+            f.started(false),
+            message("hang"),
+            message("one"),
+            message("two"),
+            FakeInput::Shutdown,
+        ]
+    );
+}
+
+/// A message queued behind a turn the daemon abandoned is named in the
+/// lost turn's one `Errored`.
+#[tokio::test]
+async fn a_message_queued_behind_a_lost_turn_is_named_in_its_errored() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    let hang = f.send("hang");
+    f.wait_for("working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    f.send("queued");
+    wait_message(&agent, f.session_id, "queued").await;
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        errored_after(&f, hang),
+        [(errored(&format!("{TURN_LOST}; {ONE_UNSENT}")), f.first())]
+    );
+}
+
+/// Every session's messages are checked, not only the one handed over
+/// last: another session's message handed later does not hide one whose
+/// turn never began.
+#[tokio::test]
+async fn a_restart_errors_a_lost_message_of_a_session_handed_before_another() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]).end_turns_on_shutdown());
+    let supervisor = f.start(&agent).await;
+    let a = f.session_id;
+    f.send("hang a");
+    f.wait_for("a working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    let lost = f.send("queued in a");
+    wait_message(&agent, a, "queued in a").await;
+    let b = f.create_session();
+    f.session_id = b;
+    let b_seq = f.send("hang b");
+    f.wait_for("b working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    // B's message ran its turn, which the shutdown ended.
+    assert!(errored_after(&f, b_seq).is_empty(), "{:#?}", f.kinds());
+    f.session_id = a;
+    assert_eq!(errored_after(&f, lost), [(message_lost(), f.first())]);
+}
+
+/// Starts complete out of order: a message handed over after another
+/// session's later one (a slow start) does not hide that one either.
+#[tokio::test]
+async fn a_restart_errors_a_lost_message_handed_before_an_earlier_one() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]).end_turns_on_shutdown());
+    let supervisor = f.start(&agent).await;
+    let a = f.session_id;
+    let b = f.create_session();
+    let started = Gate::new();
+    agent.hold_start(a, started.clone());
+    let a_seq = send_in(&mut f, a, "slow start");
+    wait_inputs(&agent, a, "a's start", |i| !i.is_empty()).await;
+    f.session_id = b;
+    f.send("hang b");
+    f.wait_for("b working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    let lost = f.send("queued in b");
+    wait_message(&agent, b, "queued in b").await;
+    assert!(lost > a_seq);
+    // A's message, the earlier one, is handed over last.
+    started.open();
+    wait_message(&agent, a, "slow start").await;
+    f.session_id = a;
+    f.wait_for("a working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert!(errored_after(&f, a_seq).is_empty(), "{:#?}", f.kinds());
+    f.session_id = b;
+    assert_eq!(
+        errored_after(&f, lost),
+        [(message_lost(), ContextId::first_of(b))]
+    );
+}
+
+/// An `Errored` logged before the message was handed over (a stopped
+/// agent's exit, logged after the message only because the message waited
+/// for the stop) does not answer it: a crash before the agent got the
+/// message still reports it.
+#[tokio::test]
+async fn a_stopped_agents_late_errored_does_not_hide_a_message_handed_after_it() {
+    let mut f = Fixture::new();
+    // The interrupt ends the first turn; the queued message's turn is
+    // still running when the stop ends it, which the exit reports.
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]).turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    f.send("hang");
+    f.wait_for("working", |k| {
+        k.contains(&state(SessionState::AgentWorking))
+    })
+    .await;
+    f.send("queued");
+    wait_message(&agent, f.session_id, "queued").await;
+    let stopped = Gate::new();
+    agent.hold_shutdown(f.session_id, stopped.clone());
+    accepted(f.stop());
+    wait_shutdown(&agent, &f, 1).await;
+    let during = f.send("during the stop");
+    // The stop completes; the start for the message never does.
+    agent.hold_start(f.session_id, Gate::new());
+    stopped.open();
+    f.wait_count("the stopped agent's exit", 1, is_errored)
+        .await;
+    wait_inputs(&agent, f.session_id, "the second start", |i| {
+        i.iter()
+            .filter(|i| matches!(i, FakeInput::Started { .. }))
+            .count()
+            == 2
+    })
+    .await;
+    supervisor.shutdown().await.unwrap();
+    // The exit's `Errored` follows the message in the log.
+    assert_eq!(errored_after(&f, during).len(), 1);
+
+    // As if the run had handed the message over after logging that exit,
+    // and died before the agent got it.
+    f.storage
+        .db
+        .conn()
+        .execute("DELETE FROM supervisor_held", [])
+        .unwrap();
+    set_owed(&f, &[during], false);
+    set_accounted(&f);
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    let after = errored_after(&f, during);
+    assert_eq!(after.len(), 2, "{after:#?}");
+    assert_eq!(after[1], (message_lost(), f.first()));
+    assert!(
+        !agent
+            .inputs(f.session_id)
+            .contains(&message("during the stop"))
+    );
+}
+
+/// A message marked as reported by an `Errored` about to be logged is
+/// settled once that `Errored` is in the log after the stored rows, and
+/// reported by the restart when it is not.
+#[tokio::test]
+async fn a_restart_reports_a_settling_message_only_if_its_errored_is_missing() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    let seq = f.send("lost");
+    let conn = f.storage.db.conn();
+    conn.execute(
+        "UPDATE supervisor_cursor SET seq = ?1 WHERE id = 1",
+        [i64::try_from(seq.0).unwrap()],
+    )
+    .unwrap();
+    // The `Errored` was not logged: the restart reports the message.
+    set_owed(&f, &[seq], true);
+    set_accounted(&f);
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, seq), [(message_lost(), f.first())]);
+
+    // It was logged after the rows were stored: nothing more.
+    set_owed(&f, &[seq], true);
+    f.storage
+        .db
+        .conn()
+        .execute(
+            "UPDATE supervisor_cursor SET accounted = ?1 WHERE id = 1",
+            [i64::try_from(seq.0).unwrap()],
+        )
+        .unwrap();
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, seq), [(message_lost(), f.first())]);
+    assert!(agent.inputs(f.session_id).is_empty());
 }
 
 #[tokio::test]
@@ -2045,6 +2350,26 @@ async fn a_stop_reports_a_message_queued_behind_the_turn_once() {
         "{kinds:#?}"
     );
     supervisor.shutdown().await.unwrap();
+}
+
+/// The exit of an agent stopped on request already reported its queued
+/// message: a restart does not report it again.
+#[tokio::test]
+async fn a_restart_does_not_report_a_stopped_agents_queued_message_again() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+
+    f.send("hang");
+    let hello = f.send("hello");
+    accepted(f.stop());
+    f.wait_count("errored", 1, is_errored).await;
+    supervisor.shutdown().await.unwrap();
+    assert!(owed_rows(&f).is_empty());
+
+    f.reopen_log();
+    let supervisor = start_claude(&f).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, hello), [(errored(ONE_UNSENT), f.first())]);
 }
 
 #[tokio::test]
