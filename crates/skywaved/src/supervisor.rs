@@ -99,7 +99,15 @@
 //! origin's handle) until its own copy reports a handle, so a start stopped
 //! before any message forks again; any other context starts fresh. An
 //! origin with no handle refuses the start, logged like any failed start,
-//! rather than starting fresh. The fork reads a finished conversation: the
+//! rather than starting fresh. A handle whose conversation the agent no
+//! longer has (its history deleted on the server, say by the agent's own
+//! retention sweep) fails the start with
+//! [`AgentError::ConversationGone`], whose text tells the user to start a
+//! new context. It is logged like any failed start and never turned into a
+//! fresh start behind the user's back: the agent would answer without the
+//! context's history. Each later message tries the resume again (and gets
+//! the same answer), so a history put back on the server resumes. The fork
+//! reads a finished conversation: the
 //! clear or switch before the move stops the source's agent, and a start
 //! that would fork waits (holding its session) while the source session is
 //! held, so that agent has exited (its stop drains to `Exited`) and nothing

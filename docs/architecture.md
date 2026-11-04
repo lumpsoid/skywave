@@ -246,7 +246,10 @@ the daemon's appends, which would otherwise stop `serve` (below).
   started lazily for the context a message or setting request is stamped
   with: resumed from that context's opaque handle, else forked from the
   context it continues (D30) or the outside conversation it adopts (D32),
-  else fresh. A clear or switch stops a running agent like `StopSession`.
+  else fresh. A handle whose conversation the agent no longer has (its
+  history deleted on the server) fails the start, never falls back to a
+  fresh one: the message is `Errored` saying the history is gone and to
+  start a new context. A clear or switch stops a running agent like `StopSession`.
   The session's grants pass to every start of its contexts, never to
   another session. An approval waits with no timeout but ends with the agent
   process. An `Interrupt` repeated before the agent ends the interrupted

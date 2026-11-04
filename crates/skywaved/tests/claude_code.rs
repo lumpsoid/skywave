@@ -17,13 +17,14 @@ use skywave_proto::{ContextId, Decision, SessionId};
 use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{
-    ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, NO_AUTOUPDATE_ENV, REQUIRED_ARGS,
+    ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, KEEP_TRANSCRIPTS_SETTINGS, NO_AUTOUPDATE_ENV,
+    REQUIRED_ARGS,
 };
 use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
-    AgentSession, AgentTask, BodyFormat, Conversation, DisplayBody, Effort, Grants,
-    INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation, DisplayBody, Effort,
+    Grants, INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
+    RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -2242,6 +2243,38 @@ fn every_process_is_started_with_the_auto_updater_off() {
     assert_eq!(NO_AUTOUPDATE_ENV, ("DISABLE_AUTOUPDATER", "1"));
 }
 
+#[test]
+fn every_process_keeps_its_transcripts_for_far_longer_than_the_cli_default() {
+    // Every kind of start, since a resume and a fork need the transcript.
+    for session in [
+        CliSession::New(Uuid::new_v4()),
+        CliSession::Resume(Uuid::new_v4()),
+        CliSession::Fork {
+            parent: Uuid::new_v4(),
+            id: Uuid::new_v4(),
+        },
+    ] {
+        let command = adapter().command(Path::new("/"), session, &[]);
+        let args: Vec<&OsStr> = command.as_std().get_args().collect();
+        let at = args
+            .iter()
+            .position(|a| *a == "--settings")
+            .unwrap_or_else(|| panic!("no --settings in {args:?}"));
+        let settings: Value = serde_json::from_str(args[at + 1].to_str().unwrap()).unwrap();
+        // The CLI's default is 30 days; a context may idle for months.
+        let days = settings["cleanupPeriodDays"].as_u64().unwrap();
+        assert!(days >= 36500, "{settings}");
+        assert_eq!(args[at + 1], KEEP_TRANSCRIPTS_SETTINGS);
+        // Before the session flags and `agent.args`, so `agent.args` can
+        // still give its own.
+        let session_at = args
+            .iter()
+            .position(|a| *a == "--session-id" || *a == "--resume")
+            .unwrap();
+        assert!(at < session_at, "{args:?}");
+    }
+}
+
 #[tokio::test]
 async fn an_old_handle_with_rules_still_resumes_without_granting_them() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2287,20 +2320,29 @@ async fn foreign_grants_are_a_start_error() {
     assert!(matches!(error, AgentError::Start(_)), "{error:?}");
 }
 
+/// Asserts `error` says the conversation is gone, with the CLI's own words.
+fn assert_conversation_gone(error: AgentError) {
+    let text = error.to_string();
+    match error {
+        AgentError::ConversationGone(message) => {
+            assert!(message.contains("No conversation found"), "{message}");
+            // What the user reads tells them the way out.
+            assert!(text.starts_with(CONVERSATION_GONE), "{text}");
+            assert!(text.contains("Start a new context"), "{text}");
+        }
+        other => panic!("expected the conversation to be gone, got {other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn resuming_an_unknown_session_is_a_resume_error() {
+async fn resuming_an_unknown_session_says_the_conversation_is_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let handle = protocol::resume_handle(Uuid::nil());
     let error = adapter()
         .start(spec(tmp.path(), Conversation::Resume(handle)))
         .await
         .unwrap_err();
-    match error {
-        AgentError::Resume(message) => {
-            assert!(message.contains("No conversation found"), "{message}")
-        }
-        other => panic!("expected a resume error, got {other:?}"),
-    }
+    assert_conversation_gone(error);
 }
 
 #[tokio::test]
@@ -2346,7 +2388,7 @@ async fn a_fork_resumes_its_parent_under_a_new_session_id() {
 }
 
 #[tokio::test]
-async fn forking_an_unknown_parent_is_a_resume_error() {
+async fn forking_an_unknown_parent_says_the_conversation_is_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let handle = protocol::resume_handle(Uuid::nil());
     let error = adapter()
@@ -2354,12 +2396,7 @@ async fn forking_an_unknown_parent_is_a_resume_error() {
         .await
         .unwrap_err();
     assert!(argv(tmp.path()).contains(&"--fork-session".to_owned()));
-    match error {
-        AgentError::Resume(message) => {
-            assert!(message.contains("No conversation found"), "{message}")
-        }
-        other => panic!("expected a resume error, got {other:?}"),
-    }
+    assert_conversation_gone(error);
 }
 
 #[tokio::test]
@@ -2430,7 +2467,7 @@ async fn adopting_something_that_is_not_a_session_id_spawns_nothing() {
 }
 
 #[tokio::test]
-async fn adopting_an_unknown_conversation_is_a_resume_error() {
+async fn adopting_an_unknown_conversation_says_the_conversation_is_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let error = adapter()
         .start(spec(
@@ -2440,12 +2477,7 @@ async fn adopting_an_unknown_conversation_is_a_resume_error() {
         .await
         .unwrap_err();
     assert!(argv(tmp.path()).contains(&"--fork-session".to_owned()));
-    match error {
-        AgentError::Resume(message) => {
-            assert!(message.contains("No conversation found"), "{message}")
-        }
-        other => panic!("expected a resume error, got {other:?}"),
-    }
+    assert_conversation_gone(error);
 }
 
 #[tokio::test]
@@ -2457,6 +2489,9 @@ async fn a_foreign_resume_handle_is_refused() {
         .await
         .unwrap_err();
     assert!(matches!(error, AgentError::Resume(_)), "{error:?}");
+    // A handle that is not ours is a fault, not a deleted history: no
+    // advice to start over.
+    assert!(!error.to_string().contains(CONVERSATION_GONE), "{error}");
 }
 
 #[tokio::test]

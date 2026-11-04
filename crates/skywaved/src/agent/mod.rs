@@ -431,6 +431,12 @@ pub enum AgentError {
     /// The resume handle is unusable; starting fresh would lose history.
     #[error("cannot resume agent session: {0}")]
     Resume(String),
+    /// The agent no longer has the conversation to resume or fork: its
+    /// history is gone on the server, so no retry brings it back and only a
+    /// new context goes on. The text says so ([`CONVERSATION_GONE`]), as it
+    /// is what the user reads.
+    #[error("{CONVERSATION_GONE} (cannot resume agent session: {0})")]
+    ConversationGone(String),
     #[error("agent i/o: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -442,8 +448,9 @@ pub trait AgentAdapter: Send + Sync + 'static {
     /// Starts the agent for one session in `spec.conversation` (fresh,
     /// resumed or forked) and returns the session with its event stream.
     /// An unusable handle to resume or fork fails with
-    /// [`AgentError::Resume`]; an adapter that cannot fork fails a fork
-    /// with [`AgentError::Start`].
+    /// [`AgentError::Resume`], and a well-formed one naming a conversation
+    /// the agent no longer has with [`AgentError::ConversationGone`]; an
+    /// adapter that cannot fork fails a fork with [`AgentError::Start`].
     fn start(
         &self,
         spec: StartSpec,
@@ -453,6 +460,11 @@ pub trait AgentAdapter: Send + Sync + 'static {
 /// The exit error of an agent stopped by
 /// [`AgentSession::escalate_interrupt`].
 pub const INTERRUPT_UNANSWERED: &str = "agent did not answer the interrupt; stopped it";
+
+/// What the user is told when a context's conversation cannot be resumed
+/// because the agent no longer has it ([`AgentError::ConversationGone`]).
+pub const CONVERSATION_GONE: &str = "This context's conversation history is gone from the \
+    server, so the agent cannot go on with it. Start a new context to continue.";
 
 /// One running agent session.
 ///
