@@ -114,7 +114,7 @@ impl Http {
                 .connector
                 .connect(self.address.server_name(), tcp)
                 .await
-                .map_err(|e| TransportError::Tls(e.to_string()))?;
+                .map_err(|e| handshake_error(&e))?;
             let (sender, conn) = http1::handshake(TokioIo::new(tls))
                 .await
                 .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -260,6 +260,26 @@ fn into_head(resp: hyper::Response<Incoming>, sender: Sender) -> Head {
         headers: parts.headers,
         body,
         sender,
+    }
+}
+
+/// The error for a failed TLS handshake. rustls's verdict on the server's
+/// certificate, which tokio-rustls wraps in the `io::Error`, tells the two
+/// identity faults that no retry can fix from any other failure.
+fn handshake_error(error: &std::io::Error) -> TransportError {
+    use rustls::{CertificateError, Error};
+    let reason = error.to_string();
+    let verdict = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>());
+    match verdict {
+        Some(Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+            TransportError::UntrustedServer(reason)
+        }
+        Some(Error::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+        )) => TransportError::ServerNameMismatch(reason),
+        _ => TransportError::Tls(reason),
     }
 }
 

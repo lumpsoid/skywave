@@ -207,8 +207,8 @@ pub enum GuiIntent {
     PairScanned {
         text: String,
     },
-    /// Browse local data behind the revoked notice.
-    RevokedDismiss,
+    /// Browse local data behind the re-pair notice.
+    RepairDismiss,
     /// What the usage screen totals: the days and the grouping. Kept
     /// while away from it.
     UsageShow {

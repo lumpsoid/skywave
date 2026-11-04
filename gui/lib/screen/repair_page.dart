@@ -3,11 +3,15 @@ import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// The device was revoked: a full-screen notice over whatever screen was
-/// showing. Re-pair, or browse the local data, which stays readable.
-class RevokedPage extends StatelessWidget {
-  const RevokedPage({required this.send, super.key});
+/// The link stopped for a reason only pairing again fixes (revoked, the
+/// server's CA or names changed, a damaged identity): a full-screen notice
+/// over whatever screen was showing, saying which. Re-pair, try again
+/// where a fix on the server may do, or browse the local data, which
+/// stays readable.
+class RepairPage extends StatelessWidget {
+  const RepairPage({required this.notice, required this.send, super.key});
 
+  final RepairNotice notice;
   final SendIntent send;
 
   @override
@@ -27,14 +31,13 @@ class RevokedPage extends StatelessWidget {
                   Icon(Icons.block, size: 56, color: theme.colorScheme.error),
                   const SizedBox(height: 16),
                   Text(
-                    'This device was revoked.',
+                    notice.title,
                     style: theme.textTheme.headlineSmall,
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'The server no longer accepts this device. '
-                    'Local data stays readable.',
+                    notice.body,
                     style: theme.textTheme.bodyLarge,
                     textAlign: TextAlign.center,
                   ),
@@ -46,10 +49,18 @@ class RevokedPage extends StatelessWidget {
                     ),
                     label: const Text('Re-pair'),
                   ),
+                  if (notice.canRetry) ...[
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.refresh),
+                      onPressed: () => send.act(const ActionIntentRetryNow()),
+                      label: const Text('Try again'),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   OutlinedButton.icon(
                     icon: const Icon(Icons.folder_open),
-                    onPressed: () => send(const GuiIntentRevokedDismiss()),
+                    onPressed: () => send(const GuiIntentRepairDismiss()),
                     label: const Text('Browse local data'),
                   ),
                 ],

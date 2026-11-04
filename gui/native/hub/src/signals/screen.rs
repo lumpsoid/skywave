@@ -12,9 +12,22 @@ pub struct ScreenUpdate {
     pub screen: ScreenView,
     /// `Back` goes somewhere; when false, system back leaves the app.
     pub can_go_back: bool,
-    /// The device was revoked: a full-screen notice covers `screen` until
-    /// `RevokedDismiss` (browse local data) or `Navigate(Pairing)`.
-    pub revoked_full_screen: bool,
+    /// The link stopped for a reason only pairing again fixes (revoked, the
+    /// server's CA or names changed, a damaged identity): a full-screen
+    /// notice covers `screen` until `RepairDismiss` (browse local data) or
+    /// `Navigate(Pairing)`. `None` otherwise.
+    pub repair: Option<RepairNotice>,
+}
+
+/// The full-screen re-pair notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct RepairNotice {
+    /// A sentence: `This device was revoked.`
+    pub title: String,
+    /// What happened and what to do.
+    pub body: String,
+    /// `RetryNow` connects again: a fix on the server may clear it.
+    pub can_retry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, SignalPiece)]

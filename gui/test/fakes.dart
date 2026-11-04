@@ -92,7 +92,7 @@ ScreenUpdate pairingScreen({bool canGoBack = false}) => ScreenUpdate(
     form: PairForm(address: '', code: '', fingerprint: '', rev: 0),
   ),
   canGoBack: canGoBack,
-  revokedFullScreen: false,
+  repair: null,
 );
 
 ScreenUpdate listScreen() => const ScreenUpdate(
@@ -105,7 +105,7 @@ ScreenUpdate listScreen() => const ScreenUpdate(
     creating: [],
   ),
   canGoBack: false,
-  revokedFullScreen: false,
+  repair: null,
 );
 
 const _headings = StopHeadings(
@@ -151,7 +151,7 @@ ScreenUpdate sessionScreen({SubagentHeaderView? subagent}) => ScreenUpdate(
     ),
   ),
   canGoBack: true,
-  revokedFullScreen: false,
+  repair: null,
 );
 
 /// A subagent's header: its `Agent` call is [call].

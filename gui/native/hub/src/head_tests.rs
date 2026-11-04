@@ -473,6 +473,7 @@ fn offline_the_conversation_picker_says_why_it_is_empty() {
         attempt: 1,
         retry_at: Utc::now() + chrono::TimeDelta::seconds(2),
         offline_since: Utc::now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     rig.intent(GuiIntent::Act {
         action: ActionIntent::Back,
@@ -490,6 +491,64 @@ fn offline_the_conversation_picker_says_why_it_is_empty() {
         Some("offline · the server lists its conversations once connected")
     );
     assert!(picker.rows.is_empty());
+}
+
+/// A server with another CA gets the re-pair notice, saying why and
+/// offering a retry; the banner says it is a re-pair. Dismissed, the list
+/// shows until the link is fine again; a damaged identity has no retry.
+#[test]
+fn an_identity_fault_sends_the_re_pair_notice() {
+    use skywave_core::{Link, LinkRejection};
+    let mut rig = Rig::new();
+    rig.online_on_the_list();
+    assert_eq!(rig.head.sent.screen.as_ref().unwrap().repair, None);
+
+    rig.seam
+        .set_link(Link::Rejected(LinkRejection::ServerChanged));
+    rig.view();
+    let repair = rig
+        .head
+        .sent
+        .screen
+        .as_ref()
+        .unwrap()
+        .repair
+        .clone()
+        .unwrap();
+    assert_eq!(repair.title, "The server's identity changed.");
+    assert!(repair.can_retry);
+    let banner = rig.head.sent.link.as_ref().unwrap();
+    assert_eq!(banner.state, crate::signals::LinkState::RepairNeeded);
+    assert!(banner.rejected);
+
+    rig.intent(GuiIntent::RepairDismiss);
+    assert_eq!(rig.head.sent.screen.as_ref().unwrap().repair, None);
+    rig.list();
+
+    rig.seam
+        .set_link(Link::Rejected(LinkRejection::BadIdentity));
+    rig.view();
+    assert_eq!(
+        rig.head.sent.screen.as_ref().unwrap().repair,
+        None,
+        "dismissed until the link is fine again"
+    );
+    rig.seam.set_link(Link::Connecting);
+    rig.view();
+    rig.seam
+        .set_link(Link::Rejected(LinkRejection::BadIdentity));
+    rig.view();
+    let repair = rig
+        .head
+        .sent
+        .screen
+        .as_ref()
+        .unwrap()
+        .repair
+        .clone()
+        .unwrap();
+    assert_eq!(repair.title, "This device's identity is damaged.");
+    assert!(!repair.can_retry);
 }
 
 #[test]

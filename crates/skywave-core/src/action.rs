@@ -9,7 +9,8 @@ use crate::view::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Pair with a server using what `skywaved pair` printed. Also re-pairs
-    /// a paired device, e.g. after `Rejected(Revoked)`.
+    /// a paired device, e.g. after a rejection that
+    /// [`needs_repair`](crate::LinkRejection::needs_repair).
     Pair {
         address: String,
         code: String,
@@ -285,8 +286,9 @@ pub enum Action {
     SetBlobPolicy(BlobPolicy),
     /// While the link is `Reconnecting`, skip the rest of the wait and
     /// reconnect now. The attempt count and `offline_since` carry on.
-    /// After `Rejected(ProtocolMismatch)`, connect again: the server may
-    /// have been updated since.
+    /// After a rejection a server-side fix may clear
+    /// ([`LinkRejection::can_retry`](crate::LinkRejection::can_retry):
+    /// `ProtocolMismatch`, `ServerChanged`, `NameMismatch`), connect again.
     RetryNow,
     /// After `Rejected(HistoryLost)`, start the replica over from the
     /// server's log: the replicated log, cursor, sessions, outbox (queued

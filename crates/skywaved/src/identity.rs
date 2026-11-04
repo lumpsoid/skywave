@@ -15,8 +15,11 @@
 //! [`Fingerprint`] is what `skywaved pair` prints), so the server certificate
 //! can be reissued without re-pairing: bootstrap reissues it whenever its
 //! subject alternative names differ from the requested ones or it is not
-//! signed by the current CA. Deleting `ca/` creates a new CA, which
-//! invalidates every paired device.
+//! signed by the current CA. A device connects by the name it was paired
+//! with, so a reissue that drops a name warns (and
+//! [`ServerIdentity::dropped_names`] lists them): such a device sees a
+//! name mismatch until the name is back or it moves to a listed one.
+//! Deleting `ca/` creates a new CA, which invalidates every paired device.
 //!
 //! Bootstrap holds an exclusive lock on `<data_dir>/identity.lock`, so
 //! `serve` and `pair` running for the first time at the same moment agree
@@ -68,6 +71,7 @@ pub struct ServerIdentity {
     server_cert_pem: String,
     server_cert_der: Vec<u8>,
     server_names: Vec<String>,
+    dropped_names: Vec<String>,
 }
 
 impl ServerIdentity {
@@ -91,17 +95,33 @@ impl ServerIdentity {
 
         let server_dir = dir.server_dir();
         let (key_path, cert_path) = (server_dir.join(KEY_FILE), server_dir.join(CERT_FILE));
+        let mut dropped_names = Vec::new();
         let existing = match read_optional(&cert_path)? {
             Some(cert_pem) => {
                 let key_pem = read_optional(&key_path)?
                     .ok_or_else(|| bad(&key_path, "missing, but the certificate exists"))?;
                 KeyPair::from_pem(&key_pem).map_err(|e| bad(&key_path, e))?;
                 let der = pem_to_der(&cert_path, &cert_pem)?;
-                server_cert_is_current(&cert_path, &der, &ca_cert_der, &names)?
-                    .then_some((key_pem, cert_pem, der))
+                let current = server_cert_is_current(&cert_path, &der, &ca_cert_der, &names)?;
+                if !current {
+                    dropped_names = names_dropped(&cert_path, &der, &names)?;
+                }
+                current.then_some((key_pem, cert_pem, der))
             }
             None => None,
         };
+        if !dropped_names.is_empty() {
+            // A device connects by the name it was paired with; one the
+            // new certificate lacks fails every handshake on that device.
+            tracing::warn!(
+                dropped = ?dropped_names,
+                "the reissued server certificate no longer covers {}: devices that connect \
+                 by one of these names cannot connect until it is back in `server_names` \
+                 (or the host name), their address is changed to a listed name, or they \
+                 re-pair",
+                dropped_names.join(", ")
+            );
+        }
         let (server_key_pem, server_cert_pem, server_cert_der) = match existing {
             Some(found) => found,
             None => {
@@ -133,7 +153,15 @@ impl ServerIdentity {
             server_cert_pem,
             server_cert_der,
             server_names: names,
+            dropped_names,
         })
+    }
+
+    /// Names the previous server certificate covered that this bootstrap
+    /// reissued it without, sorted; empty when nothing was reissued or no
+    /// name was dropped. Bootstrap already warned about them (`tracing`).
+    pub fn dropped_names(&self) -> &[String] {
+        &self.dropped_names
     }
 
     pub fn server_id(&self) -> ServerId {
@@ -316,6 +344,13 @@ fn server_cert_is_current(
     Ok(true)
 }
 
+/// The names the stored certificate covers that `names` lacks.
+fn names_dropped(path: &Path, der: &[u8], names: &[String]) -> Result<Vec<String>> {
+    let cert = parse_cert(path, der)?;
+    let found = cert_names(&cert).map_err(|e| bad(path, e))?;
+    Ok(found.into_iter().filter(|n| !names.contains(n)).collect())
+}
+
 fn parse_cert<'a>(path: &Path, der: &'a [u8]) -> Result<X509Certificate<'a>> {
     x509_parser::parse_x509_certificate(der)
         .map(|(_, cert)| cert)
@@ -485,6 +520,68 @@ mod tests {
         assert_eq!(second.server_id(), first.server_id());
         assert_ne!(second.server_cert_pem(), first.server_cert_pem());
         assert!(second.server_names().contains(&"10.0.0.7".to_owned()));
+    }
+
+    /// Log lines a closure emits, captured.
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        (out, text)
+    }
+
+    /// A reissue that drops a name a device may connect by says so, as a
+    /// warning on the command's output; one that only adds names, or
+    /// changes nothing, does not.
+    #[test]
+    fn a_reissue_that_drops_a_name_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = DataDir::create(tmp.path().join("d")).unwrap();
+        ServerIdentity::bootstrap(&dir, &names()).unwrap();
+
+        let mut more = names();
+        more.push("10.0.0.7".into());
+        let (added, logs) = logged(|| ServerIdentity::bootstrap(&dir, &more).unwrap());
+        assert!(added.dropped_names().is_empty());
+        assert!(!logs.contains("WARN"), "{logs}");
+
+        let renamed = vec!["localhost".into(), "127.0.0.1".into(), "box2.lan".into()];
+        let (reissued, logs) = logged(|| ServerIdentity::bootstrap(&dir, &renamed).unwrap());
+        assert_eq!(reissued.dropped_names(), ["10.0.0.7", "box.lan"]);
+        assert_eq!(reissued.ca_fingerprint(), added.ca_fingerprint());
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("no longer covers 10.0.0.7, box.lan"),
+            "{logs}"
+        );
+
+        let (same, logs) = logged(|| ServerIdentity::bootstrap(&dir, &renamed).unwrap());
+        assert!(same.dropped_names().is_empty());
+        assert!(!logs.contains("WARN"), "{logs}");
     }
 
     #[test]

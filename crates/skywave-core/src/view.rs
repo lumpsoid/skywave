@@ -150,17 +150,59 @@ pub enum Link {
         /// failure since `hello` last succeeded, kept across the attempts
         /// that fail before it.
         offline_since: DateTime<Utc>,
+        /// Why the attempt that started this wait failed.
+        reason: LinkFailure,
     },
-    /// The server refused this device for good; retries stop until the user
-    /// re-pairs. Local data stays readable.
+    /// The link cannot work until the user acts, so retries stop until the
+    /// next `Connect` (re-pairing, or a retry where
+    /// [`LinkRejection::can_retry`] says one may help). Local data stays
+    /// readable.
     Rejected(LinkRejection),
 }
 
-/// Why the server refused the device.
+/// Why a connection failed in a way worth retrying: what a head shows
+/// beside the countdown while [`Link::Reconnecting`]. Coarse on purpose:
+/// it says where things broke, not the transport's own message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkFailure {
+    /// No connection: DNS, TCP connect or a refused connection.
+    Unreachable,
+    /// Connecting or a request took too long.
+    TimedOut,
+    /// The connection broke during a request.
+    ConnectionLost,
+    /// The TLS handshake failed for a reason other than the server's
+    /// identity (which is [`LinkRejection::ServerChanged`] or
+    /// [`LinkRejection::NameMismatch`]).
+    Handshake,
+    /// The server is in another run than the connection expected: it
+    /// restarted.
+    ServerRestarted,
+    /// The server answered with this HTTP status: a 5xx, or a 4xx that is
+    /// about neither the device nor one command.
+    ServerError(u16),
+    /// The server's reply could not be understood.
+    BadResponse,
+    /// The local replica could not be read or written.
+    Storage,
+}
+
+/// Why the link stopped for good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRejection {
     /// The device's certificate was revoked (`skywaved devices revoke`).
     Revoked,
+    /// The server's certificate does not chain to the CA this device
+    /// pinned when it paired: the server's CA was regenerated, or something
+    /// else answers at the address. Every handshake would fail the same way.
+    ServerChanged,
+    /// The server's certificate does not cover the address this device
+    /// connects to: its names changed (a host rename, or a reissue that
+    /// dropped the name) while the CA stayed.
+    NameMismatch,
+    /// This device's stored identity (certificate or key) cannot be used
+    /// for TLS: the file is damaged.
+    BadIdentity,
     /// Client and server speak different protocol versions.
     ProtocolMismatch { client: u32, server: u32 },
     /// The server's log lost events this replica holds (a crash dropped
@@ -170,6 +212,35 @@ pub enum LinkRejection {
     /// ([`Action::ResetReplica`](crate::Action::ResetReplica)). `have` is
     /// how far this device had seen the log, `server` the head it reports.
     HistoryLost { have: Seq, server: Seq },
+}
+
+impl LinkRejection {
+    /// Only pairing again (a new identity, or a new pinned CA or address)
+    /// brings the link back, so a head offers re-pairing.
+    pub fn needs_repair(self) -> bool {
+        match self {
+            LinkRejection::Revoked
+            | LinkRejection::ServerChanged
+            | LinkRejection::NameMismatch
+            | LinkRejection::BadIdentity => true,
+            LinkRejection::ProtocolMismatch { .. } | LinkRejection::HistoryLost { .. } => false,
+        }
+    }
+
+    /// Something on the server's side may fix it without this device
+    /// changing, so [`Action::RetryNow`](crate::Action::RetryNow) connects
+    /// again: the server was updated, its old CA or a dropped name restored,
+    /// or a network that intercepted TLS left behind.
+    pub fn can_retry(self) -> bool {
+        match self {
+            LinkRejection::ProtocolMismatch { .. }
+            | LinkRejection::ServerChanged
+            | LinkRejection::NameMismatch => true,
+            LinkRejection::Revoked
+            | LinkRejection::BadIdentity
+            | LinkRejection::HistoryLost { .. } => false,
+        }
+    }
 }
 
 /// Delivery state of one of this device's commands.

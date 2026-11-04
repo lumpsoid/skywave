@@ -480,6 +480,18 @@ fn banner_shows_every_link_state() {
             "device revoked · re-pair to reconnect",
         ),
         (
+            Link::Rejected(LinkRejection::ServerChanged),
+            "server identity changed · re-pair to reconnect · Ctrl-R retry",
+        ),
+        (
+            Link::Rejected(LinkRejection::NameMismatch),
+            "server name mismatch · re-pair to reconnect · Ctrl-R retry",
+        ),
+        (
+            Link::Rejected(LinkRejection::BadIdentity),
+            "device identity unusable · re-pair to reconnect",
+        ),
+        (
             Link::Rejected(LinkRejection::ProtocolMismatch {
                 client: 1,
                 server: 2,
@@ -522,15 +534,16 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         attempt: 3,
         retry_at: t0 + TimeDelta::seconds(5),
         offline_since: t0,
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     h.sync();
     assert_eq!(
         h.banner_at(t0),
-        "offline · 2 queued · retry in 05s · Ctrl-R now (attempt 3)"
+        "offline · server unreachable · 2 queued · retry in 05s · Ctrl-R now (attempt 3)"
     );
     assert_eq!(
         h.banner_at(t0 + TimeDelta::milliseconds(2500)),
-        "offline · 2 queued · retry in 03s · Ctrl-R now (attempt 3)"
+        "offline · server unreachable · 2 queued · retry in 03s · Ctrl-R now (attempt 3)"
     );
     // Another snapshot in the same wait does not restart the countdown.
     h.core
@@ -542,11 +555,11 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
     h.sync();
     assert_eq!(
         h.banner_at(t0 + TimeDelta::milliseconds(2500)),
-        "offline · 3 queued · retry in 03s · Ctrl-R now (attempt 3)"
+        "offline · server unreachable · 3 queued · retry in 03s · Ctrl-R now (attempt 3)"
     );
     assert_eq!(
         h.banner_at(t0 + TimeDelta::seconds(6)),
-        "offline · 3 queued · retrying… (attempt 3)"
+        "offline · server unreachable · 3 queued · retrying… (attempt 3)"
     );
     // Local data still renders under the banner.
     assert_contains(&line_with(&h.screen(), "/srv/a"), "[queued]");
@@ -562,11 +575,13 @@ fn reconnecting_banner_counts_queued_commands_and_down_to_the_retry() {
         attempt: 4,
         retry_at: later + TimeDelta::seconds(10),
         offline_since: t0,
+        reason: skywave_core::LinkFailure::ServerError(503),
     });
     h.sync();
+    // It says why this attempt failed, not the first one.
     assert_eq!(
         h.banner_at(later + TimeDelta::seconds(1)),
-        "offline · 3 queued · retry in 09s · Ctrl-R now (attempt 4)"
+        "offline · server error 503 · 3 queued · retry in 09s · Ctrl-R now (attempt 4)"
     );
 
     // Back online, the queue drains; the count stays until results arrive.
@@ -666,6 +681,47 @@ fn revoked_device_gets_a_full_screen_state_with_re_pair() {
     h.sync();
     assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
     assert_eq!(h.banner(), "connecting…");
+}
+
+/// A server with another CA, an address its certificate dropped, or a
+/// damaged identity gets the same full-screen re-pair state as a
+/// revoke, saying which; where a fix on the server may do, Ctrl-R tries
+/// again. A protocol mismatch is no re-pair matter.
+#[test]
+fn identity_faults_get_the_re_pair_screen_saying_why() {
+    let mut h = Harness::paired();
+    h.seam
+        .set_link(Link::Rejected(LinkRejection::ServerChanged));
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "The server's identity changed.");
+    assert_contains(&screen, "try again");
+    h.drain_requests();
+    assert_eq!(h.key_with(ctrl('r')), Some(Action::RetryNow));
+    assert_eq!(h.drain_requests(), vec![Request::Connect]);
+
+    h.seam.set_link(Link::Rejected(LinkRejection::NameMismatch));
+    h.sync();
+    assert_contains(&h.screen(), "does not cover this address");
+
+    h.seam.set_link(Link::Rejected(LinkRejection::BadIdentity));
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "This device's identity is damaged.");
+    assert!(!screen.contains("try again"), "{screen}");
+    assert_eq!(
+        h.key(KeyCode::Char('p')),
+        Some(Action::Navigate(Route::Pairing))
+    );
+
+    let mut h = Harness::paired();
+    h.seam
+        .set_link(Link::Rejected(LinkRejection::ProtocolMismatch {
+            client: 1,
+            server: 2,
+        }));
+    h.sync();
+    assert_contains(&h.screen(), "No sessions yet.");
 }
 
 #[test]
@@ -1506,6 +1562,7 @@ fn the_picker_says_when_it_cannot_list() {
         attempt: 1,
         retry_at: mockup_now(),
         offline_since: mockup_now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     h.sync();
     assert_eq!(h.key(KeyCode::Char('c')), Some(Action::ListConversations));
@@ -1601,6 +1658,7 @@ fn esc_closes_the_popup_then_the_prompt() {
         attempt: 1,
         retry_at: Utc::now() + TimeDelta::seconds(5),
         offline_since: Utc::now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     h.sync();
     h.key(KeyCode::Char('n'));
@@ -2967,6 +3025,7 @@ fn tool_output_expands_through_every_blob_state() {
         attempt: 1,
         retry_at: mockup_now() + TimeDelta::seconds(5),
         offline_since: mockup_now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     h.sync();
     assert_contains(&h.screen(), "│ … downloading 40% · paused, offline");
@@ -3748,6 +3807,7 @@ fn offline_composer_says_messages_wait() {
         attempt: 1,
         retry_at: mockup_now() + TimeDelta::seconds(5),
         offline_since: mockup_now(),
+        reason: skywave_core::LinkFailure::Unreachable,
     });
     h.sync();
     assert_contains(&h.screen(), "Message · offline, sends when back online");

@@ -177,7 +177,8 @@ every version.
 `skywave.db` (SQLite, WAL), `blobs/`, `ca/` and `server/` (ECDSA P-256 keys,
 mode 0600), `server_id`, `shell/` (running shell output until it becomes
 a blob) and `serve.lock` (held locked by the one running `serve`).
-`serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change. Admin commands
+`serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change, warning when a
+name was dropped (devices that connect by it fail with a name mismatch). Admin commands
 (`pair`, `devices list`, `devices revoke`) work on the database directly,
 beside a running `serve`.
 
@@ -372,6 +373,15 @@ D9. The server owns a CA; every device holds a certificate it signed.
    24 h), signs the CSR, records the device and returns its certificate and
    the CA.
 4. Every later connection is mTLS: chain **and** registry (not revoked).
+   A handshake the device's pinned CA refuses is final, decided from
+   rustls's verdict, not a retry count: a server certificate from another
+   CA (the server's `ca/` was recreated, or something else answers) is
+   `Rejected(ServerChanged)`, one that does not cover the address the
+   device connects by is `Rejected(NameMismatch)`, and a stored identity
+   that cannot be loaded into TLS is `Rejected(BadIdentity)`. Heads show
+   the re-pair notice for these as for a revoke. A reissue that drops a
+   name from the server certificate (`server_names` or the host name
+   changed) warns on the reissuing command's output.
 
 - **Codes:** 10 Crockford base32 symbols (50 bits), shown `XXXXX-XXXXX`;
   input ignores case, `-` and spaces, and reads `O` as `0`, `I`/`L` as `1`.
@@ -466,8 +476,14 @@ logs) an event that no longer decodes rather than failing.
   then fails keeps backing off. `offline_since` starts over once `hello`
   succeeds. The wait ends by whichever of the
   monotonic and wall clocks says first, so a device that slept retries when
-  the head says. A revoked device or protocol mismatch is `Rejected`, and
-  retries stop until re-pairing. `suspend()` / `resume()` pause the network
+  the head says. `Reconnecting` carries why the last attempt failed
+  (`LinkFailure`: unreachable, timed out, connection lost, handshake,
+  server restarted, a server status, an unreadable reply, local storage),
+  worded by `skywave-present::link`. A revoked device, a protocol
+  mismatch, or an identity fault (see Pairing) is `Rejected`, and retries
+  stop until the user acts: re-pairing, or a retry where a server-side fix
+  may clear it (`LinkRejection::can_retry`: a protocol mismatch, a
+  changed CA or name). `suspend()` / `resume()` pause the network
   for heads that background.
 - **A log that went backwards.** The server's log can lose events the
   device holds: a crash dropping its last commits, the data dir restored
@@ -624,8 +640,11 @@ enum Link {
     Online { latency_ms: u32 },
     CatchingUp { have: Seq, server: Seq },
     // wall-clock instants fixed at the failure; heads count down to retry_at
-    Reconnecting { attempt: u32, retry_at: DateTime<Utc>, offline_since: DateTime<Utc> },
-    Rejected(LinkRejection),         // revoked cert, protocol mismatch, history lost
+    // reason: why the attempt that started this wait failed
+    Reconnecting { attempt: u32, retry_at: DateTime<Utc>, offline_since: DateTime<Utc>, reason: LinkFailure },
+    // revoked cert, server CA changed, name mismatch, bad identity,
+    // protocol mismatch, history lost
+    Rejected(LinkRejection),
 }
 
 enum Outgoing {
@@ -654,13 +673,13 @@ enum BlobState {
 | Situation | Presentation |
 |-----------|--------------|
 | `Unpaired` | No banner; the pairing screen. |
-| `Reconnecting` with queued items | Banner: offline · N queued · retry in Xs. Input stays enabled. |
+| `Reconnecting` with queued items | Banner: offline · why · N queued · retry in Xs. Input stays enabled. |
 | `CatchingUp` | Render local replica immediately, subtle syncing indicator. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
 | Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
-| `Rejected(Revoked)` | Full-screen state with re-pair action; local data stays readable. |
+| `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
 

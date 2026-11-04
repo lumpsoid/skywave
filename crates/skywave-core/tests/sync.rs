@@ -400,6 +400,82 @@ async fn revoked_device_is_rejected_until_it_re_pairs() {
     );
 }
 
+/// The rejection the link comes to show; `Reconnecting` on the way is
+/// allowed (a cut drops the live connection first).
+async fn rejection(client: &Client) -> LinkRejection {
+    let view = client
+        .wait("a rejection", |_, view| {
+            matches!(view.link, Link::Rejected(_))
+        })
+        .await;
+    match view.link {
+        Link::Rejected(rejection) => rejection,
+        other => panic!("not rejected: {other:?}"),
+    }
+}
+
+/// A server whose CA was regenerated (or another server at the address)
+/// fails every handshake the same way, so the link stops on the first
+/// one with `ServerChanged` instead of reconnecting forever. Retrying
+/// asks again, and once the old server is back it connects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_with_another_ca_stops_the_link_until_re_paired() {
+    let daemon = Daemon::start(FakeAgent::new(FakeScript::new())).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+
+    let other = Daemon::start(FakeAgent::new(FakeScript::new())).await;
+    assert_ne!(
+        other.identity.ca_fingerprint(),
+        daemon.identity.ca_fingerprint()
+    );
+    proxy.retarget(other.addr);
+    proxy.cut();
+    let rejected = rejection(&client).await;
+    assert_eq!(rejected, LinkRejection::ServerChanged);
+    assert!(rejected.needs_repair());
+
+    // Still the other CA: the retry is rejected the same way.
+    client.dispatch(Action::RetryNow);
+    assert_eq!(rejection(&client).await, LinkRejection::ServerChanged);
+
+    proxy.retarget(daemon.addr);
+    client.dispatch(Action::RetryNow);
+    client
+        .wait("online with the old CA", |_, view| {
+            matches!(view.link, Link::Online { .. })
+        })
+        .await;
+}
+
+/// A stored identity that cannot be used for TLS (a damaged key file)
+/// can never connect: the link stops with `BadIdentity` and asks to
+/// re-pair, which brings it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_identity_stops_the_link_until_re_paired() {
+    let daemon = Daemon::start(FakeAgent::new(FakeScript::new())).await;
+    let proxy = proxy(&daemon).await;
+    let client = Client::open(config());
+    daemon.pair(&client, &proxy.address()).await;
+
+    let dir = client.stop();
+    std::fs::write(dir.path().join("identity/device_key.pem"), "not a key").unwrap();
+    let client = Client::open_in(dir, config());
+    let rejected = rejection(&client).await;
+    assert_eq!(rejected, LinkRejection::BadIdentity);
+    assert!(rejected.needs_repair());
+    client.dispatch(Action::RetryNow);
+    assert_eq!(
+        client.core.view().link,
+        Link::Rejected(LinkRejection::BadIdentity),
+        "retrying cannot mend the file"
+    );
+
+    client.dispatch(Action::Navigate(skywave_core::Route::Pairing));
+    daemon.pair(&client, &proxy.address()).await;
+}
+
 /// Messages taken back while offline — discarded, or pulled into the draft
 /// to edit — never reach the server once the link is back; the rest still
 /// drains.

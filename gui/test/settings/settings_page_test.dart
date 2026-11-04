@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/link/link_holder.dart';
-import 'package:skywave_gui/screen/revoked_page.dart';
+import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -145,18 +145,51 @@ void main() {
     expect(find.byIcon(Icons.link_off), findsOneWidget);
   });
 
-  testWidgets('the revoked notice re-pairs or browses local data', (
+  testWidgets('the re-pair notice re-pairs or browses local data', (
     tester,
   ) async {
     final sent = <GuiIntent>[];
-    await tester.pumpWidget(MaterialApp(home: RevokedPage(send: sent.add)));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RepairPage(
+          notice: const RepairNotice(
+            title: 'This device was revoked.',
+            body: 'The server no longer accepts this device.',
+            canRetry: false,
+          ),
+          send: sent.add,
+        ),
+      ),
+    );
+    expect(find.text('Try again'), findsNothing);
     await tester.tap(find.text('Re-pair'));
     await tester.tap(find.text('Browse local data'));
     expect(sent, [
       const GuiIntentAct(
         action: ActionIntentNavigate(route: RouteView.pairing),
       ),
-      const GuiIntentRevokedDismiss(),
+      const GuiIntentRepairDismiss(),
     ]);
+  });
+
+  testWidgets('a re-pair notice a server fix may clear offers a retry', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RepairPage(
+          notice: const RepairNotice(
+            title: "The server's identity changed.",
+            body: 'Re-pair with what `skywaved pair` prints now.',
+            canRetry: true,
+          ),
+          send: sent.add,
+        ),
+      ),
+    );
+    expect(find.text("The server's identity changed."), findsOneWidget);
+    await tester.tap(find.text('Try again'));
+    expect(sent, [const GuiIntentAct(action: ActionIntentRetryNow())]);
   });
 }

@@ -11,6 +11,8 @@
 //!   shows beneath its title, and what a copy takes.
 //! - [`format`](mod@format): sizes, durations, token counts, costs, delivery and
 //!   failure wording.
+//! - [`link`]: why the link is reconnecting, and the re-pair notice for
+//!   a rejection only pairing again fixes.
 //! - [`output`]: where a shell run's whole output is, and how a head reads
 //!   a downloaded one.
 //! - [`usage`]: cost and tokens totalled across sessions for the usage
@@ -27,6 +29,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod format;
+pub mod link;
 pub mod output;
 pub mod policy;
 pub mod sections;

@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
-import 'package:skywave_gui/screen/revoked_page.dart';
+import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/screen/screen_navigator.dart';
 import 'package:skywave_gui/session/session_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
@@ -70,7 +70,7 @@ void main() {
     expect(sent, [const GuiIntentAct(action: ActionIntentBack())]);
   });
 
-  testWidgets('the revoked notice covers the screen', (tester) async {
+  testWidgets('the re-pair notice covers the screen', (tester) async {
     final holders = fakeHolders();
     final sent = <GuiIntent>[];
     await tester.pumpWidget(
@@ -83,13 +83,18 @@ void main() {
       ScreenUpdate(
         screen: list.screen,
         canGoBack: false,
-        revokedFullScreen: true,
+        repair: const RepairNotice(
+          title: 'This device was revoked.',
+          body: 'The server no longer accepts this device.',
+          canRetry: false,
+        ),
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.byType(RevokedPage), findsOneWidget);
+    expect(find.byType(RepairPage), findsOneWidget);
+    expect(find.text('This device was revoked.'), findsOneWidget);
     await tester.tap(find.text('Browse local data'));
-    expect(sent, [const GuiIntentRevokedDismiss()]);
+    expect(sent, [const GuiIntentRepairDismiss()]);
   });
 
   testWidgets('a subagent\'s view is a page over its session\'s, which '

@@ -700,8 +700,9 @@ impl Model {
             }
             Action::RetryNow => match self.link {
                 Link::Reconnecting { .. } => vec![Effect::Request(Request::RetryNow)],
-                // The server may have been updated since: ask it again.
-                Link::Rejected(LinkRejection::ProtocolMismatch { .. }) => {
+                // The server may have been updated (or its certificate
+                // restored) since: ask it again.
+                Link::Rejected(rejection) if rejection.can_retry() => {
                     self.link = Link::Connecting;
                     vec![Effect::Request(Request::Connect)]
                 }
@@ -5499,6 +5500,7 @@ mod tests {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
         });
         assert_eq!(output_state(&f), downloading(true));
         f.model.set_link(Link::CatchingUp {
@@ -6532,6 +6534,7 @@ mod tests {
             attempt: 3,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(4),
             offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
         };
         f.model.set_link(reconnecting.clone());
         assert_eq!(f.model.view().link, reconnecting);
@@ -6548,6 +6551,7 @@ mod tests {
             Link::Connecting,
             Link::Online { latency_ms: 5 },
             Link::Rejected(LinkRejection::Revoked),
+            Link::Rejected(LinkRejection::BadIdentity),
         ] {
             f.model.set_link(link);
             assert!(f.dispatch(Action::RetryNow).is_empty());
@@ -6556,6 +6560,7 @@ mod tests {
             attempt: 2,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(30),
             offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
         });
         assert_eq!(
             f.dispatch(Action::RetryNow),
@@ -6563,21 +6568,28 @@ mod tests {
         );
     }
 
-    /// A mismatch may have been the server's, since updated: retrying
-    /// connects again, where a revoked device has to re-pair.
+    /// A mismatch may have been the server's, since updated, and a
+    /// certificate it presented may be put back: retrying connects again,
+    /// where a revoked device or a damaged identity has to re-pair.
     #[test]
     fn retry_now_after_a_protocol_mismatch_connects_again() {
-        let mut f = Fixture::paired();
-        f.model
-            .set_link(Link::Rejected(LinkRejection::ProtocolMismatch {
+        for rejection in [
+            LinkRejection::ProtocolMismatch {
                 client: 3,
                 server: 2,
-            }));
-        assert_eq!(
-            f.dispatch(Action::RetryNow),
-            vec![Effect::Request(Request::Connect)]
-        );
-        assert_eq!(f.model.view().link, Link::Connecting);
+            },
+            LinkRejection::ServerChanged,
+            LinkRejection::NameMismatch,
+        ] {
+            let mut f = Fixture::paired();
+            f.model.set_link(Link::Rejected(rejection));
+            assert_eq!(
+                f.dispatch(Action::RetryNow),
+                vec![Effect::Request(Request::Connect)],
+                "{rejection:?}"
+            );
+            assert_eq!(f.model.view().link, Link::Connecting);
+        }
     }
 
     /// The reset is for a log that lost history only; anywhere else it
@@ -7710,6 +7722,7 @@ mod tests {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
         });
         assert_eq!(complete(&mut f, "/srv/"), None, "nothing is asked offline");
         assert_eq!(completion(&f).status, CompletionStatus::Unavailable);
@@ -7888,6 +7901,7 @@ mod tests {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
         });
         let offline = ConversationsStatus::Unavailable(ConversationsUnavailable::Offline);
         assert_eq!(list_conversations(&mut f), None, "nothing is asked offline");
@@ -9366,6 +9380,7 @@ mod tests {
                 attempt: 1,
                 retry_at: Utc::now(),
                 offline_since: Utc::now(),
+                reason: crate::view::LinkFailure::Unreachable,
             }
         }
 

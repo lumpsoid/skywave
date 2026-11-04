@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use skywave_core::{Link, LinkRejection};
+use skywave_present::link;
 
 use crate::signals::{LinkState, LinkUpdate};
 
@@ -29,7 +30,10 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
             format!("syncing · {}/{}{queued_part}", have.0, server.0),
         ),
         Link::Reconnecting {
-            attempt, retry_at, ..
+            attempt,
+            retry_at,
+            reason,
+            ..
         } => {
             let left = seconds_left(retry_at.timestamp_millis(), wall_ms);
             retry_in_s = Some(left);
@@ -38,14 +42,23 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
                 // Two digits (the cap is 30s) keep the banner from shifting.
                 n => format!("retry in {n:02}s"),
             };
+            let reason = link::failure(*reason);
             (
                 LinkState::Reconnecting,
-                format!("offline{queued_part} · {retry} (attempt {attempt})"),
+                format!("offline · {reason}{queued_part} · {retry} (attempt {attempt})"),
             )
         }
-        Link::Rejected(LinkRejection::Revoked) => (
-            LinkState::Revoked,
-            format!("device revoked · re-pair to reconnect{queued_part}"),
+        Link::Rejected(
+            rejection @ (LinkRejection::Revoked
+            | LinkRejection::ServerChanged
+            | LinkRejection::NameMismatch
+            | LinkRejection::BadIdentity),
+        ) => (
+            LinkState::RepairNeeded,
+            format!(
+                "{} · re-pair to reconnect{queued_part}",
+                repair_short(*rejection)
+            ),
         ),
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => (
             LinkState::ProtocolMismatch,
@@ -66,10 +79,11 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
         label,
         connection_label: connection_label(link, &retry),
         retry_in_s,
-        can_retry_now: matches!(
-            link,
-            Link::Reconnecting { .. } | Link::Rejected(LinkRejection::ProtocolMismatch { .. })
-        ),
+        can_retry_now: match link {
+            Link::Reconnecting { .. } => true,
+            Link::Rejected(rejection) => rejection.can_retry(),
+            _ => false,
+        },
         rejected: matches!(link, Link::Rejected(_)),
         can_reset_replica: matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. })),
         queued: count(queued),
@@ -90,12 +104,33 @@ fn connection_label(link: &Link, retry: &str) -> String {
         Link::Connecting => "Connecting…".to_owned(),
         Link::Online { latency_ms } => format!("Connected · {latency_ms} ms"),
         Link::CatchingUp { have, server } => format!("Syncing · {}/{}", have.0, server.0),
-        Link::Reconnecting { .. } => format!("Offline · {retry}"),
-        Link::Rejected(LinkRejection::Revoked) => "Device revoked".to_owned(),
+        Link::Reconnecting { reason, .. } => {
+            format!("Offline · {} · {retry}", link::failure(*reason))
+        }
+        Link::Rejected(
+            rejection @ (LinkRejection::Revoked
+            | LinkRejection::ServerChanged
+            | LinkRejection::NameMismatch
+            | LinkRejection::BadIdentity),
+        ) => sentence_case(repair_short(*rejection)),
         Link::Rejected(LinkRejection::ProtocolMismatch { client, server }) => {
             format!("Protocol mismatch · client v{client}, server v{server}")
         }
         Link::Rejected(LinkRejection::HistoryLost { .. }) => "Server lost history".to_owned(),
+    }
+}
+
+/// The re-pair reason as the banner says it: `server identity changed`.
+fn repair_short(rejection: LinkRejection) -> &'static str {
+    link::repair_notice(rejection).map_or("", |notice| notice.short)
+}
+
+/// `text` with its first letter upper case, for Settings.
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -142,6 +177,7 @@ mod tests {
             attempt: 3,
             retry_at: at,
             offline_since: at,
+            reason: skywave_core::LinkFailure::Unreachable,
         };
         let cases = [
             (Link::Unpaired, ""),
@@ -156,11 +192,23 @@ mod tests {
             ),
             (
                 reconnecting.clone(),
-                "offline · 2 queued · retry in 07s (attempt 3)",
+                "offline · server unreachable · 2 queued · retry in 07s (attempt 3)",
             ),
             (
                 Link::Rejected(LinkRejection::Revoked),
                 "device revoked · re-pair to reconnect · 2 queued",
+            ),
+            (
+                Link::Rejected(LinkRejection::ServerChanged),
+                "server identity changed · re-pair to reconnect · 2 queued",
+            ),
+            (
+                Link::Rejected(LinkRejection::NameMismatch),
+                "server name mismatch · re-pair to reconnect · 2 queued",
+            ),
+            (
+                Link::Rejected(LinkRejection::BadIdentity),
+                "device identity unusable · re-pair to reconnect · 2 queued",
             ),
             (
                 Link::Rejected(LinkRejection::HistoryLost {
@@ -175,6 +223,8 @@ mod tests {
             assert_eq!(banner.label, label, "{link:?}");
             let lost = matches!(link, Link::Rejected(LinkRejection::HistoryLost { .. }));
             assert_eq!(banner.can_reset_replica, lost, "{link:?}");
+            let repair = matches!(link, Link::Rejected(r) if r.needs_repair());
+            assert_eq!(banner.state == LinkState::RepairNeeded, repair, "{link:?}");
         }
         let online = Link::Online { latency_ms: 12 };
         assert_eq!(update(&online, 0, 0, now).label, "", "nothing to say");
@@ -184,7 +234,10 @@ mod tests {
             "a button to show"
         );
         let banner = update(&reconnecting, 0, 1, now);
-        assert_eq!(banner.connection_label, "Offline · retry in 07s");
+        assert_eq!(
+            banner.connection_label,
+            "Offline · server unreachable · retry in 07s"
+        );
         assert_eq!(banner.retry_in_s, Some(7));
         assert!(banner.can_retry_now);
         assert_eq!(
@@ -199,7 +252,10 @@ mod tests {
         let due = update(&reconnecting, 0, 0, at.timestamp_millis() + 10);
         assert_eq!(due.retry_in_s, Some(0));
         assert!(due.label.contains("retrying…"));
-        assert_eq!(due.connection_label, "Offline · retrying…");
+        assert_eq!(
+            due.connection_label,
+            "Offline · server unreachable · retrying…"
+        );
         assert_eq!(next_change(&reconnecting, at.timestamp_millis()), None);
     }
 
@@ -218,6 +274,14 @@ mod tests {
             ),
             (Link::Rejected(LinkRejection::Revoked), "Device revoked"),
             (
+                Link::Rejected(LinkRejection::ServerChanged),
+                "Server identity changed",
+            ),
+            (
+                Link::Rejected(LinkRejection::BadIdentity),
+                "Device identity unusable",
+            ),
+            (
                 Link::Rejected(LinkRejection::ProtocolMismatch {
                     client: 3,
                     server: 4,
@@ -226,7 +290,15 @@ mod tests {
             ),
         ];
         for (link, label) in cases {
-            let retry = matches!(link, Link::Rejected(LinkRejection::ProtocolMismatch { .. }));
+            // A server-side fix may clear a mismatch or a changed
+            // certificate; nothing on the server mends a revoke or a
+            // damaged identity file.
+            let retry = matches!(
+                link,
+                Link::Rejected(
+                    LinkRejection::ProtocolMismatch { .. } | LinkRejection::ServerChanged
+                )
+            );
             assert_eq!(update(&link, 0, 0, 0).can_retry_now, retry, "{link:?}");
             // Said whatever is queued, and even while the banner hides.
             assert_eq!(update(&link, 0, 0, 0).connection_label, label, "{link:?}");

@@ -52,9 +52,14 @@
 //! closed) refuses it with [`TransportError::RunChanged`]: that ends the
 //! connection like any failure, and the next one's `hello` tells a clean
 //! restart from a lost log. Any other failure ends
-//! the connection: a rejection (401/403, protocol mismatch) shows
-//! `Rejected(..)` and stops the link until the next `Connect`; anything
-//! else shows `Reconnecting { attempt, retry_at, offline_since }`, waits
+//! the connection, and its kind alone decides what follows
+//! ([`TransportError::link_verdict`]), never a count or a timeout. A
+//! rejection shows `Rejected(..)` and stops the link until the next
+//! `Connect`: 401/403, a protocol mismatch, and the faults no retry can
+//! fix, a server certificate from another CA (`ServerChanged`), one that
+//! does not cover the address (`NameMismatch`) or an unusable stored
+//! identity (`BadIdentity`). Anything else shows
+//! `Reconnecting { attempt, retry_at, offline_since, reason }`, waits
 //! [`Backoff::delay`] and connects again, still showing `Reconnecting`
 //! until `hello` succeeds (`RetryNow` ends the wait early and moves
 //! `retry_at` to match, without touching the bookkeeping). Both times are
@@ -108,7 +113,7 @@ use crate::pairing::pair_and_report;
 use crate::seam::{Request, Seam};
 use crate::store::{LogCheck, OutboxEntry, StoreError};
 use crate::transport::{Transport, TransportError};
-use crate::view::{CommandId, Link, LinkRejection};
+use crate::view::{CommandId, Link, LinkFailure, LinkRejection};
 use crate::workdir::{WORKDIR_TIMEOUT, WorkdirAnswer, WorkdirAsk, not_connected};
 
 /// Long-poll wait the engine asks for by default; the server caps it at 60.
@@ -555,11 +560,12 @@ enum LinkError {
 }
 
 impl LinkError {
-    fn rejection(&self) -> Option<LinkRejection> {
+    /// Stop with a rejection, or retry and show why.
+    fn verdict(&self) -> Result<LinkFailure, LinkRejection> {
         match self {
-            LinkError::Transport(e) => e.rejection(),
-            LinkError::Core(_) => None,
-            LinkError::HistoryLost { have, server } => Some(LinkRejection::HistoryLost {
+            LinkError::Transport(e) => e.link_verdict(),
+            LinkError::Core(_) => Ok(LinkFailure::Storage),
+            LinkError::HistoryLost { have, server } => Err(LinkRejection::HistoryLost {
                 have: *have,
                 server: *server,
             }),
@@ -676,10 +682,14 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
                 }
             }
         };
-        if let Some(rejection) = error.rejection() {
-            reporter.set(Link::Rejected(rejection));
-            return rejection;
-        }
+        let reason = match error.verdict() {
+            Ok(reason) => reason,
+            Err(rejection) => {
+                tracing::warn!(%error, "link stopped");
+                reporter.set(Link::Rejected(rejection));
+                return rejection;
+            }
+        };
         retry.attempt = retry.attempt.saturating_add(1);
         // The view gets the failure and the deadline as wall time, read once
         // here so every snapshot of this wait carries the same values. The
@@ -700,6 +710,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
             attempt: retry.attempt,
             retry_at: wait.retry_at(),
             offline_since,
+            reason,
         });
         let retry_now = ctx.retry_now.notified();
         tokio::pin!(retry_now);
@@ -720,6 +731,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
                         attempt: retry.attempt,
                         retry_at: wait.retry_at(),
                         offline_since,
+                        reason,
                     });
                 }
             }
@@ -1211,20 +1223,22 @@ mod tests {
                         attempt,
                         retry_at,
                         offline_since,
+                        ..
                     } => Some((*attempt, (*retry_at - *offline_since).num_milliseconds())),
                     _ => None,
                 })
                 .collect()
         };
-        let outages = |links: &[Link]| -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+        let outages = |links: &[Link]| -> Vec<(DateTime<Utc>, DateTime<Utc>, LinkFailure)> {
             links
                 .iter()
                 .filter_map(|l| match l {
                     Link::Reconnecting {
                         retry_at,
                         offline_since,
+                        reason,
                         ..
-                    } => Some((*retry_at, *offline_since)),
+                    } => Some((*retry_at, *offline_since, *reason)),
                     _ => None,
                 })
                 .collect()
@@ -1263,6 +1277,10 @@ mod tests {
             TimeDelta::seconds(1),
             "the first retry is the failure plus its delay"
         );
+        assert!(
+            first[..6].iter().all(|o| o.2 == LinkFailure::Unreachable),
+            "each wait says why its attempt failed: {first:?}"
+        );
 
         // Back up: online, and the next drop starts over at attempt 1.
         server.up.store(true, Ordering::SeqCst);
@@ -1278,8 +1296,14 @@ mod tests {
             reconnects(&links.lock().unwrap())[before..before + 2],
             [(1, 1_000), (2, 3_000)]
         );
-        let second = outages(&links.lock().unwrap())[before].1;
-        assert!(second > first[0].1, "offline_since starts over");
+        let second = outages(&links.lock().unwrap());
+        assert!(second[before].1 > first[0].1, "offline_since starts over");
+        // The pull broke first, then `hello` found the server gone: the
+        // reason follows the latest failure.
+        assert_eq!(
+            [second[before].2, second[before + 1].2],
+            [LinkFailure::ConnectionLost, LinkFailure::Unreachable]
+        );
         link.abort();
     }
 
@@ -1527,6 +1551,7 @@ mod tests {
                         attempt,
                         retry_at,
                         offline_since,
+                        ..
                     } => Some((*attempt, (*retry_at - *offline_since).num_milliseconds())),
                     _ => None,
                 })
