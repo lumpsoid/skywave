@@ -113,7 +113,8 @@ void main() {
   testWidgets('a hub crash shows the failure with Restart, which boots', (
     tester,
   ) async {
-    final holder = BootHolder();
+    final answered = <GuiIntent>[];
+    final holder = BootHolder(send: answered.add);
     await tester.pumpWidget(
       SkywaveApp(boot: holder, holders: fakeHolders(), send: (_) {}),
     );
@@ -121,7 +122,9 @@ void main() {
     await tester.pump();
     expect(find.byType(ScreenNavigator), findsOneWidget);
 
-    holder.crashed('index out of bounds');
+    holder.crashed('index out of bounds', epoch: 3);
+    // Answered at once, so Rust can drop what was sent before.
+    expect(answered, [const GuiIntentHubFailedSeen(epoch: 3)]);
     await tester.pump();
     expect(find.byType(ScreenNavigator), findsNothing);
     expect(

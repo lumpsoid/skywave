@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// Where boot stands, as Rust last reported it.
@@ -38,6 +39,10 @@ final class BootError extends BootStatus {
 
 /// Whether Rust has booted. Created at start, lives for the app's lifetime.
 class BootHolder extends ChangeNotifier {
+  /// [send] carries the answer to [HubFailed]; tests record it.
+  BootHolder({this._send = sendToRust});
+
+  final SendIntent _send;
   StreamSubscription<void>? _booted;
   StreamSubscription<void>? _failed;
   StreamSubscription<void>? _crashed;
@@ -52,7 +57,7 @@ class BootHolder extends ChangeNotifier {
       (pack) => fail(pack.message.message, unreadable: pack.message.unreadable),
     );
     _crashed = HubFailed.rustSignalStream.listen(
-      (pack) => crashed(pack.message.message),
+      (pack) => crashed(pack.message.message, epoch: pack.message.epoch),
     );
     await boot();
   }
@@ -82,10 +87,19 @@ class BootHolder extends ChangeNotifier {
       _set(BootError(message, unreadable: unreadable));
 
   /// Rust answered [HubFailed]: its hub panicked with [panic] and closed
-  /// the core; nothing sent reaches it until the next [Boot].
-  void crashed(String panic) => _set(
-    BootError('Skywave stopped after an internal error: $panic', crashed: true),
-  );
+  /// the core; nothing sent reaches it until the next [Boot]. Answers at
+  /// once with the failure's [epoch], before anything else is sent: Rust
+  /// drops every intent sent before that answer, as meant for the hub that
+  /// failed.
+  void crashed(String panic, {required int epoch}) {
+    _send(GuiIntentHubFailedSeen(epoch: epoch));
+    _set(
+      BootError(
+        'Skywave stopped after an internal error: $panic',
+        crashed: true,
+      ),
+    );
+  }
 
   void _set(BootStatus status) {
     _status = status;

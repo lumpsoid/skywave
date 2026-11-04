@@ -5,11 +5,12 @@
 //! each arm hands its input to the head and carries out what comes back.
 //!
 //! A panic in the task (an index out of range, an overflow: clippy denies
-//! only the explicit kinds) is caught where it happens: the core is closed,
-//! Dart gets `HubFailed`, and the task waits for the next `Boot` to open
-//! the core again with a fresh head.
+//! only the explicit kinds), in opening the core, or on the dispatch thread
+//! is caught where it happens: the core is closed, Dart gets `HubFailed`,
+//! and the task waits for the next `Boot` to open the core again with a
+//! fresh head. Intents Dart sent before it saw `HubFailed` never reach that
+//! head ([`Gate`]).
 
-use std::any::Any;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
@@ -20,7 +21,9 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::boot::{self, Running};
+use crate::dispatcher::Report;
 use crate::head::{Clock, Head, Out};
+use crate::panics::panic_message;
 use crate::signals::{Boot, Booted, GuiIntent, HubFailed, ScreenUpdate, ScreenView};
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
@@ -33,19 +36,60 @@ pub async fn boot_then_run(stop: oneshot::Receiver<()>) {
     // loop, are the only ones. Intents sent before the loop are queued.
     let boot = Boot::get_dart_signal_receiver();
     let intents = GuiIntent::get_dart_signal_receiver();
+    let mut gate = Gate::default();
     loop {
-        let failed = match catching(open_on_boot(&boot, &mut stop)).await {
+        let message = match catching(open_on_boot(&boot, &mut stop)).await {
             Ok(None) => return,
-            Ok(Some(hub)) => match serve(hub, &boot, &intents, &mut stop).await {
+            Ok(Some(hub)) => match serve(hub, &boot, &intents, &mut gate, &mut stop).await {
                 Served::Stopped => return,
-                Served::Failed(failed) => failed,
+                Served::Failed(message) => message,
             },
             Err(message) => {
                 tracing::error!("hub panicked while booting: {message}");
-                HubFailed { message }
+                message
             }
         };
-        failed.send_signal_to_dart();
+        gate.failed(message).send_signal_to_dart();
+    }
+}
+
+/// Which intents reach the head. Dart sends intents and `Boot` on separate
+/// channels, so only the intents themselves can say which head they were
+/// for: after `HubFailed`, Dart answers with `HubFailedSeen` of its epoch,
+/// and every intent queued before that marker is dropped.
+#[derive(Debug, Default)]
+struct Gate {
+    /// Failures so far in this process; the last one's is the epoch.
+    epoch: u32,
+    /// The last failure's marker has not arrived yet.
+    closed: bool,
+}
+
+impl Gate {
+    /// The hub failed with `message`: what Dart is told, under a new epoch,
+    /// and intents are dropped until Dart answers it.
+    fn failed(&mut self, message: String) -> HubFailed {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.closed = true;
+        HubFailed {
+            message,
+            epoch: self.epoch,
+        }
+    }
+
+    /// Whether `intent` goes to the head. A marker never does; the last
+    /// failure's opens the gate (an older one, overtaken by a second
+    /// failure, does not).
+    fn admit(&mut self, intent: &GuiIntent) -> bool {
+        match intent {
+            GuiIntent::HubFailedSeen { epoch } => {
+                if *epoch == self.epoch {
+                    self.closed = false;
+                }
+                false
+            }
+            _ => !self.closed,
+        }
     }
 }
 
@@ -102,38 +146,47 @@ async fn open_on_boot(
 /// How serving an open core ended.
 enum Served {
     Stopped,
-    Failed(HubFailed),
+    /// With the panic's message.
+    Failed(String),
 }
 
 /// Runs the loop over `hub` until `stop` fires, then closes the core. A
-/// panic ends the loop where it happens, and the core is closed all the
-/// same: actions dispatched before it are applied, but nothing is asked of
-/// the head that panicked, so the stop's last draft save and read mark are
-/// not made. Closing releases the core's slot and data dir, so the next
-/// `Boot` opens it again.
+/// panic, in the loop or on the dispatch thread, ends the loop where it
+/// happens, and the core is closed all the same: actions dispatched before
+/// it are applied (on the dispatch thread, those before the one that
+/// panicked), but nothing is asked of the head, so the stop's last draft
+/// save and read mark are not made. Closing releases the core's slot and
+/// data dir, so the next `Boot` opens it again.
 async fn serve(
     mut hub: Running,
     boot: &SignalReceiver<DartSignalPack<Boot>>,
     intents: &SignalReceiver<DartSignalPack<GuiIntent>>,
+    gate: &mut Gate,
     stop: &mut Stop,
 ) -> Served {
-    let ran = catching(run(&mut hub, boot, intents, stop)).await;
+    let ran = catching(run(&mut hub, boot, intents, gate, stop)).await;
     hub.close();
     match ran {
-        Ok(()) => Served::Stopped,
+        Ok(Ok(())) => Served::Stopped,
+        Ok(Err(message)) => {
+            tracing::error!("hub's dispatch thread failed: {message}");
+            Served::Failed(message)
+        }
         Err(message) => {
             tracing::error!("hub panicked: {message}");
-            Served::Failed(HubFailed { message })
+            Served::Failed(message)
         }
     }
 }
 
+/// The loop. `Err`: the dispatch thread panicked with this message.
 async fn run(
     hub: &mut Running,
     boot: &SignalReceiver<DartSignalPack<Boot>>,
     intents: &SignalReceiver<DartSignalPack<GuiIntent>>,
+    gate: &mut Gate,
     stop: &mut Stop,
-) {
+) -> Result<(), String> {
     let mut head = Head::new();
     let mut shown = None;
     loop {
@@ -147,7 +200,13 @@ async fn run(
                 Booted.send_signal_to_dart();
                 continue;
             }
-            Some(pack) = intents.recv() => head.on_intent(pack.message, Clock::read()),
+            Some(pack) = intents.recv() => {
+                if !gate.admit(&pack.message) {
+                    tracing::debug!(intent = ?pack.message, "intent for a failed hub dropped");
+                    continue;
+                }
+                head.on_intent(pack.message, Clock::read())
+            }
             Some(mut view) = hub.views.recv() => {
                 // Snapshots are whole: only the newest waiting one matters.
                 while let Ok(newer) = hub.views.try_recv() {
@@ -155,7 +214,14 @@ async fn run(
                 }
                 head.on_view(view, Clock::read())
             }
-            Some(done) = hub.results.recv() => head.on_dispatched(done, Clock::read()),
+            // The channel closes only when the dispatch thread ends, which
+            // while the hub runs means it panicked: then no action is
+            // applied any more, so the hub fails rather than carry on.
+            report = hub.results.recv() => match report {
+                Some(Report::Done(done)) => head.on_dispatched(done, Clock::read()),
+                Some(Report::Panicked { message, .. }) => return Err(message),
+                None => return Err("the dispatch thread ended".to_owned()),
+            },
             () = sleep_until(wake.unwrap_or_else(TokioInstant::now)), if wake.is_some() => {
                 head.on_wake(Clock::read())
             }
@@ -167,6 +233,7 @@ async fn run(
     // The one way out of the loop: the unsaved draft and read mark are
     // queued now, and closing applies everything queued before shutdown.
     perform(head.on_stop(Clock::read()), hub, &mut shown);
+    Ok(())
 }
 
 /// Runs `work`, turning a panic in it into the panic's message. The future
@@ -182,17 +249,6 @@ async fn catching<T>(work: impl Future<Output = T>) -> Result<T, String> {
         },
     )
     .await
-}
-
-/// What `panic!` was given, when it was text, as it nearly always is.
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        (*text).to_owned()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "a panic without a message".to_owned()
-    }
 }
 
 /// Carries out a step's outputs in order: signals to Dart, actions to the
@@ -248,7 +304,10 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use skywave_core::Action;
+
     use super::*;
+    use crate::dispatcher::Dispatcher;
 
     thread_local! {
         /// Makes the hub's next step panic, after the head has taken its
@@ -291,21 +350,93 @@ mod tests {
         // The core's first snapshot is the step that panics.
         let hub = reopen(dir.path()).await;
         PANIC_NEXT_STEP.with(|asked| asked.set(true));
-        let Served::Failed(failed) = serve(hub, &boot, &intents, &mut stop).await else {
+        let mut gate = Gate::default();
+        let Served::Failed(message) = serve(hub, &boot, &intents, &mut gate, &mut stop).await
+        else {
             panic!("the hub stopped without failing");
         };
-        assert_eq!(failed.message, "injected panic");
+        assert_eq!(message, "injected panic");
 
         // The core was closed: the slot is free and the data dir unlocked,
         // and a fresh hub runs over the reopened core until stopped.
         let hub = reopen(dir.path()).await;
-        let (stopping, stopped) = oneshot::channel();
-        stopping.send(()).unwrap();
-        let mut stop = Stop::new(stopped);
         assert!(matches!(
-            serve(hub, &boot, &intents, &mut stop).await,
+            serve(hub, &boot, &intents, &mut gate, &mut stopped()).await,
             Served::Stopped
         ));
+    }
+
+    /// A stop that has fired already.
+    fn stopped() -> Stop {
+        let (stopping, stopped) = oneshot::channel();
+        stopping.send(()).unwrap();
+        Stop::new(stopped)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panicking_dispatch_fails_the_hub_and_a_reboot_opens_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = Boot::get_dart_signal_receiver();
+        let intents = GuiIntent::get_dart_signal_receiver();
+        let (_running, never) = oneshot::channel();
+        let mut stop = Stop::new(never);
+
+        // The dispatch thread's next action panics.
+        let mut hub = reopen(dir.path()).await;
+        let (reports_tx, reports) = tokio::sync::mpsc::unbounded_channel();
+        let panicking = Dispatcher::start_with(reports_tx, |_| panic!("dispatch blew up")).unwrap();
+        std::mem::replace(&mut hub.dispatcher, panicking).stop();
+        hub.results = reports;
+        hub.dispatcher.send(1, Action::RetryNow);
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(hub, &boot, &intents, &mut Gate::default(), &mut stop),
+        )
+        .await
+        .expect("the hub noticed the dispatch thread's panic");
+        let Served::Failed(message) = served else {
+            panic!("the hub stopped without failing");
+        };
+        assert_eq!(message, "dispatch blew up");
+
+        // Closed as after any panic: the core opens again at once.
+        let hub = reopen(dir.path()).await;
+        assert!(matches!(
+            serve(hub, &boot, &intents, &mut Gate::default(), &mut stopped()).await,
+            Served::Stopped
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panic_while_opening_closes_the_half_open_core() {
+        let dir = tempfile::tempdir().unwrap();
+        boot::tests::PANIC_WHILE_OPENING.with(|asked| asked.set(true));
+        let caught = catching(boot::open(boot_in(dir.path()))).await;
+        assert_eq!(caught.err().unwrap(), "injected panic while opening");
+        // The core, its dispatcher and its engine were closed before the
+        // slot was released: the data dir is not "in use".
+        reopen(dir.path()).await.close();
+    }
+
+    #[test]
+    fn intents_sent_before_dart_saw_the_failure_are_dropped() {
+        let mut gate = Gate::default();
+        // Before any failure everything goes through, markers excepted.
+        assert!(gate.admit(&GuiIntent::AppReady));
+        assert!(!gate.admit(&GuiIntent::HubFailedSeen { epoch: 0 }));
+
+        assert_eq!(gate.failed("first".into()).epoch, 1);
+        assert!(!gate.admit(&GuiIntent::AppForegrounded));
+        // A second failure before Dart answered the first: the first's
+        // marker does not open the gate.
+        assert_eq!(gate.failed("second".into()).epoch, 2);
+        assert!(!gate.admit(&GuiIntent::HubFailedSeen { epoch: 1 }));
+        assert!(!gate.admit(&GuiIntent::AppBackgrounded));
+        // The last one's does, and what follows it is for the new head.
+        assert!(!gate.admit(&GuiIntent::HubFailedSeen { epoch: 2 }));
+        assert!(gate.admit(&GuiIntent::AppReady));
+        assert!(gate.admit(&GuiIntent::AppBackgrounded));
     }
 
     #[tokio::test(flavor = "current_thread")]

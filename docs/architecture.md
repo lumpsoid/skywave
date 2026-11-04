@@ -652,7 +652,15 @@ skywave-core                 all logic, sync, replica
   poll): the core is closed (queued actions applied, no stop-time draft
   save), Dart gets `HubFailed` with the panic's message and shows the boot
   failure page with Restart, which sends `Boot` and opens the core afresh
-  with a new head. Panics on the dispatch or core threads are not caught.
+  with a new head. A panic in `dispatch` is caught on the dispatch thread,
+  which reports it and ends (nothing queued after it is applied); the hub
+  fails the same way. A panic part way through opening the core closes
+  what was built before the slot is released, so Restart does not find the
+  data dir in use. `HubFailed` carries an epoch, and Dart answers it at
+  once with `HubFailedSeen` on the intent channel: the hub drops every
+  intent queued before that marker, as meant for the head that failed.
+  Panics on the core's own threads (its engine runtime, `skywave-deliver`)
+  are not caught by the hub.
 - **Boot:** Dart sends its application support directory and device name;
   the hub opens the core in `<dir>/skywave`. The GUI is its own device with
   its own data (D25). A hot restart reruns Rust's `main` and reopens the

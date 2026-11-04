@@ -6,12 +6,19 @@
 //! mark before navigating away), so one dedicated thread takes actions from
 //! a queue one at a time. Each result goes back to the hub task with the tag
 //! its action was sent with.
+//!
+//! A panic in `dispatch` is caught on the thread and reported instead of a
+//! result; the thread then ends, so nothing queued after the action that
+//! panicked is applied to a core that may be half way through a change.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use skywave_core::{Action, Core, CoreError};
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::panics::panic_message;
 
 /// Names one sent action, so the hub task can tell which result is whose.
 /// The hub picks the values; the dispatcher only carries them.
@@ -25,6 +32,18 @@ pub struct Dispatched {
     pub result: Result<(), CoreError>,
 }
 
+/// What the dispatch thread sends the hub task.
+#[derive(Debug)]
+pub enum Report {
+    Done(Dispatched),
+    /// Dispatching the action `tag` panicked with this message. It is the
+    /// thread's last report: nothing queued after it is applied.
+    Panicked {
+        tag: Tag,
+        message: String,
+    },
+}
+
 /// The dispatch thread and its queue. It holds a clone of the core until
 /// [`stop`](Dispatcher::stop), which the core's shutdown needs first.
 pub struct Dispatcher {
@@ -33,20 +52,38 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Starts the thread over `core`; every result goes to `results`.
-    pub fn start(core: Core, results: UnboundedSender<Dispatched>) -> std::io::Result<Dispatcher> {
+    /// Starts the thread over `core`; every report goes to `reports`.
+    pub fn start(core: Core, reports: UnboundedSender<Report>) -> std::io::Result<Dispatcher> {
+        Dispatcher::start_with(reports, move |action| core.dispatch(action))
+    }
+
+    /// Starts the thread over `apply`, which is `Core::dispatch` but in
+    /// tests.
+    pub(crate) fn start_with(
+        reports: UnboundedSender<Report>,
+        mut apply: impl FnMut(Action) -> Result<(), CoreError> + Send + 'static,
+    ) -> std::io::Result<Dispatcher> {
         let (queue, actions) = mpsc::channel::<(Tag, Action)>();
         let thread = thread::Builder::new()
             .name("skywave-hub-dispatch".into())
             .spawn(move || {
                 for (tag, action) in actions {
-                    let result = core.dispatch(action);
-                    if let Err(err) = &result {
-                        tracing::warn!(tag, "dispatch failed: {err}");
+                    // The hub task is gone during shutdown, so sends may
+                    // fail; the action is applied all the same.
+                    match catch_unwind(AssertUnwindSafe(|| apply(action))) {
+                        Ok(result) => {
+                            if let Err(err) = &result {
+                                tracing::warn!(tag, "dispatch failed: {err}");
+                            }
+                            let _ = reports.send(Report::Done(Dispatched { tag, result }));
+                        }
+                        Err(payload) => {
+                            let message = panic_message(payload.as_ref());
+                            tracing::error!(tag, "dispatch panicked: {message}");
+                            let _ = reports.send(Report::Panicked { tag, message });
+                            return;
+                        }
                     }
-                    // The hub task is gone during shutdown; the action is
-                    // applied all the same.
-                    let _ = results.send(Dispatched { tag, result });
                 }
             })?;
         Ok(Dispatcher { queue, thread })
@@ -55,7 +92,8 @@ impl Dispatcher {
     /// Queues `action` behind every action sent before it. Never blocks.
     pub fn send(&self, tag: Tag, action: Action) {
         if self.queue.send((tag, action)).is_err() {
-            // Only if the thread died, which `dispatch` does not make it do.
+            // The thread ended after a panic, which the hub task is about
+            // to report from `Report::Panicked`.
             tracing::error!(tag, "dispatch thread is gone; action dropped");
         }
     }
@@ -135,7 +173,10 @@ mod tests {
         assert_eq!(queued, workdirs);
 
         let mut tags = Vec::new();
-        while let Ok(done) = results.try_recv() {
+        while let Ok(report) = results.try_recv() {
+            let Report::Done(done) = report else {
+                panic!("{report:?}");
+            };
             assert!(done.result.is_ok(), "{:?}", done.result);
             tags.push(done.tag);
         }
@@ -150,8 +191,46 @@ mod tests {
         let dispatcher = Dispatcher::start(core.clone(), results_tx).unwrap();
         dispatcher.send(7, Action::RetryNow);
         dispatcher.stop();
-        assert_eq!(results.try_recv().map(|d| d.tag).ok(), Some(7));
+        assert!(matches!(
+            results.try_recv(),
+            Ok(Report::Done(Dispatched { tag: 7, .. }))
+        ));
         // The dispatcher's clone is gone, so the store closes.
         core.shutdown(std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_panicking_dispatch_is_reported_and_ends_the_thread() {
+        let (reports_tx, mut reports) = unbounded_channel();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let dispatcher = Dispatcher::start_with(reports_tx, move |action| {
+            if matches!(action, Action::Back) {
+                panic!("dispatch blew up");
+            }
+            applied_tx.send(action).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        dispatcher.send(1, Action::RetryNow);
+        dispatcher.send(2, Action::Back);
+        dispatcher.send(3, Action::RetryNow);
+        dispatcher.stop();
+
+        assert!(matches!(
+            reports.try_recv(),
+            Ok(Report::Done(Dispatched { tag: 1, .. }))
+        ));
+        match reports.try_recv() {
+            Ok(Report::Panicked { tag: 2, message }) => assert_eq!(message, "dispatch blew up"),
+            other => panic!("{other:?}"),
+        }
+        // Nothing after the panic was applied or reported, and the
+        // thread's sender is gone: the hub sees the channel close.
+        let applied: Vec<Action> = applied_rx.try_iter().collect();
+        assert_eq!(applied, [Action::RetryNow]);
+        assert!(matches!(
+            reports.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

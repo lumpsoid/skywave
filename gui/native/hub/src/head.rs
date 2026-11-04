@@ -1086,6 +1086,8 @@ impl Head {
             }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
+            // The hub task's, which keeps it from every head.
+            GuiIntent::HubFailedSeen { .. } => {}
         }
         Ok(())
     }
