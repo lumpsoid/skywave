@@ -1011,7 +1011,7 @@ pub(crate) fn input_blob(
 /// reported, not redelivered: after a stop the user chose to end the work,
 /// and after a crash or kill delivery stays at most once (architecture.md
 /// "Agent supervisor"), so the user decides whether to send them again.
-fn unsent_notice(unsent: usize) -> Option<String> {
+pub(crate) fn unsent_notice(unsent: usize) -> Option<String> {
     match unsent {
         0 => None,
         1 => Some("1 queued message was not sent to the agent; send it again".to_owned()),

@@ -123,7 +123,7 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 
 pub use mapper::EventMapper;
-pub(crate) use mapper::bounded_models;
+pub(crate) use mapper::{bounded_models, unsent_notice};
 pub use skywave_proto::{BodyFormat, ToolKind};
 
 /// The agent's own id for one approval request (e.g. a control request id).

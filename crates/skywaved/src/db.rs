@@ -331,6 +331,25 @@ const MIGRATIONS: &[&str] = &[
         seq        INTEGER NOT NULL CHECK (seq >= 0)
     ) STRICT;
     "#,
+    // v17: every message handed to an agent whose turn has not started,
+    // per session, replacing the one `handed` seq: a restart reports each
+    // one no agent took, whichever session it was in.
+    r#"
+    ALTER TABLE supervisor_cursor DROP COLUMN handed;
+    -- The log's last seq when the rows below were stored: the
+    -- supervisor's own state events after it are not reflected in them.
+    ALTER TABLE supervisor_cursor ADD COLUMN
+        accounted INTEGER NOT NULL DEFAULT 0 CHECK (accounted >= 0);
+    -- A UserMessage handed to its session's agent (stored before the agent
+    -- gets it) whose turn has not started. `settling`: an Errored about to
+    -- be logged in its context reports it.
+    CREATE TABLE supervisor_owed (
+        seq        INTEGER PRIMARY KEY CHECK (seq >= 0),
+        session_id TEXT NOT NULL,
+        context    TEXT NOT NULL,
+        settling   INTEGER NOT NULL CHECK (settling IN (0, 1))
+    ) STRICT;
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -528,7 +547,7 @@ mod tests {
     use super::*;
     use crate::event_log::parse_id;
 
-    const TABLES: [&str; 13] = [
+    const TABLES: [&str; 14] = [
         "approvals",
         "blobs",
         "commands",
@@ -541,6 +560,7 @@ mod tests {
         "shell_runs",
         "supervisor_cursor",
         "supervisor_held",
+        "supervisor_owed",
         "workdir_blobs",
     ];
 
