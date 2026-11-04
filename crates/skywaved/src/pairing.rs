@@ -24,6 +24,13 @@
 //! 2^50 codes — and bounds the per-source map: an entry lives only while it
 //! holds a slot, and every remote slot is also a global one.
 //!
+//! A full global window refuses the right code from a remote address too, so
+//! a few dozen attacking addresses could keep remote pairing blocked. Issuing
+//! a code clears every window: the owner gets unstuck with `skywaved pair`.
+//! That may run as another process, so the server learns of the code from
+//! the database: each attempt reads which code was issued last
+//! (`newest_code`) and clears the windows when it changed.
+//!
 //! **HTTP** ([`router`]): the only route is `POST /v1/pair`; errors are bare
 //! status codes (architecture.md "Protocol"): 400 malformed request or CSR, 401 wrong, used or
 //! expired code, 429 rate limited with `Retry-After`, 500 server fault.
@@ -41,7 +48,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use skywave_proto::{DeviceId, Fingerprint, PairRequest, PairResponse, path};
 
@@ -148,6 +155,18 @@ pub fn issue_code(conn: &Connection, now: DateTime<Utc>, ttl: Duration) -> Resul
         params![code.hash(), timestamp(expires_at)],
     )?;
     Ok(IssuedCode { code, expires_at })
+}
+
+/// The hash of the code [`issue_code`] stored last, if any. A new code
+/// always changes it: a row's rowid is one past the highest at insert, and
+/// only a later issue deletes rows, so the newest code has the highest.
+fn newest_code(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT hash FROM pair_codes ORDER BY rowid DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// Parses `--ttl`: a positive whole number with unit `s`, `m` or `h`
@@ -340,6 +359,8 @@ impl Window {
 struct Slot {
     source: Source,
     at: DateTime<Utc>,
+    /// [`Attempts::cleared`] when the slot was taken.
+    cleared: u64,
 }
 
 /// The rate limit's windows; an attempt holds its slots until it turns out
@@ -351,6 +372,11 @@ struct Attempts {
     global: Window,
     /// Only sources holding a slot: an emptied window is dropped.
     by_source: HashMap<Source, Window>,
+    /// The newest issued code (its hash) these windows have seen.
+    newest_code: Option<String>,
+    /// How many times a new code cleared the windows; a slot taken before
+    /// that is gone and is not given back.
+    cleared: u64,
 }
 
 impl Attempts {
@@ -359,7 +385,25 @@ impl Attempts {
             limit,
             global: Window::default(),
             by_source: HashMap::new(),
+            newest_code: None,
+            cleared: 0,
         }
+    }
+
+    /// Clears every window if `newest` (the hash of the newest issued code)
+    /// is not the one seen last: issuing a code is how the owner gets
+    /// pairing unstuck when a flood keeps the windows full.
+    fn note_newest_code(&mut self, newest: Option<String>) {
+        if newest == self.newest_code {
+            return;
+        }
+        if self.newest_code.is_some() {
+            tracing::info!("new pairing code issued, clearing the pairing rate limit");
+        }
+        self.newest_code = newest;
+        self.global = Window::default();
+        self.by_source.clear();
+        self.cleared += 1;
     }
 
     /// Reserves a slot for `ip` at `now`, or says how long until one frees
@@ -386,11 +430,19 @@ impl Attempts {
             self.global.0.push_back(now);
         }
         self.by_source.entry(source).or_default().0.push_back(now);
-        Ok(Slot { source, at: now })
+        Ok(Slot {
+            source,
+            at: now,
+            cleared: self.cleared,
+        })
     }
 
     /// Gives back a slot taken by [`Attempts::reserve`].
     fn release(&mut self, slot: Slot) {
+        if slot.cleared != self.cleared {
+            // Cleared since: giving it back would free someone else's slot.
+            return;
+        }
         if slot.source != Source::Loopback {
             self.global.remove(slot.at);
         }
@@ -468,9 +520,15 @@ impl PairService {
         }
 
         let now = self.clock.now();
-        let slot = lock(&self.attempts)
-            .reserve(peer, now)
-            .map_err(|retry_after| PairError::RateLimited { retry_after })?;
+        // `skywaved pair` may be another process: the database is how a new
+        // code reaches this one.
+        let newest = newest_code(lock(&self.db).conn())?;
+        let slot = {
+            let mut attempts = lock(&self.attempts);
+            attempts.note_newest_code(newest);
+            attempts.reserve(peer, now)
+        }
+        .map_err(|retry_after| PairError::RateLimited { retry_after })?;
         let result = self.redeem(req, name, now);
         match &result {
             Err(PairError::InvalidCode) => {
@@ -832,6 +890,8 @@ mod tests {
     #[test]
     fn global_cap_backstops_every_remote_source_but_spares_loopback() {
         let f = fixture();
+        // Two codes up front: issuing one later would clear the windows.
+        let spare = f.issue(Duration::hours(1));
         let code = f.issue(Duration::hours(1));
         let limit = RateLimit::default();
         let sources = (limit.global / limit.per_source) as u32;
@@ -856,7 +916,7 @@ mod tests {
         // cap bounds it (plus loopback, which released its slot).
         assert_eq!(lock(&f.service.attempts).by_source.len(), sources as usize);
         f.clock.advance(retry_after);
-        let code = f.issue(Duration::hours(1));
+        let code = spare;
         f.service.pair(fresh, &request(code.as_str())).unwrap();
         assert_eq!(
             lock(&f.service.attempts).by_source.len(),
@@ -865,6 +925,49 @@ mod tests {
         f.clock.advance(limit.window);
         f.fail(fresh, 1, &code);
         assert_eq!(lock(&f.service.attempts).by_source.len(), 1);
+    }
+
+    #[test]
+    fn issuing_a_code_clears_both_windows() {
+        let f = fixture();
+        let old = f.issue(Duration::hours(1));
+        let limit = RateLimit::default();
+        // REMOTE fills its own window, and with the others the global one.
+        let sources = (limit.global / limit.per_source) as u32;
+        f.fail(REMOTE, limit.per_source, &old);
+        for n in 1..sources {
+            f.fail(remote(n), limit.per_source, &old);
+        }
+        let fresh = remote(sources);
+        rate_limited(f.pair(&request(old.as_str())));
+        rate_limited(f.service.pair(fresh, &request(old.as_str())));
+
+        // Issued through another connection, as `skywaved pair` does from
+        // its own process; the clock has not moved.
+        let new = f.issue(DEFAULT_TTL);
+        f.pair(&request(new.as_str())).unwrap();
+        f.service.pair(fresh, &request(old.as_str())).unwrap();
+        assert_eq!(f.devices().len(), 2);
+
+        // Cleared, not lifted: the limit still counts from here.
+        let code = f.issue(DEFAULT_TTL);
+        f.fail(REMOTE, limit.per_source, &code);
+        rate_limited(f.pair(&request(code.as_str())));
+    }
+
+    #[test]
+    fn a_slot_from_before_a_clear_is_not_given_back() {
+        let mut attempts = Attempts::new(RateLimit::default());
+        let before = attempts.reserve(REMOTE, start()).unwrap();
+        attempts.note_newest_code(Some("a".into()));
+        attempts.reserve(REMOTE, start()).unwrap();
+        attempts.release(before);
+        assert_eq!(attempts.global.0.len(), 1);
+        assert_eq!(attempts.by_source[&Source::of(REMOTE)].0.len(), 1);
+
+        // The same code again is no news.
+        attempts.note_newest_code(Some("a".into()));
+        assert_eq!(attempts.global.0.len(), 1);
     }
 
     #[test]
@@ -1026,8 +1129,9 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        // One failure so far (the reuse); fill the window, then 429.
-        for _ in 1..RateLimit::default().per_source {
+        // Issuing the code cleared the reuse's failure; fill the window,
+        // then 429.
+        for _ in 0..RateLimit::default().per_source {
             let resp = post(&f, json(&request(&wrong_code(&code))), true).await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }

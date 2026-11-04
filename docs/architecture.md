@@ -349,7 +349,12 @@ D9. The server owns a CA; every device holds a certificate it signed.
   answers 429 even to the right code. A source is the peer's IP (an IPv6
   address by its /64; all of loopback is one source). Loopback is outside
   the global cap, so a remote flood can't lock out pairing on the server
-  itself; 100 a minute still leaves guessing a 50-bit code hopeless. The pairing
+  itself; 100 a minute still leaves guessing a 50-bit code hopeless. So a
+  few dozen remote addresses can't keep remote pairing blocked, issuing a
+  code clears both windows: `skywaved pair` gets the owner unstuck. It may
+  run as a separate process, so the running server reads, at each attempt,
+  which code was issued last (`pair_codes`, highest rowid) and clears the
+  windows when that changed. The pairing
   endpoint is the only one without a client certificate and exposes
   nothing else.
 - **Pairing URI** (the QR code):
