@@ -120,10 +120,27 @@ fn all_event_kinds() -> Vec<EventKind> {
                     format: BodyFormat::Diff,
                     preview: "@@ -1 +1 @@\n-old\n+new".into(),
                     lines: 120,
-                    full: Some(blob()),
+                    full: Some(Full::Blob(blob())),
                 }),
             },
-            input: Some(blob()),
+            input: Some(Full::Blob(blob())),
+        }),
+        EventKind::ToolCall(ToolCall {
+            parent: None,
+            call: Some(call()),
+            name: "patch".into(),
+            display: ToolDisplay {
+                kind: ToolKind::FileEdit,
+                title: "src/big.rs".into(),
+                detail: None,
+                body: Some(Body {
+                    format: BodyFormat::Diff,
+                    preview: "@@ -1 +1 @@\n-old\n+new".into(),
+                    lines: 120,
+                    full: Some(Full::Lost),
+                }),
+            },
+            input: Some(Full::Lost),
         }),
         EventKind::ToolCall(ToolCall {
             parent: None,
@@ -148,7 +165,15 @@ fn all_event_kinds() -> Vec<EventKind> {
             status: Some("exit 0".into()),
             preview: "running 3 tests\ntest a ... ok".into(),
             lines: 40,
-            output: Some(blob()),
+            output: Some(Full::Blob(blob())),
+        }),
+        EventKind::ToolResult(ToolResult {
+            call: Some(call()),
+            is_error: false,
+            status: Some("exit 0".into()),
+            preview: "running 3 tests\ntest a ... ok".into(),
+            lines: 40,
+            output: Some(Full::Lost),
         }),
         EventKind::ToolResult(ToolResult {
             call: Some(call()),
@@ -192,7 +217,15 @@ fn all_event_kinds() -> Vec<EventKind> {
             call: None,
             tool: "put".into(),
             summary: "src/main.rs".into(),
-            input: Some(blob()),
+            input: Some(Full::Blob(blob())),
+            suggestions: Vec::new(),
+        },
+        EventKind::ApprovalRequested {
+            id: approval(),
+            call: None,
+            tool: "put".into(),
+            summary: "src/main.rs".into(),
+            input: Some(Full::Lost),
             suggestions: Vec::new(),
         },
         EventKind::ApprovalResolved {
@@ -440,7 +473,7 @@ fn all_imported_items() -> Vec<ImportedItem> {
                 detail: None,
                 body: None,
             },
-            input: Some(blob()),
+            input: Some(Full::Blob(blob())),
         }),
         ImportedItem::ToolResult(ToolResult {
             call: Some(call()),
@@ -1308,8 +1341,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v18() {
-    assert_eq!(PROTOCOL_VERSION, 18);
+fn protocol_is_v19() {
+    assert_eq!(PROTOCOL_VERSION, 19);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

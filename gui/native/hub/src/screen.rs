@@ -22,7 +22,7 @@ use skywave_present::format::{
     viewing_hint, work_summary,
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
-use skywave_present::sections::{ItemKey, Section, gated_item, sections, tool_sections};
+use skywave_present::sections::{ItemKey, Section, gated_item, lost, sections, tool_sections};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
 use crate::link::count;
@@ -728,7 +728,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
         .map(|s| preview_view(s, APPROVAL_LINES));
     let input_label = preview
         .is_none()
-        .then(|| sections.iter().find_map(|s| s.blob))
+        .then(|| sections.iter().find_map(Section::blob))
         .flatten()
         .map(|blob| {
             blob_size(&blob.state).map_or_else(
@@ -776,6 +776,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
         detail,
         preview,
         input_label,
+        lost: lost(&sections).map(str::to_owned),
         can_answer,
         suggestions: prompt
             .suggestions
@@ -882,9 +883,10 @@ fn badge(state: &SessionState) -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use skywave_core::{
-        AgentWork, Attention, BackgroundTask, Link, Outgoing, Schedule, ScheduleId, Seq, TaskId,
-        TaskKind,
+        AgentWork, Attention, BackgroundTask, FullView, Link, Outgoing, Schedule, ScheduleId, Seq,
+        TaskId, TaskKind,
     };
+    use skywave_present::sections::INPUT_LOST;
 
     use super::*;
 
@@ -900,7 +902,34 @@ mod tests {
     }
 
     fn session_screen(work: AgentWork, task_stops: Vec<(TaskId, Outgoing)>) -> SessionScreen {
-        let session = SessionView {
+        let session = session_view(work, task_stops);
+        let view = ViewState {
+            link: Link::Connecting,
+            queued: 0,
+            attention: Attention::default(),
+            screen: Screen::Session(Box::new(session)),
+            can_go_back: true,
+            snippets: Vec::new(),
+        };
+        let form = PairForm::default();
+        let ui = Ui {
+            form: &form,
+            create: None,
+            rename: None,
+            composer: None,
+            repair_dismissed: false,
+            usage: Default::default(),
+            wall_ms: 0,
+            workdir_text: None,
+        };
+        match update(&view, ui).screen {
+            ScreenView::Session { session } => session,
+            other => panic!("not a session: {other:?}"),
+        }
+    }
+
+    fn session_view(work: AgentWork, task_stops: Vec<(TaskId, Outgoing)>) -> SessionView {
+        SessionView {
             subagent: None,
             id: skywave_core::SessionId::new(),
             title: "x".into(),
@@ -931,30 +960,34 @@ mod tests {
             shell: Default::default(),
             last_seq: Seq(0),
             unread_from: None,
-        };
-        let view = ViewState {
-            link: Link::Connecting,
-            queued: 0,
-            attention: Attention::default(),
-            screen: Screen::Session(Box::new(session)),
-            can_go_back: true,
-            snippets: Vec::new(),
-        };
-        let form = PairForm::default();
-        let ui = Ui {
-            form: &form,
-            create: None,
-            rename: None,
-            composer: None,
-            repair_dismissed: false,
-            usage: Default::default(),
-            wall_ms: 0,
-            workdir_text: None,
-        };
-        match update(&view, ui).screen {
-            ScreenView::Session { session } => session,
-            other => panic!("not a session: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_approval_whose_input_was_lost_says_so_up_front() {
+        let session = session_view(AgentWork::default(), Vec::new());
+        let prompt = |input| ApprovalPrompt {
+            id: skywave_core::ApprovalId::new(),
+            call: None,
+            from: None,
+            tool: "write".into(),
+            summary: "a.txt".into(),
+            input: Some(input),
+            suggestions: Vec::new(),
+            answer: None,
+        };
+        let panel = approval_panel(&prompt(FullView::Lost), &session);
+        assert_eq!(panel.lost.as_deref(), Some(INPUT_LOST));
+        assert_eq!(panel.input_label, None, "no blob to offer");
+
+        // Control: a kept input is offered and nothing is said.
+        let kept = FullView::Blob(skywave_core::BlobView {
+            id: skywave_core::BlobId::new(),
+            state: skywave_core::BlobState::NotDownloaded { size: 2048 },
+        });
+        let panel = approval_panel(&prompt(kept), &session);
+        assert_eq!(panel.lost, None);
+        assert_eq!(panel.input_label.as_deref(), Some("full input 2.0 KiB"));
     }
 
     #[test]

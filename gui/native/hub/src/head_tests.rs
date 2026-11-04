@@ -1811,7 +1811,7 @@ fn a_malformed_context_id_is_an_error_not_an_action() {
 /// a diff body whole in its preview, the input as a blob, and a result
 /// with no preview whose whole text is a 70 B blob.
 fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
-    use skywave_proto::{BlobId, BlobRef, Body, CallId, ToolCall, ToolDisplay, ToolResult};
+    use skywave_proto::{BlobId, BlobRef, Body, CallId, Full, ToolCall, ToolDisplay, ToolResult};
     let call = CallId::new();
     let output = BlobId::new();
     let kinds = vec![
@@ -1830,11 +1830,11 @@ fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
                     full: None,
                 }),
             },
-            input: Some(BlobRef {
+            input: Some(Full::Blob(BlobRef {
                 id: BlobId::new(),
                 size: 180,
                 sha256: skywave_proto::ContentHash::of(b""),
-            }),
+            })),
         }),
         EventKind::ToolResult(ToolResult {
             call: Some(call),
@@ -1842,11 +1842,11 @@ fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
             status: Some("updated +1 -1".into()),
             preview: String::new(),
             lines: 1,
-            output: Some(BlobRef {
+            output: Some(Full::Blob(BlobRef {
                 id: output,
                 size: 70,
                 sha256: skywave_proto::ContentHash::of(b""),
-            }),
+            })),
         }),
     ];
     (kinds, output)

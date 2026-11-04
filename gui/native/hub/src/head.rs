@@ -788,7 +788,7 @@ impl Head {
                         view.timeline.iter().find_map(|item| match item {
                             TimelineItem::Logged { entry, .. } => sections(entry)
                                 .into_iter()
-                                .filter_map(|s| s.blob)
+                                .filter_map(|s| s.blob())
                                 .find(|b| b.id == id)
                                 .map(|b| b.state.clone()),
                             TimelineItem::Pending { .. } => None,

@@ -375,6 +375,27 @@ pub struct BlobView {
     pub state: BlobState,
 }
 
+/// The whole of some content a preview or summary does not hold all of
+/// ([`skywave_proto::Full`]). Where it is optional, `None` means the
+/// preview holds it all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FullView {
+    /// Kept as a blob, with its download state.
+    Blob(BlobView),
+    /// The server could not keep it: only the preview or summary is left.
+    Lost,
+}
+
+impl FullView {
+    /// The blob holding the whole content, unless it was lost.
+    pub fn blob(&self) -> Option<&BlobView> {
+        match self {
+            FullView::Blob(blob) => Some(blob),
+            FullView::Lost => None,
+        }
+    }
+}
+
 /// The screen to show, with its data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
@@ -1225,13 +1246,13 @@ pub enum Entry {
     ToolCall {
         name: String,
         summary: String,
-        input: Option<BlobView>,
+        input: Option<FullView>,
     },
     /// A tool result with no logged call to fold into (v1 logs, or a result
     /// for a call that is not in the log).
     ToolResult {
         summary: String,
-        output: Option<BlobView>,
+        output: Option<FullView>,
     },
     /// An approval with no logged call to fold into (v1 logs, or a request
     /// gating no logged call).
@@ -1239,7 +1260,7 @@ pub enum Entry {
         id: ApprovalId,
         tool: String,
         summary: String,
-        input: Option<BlobView>,
+        input: Option<FullView>,
         status: ApprovalStatus,
         /// This device's answer, if it gave one (see [`ToolApproval::answer`]).
         answer: Option<Answer>,
@@ -1347,7 +1368,7 @@ pub enum ImportedEntry {
     /// was not on the imported branch), or a second one for a call.
     ToolResult {
         summary: String,
-        output: Option<BlobView>,
+        output: Option<FullView>,
     },
 }
 
@@ -1366,8 +1387,8 @@ pub struct ToolView {
     pub detail: Option<String>,
     /// Content worth showing beneath the title, e.g. a diff.
     pub body: Option<BodyView>,
-    /// The call's whole input.
-    pub input: Option<BlobView>,
+    /// The call's whole input, when its display does not show all of it.
+    pub input: Option<FullView>,
     /// The approval that gated the call, if it needed one.
     pub approval: Option<ToolApproval>,
     /// How the call's own outcome stands. A [`ToolKind::Subagent`] call's
@@ -1422,7 +1443,7 @@ pub struct BodyView {
     /// Line count of the whole content.
     pub lines: u32,
     /// The whole content, when `preview` does not hold all of it.
-    pub full: Option<BlobView>,
+    pub full: Option<FullView>,
 }
 
 /// The approval a tool call waited on.
@@ -1453,7 +1474,7 @@ pub enum ToolOutcome {
         /// Line count of the whole output.
         lines: u32,
         /// The whole output, when `preview` does not hold all of it.
-        output: Option<BlobView>,
+        output: Option<FullView>,
         took: Duration,
     },
     /// Its approval was denied, so the tool did not run.
@@ -1493,7 +1514,7 @@ pub struct ApprovalPrompt {
     pub from: Option<String>,
     pub tool: String,
     pub summary: String,
-    pub input: Option<BlobView>,
+    pub input: Option<FullView>,
     /// Lasting rules the agent offers to grant with an approval; an answer
     /// names one by its index
     /// ([`Action::ResolveApproval::rule`](crate::Action::ResolveApproval)).

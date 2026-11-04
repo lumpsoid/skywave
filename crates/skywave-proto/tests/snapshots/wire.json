@@ -1,7 +1,7 @@
 {
-  "protocol_version": 18,
+  "protocol_version": 19,
   "hello": {
-    "protocol_version": 18,
+    "protocol_version": 19,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -207,17 +207,45 @@
               "preview": "@@ -1 +1 @@\n-old\n+new",
               "lines": 120,
               "full": {
-                "id": "01920000-0000-7000-8000-000000000005",
-                "size": 48213,
-                "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+                "blob": {
+                  "id": "01920000-0000-7000-8000-000000000005",
+                  "size": 48213,
+                  "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+                }
               }
             }
           },
           "input": {
-            "id": "01920000-0000-7000-8000-000000000005",
-            "size": 48213,
-            "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            "blob": {
+              "id": "01920000-0000-7000-8000-000000000005",
+              "size": 48213,
+              "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            }
           }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "tool_call",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "parent": null,
+          "name": "patch",
+          "display": {
+            "kind": "file_edit",
+            "title": "src/big.rs",
+            "detail": null,
+            "body": {
+              "format": "diff",
+              "preview": "@@ -1 +1 @@\n-old\n+new",
+              "lines": 120,
+              "full": "lost"
+            }
+          },
+          "input": "lost"
         }
       },
       {
@@ -257,10 +285,27 @@
           "preview": "running 3 tests\ntest a ... ok",
           "lines": 40,
           "output": {
-            "id": "01920000-0000-7000-8000-000000000005",
-            "size": 48213,
-            "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            "blob": {
+              "id": "01920000-0000-7000-8000-000000000005",
+              "size": 48213,
+              "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            }
           }
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "tool_result",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "is_error": false,
+          "status": "exit 0",
+          "preview": "running 3 tests\ntest a ... ok",
+          "lines": 40,
+          "output": "lost"
         }
       },
       {
@@ -333,10 +378,27 @@
           "tool": "put",
           "summary": "src/main.rs",
           "input": {
-            "id": "01920000-0000-7000-8000-000000000005",
-            "size": 48213,
-            "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            "blob": {
+              "id": "01920000-0000-7000-8000-000000000005",
+              "size": 48213,
+              "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+            }
           },
+          "suggestions": []
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "approval_requested",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "call": null,
+          "tool": "put",
+          "summary": "src/main.rs",
+          "input": "lost",
           "suggestions": []
         }
       },
@@ -1059,9 +1121,11 @@
               "body": null
             },
             "input": {
-              "id": "01920000-0000-7000-8000-000000000005",
-              "size": 48213,
-              "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+              "blob": {
+                "id": "01920000-0000-7000-8000-000000000005",
+                "size": 48213,
+                "sha256": "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+              }
             }
           }
         }

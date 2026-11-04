@@ -304,7 +304,7 @@ mod tests {
                 Entry::ToolCall {
                     name: "bash".into(),
                     summary: "ls".into(),
-                    input: Some(blob.clone()),
+                    input: Some(skywave_core::FullView::Blob(blob.clone())),
                 },
             ),
         ]);

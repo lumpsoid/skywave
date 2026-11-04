@@ -802,7 +802,7 @@ mod tests {
     use chrono::Utc;
     use skywave_proto::{
         BlobId as ProtoBlobId, BlobRef, Command, CommandResult, Event, EventBatch, EventKind,
-        EventsQuery, HelloResponse, Seq, SessionId, ToolResult,
+        EventsQuery, Full, HelloResponse, Seq, SessionId, ToolResult,
     };
 
     use super::*;
@@ -810,7 +810,7 @@ mod tests {
     use crate::engine::Connector;
     use crate::identity::PairedCredentials;
     use crate::transport::{BlobBody, BlobDownload, BoxFuture};
-    use crate::view::{BlobState, DeviceId, Entry, Screen, TimelineItem};
+    use crate::view::{BlobState, DeviceId, Entry, FullView, Screen, TimelineItem};
     use crate::{Action, Core};
 
     /// Serves one blob's content (claiming `total` as its size), honouring
@@ -982,7 +982,7 @@ mod tests {
                         status: None,
                         preview: "big".into(),
                         lines: 1,
-                        output: Some(blob.clone()),
+                        output: Some(Full::Blob(blob.clone())),
                     })),
                 ],
             })
@@ -1062,7 +1062,8 @@ mod tests {
                         TimelineItem::Logged {
                             entry:
                                 Entry::ToolResult {
-                                    output: Some(blob), ..
+                                    output: Some(FullView::Blob(blob)),
+                                    ..
                                 },
                             ..
                         },
@@ -1091,11 +1092,11 @@ mod tests {
                     status: None,
                     preview: "held".into(),
                     lines: 1,
-                    output: Some(BlobRef {
+                    output: Some(Full::Blob(BlobRef {
                         id: *id,
                         size: 10,
                         sha256: ContentHash::of(&[0; 10]),
-                    }),
+                    })),
                 }),
             });
             self.seam
@@ -1884,7 +1885,7 @@ mod tests {
                                 status: None,
                                 preview: "big".into(),
                                 lines: 1,
-                                output: Some(event_blob.clone()),
+                                output: Some(Full::Blob(event_blob.clone())),
                             })),
                         ],
                     },

@@ -9,13 +9,13 @@ use std::thread;
 use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
-    Draft, Entry, FailReason, Fingerprint, Link, Outgoing, PairedCredentials, PairingStatus,
-    Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView, ShellAlert, ShellEnd,
-    ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem, ViewState,
+    Draft, Entry, FailReason, Fingerprint, FullView, Link, Outgoing, PairedCredentials,
+    PairingStatus, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView, ShellAlert,
+    ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem, ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
-    DeviceId, Event, EventBatch, EventKind, RejectReason, Seq, SessionId, ToolResult,
+    DeviceId, Event, EventBatch, EventKind, Full, RejectReason, Seq, SessionId, ToolResult,
 };
 
 fn assert_owned_snapshot<T: Clone + Send + Sync + 'static>() {}
@@ -605,7 +605,7 @@ fn blob_progress_is_persisted_and_shown() {
                     status: None,
                     preview: "log".into(),
                     lines: 1,
-                    output: Some(blob.clone()),
+                    output: Some(Full::Blob(blob.clone())),
                 }),
             ),
         ],
@@ -617,9 +617,11 @@ fn blob_progress_is_persisted_and_shown() {
 
     let output_state = |core: &Core| match &session_view(&core.view()).timeline[0] {
         TimelineItem::Logged {
-            entry: Entry::ToolResult {
-                output: Some(blob), ..
-            },
+            entry:
+                Entry::ToolResult {
+                    output: Some(FullView::Blob(blob)),
+                    ..
+                },
             ..
         } => blob.state.clone(),
         other => panic!("expected the tool result, got {other:?}"),
@@ -792,7 +794,7 @@ fn deleted_session_stays_gone_after_restart() {
                     status: None,
                     preview: "log".into(),
                     lines: 1,
-                    output: Some(blob.clone()),
+                    output: Some(Full::Blob(blob.clone())),
                 }),
             ),
             event(gone, 3, archived.clone()),
@@ -2124,7 +2126,7 @@ fn replica_to_reset() -> ToReset {
                     status: None,
                     preview: "log".into(),
                     lines: 1,
-                    output: Some(blob.clone()),
+                    output: Some(Full::Blob(blob.clone())),
                 }),
             ),
             event(

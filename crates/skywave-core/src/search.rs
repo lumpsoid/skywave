@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use crate::blobs::read_head;
 use crate::view::{
-    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, ImportedEntry, TimelineItem,
-    ToolOutcome, ToolView,
+    AgentSetting, BlobId, BlobState, BlobView, Effort, Entry, FullView, ImportedEntry,
+    TimelineItem, ToolOutcome, ToolView,
 };
 
 /// Most of a downloaded blob a search reads: the head of a longer one.
@@ -221,30 +221,40 @@ pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
             entry: ImportedEntry::Tool(view),
             ..
         } => tool_blobs(view),
-        Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => {
-            input.as_ref().into_iter().collect()
-        }
+        Entry::ToolCall { input, .. } | Entry::Approval { input, .. } => input
+            .as_ref()
+            .and_then(FullView::blob)
+            .into_iter()
+            .collect(),
         Entry::ToolResult { output, .. }
         | Entry::Imported {
             entry: ImportedEntry::ToolResult { output, .. },
             ..
-        } => output.as_ref().into_iter().collect(),
+        } => output
+            .as_ref()
+            .and_then(FullView::blob)
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
 }
 
 fn tool_blobs(view: &ToolView) -> Vec<&BlobView> {
     let mut out: Vec<&BlobView> = Vec::new();
-    out.extend(view.body.as_ref().and_then(|body| body.full.as_ref()));
+    out.extend(
+        view.body
+            .as_ref()
+            .and_then(|body| body.full.as_ref()?.blob()),
+    );
     if let ToolOutcome::Done {
         output: Some(output),
         ..
     } = &view.outcome
     {
-        out.push(output);
+        out.extend(output.blob());
     }
     if out.is_empty() {
-        out.extend(view.input.as_ref());
+        out.extend(view.input.as_ref().and_then(FullView::blob));
     }
     out
 }
@@ -543,7 +553,7 @@ mod tests {
     fn result(output: BlobView) -> TimelineItem {
         logged(Entry::ToolResult {
             summary: "output".into(),
-            output: Some(output),
+            output: Some(FullView::Blob(output)),
         })
     }
 
@@ -603,12 +613,12 @@ mod tests {
             status: None,
             preview: String::new(),
             lines: 40,
-            output: Some(output.clone()),
+            output: Some(FullView::Blob(output.clone())),
             took: Duration::from_secs(1),
         });
-        view.body.as_mut().unwrap().full = Some(body.clone());
+        view.body.as_mut().unwrap().full = Some(FullView::Blob(body.clone()));
         // The whole input is not shown beside a body or an output.
-        view.input = Some(input.clone());
+        view.input = Some(FullView::Blob(input.clone()));
         let timeline = vec![logged(Entry::Tool(Box::new(view)))];
         let texts = [
             (body.id, "fn main() {}\n"),

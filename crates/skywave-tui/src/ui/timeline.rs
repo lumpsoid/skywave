@@ -746,13 +746,13 @@ impl Layout<'_> {
         mark: Option<Mark>,
     ) -> (Vec<Line<'static>>, Option<usize>) {
         let preview = content_lines(section.text);
-        let mut note: Option<Span<'static>> = None;
+        let note: Option<Span<'static>>;
         // Lines of the blob left out above what is shown.
         let mut skipped = 0;
         // Which content line the current match is on.
         let mut matched = None;
         let content: Vec<String> = if expanded {
-            match section.blob.map(|blob| (blob.id, &blob.state)) {
+            match section.blob().map(|blob| (blob.id, &blob.state)) {
                 Some((id, BlobState::Available { path })) => {
                     let line = self
                         .current_line
@@ -779,7 +779,10 @@ impl Layout<'_> {
                     note = blob_note(state);
                     preview.into_iter().map(clean).collect()
                 }
-                None => preview.into_iter().map(clean).collect(),
+                None => {
+                    note = section.lost().map(|lost| Span::raw(lost).yellow());
+                    preview.into_iter().map(clean).collect()
+                }
             }
         } else if preview.is_empty() {
             // Nothing worth a line, e.g. a write's output beside its status;
@@ -800,7 +803,7 @@ impl Layout<'_> {
                     if rest == 1 { "line" } else { "lines" }
                 ));
             }
-            if let Some(blob) = section.blob {
+            if let Some(blob) = section.blob() {
                 more.push(match &blob.state {
                     BlobState::NotDownloaded { size } => {
                         format!("full {} · not downloaded", bytes(*size))
@@ -822,9 +825,17 @@ impl Layout<'_> {
                     BlobState::Available { .. } => "downloaded".to_owned(),
                 });
             }
-            if !more.is_empty() {
-                note = Some(Span::raw(format!("… {}", more.join(" · "))).dark_gray());
-            }
+            note = match section.lost() {
+                // Said in full and in colour: the preview is all there is.
+                Some(lost) => {
+                    more.push(lost.to_owned());
+                    Some(Span::raw(format!("… {}", more.join(" · "))).yellow())
+                }
+                None if !more.is_empty() => {
+                    Some(Span::raw(format!("… {}", more.join(" · "))).dark_gray())
+                }
+                None => None,
+            };
             shown
         };
 
@@ -985,20 +996,24 @@ fn head_of(text: &str, max: usize) -> &str {
 
 /// While collapsed, the state of an item's blob when no section on screen
 /// carries one (a hidden input or output, an empty preview), so `d` on it
-/// shows what it did: `input 4.2 KiB`, `output 4.2 KiB · requested`.
+/// shows what it did: `input 4.2 KiB`, `output 4.2 KiB · requested`; or
+/// that the server could not keep it: `input not stored`.
 fn unseen_blob(entry: &Entry) -> Option<String> {
     let sections = sections(entry);
     let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.blob.is_some()) {
+    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
         return None;
     }
-    let section = sections.iter().find(|s| s.blob.is_some())?;
+    let section = sections.iter().find(|s| s.full.is_some())?;
     let what = match (section.input, section.hidden) {
         (true, _) => "input",
         (false, true) => "output",
         (false, false) => "full",
     };
-    let state = match &section.blob?.state {
+    let Some(blob) = section.blob() else {
+        return Some(format!("{what} not stored"));
+    };
+    let state = match &blob.state {
         BlobState::NotDownloaded { size } => bytes(*size),
         BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
         BlobState::Downloading { got, size, paused } => format!(
@@ -1043,13 +1058,13 @@ pub(super) fn preview_lines(
         .map_or(preview.len(), |lines| lines as usize)
         .max(preview.len());
     let rest = whole - shown;
-    if rest > 0 || section.blob.is_some() {
+    if rest > 0 || section.blob().is_some() {
         let mut more = match rest {
             0 => String::new(),
             1 => "+1 line · ".to_owned(),
             _ => format!("+{rest} lines · "),
         };
-        if let Some(size) = section.blob.and_then(|blob| blob_size(&blob.state)) {
+        if let Some(size) = section.blob().and_then(|blob| blob_size(&blob.state)) {
             more.push_str(&format!("full {} · ", bytes(size)));
         }
         out.extend(wrap(

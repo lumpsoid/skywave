@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, ImportedItem, Seq,
-    SessionId, SessionOrigin, SessionState, ToolCall, ToolResult, TurnUsage,
+    AgentSettings, AgentWork, ApprovalId, BlobRef, Body, ContextId, Event, EventKind, Full,
+    ImportedItem, Seq, SessionId, SessionOrigin, SessionState, ToolCall, ToolResult, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -402,12 +402,14 @@ pub fn is_notable(kind: &EventKind) -> bool {
 pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
     let (first, second) = match kind {
         EventKind::ToolCall(ToolCall { input, display, .. }) => (
-            input.as_ref(),
-            display.body.as_ref().and_then(|body| body.full.as_ref()),
+            input.as_ref().and_then(Full::blob),
+            display.body.as_ref().and_then(body_blob),
         ),
-        EventKind::ApprovalRequested { input, .. } => (input.as_ref(), None),
-        EventKind::ToolResult(ToolResult { output, .. })
-        | EventKind::ShellFinished { output, .. } => (output.as_ref(), None),
+        EventKind::ApprovalRequested { input, .. } => (input.as_ref().and_then(Full::blob), None),
+        EventKind::ToolResult(ToolResult { output, .. }) => {
+            (output.as_ref().and_then(Full::blob), None)
+        }
+        EventKind::ShellFinished { output, .. } => (output.as_ref(), None),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
         | EventKind::AgentMessage { .. }
@@ -445,14 +447,21 @@ pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
         | EventKind::ImportFinished { .. } => (None, None),
         EventKind::Imported { item, .. } => match item {
             ImportedItem::ToolCall(ToolCall { input, display, .. }) => (
-                input.as_ref(),
-                display.body.as_ref().and_then(|body| body.full.as_ref()),
+                input.as_ref().and_then(Full::blob),
+                display.body.as_ref().and_then(body_blob),
             ),
-            ImportedItem::ToolResult(ToolResult { output, .. }) => (output.as_ref(), None),
+            ImportedItem::ToolResult(ToolResult { output, .. }) => {
+                (output.as_ref().and_then(Full::blob), None)
+            }
             ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. } => (None, None),
         },
     };
     first.into_iter().chain(second)
+}
+
+/// The blob holding a display body's whole content, if it was kept.
+fn body_blob(body: &Body) -> Option<&BlobRef> {
+    body.full.as_ref().and_then(Full::blob)
 }
 
 #[cfg(test)]
@@ -925,24 +934,30 @@ mod tests {
             sha256: skywave_proto::ContentHash::of(b""),
         };
         let (input, full) = (blob(10), blob(20));
-        let call = EventKind::ToolCall(ToolCall {
-            parent: None,
-            call: Some(skywave_proto::CallId::new()),
-            name: "Edit".into(),
-            display: skywave_proto::ToolDisplay {
-                kind: skywave_proto::ToolKind::FileEdit,
-                title: "a.rs".into(),
-                detail: None,
-                body: Some(skywave_proto::Body {
-                    format: skywave_proto::BodyFormat::Diff,
-                    preview: "-a\n+b".into(),
-                    lines: 2,
-                    full: Some(full.clone()),
-                }),
-            },
-            input: Some(input.clone()),
-        });
-        assert_eq!(blob_refs(&call).collect::<Vec<_>>(), vec![&input, &full]);
+        let call = |input, full| {
+            EventKind::ToolCall(ToolCall {
+                parent: None,
+                call: Some(skywave_proto::CallId::new()),
+                name: "Edit".into(),
+                display: skywave_proto::ToolDisplay {
+                    kind: skywave_proto::ToolKind::FileEdit,
+                    title: "a.rs".into(),
+                    detail: None,
+                    body: Some(skywave_proto::Body {
+                        format: skywave_proto::BodyFormat::Diff,
+                        preview: "-a\n+b".into(),
+                        lines: 2,
+                        full: Some(full),
+                    }),
+                },
+                input: Some(input),
+            })
+        };
+        let kept = call(Full::Blob(input.clone()), Full::Blob(full.clone()));
+        assert_eq!(blob_refs(&kept).collect::<Vec<_>>(), vec![&input, &full]);
+        // Content the server could not keep has no blob to fetch.
+        let lost = call(Full::Lost, Full::Lost);
+        assert_eq!(blob_refs(&lost).count(), 0);
         assert_eq!(blob_refs(&EventKind::TurnInterrupted).count(), 0);
     }
 }

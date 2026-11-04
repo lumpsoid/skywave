@@ -715,6 +715,39 @@ void main() {
       expect(find.text('Approve'), findsNothing);
       expect(find.text('Show call'), findsNothing);
     });
+
+    testWidgets('an input the server lost is said up front', (tester) async {
+      const lost =
+          'the server could not store the full input: you are seeing a summary';
+      ApprovalPanel withLost(String? said) => ApprovalPanel(
+        approvalId: 'a1',
+        kind: ToolKindView.other,
+        tool: 'write',
+        title: 'a.txt',
+        lost: said,
+        canAnswer: true,
+        suggestions: const [],
+        alwaysPicks: false,
+      );
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withLost(lost)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text(lost), findsOneWidget);
+      expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+
+      // Control: nothing lost, nothing said.
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withLost(null)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text(lost), findsNothing);
+      expect(find.byIcon(Icons.warning_amber_rounded), findsNothing);
+    });
   });
 
   group('composer', () {
