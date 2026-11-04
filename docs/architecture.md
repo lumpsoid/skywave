@@ -178,7 +178,10 @@ every version.
 mode 0600), `server_id`, `shell/` (running shell output until it becomes
 a blob) and `serve.lock` (held locked by the one running `serve`).
 `serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change, warning when a
-name was dropped (devices that connect by it fail with a name mismatch). Admin commands
+name was dropped (devices that connect by it fail with a name mismatch). A missing
+`ca/` is recreated by `serve` or `pair`; when unrevoked devices are registered,
+the command warns on stderr (and in the log) that every one must re-pair. Both
+warnings go to the command's stderr as well as the log. Admin commands
 (`pair`, `devices list`, `devices revoke`) work on the database directly,
 beside a running `serve`.
 

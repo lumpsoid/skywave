@@ -87,7 +87,9 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     let hostname = local_hostname();
     let bootstrap = || {
         let names = server_names(config.listen, hostname.as_deref(), &config.server_names);
-        ServerIdentity::bootstrap(&storage.dir, &names)
+        let identity = ServerIdentity::bootstrap(&storage.dir, &names)?;
+        warn_operator(&identity, &storage)?;
+        Ok::<_, skywaved::Error>(identity)
     };
 
     match cli.command {
@@ -150,6 +152,32 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                 ),
             }
         }
+    }
+    Ok(())
+}
+
+/// Prints, on the command's own stderr as well as the log (which may be a
+/// file), what a bootstrap did that locks devices out: a new CA while
+/// devices are paired, or server certificate names it dropped.
+fn warn_operator(identity: &ServerIdentity, storage: &Storage) -> skywaved::Result<()> {
+    if identity.created_ca() {
+        let paired = devices::list(storage.db.conn())?
+            .iter()
+            .filter(|d| !d.is_revoked())
+            .count();
+        if let Some(warning) = identity.new_ca_warning(paired) {
+            tracing::warn!(paired, "{warning}");
+            eprintln!("skywaved: WARNING: {warning}");
+        }
+    }
+    // Bootstrap already logged these.
+    if !identity.dropped_names().is_empty() {
+        eprintln!(
+            "skywaved: WARNING: the server certificate no longer covers {}: devices that \
+             connect by one of these names cannot connect until it is back in `server_names`, \
+             their address is changed to a listed name, or they re-pair",
+            identity.dropped_names().join(", ")
+        );
     }
     Ok(())
 }
