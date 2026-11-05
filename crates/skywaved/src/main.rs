@@ -14,6 +14,7 @@ use skywaved::data_dir::CONTROL_SOCKET_FILE;
 use skywaved::devices::{self, Revoke};
 use skywaved::disk::{Disk, FsFreeSpace};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
+use skywaved::logging::LogFile;
 use skywaved::pairing;
 use skywaved::server::{Server, ServerOptions};
 use skywaved::shell::ShellRunner;
@@ -51,6 +52,9 @@ enum Command {
     /// Stop the running serve as `stop` does, then start it again with the
     /// same arguments (and the binary now at its path).
     Restart(StopArgs),
+    /// Report whether serve runs and what it is doing: the local health
+    /// check. Fails when no serve runs, or it is stopping.
+    Status,
 }
 
 #[derive(clap::Args)]
@@ -109,9 +113,10 @@ fn run(cli: Cli) -> skywaved::Result<()> {
     match &cli.command {
         Command::Stop(args) => return request_stop(&socket, false, args),
         Command::Restart(args) => return request_stop(&socket, true, args),
+        Command::Status => return request_status(&socket),
         _ => {}
     }
-    skywaved::logging::init(config.log_file.as_deref())?;
+    let log_file = skywaved::logging::init(config.log_file.as_deref())?;
     // Every other subcommand works on the data dir, so open (and migrate)
     // it first.
     let mut storage = Storage::open(&config.data_dir)?;
@@ -130,6 +135,8 @@ fn run(cli: Cli) -> skywaved::Result<()> {
             // Held until the process exits; first, so a second `serve` on
             // this dir fails before it touches the identity or the blobs.
             let _serve_lock = storage.dir.lock_for_serve()?;
+            // Every page, once, before anything is served from the file.
+            storage.db.quick_check(&storage.dir.db_path())?;
             let identity = bootstrap()?;
             // Before anything can replace the binary: a restart executes
             // the one at this path then.
@@ -150,7 +157,7 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                     context: "starting the async runtime".into(),
                     source,
                 })?;
-            let exit = runtime.block_on(serve(&config, &mut storage, identity))?;
+            let exit = runtime.block_on(serve(&config, &mut storage, identity, log_file))?;
             if exit == Exit::Restart {
                 // Everything `serve` held goes before the new one starts:
                 // its connections and tasks, the database, the serve lock.
@@ -160,7 +167,9 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                 return Err(restart(&exe));
             }
         }
-        Command::Stop(_) | Command::Restart(_) => unreachable!("handled before the data dir"),
+        Command::Stop(_) | Command::Restart(_) | Command::Status => {
+            unreachable!("handled before the data dir")
+        }
         Command::Pair { ttl } => {
             let identity = bootstrap()?;
             let issued = pairing::issue_code(storage.db.conn(), Utc::now(), ttl)?;
@@ -239,12 +248,18 @@ enum Exit {
 }
 
 /// Runs the daemon until Ctrl-C, SIGTERM or a `skywaved stop` or
-/// `restart`.
+/// `restart`. SIGHUP reopens `log_file`, if logs go to one.
 async fn serve(
     config: &Config,
     storage: &mut Storage,
     identity: ServerIdentity,
+    log_file: Option<LogFile>,
 ) -> skywaved::Result<Exit> {
+    // Before anything else: SIGHUP's default action ends the process.
+    #[cfg(unix)]
+    let _hangup = reopen_on_hangup(log_file)?;
+    #[cfg(not(unix))]
+    let _ = log_file;
     let disk = Disk::new(
         Arc::new(FsFreeSpace::new(&config.data_dir)),
         config.disk.min_free,
@@ -409,7 +424,8 @@ fn request_stop(socket: &std::path::Path, restart: bool, args: &StopArgs) -> sky
                 }
                 if !std::io::stdin().is_terminal() {
                     return Err(skywaved::Error::Control(
-                        "not stopped: pass --force to stop anyway, or --after-work to stop                          once it has ended"
+                        "not stopped: pass --force to stop anyway, or --after-work to stop \
+                         once it has ended"
                             .into(),
                     ));
                 }
@@ -483,7 +499,7 @@ fn follow_stop(client: &mut Client, mut reply: Reply) -> skywaved::Result<()> {
                 return Ok(());
             }
             Reply::Failed { message } => return Err(skywaved::Error::Control(message)),
-            Reply::Busy { .. } => {
+            Reply::Busy { .. } | Reply::Status { .. } => {
                 return Err(skywaved::Error::Control("unexpected answer".into()));
             }
         }
@@ -507,6 +523,82 @@ fn request_stop(
     Err(skywaved::Error::Control(
         "stop and restart need Unix".into(),
     ))
+}
+
+/// Reopens `log_file` on every SIGHUP (so logrotate can move it) until the
+/// returned task is dropped; with no log file, SIGHUP is ignored.
+#[cfg(unix)]
+fn reopen_on_hangup(log_file: Option<LogFile>) -> skywaved::Result<AbortOnDrop> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = signal(SignalKind::hangup()).map_err(|source| skywaved::Error::Io {
+        context: "listening for SIGHUP".into(),
+        source,
+    })?;
+    Ok(AbortOnDrop(tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            let Some(log_file) = &log_file else { continue };
+            match log_file.reopen() {
+                Ok(()) => tracing::info!("received SIGHUP; reopened the log file"),
+                Err(e) => {
+                    tracing::error!(error = %e, "received SIGHUP; cannot reopen the log file")
+                }
+            }
+        }
+    })))
+}
+
+/// Aborts its task when dropped.
+#[cfg(unix)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+#[cfg(unix)]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// `skywaved status`: asks the running `serve` how it is and prints it.
+#[cfg(unix)]
+fn request_status(socket: &std::path::Path) -> skywaved::Result<()> {
+    let mut client = Client::connect(socket)?;
+    client.send(&Request::Status)?;
+    let reply = client.reply()?.ok_or_else(|| {
+        skywaved::Error::Control("serve closed the connection without an answer".into())
+    })?;
+    match reply {
+        Reply::Status {
+            protocol_version,
+            stopping_after_work,
+            disk_low,
+            work,
+        } => {
+            println!("serving (protocol {protocol_version})");
+            if stopping_after_work {
+                println!("stopping once the running work has ended; refusing new work");
+            }
+            if disk_low {
+                println!("disk low: agents paused, new work refused until space is freed");
+            }
+            if work.is_empty() {
+                println!("nothing running");
+            } else {
+                println!("running:");
+                for item in &work {
+                    println!("  - {item}");
+                }
+            }
+            Ok(())
+        }
+        Reply::Stopping { .. } => Err(skywaved::Error::Control("serve is stopping".into())),
+        Reply::Failed { message } => Err(skywaved::Error::Control(message)),
+        _ => Err(skywaved::Error::Control("unexpected answer".into())),
+    }
+}
+
+#[cfg(not(unix))]
+fn request_status(_socket: &std::path::Path) -> skywaved::Result<()> {
+    Err(skywaved::Error::Control("status needs Unix".into()))
 }
 
 /// Completes on Ctrl-C or, on Unix, SIGTERM.

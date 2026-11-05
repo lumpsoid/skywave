@@ -154,3 +154,62 @@ async fn cancel_with_no_stop_waiting_says_so() {
         .unwrap();
     assert!(status.success(), "{status:?}");
 }
+
+#[tokio::test]
+async fn status_reports_a_running_serve_and_fails_without_one() {
+    let d = Daemon::new();
+    let none = d.cli(&["status"]).await;
+    assert!(!none.status.success(), "{none:?}");
+    assert!(
+        stderr(&none).contains("no skywaved serve is running"),
+        "{}",
+        stderr(&none)
+    );
+
+    let mut serve = d.serve();
+    d.listening(1).await;
+    let status = d.cli(&["status"]).await;
+    assert!(status.status.success(), "{status:?}");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "serving (protocol {})",
+            skywave_proto::PROTOCOL_VERSION
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("nothing running"), "{stdout}");
+
+    assert!(d.cli(&["stop"]).await.status.success());
+    tokio::time::timeout(WAIT, serve.wait())
+        .await
+        .expect("serve ends")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sighup_reopens_a_moved_log_file() {
+    let d = Daemon::new();
+    let mut serve = d.serve();
+    d.listening(1).await;
+    let rotated = d.log_file.with_extension("log.1");
+    std::fs::rename(&d.log_file, &rotated).unwrap();
+    let pid = libc::pid_t::try_from(serve.id().unwrap()).unwrap();
+    // SAFETY: signals a child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    wait_logged(&d.log_file, "reopened the log file", 1).await;
+    assert!(
+        serve.try_wait().unwrap().is_none(),
+        "SIGHUP does not end serve"
+    );
+
+    assert!(d.cli(&["stop"]).await.status.success());
+    tokio::time::timeout(WAIT, serve.wait())
+        .await
+        .expect("serve ends")
+        .unwrap();
+    let rotated = std::fs::read_to_string(&rotated).unwrap();
+    assert!(rotated.contains(" listening addr="), "{rotated}");
+    let current = std::fs::read_to_string(&d.log_file).unwrap();
+    assert!(current.contains("stopped"), "{current}");
+}

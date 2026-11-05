@@ -201,7 +201,7 @@ every version.
 `skywave.db` (SQLite, WAL), `blobs/`, `ca/` and `server/` (ECDSA P-256 keys,
 mode 0600), `server_id`, `shell/` (running shell output until it becomes
 a blob), `serve.lock` (held locked by the one running `serve`) and
-`control.sock` (where that `serve` takes `stop` and `restart`, D41).
+`control.sock` (where that `serve` takes `stop`, `restart` and `status`, D41).
 `serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change, warning when a
 name was dropped (devices that connect by it fail with a name mismatch). A missing
 `ca/` is recreated by `serve` or `pair`; when unrevoked devices are registered,
@@ -226,7 +226,21 @@ records under the write lock. It checks again at every append and every
 supervisor step, never on a timer. `--cancel` clears the flag. Any decided
 stop is SIGTERM's graceful stop; a restart then executes `serve`'s binary
 path, read at start, again with the same arguments and pid. The
-connection stays open until the old `serve` is gone.
+connection stays open until the old `serve` is gone. `status` asks the same
+socket how `serve` is (protocol version, a waiting stop, a low disk, the
+running work) and fails when no `serve` answers: the health check, local
+only, so nothing about the daemon is served without a client certificate.
+
+`serve` runs `PRAGMA quick_check` once at startup, after taking the serve
+lock and before anything reads the log, and refuses a damaged file, telling
+the operator to restore a backup. Backups follow from the layout: the
+database is copied with SQLite's online backup (`sqlite3 .backup`), never
+as a file under a running WAL; then `blobs/`, `ca/`, `server/` and
+`server_id`. Blob files are written before their rows, so blobs copied
+after the database cover every event blob it names. Only a workdir blob
+collected between the two copies can be missing; fetching it fails until a
+refresh of its read replaces it. Copying with `serve` stopped is exact
+(README, "Running it as a service").
 
 Opening the database migrates its schema (`PRAGMA user_version`), but no
 migration rewrites the wire JSON its columns hold. So the database records
@@ -795,7 +809,11 @@ logs) an event that no longer decodes rather than failing.
   injects latency, jitter, bandwidth caps and drops between real cores and a
   real `skywaved`. It asserts no lost commands, no duplicated events, cursor
   convergence, and two devices converging on the same state.
-- `tracing` logs on both sides; the daemon logs to stderr or `log_file`.
+- `tracing` logs on both sides; the daemon logs to stderr or `log_file`,
+  which `serve` reopens at its path on SIGHUP (for logrotate). An agent's
+  stderr and stray stdout lines are all logged at warn, unthrottled: one
+  dropped could be the one that explains a failure, and rotation bounds
+  the file.
 
 ## Render states (owned by core, drawn by heads)
 

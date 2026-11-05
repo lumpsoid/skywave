@@ -304,6 +304,69 @@ the meantime, so you can finish them from a device. `restart` executes the
 systemd, `nohup` or a terminal, and picks up a binary you deployed since.
 SIGTERM (`systemctl stop`, Ctrl-C) still stops right away.
 
+### Running it as a service
+
+[`contrib/systemd/skywaved.service`](contrib/systemd/skywaved.service) is a
+systemd user unit; its header says how to install it. It runs as you, so
+the agent finds your `claude` login. Before `systemctl --user stop`, which
+loses running work, run `skywaved stop --after-work`.
+
+**Health.** `skywaved status` asks the running `serve` over its local
+socket and prints its protocol version, a stop that is waiting, a low disk
+and what runs. It exits non-zero when no `serve` answers or it is stopping.
+Without a client certificate, the network port answers nothing but pairing.
+
+**Logs.** Under systemd, leave `log_file` unset and read
+`journalctl --user -u skywaved`. With a `log_file`, `serve` reopens it on
+SIGHUP (`systemctl --user reload skywaved`), so logrotate can move it:
+
+```
+/home/me/.local/state/skywaved.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    postrotate
+        systemctl --user -M me@ reload skywaved
+    endscript
+}
+```
+
+Or use `copytruncate` without the reload. Every line the agent writes to
+stderr, and every stdout line that is not JSON, is logged at warn, so
+rotation, not the daemon, bounds the log.
+
+**Backup.** Don't copy `skywave.db` while `serve` runs: under WAL the file
+alone is not the database. The exact way is to stop, copy, start:
+
+```sh
+skywaved stop --after-work
+cp -a ~/.local/share/skywave /backup/skywave-$(date +%F)
+systemctl --user start skywaved
+```
+
+To back up while it runs, copy the database with SQLite's online backup
+first, then the rest (not `serve.lock` or `control.sock`):
+
+```sh
+cd ~/.local/share/skywave
+sqlite3 skywave.db ".backup '/backup/skywave/skywave.db'"
+cp -a blobs ca server server_id /backup/skywave/
+```
+
+That order keeps every blob the copied log names. Only a workdir file view
+replaced during the copy can be missing; refreshing it fixes that. The
+backup holds the CA, so keep it as private as the data dir. To restore,
+stop `serve` and put the copy in place of the data dir. A device that saw
+events newer than the backup detects the lost history and stops syncing
+until its local copy is reset (architecture.md, "A log that went
+backwards").
+
+**Startup check.** `serve` runs SQLite's `quick_check` over the database
+before it serves anything, and refuses to start on a damaged file. Then
+restore a backup.
+
 ### Pair a phone
 
 1. **Install the app.** Build the Flutter head for Android as in

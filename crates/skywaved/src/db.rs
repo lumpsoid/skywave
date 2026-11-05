@@ -445,6 +445,24 @@ impl Db {
         &mut self.conn
     }
 
+    /// Runs SQLite's `PRAGMA quick_check` over the whole file: fails with
+    /// [`Error::DamagedDatabase`], listing the first problems it found, if
+    /// the file is damaged. Reads every page, so `serve` runs it once at
+    /// startup, before it serves anything from the file.
+    pub fn quick_check(&self, path: &Path) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA quick_check(10)")?;
+        let found = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if found == ["ok"] {
+            return Ok(());
+        }
+        Err(Error::DamagedDatabase {
+            path: path.to_owned(),
+            problems: found.join("; "),
+        })
+    }
+
     /// Current `user_version` of the database.
     pub fn schema_version(&self) -> Result<u32> {
         user_version(&self.conn)
@@ -664,6 +682,32 @@ mod tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn quick_check_passes_a_sound_file_and_fails_a_damaged_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let db = Db::open(&path).unwrap();
+        db.quick_check(&path).unwrap();
+        // Closing the last connection checkpoints the WAL into the file.
+        drop(db);
+
+        // The last page is a b-tree page; an invalid page type byte (the
+        // first of its header) damages it.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page_size = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+        let last_page = bytes.len() - page_size;
+        bytes[last_page] = 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let db = Db {
+            conn: Connection::open(&path).unwrap(),
+        };
+        match db.quick_check(&path) {
+            Err(Error::DamagedDatabase { problems, .. }) => assert!(!problems.is_empty()),
+            other => panic!("damage not found: {other:?}"),
+        }
     }
 
     #[test]
