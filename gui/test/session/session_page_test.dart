@@ -209,8 +209,9 @@ void main() {
     expect(opacityOf('live again'), 1);
   });
 
-  testWidgets('a logged message replacing its pending one keeps the selection '
-      'and the scroll', (tester) async {
+  testWidgets('a logged message replacing its pending one keeps the scroll', (
+    tester,
+  ) async {
     final timeline = holding([
       for (var i = 0; i < 30; i++) row('s:$i', 'row $i'),
       message('p:c1', 'mine', pending: true),
@@ -230,9 +231,6 @@ void main() {
       scrollable: listScrollable(),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('mine'));
-    await tester.pump();
-    expect(timeline.selectedKey, 'p:c1');
     final where = tester.getTopLeft(find.text('mine'));
 
     timeline
@@ -247,7 +245,6 @@ void main() {
       );
     await tester.pumpAndSettle();
 
-    expect(timeline.selectedKey, 's:99');
     expect(tester.getTopLeft(find.text('mine')), where);
   });
 
@@ -302,7 +299,6 @@ void main() {
 
     await tester.tap(find.text('Bash  cat a', findRichText: true));
     expect(sent, [const GuiIntentExpandItem(key: 's:1')]);
-    expect(timeline.selectedKey, 's:1');
     await tester.tap(find.text('Bash  cat b', findRichText: true));
     expect(sent.last, const GuiIntentCollapseItem(key: 's:2'));
 
@@ -371,11 +367,6 @@ void main() {
         find.ancestor(of: text, matching: find.byType(SelectionArea)),
         findsOneWidget,
       );
-
-      // A tap on the text is the row's.
-      await tester.tap(text);
-      await tester.pump();
-      expect(timeline.selectedKey, 's:1');
 
       // A mouse drag selects part of it; Copy takes just that.
       final box = tester.getRect(text);
@@ -447,11 +438,10 @@ void main() {
     expect(find.text('Copy message'), findsOneWidget);
     expect(find.text('Edit queued'), findsNothing);
 
-    // A tap clears the selection; it does not also select the row.
+    // A tap clears the text selection.
     await tester.tap(find.text('hello world', findRichText: true));
     await tester.pumpAndSettle();
     expect(find.text('Copy message'), findsNothing);
-    expect(timeline.selectedKey, isNull);
 
     await tester.longPress(find.text('agent'));
     await tester.pumpAndSettle();

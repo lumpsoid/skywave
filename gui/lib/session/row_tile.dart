@@ -18,8 +18,6 @@ class RowTile extends StatelessWidget {
     required this.sessionId,
     required this.row,
     required this.send,
-    required this.onSelect,
-    this.selected = false,
     this.hit,
     this.current = false,
     this.currentLine,
@@ -32,10 +30,6 @@ class RowTile extends StatelessWidget {
   final TimelineRow row;
   final SendIntent send;
 
-  /// Selects this row.
-  final VoidCallback onSelect;
-  final bool selected;
-
   /// Where the search matches in this row.
   final SearchHit? hit;
 
@@ -47,7 +41,6 @@ class RowTile extends StatelessWidget {
   final Key? currentLineKey;
 
   void _tap() {
-    if (row.selectable) onSelect();
     if (!row.expandable) return;
     send(
       row.expanded
@@ -59,7 +52,6 @@ class RowTile extends StatelessWidget {
   Future<void> _menu(BuildContext context, Offset at) async {
     final items = _menuItems();
     if (items.isEmpty) return;
-    if (row.selectable) onSelect();
     final overlay =
         Overlay.of(context).context.findRenderObject()! as RenderBox;
     final chosen = await showMenu<GuiIntent>(
@@ -303,24 +295,8 @@ class RowTile extends StatelessWidget {
             onSecondaryTapUp: interactive
                 ? (details) => _menu(context, details.globalPosition)
                 : null,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 150),
-              decoration: BoxDecoration(
-                color: selected
-                    ? theme.colorScheme.secondaryContainer.withValues(
-                        alpha: 0.45,
-                      )
-                    : null,
-                border: Border(
-                  left: BorderSide(
-                    width: 3,
-                    color: selected
-                        ? theme.colorScheme.secondary
-                        : Colors.transparent,
-                  ),
-                ),
-              ),
-              padding: const EdgeInsets.fromLTRB(13, 4, 16, 4),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
               // Imported history is dimmed: a record from outside Skywave.
               child: Opacity(
                 opacity: _imported(row) ? 0.65 : 1,

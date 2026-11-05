@@ -64,7 +64,8 @@ pub struct TimelineRow {
     /// The "new" rule goes above: the unread part starts here. Never
     /// together with `turn_start`.
     pub unread_rule: bool,
-    /// The item can be selected (messages and tool items).
+    /// The item is one the TUI can select (messages and tool items): it
+    /// takes a tap and has a menu with Copy.
     pub selectable: bool,
     /// `ExpandItem` would show more (only logged items with sections).
     pub expandable: bool,

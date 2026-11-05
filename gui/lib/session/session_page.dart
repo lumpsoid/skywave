@@ -180,7 +180,6 @@ class _SessionPageState extends State<SessionPage> {
   /// Reveals the call an approval gates, expanded.
   void _showCall(String key) {
     _timelineView.currentState?.reveal(key);
-    widget.timeline.select(key);
     final index = widget.timeline.indexOf(key);
     if (index < 0) return;
     final row = widget.timeline.rows[index];
