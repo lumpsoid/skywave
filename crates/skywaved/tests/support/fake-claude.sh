@@ -21,6 +21,9 @@
 # result has seen stdout end, and the CLI exits 0 only once a line is
 # written to ./linger.fifo.
 # One containing "run" starts the Write call and runs it until interrupted.
+# One containing "flood" asks for a Write of 128 KiB, and while the answer
+# arrives writes 128 KiB of text before reading on (a CLI whose stdout
+# writes block).
 # One containing "stuck" gets the text "working", then the CLI answers
 # nothing more, interrupts included (each one gets the text "ignored").
 # A SIGTERM makes the CLI write ./term.txt and exit, reporting a running
@@ -240,6 +243,30 @@ while IFS= read -r line; do
           exec >&-
           sleep 1
           exit 0
+          ;;
+        *flood*)
+          # A Write of more than a pipe holds asks for approval, so its
+          # answer, which echoes the input, is longer than a pipe holds too.
+          # Once the answer starts to arrive, the CLI writes more than a
+          # pipe holds before reading on, as a busy CLI whose stdout writes
+          # block (Node on a pipe) does.
+          big=$(head -c 131072 /dev/zero | tr '\0' x)
+          printf '{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"big.txt","content":"%s"}}]},"session_id":"%s"}\n' "$big" "$sid"
+          printf '{"type":"control_request","request_id":"perm-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"big.txt","content":"%s"},"tool_use_id":"toolu_1"}}\n' "$big"
+          dd bs=1 count=1 of=/dev/null 2>/dev/null
+          text "$big"
+          IFS= read -r answer
+          case "$answer" in
+            *'"behavior":"allow"'*)
+              tool_result "written" false
+              text "done writing"
+              result_ok
+              ;;
+            *)
+              echo "unexpected answer: $answer" >&2
+              exit 2
+              ;;
+          esac
           ;;
         *garbage*)
           # Bytes that are not UTF-8, inside a message and on a stray line,

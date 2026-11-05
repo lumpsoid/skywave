@@ -113,7 +113,7 @@ pub mod rules;
 pub mod transcripts;
 pub mod usage;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -515,7 +515,7 @@ async fn handshake(
         if let Some(error) = protocol.startup_error() {
             return Err(error.to_owned());
         }
-        match process.stdout.next_line().await {
+        match process.next_line().await {
             Ok(Some(line)) => out = on_stdout(protocol, line),
             Ok(None) | Err(_) => {
                 let status = process.wait_exit().await;
@@ -623,7 +623,14 @@ struct Process {
     child: Child,
     /// `None` once closed.
     stdin: Option<ChildStdin>,
+    /// Read only through [`Process::next_line`], which hands out the backlog
+    /// first.
     stdout: LineReader<BufReader<ChildStdout>>,
+    /// What stdout said while a write was pending, its end included, not yet
+    /// handed out.
+    backlog: VecDeque<std::io::Result<Option<Line>>>,
+    /// stdout ended or failed while a write was pending.
+    stdout_ended: bool,
     stderr_task: Option<JoinHandle<()>>,
     /// The last non-blank stderr line.
     stderr_tail: Arc<Mutex<Option<String>>>,
@@ -654,6 +661,8 @@ impl Process {
             child,
             stdin: Some(stdin),
             stdout: LineReader::new(BufReader::new(stdout), MAX_LINE),
+            backlog: VecDeque::new(),
+            stdout_ended: false,
             stderr_task: Some(stderr_task),
             stderr_tail,
             write_timeout,
@@ -685,17 +694,45 @@ impl Process {
         }
     }
 
+    /// Writes `lines` while reading stdout into the backlog: a CLI whose
+    /// stdout writes block (Node on a pipe) stops reading its stdin once
+    /// nobody reads its stdout, and a write longer than a pipe holds would
+    /// then wait on it for good.
     async fn write_lines(&mut self, lines: &[Value]) -> std::io::Result<()> {
         let stdin = self
             .stdin
             .as_mut()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin closed"))?;
-        for line in lines {
-            let mut bytes = serde_json::to_vec(line)?;
-            bytes.push(b'\n');
-            stdin.write_all(&bytes).await?;
+        let write = async {
+            for line in lines {
+                let mut bytes = serde_json::to_vec(line)?;
+                bytes.push(b'\n');
+                stdin.write_all(&bytes).await?;
+            }
+            stdin.flush().await
+        };
+        tokio::pin!(write);
+        loop {
+            tokio::select! {
+                written = &mut write => return written,
+                line = self.stdout.next_line(), if !self.stdout_ended => {
+                    self.stdout_ended = !matches!(line, Ok(Some(_)));
+                    self.backlog.push_back(line);
+                }
+            }
         }
-        stdin.flush().await
+    }
+
+    /// The next stdout line, the backlog's first; `None` at EOF. Cancel
+    /// safe, as [`LineReader::next_line`] is.
+    async fn next_line(&mut self) -> std::io::Result<Option<Line>> {
+        if let Some(line) = self.backlog.pop_front() {
+            return line;
+        }
+        if self.stdout_ended {
+            return Ok(None);
+        }
+        self.stdout.next_line().await
     }
 
     /// Waits for the process to exit, then kills what it left in its group;
@@ -801,7 +838,7 @@ impl Driver {
     async fn run(mut self) {
         let error = loop {
             tokio::select! {
-                line = self.process.stdout.next_line() => match line {
+                line = self.process.next_line() => match line {
                     Ok(Some(line)) => {
                         let out = on_stdout(&mut self.protocol, line);
                         if !self.apply(out).await {
@@ -958,7 +995,7 @@ impl Driver {
             if until_idle && !self.protocol.turn_open() {
                 return;
             }
-            match self.process.stdout.next_line().await {
+            match self.process.next_line().await {
                 Ok(Some(line)) => {
                     let out = on_stdout(&mut self.protocol, line);
                     self.apply(out).await;
