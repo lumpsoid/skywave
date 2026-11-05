@@ -113,7 +113,7 @@ impl ScenarioReport {
     /// hold (every check when `verbose`).
     pub fn print(&self, verbose: bool) {
         println!(
-            "{:<26} {:<16} {:>6.1}s",
+            "{:<34} {:<16} {:>6.1}s",
             self.name,
             self.status().label(),
             self.elapsed.as_secs_f64()

@@ -13,6 +13,7 @@
 
 mod controls;
 mod conversations;
+mod subagents;
 mod tasks;
 mod turns;
 
@@ -128,8 +129,32 @@ pub const ALL: &[Scenario] = &[
     Scenario {
         name: "basic",
         tier: Tier::Full,
-        about: "two turns: handle, text, Stop hook before result, usage",
+        about: "two turns: handle, text, Stop hook before result, usage; then a resume",
         run: turns::basic,
+    },
+    Scenario {
+        name: "fork_turns",
+        tier: Tier::Full,
+        about: "a fork with model turns; resuming parent and fork shows the parent untouched",
+        run: conversations::fork_turns,
+    },
+    Scenario {
+        name: "interrupt",
+        tier: Tier::Full,
+        about: "interrupt while text streams and while idle; an echo runs unasked",
+        run: turns::interrupt,
+    },
+    Scenario {
+        name: "permission_modes",
+        tier: Tier::Full,
+        about: "every mode in turn, and a switch while an approval waits",
+        run: turns::permission_modes,
+    },
+    Scenario {
+        name: "permission_modes_plan",
+        tier: Tier::Full,
+        about: "plan from default: the approved ExitPlanMode returns to default",
+        run: turns::permission_modes_plan,
     },
     Scenario {
         name: "permissions",
@@ -146,7 +171,7 @@ pub const ALL: &[Scenario] = &[
     Scenario {
         name: "interrupt_pending",
         tier: Tier::Full,
-        about: "interrupt while an approval waits: cancel, an aborted result, no Stop hook",
+        about: "interrupt while an approval waits, and stdin closed while one waits",
         run: turns::interrupt_pending,
     },
     Scenario {
@@ -156,9 +181,15 @@ pub const ALL: &[Scenario] = &[
         run: tasks::background_bash,
     },
     Scenario {
+        name: "message_meets_own_turn",
+        tier: Tier::Full,
+        about: "a message written as the CLI starts a turn of its own: its started is its turn (~30s)",
+        run: tasks::message_meets_own_turn,
+    },
+    Scenario {
         name: "stop_task",
         tier: Tier::Full,
-        about: "stop_task on a background shell: event order before the ack",
+        about: "stop_task on a shell, a subagent, an unknown and an ended id; a refused one (~40s)",
         run: tasks::stop_task,
     },
     Scenario {
@@ -166,6 +197,18 @@ pub const ALL: &[Scenario] = &[
         tier: Tier::Full,
         about: "a background subagent: its call, its lines, agent_id on its approval",
         run: tasks::subagent,
+    },
+    Scenario {
+        name: "subagent_approval",
+        tier: Tier::Full,
+        about: "a background subagent's approval, outside any turn, answered later",
+        run: tasks::subagent_approval,
+    },
+    Scenario {
+        name: "subagent_background_bash",
+        tier: Tier::Full,
+        about: "a subagent's own background shell: nested in the set, wakes it (~90s)",
+        run: tasks::subagent_background_bash,
     },
     Scenario {
         name: "subagent_foreground",
@@ -180,9 +223,69 @@ pub const ALL: &[Scenario] = &[
         run: tasks::interrupt_spares_tasks,
     },
     Scenario {
+        name: "interrupt_kills_tasks",
+        tier: Tier::Full,
+        about: "without perTaskStopAffordance an interrupt kills a background subagent",
+        run: tasks::interrupt_kills_tasks,
+    },
+    Scenario {
+        name: "subagent_foreground_backgrounded",
+        tier: Tier::Full,
+        about: "a foreground helper sent to the background (Ctrl+B) enters the set",
+        run: subagents::subagent_foreground_backgrounded,
+    },
+    Scenario {
+        name: "subagent_foreground_stop",
+        tier: Tier::Full,
+        about: "a stopped foreground helper fails its Agent call",
+        run: subagents::subagent_foreground_stop,
+    },
+    Scenario {
+        name: "subagent_message_ctl",
+        tier: Tier::Full,
+        about: "send_task_message to a running subagent is refused (~60s)",
+        run: subagents::subagent_message_ctl,
+    },
+    Scenario {
+        name: "subagent_message_ctl_done",
+        tier: Tier::Full,
+        about: "send_task_message to a finished subagent is refused",
+        run: subagents::subagent_message_ctl_done,
+    },
+    Scenario {
+        name: "subagent_message_ptu",
+        tier: Tier::Full,
+        about: "a user line under a subagent's call goes to the main agent (~60s)",
+        run: subagents::subagent_message_ptu,
+    },
+    Scenario {
+        name: "subagent_message_relay",
+        tier: Tier::Full,
+        about: "the relay: the main agent SendMessages a working subagent (~60s)",
+        run: subagents::subagent_message_relay,
+    },
+    Scenario {
+        name: "subagent_message_relay_midrun",
+        tier: Tier::Full,
+        about: "the relay to a subagent busy with quick calls",
+        run: subagents::subagent_message_relay_midrun,
+    },
+    Scenario {
         name: "loop",
         tier: Tier::Full,
         about: "/loop: schedules in the Stop hook, a tick the CLI starts, durable crons (~80s)",
         run: tasks::loop_tick,
+    },
+    Scenario {
+        name: "stop_hook",
+        tier: Tier::Full,
+        about: "the Stop hook lists the jobs after a tick, a delete, a durable create (~80s)",
+        run: tasks::stop_hook,
+    },
+    Scenario {
+        name: "loop_resume",
+        tier: Tier::Full,
+        about: "/loop, a tick, a resume: the job is listed and ticks again (~3min)",
+        run: tasks::loop_resume,
     },
 ];

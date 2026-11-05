@@ -75,6 +75,9 @@ pub struct Setup {
     /// The workdir, shared with another process of the scenario (a resume
     /// must run where its conversation did); a fresh one by default.
     pub workdir: Option<Rc<Workdir>>,
+    /// Changes the adapter's `initialize` request before it is written: to
+    /// record what the CLI does with a handshake skywaved no longer sends.
+    pub initialize: Option<fn(&mut Value)>,
 }
 
 /// A scratch workdir. Dropped, it takes the CLI's project dir for it (the
@@ -271,7 +274,10 @@ impl Session {
             workdir,
         };
         session.note(&format!("argv: claude {}", args.join(" ")));
-        let start = session.protocol.start();
+        let mut start = session.protocol.start();
+        if let Some(change) = setup.initialize {
+            start.writes.iter_mut().for_each(change);
+        }
         session.apply(start);
         let deadline = Instant::now() + STARTUP;
         while !session.protocol.ready() {
@@ -320,6 +326,31 @@ impl Session {
     pub fn send(&mut self, text: &str) {
         let out = self.protocol.send_message(text.to_owned());
         self.apply(out);
+    }
+
+    /// Writes `line` as is: a line the adapter does not send.
+    pub fn raw(&mut self, line: Value) {
+        self.write(line);
+    }
+
+    /// Closes the CLI's stdin, as a stopping skywaved does.
+    pub fn close_stdin(&mut self) {
+        self.note("closing stdin");
+        self.stdin = None;
+    }
+
+    /// Waits until stdout closes, up to `secs`.
+    pub fn wait_closed(&mut self, secs: u64) -> Result<(), Stop> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            match self.pump(deadline) {
+                Pumped::Closed => return Ok(()),
+                Pumped::Timeout => {
+                    return Err(Stop::Stalled(format!("stdout still open after {secs}s")));
+                }
+                Pumped::Seen(_) | Pumped::Other => {}
+            }
+        }
     }
 
     /// Writes a control request the adapter does not send; its request id.

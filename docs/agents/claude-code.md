@@ -213,21 +213,22 @@ the final mapping.
 The full `assistant` message for each block is still emitted, so T09 can
 ignore `stream_event` entirely and get correct output, only less live.
 
-### 2.5 Cost, tokens and time in `result` (read off the fixtures, 2026-10-30)
+### 2.5 Cost, tokens and time in `result` (read off the fixtures, 2026-10-30, rechecked 2026-11-05)
 
 Which figures in `result` are the turn's own and which run on, checked on
-every `result` in the fixtures: `basic.ndjson` (two turns in one process),
-`resume.ndjson` (a new process resuming `basic`'s session),
-`permissions.ndjson`, `interrupt.ndjson` and `interrupt_pending.ndjson`
-(several turns each). No new capture was needed. All runs are on one model.
+every `result` in the fixtures: `basic.ndjson` (two turns in one process,
+then a second process resuming the session), `permissions.ndjson`,
+`interrupt.ndjson`, `interrupt_pending.ndjson` and
+`interrupt_spares_tasks.ndjson` (several turns each). All runs are on one
+model. The figures below are from the 2026-11-05 recordings.
 
 | field | scope | evidence |
 |-------|-------|----------|
-| `duration_ms` | **the turn**, wall clock, waiting for approvals included | `permissions` turn 1: 153312 ms with the approval held 150 s |
-| `usage` | **the turn**, summed over its requests (`usage.iterations`) | `permissions` turn 1 (`num_turns: 2`): `cache_read_input_tokens` 34669 = 15367 + 19302 of its two `assistant` messages |
-| `model_usage_since_last_result` | **the turn**, per model, with `costUSD` | `basic` turn 2: `costUSD` 0.00086724 = 0.00229693 − 0.00142969 |
-| `total_cost_usd` | **the whole CLI session, across processes** | `basic`: 0.00142969, then 0.00229693; `resume`'s first turn: 0.00251523 = 0.00229693 + 0.0002183 |
-| `modelUsage` | the whole CLI session, across processes, per model | `resume`: `inputTokens` 6 = 2 + 2 (`basic`) + 2 |
+| `duration_ms` | **the turn**, wall clock, waiting for approvals included | the 2026-10-30 `permissions` recording (git history): 153312 ms with the approval held 150 s. The compat scenarios answer at once, so no current fixture holds one. |
+| `usage` | **the turn**, summed over its requests (`usage.iterations`) | `permissions` turn 1 (`num_turns: 2`): `cache_read_input_tokens` 32137 = 12799 + 19338 of its two `assistant` messages |
+| `model_usage_since_last_result` | **the turn**, per model, with `costUSD` | `basic` turn 2: `costUSD` 0.00086521 = 0.0023041 − 0.00143889 |
+| `total_cost_usd` | **the whole CLI session, across processes** | `basic`: 0.00143889, then 0.0023041; the resumed process's turn: 0.00252607 = 0.0023041 + 0.00022197 |
+| `modelUsage` | the whole CLI session, across processes, per model | `basic`'s resumed process: `inputTokens` 6 = 2 + 2 + 2 |
 
 So `total_cost_usd` is cumulative, and **a resume does not reset it**: the
 CLI restores the session's spend from its transcript. A delta of
@@ -249,8 +250,10 @@ A turn interrupted while text streamed (`interrupt.ndjson` turn 1,
 `model_usage_since_last_result` and `total_cost_usd: 0`, though its
 `assistant` message did consume tokens; the spend is not counted in any later
 `result` either (turn 2's `total_cost_usd` is turn 2's own cost). Only its
-time is reported for it. A turn interrupted at an approval (`interrupt_pending`,
-`aborted_tools`) reports its figures normally.
+time is reported for it. The same holds for `interrupt_pending`'s first turn,
+interrupted at an approval while the message holding the `tool_use` was still
+streaming (`aborted_streaming`, §4.2). A turn interrupted while a tool runs
+(`interrupt_spares_tasks`, `aborted_tools`) reports its figures normally.
 
 Not observed: a turn on two models. Summing `costUSD` per model is the
 reading of the field's shape, not a capture.
@@ -656,7 +659,8 @@ Work the agent runs outside a turn: shells started with
 (`CronCreate`, `/loop`). Skywave reports tasks and schedules as two whole
 sets (D31). Fixtures: `background_bash`, `subagent`,
 `subagent_background_bash`, `stop_task`, `stop_hook`, `loop`, `loop_resume`,
-`subagent_approval`, `interrupt_spares_tasks`, `interrupt_kills_tasks`.
+`subagent_approval`, `interrupt_spares_tasks`, `interrupt_kills_tasks`,
+`message_meets_own_turn`.
 
 **The level signal.** `{"type":"system","subtype":"background_tasks_changed",
 "tasks":[…]}` carries the CLI's whole live set each time it changes
@@ -765,10 +769,11 @@ and the main agent can message one with its `SendMessage` tool. This
 section records whether a stream-json consumer can do the same (probed
 2026-11-02 against 2.1.310; D33 is the decision taken from it). Fixtures:
 `subagent_message_ctl`, `subagent_message_ctl_done`, `subagent_message_ptu`,
-`subagent_message_relay`, `subagent_message_relay_midrun`, recorded with
-the Python probe `tests/support/probe-subagent-message.py` (retired for
-`skywave-claude-compat`; git history keeps it). In each, a background subagent is
-told to reply with the code word it was sent while it worked, or NONE.
+`subagent_message_relay`, `subagent_message_relay_midrun`, first recorded
+with a Python probe and re-recorded on 2026-11-05 through the
+`skywave-claude-compat` scenarios of the same names, with the same outcomes.
+In each, a background subagent is told to reply with the code word it was
+sent while it worked, or NONE.
 
 **What was tried.**
 
@@ -795,15 +800,19 @@ the main agent to forward the text with `SendMessage`.
    notification before resending.","pin":{…}}`. This acks the **queueing**,
    not the delivery.
 3. Delivery has two forms:
-   - **Mid-run** (`subagent_message_relay_midrun`): the subagent reads the
-     message at its next tool round. Nothing on stdout shows it: no line of
-     the subagent's carries the text (searched for it); only the subagent's
-     later behaviour does.
-   - **After it finished** (`subagent_message_relay`): the subagent is
+   - **Mid-run** (`subagent_message_relay_midrun`, and
+     `subagent_message_relay` as recorded on 2026-11-05, where the subagent
+     was still in its sleeps): the subagent reads the message at its next
+     tool round. Nothing on stdout shows it: no line of the subagent's
+     carries the text (searched for it); only the subagent's later
+     behaviour does.
+   - **After it finished** (the 2026-11-02 `subagent_message_relay`
+     recording, in git history; no current fixture): the subagent is
      resumed. A new `task_started` comes with the **same** `task_id` and
      `tool_use_id`, a **new** `run_id`, and `prompt` equal to the text,
      with the task back in the level set. That line is the one definitive
-     delivery signal.
+     delivery signal. Which form a relay takes depends on the model's
+     timing, so the scenario accepts either.
 4. The subagent sees the text as from the main agent ("the coordinator's
    message"), not from a human. The model passed the text on verbatim in
    every run; nothing guarantees it.
@@ -875,12 +884,11 @@ back as is (probe, 2026-11-05). The adapter does not pass the flag: the
 marker.
 
 **`sleep` is blocked.** This CLI refuses a standalone `sleep 25` in a
-subagent ("use Monitor"), so the `relay_live` and `relay_midrun` prompts need
-changing before they are re-recorded. The raw `relay_race` recordings
-(`/tmp/skywave-race/`) are not fixtures; nothing replays them. The relay
-scenarios were not carried into `skywave-claude-compat`: D34 deferred the
-relay, so nothing relies on them. Revive them from the retired probe if a
-relay is ever reconsidered.
+subagent ("use Monitor"), so the scenarios' subagents wait with a
+foreground `python3 -c "import time; time.sleep(20)"` instead. The raw
+`relay_race` recordings are not fixtures; nothing replays them. D34
+deferred the relay, so nothing in skywaved relies on the relay scenarios;
+they are kept so a CLI bump that changes the outcome shows up.
 
 **Re-check on every CLI bump.** `skywave-claude-compat` (quick tier) sends
 `send_task_message` and watches the answer. While it is still
@@ -894,15 +902,15 @@ The `Agent` tool takes `run_in_background`; with `false` the subagent is
 **foreground** ("synchronous"): the main agent's `Agent` call blocks until
 it ends. The model chooses: asked to wait ("I'll wait for its answer") it
 picked foreground, asked for a chore with "no rush" it picked background,
-and the same ask went either way across runs. Fixtures:
-`subagent_foreground`, `subagent_foreground_backgrounded`,
-`subagent_foreground_stop`, recorded 2026-11-02 with the Python probe
-`tests/support/probe-foreground-subagent.py` (retired; git history keeps
-it), which asks the way a user would over a small folder of recipes and
-lets the agent pick its tools. `skywave-claude-compat`'s
-`subagent_foreground` re-checks the first of them; backgrounding
-(Ctrl+B) and stopping a foreground subagent are deferred (D31, D34), so
-it does not check them.
+and the same ask went either way across runs (Python probes, 2026-11-02).
+Fixtures: `subagent_foreground`, `subagent_foreground_backgrounded`,
+`subagent_foreground_stop`, recorded 2026-11-05 through the
+`skywave-claude-compat` scenarios of the same names over a small folder of
+recipes. To make the recordings repeatable, the asks now name
+`run_in_background false`. The `subagent_foreground` helper writes its
+findings to a file, so it also asks for an approval. Backgrounding (Ctrl+B)
+and stopping a foreground subagent are deferred (D31, D34). Their scenarios
+record what the CLI does for when they are built.
 
 **What a foreground subagent looks like** (`subagent_foreground`):
 - `task_started` with a `task_id`, the `Agent` call's `tool_use_id` and
@@ -968,14 +976,20 @@ The CLI emits, in order:
    → T09 maps this to `ApprovalCancelled`.
 2. the interrupt's control_response
 3. a `tool_result` with `is_error:true`: "The user doesn't want to proceed with this tool use..."
-4. the user message `[Request interrupted by user for tool use]`
-5. `result` with `error_during_execution`, `terminal_reason:"aborted_tools"`,
-   and the tool listed in `permission_denials`
+4. a user message: `[Request interrupted by user for tool use]` in the
+   2026-10-29 recording, `[Request interrupted by user]` in the 2026-11-05 one
+5. `result` with `error_during_execution` and the tool listed in
+   `permission_denials`. `terminal_reason` was `"aborted_tools"` in the
+   2026-10-29 recording. In the 2026-11-05 one the `can_use_tool` came while
+   the message holding the `tool_use` was still streaming, and it was
+   `"aborted_streaming"`, with zero `usage` (§2.5). Treat both as an
+   interrupted turn.
 
 A **late** `control_response` for the cancelled request, sent 3 s later, was
 silently ignored. There was no error, and the file was not written. **[C]**
-T09 should still drop answers to approvals that are no longer pending, rather
-than rely on that.
+(2026-10-29 recording; the adapter never sends one, so the compat scenario
+does not.) T09 should still drop answers to approvals that are no longer
+pending, rather than rely on that.
 
 ### 4.3 Process still usable [C]
 
@@ -1018,12 +1032,12 @@ waiting on stays pending.
   rules are ignored, not granted.
 - Without `--session-id`, the CLI picks a UUID. It is first visible in
   `system/init.session_id` and is repeated on every message. **[C]**
-- `--resume <uuid>` in a **new** process restores the history (`resume.ndjson`
-  quotes the first prompt of `basic`) and keeps the **same** session id.
-  **[C]**
+- `--resume <uuid>` in a **new** process restores the history (`basic.ndjson`'s
+  second process names both bells of the first) and keeps the **same**
+  session id. **[C]**
 - `--resume <A> --fork-session --session-id <B>` in a new process copies A's
   history into a new transcript under the id **B we chose**: `system/init`
-  and every message carry B. **[C]** (`fork.ndjson`, 2026-11-01). Without
+  and every message carry B. **[C]** (`fork_turns.ndjson`, 2026-11-05). Without
   `--session-id` the CLI picks the new id (seen in a probe, not recorded).
   A is untouched: a later `--resume <A>` does not know the fork's turns, and
   `--resume <B>` restores A's history plus the fork's. **[C]** Nothing in the

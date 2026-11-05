@@ -668,8 +668,9 @@ docs/agents/claude-code.md §3.12):
   `uuid` is echoed back. (Since verified, 2026-11-05: it is, and a `uuid`
   alone brings `command_lifecycle` lines naming the line, which the adapter
   now reads for every message; docs/agents/claude-code.md §3.11.)
-- This CLI blocks a standalone `sleep 25` in a subagent ("use Monitor"), so
-  the `relay_live` / `relay_midrun` prompts need changing before re-recording.
+- This CLI blocks a standalone `sleep 25` in a subagent ("use Monitor"). The
+  relay fixtures were re-recorded on 2026-11-05 through `skywave-claude-compat`
+  with subagents that sleep in `python3`; both relays still deliver ZEBRA.
 - The raw recordings in `/tmp/skywave-race/` are not fixtures; nothing
   replays them. The retired probe `tests/support/probe-subagent-message.py`
   (in git history) regenerates them with `relay_race` / `relay_race_echo`.

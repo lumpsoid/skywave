@@ -768,7 +768,10 @@ logs) an event that no longer decodes rather than failing.
 
 - Tests are deterministic: a scripted fake agent (`skywaved/src/agent/fake.rs`,
   `tests/support/fake-claude.sh`) and recorded CLI fixtures. Only fixture
-  recording and `skywave-claude-compat` run the real CLI.
+  recording and `skywave-claude-compat` run the real CLI. The Claude Code
+  fixtures are recordings of compat scenarios (`--record`), so their stdin is
+  what skywaved writes, `uuid`s included. A replay feeds the recorded stdout
+  to the adapter and maps only the recorded `uuid`s to the ones it wrote.
 - **Link harness** (`skywave-testkit`, D11): an in-process TCP proxy that
   injects latency, jitter, bandwidth caps and drops between real cores and a
   real `skywaved`. It asserts no lost commands, no duplicated events, cursor

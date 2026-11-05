@@ -294,7 +294,10 @@ fn offered(s: &Session) -> Vec<ModelChoice> {
 }
 
 /// Asks for `mode`: the mode set, or the refusal's reason.
-fn set_mode(s: &mut Session, mode: PermissionMode) -> Result<Result<PermissionMode, String>, Stop> {
+pub(super) fn set_mode(
+    s: &mut Session,
+    mode: PermissionMode,
+) -> Result<Result<PermissionMode, String>, Stop> {
     let from = s.mark();
     let out = s.protocol.set_permission_mode(mode);
     s.apply(out);
@@ -307,7 +310,7 @@ fn set_mode(s: &mut Session, mode: PermissionMode) -> Result<Result<PermissionMo
     .map(|(_, answer)| answer)
 }
 
-fn expect_mode(
+pub(super) fn expect_mode(
     answer: Result<Result<PermissionMode, String>, Stop>,
     want: PermissionMode,
 ) -> Result<(), String> {
