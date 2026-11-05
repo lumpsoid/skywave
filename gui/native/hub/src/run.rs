@@ -10,7 +10,9 @@
 //! where it happens: the core is closed, Dart gets `HubFailed`,
 //! and the task waits for the next `Boot` to open the core again with a
 //! fresh head. Intents Dart sent before it saw `HubFailed` never reach that
-//! head ([`Gate`]).
+//! head ([`Gate`]). Off screen with the background service holding the
+//! link, nobody would see the Restart page, so the hub reopens the core
+//! itself, once ([`Recovery`]).
 
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,14 +26,19 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 use crate::boot::{self, Running};
 use crate::dispatcher::Report;
 use crate::head::{Clock, Head, Out};
+use crate::lifecycle::{Awake, Holder};
+use crate::notify;
 use crate::panics::panic_message;
 use crate::prefs;
-use crate::signals::{Boot, Booted, GuiIntent, HubFailed, ScreenUpdate, ScreenView};
+use crate::signals::{
+    Boot, Booted, GuiIntent, HubFailed, PlatformEffect, ScreenUpdate, ScreenView,
+};
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
 /// `BootFailed` and waiting for the next `Boot`; then runs the loop. After
-/// a panic, answers `HubFailed` and waits for `Boot` again. Returns once
-/// `stop` fires (or its sender goes), with the core closed.
+/// a panic, answers `HubFailed`, then reopens the core itself or waits for
+/// `Boot` again, as [`Recovery`] says. Returns once `stop` fires (or its
+/// sender goes), with the core closed.
 pub async fn boot_then_run(stop: oneshot::Receiver<()>) {
     let mut stop = Stop::new(stop);
     // rinf keeps one receiver per signal type: these, handed on to the
@@ -39,20 +46,139 @@ pub async fn boot_then_run(stop: oneshot::Receiver<()>) {
     let boot = Boot::get_dart_signal_receiver();
     let intents = GuiIntent::get_dart_signal_receiver();
     let mut gate = Gate::default();
+    let mut recovery = Recovery::default();
+    // A core the hub reopened itself after a failure.
+    let mut reopened = None;
     loop {
-        let message = match catching(open_on_boot(&boot, &mut stop)).await {
-            Ok(None) => return,
-            Ok(Some(hub)) => match serve(hub, &boot, &intents, &mut gate, &mut stop).await {
-                Served::Stopped => return,
-                Served::Failed(message) => message,
+        let hub = match reopened.take() {
+            Some(hub) => hub,
+            None => match catching(open_on_boot(&boot, &mut stop)).await {
+                Ok(None) => return,
+                Ok(Some((hub, booted))) => {
+                    recovery.boot = Some(booted);
+                    hub
+                }
+                Err(message) => {
+                    tracing::error!("hub panicked while booting: {message}");
+                    gate.failed(message).send_signal_to_dart();
+                    continue;
+                }
             },
-            Err(message) => {
-                tracing::error!("hub panicked while booting: {message}");
-                message
-            }
         };
-        gate.failed(message).send_signal_to_dart();
+        match serve(hub, &boot, &intents, &mut gate, &mut recovery, &mut stop).await {
+            Served::Stopped => return,
+            Served::Failed(message) => gate.failed(message).send_signal_to_dart(),
+        }
+        reopened = recover(&mut recovery).await;
     }
+}
+
+/// What a hub failure does, from where the app was when it failed. On
+/// screen, or off it with nothing holding the link, the user restarts it
+/// (the Restart page). Off screen with the background service holding the
+/// link, nobody sees that page while the service's notification still
+/// says the link is open: the hub reopens the core itself, once. Failing
+/// again before the app is back on screen, it stops the service and says
+/// so in a notification, rather than restart a failure that repeats.
+#[derive(Debug, Default)]
+struct Recovery {
+    /// The `Boot` that opened the core last; a restart opens it again.
+    boot: Option<Boot>,
+    /// The holders after the running head's last step, and the ones the
+    /// next head starts with.
+    holders: Awake,
+    /// The hub restarted itself since the app was last on screen.
+    restarted: bool,
+}
+
+/// What [`Recovery::failed`] decided.
+#[derive(Debug)]
+enum Recover {
+    /// Wait for Dart's `Boot`.
+    Wait,
+    /// Open the core again with this `Boot`, without Dart asking.
+    Restart(Boot),
+    /// Stop the service and say the hub stopped; then wait for `Boot`.
+    GiveUp,
+}
+
+impl Recovery {
+    /// The running head's holders after a whole step: on screen, the next
+    /// failure may restart again.
+    fn stepped(&mut self, holders: Awake) {
+        if holders.holds(Holder::Visible) {
+            self.restarted = false;
+        }
+        self.holders = holders;
+    }
+
+    /// The hub failed. A restarted head starts with the holders the failed
+    /// one had; any other starts on screen, as Dart's `Boot` follows the
+    /// user's tap.
+    fn failed(&mut self) -> Recover {
+        let away = !self.holders.holds(Holder::Visible) && self.holders.holds(Holder::Service);
+        let decided = match (away, self.restarted, &self.boot) {
+            (false, ..) => Recover::Wait,
+            (true, false, Some(boot)) => Recover::Restart(boot.clone()),
+            (true, ..) => Recover::GiveUp,
+        };
+        match decided {
+            Recover::Restart(_) => self.restarted = true,
+            Recover::Wait | Recover::GiveUp => self.holders = Awake::default(),
+        }
+        decided
+    }
+}
+
+/// Carries out what [`Recovery::failed`] decides: a core reopened, or
+/// `None` to wait for Dart's `Boot`. A restart that cannot open the core
+/// gives up.
+async fn recover(recovery: &mut Recovery) -> Option<Running> {
+    let boot = match recovery.failed() {
+        Recover::Wait => return None,
+        Recover::GiveUp => {
+            give_up();
+            return None;
+        }
+        Recover::Restart(boot) => boot,
+    };
+    tracing::warn!("hub failed off screen while the service holds the link: reopening the core");
+    match catching(boot::open(boot)).await {
+        Ok(Ok(hub)) => {
+            Booted.send_signal_to_dart();
+            Some(hub)
+        }
+        Ok(Err(failed)) => {
+            tracing::warn!(
+                unreadable = failed.unreadable,
+                "restart failed: {}",
+                failed.message
+            );
+            failed.send_signal_to_dart();
+            give_up();
+            None
+        }
+        Err(message) => {
+            tracing::error!("hub panicked while restarting: {message}");
+            give_up();
+            None
+        }
+    }
+}
+
+/// Stops the background service, whose notification would claim a link
+/// that is gone, and says the hub stopped. The Restart page waits for the
+/// user; a successful boot takes the notification down.
+fn give_up() {
+    tracing::error!("hub failed off screen again: stopping the background service");
+    PlatformEffect::BackgroundService { run: false }.send_signal_to_dart();
+    PlatformEffect::Notify {
+        id: notify::STOPPED,
+        title: "Skywave stopped".to_owned(),
+        body: "An internal error stopped it in the background. Open it to restart.".to_owned(),
+        session_id: None,
+    }
+    .send_signal_to_dart();
 }
 
 /// Which intents reach the head. Dart sends intents and `Boot` on separate
@@ -121,19 +247,26 @@ impl Stop {
 }
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
-/// `BootFailed` and waiting for the next `Boot`. `None`: stopped first.
+/// `BootFailed` and waiting for the next `Boot`. Returns the open core and
+/// the `Boot` that opened it; `None`: stopped first.
 async fn open_on_boot(
     boot: &SignalReceiver<DartSignalPack<Boot>>,
     stop: &mut Stop,
-) -> Option<Running> {
+) -> Option<(Running, Boot)> {
     loop {
         tokio::select! {
             () = stop.fired() => return None,
             pack = boot.recv() => {
-                match boot::open(pack?.message).await {
+                let asked = pack?.message;
+                // Reopened later as it was opened now, not reset again.
+                let again = Boot { reset_replica: false, ..asked.clone() };
+                match boot::open(asked).await {
                     Ok(running) => {
                         Booted.send_signal_to_dart();
-                        return Some(running);
+                        // Up if the hub gave up off screen; the user has
+                        // restarted it now.
+                        PlatformEffect::Dismiss { id: notify::STOPPED }.send_signal_to_dart();
+                        return Some((running, again));
                     }
                     Err(failed) => {
                         tracing::warn!(unreadable = failed.unreadable, "boot failed: {}", failed.message);
@@ -164,9 +297,10 @@ async fn serve(
     boot: &SignalReceiver<DartSignalPack<Boot>>,
     intents: &SignalReceiver<DartSignalPack<GuiIntent>>,
     gate: &mut Gate,
+    recovery: &mut Recovery,
     stop: &mut Stop,
 ) -> Served {
-    let ran = catching(run(&mut hub, boot, intents, gate, stop)).await;
+    let ran = catching(run(&mut hub, boot, intents, gate, recovery, stop)).await;
     hub.close();
     match ran {
         Ok(Ok(())) => Served::Stopped,
@@ -188,9 +322,11 @@ async fn run(
     boot: &SignalReceiver<DartSignalPack<Boot>>,
     intents: &SignalReceiver<DartSignalPack<GuiIntent>>,
     gate: &mut Gate,
+    recovery: &mut Recovery,
     stop: &mut Stop,
 ) -> Result<(), String> {
-    let mut head = Head::new(hub.prefs);
+    let mut head = Head::holding(hub.prefs, recovery.holders);
+    recovery.stepped(*head.awake());
     let mut shown = None;
     loop {
         // Read afresh each turn: what is due changes with every step.
@@ -236,6 +372,7 @@ async fn run(
         #[cfg(test)]
         tests::panic_if_asked();
         perform(outs, hub, &mut shown);
+        recovery.stepped(*head.awake());
     }
     // The one way out of the loop: the unsaved draft and read mark are
     // queued now, and closing applies everything queued before shutdown.
@@ -321,6 +458,109 @@ mod tests {
 
     use super::*;
     use crate::dispatcher::Dispatcher;
+    use crate::lifecycle::{Moved, Target};
+
+    /// A phone's holders off screen, with the service holding the link or not.
+    fn away(service: bool) -> Awake {
+        let mut awake = Awake::new(Target::Mobile);
+        awake.service(service);
+        awake.moved(Moved::Backgrounded);
+        awake
+    }
+
+    /// A phone's holders on screen, the service running.
+    fn shown() -> Awake {
+        let mut awake = away(true);
+        awake.moved(Moved::Foregrounded);
+        awake
+    }
+
+    fn booted_once(dir: &Path) -> Recovery {
+        Recovery {
+            boot: Some(boot_in(dir)),
+            ..Recovery::default()
+        }
+    }
+
+    #[test]
+    fn a_failure_on_screen_or_with_nothing_holding_waits_for_the_user() {
+        let dir = Path::new("/nowhere");
+        for holders in [Awake::default(), shown(), away(false)] {
+            let mut recovery = booted_once(dir);
+            recovery.stepped(holders);
+            assert!(matches!(recovery.failed(), Recover::Wait), "{holders:?}");
+            assert_eq!(
+                recovery.holders,
+                Awake::default(),
+                "the next head starts on screen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_off_screen_under_the_service_restarts_once_then_gives_up() {
+        let mut recovery = booted_once(Path::new("/data"));
+        recovery.stepped(away(true));
+        let Recover::Restart(boot) = recovery.failed() else {
+            panic!("not restarted");
+        };
+        assert_eq!(boot.dir, "/data");
+        assert_eq!(
+            recovery.holders,
+            away(true),
+            "the restarted head starts away"
+        );
+
+        // The restarted head fails again, before or after a step off screen.
+        recovery.stepped(recovery.holders);
+        assert!(matches!(recovery.failed(), Recover::GiveUp));
+        assert_eq!(recovery.holders, Awake::default());
+    }
+
+    #[test]
+    fn coming_back_on_screen_allows_another_restart() {
+        let mut recovery = booted_once(Path::new("/data"));
+        recovery.stepped(away(true));
+        assert!(matches!(recovery.failed(), Recover::Restart(_)));
+        recovery.stepped(shown());
+        recovery.stepped(away(true));
+        assert!(matches!(recovery.failed(), Recover::Restart(_)));
+    }
+
+    #[test]
+    fn a_failure_off_screen_before_any_boot_gives_up() {
+        let mut recovery = Recovery::default();
+        recovery.stepped(away(true));
+        assert!(matches!(recovery.failed(), Recover::GiveUp));
+    }
+
+    /// The whole path: a head off screen under the service panics, and the
+    /// hub reopens the core without a `Boot`, its head starting away.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hub_failing_off_screen_under_the_service_reopens_the_core_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = Boot::get_dart_signal_receiver();
+        let intents = GuiIntent::get_dart_signal_receiver();
+        let (_running, never) = oneshot::channel();
+        let mut stop = Stop::new(never);
+        let mut recovery = booted_once(dir.path());
+        recovery.holders = away(true);
+
+        let mut gate = Gate::default();
+        let hub = reopen(dir.path()).await;
+        PANIC_NEXT_STEP.with(|asked| asked.set(true));
+        let served = serve(hub, &boot, &intents, &mut gate, &mut recovery, &mut stop).await;
+        assert!(matches!(served, Served::Failed(_)));
+
+        let hub = tokio::time::timeout(Duration::from_secs(10), recover(&mut recovery))
+            .await
+            .expect("the last core released its slot")
+            .expect("the core reopened");
+        assert_eq!(recovery.holders, away(true));
+        let mut stop = stopped();
+        let served = serve(hub, &boot, &intents, &mut gate, &mut recovery, &mut stop).await;
+        assert!(matches!(served, Served::Stopped));
+    }
 
     thread_local! {
         /// Makes the hub's next step panic, after the head has taken its
@@ -364,7 +604,15 @@ mod tests {
         let hub = reopen(dir.path()).await;
         PANIC_NEXT_STEP.with(|asked| asked.set(true));
         let mut gate = Gate::default();
-        let Served::Failed(message) = serve(hub, &boot, &intents, &mut gate, &mut stop).await
+        let Served::Failed(message) = serve(
+            hub,
+            &boot,
+            &intents,
+            &mut gate,
+            &mut Recovery::default(),
+            &mut stop,
+        )
+        .await
         else {
             panic!("the hub stopped without failing");
         };
@@ -374,7 +622,15 @@ mod tests {
         // and a fresh hub runs over the reopened core until stopped.
         let hub = reopen(dir.path()).await;
         assert!(matches!(
-            serve(hub, &boot, &intents, &mut gate, &mut stopped()).await,
+            serve(
+                hub,
+                &boot,
+                &intents,
+                &mut gate,
+                &mut Recovery::default(),
+                &mut stopped()
+            )
+            .await,
             Served::Stopped
         ));
     }
@@ -404,7 +660,14 @@ mod tests {
 
         let served = tokio::time::timeout(
             Duration::from_secs(10),
-            serve(hub, &boot, &intents, &mut Gate::default(), &mut stop),
+            serve(
+                hub,
+                &boot,
+                &intents,
+                &mut Gate::default(),
+                &mut Recovery::default(),
+                &mut stop,
+            ),
         )
         .await
         .expect("the hub noticed the dispatch thread's panic");
@@ -416,7 +679,15 @@ mod tests {
         // Closed as after any panic: the core opens again at once.
         let hub = reopen(dir.path()).await;
         assert!(matches!(
-            serve(hub, &boot, &intents, &mut Gate::default(), &mut stopped()).await,
+            serve(
+                hub,
+                &boot,
+                &intents,
+                &mut Gate::default(),
+                &mut Recovery::default(),
+                &mut stopped()
+            )
+            .await,
             Served::Stopped
         ));
     }
@@ -439,7 +710,14 @@ mod tests {
 
         let served = tokio::time::timeout(
             Duration::from_secs(10),
-            serve(hub, &boot, &intents, &mut Gate::default(), &mut stop),
+            serve(
+                hub,
+                &boot,
+                &intents,
+                &mut Gate::default(),
+                &mut Recovery::default(),
+                &mut stop,
+            ),
         )
         .await
         .expect("the hub noticed the core's failure");
@@ -452,7 +730,15 @@ mod tests {
         // core that never fails serves until stopped.
         let hub = reopen(dir.path()).await;
         assert!(matches!(
-            serve(hub, &boot, &intents, &mut Gate::default(), &mut stopped()).await,
+            serve(
+                hub,
+                &boot,
+                &intents,
+                &mut Gate::default(),
+                &mut Recovery::default(),
+                &mut stopped()
+            )
+            .await,
             Served::Stopped
         ));
     }

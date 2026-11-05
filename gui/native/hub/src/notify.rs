@@ -20,6 +20,11 @@ pub enum Kind {
     Shell,
 }
 
+/// The notification saying the hub stopped off screen: negative, apart
+/// from every session's, and not -1, the background service's
+/// (`StayConnectedService.NOTIFICATION_ID`).
+pub const STOPPED: i32 = -2;
+
 /// Slots are 30 bits, so a slot doubled (plus one) stays a positive `i32`.
 const SLOT_MASK: i32 = (1 << 30) - 1;
 

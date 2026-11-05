@@ -333,13 +333,22 @@ pub struct Head {
 }
 
 impl Head {
-    /// A head with the preferences read at boot.
+    /// A head on screen with `prefs`, as a boot Dart asked for starts one.
+    #[cfg(test)]
     pub fn new(prefs: Prefs) -> Head {
+        Head::holding(prefs, Awake::default())
+    }
+
+    /// A head that starts with `awake`'s holders rather than on screen:
+    /// the one a hub failure off screen restarts, while the service still
+    /// runs and Dart reports no move.
+    pub fn holding(prefs: Prefs, awake: Awake) -> Head {
         Head {
             stay_connected: StayConnected {
                 on: prefs.stay_connected,
                 ..StayConnected::default()
             },
+            awake,
             ..Head::default()
         }
     }
@@ -367,7 +376,6 @@ impl Head {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn awake(&self) -> &Awake {
         &self.awake
     }

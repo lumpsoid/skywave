@@ -30,7 +30,7 @@ import io.flutter.plugin.common.MethodChannel
  * opens the ZXing scanner, which asks for the camera itself, and answers
  * with the code's text, or null when cancelled. `start`/`stop` on
  * [StayConnectedService.BACKGROUND_CHANNEL] start or stop the stay-connected
- * service.
+ * service; [engine] binds that channel, so it answers with no activity too.
  *
  * The Flutter engine, and with it Dart and the Rust core, belongs to the
  * app, not to this activity: [engine] creates it once per process and every
@@ -70,16 +70,6 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
-        // Only asks; the service reports what happened (StayConnectedService).
-        flutterEngine.backgroundChannel()
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "start" -> StayConnectedService.start(this)
-                    "stop" -> StayConnectedService.stop(this)
-                    else -> return@setMethodCallHandler result.notImplemented()
-                }
-                result.success(null)
-            }
     }
 
     // FlutterActivity is no ComponentActivity, so no activity result API.
@@ -98,7 +88,6 @@ class MainActivity : FlutterActivity() {
     // answer it as cancelled, so Dart does not wait for good.
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         flutterEngine.scanChannel().setMethodCallHandler(null)
-        flutterEngine.backgroundChannel().setMethodCallHandler(null)
         scanning?.success(null)
         scanning = null
         super.cleanUpFlutterEngine(flutterEngine)
@@ -116,9 +105,6 @@ class MainActivity : FlutterActivity() {
 
     private fun FlutterEngine.scanChannel() =
         MethodChannel(dartExecutor.binaryMessenger, SCAN_CHANNEL)
-
-    private fun FlutterEngine.backgroundChannel() =
-        MethodChannel(dartExecutor.binaryMessenger, StayConnectedService.BACKGROUND_CHANNEL)
 
     private fun askForPermissions() {
         val wanted = buildList {
@@ -161,7 +147,21 @@ class MainActivity : FlutterActivity() {
             cache.get(ENGINE_ID)?.let { return it }
             // Registers the plugins itself; the activity does not for a
             // host-provided engine.
-            val engine = FlutterEngine(context.applicationContext)
+            val app = context.applicationContext
+            val engine = FlutterEngine(app)
+            // Bound for the engine's life, not an activity's: the hub stops
+            // the service off screen too, when it gives up after a failure.
+            // Only asks; the service reports what happened
+            // (StayConnectedService).
+            MethodChannel(engine.dartExecutor.binaryMessenger, StayConnectedService.BACKGROUND_CHANNEL)
+                .setMethodCallHandler { call, result ->
+                    when (call.method) {
+                        "start" -> StayConnectedService.start(app)
+                        "stop" -> StayConnectedService.stop(app)
+                        else -> return@setMethodCallHandler result.notImplemented()
+                    }
+                    result.success(null)
+                }
             engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
             cache.put(ENGINE_ID, engine)
             return engine

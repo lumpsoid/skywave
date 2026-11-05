@@ -531,7 +531,8 @@ and skipped. A panic anywhere else on those threads would stop sync or
 snapshots for good with nothing to show for it, so it is caught and
 *fails the core*: `Core::on_failure(watcher)` calls the watcher once, with
 what panicked. A task cancelled by `Core::shutdown` or a drop never
-fails it. The GUI hub answers `HubFailed` and reopens the core on Restart;
+fails it. The GUI hub answers `HubFailed` and reopens the core on Restart
+(or by itself, once, off screen under the Stay connected service);
 the TUI exits with "the client core failed: ...".
 
 One core per data dir: an open core holds an exclusive OS lock (`flock`)
@@ -864,7 +865,14 @@ skywave-core                 all logic, sync, replica
   intent queued before that marker, as meant for the head that failed.
   A panic on the core's own threads (any task on its engine runtime,
   `skywave-deliver` outside a callback) reaches the hub through
-  `Core::on_failure`, and the hub fails the same way.
+  `Core::on_failure`, and the hub fails the same way. A failure off screen
+  while the Android service holds the link would otherwise go unseen
+  under a notification claiming the link is open: the hub reopens the
+  core itself with the last `Boot`, answering `Booted` unasked, and the
+  new head starts with the failed head's holders (off screen, service
+  held). Only once per absence: a second failure before the app is back
+  on screen stops the service and posts a "Skywave stopped" notification
+  (taken down by the next successful boot), and the Restart page waits.
 - **Boot:** Dart sends its application support directory and device name;
   the hub opens the core in `<dir>/skywave`. The GUI is its own device with
   its own data (D25). A hot restart reruns Rust's `main` and reopens the
