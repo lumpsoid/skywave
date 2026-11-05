@@ -9,6 +9,8 @@ use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -16,6 +18,7 @@ use skywave_proto::{
     BlobRef, Command, CommandId, CommandKind, CommandResult, DeviceId, Event, EventKind, RunWhen,
     Seq, SessionId, ShellEnd,
 };
+use skywaved::disk::{Disk, FreeSpace};
 use skywaved::event_log::ShellStatus;
 use skywaved::shell::{DISABLED_REASON, Progress, ShellConfig, ShellHandle, ShellRunner};
 use skywaved::{EventLog, Storage};
@@ -1135,6 +1138,55 @@ async fn output_past_the_cap_is_discarded() {
     let blob = finished.output.expect("a blob");
     assert_eq!(blob.size, 1000);
     assert_eq!(f.blob(&blob), all.as_bytes()[..1000]);
+    runner.shutdown().await.unwrap();
+}
+
+/// Free space a test sets.
+struct FakeSpace(AtomicU64);
+
+impl FreeSpace for FakeSpace {
+    fn free(&self) -> std::io::Result<u64> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// While the disk is low a running run's output stays in its pipe, so the
+/// command blocks once the pipe is full; with room again it is read on and
+/// the run ends with all of it.
+#[tokio::test]
+async fn a_low_disk_pauses_a_runs_output_and_loses_none_of_it() {
+    const FLOOR: u64 = 1 << 30;
+    let mut f = Fixture::new();
+    let space = Arc::new(FakeSpace(AtomicU64::new(FLOOR)));
+    let disk = Disk::new(space.clone(), FLOOR);
+    f.log = f.log.clone().with_disk(disk.clone());
+    let runner = f.start().await;
+    let gate = f.fifo("gate");
+    let done = f.dir().join("done");
+    // Far more than a pipe holds; `done` only once all of it was taken.
+    let run = f.run(&format!(
+        "cat '{}'; seq 1 100000; touch '{}'",
+        gate.display(),
+        done.display()
+    ));
+    f.started(run).await;
+
+    space.0.store(FLOOR - 1, Ordering::SeqCst);
+    assert!(disk.check());
+    open_gate(&gate).await;
+    let finished = tokio::time::timeout(Duration::from_millis(300), f.finished(run)).await;
+    assert!(finished.is_err(), "the run cannot finish while paused");
+    assert!(!done.exists(), "the command blocks on its output");
+
+    space.0.store(FLOOR, Ordering::SeqCst);
+    assert!(!disk.check());
+    let finished = f.finished(run).await;
+    assert_eq!(finished.end, exited(0));
+    assert_eq!(finished.lines, 100_000);
+    assert!(done.exists());
+    let blob = finished.output.expect("a blob");
+    let all: String = (1..=100_000).map(|n| format!("{n}\n")).collect();
+    assert_eq!(f.blob(&blob), all.as_bytes());
     runner.shutdown().await.unwrap();
 }
 

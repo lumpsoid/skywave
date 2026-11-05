@@ -39,8 +39,10 @@
 //! has whatever the command appended before it too. A rejected command
 //! appends nothing; only its stored result answers it.
 //!
-//! **A low disk** ([`crate::disk`]): while the log's disk is low, a command
-//! that starts new work is `DiskLow` before anything else is checked:
+//! **A low disk** ([`crate::disk`]): a command that starts new work reads
+//! the free space ([`Disk::refresh`](crate::disk::Disk::refresh): a reading
+//! up to 5 s old is reused) and, while the disk is low, is `DiskLow` before
+//! anything else is checked:
 //! `CreateSession`, `SendMessage`, `SetPermissionMode`, `SetModel`,
 //! `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`. The rest is
 //! control the user needs while the agents are paused, or one small event
@@ -273,7 +275,9 @@ impl EventLog {
         command: &Command,
         prepared: Option<&mut Prepared>,
     ) -> Result<Result<Seq, RejectReason>> {
-        if self.disk().is_low() && starts_work(&command.kind) {
+        // Read only for work, at most once per check interval: control
+        // and an idle server read nothing.
+        if starts_work(&command.kind) && self.disk().refresh() {
             return Ok(Err(RejectReason::DiskLow));
         }
         let known = |id: SessionId| event_log::session_in(tx, id);

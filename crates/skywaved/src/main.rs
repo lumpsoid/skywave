@@ -9,7 +9,7 @@ use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
 use skywaved::agent::{NoOutsideConversations, OutsideConversations};
 use skywaved::config::{Config, ProcessEnv};
 use skywaved::devices::{self, Revoke};
-use skywaved::disk::{self, CHECK_INTERVAL, Disk, FreeSpace, FsFreeSpace, START_MIN_FREE};
+use skywaved::disk::{Disk, FsFreeSpace};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
 use skywaved::pairing;
 use skywaved::server::{Server, ServerOptions};
@@ -189,17 +189,17 @@ async fn serve(
     storage: &mut Storage,
     identity: ServerIdentity,
 ) -> skywaved::Result<()> {
-    let space: Arc<dyn FreeSpace> = Arc::new(FsFreeSpace::new(&config.data_dir));
-    let floor = config.disk.min_free;
+    let disk = Disk::new(
+        Arc::new(FsFreeSpace::new(&config.data_dir)),
+        config.disk.min_free,
+    );
     // Before the first write (the run's record below): on a full disk a
     // start would fail there, and a service manager restart it in a loop.
+    // Then read against the floor, so a start below it comes up paused.
     tokio::select! {
-        () = disk::wait_for_room(&*space, START_MIN_FREE.min(floor), CHECK_INTERVAL) => {}
+        () = disk.wait_to_start() => {}
         () = shutdown_signal() => return Ok(()),
     }
-    // Checked now, so a start below the floor comes up paused.
-    let disk = Disk::default();
-    let watching = disk.watch(space, floor, CHECK_INTERVAL);
     // The one event log of the process: every writer shares it so appends
     // wake the API's long-polls. The shell and bypass flags and the disk
     // are set before any clone: each clone keeps its own.
@@ -266,9 +266,7 @@ async fn serve(
     };
     let served = server.serve(stop).await;
     let shell_stopped = shell.shutdown().await;
-    let supervisor_stopped = supervisor.shutdown().await;
-    watching.abort();
-    supervisor_stopped?;
+    supervisor.shutdown().await?;
     shell_stopped?;
     served?;
     tracing::info!("stopped");

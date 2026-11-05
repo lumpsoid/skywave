@@ -261,12 +261,16 @@
 //! its agent: the event it was for, and what waited behind it, stay held
 //! for the next run.
 //!
-//! **A low disk** ([`crate::disk`], D40). While the log's disk is low the
-//! supervisor stops reading its agents' events: the event channel an
+//! **A low disk** ([`crate::disk`], D40). The supervisor reads the free
+//! space as it logs what an agent reports ([`Disk::refresh`]: at most one
+//! reading per check interval, so a burst costs one, and none while no
+//! agent reports). While the disk is low it stops reading its agents'
+//! events: the event channel an
 //! adapter reports on is bounded, so once it is full the agent waits to
 //! report (the Claude Code CLI blocks writing its stdout). Nothing is
 //! lost and nothing is killed: the agent stays alive and supervised, and
-//! when the disk has room again the supervisor reads on where it stopped.
+//! when the disk's own poll finds room again the supervisor reads on where
+//! it stopped.
 //! It goes on following the log meanwhile (the API refuses new work, but
 //! what it accepted before still reaches its agent), and control still
 //! works. A stop drains the agent as always (`halt`), so it ends with the
@@ -1752,6 +1756,9 @@ impl<A: AgentAdapter> Supervisor<A> {
             unsent: 0,
         });
         let exited = matches!(event, AdapterEvent::Exited { .. });
+        // About to log: a reading up to the check interval old is reused,
+        // so a burst costs one. A flip to low pauses the reads from here.
+        self.log.disk().refresh();
         self.map(id, event)?;
         if exited && let Some(running) = self.running.remove(&id) {
             tracing::info!(session = %id.0, "agent exited");
@@ -1821,6 +1828,9 @@ impl<A: AgentAdapter> Supervisor<A> {
         if !map_exit {
             events.pop();
         }
+        // Logged whatever it says: a stop is the user's, and its events are
+        // in hand. The reading only lets a low disk pause the others.
+        self.log.disk().refresh();
         for event in events {
             if let AdapterEvent::ModelsOffered(models) = event {
                 let context = mapper.context();
