@@ -319,7 +319,7 @@ started with them as flags, before the session flag:
 
 | update | flags |
 |--------|-------|
-| `setMode` `acceptEdits` / `bypassPermissions` | `--permission-mode <mode>` (`bypassPermissions` only while `agent.allow_bypass`) |
+| `setMode` `acceptEdits` | `--permission-mode acceptEdits` (a stored `bypassPermissions` is never passed; §3.6) |
 | `addRules` (`allow`) | `--allowedTools <Tool(content)>` per rule |
 | `addDirectories` | `--add-dir <dir>` per directory |
 
@@ -395,8 +395,8 @@ reply shape is wrong. Record what the CLI does instead (does it change
 `system/init.permissionMode`? does it write `.claude/settings.local.json`?)
 before changing `protocol::allow_always_response`.
 
-`bypassPermissions` granted this way is **[U]**: the adapter offers it only
-when the CLI suggests it and the server allows bypass (§3.6).
+A `bypassPermissions` suggestion is never offered, so never granted this
+way (§3.6).
 
 ### 3.6 Bypass only where the operator allows it (D38)
 
@@ -420,16 +420,11 @@ asks, is available from a head only when the server's operator set
   or `--permission-mode bypassPermissions` (two arguments or `=`-joined):
   the config refuses them (`claude_code::bypass_arg`), naming
   `allow_bypass`.
-- **Rule suggestions.** `rules::offered` offers a `setMode`
-  `bypassPermissions` suggestion, labelled `every tool`, only with the
-  opt-in, and only when the CLI itself puts it in a request's
-  `permission_suggestions` (Skywave never makes one up; none of the
-  recorded requests had one). Without the opt-in it is dropped, so no
-  approval can grant it. A session-scoped one granted while the opt-in was
-  on is kept in the session's grants, but `rules::cli_args` passes it back
-  as `--permission-mode bypassPermissions` only while the opt-in is still
-  on: turning it off takes bypass away from every later start. Whether
-  that flag holds on resume is **[U]** (§3.2).
+- **Never a rule grant.** Bypass is a permission mode the operator
+  unlocks, switched from a head; it is never granted on an approval.
+  `rules::offered` drops a `setMode` `bypassPermissions` suggestion even
+  with the opt-in (none of the recorded requests had one), and
+  `rules::cli_args` never passes a stored one back as a flag.
 
 ### 3.7 Changing the permission mode mid-session [C]
 
