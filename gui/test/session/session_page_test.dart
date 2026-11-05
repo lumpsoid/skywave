@@ -1300,7 +1300,9 @@ void main() {
     expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'agent idle');
 
     await show(screenWith(interruptBusy: true));
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    // Still, not a spinner: offline it can wait as long as the link is down.
+    expect(find.byIcon(Icons.hourglass_top), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
     await tester.tap(find.byTooltip('Interrupting…'));
     await ctrlX();
     expect(sent.whereType<GuiIntentAct>(), isEmpty, reason: 'on its way');
