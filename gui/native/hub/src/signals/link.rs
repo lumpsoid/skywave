@@ -7,8 +7,9 @@ use serde::Serialize;
 pub struct LinkUpdate {
     pub state: LinkState,
     /// The banner's text, e.g. `online · 2 queued`, `offline · server
-    /// unreachable · 2 queued · retry in 07s (attempt 3)`, `device revoked
-    /// · re-pair to reconnect`.
+    /// unreachable · 2 queued\nattempt 3 · retry in 07s`, `device revoked
+    /// · re-pair to reconnect`. A `\n` splits it into lines the banner
+    /// keeps whole, one each.
     /// Empty when there is nothing to say, and the banner hides: while
     /// unpaired (the pairing screen says what to do), and while online
     /// with nothing queued and no approvals elsewhere. No key hints.

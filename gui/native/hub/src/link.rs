@@ -43,9 +43,13 @@ pub fn update(link: &Link, queued: usize, elsewhere: usize, wall_ms: i64) -> Lin
                 n => format!("retry in {n:02}s"),
             };
             let reason = link::failure(*reason);
+            // Two lines, always: wrapped as one, the ticking countdown
+            // moved the break and the banner flipped between one and two
+            // lines on a phone. The countdown goes last, so its change to
+            // `retrying…` moves nothing after it.
             (
                 LinkState::Reconnecting,
-                format!("offline · {reason}{queued_part} · {retry} (attempt {attempt})"),
+                format!("offline · {reason}{queued_part}\nattempt {attempt} · {retry}"),
             )
         }
         Link::Rejected(
@@ -192,7 +196,7 @@ mod tests {
             ),
             (
                 reconnecting.clone(),
-                "offline · server unreachable · 2 queued · retry in 07s (attempt 3)",
+                "offline · server unreachable · 2 queued\nattempt 3 · retry in 07s",
             ),
             (
                 Link::Rejected(LinkRejection::Revoked),
@@ -251,7 +255,7 @@ mod tests {
         );
         let due = update(&reconnecting, 0, 0, at.timestamp_millis() + 10);
         assert_eq!(due.retry_in_s, Some(0));
-        assert!(due.label.contains("retrying…"));
+        assert!(due.label.ends_with("\nattempt 3 · retrying…"));
         assert_eq!(
             due.connection_label,
             "Offline · server unreachable · retrying…"
