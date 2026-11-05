@@ -2900,6 +2900,42 @@ async fn an_agent_that_stops_reading_is_killed_and_reported() {
 }
 
 #[tokio::test]
+async fn a_long_answer_reaches_an_agent_that_writes_while_it_arrives() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A driver that stops reading stdout while it writes would wait on the
+    // CLI as the CLI waits on it, until this timeout kills the CLI.
+    let (mut session, mut events) = adapter()
+        .with_write_timeout(Duration::from_secs(2))
+        .start(spec(tmp.path(), Conversation::Fresh))
+        .await
+        .unwrap();
+    session.send_message("flood".to_owned()).await.unwrap();
+    handle_then_turn(&mut events).await;
+    let events_before = take(&mut events, 2).await;
+    assert!(matches!(
+        events_before[..],
+        [
+            AdapterEvent::ToolCall { .. },
+            AdapterEvent::ApprovalRequested { .. }
+        ]
+    ));
+    session
+        .answer_approval("perm-1".into(), Decision::Approve, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        take(&mut events, 4).await,
+        [
+            text(&"x".repeat(1 << 17)),
+            tool_result("written", false, None),
+            text("done writing"),
+            COMPLETED,
+        ]
+    );
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_kill_reports_what_the_agent_says_as_it_stops() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut session, mut events) = adapter()

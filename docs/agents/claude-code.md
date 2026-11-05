@@ -1275,6 +1275,13 @@ notes above:
   after the signal, so the CLI handles the signal rather than an EOF.
 - **A write the CLI does not read within 30 s** kills it, reported as
   `Exited { error }`: a wedged CLI cannot hold up its session's driver.
+  While a write waits, the driver keeps reading stdout and handles those
+  lines once the write is done. A CLI whose stdout writes block (Node on a
+  pipe) stops reading stdin while its stdout is full. Without that read, a
+  line longer than a pipe holds, such as an approval that echoes a large
+  Write, would hang both sides until the timeout. 2.1.310 (a Bun binary)
+  buffers stdout instead: a probe left its stdout unread and saw it go on
+  reading stdin (2026-11-05).
 - **Once stdout ends the session refuses requests** (`AgentError::Closed`),
   while the driver still waits for the exit: a message sent then fails, so
   the supervisor restarts the agent and delivers it there instead of it
