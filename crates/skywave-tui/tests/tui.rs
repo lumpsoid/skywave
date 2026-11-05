@@ -968,7 +968,7 @@ fn settings_toggle_the_blob_policy_through_the_core() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));
     let screen = h.screen();
-    assert_contains(&screen, "Blob policy: on demand");
+    assert_contains(&screen, "(•) On demand");
     assert_contains(&screen, "Server:      srv:7443");
     assert_eq!(
         h.key(KeyCode::Char('b')),
@@ -978,7 +978,7 @@ fn settings_toggle_the_blob_policy_through_the_core() {
         h.drain_requests(),
         vec![Request::BlobPolicyChanged(BlobPolicy::Eager)]
     );
-    assert_contains(&h.screen(), "Blob policy: eager");
+    assert_contains(&h.screen(), "(•) Eager");
     assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
 }
 
@@ -3993,9 +3993,18 @@ fn settings_explain_the_blob_policy() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));
     let screen = h.screen();
-    assert_contains(&screen, "(•) On demand  a blob downloads when you expand");
-    assert_contains(&screen, "( ) Eager      every tool blob downloads as soon");
-    assert_contains(&screen, "Workdir diffs and files download only when opened");
+    assert_contains(
+        &screen,
+        "(•) On demand  a tool's blob downloads when you expand",
+    );
+    assert_contains(
+        &screen,
+        "( ) Eager      every tool blob downloads as it syncs",
+    );
+    assert_contains(
+        &screen,
+        "Workdir diffs and files always download when opened",
+    );
     h.key(KeyCode::Char('b'));
     let screen = h.screen();
     assert_contains(&screen, "( ) On demand");
