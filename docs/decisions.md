@@ -941,3 +941,33 @@ the latest tail, only less often.
 **Rejected:** progress that replaces rather than appends (a new event kind
 or log compaction, for a problem a plain schedule bounds); a cap on the
 event count (a run past it would go silent).
+
+## D40. A low disk pauses the agents; it never kills them
+Agents share the server's disk with whatever else runs there (build
+trees of several GB), and a failed append ends the supervisor. So `serve`
+keeps a floor of free space on the data dir's file system (`[disk]
+min_free`, 1 GiB by default), read with `statvfs` every 5 s through an
+injectable source (`crates/skywaved/src/disk.rs`). Below it the API
+refuses commands that start new work with `RejectReason::DiskLow`, and the
+supervisor stops reading its agents' events: the adapter's event channel
+is bounded, so an agent waits to report with nothing lost, alive and
+supervised. Control still works: interrupts, task stops, stops and
+approval answers are taken, and a session the user interrupts or stops a
+task in is read until that settles. Back above the floor everything goes
+on by itself; a start below it comes up paused. The check polls because
+nothing announces free space; what follows is decided by the space read.
+**Full anyway.** A disk filled between checks still fails an append, and
+that stays fatal to the supervisor (skipping an append would break what
+the mapper counts as logged). Its agents are then stopped as at a
+shutdown, with SIGTERM and its grace, never dropped (a SIGKILL of the
+group leaves a CLI's `setsid` jobs running). `serve` stops, and the next
+`serve` waits for 64 MiB free before its first write instead of failing
+on it at every restart.
+**Wire.** One new reject reason (v20); the heads show it like any other
+refusal. A device learns of the pause when it sends work.
+**Rejected:** interrupting the running turns at the floor (it throws away
+work the user did not stop); killing the agents (orphans their jobs);
+coming up at 0 bytes free serving reads only (every write path, the device
+`last_seen` touch included, would need a read-only mode); a live
+"paused" status pushed to devices (a new event or hello field for a rare
+state the refusal already names).

@@ -129,6 +129,11 @@ enabled = true
 program = "/bin/sh"     # any POSIX sh
 # rc = "/home/me/.config/skywave/shellrc" # sourced before every command
 output_max = "64MiB"    # output kept per command; the rest is dropped
+
+[disk]
+min_free = "1GiB"       # below this free on the data dir's disk, agents
+                        # pause and new work is refused until space is
+                        # freed; 0 turns it off
 ```
 
 ```sh

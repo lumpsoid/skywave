@@ -16,6 +16,7 @@ use skywaved::agent::{
     AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay, ResumeHandle,
     store_resume_handle,
 };
+use skywaved::disk::{Disk, FreeSpace};
 use skywaved::event_log::{
     BATCH_MAX_BYTES, DEFAULT_BATCH_LIMIT, MAX_BATCH_LIMIT, PendingApproval, ShellAppended,
     ShellRun, ShellStatus,
@@ -1631,6 +1632,135 @@ fn shell_commands_are_refused_while_shell_is_off() {
         session_id: session,
     }));
     assert_eq!(f.log.head(), head.next());
+}
+
+/// A fixed free space.
+struct Free(u64);
+
+impl FreeSpace for Free {
+    fn free(&self) -> std::io::Result<u64> {
+        Ok(self.0)
+    }
+}
+
+/// While the disk is low, the commands that start new work are refused
+/// `DiskLow` before anything else is checked, and nothing is logged for
+/// them; control and small bookkeeping go through. With room again they
+/// are taken as usual.
+#[test]
+fn a_low_disk_refuses_new_work_and_takes_control() {
+    let mut f = Fixture::with_shell();
+    let disk = Disk::default();
+    f.log = f.log.clone().with_disk(disk.clone());
+    let session = f.create_session();
+    let first = ContextId::first_of(session);
+    // Something to stop and to answer.
+    f.agent(
+        session,
+        EventKind::BackgroundTasksChanged {
+            tasks: vec![shell("t1")],
+        },
+    );
+    f.start_turn(session);
+    let approval = f.request_approval(session);
+    let run = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id: session,
+            command: "make".into(),
+            when: RunWhen::Always,
+        },
+    };
+    accepted(
+        f.log
+            .handle(&mut f.storage.db, DeviceId::new(), &run)
+            .unwrap(),
+    );
+    let run = run.id;
+
+    disk.check(&Free(9), 10);
+    assert!(disk.is_low());
+    let head = f.log.head();
+    let refused = [
+        CommandKind::CreateSession {
+            workdir: workdir(&f.root.join("project")),
+            conversation: None,
+        },
+        CommandKind::SendMessage {
+            session_id: session,
+            context: first,
+            text: "hi".into(),
+        },
+        CommandKind::SetPermissionMode {
+            session_id: session,
+            mode: PermissionMode::Plan,
+        },
+        CommandKind::SetModel {
+            session_id: session,
+            model: "opus".into(),
+        },
+        CommandKind::SetEffort {
+            session_id: session,
+            effort: Effort::High,
+        },
+        clear_kind(session, "another"),
+        // Refused before the move is checked at all.
+        move_kind(session, first, "moved"),
+        CommandKind::RunShell {
+            session_id: session,
+            command: "make".into(),
+            when: RunWhen::Always,
+        },
+    ];
+    for kind in refused {
+        assert_eq!(
+            f.handle(kind.clone()),
+            rejected(RejectReason::DiskLow),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(f.log.head(), head, "a refused command logs nothing");
+
+    let taken = [
+        CommandKind::ResolveApproval {
+            id: approval,
+            decision: Decision::Approve,
+            rule: None,
+        },
+        CommandKind::Interrupt {
+            session_id: session,
+        },
+        stop_kind(session, "t1"),
+        CommandKind::StopShell {
+            session_id: session,
+            run,
+        },
+        CommandKind::RenameSession {
+            session_id: session,
+            name: Some("renamed".into()),
+        },
+        CommandKind::SetSessionArchived {
+            session_id: session,
+            archived: true,
+        },
+        CommandKind::SwitchContext {
+            session_id: session,
+            context: first,
+        },
+        CommandKind::StopSession {
+            session_id: session,
+        },
+    ];
+    for kind in taken {
+        accepted(f.handle(kind));
+    }
+
+    disk.check(&Free(10), 10);
+    accepted(f.handle(CommandKind::SendMessage {
+        session_id: session,
+        context: first,
+        text: "hi".into(),
+    }));
 }
 
 #[test]

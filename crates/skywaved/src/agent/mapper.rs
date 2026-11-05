@@ -262,6 +262,11 @@ impl EventMapper {
         self.asked_stops.push_back((task, command));
     }
 
+    /// A task stop the agent was asked for has no answer yet.
+    pub fn stops_pending(&self) -> bool {
+        !self.asked_stops.is_empty()
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }

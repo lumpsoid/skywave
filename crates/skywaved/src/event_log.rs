@@ -51,6 +51,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::disk::Disk;
 use crate::error::{Error, Result};
 
 /// Batch size used when `GET /v1/events` names no `limit`.
@@ -77,6 +78,9 @@ pub struct EventLog {
     /// Whether a `SetPermissionMode` may ask for bypass
     /// ([`EventLog::with_bypass`]). Beside `inner` like `shell_enabled`.
     bypass_allowed: bool,
+    /// Whether the data dir's disk is low ([`EventLog::with_disk`]); shared
+    /// with whatever checks it. Beside `inner` like `shell_enabled`.
+    disk: Disk,
 }
 
 #[derive(Debug)]
@@ -216,7 +220,21 @@ impl EventLog {
             }),
             shell_enabled: false,
             bypass_allowed: false,
+            disk: Disk::default(),
         })
+    }
+
+    /// This log watching `disk`: while it is low, commands that start new
+    /// work are refused `DiskLow` and the supervisor pauses its agents.
+    /// [`EventLog::open`] has a disk that is never low. Set it before
+    /// cloning, like [`EventLog::with_shell`].
+    pub fn with_disk(self, disk: Disk) -> EventLog {
+        EventLog { disk, ..self }
+    }
+
+    /// The disk this log watches.
+    pub fn disk(&self) -> &Disk {
+        &self.disk
     }
 
     /// This log with shell commands on or off; [`EventLog::open`] has them

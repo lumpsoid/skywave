@@ -261,9 +261,27 @@
 //! its agent: the event it was for, and what waited behind it, stay held
 //! for the next run.
 //!
+//! **A low disk** ([`crate::disk`], D40). While the log's disk is low the
+//! supervisor stops reading its agents' events: the event channel an
+//! adapter reports on is bounded, so once it is full the agent waits to
+//! report (the Claude Code CLI blocks writing its stdout). Nothing is
+//! lost and nothing is killed: the agent stays alive and supervised, and
+//! when the disk has room again the supervisor reads on where it stopped.
+//! It goes on following the log meanwhile (the API refuses new work, but
+//! what it accepted before still reaches its agent), and control still
+//! works. A stop drains the agent as always (`halt`), so it ends with the
+//! usual interrupt, grace and SIGTERM, and what it reported is logged. An
+//! interrupt or a task stop is sent as usual, and that session alone is
+//! read until it settles: until the interrupted turn ends, or the agent
+//! answers the stop (`Running::controlled`). No agent is stopped as idle
+//! while paused, since its unread events may hold work.
+//!
 //! **Failure.** An error while following the log (the database full or
-//! gone, say) ends the supervisor: its agent sessions are dropped, which
-//! kills their processes, nothing more is logged, and the error is logged.
+//! gone, say) ends the supervisor: its agents are stopped as at a shutdown
+//! (the adapter's own stop: an interrupted turn's grace, SIGTERM, then
+//! SIGKILL for what outlives the term grace; never a bare SIGKILL, which
+//! would leave the commands a CLI started running), nothing more is logged,
+//! and the error is logged. A start under way is dropped, as at a shutdown.
 //! [`SupervisorHandle::failed`] then returns, and `serve` stops the daemon
 //! on it and exits non-zero: a daemon without its supervisor would go on
 //! accepting commands no agent hears. The next start settles what it left,
@@ -306,6 +324,7 @@ use crate::agent::{
     StartSpec, bounded_models, load_grants, load_origin, load_resume_handle, unsent_notice,
 };
 use crate::db::Db;
+use crate::disk::Disk;
 use crate::error::{Error, Result};
 use crate::event_log::{self, parse_id};
 use crate::{EventLog, Storage};
@@ -370,8 +389,8 @@ impl SupervisorHandle {
 
     /// Returns once the supervisor has stopped on an error (or panicked);
     /// never while it runs, nor after a clean end. Its agent sessions are
-    /// gone by then, killed with their processes and logging nothing, as at
-    /// a shutdown. [`SupervisorHandle::shutdown`] then returns the error.
+    /// gone by then, stopped as at a shutdown and logging nothing.
+    /// [`SupervisorHandle::shutdown`] then returns the error.
     /// Cancel safe.
     pub async fn failed(&mut self) {
         if self.ended.is_none() {
@@ -573,6 +592,14 @@ impl<S> Running<S> {
         self.owed_turns > 0 || self.mapper.turn_open() || self.busy_tasks > 0
     }
 
+    /// The user is stopping something in it: its turn was handed an
+    /// interrupt that has not ended it yet, or a task stop is unanswered.
+    /// Such an agent is read while the supervisor is paused, until that
+    /// settles, so the control reaches it and its answer is logged.
+    fn controlled(&self) -> bool {
+        self.interrupted || self.mapper.stops_pending()
+    }
+
     /// Stops the idle clock while the agent has work and starts it once it
     /// has none. A clock already running keeps its start, so a repeated
     /// report of nothing to do does not push the deadline back.
@@ -591,6 +618,8 @@ enum Wake<S> {
     /// Boxed: an event is far larger than the other wakes.
     Agent(SessionId, Option<Box<AdapterEvent>>),
     Idle,
+    /// The disk turned low, or has room again.
+    Disk,
     Started(Box<Result<(SessionId, Started<S>), JoinError>>),
     Stopped(Box<Result<(SessionId, Halted, bool), JoinError>>),
 }
@@ -868,7 +897,19 @@ impl<A: AgentAdapter> Supervisor<A> {
     }
 
     async fn run(mut self, mut stop: oneshot::Receiver<()>) -> Result<()> {
+        match self.follow_log(&mut stop).await {
+            Ok(()) => self.shut_down().await,
+            Err(error) => {
+                self.stop_unrecorded().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Follows the log and the agents until `stop`; see the module docs.
+    async fn follow_log(&mut self, stop: &mut oneshot::Receiver<()>) -> Result<()> {
         let mut head = self.log.subscribe();
+        let mut disk = self.log.disk().subscribe();
         // What the previous run left waiting, before anything newer.
         let replayed: Vec<SessionId> = self.held.keys().copied().collect();
         for id in replayed {
@@ -880,19 +921,29 @@ impl<A: AgentAdapter> Supervisor<A> {
                 self.follow().await?;
                 continue;
             }
-            let deadline = self.next_idle_deadline();
+            let paused = *disk.borrow_and_update();
+            // Paused, an agent's unread events may hold work: no idle stop.
+            let deadline = if paused {
+                None
+            } else {
+                self.next_idle_deadline()
+            };
             let wake = tokio::select! {
                 biased;
-                _ = &mut stop => Wake::Stop,
+                _ = &mut *stop => Wake::Stop,
                 Some(started) = self.starts.join_next() => Wake::Started(Box::new(started)),
                 Some(stopped) = self.stops.join_next() => Wake::Stopped(Box::new(stopped)),
-                (id, event) = next_event(&mut self.running) => Wake::Agent(id, event.map(Box::new)),
+                (id, event) = next_event(&mut self.running, self.log.disk()) => {
+                    Wake::Agent(id, event.map(Box::new))
+                }
                 _ = head.changed() => Wake::Log,
+                _ = disk.changed() => Wake::Disk,
                 () = sleep_until(deadline) => Wake::Idle,
             };
             match wake {
-                Wake::Stop => break,
-                Wake::Log => {}
+                Wake::Stop => return Ok(()),
+                // The next round reads the agents as the disk now says.
+                Wake::Log | Wake::Disk => {}
                 Wake::Agent(id, event) => self.on_agent_event(id, event.map(|e| *e)).await?,
                 Wake::Idle => self.stop_idle(),
                 Wake::Started(started) => {
@@ -906,14 +957,46 @@ impl<A: AgentAdapter> Supervisor<A> {
             }
             self.store_progress()?;
         }
-        self.shut_down().await
     }
 
     /// Stops every agent, those stopping already included, without
     /// interrupting them; see the module docs.
     async fn shut_down(mut self) -> Result<()> {
-        // Dropping a start under way kills its agent. Its trigger and what
-        // waited behind it stay unhandled, for the next run.
+        let (stopped, halted) = self.halt_all().await;
+        for joined in stopped {
+            let (id, halted, map_exit) = joined.map_err(panicked)?;
+            self.record_stop(id, halted, map_exit)?;
+        }
+        for (id, halted, map_exit) in halted {
+            self.record_stop(id, halted, map_exit)?;
+        }
+        self.store_progress()
+    }
+
+    /// After a failure: stops every agent as a shutdown does, with the
+    /// adapter's own stop (for a process, SIGTERM and its grace), and
+    /// records nothing: the log is what failed. Dropping the agents instead
+    /// would kill them outright, and a CLI killed without its SIGTERM
+    /// leaves the commands it started running.
+    async fn stop_unrecorded(mut self) {
+        tracing::warn!(
+            agents = self.running.len() + self.stops.len(),
+            "stopping every agent after the failure"
+        );
+        let _ = self.halt_all().await;
+    }
+
+    /// Stops every agent at once, and waits for the stops under way: what
+    /// each reported, the stops under way first. A start under way is
+    /// dropped, which kills its agent: its trigger and what waited behind
+    /// it stay unhandled, for the next run.
+    #[allow(clippy::type_complexity)]
+    async fn halt_all(
+        &mut self,
+    ) -> (
+        Vec<std::result::Result<(SessionId, Halted, bool), JoinError>>,
+        Vec<(SessionId, Halted, bool)>,
+    ) {
         self.starts.shutdown().await;
         // All at once: one by one, each agent's grace would add up.
         let halts = std::mem::take(&mut self.running)
@@ -928,14 +1011,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             stopped
         };
         let (halted, stopped) = tokio::join!(join_all(halts), under_way);
-        for joined in stopped {
-            let (id, halted, map_exit) = joined.map_err(panicked)?;
-            self.record_stop(id, halted, map_exit)?;
-        }
-        for (id, halted, map_exit) in halted {
-            self.record_stop(id, halted, map_exit)?;
-        }
-        self.store_progress()
+        (stopped, halted)
     }
 
     /// Handles one batch of log events after the cursor.
@@ -2003,12 +2079,20 @@ async fn halt<S: AgentSession>(id: SessionId, running: Running<S>) -> Halted {
     }
 }
 
-/// The next event from any running agent session. Pending while none runs.
+/// The next event from any running agent session; while `disk` is low, only
+/// from one the user is stopping something in ([`Running::controlled`]).
+/// The disk is read at every poll, so no event is read once it turned low.
+/// Pending while none is read.
 async fn next_event<S>(
     running: &mut HashMap<SessionId, Running<S>>,
+    disk: &Disk,
 ) -> (SessionId, Option<AdapterEvent>) {
     poll_fn(|cx| {
+        let paused = disk.is_low();
         for (id, session) in running.iter_mut() {
+            if paused && !session.controlled() {
+                continue;
+            }
             if let Poll::Ready(event) = session.events.poll_recv(cx) {
                 return Poll::Ready((*id, event));
             }

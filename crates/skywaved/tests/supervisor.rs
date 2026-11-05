@@ -5,6 +5,8 @@
 //! by fixed sleeps.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -23,6 +25,7 @@ use skywaved::agent::fake::{
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED};
 use skywaved::config::AgentConfig;
+use skywaved::disk::{Disk, FreeSpace};
 use skywaved::supervisor::{
     AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, MESSAGE_LOST, TURN_LOST,
 };
@@ -39,7 +42,23 @@ struct Fixture {
     storage: Storage,
     log: EventLog,
     session_id: SessionId,
+    /// The disk the log watches, and the free space it is checked against.
+    disk: Disk,
+    space: Arc<FakeSpace>,
 }
+
+/// The free space a test sets, as [`FreeSpace`] reports it.
+#[derive(Debug, Default)]
+struct FakeSpace(AtomicU64);
+
+impl FreeSpace for FakeSpace {
+    fn free(&self) -> std::io::Result<u64> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// The fixture's `[disk] min_free`.
+const FLOOR: u64 = 1 << 30;
 
 impl Fixture {
     fn new() -> Fixture {
@@ -69,7 +88,11 @@ impl Fixture {
         std::fs::create_dir_all(&workdir).unwrap();
         let data = tmp.path().join("data");
         let storage = Storage::open(&data).unwrap();
-        let log = EventLog::open(&storage.db, vec![root.clone()]).unwrap();
+        let disk = Disk::default();
+        let space = Arc::new(FakeSpace(AtomicU64::new(FLOOR)));
+        let log = EventLog::open(&storage.db, vec![root.clone()])
+            .unwrap()
+            .with_disk(disk.clone());
         let mut f = Fixture {
             _tmp: tmp,
             data,
@@ -77,6 +100,8 @@ impl Fixture {
             storage,
             log,
             session_id: SessionId::new(),
+            disk,
+            space,
         };
         let workdir = workdir.to_str().unwrap().to_owned();
         let prepared = match (&conversation, history) {
@@ -117,7 +142,27 @@ impl Fixture {
 
     /// Simulates a daemon restart: a new process has a new `EventLog`.
     fn reopen_log(&mut self) {
-        self.log = EventLog::open(&self.storage.db, vec![self.root.clone()]).unwrap();
+        self.log = EventLog::open(&self.storage.db, vec![self.root.clone()])
+            .unwrap()
+            .with_disk(self.disk.clone());
+    }
+
+    /// Checks the disk with `free` bytes left, as `serve`'s watch does.
+    fn disk_free(&self, free: u64) {
+        self.space.0.store(free, Ordering::SeqCst);
+        self.disk.check(&*self.space, FLOOR);
+    }
+
+    /// The disk drops below the floor.
+    fn disk_low(&self) {
+        self.disk_free(FLOOR - 1);
+        assert!(self.disk.is_low());
+    }
+
+    /// The disk is back at the floor.
+    fn disk_freed(&self) {
+        self.disk_free(FLOOR);
+        assert!(!self.disk.is_low());
     }
 
     fn handle(&mut self, device: DeviceId, kind: CommandKind) -> CommandResult {
@@ -4397,8 +4442,8 @@ async fn a_supervisor_error_surfaces_and_the_next_start_delivers() {
     assert!(error.to_string().contains("disk is full"), "{error}");
     assert_eq!(
         agent.inputs(f.session_id),
-        [f.started(false), message("one")],
-        "the failed supervisor never handed the message out"
+        [f.started(false), message("one"), FakeInput::Shutdown],
+        "the failed supervisor never handed the message out, and stopped its agent"
     );
 
     // Its cursor never passed "two": the next start delivers it.
@@ -4412,11 +4457,198 @@ async fn a_supervisor_error_surfaces_and_the_next_start_delivers() {
         [
             f.started(false),
             message("one"),
+            FakeInput::Shutdown,
             f.started(true),
             message("two"),
             FakeInput::Shutdown,
         ]
     );
+}
+
+/// A failed supervisor stops its agents as a shutdown does: the CLI gets
+/// SIGTERM (and stops its commands) rather than a bare SIGKILL of its group.
+#[tokio::test]
+async fn a_failed_supervisor_stops_its_agent_with_sigterm() {
+    let mut f = Fixture::new();
+    let mut supervisor = start_claude(&f).await;
+    f.send("run");
+    f.wait_for("the running call", |k| {
+        k.iter().any(|k| matches!(k, EventKind::ToolCall(_)))
+    })
+    .await;
+    let pid = fake_cli_pid(&f);
+
+    f.cursor_disk_full();
+    f.send("two");
+    tokio::time::timeout(WAIT, supervisor.failed())
+        .await
+        .expect("the supervisor's failure surfaces");
+    assert!(
+        f.root.join("project/term.txt").exists(),
+        "the agent got SIGTERM"
+    );
+    assert!(!process_exists(pid), "agent process {pid} still exists");
+    let error = supervisor.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("disk is full"), "{error}");
+    f.disk_has_room();
+}
+
+// --- a low disk -----------------------------------------------------------
+
+fn said(text: &str) -> EventKind {
+    EventKind::AgentMessage {
+        parent: None,
+        text: text.into(),
+    }
+}
+
+fn rejected(result: CommandResult) -> RejectReason {
+    match result {
+        CommandResult::Rejected { reason } => reason,
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+/// Bounds a check that something does not happen. The pause itself is
+/// decided by the disk state the supervisor reads at every poll; this only
+/// gives an agent that was wrongly read the time to show it.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Asserts the session's log does not get `kind` within [`QUIET`].
+async fn stays_unlogged(f: &Fixture, kind: &EventKind) {
+    let logged = tokio::time::timeout(QUIET, f.wait_for("nothing", |k| k.contains(kind))).await;
+    assert!(logged.is_err(), "{kind:?} was logged while paused");
+}
+
+/// Below the floor the agent's events stay unread, so it waits with
+/// nothing lost; new work is refused, and an interrupt and a stop still
+/// reach the agent and are logged.
+#[tokio::test]
+async fn a_low_disk_pauses_the_agent_refuses_new_work_and_still_interrupts_and_stops() {
+    let mut f = Fixture::new();
+    let gate = Gate::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::text("before"),
+        Step::Wait(gate.clone()),
+        Step::text("after"),
+        Step::Hang,
+    ]));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_for("the turn to block", |k| k.contains(&said("before")))
+        .await;
+
+    f.disk_low();
+    gate.open();
+    stays_unlogged(&f, &said("after")).await;
+
+    let context = f.current();
+    let message = CommandKind::SendMessage {
+        session_id: f.session_id,
+        context,
+        text: "more".into(),
+    };
+    assert_eq!(
+        rejected(f.handle(DeviceId::new(), message)),
+        RejectReason::DiskLow
+    );
+    let create = CommandKind::CreateSession {
+        workdir: f.root.join("project").to_str().unwrap().to_owned(),
+        conversation: None,
+    };
+    assert_eq!(
+        rejected(f.handle(DeviceId::new(), create)),
+        RejectReason::DiskLow
+    );
+
+    // The interrupt reaches the paused agent, and its session is read
+    // until the turn ends: what it said meanwhile first.
+    accepted(f.interrupt());
+    let kinds = f.wait_count("the interrupted turn's end", 1, is_idle).await;
+    let after = kinds.iter().position(|k| *k == said("after"));
+    let idle = kinds.iter().position(is_idle);
+    assert!(after.is_some() && after < idle, "{kinds:#?}");
+    assert!(agent.inputs(f.session_id).contains(&FakeInput::Interrupt));
+
+    // A stop still stops it, as always.
+    accepted(f.stop());
+    wait_inputs(&agent, f.session_id, "the stop", |inputs| {
+        inputs.contains(&FakeInput::Shutdown)
+    })
+    .await;
+    f.disk_freed();
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Once the disk has room again the paused agent is read on where it
+/// stopped: everything it said while paused is logged once, in order, and
+/// it was never stopped.
+#[tokio::test]
+async fn a_paused_agent_resumes_when_space_returns_and_loses_nothing() {
+    // More than a fake session's event channel holds, so the agent blocks.
+    let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+    let mut f = Fixture::new();
+    let gate = Gate::new();
+    let mut steps = vec![Step::text("before"), Step::Wait(gate.clone())];
+    steps.extend(lines.iter().map(|line| Step::text(line.clone())));
+    let agent = FakeAgent::new(FakeScript::new().turn(steps));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_for("the turn to block", |k| k.contains(&said("before")))
+        .await;
+
+    f.disk_low();
+    gate.open();
+    stays_unlogged(&f, &said("line 0")).await;
+
+    f.disk_freed();
+    let kinds = f.wait_count("the turn's end", 1, is_idle).await;
+    let logged: Vec<&EventKind> = kinds
+        .iter()
+        .skip_while(|k| **k != said("before"))
+        .skip(1)
+        .filter(|k| matches!(k, EventKind::AgentMessage { .. }))
+        .collect();
+    let expected: Vec<EventKind> = lines.iter().map(|line| said(line)).collect();
+    assert_eq!(logged, expected.iter().collect::<Vec<_>>());
+    assert_eq!(
+        agent.inputs(f.session_id),
+        [f.started(false), message("work")],
+        "the agent was neither interrupted nor stopped"
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A daemon that starts below the floor comes up paused: it recovers and
+/// hands a message accepted before to its agent, logs nothing the agent
+/// says until there is room, and refuses new work meanwhile.
+#[tokio::test]
+async fn a_start_below_the_floor_comes_up_paused() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new());
+    f.send("one");
+    f.disk_low();
+    let supervisor = f.start(&agent).await;
+    wait_inputs(&agent, f.session_id, "the message", |inputs| {
+        inputs.contains(&message("one"))
+    })
+    .await;
+    stays_unlogged(&f, &state(SessionState::AgentWorking)).await;
+    let context = f.current();
+    let message = CommandKind::SendMessage {
+        session_id: f.session_id,
+        context,
+        text: "two".into(),
+    };
+    assert_eq!(
+        rejected(f.handle(DeviceId::new(), message)),
+        RejectReason::DiskLow
+    );
+
+    f.disk_freed();
+    let kinds = f.wait_count("the reply", 1, is_idle).await;
+    assert!(kinds.contains(&said("echo: one")), "{kinds:#?}");
+    supervisor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4673,7 +4905,9 @@ async fn the_daemon_stops_when_its_supervisor_fails() {
     std::fs::write(
         &config,
         format!(
-            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n",
+            // No floor: the test machine's free space is no part of it.
+            "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n\
+             [disk]\nmin_free = 0\n",
             f.data, f.root, log_file
         ),
     )

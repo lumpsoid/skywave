@@ -118,7 +118,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`BlobRef`] on `ToolCall::input`, `Body::full`, `ToolResult::output`
 /// and `ApprovalRequested::input`: `Full::Lost` when the preview is cut and
 /// its whole content could not be stored.
-pub const PROTOCOL_VERSION: u32 = 19;
+///
+/// v20: [`RejectReason::DiskLow`]: a command that would start new work,
+/// refused while the server's disk is below its free-space floor.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -1789,6 +1792,12 @@ pub enum RejectReason {
     BypassDisabled,
     /// `SendMessage.text` is longer than [`limits::MESSAGE_MAX_BYTES`].
     MessageTooLong,
+    /// A command that would start new work (a message, a session, a
+    /// context, a setting, a shell run) while the server's disk is below
+    /// its free-space floor: the server has paused its agents until space
+    /// is freed. Control (interrupts, stops, approval answers) is still
+    /// taken. Send it again once the server has room.
+    DiskLow,
 }
 
 impl RejectReason {

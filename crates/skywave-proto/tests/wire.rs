@@ -700,6 +700,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::BadShellCommand,
             RejectReason::BypassDisabled,
             RejectReason::MessageTooLong,
+            RejectReason::DiskLow,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -1341,8 +1342,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v19() {
-    assert_eq!(PROTOCOL_VERSION, 19);
+fn protocol_is_v20() {
+    assert_eq!(PROTOCOL_VERSION, 20);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

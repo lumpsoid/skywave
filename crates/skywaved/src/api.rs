@@ -482,6 +482,12 @@ async fn prepare_import(
     let Some(conversation) = check_conversation_id(conversation) else {
         return Ok(None);
     };
+    // Refused `DiskLow` before it writes blobs. Should the disk have room
+    // again by the transaction, the session is created with nothing
+    // imported (`Unavailable`), as for any create with nothing prepared.
+    if api.log.disk().is_low() {
+        return Ok(None);
+    }
     let conversation = conversation.to_owned();
     let deadline = Instant::now() + api.import_deadline;
     let (roots, workdir) = (api.log.roots().to_vec(), workdir.clone());

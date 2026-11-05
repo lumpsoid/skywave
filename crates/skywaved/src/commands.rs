@@ -39,6 +39,17 @@
 //! has whatever the command appended before it too. A rejected command
 //! appends nothing; only its stored result answers it.
 //!
+//! **A low disk** ([`crate::disk`]): while the log's disk is low, a command
+//! that starts new work is `DiskLow` before anything else is checked:
+//! `CreateSession`, `SendMessage`, `SetPermissionMode`, `SetModel`,
+//! `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`. The rest is
+//! control the user needs while the agents are paused, or one small event
+//! that starts nothing, and is handled as usual: `ResolveApproval`,
+//! `Interrupt`, `StopSession`, `StopTask`, `StopShell`, `RenameSession`,
+//! `SetSessionArchived` and `SwitchContext`. The refusal is stored like any
+//! other, so the command keeps it; the user sends the work again once the
+//! server has room.
+//!
 //! **Context stamps.** The server stamps each event with the context it
 //! belongs to ([`Event::context`](skywave_proto::Event::context)):
 //! `SessionCreated` with the session's first context, which has the
@@ -262,6 +273,9 @@ impl EventLog {
         command: &Command,
         prepared: Option<&mut Prepared>,
     ) -> Result<Result<Seq, RejectReason>> {
+        if self.disk().is_low() && starts_work(&command.kind) {
+            return Ok(Err(RejectReason::DiskLow));
+        }
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
             CommandKind::CreateSession {
@@ -594,6 +608,34 @@ impl EventLog {
             Some(command.id),
             &kind,
         )?))
+    }
+}
+
+/// Whether a command of this kind starts new work, which a low disk refuses
+/// (`DiskLow`): it creates a session or context, gives the agent a message
+/// or a setting request (either may start an agent), or runs a shell
+/// command. Everything else is control the user needs while the agents are
+/// paused (an interrupt, a stop, an approval answer) or one small event
+/// that starts nothing (a rename, an archive, a switch to a context that
+/// exists). Exhaustive, so a new command must be placed.
+fn starts_work(kind: &CommandKind) -> bool {
+    match kind {
+        CommandKind::CreateSession { .. }
+        | CommandKind::SendMessage { .. }
+        | CommandKind::SetPermissionMode { .. }
+        | CommandKind::SetModel { .. }
+        | CommandKind::SetEffort { .. }
+        | CommandKind::ClearContext { .. }
+        | CommandKind::MoveContext { .. }
+        | CommandKind::RunShell { .. } => true,
+        CommandKind::ResolveApproval { .. }
+        | CommandKind::Interrupt { .. }
+        | CommandKind::StopSession { .. }
+        | CommandKind::StopTask { .. }
+        | CommandKind::StopShell { .. }
+        | CommandKind::RenameSession { .. }
+        | CommandKind::SetSessionArchived { .. }
+        | CommandKind::SwitchContext { .. } => false,
     }
 }
 

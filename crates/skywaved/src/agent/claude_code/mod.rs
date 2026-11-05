@@ -77,7 +77,13 @@
 //! cancels no approvals, so an abandoned turn and its approvals stay open.
 //! A CLI that stops reading stdin for the write timeout is killed and
 //! reported as an `Exited` error, so a wedged process cannot block its
-//! session.
+//! session. A supervisor paused on a low disk stops reading the events
+//! (D40): the driver then waits in its event send, with its writes for the
+//! request or line at hand already done, and the CLI blocks writing its
+//! stdout. No timer runs in that wait: the write timeout covers only a
+//! write in progress, so a paused CLI is never killed as wedged, and a
+//! request sent meanwhile waits in the driver's queue until the events are
+//! read again.
 //!
 //! **Unanswered interrupts.** The CLI is sent one interrupt per turn. An
 //! [`AgentSession::escalate_interrupt`] (the user interrupting again) that
