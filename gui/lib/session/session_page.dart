@@ -516,14 +516,18 @@ class _SessionPageState extends State<SessionPage> {
                           send: widget.send,
                         ),
                 ),
+                // Flexible: with the keyboard up the panel shrinks to what
+                // the timeline leaves and scrolls, instead of overflowing.
                 if (screen.approval case final approval?)
-                  _Column(
+                  Flexible(
+                    child: _Column(
                     child: ApprovalPanelView(
                       approval: approval,
                       send: widget.send,
                       onShowCall: approval.gatedKey == null
                           ? null
                           : () => _showCall(approval.gatedKey!),
+                      ),
                     ),
                   ),
                 ColoredBox(
@@ -598,7 +602,9 @@ class _Column extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // heightFactor: as tall as the child, even under a bounded height.
     return Center(
+      heightFactor: 1,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: timelineMaxWidth),
         child: child,

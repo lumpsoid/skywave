@@ -691,6 +691,39 @@ void main() {
       expect(sent, [resolve(DecisionView.approve, 1)]);
     });
 
+    testWidgets('a phone with the keyboard up: one button row, no overflow', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      tester.view.viewInsets = const FakeViewPadding(bottom: 330);
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(
+          approval: ApprovalPanel(
+            approvalId: 'a1',
+            kind: ToolKindView.shell,
+            tool: 'Bash',
+            title: r'$ rm -rf build',
+            detail: List.filled(12, 'a long line of what it does').join('\n'),
+            canAnswer: true,
+            suggestions: const [
+              RuleOption(index: 0, label: 'Bash(rm:*) (project)'),
+              RuleOption(index: 1, label: 'Bash(*) (session)'),
+            ],
+            alwaysPicks: true,
+          ),
+        ),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(tester.takeException(), isNull);
+      final row = tester.getCenter(find.text('Approve')).dy;
+      expect(tester.getCenter(find.text('Deny')).dy, row);
+      expect(tester.getCenter(find.text('Always allow…')).dy, row);
+    });
+
     testWidgets('answered: the answer shows and the buttons go', (
       tester,
     ) async {
