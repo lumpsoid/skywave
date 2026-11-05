@@ -170,4 +170,73 @@ void main() {
     }
     expect(sent, [const GuiIntentAppForegrounded()]);
   });
+
+  testWidgets('a detached Activity keeps the core, and a new one reports '
+      'the return and checks its launch', (tester) async {
+    final sent = <GuiIntent>[];
+    var finalized = 0;
+    var reattached = 0;
+    await tester.pumpWidget(
+      SkywaveApp(
+        boot: BootHolder(),
+        holders: fakeHolders(),
+        send: sent.add,
+        finalize: () => finalized++,
+        onReattach: () => reattached++,
+      ),
+    );
+
+    // The Activity goes: through hidden and paused to detached.
+    for (final state in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+      AppLifecycleState.detached,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    expect(sent, [const GuiIntentAppBackgrounded()]);
+    expect(finalized, 0);
+    expect(reattached, 0);
+
+    // A new Activity attaches: detached straight to resumed.
+    sent.clear();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    expect(sent, [const GuiIntentAppForegrounded()]);
+    expect(reattached, 1);
+    expect(finalized, 0);
+
+    // A plain leave and return afterwards goes through shown only.
+    sent.clear();
+    for (final state in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    expect(sent, [
+      const GuiIntentAppBackgrounded(),
+      const GuiIntentAppForegrounded(),
+    ]);
+    expect(reattached, 1);
+    expect(finalized, 0);
+  });
+
+  testWidgets('an exit request finalizes once', (tester) async {
+    var finalized = 0;
+    await tester.pumpWidget(
+      SkywaveApp(
+        boot: BootHolder(),
+        holders: fakeHolders(),
+        send: (_) {},
+        finalize: () => finalized++,
+      ),
+    );
+
+    await tester.binding.handleRequestAppExit();
+    await tester.binding.handleRequestAppExit();
+    expect(finalized, 1);
+  });
 }

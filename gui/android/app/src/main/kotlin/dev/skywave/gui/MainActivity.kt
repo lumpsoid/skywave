@@ -10,6 +10,8 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
+import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodChannel
 
 /**
@@ -27,6 +29,11 @@ import io.flutter.plugin.common.MethodChannel
  * It also scans the pairing QR code for Dart (D20): `scan` on [SCAN_CHANNEL]
  * opens the ZXing scanner, which asks for the camera itself, and answers
  * with the code's text, or null when cancelled.
+ *
+ * The Flutter engine, and with it Dart and the Rust core, belongs to the
+ * app, not to this activity: [engine] creates it once per process and every
+ * activity attaches to it, so the core outlives a destroyed activity. It is
+ * never destroyed; the process ending ends it.
  */
 class MainActivity : FlutterActivity() {
     private val scan = ScanContract()
@@ -38,9 +45,14 @@ class MainActivity : FlutterActivity() {
         if (savedInstanceState == null) askForPermissions()
     }
 
+    // Host-provided, so the activity does not destroy it when it goes.
+    override fun provideFlutterEngine(context: Context): FlutterEngine = engine(context)
+
+    // Runs for every activity on the shared engine, so the channel answers
+    // the activity on screen; [cleanUpFlutterEngine] unbinds it again.
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCAN_CHANNEL)
+        flutterEngine.scanChannel()
             .setMethodCallHandler { call, result ->
                 when {
                     call.method != "scan" -> result.notImplemented()
@@ -67,6 +79,30 @@ class MainActivity : FlutterActivity() {
         scanning = null
         result.success(scan.parseResult(resultCode, data).contents) // null: cancelled
     }
+
+    // The activity leaves the engine, destroyed or evicted by a newer one.
+    // The engine outlives it, so the handler, which holds this activity,
+    // comes off the channel. A scan still open never gets its result here:
+    // answer it as cancelled, so Dart does not wait for good.
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        flutterEngine.scanChannel().setMethodCallHandler(null)
+        scanning?.success(null)
+        scanning = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    // A newer MainActivity took the engine: a notification tap starts one
+    // whenever this one is not on top (singleTop only reuses the top one),
+    // say under the QR scanner. Left in the back stack, this one would come
+    // back with no engine: a frozen screen that reports no lifecycle, so the
+    // core would stay suspended. Finished, it is not there to go back to.
+    override fun detachFromFlutterEngine() {
+        super.detachFromFlutterEngine()
+        finish()
+    }
+
+    private fun FlutterEngine.scanChannel() =
+        MethodChannel(dartExecutor.binaryMessenger, SCAN_CHANNEL)
 
     private fun askForPermissions() {
         val wanted = buildList {
@@ -98,11 +134,27 @@ class MainActivity : FlutterActivity() {
 
     private fun prefs() = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private companion object {
-        const val PERMISSIONS_REQUEST = 1
-        const val SCAN_REQUEST = 2
-        const val SCAN_CHANNEL = "dev.skywave.gui/scan"
-        const val PREFS = "permissions"
-        const val NOTIFICATIONS_ASKED = "notifications_asked"
+    companion object {
+        /** The app's engine in [FlutterEngineCache]; look it up, never create it, elsewhere. */
+        const val ENGINE_ID = "skywave"
+
+        /** The app's engine, running Dart's `main`, created on first use. */
+        @Synchronized
+        fun engine(context: Context): FlutterEngine {
+            val cache = FlutterEngineCache.getInstance()
+            cache.get(ENGINE_ID)?.let { return it }
+            // Registers the plugins itself; the activity does not for a
+            // host-provided engine.
+            val engine = FlutterEngine(context.applicationContext)
+            engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
+            cache.put(ENGINE_ID, engine)
+            return engine
+        }
+
+        private const val PERMISSIONS_REQUEST = 1
+        private const val SCAN_REQUEST = 2
+        private const val SCAN_CHANNEL = "dev.skywave.gui/scan"
+        private const val PREFS = "permissions"
+        private const val NOTIFICATIONS_ASKED = "notifications_asked"
     }
 }

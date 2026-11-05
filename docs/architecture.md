@@ -798,6 +798,11 @@ skywave-core                 all logic, sync, replica
   Android and iOS the hub suspends the core, and resumes it then retries the
   link (D21's rule, without A15's background work). Every platform saves the
   open session's unsaved draft and marks it read at once on leaving, and
-  again whenever the hub task stops, before the core closes.
+  again whenever the hub task stops, before the core closes. On Android the
+  app owns the Flutter engine (`MainActivity.engine`), so Dart and the core
+  outlive the Activity: a detach does not close the core, which only
+  desktop's exit request does. When a new Activity attaches to the live
+  engine, Dart reports `AppForegrounded` and checks whether a notification
+  tap launched it.
 - **Platforms:** Linux and Android verified; macOS, iOS and Windows
   scaffolded only; no web (D26).

@@ -57,7 +57,7 @@ class SystemNotifications {
       debugPrint('notifications unavailable: $error');
       return;
     }
-    await _openLaunching();
+    await openLaunching();
   }
 
   /// Shows [body] under [title] as notification [id], replacing the one
@@ -85,8 +85,12 @@ class SystemNotifications {
   }
 
   /// A tap on a notification launched the app (mobile, macOS, Windows):
-  /// open its session as a tap would.
-  Future<void> _openLaunching() async {
+  /// open its session as a tap would. Run once from [init], and again when
+  /// a new Android Activity attaches to the live engine, whose launch
+  /// intent only this sees. Not on every return to the screen: the intent
+  /// stays with the Activity, so its session would open each time.
+  Future<void> openLaunching() async {
+    if (!_ready) return;
     final NotificationAppLaunchDetails? launch;
     try {
       launch = await _plugin.getNotificationAppLaunchDetails();
