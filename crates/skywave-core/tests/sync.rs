@@ -755,12 +755,21 @@ async fn an_answer_to_an_approval_cancelled_while_offline_is_shown_refused() {
         .unwrap();
 
     proxy.up();
+    // The view is published after the outbox settles, so wait for the view
+    // to show the result too, not only the outbox.
     let view = client
-        .wait("the answer's result and the cancel", |c, _| {
+        .wait("the answer's result and the cancel", |c, view| {
             c.outbox().iter().any(|e| {
                 matches!(e.command.kind, CommandKind::ResolveApproval { .. })
                     && matches!(e.status, OutboxStatus::Done(_))
             }) && c.cursor() >= daemon.head()
+                && matches!(&view.screen, Screen::Session(s) if s.timeline.iter().any(|item| matches!(
+                    item,
+                    TimelineItem::Logged {
+                        entry: Entry::Approval { id, answer: Some(answer), .. },
+                        ..
+                    } if *id == approval && matches!(answer.outgoing, Outgoing::Failed(_) | Outgoing::Accepted(_))
+                )))
         })
         .await;
     let answers = |c: &Client| {
