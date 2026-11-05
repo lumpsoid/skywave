@@ -9,6 +9,10 @@
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK"/>
     <!-- Approval notifications (API 33+); MainActivity asks once. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- "Stay connected": the opt-in foreground service, type specialUse on
+         API 34+ (see StayConnectedService for why). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <!-- Scanning the pairing QR code; the scanner asks when it opens. -->
     <uses-permission android:name="android.permission.CAMERA"/>
     <!-- Typing the details or pasting the link pairs without a camera. -->
@@ -50,6 +54,17 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Keeps the process, and with it the core's link, up while the
+             user chose to stay connected. Never exported; started only from
+             the app in the foreground. -->
+        <service
+            android:name=".StayConnectedService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled persistent connection to the user's own self-hosted Skywave server, so approval requests from coding agents are notified within seconds."/>
+        </service>
         <!-- The scanner (D20) declares a fixed landscape; follow the device
              instead, as the Kotlin head did. -->
         <activity

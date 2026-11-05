@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:rinf/rinf.dart';
+import 'package:skywave_gui/effects/background_service.dart';
 import 'package:skywave_gui/effects/notifications.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
@@ -20,6 +21,7 @@ abstract interface class EffectSink {
   void openFile(String path);
   void notice(String text);
   void error(String text);
+  void backgroundService({required bool run});
 }
 
 /// Hands every [PlatformEffect] Rust sends to its [EffectSink] method, and
@@ -62,12 +64,14 @@ class EffectsListener {
 }
 
 /// The app's sink: system notifications, the clipboard, the platform's
-/// file opener, and snackbars through [messenger].
+/// file opener, snackbars through [messenger], and Android's
+/// stay-connected service.
 class AppEffectSink implements EffectSink {
-  AppEffectSink(this.messenger, this.notifications);
+  AppEffectSink(this.messenger, this.notifications, this.background);
 
   final GlobalKey<ScaffoldMessengerState> messenger;
   final SystemNotifications notifications;
+  final BackgroundService background;
 
   @override
   void notify({
@@ -107,6 +111,10 @@ class AppEffectSink implements EffectSink {
 
   @override
   void error(String text) => _show(text, error: true);
+
+  @override
+  void backgroundService({required bool run}) =>
+      unawaited(run ? background.start() : background.stop());
 
   void _show(String text, {bool error = false}) {
     final state = messenger.currentState;
