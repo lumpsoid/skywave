@@ -37,7 +37,12 @@
 //!   (4xx), an unreadable reply or a server error (5xx) is an answer about
 //!   one command, so it keeps the connection and the pull going
 //!   ([`send_entry`]); after [`MAX_SERVER_ERRORS`] server errors in a row
-//!   the command is settled from the log instead of sent again.
+//!   the command is settled from the log instead of sent again. A failure
+//!   of the command's request alone (a timeout, a broken connection, a
+//!   408: [`TransportError::failed_request`]) is no answer, but it keeps
+//!   the connection too, and the command is resent after a backoff: the
+//!   request has a connection of its own, so the pull's tells whether the
+//!   link is down.
 //!
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
@@ -641,18 +646,19 @@ impl Retry {
     }
 }
 
-/// The server errors counted against the command at the head of the
-/// outbox ([`MAX_SERVER_ERRORS`]). Kept by the link across connections, so
-/// a connection that drops for another reason does not start the count
-/// over; in memory only, so a restart does.
+/// A count of failed sends of the command at the head of the outbox, in
+/// memory only, so a restart starts it over. The link keeps one for server
+/// errors ([`MAX_SERVER_ERRORS`]) across connections, so a connection that
+/// drops for another reason does not start that count over; each sender
+/// keeps one for failed requests, for their backoff.
 #[derive(Default)]
-struct ServerErrors {
+struct HeadCount {
     id: Option<CommandId>,
     count: u32,
 }
 
-impl ServerErrors {
-    /// Counts one more server error for `id` and returns the count. A
+impl HeadCount {
+    /// Counts one more failure for `id` and returns the count. A
     /// different command starts over: only the head of the outbox is sent.
     fn note(&mut self, id: CommandId) -> u32 {
         if self.id != Some(id) {
@@ -692,7 +698,7 @@ pub(crate) async fn run_link(ctx: LinkCtx) -> LinkRejection {
     };
     reporter.set(Link::Connecting);
     let mut retry = Retry::default();
-    let mut errors = ServerErrors::default();
+    let mut errors = HeadCount::default();
     let mut transport: Option<Arc<dyn Transport>> = None;
     loop {
         let error = match &transport {
@@ -797,13 +803,14 @@ impl Wait {
 }
 
 /// One connection: `hello`, then pull and send until either fails. A
-/// server error for one command is not a failure of the sender
-/// ([`send_entry`]), so it never cuts the pull short.
+/// server error for one command, or a failure of its request alone, is not
+/// a failure of the sender ([`send_entry`]), so it never cuts the pull
+/// short; the pull is what finds the link down.
 async fn connection(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     reporter: &mut LinkReporter,
-    errors: &mut ServerErrors,
+    errors: &mut HeadCount,
 ) -> Ended {
     let since = match ctx.seam.server_run() {
         Ok(since) => since,
@@ -924,14 +931,15 @@ async fn send(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     progress: &AtomicBool,
-    errors: &mut ServerErrors,
+    errors: &mut HeadCount,
 ) -> Result<Infallible, LinkError> {
+    let mut failures = HeadCount::default();
     loop {
         let Some(entry) = ctx.seam.pending_outbox()?.into_iter().next() else {
             ctx.outbox.notified().await;
             continue;
         };
-        if send_entry(ctx, transport, &entry, errors).await? {
+        if send_entry(ctx, transport, &entry, errors, &mut failures).await? {
             progress.store(true, Ordering::Relaxed);
         }
     }
@@ -960,11 +968,22 @@ async fn send(
 /// settled from the log like an unreadable reply, so one command the server
 /// keeps failing cannot hold back every later one forever, and one it did
 /// take (D7 dedups the resends) is not shown failed.
+///
+/// A request that failed on its own ([`TransportError::failed_request`]: a
+/// stalled upload, a reply that never came, a broken connection) is no
+/// answer at all, so it settles nothing; but it is no sign the link is down
+/// either, as the pull runs on a connection of its own. The link stays up
+/// and the entry is sent again after [`Backoff::delay`] for the count of
+/// such failures in a row (`failures`), as often as it takes: if the link
+/// is down, the pull fails and ends the connection. The server may have
+/// taken the command meanwhile; then the pull settles it and the resend
+/// cannot claim it, or the server answers the resend from its dedup.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
     entry: &OutboxEntry,
-    errors: &mut ServerErrors,
+    errors: &mut HeadCount,
+    failures: &mut HeadCount,
 ) -> Result<bool, LinkError> {
     let id = entry.command.id;
     if !ctx.seam.command_sending(id)? {
@@ -995,6 +1014,13 @@ async fn send_entry(
                 tracing::warn!(%error, ?id, count, "server error again; settling from the log");
                 settled_by_log(ctx, transport, id).await?;
             }
+            Ok(false)
+        }
+        Err(error) if error.failed_request() => {
+            let count = failures.note(id);
+            let after = ctx.config.backoff.delay(count);
+            tracing::debug!(%error, ?id, count, ?after, "command request failed; sending again");
+            tokio::time::sleep(after).await;
             Ok(false)
         }
         Err(error) => Err(error.into()),
@@ -1834,7 +1860,7 @@ mod tests {
         let progress = AtomicBool::new(false);
 
         // The sender drains the outbox, then waits for more forever.
-        let errors = &mut ServerErrors::default();
+        let errors = &mut HeadCount::default();
         let drained = tokio::time::timeout(
             Duration::from_secs(1),
             send(&ctx, &server, &progress, errors),
@@ -1867,15 +1893,22 @@ mod tests {
                 [deleted.id.0.to_string()],
             )
             .unwrap();
-        let errors = &mut ServerErrors::default();
-        assert!(!send_entry(&ctx, &server, &entry, errors).await.unwrap());
+        let errors = &mut HeadCount::default();
+        let failures = &mut HeadCount::default();
+        assert!(
+            !send_entry(&ctx, &server, &entry, errors, failures)
+                .await
+                .unwrap()
+        );
 
         let answered = enqueue(&seam, "answered");
         let entry = seam.pending_outbox().unwrap().remove(0);
         seam.command_result(answered.id, &CommandResult::Accepted { seq: Seq(1) })
             .unwrap();
         assert!(
-            !send_entry(&ctx, &server, &entry, errors).await.unwrap(),
+            !send_entry(&ctx, &server, &entry, errors, failures)
+                .await
+                .unwrap(),
             "a skipped row is no progress"
         );
 
@@ -1961,7 +1994,7 @@ mod tests {
         let ctx = sender_ctx(&seam);
         let progress = AtomicBool::new(false);
 
-        let errors = &mut ServerErrors::default();
+        let errors = &mut HeadCount::default();
         let drained = tokio::time::timeout(
             Duration::from_secs(1),
             send(&ctx, &server, &progress, errors),
@@ -2018,7 +2051,7 @@ mod tests {
         };
         let ctx = sender_ctx(&seam);
         let progress = AtomicBool::new(false);
-        let errors = &mut ServerErrors::default();
+        let errors = &mut HeadCount::default();
 
         let ended = tokio::time::timeout(
             Duration::from_secs(120),
@@ -2038,6 +2071,144 @@ mod tests {
             ["/busy"; MAX_SERVER_ERRORS as usize]
         );
         assert_eq!(seam.pending_outbox().unwrap().len(), 2);
+    }
+
+    /// A server on a link whose uplink stalls for the command to `/slow`:
+    /// its first `stalls` sends time out after `STALL`; every other command
+    /// is accepted. Long-polls return empty after their `wait`.
+    struct StallingServer {
+        stalls: AtomicUsize,
+        hellos: AtomicUsize,
+        pulled: AtomicUsize,
+        seen: Mutex<Vec<(String, CommandId)>>,
+    }
+
+    impl StallingServer {
+        const STALL: Duration = Duration::from_secs(30);
+    }
+
+    impl Transport for StallingServer {
+        fn hello(
+            &self,
+            _since: Option<skywave_proto::RunId>,
+        ) -> BoxFuture<'_, Result<HelloResponse, TransportError>> {
+            Box::pin(async move {
+                self.hellos.fetch_add(1, Ordering::SeqCst);
+                Ok(HelloResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_id: ServerId::new(),
+                    device_id: DeviceId::new(),
+                    head: Seq::ZERO,
+                    log: one_run(),
+                    devices: Vec::new(),
+                    shell: false,
+                    bypass: false,
+                })
+            })
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: &'a Command,
+        ) -> BoxFuture<'a, Result<CommandResult, TransportError>> {
+            Box::pin(async move {
+                let CommandKind::CreateSession { workdir, .. } = &command.kind else {
+                    panic!("only creations are sent here");
+                };
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((workdir.clone(), command.id));
+                let stalled = workdir == "/slow"
+                    && self
+                        .stalls
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                if stalled {
+                    tokio::time::sleep(StallingServer::STALL).await;
+                    return Err(TransportError::Timeout);
+                }
+                let seen = self.seen.lock().unwrap().len() as u64;
+                Ok(CommandResult::Accepted { seq: Seq(seen) })
+            })
+        }
+
+        fn events(&self, query: EventsQuery) -> BoxFuture<'_, Result<EventBatch, TransportError>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(u64::from(query.wait.unwrap_or(0)))).await;
+                self.pulled.fetch_add(1, Ordering::SeqCst);
+                Ok(EventBatch {
+                    from: Seq(query.after.0 + 1),
+                    events: Vec::new(),
+                })
+            })
+        }
+
+        fn blob(
+            &self,
+            _id: ProtoBlobId,
+            _from: u64,
+        ) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
+            Box::pin(async { Err(TransportError::NotFound) })
+        }
+    }
+
+    /// A command whose request times out is sent again, with the same id,
+    /// after a backoff, on the same connection: the long-poll beside it
+    /// goes on, the link never shows down, and no `hello` is repeated.
+    /// Once it gets through, the command behind it goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_timeout_leaves_the_pull_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        create(&seam, "/slow");
+        create(&seam, "/later");
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let sink = links.clone();
+        seam.core
+            .subscribe(move |view| sink.lock().unwrap().push(view.link));
+
+        let server = Arc::new(StallingServer {
+            stalls: AtomicUsize::new(3),
+            hellos: AtomicUsize::new(0),
+            pulled: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        });
+        let fake = server.clone();
+        let (wall_clock, _) = paused_wall();
+        let config = EngineConfig {
+            wait_secs: 10,
+            backoff: Backoff {
+                base: Duration::from_secs(1),
+                cap: Duration::from_secs(8),
+                jitter: Jitter::fixed(1.0),
+            },
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            wall_clock,
+            ..EngineConfig::default()
+        };
+        let link = tokio::spawn(run_link(link_ctx(&seam, config, Arc::new(Notify::new()))));
+
+        while !seam.pending_outbox().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        link.abort();
+
+        let seen = server.seen.lock().unwrap().clone();
+        let workdirs: Vec<_> = seen.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(workdirs, ["/slow", "/slow", "/slow", "/slow", "/later"]);
+        assert!(
+            seen[..4].iter().all(|(_, id)| *id == seen[0].1),
+            "a resend keeps the command's id"
+        );
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 1, "one connection");
+        // Three stalls and their backoffs (1 + 2 + 4 s): 97 s of 10 s polls.
+        assert!(server.pulled.load(Ordering::SeqCst) >= 9);
+        let links = links.lock().unwrap();
+        assert!(
+            !links.iter().any(|l| matches!(l, Link::Reconnecting { .. })),
+            "{links:?}"
+        );
     }
 
     /// A server with a log of one session: a message logs its event once

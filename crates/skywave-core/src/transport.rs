@@ -283,6 +283,21 @@ impl TransportError {
         matches!(self, TransportError::BadStatus(status) if (500..600).contains(status))
     }
 
+    /// This one request failed, which says nothing yet about the link: it
+    /// timed out ([`Timeout`](Self::Timeout): for a command, its upload
+    /// stalled or its reply never came), its connection broke, or the
+    /// server gave up waiting for its body (408). Each request has a
+    /// connection of its own, so the others, the long-poll among them, may
+    /// be fine; if the link is down, they fail too. Unlike a server error,
+    /// it is no answer: the outbox resends without counting it against
+    /// the command.
+    pub fn failed_request(&self) -> bool {
+        matches!(
+            self,
+            TransportError::Timeout | TransportError::Io(_) | TransportError::BadStatus(408)
+        )
+    }
+
     /// No retry can succeed: the link becomes
     /// [`Link::Rejected`](crate::Link::Rejected) until the user acts
     /// ([`link_verdict`](Self::link_verdict)).
