@@ -45,7 +45,7 @@ impl DataDirLock {
             .write(true)
             .open(data_dir.join(LOCK_FILE))
             .map_err(io)?;
-        match file.try_lock() {
+        match try_lock(&file) {
             Ok(()) => Ok(DataDirLock { _file: file }),
             Err(TryLockError::WouldBlock) => Err(LockError::InUse {
                 path: data_dir.to_path_buf(),
@@ -53,4 +53,30 @@ impl DataDirLock {
             Err(TryLockError::Error(source)) => Err(io(source)),
         }
     }
+}
+
+/// `flock(LOCK_EX | LOCK_NB)` straight through libc: std's
+/// [`File::try_lock`] answers `Unsupported` on Android (Rust 1.93), which
+/// left the app unable to open its data at all. Every Unix takes this path,
+/// so the host tests cover the code the phone runs; std's Unix lock is the
+/// same `flock`.
+#[cfg(unix)]
+fn try_lock(file: &File) -> Result<(), TryLockError> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the whole call; `flock` touches
+    // no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Err(TryLockError::WouldBlock)
+    } else {
+        Err(TryLockError::Error(error))
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock(file: &File) -> Result<(), TryLockError> {
+    file.try_lock()
 }
