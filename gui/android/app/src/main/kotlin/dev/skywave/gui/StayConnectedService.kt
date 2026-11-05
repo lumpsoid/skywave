@@ -96,7 +96,7 @@ class StayConnectedService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_skywave)
             .setContentTitle("Skywave")
             .setContentText("Keeping the link to your server open")
             .setContentIntent(open)
