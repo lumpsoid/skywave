@@ -560,9 +560,10 @@ class _SessionPageState extends State<SessionPage> {
   }
 }
 
-/// Interrupts the agent's turn: off while there is none, a spinner while
-/// the interrupt is on its way, the error colour with the reason as its
-/// tooltip when it failed and the agent still works.
+/// Interrupts the agent's turn: off while there is none, the hand under
+/// an hourglass while the interrupt is on its way (still, not a spinner:
+/// offline it can wait for as long as the link is down), the error colour
+/// with the reason as its tooltip when it failed and the agent still works.
 class _InterruptButton extends StatelessWidget {
   const _InterruptButton({required this.screen, required this.onPressed});
 
@@ -572,12 +573,16 @@ class _InterruptButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (screen.interruptBusy) {
-      return const IconButton(
+      final warning = SkyColors.of(context).warning;
+      return IconButton(
         tooltip: 'Interrupting…',
         onPressed: null,
-        icon: SizedBox.square(
-          dimension: 18,
-          child: CircularProgressIndicator(strokeWidth: 2),
+        icon: Badge(
+          backgroundColor: Colors.transparent,
+          padding: EdgeInsets.zero,
+          offset: const Offset(6, -6),
+          label: Icon(Icons.hourglass_top, size: 14, color: warning),
+          child: const Icon(Icons.pan_tool_outlined),
         ),
       );
     }
