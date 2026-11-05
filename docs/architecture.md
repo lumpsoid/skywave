@@ -96,7 +96,18 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   a whole, so a slow link that keeps delivering bytes finishes. A chunk is
   one TLS record (up to 16 KB) and must arrive within `request_timeout`
   (30 s), so below about 550 B/s the link counts as dead. Accepted limit:
-  revisit only if a real network that slow turns up.
+  revisit only if a real network that slow turns up. A command's upload
+  is timed the same way, by progress: it fails once the socket has taken
+  none of it for `request_timeout` (30 s), which, after its last byte,
+  is also how long the response head may take. So a message up to
+  `MESSAGE_MAX_BYTES` gets through a slow uplink that keeps moving. On
+  Linux and Android the client socket sets `TCP_NOTSENT_LOWAT` to 16 KiB,
+  so it takes a write only while less than that is unsent: a taken write
+  means bytes left the host, and after the last one only about 16 KiB
+  plus what is in flight remains for the head wait (some 8 s at 2 KB/s).
+  Elsewhere (desktop macOS and Windows) the send buffer, which can
+  autotune to megabytes, counts as sent, so on an uplink too slow to
+  drain it within 30 s a large command times out there and is resent.
 
 ## Protocol
 
@@ -525,7 +536,12 @@ logs) an event that no longer decodes rather than failing.
   after a backoff; after `MAX_SERVER_ERRORS` (5) in a row the command is
   settled from the log the same way, so one the server keeps failing ends
   undeliverable (shown failed, discardable, never resent) instead of
-  holding back every later command. Reconnects back off
+  holding back every later command. A command whose own request failed
+  (timed out, lost its connection, or a 408) is no answer, but each
+  request has a connection of its own, so it does not end the link
+  either: the pull goes on, and the command is resent, same id, after a
+  backoff for the failures in a row, as often as it takes. A link that
+  is really down fails the pull, which ends the connection. Reconnects back off
   exponentially with jitter to 30 s. The attempt count starts over after a
   connection that made progress (a pull returned or the server settled a
   command); `hello` alone is not progress, so a server that answers it and
