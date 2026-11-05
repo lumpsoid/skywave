@@ -23,7 +23,9 @@ use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
 use crate::dispatcher::{Dispatched, Tag};
-use crate::lifecycle::{self, Call, Moved, Target};
+#[cfg(test)]
+use crate::lifecycle::Target;
+use crate::lifecycle::{Awake, Call, Moved};
 use crate::notify::{Kind, NotificationIds};
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
@@ -284,11 +286,27 @@ pub struct Head {
     workdir_text: WorkdirText,
     session: Option<SessionHead>,
     sent: Sent,
+    /// Who holds the link: whether the core runs.
+    awake: Awake,
 }
 
 impl Head {
     pub fn new() -> Head {
         Head::default()
+    }
+
+    /// A head for `target` rather than the one built for.
+    #[cfg(test)]
+    pub(crate) fn with_target(target: Target) -> Head {
+        Head {
+            awake: Awake::new(target),
+            ..Head::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awake(&self) -> &Awake {
+        &self.awake
     }
 
     /// A snapshot from the core.
@@ -1086,6 +1104,10 @@ impl Head {
             }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
+            GuiIntent::BackgroundService { running } => {
+                let calls = self.awake.service(running);
+                self.call(calls, clock, out);
+            }
             // The hub task's, which keeps it from every head.
             GuiIntent::HubFailedSeen { .. } => {}
         }
@@ -1132,10 +1154,16 @@ impl Head {
     }
 
     /// The app left or came back to the screen: what that does to the core
-    /// on this platform is [`lifecycle::calls`]'s to say. The calls go out
-    /// in order, so a save is queued on the dispatcher before the suspend.
+    /// is [`Awake::moved`]'s to say.
     fn moved(&mut self, moved: Moved, clock: Clock, out: &mut Vec<Out>) {
-        for call in lifecycle::calls(moved, Target::BUILT) {
+        let calls = self.awake.moved(moved);
+        self.call(calls, clock, out);
+    }
+
+    /// Makes `calls` in order, so a save is queued on the dispatcher before
+    /// the suspend.
+    fn call(&mut self, calls: Vec<Call>, clock: Clock, out: &mut Vec<Out>) {
+        for call in calls {
             match call {
                 Call::SaveDraft => self.save_draft(clock, true, out),
                 Call::MarkRead => self.mark_read(clock, true, out),

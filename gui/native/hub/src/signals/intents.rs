@@ -220,6 +220,12 @@ pub enum GuiIntent {
     AppBackgrounded,
     /// The app is on screen again (shown or resumed).
     AppForegrounded,
+    /// Kotlin's definitive report on the background service: `running`
+    /// once `startForeground` succeeded, not once the service stopped or
+    /// the system refused it. Reported, not decided, like the two above.
+    BackgroundService {
+        running: bool,
+    },
     /// Dart got `HubFailed` with this `epoch`: every intent sent before
     /// this one was for the head that failed. Sent once per `HubFailed`,
     /// before anything else; never reaches a head.

@@ -6,6 +6,7 @@ use skywave_present::policy::DRAFT_SAVE_AFTER;
 use skywave_proto::{CommandId, CommandKind, Event, EventBatch, EventKind};
 
 use super::*;
+use crate::lifecycle::{Holder, Target};
 use crate::signals::{
     ActionIntent, ListKindView, RouteView, RowKind, ScreenView, ShellPromptView, ToolState,
 };
@@ -611,6 +612,15 @@ fn an_adopted_session_row_says_its_history_is_importing() {
 
 impl Rig {
     fn new() -> Rig {
+        Rig::on(Head::new())
+    }
+
+    /// A rig whose head acts as on a phone, whatever this was built for.
+    fn mobile() -> Rig {
+        Rig::on(Head::with_target(Target::Mobile))
+    }
+
+    fn on(head: Head) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let core = Core::open_detached(dir.path()).unwrap();
         let seam = core.seam();
@@ -652,7 +662,7 @@ impl Rig {
             _dir: dir,
             core,
             seam,
-            head: Head::new(),
+            head,
             clock: Clock::read(),
             session,
             me,
@@ -895,6 +905,113 @@ fn backgrounding_without_an_unsaved_draft_dispatches_nothing() {
     rig.actions.clear();
     rig.intent(GuiIntent::AppBackgrounded);
     assert!(rig.actions.is_empty(), "{:?}", rig.actions);
+}
+
+#[test]
+fn a_fresh_head_holds_the_link_on_screen_without_the_service() {
+    for head in [Head::new(), Head::with_target(Target::Mobile)] {
+        assert!(head.awake().holds(Holder::Visible));
+        assert!(!head.awake().holds(Holder::Service));
+    }
+    assert_eq!(*Head::new().awake(), Awake::new(Target::BUILT));
+}
+
+/// The kinds of what `outs` does to the core, in order: the dispatched
+/// actions and the suspends and resumes.
+fn core_calls(outs: &[Out]) -> Vec<String> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Dispatch(_, action) => Some(format!("{action:?}")),
+            Out::Suspend => Some("Suspend".into()),
+            Out::Resume => Some("Resume".into()),
+            _ => None,
+        })
+        .map(|s| {
+            s.split([' ', '(', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn a_phone_saves_then_suspends_when_backgrounded_without_the_service() {
+    let mut rig = Rig::mobile();
+    rig.edit("unsent");
+    let outs = rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    assert_eq!(core_calls(&outs), ["SaveDraft", "Suspend"]);
+    let outs = rig.head.on_intent(GuiIntent::AppForegrounded, rig.clock);
+    assert_eq!(core_calls(&outs), ["Resume", "RetryNow"]);
+}
+
+#[test]
+fn a_phone_with_the_service_running_saves_but_does_not_suspend_when_backgrounded() {
+    let mut rig = Rig::mobile();
+    let outs = rig
+        .head
+        .on_intent(GuiIntent::BackgroundService { running: true }, rig.clock);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+    rig.edit("unsent");
+    let outs = rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    assert_eq!(core_calls(&outs), ["SaveDraft"]);
+}
+
+#[test]
+fn the_service_stopping_while_backgrounded_suspends_and_starting_resumes() {
+    let mut rig = Rig::mobile();
+    rig.head
+        .on_intent(GuiIntent::BackgroundService { running: true }, rig.clock);
+    rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    let outs = rig
+        .head
+        .on_intent(GuiIntent::BackgroundService { running: false }, rig.clock);
+    assert_eq!(core_calls(&outs), ["Suspend"]);
+    let outs = rig
+        .head
+        .on_intent(GuiIntent::BackgroundService { running: true }, rig.clock);
+    assert_eq!(core_calls(&outs), ["Resume", "RetryNow"]);
+}
+
+/// The service kept the link up off screen, maybe in a long backoff wait;
+/// the user looking is when that wait costs, so it is cut short.
+#[test]
+fn a_phone_foregrounded_while_the_service_holds_retries_without_resuming() {
+    let mut rig = Rig::mobile();
+    rig.head
+        .on_intent(GuiIntent::BackgroundService { running: true }, rig.clock);
+    rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    let outs = rig.head.on_intent(GuiIntent::AppForegrounded, rig.clock);
+    assert_eq!(core_calls(&outs), ["RetryNow"]);
+}
+
+/// After the Activity is recreated, `onResume` reports the app on screen
+/// again after `onShow` already did.
+#[test]
+fn a_phone_foregrounded_twice_resumes_once() {
+    let mut rig = Rig::mobile();
+    rig.head.on_intent(GuiIntent::AppBackgrounded, rig.clock);
+    let outs = rig.head.on_intent(GuiIntent::AppForegrounded, rig.clock);
+    assert_eq!(core_calls(&outs), ["Resume", "RetryNow"]);
+    let outs = rig.head.on_intent(GuiIntent::AppForegrounded, rig.clock);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+}
+
+#[test]
+fn a_desktop_never_suspends_whatever_the_reports() {
+    let mut rig = Rig::on(Head::with_target(Target::Desktop));
+    let mut outs = Vec::new();
+    for intent in [
+        GuiIntent::AppBackgrounded,
+        GuiIntent::BackgroundService { running: true },
+        GuiIntent::BackgroundService { running: false },
+        GuiIntent::AppForegrounded,
+        GuiIntent::AppForegrounded,
+        GuiIntent::AppBackgrounded,
+    ] {
+        outs.extend(rig.head.on_intent(intent, rig.clock));
+    }
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
 }
 
 #[test]
