@@ -133,7 +133,6 @@ impl Composer {
                 text: text.clone(),
                 rev,
                 history_label: None,
-                offline_label: None,
                 to_label: None,
                 // The mode's own fields are the open session's, set when
                 // published.

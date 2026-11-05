@@ -448,7 +448,6 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             cursor_utf16: 0,
             rev: 0,
             history_label: None,
-            offline_label: None,
             to_label: None,
             mode: ComposerModeView::Agent,
             shell_enabled: false,
@@ -468,7 +467,6 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .filter(|r| r.session_id == session.id.0.to_string())
             .cloned(),
     }
-    .with_offline(&view.link)
     .with_recipient(session)
 }
 
@@ -511,13 +509,6 @@ fn snippet_view(snippet: &Snippet) -> SnippetView {
 }
 
 impl SessionScreen {
-    /// Says on the composer that a message waits for the link.
-    fn with_offline(mut self, link: &Link) -> SessionScreen {
-        self.composer.offline_label = matches!(link, Link::Reconnecting { .. })
-            .then(|| "offline, sends when back online".to_owned());
-        self
-    }
-
     /// Says on the composer, in a subagent's view, who a message goes to.
     fn with_recipient(mut self, session: &SessionView) -> SessionScreen {
         self.composer.to_label = session
