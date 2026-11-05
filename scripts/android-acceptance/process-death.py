@@ -12,14 +12,19 @@ link down (run.sh link down) to measure local durability alone; bring it up
 and run log-check.py to see what reached the server.
 
 Engine mode (--engine): checks the app-owned engine with Stay connected on
-(turn it on in Settings first; the script refuses otherwise). It sends a
-"pe<time> quick" message, then:
-  1. BACK out until MainActivity is destroyed: the process stays (same pid)
-     and the stay-connected service still runs;
+(turn it on in Settings first; the script refuses otherwise). It needs
+Developer options > "Don't keep activities" on, and refuses otherwise: on
+Android 12+ BACK only moves a root launcher Activity to the back, so HOME
+with that option is the one way to destroy MainActivity on every version.
+Set it in Developer options: `settings put global always_finish_activities`
+over adb changes the setting but not the running system. Turn it off after.
+It sends a "pe<time> quick" message, then:
+  1. HOME: MainActivity is destroyed, the process stays (same pid) and the
+     stay-connected service still runs;
   2. relaunch: same pid, the Activity attaches to the cached engine, the
      message is there, and Rust does not boot again (no new "opening the
      core" for that pid);
-  3. BACK out, SIGKILL the process, relaunch: a new pid that boots Rust
+  3. HOME, SIGKILL the process, relaunch: a new pid that boots Rust
      exactly once, cold-starts from the replica with the message intact, and
      brings the service back.
 Exits non-zero on the first failed check. Needs a debug build (run-as).
@@ -45,12 +50,21 @@ def launch():
     time.sleep(1.5)
 
 
+def rows(ns, title):
+    """The session list's rows titled `title`: a row merges its texts into one
+    label, "<title>, <state>, <workdir>, ...", with the title first."""
+    return [n for n in ns
+            if n.get("text") == title or (n.get("content-desc") or "").startswith(title + ", ")]
+
+
 def open_session(title):
+    # A cold start shows a spinner first; BACK then would leave the app.
+    wait_for(lambda: rows(ns := ui.nodes(), title) or burst.composer(ns) is not None, 20)
     for _ in range(10):
         ns = ui.nodes()
         if burst.composer(ns) is not None:
             return
-        hits = [n for n in ns if n.get("text") == title]
+        hits = rows(ns, title)
         if hits:
             ui.adb("shell", "input", "tap", *map(str, ui.center(hits[0])))
         else:
@@ -58,6 +72,14 @@ def open_session(title):
             launch()
         time.sleep(1)
     sys.exit(f"cannot open {title!r}")
+
+
+def type_in(text):
+    """Types `text` into the composer. A phone's keyboard drops what `input
+    text` sends before it has come up, so the tap that raises it is waited on."""
+    ui.adb("shell", "input", "tap", *map(str, ui.center(burst.composer(ui.nodes()))))
+    time.sleep(1)
+    ui.adb("shell", "input", "text", text.replace(" ", "%s"))
 
 
 def kill():
@@ -72,8 +94,19 @@ def pid():
 
 
 def activity_alive():
+    """A MainActivity record in the history that is not DESTROYED. A destroyed
+    one keeps its record (with its saved state, to be recreated from), so
+    the record's own `state=` line says, not its presence."""
     out = ui.adb("shell", "dumpsys", "activity", "activities", check=False)
-    return any(ACTIVITY in line and "ActivityRecord" in line for line in out.splitlines())
+    mine = False
+    for line in out.splitlines():
+        if "Hist  #" in line:
+            mine = ACTIVITY in line
+        elif mine and line.strip().startswith("state="):
+            if not line.strip().startswith("state=DESTROYED"):
+                return True
+            mine = False
+    return False
 
 
 def service_running():
@@ -97,14 +130,15 @@ def check(ok, what):
         sys.exit(1)
 
 
-def back_out():
-    """BACK until MainActivity is destroyed (Dart pops its routes first)."""
-    for _ in range(8):
-        if not activity_alive():
-            return True
-        ui.adb("shell", "input", "keyevent", "4")
-        time.sleep(1)
-    return not activity_alive()
+def dont_keep_activities():
+    out = ui.adb("shell", "settings", "get", "global", "always_finish_activities", check=False)
+    return out.strip() == "1"
+
+
+def leave():
+    """HOME; with "Don't keep activities" on, MainActivity is destroyed."""
+    ui.adb("shell", "input", "keyevent", "3")
+    return wait_for(lambda: not activity_alive(), 10)
 
 
 def wait_for(cond, timeout=20):
@@ -117,19 +151,18 @@ def wait_for(cond, timeout=20):
 
 
 def engine(title):
+    check(dont_keep_activities(), "Developer options > Don't keep activities is on")
     launch()
     check(service_running(), "Stay connected is on (service running)")
     open_session(title)
     text = f"pe{int(time.time()) % 100000} quick"
-    c = burst.composer(ui.nodes())
-    ui.adb("shell", "input", "tap", *map(str, ui.center(c)))
-    ui.adb("shell", "input", "text", text.replace(" ", "%s"))
+    type_in(text)
     ui.adb("shell", "input", "tap", *map(str, ui.center(burst.send_button(ui.nodes()))))
     check(wait_for(lambda: in_timeline(text)), f"{text!r} in the timeline")
     ui.adb("logcat", "-c")
     first = pid()
 
-    check(back_out(), "BACK destroyed MainActivity")
+    check(leave(), "HOME destroyed MainActivity")
     time.sleep(2)
     check(pid() == first, f"process alive after the Activity went (pid {first})")
     check(service_running(), "service still running without an Activity")
@@ -140,7 +173,7 @@ def engine(title):
     check(wait_for(lambda: in_timeline(text)), "message there after re-attach")
     check(boots(first) == 0, f"no second boot in pid {first} ({boots(first)} seen)")
 
-    check(back_out(), "BACK destroyed MainActivity again")
+    check(leave(), "HOME destroyed MainActivity again")
     kill()
     check(wait_for(lambda: pid() != first, 10), f"pid {first} killed")
     launch()
@@ -161,9 +194,7 @@ def main():
         launch()
         open_session(title)
         text = f"pd{delay} quick"
-        c = burst.composer(ui.nodes())
-        ui.adb("shell", "input", "tap", *map(str, ui.center(c)))
-        ui.adb("shell", "input", "text", text.replace(" ", "%s"))
+        type_in(text)
         s = burst.send_button(ui.nodes())
         x, y = map(str, ui.center(s))
         # one shell: tap, sleep, kill, so adb round trips stay out of the delay
