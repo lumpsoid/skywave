@@ -891,19 +891,19 @@ fn a_rule_the_request_did_not_offer_or_a_denial_grants_nothing() {
     );
 }
 
-/// The fixture `rules_granted.ndjson` is to be recorded with the runbook in
-/// docs/agents/claude-code.md §3.5: one CLI process in which a tool rule
-/// (`addRules`), a directory (`addDirectories`) and file edits (`setMode`
-/// `acceptEdits`) are each granted with an approval, each followed by a
-/// call of the same tool that the grant covers.
+/// The fixture `rules_granted.ndjson`, recorded by `skywave-claude-compat
+/// --only rules_granted --record` (docs/agents/claude-code.md §3.5): one CLI
+/// process in which a tool rule (`addRules`), a directory (`addDirectories`)
+/// and file edits (`setMode` `acceptEdits`) are each granted with an
+/// approval, each followed by a call of the same tool that the grant covers.
 #[test]
-#[ignore = "needs real capture, task d29758"]
 fn replay_granted_rules_are_applied_by_the_cli() {
     const NAME: &str = "rules_granted";
     let records = fixture(NAME);
+    // The compat recorder puts the time first (`t+0s argv: …`).
     let argv: Vec<&str> = records
         .iter()
-        .filter_map(|r| r["text"].as_str()?.strip_prefix("argv: "))
+        .filter_map(|r| Some(r["text"].as_str()?.split_once("argv: ")?.1))
         .collect();
     let [argv] = argv[..] else {
         panic!("{NAME}: expected one CLI process, got {argv:?}");

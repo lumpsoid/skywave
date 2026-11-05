@@ -8,7 +8,7 @@ use skywaved::agent::{
 
 use super::Ctx;
 use crate::report::{Stop, ensure};
-use crate::session::{Session, Setup};
+use crate::session::{Session, Setup, Workdir};
 
 /// How long one turn may take.
 pub(super) const TURN: u64 = 120;
@@ -175,13 +175,133 @@ pub fn permissions(ctx: &mut Ctx) -> Result<(), Stop> {
         "a granted rule spares the next call its approval",
         ensure(again.is_none(), || "the call was asked again".into()),
     );
-    if again.is_none() {
-        ctx.checks.watch(
-            "the always-allow reply shape is unconfirmed",
-            "d29758: record rules_granted.ndjson and mark §3.2 [C] (docs/agents/claude-code.md §3.5)",
-            Err("the CLI applied the granted rule".into()),
-        );
+    Ok(())
+}
+
+/// One process in which each kind of update is granted with an approval and
+/// then spares the next call of the same tool: a tool rule, a directory
+/// outside the workdir, and file edits. Its recording is the fixture
+/// `rules_granted.ndjson` (docs/agents/claude-code.md §3.5).
+pub fn rules_granted(ctx: &mut Ctx) -> Result<(), Stop> {
+    let workdir = Workdir::new(Some("kitchen"))?;
+    let pantry = workdir.root().join("pantry");
+    std::fs::create_dir_all(&pantry)
+        .and_then(|()| std::fs::write(pantry.join("flour.txt"), "rye\n"))
+        .map_err(|e| Stop::Stalled(format!("cannot stock the pantry: {e}")))?;
+    let pantry = std::fs::canonicalize(&pantry)
+        .map_err(|e| Stop::Stalled(format!("cannot find the pantry: {e}")))?;
+    let pantry = pantry.display();
+    // `local`: the CLI keeps a project rule in .claude/settings.local.json.
+    let mut s = ctx.session(Setup {
+        args: vec!["--setting-sources".into(), "project,local".into()],
+        workdir: Some(workdir),
+        ..Setup::default()
+    })?;
+    s.auto_approve = false;
+
+    grant_then_repeat(
+        ctx,
+        &mut s,
+        "Bash",
+        "addRules",
+        |r| r.scope != RuleScope::User && r.label.starts_with("Bash("),
+        [
+            "The oven timer counts by little marker files. Use the Bash tool to run exactly: \
+             touch oven-timer"
+                .to_owned(),
+            "The scones want another round. Use the Bash tool to run exactly the same command \
+             again: touch oven-timer"
+                .to_owned(),
+        ],
+    )?;
+    grant_then_repeat(
+        ctx,
+        &mut s,
+        "Bash",
+        "addDirectories",
+        |r| r.label.starts_with("access to "),
+        // The directory is offered for a write there; a read outside the
+        // workdir is offered a `Read(…)` rule instead. Once it is a working
+        // directory, a read-only command there runs unasked.
+        [
+            format!(
+                "Mark the pantry as checked: use the Bash tool to run exactly: touch \
+                 {pantry}/checked"
+            ),
+            format!("What flour is left? Use the Bash tool to run exactly: cat {pantry}/flour.txt"),
+        ],
+    )?;
+    grant_then_repeat(
+        ctx,
+        &mut s,
+        "Write",
+        "setMode acceptEdits",
+        |r| r.label == "file edits",
+        [
+            "Leave a note for the morning baker: use the Write tool to create note-one.txt \
+             containing exactly: rye is low"
+                .to_owned(),
+            "And a second one: use the Write tool to create note-two.txt containing exactly: \
+             sugar is fine"
+                .to_owned(),
+        ],
+    )
+}
+
+/// Sends `messages[0]`, grants the first update `pick` takes from its
+/// `tool` approval, then sends `messages[1]` and checks that its `tool` call
+/// is not asked; `kind` names the update in the check.
+fn grant_then_repeat(
+    ctx: &mut Ctx,
+    s: &mut Session,
+    tool: &str,
+    kind: &str,
+    pick: fn(&RuleSuggestion) -> bool,
+    messages: [String; 2],
+) -> Result<(), Stop> {
+    let from = s.mark();
+    s.send(&messages[0]);
+    let first = asked(s, from, tool)?;
+    let Some(rule) = first.suggestions.iter().position(pick) else {
+        answer(s, &first.request, Decision::Deny, None);
+        return Err(Stop::Inconclusive(format!(
+            "no {kind} offered for {tool}: {:?}",
+            first.suggestions
+        )));
+    };
+    s.note(&format!("granting {:?}", first.suggestions[rule]));
+    answer(
+        s,
+        &first.request,
+        Decision::Approve,
+        Some(u8::try_from(rule).unwrap_or(u8::MAX)),
+    );
+    s.turn_end(from, TURN)?;
+
+    let from = s.mark();
+    s.send(&messages[1]);
+    let again = next_approval(s, from)?;
+    if let Some(again) = &again {
+        answer(s, &again.request, Decision::Approve, None);
     }
+    let (end, _) = s.turn_end(from, TURN)?;
+    let called = s
+        .find_event(from, |e| match e {
+            AdapterEvent::ToolCall { name, .. } if name == tool => Some(()),
+            _ => None,
+        })
+        .is_some_and(|(at, ())| at <= end);
+    if !called {
+        return Err(Stop::Inconclusive(format!(
+            "the model did not call {tool} again"
+        )));
+    }
+    ctx.checks.contract(
+        &format!("a granted {kind} spares the next {tool} call its approval"),
+        ensure(again.is_none(), || {
+            format!("the {tool} call was asked again")
+        }),
+    );
     Ok(())
 }
 

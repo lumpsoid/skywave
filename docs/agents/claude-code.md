@@ -288,11 +288,23 @@ not tested, so send it every time. **[U]**
 
 To grant a suggestion with the approval ("always allow"), the response also
 carries it, verbatim, as `"updatedPermissions":[<suggestion>]`; the CLI then
-keeps the rule at the suggestion's `destination`. **[U] Unverified — pending
-capture (2026-10-30).** The shape comes from the SDK's `PermissionResult`; no
-fixture holds such a reply yet. §3.5 is the runbook that records one.
+keeps the rule at the suggestion's `destination`. **[C]** with 2.1.310
+(2026-11-05, `rules_granted.ndjson`, §3.5) for `addRules`, `addDirectories`
+and `setMode` `acceptEdits`:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"…",
+ "response":{"behavior":"allow","updatedInput":{"command":"touch oven-timer","description":"…"},
+  "updatedPermissions":[{"type":"addRules","behavior":"allow","destination":"localSettings",
+   "rules":[{"toolName":"Bash","ruleContent":"touch oven-timer *"}]}]}}}
+```
+
 Result: the tool runs, `tool_result` follows, and
-`tool_result_meta[].permission_decision` is `{"decision":"accept","source":"user_temporary"}`.
+`tool_result_meta[].permission_decision` is `{"decision":"accept","source":"user_temporary"}`,
+the same as for a plain allow. A later call the grant covers gets no
+`can_use_tool`; its `permission_decision` is `{"decision":"accept","source":"config"}`
+with `reason_type` `subcommandResults` after a rule or a directory, and `mode`
+after `acceptEdits`.
 
 A granted update with destination `session` or `cliArg` lives in the CLI
 process only: `--resume` restores the conversation, not the permission
@@ -346,129 +358,45 @@ T09 must handle both anyway (§4.2, §6). Map either one to
 `ApprovalCancelled` with a reason, so the log never shows an approval that
 hangs forever.
 
-### 3.5 Runbook: capture "always allow" (task d29758)
+### 3.5 Recording "always allow" (`rules_granted`)
 
-**Status: unverified — pending capture (2026-10-30).** Nobody has yet
-recorded the `updatedPermissions` reply of §3.2 against a real CLI. This
-runbook records one real session in which skywaved grants three rules: a
-tool rule (`addRules`), a directory (`addDirectories`), and file edits
-(`setMode` `acceptEdits`). The recording then becomes the fixture
-`tests/fixtures/claude-code/rules_granted.ndjson`. The test
+`skywave-claude-compat --only rules_granted --record <dir>` records one CLI
+process through the adapter's `Protocol`, so its stdin is what skywaved
+writes. It runs in a scratch workdir with `--setting-sources project,local`
+(the CLI keeps a project rule in the workdir's `.claude/settings.local.json`,
+and `local` loads it). In it, three approvals each grant one update, and the
+next call of the same tool must not be asked:
+
+| grant | asked for | the call it spares |
+|-------|-----------|--------------------|
+| `addRules` `Bash(touch oven-timer *)` (`localSettings`) | `touch oven-timer` | the same command |
+| `addDirectories` `<scratch>/pantry` (`session`) | `touch <pantry>/checked`, outside the workdir | `cat <pantry>/flour.txt` |
+| `setMode` `acceptEdits` (`session`) | a Write | another Write |
+
+Which suggestions the CLI offers, seen with 2.1.310:
+
+- `addDirectories` comes with a write (`blocked_path`): a Bash `touch`
+  outside the workdir offers that directory, and one inside offers the
+  workdir itself.
+- A read outside the workdir offers a session rule
+  `Read(//<dir>/**)` (`addRules`), not the directory, for the Read tool and
+  for a Bash `cat` alike.
+
+The scenario stops as inconclusive when the model calls some other tool or
+the CLI offers no update of the kind wanted. Its recording is the fixture
+`tests/fixtures/claude-code/rules_granted.ndjson`, which
 `replay_granted_rules_are_applied_by_the_cli` in `tests/claude_code.rs`
-checks two things. (a) Each allow that grants a rule carries the suggestion
+checks for two things. (a) Each allow that grants an update carries it
 unchanged as `updatedPermissions`, byte for byte what the adapter writes.
-(b) After each grant, the next call of the same tool gets no `can_use_tool`.
-The test is `#[ignore]`d until the fixture exists.
-
-`skywave-claude-compat --only permissions` checks a quicker version
-automatically. It grants a `Bash(…)` rule through the adapter, then runs the
-same command again. If the call is asked again, the scenario is BROKEN. If
-it is not asked, it reports the grant as newly available: the reply shape
-works, and this runbook is worth running to record the fixture.
-
-The recorder is `crates/skywaved/tests/support/record-claude.sh`. You set it
-as skywaved's agent command. It runs the real CLI and writes every stdin and
-stdout line to an NDJSON file in the fixture format (see the fixtures'
-`README.md`). So the recording holds what skywaved really sent. Needs `jq`.
-Below, `$REPO` is the repository root.
-
-**1. Prepare** a scratch workdir and a directory outside it:
-
-```sh
-mkdir -p /tmp/skywave-d29758/work /tmp/skywave-d29758-outside
-echo a > /tmp/skywave-d29758-outside/a.txt
-echo b > /tmp/skywave-d29758-outside/b.txt
-```
-
-**2. Point skywaved at the recorder.** Stop the running daemon. Then edit
-`~/.config/skywave/skywaved.toml` and keep a copy of the old file:
-
-```toml
-roots = ["/tmp/skywave-d29758", ...]   # add the scratch dir
-[agent]
-command = "$REPO/crates/skywaved/tests/support/record-claude.sh"   # absolute path
-args = ["--model", "haiku", "--setting-sources", "project,local", "--strict-mcp-config"]
-```
-
-The `args` are the same as the earlier fixtures, with one change: `local` is
-added. The CLI keeps a project rule in the workdir's
-`.claude/settings.local.json`, and `local` makes it load that file. Start the
-daemon with recording on:
-
-```sh
-SKYWAVE_RECORD=/tmp/skywave-d29758/rules_granted.raw.ndjson skywaved serve
-# if `claude` is not on the daemon's PATH, also set SKYWAVE_REAL_CLAUDE=/path/to/claude
-```
-
-**3. Run the session** in `skywave-tui`. Press `n` and pick workdir
-`/tmp/skywave-d29758/work`. Send the six messages below in order. Send each
-one only after the previous turn ended, and keep the gaps under 5 minutes
-(the idle timeout). Otherwise the CLI restarts, gets the rules as flags
-(§3.2), and the recording proves nothing. `A` approves and grants a rule.
-With several rules offered, pick one with `↑↓` and `Enter`. Never pick a
-`user` scope rule: it would write to your own `~/.claude/settings.json`.
-
-| # | message | expected | do |
-|---|---------|----------|----|
-| 1 | `Use the Bash tool to run exactly: touch rule-check` | approval for Bash | `A`, pick `Bash(touch rule-check)` (`addRules`) |
-| 2 | `Use the Bash tool to run exactly the same command again: touch rule-check` | **no** approval | — |
-| 3 | `Use the Read tool to read /tmp/skywave-d29758-outside/a.txt` | approval for Read | `A`, pick `access to /tmp/skywave-d29758-outside` (`addDirectories`) |
-| 4 | `Use the Read tool to read /tmp/skywave-d29758-outside/b.txt` | **no** approval | — |
-| 5 | `Use the Write tool to create one.txt containing 1` | approval for Write | `A`, pick `file edits` (`setMode acceptEdits`) |
-| 6 | `Use the Write tool to create two.txt containing 2` | **no** approval | — |
-
-If the model calls another tool of the same kind in between, or a step
-offers a different rule, write down what happened and record again. The
-test only looks at the next call of the same tool. If step 3 offers no
-`access to …`, record what it did offer, and try the same step with `ls`
-through Bash.
-
-Then press `S` on the timeline to stop the agent. This closes its stdin, and
-the recorder adds `closing stdin` and `exit 0`. Stop the daemon and put the
-old config back.
-
-**4. Scrub and install** the fixture. The scrubbing is the same as in the
-fixtures' `README.md`:
-
-```sh
-cd $REPO/crates/skywaved
-tests/support/record-claude.sh --scrub /tmp/skywave-d29758/rules_granted.raw.ndjson \
-  tests/fixtures/claude-code/rules_granted.ndjson
-grep -c '"dir":"note","text":"argv' tests/fixtures/claude-code/rules_granted.ndjson   # must be 1
-ls /tmp/skywave-d29758/*.stderr 2>/dev/null   # the CLI's stderr, only if there was any
-```
-
-Read the file once and check for anything private the scrub missed.
-
-**5. Confirm.** The quick look below lists each grant, then each tool call
-with whether the CLI asked for it. Every call after a grant should show
-`asked: false`:
-
-```sh
-jq -c 'select(.dir=="in") | .msg.response.response.updatedPermissions // empty' \
-  tests/fixtures/claude-code/rules_granted.ndjson
-jq -sc '[.[] | select(.dir=="out") | .msg] as $m
-  | ([$m[] | select(.request.subtype=="can_use_tool") | .request.tool_use_id]) as $asked
-  | $m[] | select(.type=="assistant") | .message.content[] | select(.type=="tool_use")
-  | {tool: .name, input, asked: (.id as $id | $asked | index($id) != null)}' \
-  tests/fixtures/claude-code/rules_granted.ndjson
-```
-
-Then remove the `#[ignore]` from `replay_granted_rules_are_applied_by_the_cli`
-and run:
-
-```sh
-cargo test -p skywaved --test claude_code replay_granted_rules
-```
-
-If it passes, mark §3.2 **[C]**, add the file to the fixtures' `README.md`,
-and note the CLI version (from `system/init`) and the
-`tool_result_meta[].permission_decision.source` of the calls that were not
-asked. If the version differs from `PINNED_VERSION`, the other replay tests
-still pin 2.1.310. This one accepts any version. If a call is asked again,
-the reply shape is wrong. Record what the CLI does instead (does it change
+(b) After each grant, the next call of the same tool gets no
+`can_use_tool`. To refresh the fixture after a CLI upgrade, record again and
+copy `<dir>/rules_granted.ndjson` over it. If a call is asked again, the
+reply shape is wrong. Record what the CLI does instead (does it change
 `system/init.permissionMode`? does it write `.claude/settings.local.json`?)
 before changing `protocol::allow_always_response`.
+
+`bypassPermissions` granted this way is **[U]**: the adapter offers it only
+when the CLI suggests it and the server allows bypass (§3.6).
 
 ### 3.6 Bypass only where the operator allows it (D38)
 
