@@ -66,15 +66,7 @@ class LinkBanner extends StatelessWidget {
               children: [
                 Icon(icon, size: 18, color: foreground),
                 const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    link.label,
-                    key: const Key('link-label'),
-                    style: TextStyle(color: foreground),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 2,
-                  ),
-                ),
+                Expanded(child: _label(link.label, foreground)),
                 // Side by side when there is room, stacked on a phone.
                 if (link.canRetryNow ||
                     link.canResetReplica ||
@@ -103,7 +95,13 @@ class LinkBanner extends StatelessWidget {
                             icon: const Icon(Icons.notification_important),
                             onPressed: () =>
                                 send.act(const ActionIntentOpenNextApproval()),
-                            label: Text(elsewhere),
+                            // Wrapped on a phone, the button hugs its
+                            // words: as wide as the bar, it splashed
+                            // across empty space.
+                            label: Text(
+                              elsewhere,
+                              textWidthBasis: TextWidthBasis.longestLine,
+                            ),
                           ),
                       ],
                     ),
@@ -113,6 +111,37 @@ class LinkBanner extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+
+  /// Rust's label: up to two wrapped lines, or, when it says where its
+  /// lines break, each of them whole on its own, cut short if need be. A
+  /// countdown on a line of its own cannot move the break.
+  static Widget _label(String label, Color foreground) {
+    final style = TextStyle(color: foreground);
+    final lines = label.split('\n');
+    if (lines.length == 1) {
+      return Text(
+        label,
+        key: const Key('link-label'),
+        style: style,
+        overflow: TextOverflow.ellipsis,
+        maxLines: 2,
+      );
+    }
+    return Column(
+      key: const Key('link-label'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final line in lines)
+          Text(
+            line,
+            style: style,
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+          ),
+      ],
     );
   }
 

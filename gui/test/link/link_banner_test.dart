@@ -58,10 +58,6 @@ void main() {
       (LinkState.online, 'online · 2 queued'),
       (LinkState.catchingUp, 'syncing · 4/9'),
       (
-        LinkState.reconnecting,
-        'offline · server unreachable · retry in 07s (attempt 3)',
-      ),
-      (
         LinkState.repairNeeded,
         'server identity changed · re-pair to reconnect',
       ),
@@ -75,6 +71,65 @@ void main() {
       expect(find.text(label), findsOneWidget, reason: '$state');
     }
     expect(find.text('Retry now'), findsNothing);
+
+    holder.apply(
+      link(
+        LinkState.reconnecting,
+        'offline · server unreachable\nattempt 3 · retry in 07s',
+      ),
+    );
+    await tester.pump();
+    expect(find.text('offline · server unreachable'), findsOneWidget);
+    expect(find.text('attempt 3 · retry in 07s'), findsOneWidget);
+  });
+
+  testWidgets('a phone banner keeps its height as the countdown ticks', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await pump(tester);
+    final heights = <double>[];
+    for (final retry in ['retry in 10s', 'retry in 07s', 'retrying…']) {
+      holder.apply(
+        link(
+          LinkState.reconnecting,
+          'offline · server unreachable · 4 queued\nattempt 3 · $retry',
+          canRetryNow: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+      heights.add(tester.getSize(find.byType(LinkBanner)).height);
+    }
+    expect(heights.toSet(), hasLength(1), reason: '$heights');
+  });
+
+  testWidgets('a wrapped approvals button is no wider than its words', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await pump(tester);
+    holder.apply(
+      link(
+        LinkState.reconnecting,
+        'offline\nattempt 3 · retry in 07s',
+        canRetryNow: true,
+        elsewhere: 12,
+        elsewhereLabel: '12 approvals elsewhere',
+      ),
+    );
+    await tester.pumpAndSettle();
+    final words = find.text('12 approvals elsewhere');
+    final button = find.ancestor(of: words, matching: find.byType(TextButton));
+    final bar = find.byType(OverflowBar);
+    expect(tester.getSize(words).height, greaterThan(20), reason: 'wraps');
+    expect(
+      tester.getSize(button).width,
+      lessThan(tester.getSize(bar).width - 8),
+    );
   });
 
   testWidgets('the banner slides away once online with nothing waiting', (
@@ -180,7 +235,7 @@ void main() {
     holder.apply(
       link(
         LinkState.reconnecting,
-        'offline · 4 queued · retry in 07s (attempt 3)',
+        'offline · 4 queued\nattempt 3 · retry in 07s',
         canRetryNow: true,
         elsewhere: 12,
         elsewhereLabel: '12 approvals elsewhere',
