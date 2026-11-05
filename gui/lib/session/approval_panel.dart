@@ -216,30 +216,36 @@ class ApprovalPanelView extends StatelessWidget {
               if (approval.canAnswer)
                 Padding(
                   padding: const EdgeInsets.only(top: 10),
-                  child: Wrap(
+                  // One line on any width: equal shares, labels scaled
+                  // down rather than wrapped onto a second row.
+                  child: Row(
                     spacing: 8,
-                    runSpacing: 8,
-                    alignment: WrapAlignment.end,
                     children: [
                       if (approval.suggestions.isNotEmpty)
-                        TextButton.icon(
-                          onPressed: () => _always(context),
-                          icon: const Icon(Icons.verified_outlined, size: 18),
-                          label: Text(
-                            approval.alwaysPicks
-                                ? 'Always allow…'
-                                : 'Always allow',
+                        Expanded(
+                          child: TextButton(
+                            style: _compact,
+                            onPressed: () => _always(context),
+                            child: _Label(
+                              approval.alwaysPicks
+                                  ? 'Always allow…'
+                                  : 'Always allow',
+                            ),
                           ),
                         ),
-                      OutlinedButton.icon(
-                        onPressed: () => _resolve(DecisionView.deny),
-                        icon: const Icon(Icons.block, size: 18),
-                        label: const Text('Deny'),
+                      Expanded(
+                        child: OutlinedButton(
+                          style: _compact,
+                          onPressed: () => _resolve(DecisionView.deny),
+                          child: const _Label('Deny'),
+                        ),
                       ),
-                      FilledButton.icon(
-                        onPressed: () => _resolve(DecisionView.approve),
-                        icon: const Icon(Icons.check, size: 18),
-                        label: const Text('Approve'),
+                      Expanded(
+                        child: FilledButton(
+                          style: _compact,
+                          onPressed: () => _resolve(DecisionView.approve),
+                          child: const _Label('Approve'),
+                        ),
                       ),
                     ],
                   ),
@@ -250,4 +256,19 @@ class ApprovalPanelView extends StatelessWidget {
       ),
     );
   }
+}
+
+final _compact = ButtonStyle(
+  padding: WidgetStateProperty.all(const EdgeInsets.symmetric(horizontal: 8)),
+);
+
+/// A button label that shrinks to fit its share of the row.
+class _Label extends StatelessWidget {
+  const _Label(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) =>
+      FittedBox(fit: BoxFit.scaleDown, child: Text(text, maxLines: 1));
 }
