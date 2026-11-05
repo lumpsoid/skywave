@@ -34,7 +34,7 @@ pkg-config, GTK 3).
 
 ```shell
 flutter build linux          # or: flutter run -d linux
-build/linux/x64/release/bundle/skywave_gui
+build/linux/x64/release/bundle/skywave
 ```
 
 Notifications go over D-Bus to the desktop's notification daemon; without
