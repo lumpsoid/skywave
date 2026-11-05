@@ -639,10 +639,6 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
         Constraint::Length(if prompt.is_some() { 3 } else { 0 }),
     ])
     .areas(area);
-    let policy = match settings.blob_policy {
-        BlobPolicy::Eager => "eager (download every tool blob)",
-        BlobPolicy::OnDemand => "on demand (download when opened)",
-    };
     let mark = |policy: BlobPolicy| {
         if settings.blob_policy == policy {
             "(•)"
@@ -651,20 +647,19 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App, settings: &Settings
         }
     };
     let mut lines = vec![
-        Line::from(format!("Blob policy: {policy}")),
-        Line::from(""),
-        Line::from("  Blobs hold full tool inputs and outputs; sessions sync without them.")
+        Line::from("Blob policy"),
+        Line::from("  Blobs hold full tool inputs and outputs. Sessions sync without them.")
             .dark_gray(),
         Line::from(format!(
-            "  {} On demand  a blob downloads when you expand its tool output",
+            "  {} On demand  a tool's blob downloads when you expand it",
             mark(BlobPolicy::OnDemand)
         )),
         Line::from(format!(
-            "  {} Eager      every tool blob downloads as soon as it is synced",
+            "  {} Eager      every tool blob downloads as it syncs (more data and disk)",
             mark(BlobPolicy::Eager)
         )),
-        Line::from("  Press b to switch. Eager uses more data and disk.").dark_gray(),
-        Line::from("  Workdir diffs and files download only when opened, either way.").dark_gray(),
+        Line::from("  Press b to switch. Workdir diffs and files always download when opened.")
+            .dark_gray(),
         Line::from(""),
         Line::from(format!(
             "Server:      {}",

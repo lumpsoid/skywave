@@ -77,7 +77,7 @@ pub enum ScreenView {
     },
     Settings {
         blob_policy: BlobPolicyView,
-        /// `on demand (download when opened)`.
+        /// What the selected policy does, shown under the toggle.
         blob_policy_label: String,
         /// The server address, or `not paired`.
         server: String,

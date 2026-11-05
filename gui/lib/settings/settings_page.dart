@@ -47,8 +47,9 @@ class SettingsPage extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Blobs hold full tool inputs and outputs; sessions sync '
-                    'without them.',
+                    'Blobs hold full tool inputs and outputs. Sessions sync '
+                    'without them; workdir diffs and files always download '
+                    'when opened.',
                     style: muted,
                   ),
                   const SizedBox(height: 12),
@@ -77,17 +78,18 @@ class SettingsPage extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Text(
-                    screen.blobPolicyLabel,
-                    key: const Key('blob-policy-label'),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'On demand: a blob downloads when you expand its tool '
-                    'output. Eager: every tool blob downloads as soon as it '
-                    'is synced, which uses more data and disk. Workdir diffs '
-                    'and files download only when opened, either way.',
-                    style: muted,
+                  // Always two lines tall, so switching modes doesn't move
+                  // the page when one description wraps and the other not.
+                  Stack(
+                    children: [
+                      const Text('\n'),
+                      Text(
+                        screen.blobPolicyLabel,
+                        key: const Key('blob-policy-label'),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
                   ),
                 ],
               ),

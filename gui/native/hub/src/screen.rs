@@ -791,8 +791,14 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
 
 fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> ScreenView {
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
-        BlobPolicy::Eager => (BlobPolicyView::Eager, "eager (download every tool blob)"),
-        BlobPolicy::OnDemand => (BlobPolicyView::OnDemand, "on demand (download when opened)"),
+        BlobPolicy::Eager => (
+            BlobPolicyView::Eager,
+            "Every tool blob downloads as it syncs. Uses more data and disk.",
+        ),
+        BlobPolicy::OnDemand => (
+            BlobPolicyView::OnDemand,
+            "A tool's blob downloads when you expand it.",
+        ),
     };
     ScreenView::Settings {
         blob_policy,

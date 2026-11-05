@@ -20,7 +20,7 @@ void main() {
         home: SettingsPage(
           screen: const ScreenViewSettings(
             blobPolicy: BlobPolicyView.onDemand,
-            blobPolicyLabel: 'on demand (download when opened)',
+            blobPolicyLabel: "A tool's blob downloads when you expand it.",
             server: 'srv:7443',
             editableAddress: 'srv:7443',
             device: 'dev-1',
@@ -34,7 +34,7 @@ void main() {
       ),
     );
     for (final text in [
-      'on demand (download when opened)',
+      "A tool's blob downloads when you expand it.",
       'srv:7443',
       'dev-1',
       'AB:CD',
@@ -42,7 +42,7 @@ void main() {
       expect(find.text(text), findsOneWidget, reason: text);
     }
     expect(
-      find.textContaining('Workdir diffs and files download only when opened'),
+      find.textContaining('workdir diffs and files always download'),
       findsOneWidget,
     );
     await tester.tap(find.text('Eager'));
@@ -69,7 +69,7 @@ void main() {
     home: SettingsPage(
       screen: ScreenViewSettings(
         blobPolicy: BlobPolicyView.onDemand,
-        blobPolicyLabel: 'on demand (download when opened)',
+        blobPolicyLabel: "A tool's blob downloads when you expand it.",
         server: editableAddress ?? 'not paired',
         editableAddress: editableAddress,
         device: 'dev-1',
