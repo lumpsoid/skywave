@@ -52,6 +52,11 @@
 //! other, so the command keeps it; the user sends the work again once the
 //! server has room.
 //!
+//! **A server stopping after its running work** ([`crate::control`]): the
+//! same commands are `ServerStopping`, checked first and inside the
+//! command's write transaction, until the server stops or the stop is
+//! cancelled. Control is taken as usual, so the running turns can end.
+//!
 //! **Context stamps.** The server stamps each event with the context it
 //! belongs to ([`Event::context`](skywave_proto::Event::context)):
 //! `SessionCreated` with the session's first context, which has the
@@ -277,8 +282,13 @@ impl EventLog {
     ) -> Result<Result<Seq, RejectReason>> {
         // Read only for work, at most once per check interval: control
         // and an idle server read nothing.
-        if starts_work(&command.kind) && self.disk().refresh() {
-            return Ok(Err(RejectReason::DiskLow));
+        if starts_work(&command.kind) {
+            if self.stopping() {
+                return Ok(Err(RejectReason::ServerStopping));
+            }
+            if self.disk().refresh() {
+                return Ok(Err(RejectReason::DiskLow));
+            }
         }
         let known = |id: SessionId| event_log::session_in(tx, id);
         let (session_id, context, kind) = match &command.kind {
@@ -616,7 +626,7 @@ impl EventLog {
 }
 
 /// Whether a command of this kind starts new work, which a low disk refuses
-/// (`DiskLow`): it creates a session or context, gives the agent a message
+/// (`DiskLow`), as does a server stopping after its work (`ServerStopping`): it creates a session or context, gives the agent a message
 /// or a setting request (either may start an agent), or runs a shell
 /// command. Everything else is control the user needs while the agents are
 /// paused (an interrupt, a stop, an approval answer) or one small event

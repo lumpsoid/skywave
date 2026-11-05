@@ -21,6 +21,9 @@ use crate::error::{Error, IoContext, Result};
 
 /// File in the data dir that a running `serve` holds locked.
 pub const SERVE_LOCK_FILE: &str = "serve.lock";
+/// The socket a running `serve` takes stop and restart requests on
+/// ([`crate::control`]).
+pub const CONTROL_SOCKET_FILE: &str = "control.sock";
 
 /// One `serve` per data dir: the exclusive OS lock on [`SERVE_LOCK_FILE`].
 /// A second daemon on the same dir, on any address, would otherwise sweep
@@ -86,6 +89,11 @@ impl DataDir {
 
     pub fn db_path(&self) -> PathBuf {
         self.root.join("skywave.db")
+    }
+
+    /// Where a running `serve` listens for [`crate::control`] requests.
+    pub fn control_socket(&self) -> PathBuf {
+        self.root.join(CONTROL_SOCKET_FILE)
     }
 
     pub fn blobs_dir(&self) -> PathBuf {

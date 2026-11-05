@@ -8,6 +8,7 @@ pub mod api;
 pub mod blobs;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod data_dir;
 pub mod db;
 pub mod devices;
@@ -30,7 +31,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub use error::{Error, Result};
 pub use event_log::EventLog;
-pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
+pub use supervisor::{Activity, Supervisor, SupervisorConfig, SupervisorHandle};
 
 use blobs::{BlobFile, BlobStore};
 use data_dir::DataDir;

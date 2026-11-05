@@ -38,6 +38,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -92,6 +93,9 @@ struct Inner {
     /// The log ([`Db::log_id`]) and this run of it.
     log: LogId,
     run: RunId,
+    /// The server stops once its running work ends
+    /// ([`EventLog::set_stopping`]).
+    stopping: AtomicBool,
 }
 
 /// What the server knows about one session.
@@ -217,6 +221,7 @@ impl EventLog {
                 roots,
                 log,
                 run,
+                stopping: AtomicBool::new(false),
             }),
             shell_enabled: false,
             bypass_allowed: false,
@@ -286,6 +291,20 @@ impl EventLog {
     /// This run of the server, minted when the log was opened.
     pub fn run_id(&self) -> RunId {
         self.inner.run
+    }
+
+    /// Marks the server as stopping once its running work ends, or no
+    /// longer: while it is, commands that start new work are refused
+    /// `ServerStopping`. Shared by every clone. A command checks it inside
+    /// its write transaction, so once this returns, a writer that takes the
+    /// write lock after it sees no command accepted under the old value.
+    pub fn set_stopping(&self, stopping: bool) {
+        self.inner.stopping.store(stopping, Ordering::SeqCst);
+    }
+
+    /// Whether the server is stopping once its running work ends.
+    pub fn stopping(&self) -> bool {
+        self.inner.stopping.load(Ordering::SeqCst)
     }
 
     /// Seq of the newest event; [`Seq::ZERO`] when the log is empty.
@@ -1339,7 +1358,7 @@ fn seq_to_sql(seq: Seq) -> i64 {
     i64::try_from(seq.0).unwrap_or(i64::MAX)
 }
 
-fn seq_from_sql(seq: i64) -> Result<Seq> {
+pub(crate) fn seq_from_sql(seq: i64) -> Result<Seq> {
     u64::try_from(seq)
         .map(Seq)
         .map_err(|_| Error::Corrupt(format!("negative seq {seq}")))

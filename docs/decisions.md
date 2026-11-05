@@ -996,3 +996,42 @@ coming up at 0 bytes free serving reads only (every write path, the device
 `last_seen` touch included, would need a read-only mode); a live
 "paused" status pushed to devices (a new event or hello field for a rare
 state the refusal already names).
+
+## D41. A safe stop: confirm what is lost, or stop after it
+A stop ends every running turn and shell run (D8: an agent does not
+outlive `serve`, so a runaway one can always be stopped). Deploying often
+made losing them easy. The guard rails are in `skywaved stop` and
+`skywaved restart`, which ask the running `serve` over a Unix socket in
+its private data dir (`control.sock`). They do not open the database:
+from a binary deployed since, that would migrate it under the running
+`serve`. Its own state decides, never a timer:
+- **Now:** with nothing running, stop. Otherwise refuse and list the
+  sessions with a turn active or a message owed, and the shell runs not
+  finished. The CLI asks (y/N) and sends the list back. `serve` stops if
+  nothing outside that list runs, and refuses again if something does.
+  With no terminal it refuses, unless `--force`. Nothing stays armed
+  between requests.
+- **After the work** (`--after-work`): the log refuses the commands that
+  start new work with `RejectReason::ServerStopping` (v21; the same set as
+  `DiskLow`, checked first inside the write transaction), and `serve`
+  stops once no shell run is unfinished and the supervisor's published
+  activity (cursor plus "a turn runs or is on its way") is idle with the
+  cursor past the head recorded under the write lock when the refusals
+  began. The head is what catches a message accepted just before the
+  refusals whose agent still starts. Approvals, interrupts and stops still
+  work, so a turn waiting on an approval can be finished.
+  `--cancel` takes work again.
+- **Restart** is the same graceful stop, then `exec` of the binary path
+  read at start, with the same arguments. Same pid, so a service manager
+  sees one process, and a binary replaced since is the one that starts.
+SIGTERM is unchanged: a service manager escalates a refused SIGTERM to
+SIGKILL.
+**Not listed:** background tasks (they are not turns), and a turn the
+agent starts on its own after the stop is decided; both are lost as before.
+**Rejected:** refusing the first SIGTERM (systemd's SIGKILL follows);
+arming the daemon on a refused request so the next one goes through (it
+needs an expiry: a timer, or a rule for when the work changed); holding
+messages sent during the wait for after the restart (new delivery
+semantics for a minute's convenience); a restart action in the heads
+(wire, UI and a who-may-restart rule for a task done where the deploy
+is, on the server); an agent host that survives the restart (D8's deferral stands).

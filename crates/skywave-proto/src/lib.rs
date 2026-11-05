@@ -121,7 +121,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 ///
 /// v20: [`RejectReason::DiskLow`]: a command that would start new work,
 /// refused while the server's disk is below its free-space floor.
-pub const PROTOCOL_VERSION: u32 = 20;
+///
+/// v21: [`RejectReason::ServerStopping`]: a command that would start new
+/// work, refused while the server waits for its running turns and shell
+/// runs to end before it stops.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -1798,6 +1802,11 @@ pub enum RejectReason {
     /// is freed. Control (interrupts, stops, approval answers) is still
     /// taken. Send it again once the server has room.
     DiskLow,
+    /// A command that would start new work (the same ones as [`DiskLow`](
+    /// RejectReason::DiskLow)) while the server is stopping once its
+    /// running turns and shell runs have ended. Control is still taken, so
+    /// they can finish. Send it again once the server is back.
+    ServerStopping,
 }
 
 impl RejectReason {

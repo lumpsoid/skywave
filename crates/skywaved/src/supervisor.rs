@@ -321,7 +321,7 @@ use skywave_proto::{
     CommandId, ContextId, Effort, Event, EventKind, ModelChoice, PermissionMode, Seq, SessionId,
     SessionOrigin, SessionState, TaskId,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
@@ -370,12 +370,25 @@ impl Default for SupervisorConfig {
     }
 }
 
+/// Where the supervisor is with the turns it was given, published after
+/// each step it takes ([`SupervisorHandle::activity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Activity {
+    /// Seq of the last log event read: handled, or held for its session.
+    pub cursor: Seq,
+    /// A turn runs or a message is on its way to one: a message is owed, a
+    /// session is held while its agent starts or stops, or an agent has a
+    /// turn open or owed. Background tasks are not turns.
+    pub turns: bool,
+}
+
 /// A running supervisor. Dropping it stops the supervisor in the background;
 /// [`SupervisorHandle::shutdown`] stops it and waits.
 #[derive(Debug)]
 pub struct SupervisorHandle {
     stop: Option<oneshot::Sender<()>>,
     done: oneshot::Receiver<Result<()>>,
+    activity: watch::Receiver<Activity>,
     /// What the supervisor ended with, once [`SupervisorHandle::failed`] has
     /// seen it.
     ended: Option<Result<()>>,
@@ -408,6 +421,12 @@ impl SupervisorHandle {
         }
     }
 
+    /// Watches the supervisor's [`Activity`]. Until its first step it says
+    /// a turn may run.
+    pub fn activity(&self) -> watch::Receiver<Activity> {
+        self.activity.clone()
+    }
+
     async fn outcome(done: &mut oneshot::Receiver<Result<()>>) -> Result<()> {
         match done.await {
             Ok(result) => result,
@@ -438,6 +457,8 @@ pub struct Supervisor<A: AgentAdapter> {
     stops: JoinSet<(SessionId, Halted, bool)>,
     /// The models of the newest `ModelsOffered` in the log.
     models: Option<Vec<ModelChoice>>,
+    /// Published after every step.
+    activity: watch::Sender<Activity>,
 }
 
 /// What [`AgentAdapter::start`] returned.
@@ -653,10 +674,22 @@ impl<A: AgentAdapter> Supervisor<A> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
+        let (activity_tx, activity_rx) = watch::channel(Activity {
+            cursor: Seq::ZERO,
+            turns: true,
+        });
         std::thread::Builder::new()
             .name("skywave-supervisor".into())
             .spawn(move || {
-                let result = run_thread(adapter, data_dir, log, config, ready_tx, stop_rx);
+                let result = run_thread(
+                    adapter,
+                    data_dir,
+                    log,
+                    config,
+                    activity_tx,
+                    ready_tx,
+                    stop_rx,
+                );
                 if let Err(error) = &result {
                     tracing::error!(%error, "agent supervisor stopped");
                 }
@@ -667,6 +700,7 @@ impl<A: AgentAdapter> Supervisor<A> {
             Ok(Ok(())) => Ok(SupervisorHandle {
                 stop: Some(stop_tx),
                 done: done_rx,
+                activity: activity_rx,
                 ended: None,
             }),
             Ok(Err(error)) => Err(error),
@@ -921,6 +955,7 @@ impl<A: AgentAdapter> Supervisor<A> {
         for id in replayed {
             self.drain(id).await?;
         }
+        self.publish_activity();
         loop {
             head.borrow_and_update();
             if self.log.head() > self.cursor {
@@ -1898,7 +1933,24 @@ impl<A: AgentAdapter> Supervisor<A> {
             store_progress(&mut self.storage.db, &progress)?;
             self.stored = progress;
         }
+        self.publish_activity();
         Ok(())
+    }
+
+    /// Publishes the [`Activity`] the supervisor is at, if it changed.
+    fn publish_activity(&self) {
+        let activity = Activity {
+            cursor: self.cursor,
+            turns: !self.owed.is_empty()
+                || !self.held.is_empty()
+                || (self.running.values())
+                    .any(|running| running.owed_turns > 0 || running.mapper.turn_open()),
+        };
+        self.activity.send_if_modified(|current| {
+            let changed = *current != activity;
+            *current = activity;
+            changed
+        });
     }
 }
 
@@ -1938,6 +1990,7 @@ fn run_thread<A: AgentAdapter>(
     data_dir: PathBuf,
     log: EventLog,
     config: SupervisorConfig,
+    activity: watch::Sender<Activity>,
     ready: oneshot::Sender<Result<()>>,
     stop: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -1963,6 +2016,7 @@ fn run_thread<A: AgentAdapter>(
             starts: JoinSet::new(),
             stops: JoinSet::new(),
             models: None,
+            activity,
         };
         supervisor.recover()?;
         Ok((runtime, supervisor))

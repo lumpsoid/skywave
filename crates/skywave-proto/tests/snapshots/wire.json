@@ -1,7 +1,7 @@
 {
-  "protocol_version": 20,
+  "protocol_version": 21,
   "hello": {
-    "protocol_version": 20,
+    "protocol_version": 21,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1494,6 +1494,10 @@
     {
       "result": "rejected",
       "reason": "disk_low"
+    },
+    {
+      "result": "rejected",
+      "reason": "server_stopping"
     }
   ],
   "workdir_query": {
