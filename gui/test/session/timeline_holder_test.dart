@@ -37,32 +37,6 @@ void main() {
     expect(notified, 4);
   });
 
-  test('a logged message replacing a pending one keeps the selection', () {
-    final holder = TimelineHolder()
-      ..apply(
-        TimelineUpdateSnapshot(
-          sessionId: 's1',
-          items: [row('s:1', 'A'), message('p:c1', 'hi', pending: true)],
-        ),
-      )
-      ..select('p:c1')
-      ..apply(const TimelineUpdateRemoved(key: 'p:c1'));
-    // Gone for a moment: nothing to show as selected, but kept.
-    expect(holder.selected, isNull);
-    holder.apply(
-      TimelineUpdateUpserted(
-        key: 's:2',
-        item: message('s:2', 'hi', pending: false),
-        index: 1,
-        replaces: 'p:c1',
-      ),
-    );
-
-    expect(holder.selectedKey, 's:2');
-    expect(holder.selected?.text, 'hi');
-    expect(texts(holder), ['s:1=A', 's:2=hi']);
-  });
-
   test('an upsert that replaces drops the pending row itself too', () {
     final holder = TimelineHolder()
       ..apply(
@@ -80,18 +54,5 @@ void main() {
         ),
       );
     expect(texts(holder), ['s:2=hi']);
-  });
-
-  test('another session\'s snapshot clears the selection', () {
-    final holder = TimelineHolder()
-      ..apply(TimelineUpdateSnapshot(sessionId: 's1', items: [row('s:1', 'A')]))
-      ..select('s:1')
-      ..apply(
-        TimelineUpdateSnapshot(sessionId: 's1', items: [row('s:1', 'A')]),
-      );
-    expect(holder.selectedKey, 's:1');
-    holder.apply(const TimelineUpdateSnapshot(sessionId: 's2', items: []));
-    expect(holder.selectedKey, isNull);
-    expect(holder.rows, isEmpty);
   });
 }

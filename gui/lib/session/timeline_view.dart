@@ -352,7 +352,6 @@ class TimelineViewState extends State<TimelineView> {
   @override
   Widget build(BuildContext context) {
     final rows = widget.timeline.rows;
-    final selectedKey = widget.timeline.selectedKey;
     final search = widget.search.search;
     final currentKey = search != null && search.open ? search.currentKey : null;
     final searching = search != null && search.open;
@@ -399,8 +398,6 @@ class TimelineViewState extends State<TimelineView> {
                             sessionId: widget.sessionId,
                             row: row,
                             send: widget.send,
-                            selected: row.key == selectedKey,
-                            onSelect: () => widget.timeline.select(row.key),
                             hit: searching
                                 ? widget.search.hitFor(row.key)
                                 : null,
