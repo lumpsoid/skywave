@@ -1065,9 +1065,10 @@ impl Model {
     /// Takes back a [`discardable`](OutboxEntry::discardable) command; with
     /// `edit`, a message goes back into its session's agent draft, ahead of
     /// what the draft held, the cursor after the message; a shell run
-    /// likewise into the shell draft, which takes the run's `when`. The
-    /// state lock is the one the engine's claim takes, so a command it
-    /// claimed meanwhile is no longer discardable here: nothing happens.
+    /// likewise into the shell draft, which takes the run's `when`. A
+    /// command answered meanwhile is no longer discardable here: nothing
+    /// happens. The sender hears of it, so it stops waiting to resend this
+    /// one and moves on.
     fn withdraw(&mut self, id: CommandId, edit: bool) -> Vec<Effect> {
         let Some(index) = self
             .outbox
@@ -1095,7 +1096,10 @@ impl Model {
             _ if edit => return Vec::new(),
             _ => {
                 self.outbox.remove(index);
-                return vec![Effect::Withdraw { id, draft: None }];
+                return vec![
+                    Effect::Withdraw { id, draft: None },
+                    Effect::Request(Request::OutboxChanged),
+                ];
             }
         };
         let joined = match self.drafts.get(&key) {
@@ -1110,10 +1114,13 @@ impl Model {
         self.outbox.remove(index);
         self.drafts.insert(key, draft.clone());
         self.draft_rev += 1;
-        vec![Effect::Withdraw {
-            id,
-            draft: Some((key, draft)),
-        }]
+        vec![
+            Effect::Withdraw {
+                id,
+                draft: Some((key, draft)),
+            },
+            Effect::Request(Request::OutboxChanged),
+        ]
     }
 
     /// Pending in the replica and not already answered from this device
@@ -3719,7 +3726,7 @@ mod tests {
                 context: skywave_proto::ContextId::first_of(sid),
                 text: "hello".into(),
                 outgoing,
-                discardable: outgoing == Outgoing::Queued,
+                discardable: matches!(outgoing, Outgoing::Queued | Outgoing::Sending),
                 delivery: Some(delivery),
             }]
         };
@@ -5858,10 +5865,13 @@ mod tests {
         };
         assert_eq!(
             effects,
-            vec![Effect::Withdraw {
-                id: first.id,
-                draft: Some(((sid, ComposerMode::Agent), draft.clone())),
-            }]
+            vec![
+                Effect::Withdraw {
+                    id: first.id,
+                    draft: Some(((sid, ComposerMode::Agent), draft.clone())),
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         let view = f.session_view();
         assert_eq!(view.draft, Some(draft));
@@ -5878,17 +5888,20 @@ mod tests {
         let effects = f.dispatch(Action::EditQueued(second.id));
         assert_eq!(
             effects,
-            vec![Effect::Withdraw {
-                id: second.id,
-                draft: Some((
-                    (sid, ComposerMode::Agent),
-                    Draft {
-                        text: "then lint".into(),
-                        cursor: 9,
-                        when: RunWhen::Always,
-                    }
-                )),
-            }]
+            vec![
+                Effect::Withdraw {
+                    id: second.id,
+                    draft: Some((
+                        (sid, ComposerMode::Agent),
+                        Draft {
+                            text: "then lint".into(),
+                            cursor: 9,
+                            when: RunWhen::Always,
+                        }
+                    )),
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         assert_eq!(pending(&f), Vec::new());
 
@@ -5897,10 +5910,13 @@ mod tests {
         let rev = f.session_view().draft_rev;
         assert_eq!(
             f.dispatch(Action::Discard(third.id)),
-            vec![Effect::Withdraw {
-                id: third.id,
-                draft: None,
-            }]
+            vec![
+                Effect::Withdraw {
+                    id: third.id,
+                    draft: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         assert_eq!(pending(&f), Vec::new());
         assert_eq!(f.session_view().draft_rev, rev);
@@ -5912,34 +5928,64 @@ mod tests {
     }
 
     #[test]
-    fn claimed_message_is_not_discardable() {
+    fn a_message_is_discardable_until_accepted() {
         let mut f = Fixture::paired();
         let sid = f.session("/srv/a");
         f.open(sid);
         let command = send(&mut f, sid, "hello");
         assert_eq!(pending(&f), vec![("hello".to_owned(), true)]);
 
-        // Once claimed it may have reached the server: it stays, even after
-        // a failed attempt puts it back in the queue (a restart does that).
+        // Claimed, it may have reached the server, but taking it back still
+        // stops the resends of one that never gets through.
         f.model.command_sending(command.id, Utc::now());
-        assert_eq!(pending(&f), vec![("hello".to_owned(), false)]);
-        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
-        assert!(f.dispatch(Action::EditQueued(command.id)).is_empty());
-        f.model.outbox_entry(command.id).unwrap().status = OutboxStatus::Queued;
-        assert_eq!(pending(&f), vec![("hello".to_owned(), false)]);
-        assert!(f.dispatch(Action::Discard(command.id)).is_empty());
-
-        // A refusal settles it: the message can be dismissed or edited.
+        f.model.command_sending(command.id, Utc::now());
+        assert_eq!(pending(&f), vec![("hello".to_owned(), true)]);
+        assert_eq!(
+            f.dispatch(Action::EditQueued(command.id)),
+            vec![
+                Effect::Withdraw {
+                    id: command.id,
+                    draft: Some((
+                        (sid, ComposerMode::Agent),
+                        Draft {
+                            text: "hello".into(),
+                            cursor: 5,
+                            when: RunWhen::Always,
+                        }
+                    )),
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        assert_eq!(pending(&f), Vec::new());
+        // Its answer, still on its way, settles nothing.
         f.model.command_result(
             command.id,
+            CommandResult::Accepted { seq: Seq(9) },
+            Utc::now(),
+        );
+        assert_eq!(pending(&f), Vec::new());
+
+        // A refusal leaves it discardable; an acceptance does not.
+        let refused = send(&mut f, sid, "refused");
+        f.model.command_sending(refused.id, Utc::now());
+        f.model.command_result(
+            refused.id,
             CommandResult::Rejected {
                 reason: RejectReason::UnknownSession,
             },
             Utc::now(),
         );
-        assert_eq!(pending(&f), vec![("hello".to_owned(), true)]);
-        assert_eq!(f.dispatch(Action::EditQueued(command.id)).len(), 1);
-        assert_eq!(f.session_view().draft.unwrap().text, "hello");
+        assert_eq!(pending(&f), vec![("refused".to_owned(), true)]);
+        f.dispatch(Action::Discard(refused.id));
+        let accepted = send(&mut f, sid, "accepted");
+        f.model.command_sending(accepted.id, Utc::now());
+        f.model.command_result(
+            accepted.id,
+            CommandResult::Accepted { seq: Seq(10) },
+            Utc::now(),
+        );
+        assert!(f.dispatch(Action::Discard(accepted.id)).is_empty());
     }
 
     #[test]
@@ -5985,10 +6031,13 @@ mod tests {
         assert!(matches!(creating[0].outgoing, Outgoing::Failed(_)));
         assert_eq!(
             f.dispatch(Action::Discard(command.id)),
-            vec![Effect::Withdraw {
-                id: command.id,
-                draft: None,
-            }]
+            vec![
+                Effect::Withdraw {
+                    id: command.id,
+                    draft: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         assert!(f.list_view().creating.is_empty());
     }
@@ -6494,6 +6543,12 @@ mod tests {
             },
             Utc::now(),
         );
+        // Accepted, its session not yet in the replica: it can't go.
+        f.model.command_result(
+            waiting.id,
+            CommandResult::Accepted { seq: Seq(9) },
+            Utc::now(),
+        );
         let discardable = |f: &Fixture| -> Vec<(String, bool)> {
             f.list_view()
                 .creating
@@ -6512,10 +6567,13 @@ mod tests {
         );
         assert_eq!(
             f.dispatch(Action::Discard(refused.id)),
-            vec![Effect::Withdraw {
-                id: refused.id,
-                draft: None,
-            }]
+            vec![
+                Effect::Withdraw {
+                    id: refused.id,
+                    draft: None,
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         assert_eq!(discardable(&f), vec![("/srv/new".to_owned(), false)]);
     }
@@ -8511,7 +8569,7 @@ mod tests {
         )));
         let effects = f.dispatch(Action::EditQueued(stale.id));
         assert!(
-            matches!(&effects[..], [Effect::Withdraw { id, draft: Some(_) }] if *id == stale.id)
+            matches!(&effects[..], [Effect::Withdraw { id, draft: Some(_) }, _] if *id == stale.id)
         );
         let view = f.session_view();
         assert_eq!(
@@ -8893,10 +8951,13 @@ mod tests {
         assert!(row.can_move, "a refused move can be asked again");
         assert_eq!(
             f.dispatch(Action::Discard(moved.id)),
-            [Effect::Withdraw {
-                id: moved.id,
-                draft: None
-            }]
+            [
+                Effect::Withdraw {
+                    id: moved.id,
+                    draft: None
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
         );
         let row = context_row(&f, start);
         assert_eq!((row.outgoing, row.discard_move), (None, None));

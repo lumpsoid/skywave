@@ -5379,13 +5379,15 @@ fn edit_and_cancel_a_queued_message() {
         "a discard leaves the composer alone"
     );
 
-    // Once sent it may have reached the server: no hint, and the keys do
-    // nothing, also once it is back in the queue.
+    // Sent but unanswered, it can still be taken back: one that never gets
+    // through would otherwise hold back everything behind it.
     h.seam.command_sending(sent[0]).unwrap();
     h.sync();
-    assert!(!footer(&h).contains("e edit"), "{}", footer(&h));
-    assert_eq!(h.key(KeyCode::Char('e')), None);
-    assert_eq!(h.key(KeyCode::Delete), None);
+    assert!(
+        footer(&h).starts_with("e edit · Del cancel"),
+        "{}",
+        footer(&h)
+    );
     let mut h = h.restart();
     assert_eq!(h.seam.pending_outbox().unwrap().len(), 1);
 
@@ -5635,8 +5637,8 @@ fn attempted_queued_message_says_sent_once() {
             queued_at.format("%H:%M:%S")
         )
     );
-    // Which is why it can no longer be taken back.
-    assert!(!footer(&h).contains("e edit"), "{}", footer(&h));
+    // Unanswered, it can still be taken back.
+    assert!(footer(&h).contains("e edit"), "{}", footer(&h));
 }
 
 #[test]

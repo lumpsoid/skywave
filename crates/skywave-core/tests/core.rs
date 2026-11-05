@@ -1777,7 +1777,7 @@ fn shell_runs_fold_from_the_log_and_this_devices_outbox() {
     let run = run_of(&shell, sending);
     assert_eq!(
         (&run.state, run.outgoing, run.discardable),
-        (&ShellRunState::Pending, Some(Outgoing::Sending), false)
+        (&ShellRunState::Pending, Some(Outgoing::Sending), true)
     );
     assert!(run.delivery.is_some());
     let run = run_of(&shell, refused);

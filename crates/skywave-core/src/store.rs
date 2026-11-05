@@ -403,10 +403,8 @@ pub enum StoreError {
     BatchFromZero,
     #[error("value {0} does not fit an SQLite integer")]
     OutOfRange(u64),
-    #[error("command {0:?} is not in the outbox")]
-    UnknownCommand(CommandId),
-    /// [`Store::withdraw`] found no row it may delete: the command is gone,
-    /// was accepted, or may have reached the server.
+    /// [`Store::withdraw`] found no row it may delete: the command is gone
+    /// or was accepted.
     #[error("command {0:?} cannot be withdrawn")]
     NotWithdrawable(CommandId),
     #[error("blob {0:?} is not known")]
@@ -565,10 +563,13 @@ pub struct OutboxEntry {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, shell run, session creation or context move the server
-    /// never saw (`tries == 0`) or refused. A command that may have reached
-    /// the server and has no answer never is: withdrawing it could not stop
-    /// it.
+    /// message, shell run, session creation or context move the server has
+    /// not answered, or refused. One already sent may have reached the
+    /// server, and withdrawing cannot stop it there; it only stops the
+    /// resends, so a command whose request keeps failing no longer holds
+    /// back every later one. If the server took it, its event shows it in
+    /// the log like any other, and its answer, if one still comes, settles
+    /// nothing.
     pub fn discardable(&self) -> bool {
         let kind = matches!(
             self.command.kind,
@@ -580,7 +581,7 @@ impl OutboxEntry {
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),
             OutboxStatus::Undeliverable => true,
-            OutboxStatus::Queued | OutboxStatus::Sending => self.tries == 0,
+            OutboxStatus::Queued | OutboxStatus::Sending => true,
         }
     }
 }
@@ -1283,24 +1284,25 @@ impl Store {
         self.settle(id, &Settled::Local(LocalResult::Undeliverable), now)
     }
 
+    /// A command no longer in the outbox settles nothing: the user took it
+    /// back while its request was out ([`Store::withdraw`]).
     fn settle(
         &self,
         id: CommandId,
         settled: &Settled,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        if !settle_in(&self.conn, id, settled, now)? {
-            self.require_command(id)?;
-        }
+        settle_in(&self.conn, id, settled, now)?;
         Ok(())
     }
 
-    /// Takes a command back: deletes it from the outbox if it was never
-    /// attempted or the server refused it (or its request), and keeps `draft` as its
-    /// session's draft in that mode, in one transaction, so a crash keeps
-    /// the text in exactly one place. Any other row stays and the call
-    /// fails with [`StoreError::NotWithdrawable`], writing nothing: it may
-    /// have reached the server, and only its answer can settle it.
+    /// Takes a command back: deletes it from the outbox if the server has
+    /// not answered it or refused it (or its request), and keeps `draft` as
+    /// its session's draft in that mode, in one transaction, so a crash
+    /// keeps the text in exactly one place. An accepted command stays and
+    /// the call fails with [`StoreError::NotWithdrawable`], writing nothing.
+    /// One already sent may still reach the server
+    /// ([`OutboxEntry::discardable`]).
     pub fn withdraw(
         &self,
         id: CommandId,
@@ -1310,7 +1312,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let deleted = tx.execute(
             "DELETE FROM outbox WHERE command_id = ?1
-                AND (tries = 0 AND result IS NULL
+                AND (result IS NULL
                     OR json_extract(result, '$.result') IN ('rejected', 'undeliverable'))",
             [id.0.to_string()],
         )?;
@@ -1322,18 +1324,6 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    fn require_command(&self, id: CommandId) -> Result<(), StoreError> {
-        let known = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM outbox WHERE command_id = ?1",
-                [id.0.to_string()],
-                |_| Ok(()),
-            )
-            .optional()?;
-        known.ok_or(StoreError::UnknownCommand(id))
     }
 
     // ---- blobs ------------------------------------------------------------
