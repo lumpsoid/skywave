@@ -485,7 +485,7 @@ async fn prepare_import(
     // Refused `DiskLow` before it writes blobs. Should the disk have room
     // again by the transaction, the session is created with nothing
     // imported (`Unavailable`), as for any create with nothing prepared.
-    if api.log.disk().is_low() {
+    if api.log.disk().refresh() {
         return Ok(None);
     }
     let conversation = conversation.to_owned();

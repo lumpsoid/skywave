@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -47,13 +47,18 @@ struct Fixture {
     space: Arc<FakeSpace>,
 }
 
-/// The free space a test sets, as [`FreeSpace`] reports it.
+/// The free space a test sets, as [`FreeSpace`] reports it, counting its
+/// reads.
 #[derive(Debug, Default)]
-struct FakeSpace(AtomicU64);
+struct FakeSpace {
+    free: AtomicU64,
+    reads: AtomicUsize,
+}
 
 impl FreeSpace for FakeSpace {
     fn free(&self) -> std::io::Result<u64> {
-        Ok(self.0.load(Ordering::SeqCst))
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.free.load(Ordering::SeqCst))
     }
 }
 
@@ -88,8 +93,9 @@ impl Fixture {
         std::fs::create_dir_all(&workdir).unwrap();
         let data = tmp.path().join("data");
         let storage = Storage::open(&data).unwrap();
-        let disk = Disk::default();
-        let space = Arc::new(FakeSpace(AtomicU64::new(FLOOR)));
+        let space = Arc::new(FakeSpace::default());
+        space.free.store(FLOOR, Ordering::SeqCst);
+        let disk = Disk::new(space.clone(), FLOOR);
         let log = EventLog::open(&storage.db, vec![root.clone()])
             .unwrap()
             .with_disk(disk.clone());
@@ -147,10 +153,16 @@ impl Fixture {
             .with_disk(self.disk.clone());
     }
 
-    /// Checks the disk with `free` bytes left, as `serve`'s watch does.
+    /// Leaves `free` bytes on the disk and reads it now, rather than at the
+    /// next write or poll.
     fn disk_free(&self, free: u64) {
-        self.space.0.store(free, Ordering::SeqCst);
-        self.disk.check(&*self.space, FLOOR);
+        self.space.free.store(free, Ordering::SeqCst);
+        self.disk.check();
+    }
+
+    /// How often the free space was read.
+    fn disk_reads(&self) -> usize {
+        self.space.reads.load(Ordering::SeqCst)
     }
 
     /// The disk drops below the floor.
@@ -4518,6 +4530,34 @@ const QUIET: Duration = Duration::from_millis(300);
 async fn stays_unlogged(f: &Fixture, kind: &EventKind) {
     let logged = tokio::time::timeout(QUIET, f.wait_for("nothing", |k| k.contains(kind))).await;
     assert!(logged.is_err(), "{kind:?} was logged while paused");
+}
+
+/// The free space is read only where something is about to take space,
+/// and a recent reading is reused: commands and the burst of events a turn
+/// logs within the interval cost one reading, and an idle server, over a
+/// day, none. The
+/// disk's own timers would run on this test's runtime, whose clock the
+/// day is skipped on.
+#[tokio::test]
+async fn work_reads_the_free_space_once_per_interval_and_idle_reads_none() {
+    let mut f = Fixture::new();
+    let lines: Vec<Step> = (0..50).map(|i| Step::text(format!("line {i}"))).collect();
+    let agent = FakeAgent::new(FakeScript::new().turn(lines));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_count("the turn's end", 1, is_idle).await;
+    assert_eq!(
+        f.disk_reads(),
+        1,
+        "the session's creation, the message and its burst share one reading"
+    );
+
+    let reads = f.disk_reads();
+    tokio::time::pause();
+    tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+    tokio::time::resume();
+    assert_eq!(f.disk_reads(), reads, "an idle server reads nothing");
+    supervisor.shutdown().await.unwrap();
 }
 
 /// Below the floor the agent's events stay unread, so it waits with

@@ -1,6 +1,8 @@
 //! Event log and command handling (T03), driven through the public API.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use skywave_proto::{
@@ -1634,12 +1636,27 @@ fn shell_commands_are_refused_while_shell_is_off() {
     assert_eq!(f.log.head(), head.next());
 }
 
-/// A fixed free space.
-struct Free(u64);
+/// A free space the test sets, counting its reads.
+#[derive(Default)]
+struct Free {
+    free: AtomicU64,
+    reads: AtomicUsize,
+}
+
+impl Free {
+    fn set(&self, free: u64) {
+        self.free.store(free, Ordering::SeqCst);
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
 
 impl FreeSpace for Free {
     fn free(&self) -> std::io::Result<u64> {
-        Ok(self.0)
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.free.load(Ordering::SeqCst))
     }
 }
 
@@ -1650,7 +1667,9 @@ impl FreeSpace for Free {
 #[test]
 fn a_low_disk_refuses_new_work_and_takes_control() {
     let mut f = Fixture::with_shell();
-    let disk = Disk::default();
+    let free = Arc::new(Free::default());
+    free.set(10);
+    let disk = Disk::new(free.clone(), 10);
     f.log = f.log.clone().with_disk(disk.clone());
     let session = f.create_session();
     let first = ContextId::first_of(session);
@@ -1678,8 +1697,8 @@ fn a_low_disk_refuses_new_work_and_takes_control() {
     );
     let run = run.id;
 
-    disk.check(&Free(9), 10);
-    assert!(disk.is_low());
+    free.set(9);
+    assert!(disk.check());
     let head = f.log.head();
     let refused = [
         CommandKind::CreateSession {
@@ -1751,11 +1770,14 @@ fn a_low_disk_refuses_new_work_and_takes_control() {
             session_id: session,
         },
     ];
+    let reads = free.reads();
     for kind in taken {
         accepted(f.handle(kind));
     }
+    assert_eq!(free.reads(), reads, "control reads no free space");
 
-    disk.check(&Free(10), 10);
+    free.set(10);
+    assert!(!disk.check());
     accepted(f.handle(CommandKind::SendMessage {
         session_id: session,
         context: first,

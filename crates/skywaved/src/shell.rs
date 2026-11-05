@@ -92,6 +92,15 @@
 //! goes on, `ShellOutput` reports the tail at the [`Progress`] cadence, only
 //! when there is new output and the tail differs from the last one reported.
 //!
+//! **A low disk** ([`crate::disk`], D40): the runner reads the free space
+//! as it stores output and as it logs ([`Disk::refresh`], at most one
+//! reading per check interval). While the disk is low a run's output is not
+//! read: it waits in the pipe, and once the pipe is full the command blocks
+//! on its next write, paused like an agent, with nothing lost. When the
+//! disk has room again the reading goes on. A stop still ends the run, and
+//! a run whose shell exits meanwhile ends as usual with what the pipe held.
+//! Reports already made are logged either way.
+//!
 //! **Shutdown** ([`ShellHandle::shutdown`]) kills every running run's group
 //! and logs nothing, so the next start settles them `Lost`, as after a
 //! crash.
@@ -118,6 +127,7 @@ use skywave_proto::{CommandId, DeviceId, Event, EventKind, RunWhen, Seq, Session
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
+use crate::disk::Disk;
 use crate::error::{Error, Result};
 use crate::event_log::{ShellAppended, ShellRecovery, ShellRun, shell_command_line, shell_run_in};
 use crate::{EventLog, Storage};
@@ -619,6 +629,7 @@ impl ShellRunner {
                     config: &self.config,
                     control: controlled,
                     reports: self.reports.clone(),
+                    disk: self.log.disk().clone(),
                 },
                 &mut self.tasks,
             );
@@ -649,6 +660,10 @@ impl ShellRunner {
     }
 
     fn on_report(&mut self, report: Report) -> Result<()> {
+        // About to log (and maybe store a blob): a reading up to the check
+        // interval old is reused. What is reported is logged either way:
+        // the output it covers was read before the disk turned low.
+        self.log.disk().refresh();
         match report {
             Report::Output {
                 run,
@@ -780,6 +795,8 @@ struct Launch<'a> {
     config: &'a ShellConfig,
     control: watch::Receiver<Control>,
     reports: mpsc::UnboundedSender<Report>,
+    /// The log's disk: while it is low the output is not read.
+    disk: Disk,
 }
 
 /// A run's output as it arrives: written to its file up to the cap, counted,
@@ -965,6 +982,7 @@ mod exec {
     use tokio::time::Instant;
 
     use super::{Capture, Control, Launch, Report};
+    use crate::disk::Disk;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use crate::process::isolate;
     use crate::process::{DEFAULT_TERM_GRACE, Group};
@@ -1032,6 +1050,7 @@ exit "$__skywave_status"
                 cwd,
                 capture,
                 progress: launch.config.progress.clone(),
+                disk: launch.disk,
             },
             launch.control,
             launch.reports,
@@ -1297,6 +1316,7 @@ exit "$__skywave_status"
         cwd: pipe::Receiver,
         capture: Capture,
         progress: super::Progress,
+        disk: Disk,
     }
 
     enum Wake {
@@ -1305,6 +1325,8 @@ exit "$__skywave_status"
         Exited,
         Read(io::Result<usize>),
         Tick,
+        /// The disk has room again.
+        Disk,
     }
 
     /// Follows one run until its shell exits or it is stopped, then ends
@@ -1321,8 +1343,12 @@ exit "$__skywave_status"
         let mut reported = super::Reported::default();
         let mut buf = vec![0; 64 * 1024];
         let mut output_open = true;
+        let mut low = w.disk.subscribe();
         let (status, stopped) = loop {
             let due = start + w.progress.next(checked);
+            // While the disk is low the output stays in the pipe, and the
+            // command blocks once it is full; see the module docs.
+            let paused = *low.borrow_and_update();
             let wake = tokio::select! {
                 biased;
                 changed = control.changed() => Wake::Control(match changed {
@@ -1330,11 +1356,12 @@ exit "$__skywave_status"
                     Err(_) => Control::Cancel,
                 }),
                 _ = w.shell.exited() => Wake::Exited,
-                read = w.output.read(&mut buf), if output_open => Wake::Read(read),
+                read = w.output.read(&mut buf), if output_open && !paused => Wake::Read(read),
+                _ = low.changed(), if paused => Wake::Disk,
                 () = tokio::time::sleep_until(due) => Wake::Tick,
             };
             match wake {
-                Wake::Control(Control::Run) => {}
+                Wake::Control(Control::Run) | Wake::Disk => {}
                 Wake::Control(Control::Stop) => {
                     break (end_group(&mut w.shell, &mut group).await, true);
                 }
@@ -1344,7 +1371,11 @@ exit "$__skywave_status"
                 }
                 Wake::Exited => break (end_group(&mut w.shell, &mut group).await, false),
                 Wake::Read(Ok(0) | Err(_)) => output_open = false,
-                Wake::Read(Ok(n)) => w.capture.push(&buf[..n]),
+                Wake::Read(Ok(n)) => {
+                    // About to store it: a recent reading is reused.
+                    w.disk.refresh();
+                    w.capture.push(&buf[..n]);
+                }
                 Wake::Tick => {
                     checked = w.progress.next(checked);
                     if let Some(tail) = reported.fresh(w.capture.bytes, || w.capture.tail()) {

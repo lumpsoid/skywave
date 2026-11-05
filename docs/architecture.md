@@ -327,10 +327,15 @@ the daemon's appends, which would otherwise stop `serve` (below).
   or refuses) is logged in that session, and a blob it cannot store is
   marked lost in its event (Event mapper). Recovery stores no blobs, so a
   restart on a full blob disk does not fail the same way again.
-- **A low disk** (D40): `serve` reads the free space of the data dir's
-  file system (`statvfs`) at start and every 5 s, against `[disk]
-  min_free` (default 1 GiB; 0 turns it off). Below it the disk is *low*,
-  and both sides pause until a check finds the space back:
+- **A low disk** (D40): the free space of the data dir's file system
+  (`statvfs`) is checked against `[disk] min_free` (default 1 GiB; 0
+  turns it off) only where something is about to take space: at `serve`'s
+  start, by the API when a command that starts work arrives, by the
+  supervisor as it logs agent events, and by the shell runner as it stores
+  and logs output. A reading up to 5 s old is reused, so a burst costs
+  one, and an idle server reads nothing and runs no timer. Below the floor
+  the disk is *low*; the flip starts the one poll left, every 5 s until
+  the space is back, which flips it back and stops. While low:
   - Commands that start new work are `DiskLow` before anything else is
     checked: `CreateSession`, `SendMessage`, `SetPermissionMode`,
     `SetModel`, `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`.
@@ -350,12 +355,15 @@ the daemon's appends, which would otherwise stop `serve` (below).
     turn ends or the stop is answered; a stop drains and stops the agent as
     always. No agent is stopped as idle while paused. Commands accepted
     before the pause still reach their agent.
-  - A start below the floor comes up paused. Running shell runs go on.
+  - The shell runner stops reading a running run's output: it waits in
+    the pipe, and the command blocks once the pipe is full, paused like an
+    agent with nothing lost. A stop still ends the run.
+  - A start below the floor comes up paused.
   The floor is what normally keeps the log from filling. A disk that fills
   between checks anyway fails an append, which ends the supervisor (above)
-  and `serve`; before its first write the next `serve` waits, logging that
-  it does, until 64 MiB (at most the floor) is free, so a full disk never
-  makes it fail on every start.
+  and `serve`; before its first write the next `serve` waits in the same
+  5 s loop, logging that it does, until 64 MiB (at most the floor) is free,
+  so a full disk never makes it fail on every start.
   An agent process that reports a version other than the one its adapter
   was checked against logs one `AgentVersionUnconfirmed` (neither notable
   nor activity) in the context it was started for, and every head shows it
