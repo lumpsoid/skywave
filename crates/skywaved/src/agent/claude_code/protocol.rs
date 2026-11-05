@@ -8,12 +8,22 @@
 //! replayable against the recorded fixtures.
 //!
 //! **Turns.** The adapter, not the CLI, queues a message sent while a turn
-//! runs: the next user message is written only after the turn's `result`, so
-//! every written message is exactly one turn, framed by `TurnStarted
-//! { message: true }` and exactly one `TurnEnded`. A turn the CLI starts on
-//! its own (a `system/init` with no turn open: a wakeup, a background job's
-//! report) is framed the same, with `message: false`. The `result` ending a turn also gives what the
-//! turn took, reported just before as `TurnUsage` ([`usage::turn_usage`]).
+//! runs or a written message has not started: the next user message is
+//! written only after the turn's `result`, and only once the last one
+//! started. Each written line carries a fresh `uuid`, and the CLI says when
+//! it takes the line up: `command_lifecycle` `started` with that uuid as
+//! `command_uuid`, before the turn's `system/init` (docs/agents/claude-code.md
+//! §3.11). That line, never the `init` after the write, makes the message's
+//! turn: with no turn open it opens one, `TurnStarted { message: true }`,
+//! ended by exactly one `TurnEnded`. A turn the CLI starts on its own (a
+//! `system/init` with no turn open: a wakeup, a background job's report) is
+//! framed the same, with `message: false`; one may start after the write and
+//! before the CLI reads the line, and the CLI then takes the message up at
+//! that turn's next tool round or after its `result`. Taken up inside it,
+//! the message is reported as `TurnStarted { message: true }` within the
+//! open turn, which goes on to its one `TurnEnded`. The `result` ending a
+//! turn also gives what the turn took, reported just before as `TurnUsage`
+//! ([`usage::turn_usage`]).
 //!
 //! **Approvals.** A `can_use_tool` request is reported as `ApprovalRequested`
 //! and stays pending, with no timeout (D8), until it is answered, the CLI
@@ -154,13 +164,15 @@ pub fn parse_resume_handle(handle: &ResumeHandle) -> Result<Uuid, String> {
         .ok_or_else(|| format!("not a resume handle of this adapter: {}", handle.0))
 }
 
-/// A user message: starts a turn.
-pub fn user_message(text: &str) -> Value {
+/// A user message, `id` its `uuid`: the CLI names it in the
+/// `command_lifecycle` lines of the turn that takes it up.
+pub fn user_message(text: &str, id: Uuid) -> Value {
     json!({
         "type": "user",
         "message": { "role": "user", "content": text },
         "parent_tool_use_id": null,
         "session_id": "",
+        "uuid": id.to_string(),
     })
 }
 
@@ -407,9 +419,15 @@ pub struct Protocol {
     /// The model the latest `system/init` named.
     model: Option<String>,
     turn_open: bool,
+    /// An interrupt was asked for the open turn, or, with none open, for
+    /// the written message's: then it is written as the next turn opens.
     interrupt_sent: bool,
-    /// Messages accepted and not written yet, oldest first: each starts the
-    /// next turn, unless the session is shutting down. Kept then, so the
+    /// The `uuid` of the message written whose `command_lifecycle`
+    /// `started` has not come: the CLI has not taken it up yet.
+    written: Option<Uuid>,
+    /// Messages accepted and not written yet, oldest first: each is
+    /// written once no turn is open and none is [`Protocol::written`]
+    /// unstarted, unless the session is shutting down. Kept then, so the
     /// exit can count them ([`Protocol::unsent`]).
     queued: VecDeque<String>,
     pending: Vec<Pending>,
@@ -480,6 +498,7 @@ impl Protocol {
             model: None,
             turn_open: false,
             interrupt_sent: false,
+            written: None,
             queued: VecDeque::new(),
             pending: Vec::new(),
             tools: HashMap::new(),
@@ -561,14 +580,16 @@ impl Protocol {
         })
     }
 
-    /// A message has been written and its `result` not yet read.
+    /// A turn is open (its `result` not yet read), or a message has been
+    /// written and the CLI has not taken it up yet.
     pub fn turn_open(&self) -> bool {
-        self.turn_open
+        self.turn_open || self.written.is_some()
     }
 
-    /// The open turn has been asked to stop and its `result` not yet read.
+    /// The open turn, or the written message's turn to come, has been
+    /// asked to stop and its `result` not yet read.
     pub fn interrupting(&self) -> bool {
-        self.turn_open && self.interrupt_sent
+        self.turn_open() && self.interrupt_sent
     }
 
     /// The CLI version reported by the handshake or `system/init`.
@@ -581,13 +602,14 @@ impl Protocol {
         self.session_id
     }
 
-    /// Sends `text` now if idle, else queues it for the next turn.
+    /// Writes `text` now if idle, else queues it for the next turn. Its
+    /// turn is reported when the CLI takes it up.
     pub fn send_message(&mut self, text: String) -> Output {
-        if self.turn_open {
+        if self.turn_open() {
             self.queued.push_back(text);
             Output::default()
         } else {
-            self.begin_turn(&text)
+            self.write_message(&text)
         }
     }
 
@@ -623,16 +645,24 @@ impl Protocol {
     }
 
     /// Stops the current turn; nothing when idle or already interrupting.
+    /// With no turn open yet but a message written, the interrupt is
+    /// written as the next turn opens: the CLI has not reported taking the
+    /// message up, so there is nothing yet to stop.
     pub fn interrupt(&mut self) -> Output {
-        if !self.turn_open || self.interrupt_sent {
+        if !self.turn_open() || self.interrupt_sent {
             return Output::default();
         }
         self.interrupt_sent = true;
-        let id = self.request_id();
-        Output {
-            writes: vec![interrupt_request(&id)],
-            events: Vec::new(),
+        let mut out = Output::default();
+        if self.turn_open {
+            self.write_interrupt(&mut out);
         }
+        out
+    }
+
+    fn write_interrupt(&mut self, out: &mut Output) {
+        let id = self.request_id();
+        out.writes.push(interrupt_request(&id));
     }
 
     /// Asks the CLI to switch to `mode`; answered by `PermissionModeSet` or
@@ -694,11 +724,12 @@ impl Protocol {
         self.shutting_down = true;
     }
 
-    /// Messages accepted and not written to the process: queued behind the
-    /// open turn, or [`Protocol::undelivered`]. Once the process is gone
-    /// (or [`Protocol::begin_shutdown`]) none of them will run.
+    /// Messages accepted and not taken up by the process: queued behind the
+    /// open turn, [`Protocol::undelivered`], or written and not started.
+    /// Once the process is gone (or [`Protocol::begin_shutdown`], for the
+    /// queued ones) none of them will run.
     pub fn unsent(&self) -> usize {
-        self.queued.len()
+        self.queued.len() + usize::from(self.written.is_some())
     }
 
     /// Translates one stdout line.
@@ -745,6 +776,7 @@ impl Protocol {
             "system" if str_field(message, "subtype") == "task_started" => {
                 self.on_task_started(message, &mut out);
             }
+            "command_lifecycle" => self.on_lifecycle(message, &mut out),
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
             "control_request" => self.on_control_request(message, &mut out),
@@ -763,11 +795,12 @@ impl Protocol {
 
     /// Reports `TurnStarted`, after the resume handle when it is the first
     /// turn of a fresh process: from that message on the CLI has a
-    /// conversation to resume. `message`: the turn is the one of a message
-    /// just written, not one the CLI started on its own.
+    /// conversation to resume. `message`: the turn is the one of the message
+    /// the CLI just took up, not one it started on its own.
     fn open_turn(&mut self, message: bool, out: &mut Output) {
+        // Asked while a written message waited for its turn: this one stops.
+        let asked = self.interrupt_sent;
         self.turn_open = true;
-        self.interrupt_sent = false;
         // What went wrong before this turn does not explain a later exit.
         self.error = None;
         self.stray_output = None;
@@ -777,6 +810,9 @@ impl Protocol {
                 .push(AdapterEvent::ResumeHandle(resume_handle(self.session_id)));
         }
         out.events.push(AdapterEvent::TurnStarted { message });
+        if asked {
+            self.write_interrupt(out);
+        }
     }
 
     fn request_id(&mut self) -> String {
@@ -824,13 +860,38 @@ impl Protocol {
         self.settings.insert(id, Asked::EffortRead { asked });
     }
 
-    fn begin_turn(&mut self, text: &str) -> Output {
-        let mut out = Output {
-            writes: vec![user_message(text)],
+    /// Writes `text`; its turn opens when the CLI takes it up
+    /// ([`Protocol::on_lifecycle`]).
+    fn write_message(&mut self, text: &str) -> Output {
+        let id = Uuid::new_v4();
+        self.written = Some(id);
+        Output {
+            writes: vec![user_message(text, id)],
             events: Vec::new(),
-        };
-        self.open_turn(true, &mut out);
-        out
+        }
+    }
+
+    /// `command_lifecycle`: the `started` of the written message is its
+    /// turn. Other commands' lines (a scheduled wakeup's) and other states
+    /// say nothing a `system/init` or `result` does not.
+    fn on_lifecycle(&mut self, message: &Value, out: &mut Output) {
+        let started = str_field(message, "state") == "started"
+            && message
+                .get("command_uuid")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| self.written == Some(id));
+        if !started {
+            return;
+        }
+        self.written = None;
+        if self.turn_open {
+            // Taken up by a turn the CLI started on its own, at a tool
+            // round: the message joins it, and its `result` ends both.
+            out.events.push(AdapterEvent::TurnStarted { message: true });
+        } else {
+            self.open_turn(true, out);
+        }
     }
 
     /// Keeps the `version` the CLI reported. One that is not
@@ -889,8 +950,10 @@ impl Protocol {
             report_again = self.handle_reported;
         }
         if !self.turn_open {
-            // A turn the CLI started on its own; frame it all the same. It
-            // answers no message: one written meanwhile waits in `queued`.
+            // A turn the CLI started on its own; frame it all the same. A
+            // message's turn opened on its `started`, before this line. One
+            // written and not started yet, unless this turn takes it up at
+            // a tool round, waits in the CLI for this turn's end.
             self.open_turn(false, out);
         }
         if report_again {
@@ -1398,12 +1461,14 @@ impl Protocol {
         self.tools.clear();
         self.turn_open = false;
         self.interrupt_sent = false;
+        // A message written and not started yet still waits in the CLI:
+        // the next is written once it has started, so each is its own turn.
         if !self.shutting_down
+            && self.written.is_none()
             && let Some(next) = self.queued.pop_front()
         {
-            let next = self.begin_turn(&next);
+            let next = self.write_message(&next);
             out.writes.extend(next.writes);
-            out.events.extend(next.events);
         }
     }
 }

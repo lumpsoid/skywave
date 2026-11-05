@@ -665,7 +665,9 @@ docs/agents/claude-code.md §3.12):
   `{"type":"user","isReplay":true,"uuid",...}` right after the `init` of the
   turn that takes it up, before any `assistant` line: a definitive marker of
   the line's turn if a relay is ever revived. Unverified: whether an input
-  `uuid` is echoed back.
+  `uuid` is echoed back. (Since verified, 2026-11-05: it is, and a `uuid`
+  alone brings `command_lifecycle` lines naming the line, which the adapter
+  now reads for every message; docs/agents/claude-code.md §3.11.)
 - This CLI blocks a standalone `sleep 25` in a subagent ("use Monitor"), so
   the `relay_live` / `relay_midrun` prompts need changing before re-recording.
 - The raw recordings in `/tmp/skywave-race/` are not fixtures; nothing

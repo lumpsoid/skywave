@@ -1248,6 +1248,45 @@ async fn a_message_queued_behind_a_turn_the_agent_started_errors_once_after_a_cr
     );
 }
 
+/// An agent may take a message handed before its own turn began up inside
+/// that turn (a CLI does at a tool round): `TurnStarted { message: true }`
+/// in the open turn, with no `AgentWorking` of its own. That settles the
+/// message at once, so a shutdown during the turn names only the lost turn.
+#[tokio::test]
+async fn a_message_taken_up_inside_a_turn_the_agent_started_is_settled() {
+    let mut f = Fixture::new();
+    let first_ends = Gate::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([
+        Step::wake(Duration::ZERO, [Step::TakeUp, Step::Hang]),
+        Step::Wait(first_ends.clone()),
+    ]));
+    let supervisor = f.start(&agent).await;
+    let first = f.send("first");
+    let working = |k: &EventKind| *k == state(SessionState::AgentWorking);
+    f.wait_count("the first turn", 1, working).await;
+    let queued = f.send("queued");
+    wait_message(&agent, f.session_id, "queued").await;
+    assert_eq!(owed_rows(&f), [i64::try_from(queued.0).unwrap()]);
+    first_ends.open();
+    let answer = |k: &EventKind| {
+        *k == EventKind::AgentMessage {
+            parent: None,
+            text: "echo: queued".into(),
+        }
+    };
+    let kinds = f.wait_count("the message's answer", 1, answer).await;
+    // One turn the agent started, which the message joined.
+    assert_eq!(kinds.iter().filter(|k| working(k)).count(), 2);
+    assert!(owed_rows(&f).is_empty());
+    supervisor.shutdown().await.unwrap();
+
+    f.reopen_log();
+    let supervisor = f.start(&agent).await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(errored_after(&f, first), [(errored(TURN_LOST), f.first())]);
+    assert!(owed_rows(&f).is_empty());
+}
+
 /// Every session's messages are checked, not only the one handed over
 /// last: another session's message handed later does not hide one whose
 /// turn never began.

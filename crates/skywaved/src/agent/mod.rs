@@ -304,8 +304,10 @@ pub enum AdapterEvent {
     /// oldest message sent to the agent whose turn has not started (an
     /// agent begins those turns in sending order); false for a turn the
     /// agent started on its own (a scheduled wakeup, a background job's
-    /// report), which answers none. The supervisor settles the messages it
-    /// owes by this alone, so an adapter must not guess it.
+    /// report), which answers none. Reported with `message: true` while a
+    /// turn is open, the agent took that message up inside the open turn,
+    /// whose one `TurnEnded` ends both. The supervisor settles the messages
+    /// it owes by this alone, so an adapter must not guess it.
     TurnStarted { message: bool },
     /// Text the agent wrote for the user. `parent` is the call that started
     /// the subagent that wrote it, or `None` for the main agent.

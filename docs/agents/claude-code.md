@@ -120,6 +120,14 @@ whatever value was sent here (`""` in every recording):
 {"type":"user","message":{"role":"user","content":"Say hi in exactly two words."},"parent_tool_use_id":null,"session_id":""}
 ```
 
+The adapter adds a fresh `"uuid":"<uuid>"` to each. With one, the CLI
+reports the line's progress as `command_lifecycle` lines naming it as
+`command_uuid`: `queued` as it reads the line, `started` as a turn takes it
+up (before that turn's `system/init` when the CLI was idle), `completed`
+after it. No flag is needed. A line without a `uuid` gets none (every
+recording before 2026-11-05). **[C]** (§3.11, "A message meets a turn of
+the CLI's own".)
+
 `content` can also be an array of Anthropic content blocks, which is how the
 SDK sends images and blobs. **[U]**
 
@@ -680,6 +688,26 @@ turn with no user message: `system/init`, a whole turn, `result` (a cron's
 turn is framed by `command_lifecycle`). Such a turn counts as work for the
 idle timer, so the agent is not stopped under it.
 
+**A message meets a turn of the CLI's own** (task b26ecf; probed
+2026-11-05 against 2.1.310, fixture `message_meets_own_turn`, recorded
+with `skywave-claude-compat --only message_meets_own_turn --record`). A
+`user` line written just as a background shell's `task_notification`
+arrives is read (`command_lifecycle` `queued`) before the CLI's own turn
+starts. That turn's `system/init` follows, unasked, and the line is **not**
+its turn: the CLI ran a tool round (`ls`), then took the line up inside the
+same turn (`started` after the tool result), answered it and ended both with
+one `result`. A raw probe without a tool round in the CLI's turn
+(2026-11-05) showed the same merge at the next round; a turn with none
+ends first, and the line is then taken up as a turn of its own. So the
+`init` after a write says nothing about the written line; its `started`
+does. The adapter reports the message's turn on that line alone: with no
+turn open it opens one (`TurnStarted { message: true }`), inside the CLI's
+own turn it reports `TurnStarted { message: true }` within that turn, whose
+`result` ends both. It writes no other message until that `started`, so the
+CLI never holds two of ours. Before this, the adapter opened the message's
+turn as it wrote the line, so the CLI's own turn was shown as the message's
+and a crash in it settled a message that never ran.
+
 **Keep-alive.** A live non-ambient task keeps the agent running; it is
 counted from the uncut set. The idle stop (`idle_timeout`) runs once the set
 is empty. Schedules never keep the agent alive.
@@ -839,10 +867,12 @@ cannot be settled by turn counting; D34 therefore defers messaging a
 subagent.
 
 **`--replay-user-messages`.** With it (`relay_race_echo`) the CLI echoes each
-stdin `user` line as `{"type":"user","isReplay":true,"uuid",...}` right after
-the `init` of the turn that takes it up, before any `assistant` line: a
-definitive marker of which turn is the line's. Unverified: whether an input
-`uuid` is echoed back.
+stdin `user` line as `{"type":"user","isReplay":true,"uuid",...}` where a
+turn takes it up: right after that turn's `init`, or after a tool result
+when a turn already running takes it up (§3.11). An input `uuid` is echoed
+back as is (probe, 2026-11-05). The adapter does not pass the flag: the
+`command_lifecycle` `started` a `uuid` alone brings (§2.1) is the same
+marker.
 
 **`sleep` is blocked.** This CLI refuses a standalone `sleep 25` in a
 subagent ("use Monitor"), so the `relay_live` and `relay_midrun` prompts need
@@ -1152,8 +1182,12 @@ replay-tested on the fixtures in `tests/claude_code.rs`). Choices beyond the
 notes above:
 
 - **Mid-turn messages are queued by the adapter**, not sent: the next user
-  message is written only after the turn's `result`. So each written message
-  is exactly one turn, and the [U] CLI-side queueing (§7) is never relied on.
+  message is written only after the turn's `result`, and only once the CLI
+  has taken the last one up (`command_lifecycle` `started`, §2.1). A
+  message's turn is that `started`, never the `init` after the write: a
+  turn the CLI starts on its own may come first and take the message up
+  inside it (§3.11). An interrupt asked between the write and that
+  `started` is held and written as the next turn opens.
 - **`start` waits for the initialize reply.** A CLI that exits or reports an
   error `result` before it is a start error; with `--resume` (a restart
   or a fork) and `No conversation found` in the error text,

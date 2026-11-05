@@ -177,7 +177,9 @@
 //! CLI's `system/init` with no turn open) reports `message: false` and
 //! settles none, so a message queued behind it stays owed: should the
 //! daemon stop or crash during that turn, the restart names it in the lost
-//! turn's `Errored`. Each settling event is tied to the message it settles
+//! turn's `Errored`. The agent may instead take the message up inside that
+//! turn (`TurnStarted { message: true }` while the turn is open): no
+//! `AgentWorking` follows, so the message is settled as that is read. Each settling event is tied to the message it settles
 //! by position, never by merely following it: the message is first
 //! stored as *starting* (its turn's `AgentWorking` is next) or *settling*
 //! (an `Errored` reporting it is next), with the log's last seq
@@ -1441,8 +1443,10 @@ impl<A: AgentAdapter> Supervisor<A> {
     /// open as `turn_open` says. A message's turn about to open settles the
     /// oldest message the agent owes (an agent begins the turns of the
     /// messages it was handed in order): it is marked starting, and that
-    /// stored, before its `AgentWorking` is logged. A turn the agent
-    /// started on its own settles none. An exit reports every message the
+    /// stored, before its `AgentWorking` is logged. A message the agent
+    /// took up inside the open turn (one it started on its own) gets no
+    /// `AgentWorking`: it is settled, and that stored, now. A turn the
+    /// agent started on its own settles none. An exit reports every message the
     /// agent still owes: they are marked settling, and their count goes
     /// into its `unsent` when the agent counted fewer (an event stream that
     /// ended without `Exited` counts none), so the exit's one `Errored`
@@ -1454,12 +1458,17 @@ impl<A: AgentAdapter> Supervisor<A> {
         turn_open: bool,
     ) -> Result<AdapterEvent> {
         match event {
-            AdapterEvent::TurnStarted { message: true } if !turn_open => {
+            AdapterEvent::TurnStarted { message: true } => {
                 if let Some(owed) = self.owed.get_mut(&id)
                     && let Some(first) =
                         (owed.iter_mut()).find(|owed| owed.state == OwedState::Waiting)
                 {
-                    first.state = OwedState::Starting;
+                    if turn_open {
+                        let seq = first.seq;
+                        self.forget_owed(id, |owed| owed.seq == seq);
+                    } else {
+                        first.state = OwedState::Starting;
+                    }
                     self.store_progress()?;
                 }
                 Ok(event)
