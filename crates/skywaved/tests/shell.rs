@@ -15,14 +15,21 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
-    BlobRef, Command, CommandId, CommandKind, CommandResult, DeviceId, Event, EventKind, RunWhen,
-    Seq, SessionId, ShellEnd,
+    BlobRef, Command, CommandId, CommandKind, CommandResult, DeviceId, Event, EventKind,
+    RejectReason, RunWhen, Seq, SessionId, ShellEnd,
 };
+use skywaved::control::{Confirm, Control, Reply, Request, Stop, Work};
 use skywaved::disk::{Disk, FreeSpace};
+use skywaved::event_log::MAX_SEQ;
 use skywaved::event_log::ShellStatus;
 use skywaved::shell::{DISABLED_REASON, Progress, ShellConfig, ShellHandle, ShellRunner};
-use skywaved::{EventLog, Storage};
+use skywaved::{Activity, EventLog, Storage};
 use tempfile::TempDir;
+use tokio::sync::watch;
+
+#[path = "support/control.rs"]
+mod control;
+use control::{TestClient, stop_after_work, stop_now};
 
 /// Upper bound for any wait; a passing test never gets near it.
 const WAIT: Duration = Duration::from_secs(20);
@@ -387,6 +394,13 @@ fn accepted(result: CommandResult) -> Seq {
     match result {
         CommandResult::Accepted { seq } => seq,
         other => panic!("expected Accepted, got {other:?}"),
+    }
+}
+
+fn rejected(result: CommandResult) -> RejectReason {
+    match result {
+        CommandResult::Rejected { reason } => reason,
+        other => panic!("expected Rejected, got {other:?}"),
     }
 }
 
@@ -1509,5 +1523,173 @@ async fn the_daemon_stops_when_its_shell_runner_fails() {
     f.disk_has_room();
     let runner = f.start().await;
     assert_eq!(f.finished(run).await.end, exited(0));
+    runner.shutdown().await.unwrap();
+}
+
+// Stopping serve over its control socket (`skywaved::control`), with the
+// runs it would lose. No supervisor here: its activity says no turn runs.
+
+impl Fixture {
+    /// The control socket over this log, beside a supervisor with no turns.
+    fn control(&self) -> (Control, watch::Sender<Activity>) {
+        let (activity, watched) = watch::channel(Activity {
+            cursor: MAX_SEQ,
+            turns: false,
+        });
+        let control = Control::bind(
+            self.storage.dir.control_socket(),
+            &self.storage.dir.db_path(),
+            self.log.clone(),
+            watched,
+        )
+        .unwrap();
+        (control, activity)
+    }
+
+    async fn client(&self) -> TestClient {
+        TestClient::connect(&self.storage.dir.control_socket()).await
+    }
+
+    /// Run `run` of `command` in the first session, as the control socket
+    /// lists it.
+    fn listed(&self, run: CommandId, command: &str, started: bool) -> Work {
+        Work::Shell {
+            run,
+            session: self.session,
+            workdir: self.workdir(),
+            command: command.into(),
+            started,
+        }
+    }
+
+    fn try_run(&mut self, command: &str) -> CommandResult {
+        self.handle(
+            DeviceId::new(),
+            CommandId::new(),
+            CommandKind::RunShell {
+                session_id: self.session,
+                command: command.into(),
+                when: RunWhen::Always,
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_stop_now_with_nothing_running_needs_no_confirmation() {
+    let f = Fixture::new();
+    let (mut control, _activity) = f.control();
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_now(Confirm::Nothing)).await,
+        Reply::Stopping { restart: false }
+    );
+    assert_eq!(control.stopped().await, Stop { restart: false });
+}
+
+#[tokio::test]
+async fn a_stop_now_needs_every_running_shell_run_confirmed() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let (mut control, _activity) = f.control();
+    let gate = f.fifo("gate");
+    let command = format!("cat '{}'", gate.display());
+    let held = f.run(&command);
+    f.started(held).await;
+    let running = f.listed(held, &command, true);
+
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_now(Confirm::Nothing)).await,
+        Reply::Busy {
+            work: vec![running.clone()]
+        }
+    );
+    // Asked for since: the confirmation does not cover it.
+    let later = f.run("echo later");
+    let Reply::Busy { work } = client.ask(stop_now(Confirm::Seen(vec![running]))).await else {
+        panic!("refused again");
+    };
+    assert_eq!(work.len(), 2, "{work:?}");
+    assert!(
+        work[1].same(&f.listed(later, "echo later", false)),
+        "{work:?}"
+    );
+
+    assert_eq!(
+        client.ask(stop_now(Confirm::Seen(work))).await,
+        Reply::Stopping { restart: false }
+    );
+    assert_eq!(control.stopped().await, Stop { restart: false });
+    assert_eq!(rejected(f.try_run("echo no")), RejectReason::ServerStopping);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_forced_stop_now_takes_whatever_runs() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let (mut control, _activity) = f.control();
+    let gate = f.fifo("gate");
+    let held = f.run(&format!("cat '{}'", gate.display()));
+    f.started(held).await;
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_now(Confirm::Force)).await,
+        Reply::Stopping { restart: false }
+    );
+    assert_eq!(control.stopped().await, Stop { restart: false });
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_after_work_waits_for_the_shell_runs_and_refuses_new_ones() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let (mut control, _activity) = f.control();
+    let gate = f.fifo("gate");
+    let command = format!("cat '{}'", gate.display());
+    let held = f.run(&command);
+    f.started(held).await;
+
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_after_work(true)).await,
+        Reply::Waiting {
+            work: vec![f.listed(held, &command, true)]
+        }
+    );
+    assert_eq!(rejected(f.try_run("echo no")), RejectReason::ServerStopping);
+
+    open_gate(&gate).await;
+    assert_eq!(f.finished(held).await.end, exited(0));
+    assert!(client.stopping().await);
+    assert_eq!(control.stopped().await, Stop { restart: true });
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_stop_takes_work_again() {
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    let (_control, _activity) = f.control();
+    let gate = f.fifo("gate");
+    let command = format!("cat '{}'", gate.display());
+    let held = f.run(&command);
+    f.started(held).await;
+
+    let mut waiting = f.client().await;
+    assert!(matches!(
+        waiting.ask(stop_after_work(false)).await,
+        Reply::Waiting { .. }
+    ));
+    let mut other = f.client().await;
+    assert_eq!(other.ask(Request::Cancel).await, Reply::Cancelled);
+    assert_eq!(waiting.next().await, Reply::Cancelled);
+    assert_eq!(other.ask(Request::Cancel).await, Reply::NothingToCancel);
+    accepted(f.try_run("echo yes"));
+
+    open_gate(&gate).await;
+    f.finished(held).await;
     runner.shutdown().await.unwrap();
 }

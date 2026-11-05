@@ -25,12 +25,17 @@ use skywaved::agent::fake::{
 use skywaved::agent::import::{self, IMPORT_DEADLINE};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, INTERRUPT_UNANSWERED};
 use skywaved::config::AgentConfig;
+use skywaved::control::{Confirm, Control, Reply, Stop, Work};
 use skywaved::disk::{Disk, FreeSpace};
 use skywaved::supervisor::{
     AGENT_NOT_RUNNING, BYPASS_NOT_ALLOWED, DAEMON_RESTARTED, MESSAGE_LOST, TURN_LOST,
 };
 use skywaved::{EventLog, Storage, Supervisor, SupervisorConfig, SupervisorHandle};
 use tempfile::TempDir;
+
+#[path = "support/control.rs"]
+mod control;
+use control::{TestClient, stop_after_work, stop_now};
 
 /// Upper bound for any wait; a passing test never gets near it.
 const WAIT: Duration = Duration::from_secs(10);
@@ -5425,4 +5430,129 @@ async fn a_fork_waits_for_its_origin_sessions_stop() {
             FakeInput::Shutdown,
         ]
     );
+}
+
+// Stopping serve over its control socket (`skywaved::control`) while a
+// turn runs or is on its way.
+
+impl Fixture {
+    fn control(&self, supervisor: &SupervisorHandle) -> Control {
+        Control::bind(
+            self.storage.dir.control_socket(),
+            &self.storage.dir.db_path(),
+            self.log.clone(),
+            supervisor.activity(),
+        )
+        .unwrap()
+    }
+
+    async fn client(&self) -> TestClient {
+        TestClient::connect(&self.storage.dir.control_socket()).await
+    }
+
+    /// The session's turn as the control socket lists it.
+    fn listed_turn(&self) -> Work {
+        Work::Turn {
+            session: self.session_id,
+            workdir: (self.log.session(&self.storage.db, self.session_id))
+                .unwrap()
+                .unwrap()
+                .workdir,
+        }
+    }
+
+    fn try_send(&mut self, text: &str) -> CommandResult {
+        let context = self.current();
+        self.handle(
+            DeviceId::new(),
+            CommandKind::SendMessage {
+                session_id: self.session_id,
+                context,
+                text: text.into(),
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_stop_now_needs_the_running_turn_confirmed() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_count("the turn", 1, |k| *k == state(SessionState::AgentWorking))
+        .await;
+    let mut control = f.control(&supervisor);
+    let mut client = f.client().await;
+    let turn = f.listed_turn();
+    assert_eq!(
+        client.ask(stop_now(Confirm::Nothing)).await,
+        Reply::Busy {
+            work: vec![turn.clone()]
+        }
+    );
+    assert_eq!(
+        client.ask(stop_now(Confirm::Seen(vec![turn]))).await,
+        Reply::Stopping { restart: false }
+    );
+    assert_eq!(control.stopped().await, Stop { restart: false });
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_after_work_waits_for_the_running_turn_and_refuses_messages() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Hang]));
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    f.wait_count("the turn", 1, |k| *k == state(SessionState::AgentWorking))
+        .await;
+    let mut control = f.control(&supervisor);
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_after_work(false)).await,
+        Reply::Waiting {
+            work: vec![f.listed_turn()]
+        }
+    );
+    assert_eq!(rejected(f.try_send("more")), RejectReason::ServerStopping);
+    // Control is still taken.
+    accepted(f.interrupt());
+    f.wait_count("the interrupted turn's end", 1, is_idle).await;
+    assert!(!client.stopping().await);
+    assert_eq!(control.stopped().await, Stop { restart: false });
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A message accepted before the wait began, whose agent still starts: no
+/// turn is in the log yet, but the supervisor has it on its way.
+#[tokio::test]
+async fn a_stop_after_work_waits_for_a_message_whose_agent_still_starts() {
+    let mut f = Fixture::new();
+    let turn = Gate::new();
+    let agent = FakeAgent::new(FakeScript::new().turn([Step::Wait(turn.clone())]));
+    let started = Gate::new();
+    agent.hold_start(f.session_id, started.clone());
+    let supervisor = f.start(&agent).await;
+    f.send("work");
+    wait_inputs(&agent, f.session_id, "the held start", |i| !i.is_empty()).await;
+
+    let mut control = f.control(&supervisor);
+    let mut client = f.client().await;
+    assert_eq!(
+        client.ask(stop_after_work(true)).await,
+        Reply::Waiting { work: vec![] }
+    );
+    started.open();
+    assert_eq!(
+        client.next().await,
+        Reply::Waiting {
+            work: vec![f.listed_turn()]
+        }
+    );
+    turn.open();
+    f.wait_count("the turn's end", 1, is_idle).await;
+    assert!(client.stopping().await);
+    assert_eq!(control.stopped().await, Stop { restart: true });
+    supervisor.shutdown().await.unwrap();
 }

@@ -200,7 +200,8 @@ every version.
 `skywaved`. Its config keys are in the README; its data directory holds
 `skywave.db` (SQLite, WAL), `blobs/`, `ca/` and `server/` (ECDSA P-256 keys,
 mode 0600), `server_id`, `shell/` (running shell output until it becomes
-a blob) and `serve.lock` (held locked by the one running `serve`).
+a blob), `serve.lock` (held locked by the one running `serve`) and
+`control.sock` (where that `serve` takes `stop` and `restart`, D41).
 `serve` creates the CA, certificate and id on first run and reissues the certificate (same CA) when its names change, warning when a
 name was dropped (devices that connect by it fail with a name mismatch). A missing
 `ca/` is recreated by `serve` or `pair`; when unrevoked devices are registered,
@@ -208,6 +209,24 @@ the command warns on stderr (and in the log) that every one must re-pair. Both
 warnings go to the command's stderr as well as the log. Admin commands
 (`pair`, `devices list`, `devices revoke`) work on the database directly,
 beside a running `serve`.
+
+`stop` and `restart` (D41) instead ask the running `serve` over
+`control.sock` in its data dir (JSON lines, `crates/skywaved/src/control.rs`)
+and never open the database: a binary deployed since would migrate it under
+the running `serve`. With work running (a session with `turn_active` or a
+message owed to its agent, a shell run not finished) a stop now is refused
+with that list, and is taken when asked again confirming it (or forced),
+unless more started since. `--after-work` sets the log's *stopping* flag:
+the commands that start new work are refused `ServerStopping` (checked
+inside the command's write transaction, like `DiskLow`, and first). `serve`
+then stops once no shell run is unfinished and the supervisor's published
+activity has no turn running or on its way (owed, held for a start or
+stop, open) and has read the log up to where the refusals began, which it
+records under the write lock. It checks again at every append and every
+supervisor step, never on a timer. `--cancel` clears the flag. Any decided
+stop is SIGTERM's graceful stop; a restart then executes `serve`'s binary
+path, read at start, again with the same arguments and pid. The
+connection stays open until the old `serve` is gone.
 
 Opening the database migrates its schema (`PRAGMA user_version`), but no
 migration rewrites the wire JSON its columns hold. So the database records

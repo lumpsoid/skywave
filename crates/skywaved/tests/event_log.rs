@@ -1671,118 +1671,162 @@ fn a_low_disk_refuses_new_work_and_takes_control() {
     free.set(10);
     let disk = Disk::new(free.clone(), 10);
     f.log = f.log.clone().with_disk(disk.clone());
-    let session = f.create_session();
-    let first = ContextId::first_of(session);
-    // Something to stop and to answer.
-    f.agent(
-        session,
-        EventKind::BackgroundTasksChanged {
-            tasks: vec![shell("t1")],
-        },
-    );
-    f.start_turn(session);
-    let approval = f.request_approval(session);
-    let run = Command {
-        id: CommandId::new(),
-        kind: CommandKind::RunShell {
-            session_id: session,
-            command: "make".into(),
-            when: RunWhen::Always,
-        },
-    };
-    accepted(
-        f.log
-            .handle(&mut f.storage.db, DeviceId::new(), &run)
-            .unwrap(),
-    );
-    let run = run.id;
+    let open = OpenWork::new(&mut f);
 
     free.set(9);
     assert!(disk.check());
-    let head = f.log.head();
-    let refused = [
-        CommandKind::CreateSession {
-            workdir: workdir(&f.root.join("project")),
-            conversation: None,
-        },
-        CommandKind::SendMessage {
-            session_id: session,
-            context: first,
-            text: "hi".into(),
-        },
-        CommandKind::SetPermissionMode {
-            session_id: session,
-            mode: PermissionMode::Plan,
-        },
-        CommandKind::SetModel {
-            session_id: session,
-            model: "opus".into(),
-        },
-        CommandKind::SetEffort {
-            session_id: session,
-            effort: Effort::High,
-        },
-        clear_kind(session, "another"),
-        // Refused before the move is checked at all.
-        move_kind(session, first, "moved"),
-        CommandKind::RunShell {
-            session_id: session,
-            command: "make".into(),
-            when: RunWhen::Always,
-        },
-    ];
-    for kind in refused {
-        assert_eq!(
-            f.handle(kind.clone()),
-            rejected(RejectReason::DiskLow),
-            "{kind:?}"
-        );
-    }
-    assert_eq!(f.log.head(), head, "a refused command logs nothing");
-
-    let taken = [
-        CommandKind::ResolveApproval {
-            id: approval,
-            decision: Decision::Approve,
-            rule: None,
-        },
-        CommandKind::Interrupt {
-            session_id: session,
-        },
-        stop_kind(session, "t1"),
-        CommandKind::StopShell {
-            session_id: session,
-            run,
-        },
-        CommandKind::RenameSession {
-            session_id: session,
-            name: Some("renamed".into()),
-        },
-        CommandKind::SetSessionArchived {
-            session_id: session,
-            archived: true,
-        },
-        CommandKind::SwitchContext {
-            session_id: session,
-            context: first,
-        },
-        CommandKind::StopSession {
-            session_id: session,
-        },
-    ];
+    open.refused(&mut f, RejectReason::DiskLow);
     let reads = free.reads();
-    for kind in taken {
-        accepted(f.handle(kind));
-    }
+    open.taken(&mut f);
     assert_eq!(free.reads(), reads, "control reads no free space");
 
     free.set(10);
     assert!(!disk.check());
-    accepted(f.handle(CommandKind::SendMessage {
-        session_id: session,
-        context: first,
-        text: "hi".into(),
-    }));
+    open.message(&mut f);
+}
+
+/// While the server stops after its running work, the same commands are
+/// refused `ServerStopping`, and the same control goes through. Once the
+/// stop is cancelled, work is taken again.
+#[test]
+fn a_server_stopping_refuses_new_work_and_takes_control() {
+    let mut f = Fixture::with_shell();
+    let open = OpenWork::new(&mut f);
+    f.log.set_stopping(true);
+    open.refused(&mut f, RejectReason::ServerStopping);
+    open.taken(&mut f);
+    f.log.set_stopping(false);
+    open.message(&mut f);
+}
+
+/// A session with something to stop and to answer: a background task, a
+/// turn with an approval pending and a shell run.
+struct OpenWork {
+    session: SessionId,
+    approval: ApprovalId,
+    run: CommandId,
+}
+
+impl OpenWork {
+    fn new(f: &mut Fixture) -> OpenWork {
+        let session = f.create_session();
+        f.agent(
+            session,
+            EventKind::BackgroundTasksChanged {
+                tasks: vec![shell("t1")],
+            },
+        );
+        f.start_turn(session);
+        let approval = f.request_approval(session);
+        let run = Command {
+            id: CommandId::new(),
+            kind: CommandKind::RunShell {
+                session_id: session,
+                command: "make".into(),
+                when: RunWhen::Always,
+            },
+        };
+        accepted(
+            f.log
+                .handle(&mut f.storage.db, DeviceId::new(), &run)
+                .unwrap(),
+        );
+        OpenWork {
+            session,
+            approval,
+            run: run.id,
+        }
+    }
+
+    /// Every command that starts new work is refused `reason`, and logs
+    /// nothing.
+    fn refused(&self, f: &mut Fixture, reason: RejectReason) {
+        let session = self.session;
+        let first = ContextId::first_of(session);
+        let head = f.log.head();
+        let refused = [
+            CommandKind::CreateSession {
+                workdir: workdir(&f.root.join("project")),
+                conversation: None,
+            },
+            CommandKind::SendMessage {
+                session_id: session,
+                context: first,
+                text: "hi".into(),
+            },
+            CommandKind::SetPermissionMode {
+                session_id: session,
+                mode: PermissionMode::Plan,
+            },
+            CommandKind::SetModel {
+                session_id: session,
+                model: "opus".into(),
+            },
+            CommandKind::SetEffort {
+                session_id: session,
+                effort: Effort::High,
+            },
+            clear_kind(session, "another"),
+            // Refused before the move is checked at all.
+            move_kind(session, first, "moved"),
+            CommandKind::RunShell {
+                session_id: session,
+                command: "make".into(),
+                when: RunWhen::Always,
+            },
+        ];
+        for kind in refused {
+            assert_eq!(f.handle(kind.clone()), rejected(reason), "{kind:?}");
+        }
+        assert_eq!(f.log.head(), head, "a refused command logs nothing");
+    }
+
+    /// Control and small bookkeeping are taken.
+    fn taken(&self, f: &mut Fixture) {
+        let session = self.session;
+        let taken = [
+            CommandKind::ResolveApproval {
+                id: self.approval,
+                decision: Decision::Approve,
+                rule: None,
+            },
+            CommandKind::Interrupt {
+                session_id: session,
+            },
+            stop_kind(session, "t1"),
+            CommandKind::StopShell {
+                session_id: session,
+                run: self.run,
+            },
+            CommandKind::RenameSession {
+                session_id: session,
+                name: Some("renamed".into()),
+            },
+            CommandKind::SetSessionArchived {
+                session_id: session,
+                archived: true,
+            },
+            CommandKind::SwitchContext {
+                session_id: session,
+                context: ContextId::first_of(session),
+            },
+            CommandKind::StopSession {
+                session_id: session,
+            },
+        ];
+        for kind in taken {
+            accepted(f.handle(kind));
+        }
+    }
+
+    /// A message is taken.
+    fn message(&self, f: &mut Fixture) {
+        accepted(f.handle(CommandKind::SendMessage {
+            session_id: self.session,
+            context: ContextId::first_of(self.session),
+            text: "hi".into(),
+        }));
+    }
 }
 
 #[test]

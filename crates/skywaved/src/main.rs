@@ -8,6 +8,9 @@ use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
 use skywaved::agent::{NoOutsideConversations, OutsideConversations};
 use skywaved::config::{Config, ProcessEnv};
+#[cfg(unix)]
+use skywaved::control::{Client, Confirm, Control, Reply, Request, When};
+use skywaved::data_dir::CONTROL_SOCKET_FILE;
 use skywaved::devices::{self, Revoke};
 use skywaved::disk::{Disk, FsFreeSpace};
 use skywaved::identity::{ServerIdentity, local_hostname, server_names};
@@ -42,6 +45,26 @@ enum Command {
         #[command(subcommand)]
         command: DevicesCommand,
     },
+    /// Stop the running serve. Refused while agent turns or shell runs are
+    /// running, unless you confirm losing them.
+    Stop(StopArgs),
+    /// Stop the running serve as `stop` does, then start it again with the
+    /// same arguments (and the binary now at its path).
+    Restart(StopArgs),
+}
+
+#[derive(clap::Args)]
+struct StopArgs {
+    /// Stop once the running agent turns and shell runs have ended; new
+    /// messages and shell runs are refused meanwhile.
+    #[arg(long, conflicts_with_all = ["force", "cancel"])]
+    after_work: bool,
+    /// Stop now without asking, losing whatever runs.
+    #[arg(long, conflicts_with = "cancel")]
+    force: bool,
+    /// Cancel a stop waiting for the running work, and take work again.
+    #[arg(long)]
+    cancel: bool,
 }
 
 #[derive(Subcommand)]
@@ -80,8 +103,17 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> skywaved::Result<()> {
     let config = Config::load(cli.config.as_deref(), &ProcessEnv)?;
+    // A stop or restart only talks to the running serve: opening the data
+    // dir would migrate it under that serve, from a binary deployed since.
+    let socket = config.data_dir.join(CONTROL_SOCKET_FILE);
+    match &cli.command {
+        Command::Stop(args) => return request_stop(&socket, false, args),
+        Command::Restart(args) => return request_stop(&socket, true, args),
+        _ => {}
+    }
     skywaved::logging::init(config.log_file.as_deref())?;
-    // Every subcommand works on the data dir, so open (and migrate) it first.
+    // Every other subcommand works on the data dir, so open (and migrate)
+    // it first.
     let mut storage = Storage::open(&config.data_dir)?;
     tracing::debug!(data_dir = %storage.dir.root().display(), "opened data dir");
 
@@ -99,6 +131,12 @@ fn run(cli: Cli) -> skywaved::Result<()> {
             // this dir fails before it touches the identity or the blobs.
             let _serve_lock = storage.dir.lock_for_serve()?;
             let identity = bootstrap()?;
+            // Before anything can replace the binary: a restart executes
+            // the one at this path then.
+            let exe = std::env::current_exe().map_err(|source| skywaved::Error::Io {
+                context: "finding the skywaved binary".into(),
+                source,
+            })?;
             tracing::info!(
                 server_id = %identity.server_id().0,
                 ca_fingerprint = %identity.ca_fingerprint(),
@@ -112,8 +150,17 @@ fn run(cli: Cli) -> skywaved::Result<()> {
                     context: "starting the async runtime".into(),
                     source,
                 })?;
-            runtime.block_on(serve(&config, &mut storage, identity))?;
+            let exit = runtime.block_on(serve(&config, &mut storage, identity))?;
+            if exit == Exit::Restart {
+                // Everything `serve` held goes before the new one starts:
+                // its connections and tasks, the database, the serve lock.
+                drop(runtime);
+                drop(storage);
+                drop(_serve_lock);
+                return Err(restart(&exe));
+            }
         }
+        Command::Stop(_) | Command::Restart(_) => unreachable!("handled before the data dir"),
         Command::Pair { ttl } => {
             let identity = bootstrap()?;
             let issued = pairing::issue_code(storage.db.conn(), Utc::now(), ttl)?;
@@ -183,12 +230,21 @@ fn warn_operator(identity: &ServerIdentity, storage: &Storage) -> skywaved::Resu
     Ok(())
 }
 
-/// Runs the daemon until Ctrl-C or SIGTERM.
+/// How `serve` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    Stop,
+    /// Stopped by `skywaved restart`: start again.
+    Restart,
+}
+
+/// Runs the daemon until Ctrl-C, SIGTERM or a `skywaved stop` or
+/// `restart`.
 async fn serve(
     config: &Config,
     storage: &mut Storage,
     identity: ServerIdentity,
-) -> skywaved::Result<()> {
+) -> skywaved::Result<Exit> {
     let disk = Disk::new(
         Arc::new(FsFreeSpace::new(&config.data_dir)),
         config.disk.min_free,
@@ -198,7 +254,7 @@ async fn serve(
     // Then read against the floor, so a start below it comes up paused.
     tokio::select! {
         () = disk.wait_to_start() => {}
-        () = shutdown_signal() => return Ok(()),
+        () = shutdown_signal() => return Ok(Exit::Stop),
     }
     // The one event log of the process: every writer shares it so appends
     // wake the API's long-polls. The shell and bypass flags and the disk
@@ -243,6 +299,13 @@ async fn serve(
         SupervisorConfig::default(),
     )
     .await?;
+    #[cfg(unix)]
+    let mut control = Control::bind(
+        storage.dir.control_socket(),
+        &storage.dir.db_path(),
+        log.clone(),
+        supervisor.activity(),
+    )?;
     // Always started: disabled, it still settles runs an enabled daemon
     // left, then ends.
     let mut shell = ShellRunner::start(config.data_dir.clone(), log, config.shell.clone()).await?;
@@ -255,9 +318,24 @@ async fn serve(
     // without one would accept runs nothing starts, or messages no agent
     // hears. Its error is what `shutdown` returns, so the daemon exits
     // non-zero; the next start settles what it left.
+    let exit = std::cell::Cell::new(Exit::Stop);
+    #[cfg(unix)]
+    let requested = async {
+        let stop = control.stopped().await;
+        tracing::info!(
+            restart = stop.restart,
+            "stop requested on the control socket"
+        );
+        if stop.restart {
+            exit.set(Exit::Restart);
+        }
+    };
+    #[cfg(not(unix))]
+    let requested = std::future::pending::<()>();
     let stop = async {
         tokio::select! {
             () = shutdown_signal() => {}
+            () = requested => {}
             () = shell.failed() => tracing::error!("shell runner failed; stopping the daemon"),
             () = supervisor.failed() => {
                 tracing::error!("agent supervisor failed; stopping the daemon");
@@ -270,7 +348,165 @@ async fn serve(
     shell_stopped?;
     served?;
     tracing::info!("stopped");
-    Ok(())
+    Ok(exit.get())
+}
+
+/// Executes the binary at `exe` with this process's arguments, in its
+/// place; returns only if that fails.
+#[cfg(unix)]
+fn restart(exe: &std::path::Path) -> skywaved::Error {
+    use std::os::unix::process::CommandExt;
+    let mut args = std::env::args_os();
+    let mut command = std::process::Command::new(exe);
+    if let Some(arg0) = args.next() {
+        command.arg0(arg0);
+    }
+    tracing::info!(exe = %exe.display(), "restarting");
+    let source = command.args(args).exec();
+    skywaved::Error::Io {
+        context: format!("restarting {}", exe.display()),
+        source,
+    }
+}
+
+#[cfg(not(unix))]
+fn restart(_exe: &std::path::Path) -> skywaved::Error {
+    skywaved::Error::Control("restart needs Unix".into())
+}
+
+/// `skywaved stop` / `restart`: asks the running `serve` over its control
+/// socket, and waits until it has stopped (or the wait is cancelled).
+#[cfg(unix)]
+fn request_stop(socket: &std::path::Path, restart: bool, args: &StopArgs) -> skywaved::Result<()> {
+    use std::io::IsTerminal;
+    let mut client = Client::connect(socket)?;
+    let mut request = if args.cancel {
+        Request::Cancel
+    } else {
+        Request::Stop {
+            restart,
+            when: if args.after_work {
+                When::AfterWork
+            } else {
+                When::Now
+            },
+            confirm: if args.force {
+                Confirm::Force
+            } else {
+                Confirm::Nothing
+            },
+        }
+    };
+    let gone = || skywaved::Error::Control("serve closed the connection without an answer".into());
+    loop {
+        client.send(&request)?;
+        let reply = client.reply()?.ok_or_else(gone)?;
+        match reply {
+            Reply::Busy { work } => {
+                eprintln!("skywaved: running now, and lost if it stops:");
+                for item in &work {
+                    eprintln!("  - {item}");
+                }
+                if !std::io::stdin().is_terminal() {
+                    return Err(skywaved::Error::Control(
+                        "not stopped: pass --force to stop anyway, or --after-work to stop                          once it has ended"
+                            .into(),
+                    ));
+                }
+                eprint!("Stop anyway? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|source| skywaved::Error::Io {
+                        context: "reading the answer".into(),
+                        source,
+                    })?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    eprintln!("skywaved: not stopped");
+                    return Ok(());
+                }
+                if let Request::Stop { confirm, .. } = &mut request {
+                    *confirm = Confirm::Seen(work);
+                }
+            }
+            reply => return follow_stop(&mut client, reply),
+        }
+    }
+}
+
+/// Prints how a stop goes from `reply` on, until `serve` has stopped.
+#[cfg(unix)]
+fn follow_stop(client: &mut Client, mut reply: Reply) -> skywaved::Result<()> {
+    let mut hinted = false;
+    loop {
+        match reply {
+            Reply::Waiting { work } => {
+                if work.is_empty() {
+                    eprintln!(
+                        "skywaved: refusing new work; waiting for the agents to take up what \
+                         was sent"
+                    );
+                } else {
+                    eprintln!("skywaved: refusing new work; stopping once this has ended:");
+                    for item in &work {
+                        eprintln!("  - {item}");
+                    }
+                }
+                if !hinted {
+                    eprintln!(
+                        "  (Ctrl-C here leaves serve waiting; `skywaved stop --cancel` takes \
+                         work again)"
+                    );
+                    hinted = true;
+                }
+            }
+            Reply::Stopping { restart } => {
+                eprintln!("skywaved: stopping");
+                // The connection closes once serve has stopped.
+                while client.reply()?.is_some() {}
+                eprintln!(
+                    "skywaved: {}",
+                    if restart {
+                        "stopped; starting again"
+                    } else {
+                        "stopped"
+                    }
+                );
+                return Ok(());
+            }
+            Reply::Cancelled => {
+                eprintln!("skywaved: stop cancelled; taking work again");
+                return Ok(());
+            }
+            Reply::NothingToCancel => {
+                eprintln!("skywaved: no stop was waiting");
+                return Ok(());
+            }
+            Reply::Failed { message } => return Err(skywaved::Error::Control(message)),
+            Reply::Busy { .. } => {
+                return Err(skywaved::Error::Control("unexpected answer".into()));
+            }
+        }
+        reply = match client.reply()? {
+            Some(reply) => reply,
+            None => {
+                return Err(skywaved::Error::Control(
+                    "serve closed the connection".into(),
+                ));
+            }
+        };
+    }
+}
+
+#[cfg(not(unix))]
+fn request_stop(
+    _socket: &std::path::Path,
+    _restart: bool,
+    _args: &StopArgs,
+) -> skywaved::Result<()> {
+    Err(skywaved::Error::Control(
+        "stop and restart need Unix".into(),
+    ))
 }
 
 /// Completes on Ctrl-C or, on Unix, SIGTERM.

@@ -285,6 +285,25 @@ skywaved devices revoke <id>
 
 Admin commands work on the database directly, so `serve` can keep running.
 
+### Stopping and restarting the server
+
+```sh
+skywaved restart               # stop serve, then start it again (new binary included)
+skywaved restart --after-work  # wait for running turns and shell runs to end first
+skywaved stop                  # stop serve
+skywaved stop --cancel         # call off a stop that is waiting (--after-work)
+```
+
+A stop ends whatever runs: a running turn or shell run is lost and reported
+so in its session. So if anything runs, `stop` and `restart` list it and ask
+before stopping. Without a terminal they refuse instead, unless you pass
+`--force`. `--after-work` refuses new messages and shell runs and stops once
+the running ones have ended. Approvals, interrupts and stops still work in
+the meantime, so you can finish them from a device. `restart` executes the
+`serve` binary at its path again in the same process, so it works under
+systemd, `nohup` or a terminal, and picks up a binary you deployed since.
+SIGTERM (`systemctl stop`, Ctrl-C) still stops right away.
+
 ### Pair a phone
 
 1. **Install the app.** Build the Flutter head for Android as in

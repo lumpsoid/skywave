@@ -88,6 +88,11 @@ pub enum Error {
     Supervisor(String),
     #[error("shell runner: {0}")]
     Shell(String),
+    /// No `serve` listens on the data dir's control socket.
+    #[error("no skywaved serve is running on {}", path.display())]
+    NotServing { path: PathBuf },
+    #[error("control socket: {0}")]
+    Control(String),
     /// A workdir snapshot reached its request's deadline (`crate::workdir`);
     /// the API answers 503.
     #[error("workdir snapshot passed its deadline")]
