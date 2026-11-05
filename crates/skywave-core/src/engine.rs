@@ -42,7 +42,8 @@
 //!   408: [`TransportError::failed_request`]) is no answer, but it keeps
 //!   the connection too, and the command is resent after a backoff: the
 //!   request has a connection of its own, so the pull's tells whether the
-//!   link is down.
+//!   link is down. Taking a command back (`OutboxChanged`) ends the wait to
+//!   resend it, and the next command goes.
 //!
 //! `Link` moves as follows: `Connecting` when the link (re)starts; after
 //! `hello`, `CatchingUp { have, server }` while the cursor is behind the
@@ -977,7 +978,9 @@ async fn send(
 /// such failures in a row (`failures`), as often as it takes: if the link
 /// is down, the pull fails and ends the connection. The server may have
 /// taken the command meanwhile; then the pull settles it and the resend
-/// cannot claim it, or the server answers the resend from its dedup.
+/// cannot claim it, or the server answers the resend from its dedup. The
+/// user may take it back while it waits ([`resend_after`]); an answer to a
+/// request still out then settles nothing.
 async fn send_entry(
     ctx: &LinkCtx,
     transport: &dyn Transport,
@@ -1009,7 +1012,7 @@ async fn send_entry(
             if count < MAX_SERVER_ERRORS {
                 let after = ctx.config.backoff.delay(count);
                 tracing::warn!(%error, ?id, count, ?after, "server error; sending again");
-                tokio::time::sleep(after).await;
+                resend_after(ctx, id, after).await?;
             } else {
                 tracing::warn!(%error, ?id, count, "server error again; settling from the log");
                 settled_by_log(ctx, transport, id).await?;
@@ -1020,10 +1023,36 @@ async fn send_entry(
             let count = failures.note(id);
             let after = ctx.config.backoff.delay(count);
             tracing::debug!(%error, ?id, count, ?after, "command request failed; sending again");
-            tokio::time::sleep(after).await;
+            resend_after(ctx, id, after).await?;
             Ok(false)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Waits `after` before the outbox command `id` is sent again, or less once
+/// it is no longer pending: the user took it back ([`Store::withdraw`]), so
+/// the next command goes at once, or the log settled it.
+///
+/// [`Store::withdraw`]: crate::Store::withdraw
+async fn resend_after(ctx: &LinkCtx, id: CommandId, after: Duration) -> Result<(), LinkError> {
+    let resend = tokio::time::sleep(after);
+    tokio::pin!(resend);
+    loop {
+        // Asked for before the look, so a change in between still wakes it.
+        let changed = ctx.outbox.notified();
+        if !ctx
+            .seam
+            .pending_outbox()?
+            .iter()
+            .any(|e| e.command.id == id)
+        {
+            return Ok(());
+        }
+        tokio::select! {
+            () = &mut resend => return Ok(()),
+            () = changed => {}
+        }
     }
 }
 
@@ -2209,6 +2238,62 @@ mod tests {
             !links.iter().any(|l| matches!(l, Link::Reconnecting { .. })),
             "{links:?}"
         );
+    }
+
+    /// A command whose request never gets through can be taken back while
+    /// the sender waits to resend it: the wait ends there, the command
+    /// behind it goes out at once, and the link stays up.
+    #[tokio::test(start_paused = true)]
+    async fn taking_back_a_stuck_command_lets_the_next_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let seam = paired_seam(dir.path());
+        create(&seam, "/slow");
+        create(&seam, "/later");
+        let stuck = seam.pending_outbox().unwrap()[0].command.id;
+
+        let server = Arc::new(StallingServer {
+            stalls: AtomicUsize::new(usize::MAX),
+            hellos: AtomicUsize::new(0),
+            pulled: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        });
+        let fake = server.clone();
+        let (wall_clock, _) = paused_wall();
+        let config = EngineConfig {
+            wait_secs: 10,
+            backoff: Backoff {
+                base: Duration::from_secs(60),
+                cap: Duration::from_secs(60),
+                jitter: Jitter::fixed(1.0),
+            },
+            connector: Connector::new(move |_, _, _, _| Ok(fake.clone() as Arc<dyn Transport>)),
+            wall_clock,
+            ..EngineConfig::default()
+        };
+        let ctx = link_ctx(&seam, config, Arc::new(Notify::new()));
+        let outbox = ctx.outbox.clone();
+        let link = tokio::spawn(run_link(ctx));
+
+        // The first try stalls out at 30 s; the resend waits until 90 s.
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert!(seam.pending_outbox().unwrap()[0].tries > 0);
+        seam.core.dispatch(crate::Action::Discard(stuck)).unwrap();
+        // What the engine does with the dispatch's `OutboxChanged`.
+        outbox.notify_one();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(seam.pending_outbox().unwrap().is_empty());
+        link.abort();
+        let workdirs: Vec<_> = server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(w, _)| w.clone())
+            .collect();
+        assert_eq!(workdirs, ["/slow", "/later"]);
+        assert_eq!(server.hellos.load(Ordering::SeqCst), 1, "one connection");
     }
 
     /// A server with a log of one session: a message logs its event once

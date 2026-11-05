@@ -594,7 +594,13 @@ logs) an event that no longer decodes rather than failing.
   request has a connection of its own, so it does not end the link
   either: the pull goes on, and the command is resent, same id, after a
   backoff for the failures in a row, as often as it takes. A link that
-  is really down fails the pull, which ends the connection. Reconnects back off
+  is really down fails the pull, which ends the connection. The user may
+  take back any message, shell run, session creation or context move the
+  server has not accepted, sent or not (`OutboxEntry::discardable`): the
+  row goes, the wait to resend it ends and the next command goes out. One
+  already sent may have reached the server anyway; then its event shows it
+  in the log like any other, and an answer that still comes settles
+  nothing. Reconnects back off
   exponentially with jitter to 30 s. The attempt count starts over after a
   connection that made progress (a pull returned or the server settled a
   command); `hello` alone is not progress, so a server that answers it and

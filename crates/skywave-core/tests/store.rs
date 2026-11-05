@@ -505,12 +505,6 @@ fn outbox_survives_restart() {
         store.outbox().unwrap()[2].status,
         OutboxStatus::Done(rejected)
     );
-
-    let unknown = CommandId::new();
-    assert!(matches!(
-        store.record_result(unknown, &CommandResult::Accepted { seq: Seq(1) }, Utc::now()),
-        Err(StoreError::UnknownCommand(id)) if id == unknown
-    ));
 }
 
 fn at(second: u32) -> chrono::DateTime<Utc> {
@@ -1535,7 +1529,7 @@ fn enqueue_message_clears_its_draft_atomically() {
 }
 
 #[test]
-fn withdraw_only_never_attempted_or_refused() {
+fn withdraw_anything_not_accepted() {
     let (_tmp, dir) = data_dir();
     let store = Store::open(&dir).unwrap();
     let session = SessionId::new();
@@ -1587,8 +1581,8 @@ fn withdraw_only_never_attempted_or_refused() {
         discardable,
         [
             ("fresh", true),
-            ("claimed", false),
-            ("requeued", false),
+            ("claimed", true),
+            ("requeued", true),
             ("refused", true),
             ("undeliverable", true),
             ("accepted", false),
@@ -1596,27 +1590,33 @@ fn withdraw_only_never_attempted_or_refused() {
         .map(|(text, discardable)| (text.to_owned(), discardable))
     );
 
-    // What may have reached the server, or was accepted, stays.
-    for command in [&claimed, &requeued, &accepted] {
-        assert!(matches!(
-            store.withdraw(command.id, None),
-            Err(StoreError::NotWithdrawable(id)) if id == command.id
-        ));
-    }
+    // Only what was accepted stays.
+    assert!(matches!(
+        store.withdraw(accepted.id, None),
+        Err(StoreError::NotWithdrawable(id)) if id == accepted.id
+    ));
     assert!(matches!(
         store.withdraw(CommandId::new(), None),
         Err(StoreError::NotWithdrawable(_))
     ));
-    store.withdraw(fresh.id, None).unwrap();
-    store.withdraw(refused.id, None).unwrap();
-    store.withdraw(undeliverable.id, None).unwrap();
+    for command in [&fresh, &claimed, &requeued, &refused, &undeliverable] {
+        store.withdraw(command.id, None).unwrap();
+    }
     let left: Vec<CommandId> = store
         .outbox()
         .unwrap()
         .iter()
         .map(|e| e.command.id)
         .collect();
-    assert_eq!(left, [claimed.id, requeued.id, accepted.id]);
+    assert_eq!(left, [accepted.id]);
+
+    // An answer to a request still out when it was taken back settles
+    // nothing.
+    store
+        .record_result(claimed.id, &CommandResult::Accepted { seq: Seq(2) }, at(4))
+        .unwrap();
+    store.record_undeliverable(requeued.id, at(4)).unwrap();
+    assert_eq!(store.outbox().unwrap().len(), 1);
 
     // A session creation is withdrawn the same way; other kinds are not
     // discardable even if never sent.
@@ -1636,8 +1636,8 @@ fn withdraw_only_never_attempted_or_refused() {
     store.enqueue(&create).unwrap();
     store.enqueue(&interrupt).unwrap();
     let outbox = store.outbox().unwrap();
-    assert!(outbox[3].discardable());
-    assert!(!outbox[4].discardable());
+    assert!(outbox[1].discardable());
+    assert!(!outbox[2].discardable());
     store.withdraw(create.id, None).unwrap();
 }
 
@@ -2612,8 +2612,8 @@ fn a_queued_run_drops_the_shell_draft_and_a_message_the_agent_draft() {
     assert!(outbox[0].discardable());
     store.claim_send(outbox[0].command.id, at(1)).unwrap();
     assert!(
-        !store.pending_outbox().unwrap()[0].discardable(),
-        "it may have reached the server"
+        store.pending_outbox().unwrap()[0].discardable(),
+        "unanswered, it may still go"
     );
 }
 

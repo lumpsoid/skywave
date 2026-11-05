@@ -254,8 +254,9 @@ command in the session's workdir; `↑` / `Ctrl-P` recall earlier commands.
 `Ctrl-O`'s condition shows beside the prompt (`work [if ok ✓] $`), never in
 the text: `&&` is just text, passed to the shell. On the runs, `j` / `k`
 select, `Enter` shows a run's whole output, `d` downloads it, `y` copies it
-with colours stripped, and `e` / `Del` edit or take back a command not sent
-yet. A run of yours that took ten seconds or more alerts when it finishes
+with colours stripped, and `e` / `Del` edit or take back a command the server
+has not accepted yet. One already sent may still have reached it; then it shows
+as run. A run of yours that took ten seconds or more alerts when it finishes
 while you are not watching it.
 
 Copies go to your local clipboard through the terminal (OSC 52), so they work
