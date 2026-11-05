@@ -206,6 +206,7 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::BadShellCommand => "empty or too long shell command",
         RejectReason::BypassDisabled => "bypass mode is off on the server",
         RejectReason::MessageTooLong => "message too long",
+        RejectReason::DiskLow => "the server's disk is low; free some space and send it again",
     }
 }
 

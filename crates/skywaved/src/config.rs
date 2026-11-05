@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
+use crate::disk::DEFAULT_MIN_FREE;
 use crate::error::{Error, IoContext, Result};
 use crate::shell::{DEFAULT_OUTPUT_MAX, DEFAULT_PROGRAM, ShellConfig};
 
@@ -35,6 +36,25 @@ pub struct Config {
     pub server_names: Vec<String>,
     /// Shell commands from devices (`[shell]`); off by default.
     pub shell: ShellConfig,
+    /// The data dir's disk (`[disk]`).
+    pub disk: DiskConfig,
+}
+
+/// How much of the data dir's disk the daemon keeps free ([`crate::disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskConfig {
+    /// Below this many free bytes the disk is low: agents are paused and
+    /// new work is refused until space is freed (`min_free`, default
+    /// [`DEFAULT_MIN_FREE`]). 0 turns the pause off.
+    pub min_free: u64,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        DiskConfig {
+            min_free: DEFAULT_MIN_FREE,
+        }
+    }
 }
 
 /// How to start the agent process.
@@ -63,6 +83,15 @@ struct RawConfig {
     server_names: Vec<String>,
     #[serde(default)]
     shell: RawShell,
+    #[serde(default)]
+    disk: RawDisk,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDisk {
+    #[serde(default, deserialize_with = "size")]
+    min_free: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -253,6 +282,9 @@ impl Config {
                 output_max: raw.shell.output_max.unwrap_or(DEFAULT_OUTPUT_MAX),
                 ..ShellConfig::default()
             },
+            disk: DiskConfig {
+                min_free: raw.disk.min_free.unwrap_or(DEFAULT_MIN_FREE),
+            },
         })
     }
 }
@@ -329,6 +361,9 @@ mod tests {
             program = "bin/bash"
             rc = "shellrc"
             output_max = "8 KiB"
+
+            [disk]
+            min_free = "2GiB"
         "#;
         let c = Config::parse(text, Path::new("/etc/skywave/skywaved.toml"), &env(&[])).unwrap();
         assert_eq!(c.listen, "0.0.0.0:9000".parse().unwrap());
@@ -352,6 +387,26 @@ mod tests {
             Some(Path::new("/etc/skywave/shellrc"))
         );
         assert_eq!(c.shell.output_max, 8 * 1024);
+        assert_eq!(c.disk.min_free, 2 << 30);
+    }
+
+    #[test]
+    fn the_disk_floor_takes_a_size_and_zero_turns_it_off() {
+        let parse = |text: &str| Config::parse(text, Path::new("/c.toml"), &env(&[("HOME", "/h")]));
+        assert_eq!(parse("[disk]\nmin_free = 0").unwrap().disk.min_free, 0);
+        assert_eq!(
+            parse("[disk]\nmin_free = \"512 MiB\"")
+                .unwrap()
+                .disk
+                .min_free,
+            512 << 20
+        );
+        for bad in ["[disk]\nmin_free = \"1GB\"", "[disk]\nfloor = 1"] {
+            assert!(
+                matches!(parse(bad), Err(Error::ConfigParse { .. })),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -482,6 +537,7 @@ mod tests {
         assert_eq!(c.shell.program, Path::new("/bin/sh"));
         assert_eq!(c.shell.rc, None);
         assert_eq!(c.shell.output_max, 64 << 20);
+        assert_eq!(c.disk.min_free, 1 << 30);
     }
 
     #[test]

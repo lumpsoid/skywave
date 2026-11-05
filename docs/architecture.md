@@ -317,13 +317,45 @@ the daemon's appends, which would otherwise stop `serve` (below).
   send it again", or, queued behind a turn lost with the daemon, in that
   turn's `Errored`. They are reported, not redelivered: the user stopped
   the work, or a crash leaves delivery at most once. If the supervisor
-  fails, `serve` stops rather than accept messages no agent would hear.
+  fails, it stops its agents as a shutdown does (an interrupted turn's
+  grace, then SIGTERM, so the CLI stops the commands it started; SIGKILL
+  only for what outlives the term grace), logs nothing more, and `serve`
+  stops rather than accept messages no agent would hear.
   It fails only when it cannot read or append to the log (an append it
   skipped would leave the log without an event the mapper counts as
   logged); a session's own trouble (an agent that will not start, exits
   or refuses) is logged in that session, and a blob it cannot store is
   marked lost in its event (Event mapper). Recovery stores no blobs, so a
   restart on a full blob disk does not fail the same way again.
+- **A low disk** (D40): `serve` reads the free space of the data dir's
+  file system (`statvfs`) at start and every 5 s, against `[disk]
+  min_free` (default 1 GiB; 0 turns it off). Below it the disk is *low*,
+  and both sides pause until a check finds the space back:
+  - Commands that start new work are `DiskLow` before anything else is
+    checked: `CreateSession`, `SendMessage`, `SetPermissionMode`,
+    `SetModel`, `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`.
+    Control is taken as usual (`ResolveApproval`, `Interrupt`,
+    `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
+    event and starts nothing (`RenameSession`, `SetSessionArchived`,
+    `SwitchContext`). Reads and long-polls are untouched. The refusal is
+    stored like any other; the heads show its reason, which is how a
+    device learns the server is paused.
+  - The supervisor stops reading its agents' events. An adapter reports on
+    a bounded channel, so the agent then waits to report (the CLI blocks on
+    its stdout): it stays alive and supervised, nothing is lost, and its
+    events are logged in order once the disk has room. The adapter's stdin
+    write timeout runs only while a write is in progress, never in that
+    wait, so a paused CLI is not killed as wedged. An interrupt or task
+    stop still goes to the agent, and that session alone is read until the
+    turn ends or the stop is answered; a stop drains and stops the agent as
+    always. No agent is stopped as idle while paused. Commands accepted
+    before the pause still reach their agent.
+  - A start below the floor comes up paused. Running shell runs go on.
+  The floor is what normally keeps the log from filling. A disk that fills
+  between checks anyway fails an append, which ends the supervisor (above)
+  and `serve`; before its first write the next `serve` waits, logging that
+  it does, until 64 MiB (at most the floor) is free, so a full disk never
+  makes it fail on every start.
   An agent process that reports a version other than the one its adapter
   was checked against logs one `AgentVersionUnconfirmed` (neither notable
   nor activity) in the context it was started for, and every head shows it

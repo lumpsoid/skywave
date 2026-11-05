@@ -1426,7 +1426,7 @@ async fn the_daemon_stops_when_its_shell_runner_fails() {
         &config,
         format!(
             "listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nroots = [{:?}]\nlog_file = {:?}\n\
-             [shell]\nenabled = true\n",
+             [shell]\nenabled = true\n[disk]\nmin_free = 0\n",
             f.data, f.root, log_file
         ),
     )
