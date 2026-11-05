@@ -28,7 +28,9 @@ import io.flutter.plugin.common.MethodChannel
  *
  * It also scans the pairing QR code for Dart (D20): `scan` on [SCAN_CHANNEL]
  * opens the ZXing scanner, which asks for the camera itself, and answers
- * with the code's text, or null when cancelled.
+ * with the code's text, or null when cancelled. `start`/`stop` on
+ * [StayConnectedService.BACKGROUND_CHANNEL] start or stop the stay-connected
+ * service.
  *
  * The Flutter engine, and with it Dart and the Rust core, belongs to the
  * app, not to this activity: [engine] creates it once per process and every
@@ -68,6 +70,16 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
+        // Only asks; the service reports what happened (StayConnectedService).
+        flutterEngine.backgroundChannel()
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start" -> StayConnectedService.start(this)
+                    "stop" -> StayConnectedService.stop(this)
+                    else -> return@setMethodCallHandler result.notImplemented()
+                }
+                result.success(null)
+            }
     }
 
     // FlutterActivity is no ComponentActivity, so no activity result API.
@@ -86,6 +98,7 @@ class MainActivity : FlutterActivity() {
     // answer it as cancelled, so Dart does not wait for good.
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         flutterEngine.scanChannel().setMethodCallHandler(null)
+        flutterEngine.backgroundChannel().setMethodCallHandler(null)
         scanning?.success(null)
         scanning = null
         super.cleanUpFlutterEngine(flutterEngine)
@@ -103,6 +116,9 @@ class MainActivity : FlutterActivity() {
 
     private fun FlutterEngine.scanChannel() =
         MethodChannel(dartExecutor.binaryMessenger, SCAN_CHANNEL)
+
+    private fun FlutterEngine.backgroundChannel() =
+        MethodChannel(dartExecutor.binaryMessenger, StayConnectedService.BACKGROUND_CHANNEL)
 
     private fun askForPermissions() {
         val wanted = buildList {

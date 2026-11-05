@@ -28,6 +28,10 @@ class FakeEffectSink implements EffectSink {
 
   @override
   void error(String text) => done.add('error: $text');
+
+  @override
+  void backgroundService({required bool run}) =>
+      done.add('background: ${run ? 'run' : 'stop'}');
 }
 
 /// Holders that are never connected: tests feed them with `apply`.

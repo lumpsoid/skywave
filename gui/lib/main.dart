@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:rinf/rinf.dart';
 import 'package:skywave_gui/app.dart';
 import 'package:skywave_gui/boot/boot_holder.dart';
+import 'package:skywave_gui/effects/background_service.dart';
 import 'package:skywave_gui/effects/effects.dart';
 import 'package:skywave_gui/effects/notifications.dart';
 import 'package:skywave_gui/holders.dart';
@@ -20,8 +21,11 @@ Future<void> main() async {
   final notifications = SystemNotifications(sendToRust);
   // Not awaited: on iOS and macOS it waits for the permission prompt.
   unawaited(notifications.init());
-  final holders = Holders(effects: AppEffectSink(messenger, notifications))
-    ..connect();
+  // Listening before runApp: Kotlin may report the service already.
+  final background = BackgroundService(sendToRust)..listen();
+  final holders = Holders(
+    effects: AppEffectSink(messenger, notifications, background),
+  )..connect();
   final boot = BootHolder();
   unawaited(boot.connect());
 
