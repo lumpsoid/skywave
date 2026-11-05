@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId};
-use skywaved::agent::claude_code::protocol::{self, INTERRUPT_REASON, PINNED_VERSION, Protocol};
+use skywaved::agent::claude_code::protocol::{
+    self, INTERRUPT_REASON, Output, PINNED_VERSION, Protocol,
+};
 use skywaved::agent::claude_code::rules;
 use skywaved::agent::claude_code::{
     ALLOW_BYPASS_ARG, ClaudeCodeAdapter, CliSession, KEEP_TRANSCRIPTS_SETTINGS, NO_AUTOUPDATE_ENV,
@@ -44,12 +46,15 @@ fn fixture(name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Our own control requests carry ids we choose; compare them without. An
-/// initialize request is compared by its subtype alone: the recordings
-/// registered different hooks and flags over time, so what
+/// Our own control requests and user messages carry ids we choose; compare
+/// them without. An initialize request is compared by its subtype alone: the
+/// recordings registered different hooks and flags over time, so what
 /// [`protocol::initialize_request`] sends is pinned by its own test instead.
 fn normalized(message: &Value) -> Value {
     let mut message = message.clone();
+    if message["type"] == "user" {
+        message.as_object_mut().unwrap().remove("uuid");
+    }
     if message["type"] == "control_request" {
         message.as_object_mut().unwrap().remove("request_id");
         if message["request"]["subtype"] == "initialize" {
@@ -69,6 +74,10 @@ fn normalized(message: &Value) -> Value {
 /// A `get_settings` the protocol writes where the recording has none (the
 /// fixtures made before effort reads) is dropped: the recorded CLI never saw
 /// it, so no answer comes. [`replay_strict`] fails on one instead.
+///
+/// Each recorded user message carries the `uuid` the recording driver gave
+/// it; the CLI's `command_lifecycle` lines name it, and are fed in naming
+/// ours instead.
 fn replay(name: &str, session_id: Uuid, resumed: bool, dropped: &[usize]) -> Vec<AdapterEvent> {
     let (events, version) = replay_any_version(name, session_id, resumed, dropped, false);
     assert_eq!(version.as_deref(), Some(PINNED_VERSION));
@@ -128,6 +137,8 @@ fn replay_records(
     let mut our_ids: HashMap<String, String> = HashMap::new();
     // The ids of the CLI's hook calls: the protocol answers those itself.
     let mut hook_calls: Vec<String> = Vec::new();
+    // The `uuid` of each of our user messages, by the recorded one.
+    let mut our_uuids: HashMap<String, String> = HashMap::new();
     for record in records {
         let msg = &record["msg"];
         match record["dir"].as_str().unwrap() {
@@ -204,6 +215,13 @@ fn replay_records(
                     {
                         our_ids.insert(recorded.to_owned(), id.to_owned());
                     }
+                    if ours["type"] == "user" {
+                        let recorded = msg["uuid"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("{name}: stdin #{n_in} has no uuid"));
+                        let ours = ours["uuid"].as_str().unwrap();
+                        our_uuids.insert(recorded.to_owned(), ours.to_owned());
+                    }
                 }
                 n_in += 1;
             }
@@ -226,6 +244,12 @@ fn replay_records(
                 {
                     msg["response"]["request_id"] = json!(id);
                 }
+                if let Some(id) = msg["command_uuid"]
+                    .as_str()
+                    .and_then(|recorded| our_uuids.get(recorded))
+                {
+                    msg["command_uuid"] = json!(id);
+                }
                 let line = serde_json::to_string(&msg).unwrap();
                 let out = protocol.on_line(&line);
                 written.extend(out.writes);
@@ -238,6 +262,40 @@ fn replay_records(
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
     (events, protocol.version().map(str::to_owned))
+}
+
+/// The `command_lifecycle` line by which the CLI takes up `written`, a user
+/// message the protocol wrote: the start of its turn.
+fn started(written: &Value) -> Value {
+    json!({
+        "type": "command_lifecycle",
+        "command_uuid": written["uuid"],
+        "state": "started",
+        "uuid": Uuid::new_v4().to_string(),
+        "session_id": "",
+    })
+}
+
+/// [`Protocol::send_message`], then, for a message it writes, the CLI
+/// taking it up at once ([`started`]): what an idle CLI does.
+fn send(protocol: &mut Protocol, text: &str) -> Output {
+    let mut out = protocol.send_message(text.to_owned());
+    take_up(protocol, &mut out);
+    out
+}
+
+/// Feeds the [`started`] of each user message in `out.writes` to
+/// `protocol`, adding what it reports to `out`.
+fn take_up(protocol: &mut Protocol, out: &mut Output) {
+    let messages: Vec<Value> = (out.writes.iter())
+        .filter(|w| w["type"] == "user")
+        .cloned()
+        .collect();
+    for message in messages {
+        let next = protocol.on_line(&started(&message).to_string());
+        out.writes.extend(next.writes);
+        out.events.extend(next.events);
+    }
 }
 
 /// The rule a recorded allow `response` to request `request` grants: the
@@ -474,35 +532,49 @@ fn uuid(id: &str) -> Uuid {
     Uuid::parse_str(id).unwrap()
 }
 
-const BASIC_SESSION: &str = "ce771f8e-e3a8-428f-b5d7-e2f40233a2b6";
+/// Replays process `n` of fixture `name` ([`processes`]) under the session
+/// id its argv names, resumed when it names `--resume`.
+fn replay_process(name: &str, n: usize) -> Vec<AdapterEvent> {
+    let (argv, records) = processes(name).swap_remove(n);
+    let resumed = argv.contains(" --resume ");
+    let id = flag_id(&argv, if resumed { "--resume" } else { "--session-id" });
+    let (events, version) = replay_records(name, records, id, resumed, &[], false);
+    assert_eq!(version.as_deref(), Some(PINNED_VERSION));
+    events
+}
+
+/// The session id of fixture `name`'s first process.
+fn first_session(name: &str) -> Uuid {
+    flag_id(&processes(name)[0].0, "--session-id")
+}
 
 #[test]
 fn replay_basic_two_turns() {
-    let events = replay("basic", uuid(BASIC_SESSION), false, &[]);
+    let events = replay_process("basic", 0);
     assert_eq!(
         describe(&events),
         [
-            "resume handle: ce771f8e-e3a8-428f-b5d7-e2f40233a2b6",
-            "turn started",
-            "text: Hi there!",
-            "turn usage",
-            "turn ended: Completed",
-            "turn started",
-            "text: You asked me to say hi in exactly two words.",
-            "turn usage",
-            "turn ended: Completed",
+            format!("resume handle: {}", first_session("basic")),
+            "turn started".to_owned(),
+            "text: PONG".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+            "turn started".to_owned(),
+            "text: PING".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
         ]
     );
 }
 
 #[test]
 fn replay_resume_reports_no_new_handle() {
-    let events = replay("resume", uuid(BASIC_SESSION), true, &[]);
+    let events = replay_process("basic", 1);
     assert_eq!(
         describe(&events),
         [
             "turn started",
-            "text: \"Say hi in exactly two words.\"",
+            "text: Shop bell (PONG) and back-door bell (PING).",
             "turn usage",
             "turn ended: Completed",
         ]
@@ -567,48 +639,55 @@ fn haiku_turn(duration_ms: u64, tokens_in: u64, tokens_out: u64) -> TurnUsage {
 fn replay_usage_is_per_turn_across_turns_and_a_resume() {
     // The CLI's `total_cost_usd` runs over the session: within a process,
     // and on into a resumed one.
-    let (basic_totals, resume_totals) = (recorded_totals("basic"), recorded_totals("resume"));
-    let (first, second, third) = (0.00142969, 0.00086724, 0.0002183);
+    let totals = recorded_totals("basic");
+    let (first, second, third) = (0.00143889, 0.00086521, 0.00022197);
     assert_costs(
-        &[
-            Some(basic_totals[0]),
-            Some(basic_totals[1]),
-            Some(resume_totals[0]),
-        ],
+        &totals.iter().copied().map(Some).collect::<Vec<_>>(),
         &[first, first + second, first + second + third],
     );
 
     // The adapter reports each turn's own share instead.
-    let (basic, costs) = usages(&replay("basic", uuid(BASIC_SESSION), false, &[]));
+    let (basic, costs) = usages(&replay_process("basic", 0));
     assert_eq!(
         basic,
         [
-            haiku_turn(1648, 2 + 12_799 + 6_490, 7),
-            haiku_turn(1255, 2 + 15_834 + 3_501, 17),
+            haiku_turn(1479, 2 + 12_799 + 6_541, 5),
+            haiku_turn(1489, 2 + 15_881 + 3_521, 4),
         ]
     );
     assert_costs(&costs, &[first, second]);
 
-    let (resume, costs) = usages(&replay("resume", uuid(BASIC_SESSION), true, &[]));
-    assert_eq!(resume, [haiku_turn(1471, 2 + 19_310 + 90, 14)]);
+    let (resume, costs) = usages(&replay_process("basic", 1));
+    assert_eq!(resume, [haiku_turn(1294, 2 + 19_377 + 85, 22)]);
     assert_costs(&costs, &[third]);
 }
 
+/// The working directory fixture `name` was recorded in: its first
+/// `system/init`'s `cwd`, a scratch dir.
+fn recorded_cwd(name: &str) -> String {
+    fixture(name)
+        .iter()
+        .find(|r| r["msg"]["type"] == "system" && r["msg"]["subtype"] == "init")
+        .and_then(|r| r["msg"]["cwd"].as_str())
+        .unwrap_or_else(|| panic!("{name}: no system/init"))
+        .to_owned()
+}
+
 /// The argv and records of each CLI process in fixture `name`, in order:
-/// each starts at an `argv: ` note.
+/// each starts at an `argv: ` note (the compat recorder's note naming the
+/// scenario comes before the first).
 fn processes(name: &str) -> Vec<(String, Vec<Value>)> {
     let mut processes: Vec<(String, Vec<Value>)> = Vec::new();
     for record in fixture(name) {
         match record["text"]
             .as_str()
-            .and_then(|t| t.strip_prefix("argv: "))
+            .and_then(|t| Some(t.split_once("argv: ")?.1))
         {
             Some(argv) => processes.push((argv.to_owned(), Vec::new())),
-            None => processes
-                .last_mut()
-                .unwrap_or_else(|| panic!("{name}: a record before any argv"))
-                .1
-                .push(record),
+            None => match processes.last_mut() {
+                Some((_, records)) => records.push(record),
+                None => assert_eq!(record["dir"], "note", "{name}: a record before any argv"),
+            },
         }
     }
     processes
@@ -626,7 +705,7 @@ fn flag_id(argv: &str, flag: &str) -> Uuid {
 
 #[test]
 fn replay_a_fork_runs_as_its_new_session_id_and_reports_it() {
-    const NAME: &str = "fork";
+    const NAME: &str = "fork_turns";
     let processes = processes(NAME);
     let (parent_argv, _) = &processes[0];
     let (argv, records) = processes[1].clone();
@@ -657,7 +736,8 @@ fn replay_a_fork_runs_as_its_new_session_id_and_reports_it() {
         [
             format!("resume handle: {fork}"),
             "turn started".to_owned(),
-            "text: PELICAN. OTTER is noted.".to_owned(),
+            // The first line of "PELICAN\nOTTER".
+            "text: PELICAN".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]
@@ -665,92 +745,91 @@ fn replay_a_fork_runs_as_its_new_session_id_and_reports_it() {
 
     // The CLI's total carries the parent's spend; the turn's cost is the
     // fork's own.
-    assert_costs(&[totals.first().copied()], &[0.0022982]);
+    assert_costs(&[totals.first().copied()], &[0.00230339]);
     let (_, costs) = usages(&events);
-    assert_costs(&costs, &[0.00086901]);
+    assert_costs(&costs, &[0.00230339 - 0.00143329]);
 }
 
 #[test]
 fn replay_an_unmeasured_interrupted_turn_reports_only_its_time() {
-    let ours = uuid("11111111-1111-4111-8111-111111111111");
-    let (usages, costs) = usages(&replay("interrupt", ours, false, &[4]));
+    // stdin #6 is an interrupt sent while idle: the adapter writes nothing.
+    let (usages, costs) = usages(&replay(
+        "interrupt",
+        first_session("interrupt"),
+        false,
+        &[6],
+    ));
     // Interrupted while text streamed, the CLI counts nothing for the turn
     // (zero tokens, `total_cost_usd: 0`): only its time is reported.
     assert_eq!(
         usages[0],
         TurnUsage {
-            duration_ms: Some(2590),
+            duration_ms: Some(1284),
             model: Some(HAIKU.to_owned()),
             ..TurnUsage::default()
         }
     );
     assert_eq!(costs[0], None);
-    assert_costs(&costs[1..], &[0.00055378, 0.0002098]);
+    assert_costs(&costs[1..], &[0.00114902, 0.00136454 - 0.00114902]);
 }
 
 #[test]
 fn replay_permissions_allow_then_deny() {
-    let events = replay(
-        "permissions",
-        uuid("7d7945cf-3afb-478c-b0e7-a1e6b4dff356"),
-        false,
-        &[],
-    );
+    let id = first_session("permissions");
+    let cwd = recorded_cwd("permissions");
+    let events = replay("permissions", id, false, &[]);
     // Only the events `describe` shows, so indices match it.
     let events = without_settings(events);
+    // The first two turns: an allowed Write, then a denied Bash.
     assert_eq!(
-        describe(&events),
+        describe(&events)[..15],
         [
-            "resume handle: 7d7945cf-3afb-478c-b0e7-a1e6b4dff356",
-            "turn started",
-            "tool call: Write",
-            "approval 6587ec1f-4dd9-4cd1-b704-51fcb4f5ec34: Write",
-            "tool result ok: File created successfully at: /tmp/skywave-t07-s",
-            "text: I created `/tmp/skywave-t07-scratch/hello.txt` c",
-            "turn usage",
-            "turn ended: Completed",
-            "turn started",
-            "tool call: Bash",
-            "approval 5446b928-31cd-4fb3-b499-1f4fccf50f2a: Bash",
-            "tool result error: The user denied this action.",
-            "text: The `rm` was denied, so I haven't deleted `hello",
-            "turn usage",
-            "turn ended: Completed",
+            format!("resume handle: {id}"),
+            "turn started".to_owned(),
+            "tool call: Write".to_owned(),
+            "approval 4e6fec26-3126-4395-a36a-d4e6ebd37be8: Write".to_owned(),
+            "tool result ok: File created successfully at: /tmp/skywave-baker".to_owned(),
+            "text: I created `fridge-note.txt` in `/tmp/skywave-bak".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
+            "turn started".to_owned(),
+            "tool call: Bash".to_owned(),
+            "approval 39b23c86-5a44-44fd-a2d2-cf2e2615c7e5: Bash".to_owned(),
+            "tool result error: The user denied this action.".to_owned(),
+            "text: The `rm fridge-note.txt` was denied, so the file".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
         ]
     );
     // The approval carries the tool's input, the same as its tool call.
-    let write = json!({ "file_path": "/tmp/skywave-t07-scratch/hello.txt", "content": "hi" });
-    assert!(matches!(&events[2], AdapterEvent::ToolCall { input, .. } if *input == write));
-    assert!(matches!(&events[3], AdapterEvent::ApprovalRequested { input, .. } if *input == write));
+    let write = json!({
+        "file_path": format!("{cwd}/fridge-note.txt"),
+        "content": "the croissants are in the left oven",
+    });
+    let (call, approval, result) = (&events[2], &events[3], &events[4]);
+    assert!(matches!(call, AdapterEvent::ToolCall { input, .. } if *input == write));
+    assert!(matches!(approval, AdapterEvent::ApprovalRequested { input, .. } if *input == write));
     // Call, approval and result name the same tool-use id.
-    let AdapterEvent::ToolCall {
-        call: Some(call), ..
-    } = &events[2]
-    else {
-        panic!("expected a tool call with an id, got {:?}", events[2]);
+    let AdapterEvent::ToolCall { call: Some(id), .. } = call else {
+        panic!("expected a tool call with an id, got {call:?}");
     };
-    assert!(
-        matches!(&events[3], AdapterEvent::ApprovalRequested { call: Some(c), .. } if c == call)
-    );
-    assert!(matches!(&events[4], AdapterEvent::ToolResult { call: Some(c), .. } if c == call));
+    assert!(matches!(approval, AdapterEvent::ApprovalRequested { call: Some(c), .. } if c == id));
+    assert!(matches!(result, AdapterEvent::ToolResult { call: Some(c), .. } if c == id));
 
     // Displays come from the inputs and the structured results.
     assert_eq!(
-        displays(&events),
+        displays(&events)[..4],
         [
-            r#"FileWrite "/tmp/skywave-t07-scratch/hello.txt" detail=None body=Some((Text, 1))"#,
-            r#"error=false status=Some("created") preview="""#,
-            concat!(
-                r#"Shell "$ cat /tmp/skywave-t07-scratch/hello.txt && rm /tmp/skywave-t07-scratch/hello.txt && ls -la /tmp/skywave-t07-scratch/" "#,
-                r#"detail=Some("Show hello.txt contents, delete it, and list the directory") body=None"#,
-            ),
-            r#"error=true status=Some("denied") preview="The user denied this action.""#,
+            format!(r#"FileWrite "{cwd}/fridge-note.txt" detail=None body=Some((Text, 1))"#),
+            r#"error=false status=Some("created") preview="""#.to_owned(),
+            r#"Shell "$ rm fridge-note.txt" detail=Some("Delete fridge-note.txt from the working directory") body=None"#.to_owned(),
+            r#"error=true status=Some("denied") preview="The user denied this action.""#.to_owned(),
         ]
     );
     assert_no_model_notes(&events);
     // The model-facing text, notes and all, stays the output.
-    let AdapterEvent::ToolResult { result, .. } = &events[4] else {
-        panic!("expected a tool result, got {:?}", events[4]);
+    let AdapterEvent::ToolResult { result, .. } = result else {
+        panic!("expected a tool result, got {result:?}");
     };
     assert!(
         result
@@ -770,12 +849,8 @@ fn permission_requests(name: &str) -> Vec<Value> {
 
 #[test]
 fn replay_permission_suggestions_are_offered_as_rules() {
-    let events = replay(
-        "permissions",
-        uuid("7d7945cf-3afb-478c-b0e7-a1e6b4dff356"),
-        false,
-        &[],
-    );
+    let cwd = recorded_cwd("permissions");
+    let events = replay("permissions", first_session("permissions"), false, &[]);
     let suggestions: Vec<&Vec<RuleSuggestion>> = events
         .iter()
         .filter_map(|e| match e {
@@ -783,26 +858,24 @@ fn replay_permission_suggestions_are_offered_as_rules() {
             _ => None,
         })
         .collect();
+    let rule = |label: &str, scope| RuleSuggestion {
+        label: label.to_owned(),
+        scope,
+    };
+    let (access, edits) = (format!("access to {cwd}"), "file edits");
     assert_eq!(
         suggestions,
         [
-            &vec![RuleSuggestion {
-                label: "file edits".to_owned(),
-                scope: RuleScope::Session,
-            }],
+            &vec![rule(edits, RuleScope::Session)],
             &vec![
-                RuleSuggestion {
-                    label: "Bash(cat /tmp/skywave-t07-scratch/hello.txt && rm /tmp/skywave-t07-scratch/hello.txt && ls -la /tmp/skywave-t07-scratch/)".to_owned(),
-                    scope: RuleScope::Project,
-                },
-                RuleSuggestion {
-                    label: "access to /tmp/skywave-t07-scratch".to_owned(),
-                    scope: RuleScope::Session,
-                },
-                RuleSuggestion {
-                    label: "file edits".to_owned(),
-                    scope: RuleScope::Session,
-                },
+                rule("Bash(rm fridge-note.txt)", RuleScope::Project),
+                rule(&access, RuleScope::Session),
+                rule(edits, RuleScope::Session),
+            ],
+            &vec![
+                rule("Bash(touch oven-timer *)", RuleScope::Project),
+                rule(&access, RuleScope::Session),
+                rule(edits, RuleScope::Session),
             ],
         ]
     );
@@ -987,7 +1060,7 @@ fn mode_steps(records: &[Value]) -> Vec<ModeStep> {
     for record in records {
         if let Some(name) = record["text"]
             .as_str()
-            .and_then(|t| t.strip_prefix("step: "))
+            .and_then(|t| Some(t.split_once("step: ")?.1))
         {
             steps.push(ModeStep {
                 name: name.to_owned(),
@@ -1233,6 +1306,7 @@ fn replay_mode_switches_answer_requests_and_report_the_mode() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "effort: Some(Medium)",
             // default: Write
             haiku,
             "mode: Ask",
@@ -1276,6 +1350,7 @@ fn replay_an_approved_plan_reports_the_mode_before_it() {
         strings(&[
             "mode: Ask",
             "models offered: 13",
+            "effort: Some(Medium)",
             "mode set: Plan",
             haiku,
             "mode: Plan",
@@ -1362,30 +1437,21 @@ fn offered_efforts_skip_unknown_levels_and_need_supports_effort() {
 
 #[test]
 fn replay_interrupt_while_streaming_and_while_idle() {
-    // This run had no --session-id: the CLI's own id is adopted.
-    let ours = uuid("11111111-1111-4111-8111-111111111111");
-    // stdin #4 is an interrupt sent while idle: the adapter writes nothing.
-    let events = replay("interrupt", ours, false, &[4]);
-    let cli = fixture("interrupt")
-        .into_iter()
-        .find(|r| r["msg"]["subtype"] == "init")
-        .unwrap()["msg"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let ours = first_session("interrupt");
+    // stdin #6 is an interrupt sent while idle: the adapter writes nothing.
+    let events = replay("interrupt", ours, false, &[6]);
     assert_eq!(
         describe(&events),
         [
             format!("resume handle: {ours}"),
             "turn started".to_owned(),
-            format!("resume handle: {cli}"),
-            "text: 1".to_owned(),
+            "text: 1,".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Interrupted".to_owned(),
             "turn started".to_owned(),
             "tool call: Bash".to_owned(),
-            "tool result ok: pending-test".to_owned(),
-            "text: pending-test".to_owned(),
+            "tool result ok: flour-arrived".to_owned(),
+            "text: The delivery arrived. The command printed `flour".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
             "turn started".to_owned(),
@@ -1397,58 +1463,63 @@ fn replay_interrupt_while_streaming_and_while_idle() {
     assert_eq!(
         displays(&events),
         [
-            r#"Shell "$ echo pending-test" detail=Some("Print pending-test string") body=None"#,
-            r#"error=false status=None preview="pending-test""#,
+            r#"Shell "$ echo flour-arrived" detail=Some("Print flour-arrived") body=None"#,
+            r#"error=false status=None preview="flour-arrived""#,
         ]
     );
 }
 
 #[test]
 fn replay_interrupt_with_a_pending_approval() {
-    let cli = "5be4083d-8321-408c-a950-44c6e8a7f067";
-    // stdin #3 is the late allow for the cancelled request: dropped.
-    let events = replay("interrupt_pending", uuid(cli), false, &[3]);
+    let cli = first_session("interrupt_pending");
+    let events = replay("interrupt_pending", cli, false, &[]);
     assert_eq!(
         describe(&events),
         [
             format!("resume handle: {cli}"),
             "turn started".to_owned(),
             "tool call: Write".to_owned(),
-            "approval aa219e26-965b-44bc-ad3e-0f57fede7ee4: Write".to_owned(),
-            format!("cancelled aa219e26-965b-44bc-ad3e-0f57fede7ee4: {INTERRUPT_REASON}"),
+            "approval c7312ab2-f41d-44b9-a113-bb2b83861345: Write".to_owned(),
+            format!("cancelled c7312ab2-f41d-44b9-a113-bb2b83861345: {INTERRUPT_REASON}"),
             "tool result error: The user doesn't want to proceed with this tool ".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Interrupted".to_owned(),
+            // The process takes a turn after the interrupt.
+            "turn started".to_owned(),
+            "text: PONG".to_owned(),
+            "turn usage".to_owned(),
+            "turn ended: Completed".to_owned(),
             // Then stdin closes while a second approval waits: the CLI fails
             // the approval itself and carries on.
             "turn started".to_owned(),
             "tool call: Write".to_owned(),
-            "approval 071d7172-762d-450e-8cca-676210e9b4c4: Write".to_owned(),
-            "cancelled 071d7172-762d-450e-8cca-676210e9b4c4: Tool permission request failed: AbortError: Tool"
+            "approval fd1e7905-e691-4d5f-99ae-fd72f6526350: Write".to_owned(),
+            "cancelled fd1e7905-e691-4d5f-99ae-fd72f6526350: Tool permission request failed: AbortError: Tool"
                 .to_owned(),
             "tool result error: Tool permission request failed: AbortError: Tool".to_owned(),
+            "text: The write didn't go through because the permissi".to_owned(),
             "tool call: Write".to_owned(),
             "tool result error: Tool permission request failed: AbortError: Stre".to_owned(),
-            "text: I couldn't create `pending2.txt`. The Write call".to_owned(),
+            "text: The diary file hasn't been created. Both Write a".to_owned(),
             "turn usage".to_owned(),
             "turn ended: Completed".to_owned(),
         ]
     );
-    let write = |name: &str| {
-        format!(r#"FileWrite "/tmp/skywave-t07-scratch/{name}" detail=None body=Some((Text, 1))"#)
-    };
+    let cwd = recorded_cwd("interrupt_pending");
+    let write =
+        |name: &str| format!(r#"FileWrite "{cwd}/{name}" detail=None body=Some((Text, 1))"#);
     assert_eq!(
         displays(&events),
         [
-            write("pending.txt"),
+            write("starter-diary.txt"),
             r#"error=true status=Some("cancelled") preview="User rejected tool use""#.to_owned(),
-            write("pending2.txt"),
+            write("starter-diary.txt"),
             concat!(
                 r#"error=true status=Some("cancelled") preview="Tool permission request failed: "#,
                 r#"AbortError: Tool permission stream closed before response received""#,
             )
             .to_owned(),
-            write("pending2.txt"),
+            write("starter-diary.txt"),
             concat!(
                 r#"error=true status=Some("cancelled") preview="Tool permission request failed: "#,
                 r#"AbortError: Stream closed""#,
@@ -1465,12 +1536,18 @@ fn a_message_during_a_turn_waits_for_its_result() {
     protocol.start();
     protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
     assert!(protocol.ready());
-    let first = protocol.send_message("one".to_owned());
+    let first = send(&mut protocol, "one");
     assert_eq!(first.events, [AdapterEvent::TurnStarted { message: true }]);
-    let queued = protocol.send_message("two".to_owned());
+    let queued = send(&mut protocol, "two");
     assert_eq!(queued, Default::default());
-    let end =
+    let mut end =
         protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
+    let [written] = end.writes.as_slice() else {
+        panic!("{:?}", end.writes);
+    };
+    let id = Uuid::parse_str(written["uuid"].as_str().unwrap()).unwrap();
+    assert_eq!(*written, protocol::user_message("two", id));
+    take_up(&mut protocol, &mut end);
     assert_eq!(
         end.events,
         [
@@ -1478,14 +1555,97 @@ fn a_message_during_a_turn_waits_for_its_result() {
             AdapterEvent::TurnStarted { message: true }
         ]
     );
-    assert_eq!(end.writes, [protocol::user_message("two")]);
+}
+
+#[test]
+fn a_message_the_cli_takes_up_after_its_own_turn_is_a_turn_of_its_own() {
+    // Resumed: its handle is stored, so none is reported.
+    let mut protocol = Protocol::new(Uuid::new_v4(), true);
+    protocol.start();
+    protocol.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"skywave_1","response":{}}}"#);
+    let one = protocol.send_message("one".to_owned());
+    assert_eq!(one.events, []);
+    let init = r#"{"type":"system","subtype":"init"}"#;
+    // The CLI began a turn of its own before reading the message.
+    assert_eq!(
+        protocol.on_line(init).events,
+        [AdapterEvent::TurnStarted { message: false }]
+    );
+    let two = protocol.send_message("two".to_owned());
+    assert_eq!(two, Default::default());
+    // Its end writes nothing: "one" still waits in the CLI.
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [AdapterEvent::TurnEnded(TurnOutcome::Completed)]
+    );
+    assert!(end.writes.is_empty(), "{:?}", end.writes);
+    assert!(protocol.turn_open());
+    assert_eq!(protocol.unsent(), 2);
+    let mut started = Output {
+        writes: one.writes,
+        events: Vec::new(),
+    };
+    take_up(&mut protocol, &mut started);
+    assert_eq!(
+        started.events,
+        [AdapterEvent::TurnStarted { message: true }]
+    );
+    // The message's init opens nothing more.
+    assert_eq!(protocol.on_line(init).events, []);
+    let end = protocol.on_line(RESULT_OK);
+    assert_eq!(
+        end.events,
+        [AdapterEvent::TurnEnded(TurnOutcome::Completed)]
+    );
+    assert_eq!(end.writes.len(), 1);
+    assert_eq!(end.writes[0]["message"]["content"], "two");
+}
+
+#[test]
+fn an_interrupt_before_the_cli_takes_the_message_up_goes_out_with_its_turn() {
+    let (mut protocol, _) = ready_protocol();
+    let written = protocol.send_message("one".to_owned());
+    let held = protocol.interrupt();
+    assert_eq!(held, Default::default());
+    assert!(protocol.interrupting());
+    assert_eq!(protocol.interrupt(), Default::default());
+    let mut started = Output {
+        writes: written.writes,
+        events: Vec::new(),
+    };
+    take_up(&mut protocol, &mut started);
+    let interrupts: Vec<_> = (started.writes.iter())
+        .filter(|w| w["request"]["subtype"] == "interrupt")
+        .collect();
+    assert_eq!(interrupts.len(), 1, "{:?}", started.writes);
+    let end = protocol.on_line(
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming"}"#,
+    );
+    assert_eq!(
+        end.events,
+        [AdapterEvent::TurnEnded(TurnOutcome::Interrupted)]
+    );
+    assert!(!protocol.interrupting());
+}
+
+#[test]
+fn a_lifecycle_line_of_another_command_starts_nothing() {
+    let (mut protocol, _) = ready_protocol();
+    protocol.send_message("one".to_owned());
+    let other = json!({
+        "type": "command_lifecycle", "command_uuid": Uuid::new_v4().to_string(),
+        "state": "started", "wakeup_source": "schedule_wakeup",
+    });
+    assert_eq!(protocol.on_line(&other.to_string()), Default::default());
+    assert_eq!(protocol.unsent(), 1);
 }
 
 #[test]
 fn a_failed_turn_and_unknown_messages() {
     let mut protocol = Protocol::new(Uuid::new_v4(), true);
     protocol.start();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     for line in [
         r#"{"type":"something_new","x":1}"#,
         r#"{"type":"system","subtype":"status","status":"requesting"}"#,
@@ -1523,7 +1683,7 @@ fn a_version_named_only_by_system_init_is_reported_too() {
     ));
     assert!(protocol.ready());
     assert_eq!(unconfirmed(&ready.events), []);
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     let init = r#"{"type":"system","subtype":"init","claude_code_version":"3.0.0"}"#;
     let first = protocol.on_line(init);
     assert_eq!(
@@ -1543,7 +1703,7 @@ fn exit_status(code: i32) -> Option<std::process::ExitStatus> {
 #[test]
 fn stray_output_makes_no_clean_exit_an_error_and_loses_to_stderr() {
     let (mut protocol, _) = ready_protocol();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     protocol.on_line("not json");
     assert_eq!(protocol.exit_error(None, exit_status(0)), None);
     assert_eq!(
@@ -1561,7 +1721,7 @@ fn stray_output_makes_no_clean_exit_an_error_and_loses_to_stderr() {
 #[test]
 fn undelivered_messages_are_unsent_and_leave_a_clean_exit_clean() {
     let (mut protocol, _) = ready_protocol();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
     assert_eq!(protocol.unsent(), 0);
     protocol.undelivered("one".to_owned());
@@ -1578,8 +1738,8 @@ fn undelivered_messages_are_unsent_and_leave_a_clean_exit_clean() {
 #[test]
 fn messages_queued_behind_a_turn_stay_unsent_once_shutting_down() {
     let (mut protocol, _) = ready_protocol();
-    protocol.send_message("go".to_owned());
-    protocol.send_message("queued".to_owned());
+    send(&mut protocol, "go");
+    send(&mut protocol, "queued");
     protocol.undelivered("unread".to_owned());
     assert_eq!(protocol.unsent(), 2);
     protocol.begin_shutdown();
@@ -1593,12 +1753,15 @@ fn messages_queued_behind_a_turn_stay_unsent_once_shutting_down() {
 #[test]
 fn a_queued_message_begun_after_its_turn_is_no_longer_unsent() {
     let (mut protocol, _) = ready_protocol();
-    protocol.send_message("go".to_owned());
-    protocol.send_message("queued".to_owned());
+    send(&mut protocol, "go");
+    send(&mut protocol, "queued");
     assert_eq!(protocol.unsent(), 1);
-    let end =
+    let mut end =
         protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
     assert_eq!(end.writes.len(), 1);
+    // Written, but not taken up yet: it would not run if the process ended.
+    assert_eq!(protocol.unsent(), 1);
+    take_up(&mut protocol, &mut end);
     assert_eq!(protocol.unsent(), 0);
 }
 
@@ -1607,7 +1770,7 @@ fn a_long_exit_reason_is_cut_so_its_status_survives_the_errored_cap() {
     use skywave_proto::limits::REFUSAL_MAX_CHARS;
 
     let (mut protocol, _) = ready_protocol();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     let long = "x".repeat(1 << 20);
     protocol.on_line(&format!("{long} not json"));
     let stderr = format!("{long}\nsecond line");
@@ -1648,7 +1811,7 @@ fn stray_output_before_the_last_turn_or_the_handshake_explains_nothing() {
         protocol.exit_error(None, exit_status(0)).as_deref(),
         Some("API down")
     );
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     assert_eq!(protocol.exit_error(None, exit_status(0)), None);
     assert_eq!(
         protocol.exit_error(None, exit_status(3)).as_deref(),
@@ -1711,19 +1874,19 @@ fn a_fresh_process_reports_its_handle_with_its_first_turn_only() {
     let handle = AdapterEvent::ResumeHandle(protocol::resume_handle(id));
     let mut protocol = Protocol::new(id, false);
     assert!(protocol.start().events.is_empty());
-    let first = protocol.send_message("hi".into());
+    let first = send(&mut protocol, "hi");
     assert_eq!(
         first.events,
         [handle, AdapterEvent::TurnStarted { message: true }]
     );
     protocol.on_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#);
-    let second = protocol.send_message("again".into());
+    let second = send(&mut protocol, "again");
     assert_eq!(second.events, [AdapterEvent::TurnStarted { message: true }]);
 
     // A resumed process has its handle stored already.
     let mut protocol = Protocol::new(id, true);
     assert!(protocol.start().events.is_empty());
-    let first = protocol.send_message("hi".into());
+    let first = send(&mut protocol, "hi");
     assert_eq!(first.events, [AdapterEvent::TurnStarted { message: true }]);
 }
 
@@ -1749,7 +1912,7 @@ fn a_session_id_change_reports_the_handle_once_with_the_new_id() {
     // A handle reported with the old id is reported anew.
     let mut protocol = Protocol::new(id, false);
     protocol.start();
-    protocol.send_message("hi".into());
+    send(&mut protocol, "hi");
     let out = protocol.on_line(&init);
     assert_eq!(
         out.events,
@@ -2874,15 +3037,12 @@ async fn an_agent_that_stops_reading_is_killed_and_reported() {
     let pid = fake_pid(tmp.path());
     // More than a pipe holds, to a process that no longer reads.
     session.send_message("x".repeat(1 << 20)).await.unwrap();
-    assert_eq!(
-        next(&mut events).await,
-        AdapterEvent::TurnStarted { message: true }
-    );
+    // Never taken up: no turn starts, and the exit counts it unsent.
     assert_eq!(
         next(&mut events).await,
         AdapterEvent::Exited {
             error: Some("agent stopped reading its input; killed it".to_owned()),
-            unsent: 0,
+            unsent: 1,
         }
     );
     assert!(events.recv().await.is_none());
@@ -3795,15 +3955,43 @@ fn replay_background_bash_reports_the_shell_and_its_end() {
     assert_eq!(
         timeline(&events),
         [
-            "turn started",
             "tasks: []",
-            "tasks: [bt1yntsud:Shell]",
+            "turn started",
+            "tasks: [bxc923464:Shell]",
             "text: STARTED",
+            "schedules: []",
             "turn ended",
             // The shell ended; the CLI starts the next turn itself.
             "tasks: []",
             "turn started on its own",
             "text: DONE",
+            "schedules: []",
+            "turn ended",
+        ]
+    );
+}
+
+#[test]
+fn replay_a_message_taken_up_inside_a_turn_the_cli_started_joins_it() {
+    // Written as the shell's notification came, the message was queued by
+    // the CLI, whose own turn began next; it took the message up at that
+    // turn's tool round, and one result ended both.
+    let events = replay_strict("message_meets_own_turn", Uuid::new_v4(), &[]);
+    assert_eq!(
+        timeline(&events),
+        [
+            "tasks: []",
+            "turn started",
+            "tasks: [bd18ss2dh:Shell]",
+            "text: STARTED",
+            "schedules: []",
+            "turn ended",
+            "tasks: []",
+            "turn started on its own",
+            // The message, inside the open turn: no second `turn ended`.
+            "turn started",
+            "text: TEA",
+            "schedules: []",
             "turn ended",
         ]
     );
@@ -3854,18 +4042,18 @@ fn replay_stop_task_answers_each_stop_after_the_task_leaves() {
         lines,
         [
             "tasks: []",
-            "tasks: [b1wyh3vwb]",
-            "tasks: [b1wyh3vwb, ad1d67e1d863e85eb]",
+            "tasks: [bhmdfgkim]",
+            "tasks: [bhmdfgkim, a22983dfb61c64aa2]",
             // The subagent's call, from its `task_started`.
-            "tasks: [b1wyh3vwb, ad1d67e1d863e85eb@7b9HWB]",
+            "tasks: [bhmdfgkim, a22983dfb61c64aa2@r6ZrMw]",
             // The CLI drops the task from its set before it acks the stop.
-            "tasks: [ad1d67e1d863e85eb@7b9HWB]",
-            "stop answered: b1wyh3vwb",
+            "tasks: [a22983dfb61c64aa2@r6ZrMw]",
+            "stop answered: bhmdfgkim",
             "tasks: []",
-            "stop answered: ad1d67e1d863e85eb",
+            "stop answered: a22983dfb61c64aa2",
             // An unknown id, and one already stopped, are acked as success.
             "stop answered: bnosuchtask",
-            "stop answered: b1wyh3vwb",
+            "stop answered: bhmdfgkim",
         ]
     );
 }
@@ -4018,27 +4206,29 @@ fn replay_subagent_reports_its_text_under_its_agent_call() {
         steps(&events),
         [
             "turn started",
-            "call GKDTUq Agent",
-            "result GKDTUq ok",
-            "text: The subagent is running in the b",
+            "call nAJyxF Agent",
+            "result nAJyxF ok",
+            "text: LAUNCHED",
             "turn ended",
             // After the main turn, outside any.
-            "text: PONG @GKDTUq",
+            "call 7XoMCF Write @nAJyxF",
+            "result 7XoMCF ok",
+            "text: WRITTEN @nAJyxF",
             "turn started on its own",
             // The main agent's own text has no parent.
-            "text: The subagent replied: **PONG**",
+            "text: NOTED",
             "turn ended",
         ]
     );
     // The set listing the task comes before `task_started`, so before its
     // call is known; the set is reported again once it is.
-    let sub = "adf7c47cbdbddd347";
+    let sub = "a9a97ccaec0577696";
     assert_eq!(
         task_sets(&events),
         [
             "tasks: []".to_owned(),
             format!("tasks: [{sub}:Subagent]"),
-            format!("tasks: [{sub}:Subagent@GKDTUq]"),
+            format!("tasks: [{sub}:Subagent@nAJyxF]"),
             "tasks: []".to_owned(),
         ]
     );
@@ -4047,26 +4237,24 @@ fn replay_subagent_reports_its_text_under_its_agent_call() {
 #[test]
 fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
     let events = replay("subagent_background_bash", Uuid::new_v4(), false, &[]);
-    let sub = "ad175146a4bfec159";
+    let sub = "ad4a1fecf8c202d0f";
     let sets = task_sets(&events);
     assert_eq!(
         sets,
         [
             "tasks: []".to_owned(),
             format!("tasks: [{sub}:Subagent]"),
-            format!("tasks: [{sub}:Subagent@XRGPjR]"),
-            format!("tasks: [{sub}:Subagent@XRGPjR, bq0uy05dr:Shell<{sub}]"),
-            format!("tasks: [{sub}:Subagent@XRGPjR, bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
-            format!("tasks: [bq0uy05dr:Shell<{sub}, b0mpthszv:Shell<{sub}]"),
-            format!("tasks: [b0mpthszv:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent@VMcgso]"),
+            format!("tasks: [{sub}:Subagent@VMcgso, b81g3vkgt:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent@VMcgso, b81g3vkgt:Shell<{sub}, b40ig17h3:Shell<{sub}]"),
+            format!("tasks: [b81g3vkgt:Shell<{sub}, b40ig17h3:Shell<{sub}]"),
+            format!("tasks: [b40ig17h3:Shell<{sub}]"),
             // The re-woken subagent comes first, though it started first
             // only by luck of the list: the CLI's order is kept. Its call is
             // known from the first `task_started`, so no set is reported
             // again for the wake's.
-            format!("tasks: [{sub}:Subagent@XRGPjR, b0mpthszv:Shell<{sub}]"),
-            format!("tasks: [b0mpthszv:Shell<{sub}]"),
-            "tasks: []".to_owned(),
-            format!("tasks: [{sub}:Subagent@XRGPjR]"),
+            format!("tasks: [{sub}:Subagent@VMcgso, b40ig17h3:Shell<{sub}]"),
+            format!("tasks: [{sub}:Subagent@VMcgso]"),
             "tasks: []".to_owned(),
         ]
     );
@@ -4085,27 +4273,24 @@ fn replay_subagent_background_bash_nests_shells_under_the_subagent() {
         steps(&events),
         [
             "turn started",
-            "call XRGPjR Agent",
-            "result XRGPjR ok",
+            "call VMcgso Agent",
+            "result VMcgso ok",
             "text: LAUNCHED",
             "turn ended",
-            "call DJDG2s Bash @XRGPjR",
-            "result DJDG2s ok",
-            "call XmkipX ToolSearch @XRGPjR",
-            "result XmkipX ok",
-            "call 9VhgWa Monitor @XRGPjR",
-            "result 9VhgWa ok",
-            "text: The background `sleep 120 && ech @XRGPjR",
+            "call WrP1Tp Bash @VMcgso",
+            "result WrP1Tp ok",
+            "text: The sleep is running in the back @VMcgso",
+            "call YU9QSL ToolSearch @VMcgso",
+            "result YU9QSL ok",
+            "call ZCndQo Monitor @VMcgso",
+            "result ZCndQo ok",
+            "text: The background sleep is still ru @VMcgso",
+            // The subagent's first run ended; the CLI reports it.
             "turn started on its own",
-            "text: The subagent is not finished yet",
+            "text: Still running. The subagent's ba",
             "turn ended",
-            // Woken by the first shell's end.
-            "text: SLEPT @XRGPjR",
-            "turn started on its own",
-            // Woken by the monitor, inside the turn the CLI started.
-            "text: SLEPT @XRGPjR",
-            "text: DONE",
-            "turn ended",
+            // Woken by its shell's end.
+            "text: SLEPT @VMcgso",
             "turn started on its own",
             "text: DONE",
             "turn ended",
@@ -4188,31 +4373,18 @@ fn replay_subagent_message_ctl_pairs_each_call_after_the_turn_with_its_result() 
         steps(&events),
         [
             "turn started",
-            "call y3gna1 Agent",
-            "result y3gna1 ok",
+            "call ynE9zK Agent",
+            "result ynE9zK ok",
             "text: STARTED",
             "turn ended",
             // All after the main turn's `result`.
-            "call 2KBExm Bash @y3gna1",
-            "result 2KBExm error",
-            "call C6aquz Bash @y3gna1",
-            "result C6aquz error",
-            "text: The harness blocked both foregro @y3gna1",
-            "call u9eSqe Bash @y3gna1",
-            "result u9eSqe ok",
-            "text: I could not complete the two `sl @y3gna1",
+            "call eK1wCL Bash @ynE9zK",
+            "result eK1wCL ok",
+            "call aazP1D Bash @ynE9zK",
+            "result aazP1D ok",
+            "text: NONE @ynE9zK",
             "turn started on its own",
-            "text: The background agent finished, b",
-            "turn ended",
-            "call 1TR1XM Bash @y3gna1",
-            "result 1TR1XM ok",
-            "text: The first background `sleep 25`  @y3gna1",
-            "turn started on its own",
-            "text: The agent sent an update that co",
-            "turn ended",
-            "text: Both background `sleep 25` runs  @y3gna1",
-            "turn started on its own",
-            "text: The agent has now finished. It r",
+            "text: The background agent finished. I",
             "turn ended",
         ]
     );
@@ -4253,7 +4425,7 @@ fn a_subagent_result_after_the_turn_is_still_read_by_its_tool() {
     // The recordings' subagent results carry no structured result, so a
     // tool's own reading is shown here.
     let mut protocol = running_protocol();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     protocol.on_line(&tool_use_line("sub-read", "Read", Some("agent-1")));
     protocol.on_line(&tool_use_line("main-read", "Read", None));
     let asked = protocol.on_line(&can_use_tool("p1", None));
@@ -4303,7 +4475,8 @@ fn replay_subagent_approval_is_for_the_subagents_own_call() {
             _ => None,
         })
         .expect("the subagent's Write call");
-    assert_eq!(short(&write.1.0), "ruuaq6");
+    assert_eq!(short(&write.1.0), "SK1QLq");
+    let (asked, task) = subagent_approval();
     let approval = events
         .iter()
         .find_map(|e| match e {
@@ -4312,19 +4485,16 @@ fn replay_subagent_approval_is_for_the_subagents_own_call() {
                 call,
                 task,
                 ..
-            } if request.0 == SUBAGENT_APPROVAL => Some((call.clone(), task.clone())),
+            } if request.0 == asked => Some((call.clone(), task.clone())),
             _ => None,
         })
         .expect("the approval");
-    assert_eq!(
-        approval,
-        (Some(write.0), Some("add5b3d5dc618eaff".to_owned()))
-    );
+    assert_eq!(approval, (Some(write.0), Some(task)));
 }
 
 #[test]
 fn replay_subagent_foreground_runs_its_steps_inside_the_turn() {
-    let task = "a4d46d45b352d2620";
+    let task = "aa9d9fb72136edf3e";
     let mut records = without_probe_writes("subagent_foreground");
     // Positive control: the prompt is a subagent `user` text line.
     assert!(records.iter().any(|r| {
@@ -4349,16 +4519,22 @@ fn replay_subagent_foreground_runs_its_steps_inside_the_turn() {
         steps(&events),
         [
             "turn started",
-            "call c3VtT8 Agent",
+            "call wraMNa Agent",
             // No text: the prompt shows in the Agent call.
-            "call uo1o51 Bash @c3VtT8",
-            "result uo1o51 ok",
-            "call 51eNZd Bash @c3VtT8",
-            "result 51eNZd ok",
-            "call 58QyMG Bash @c3VtT8",
-            "result 58QyMG ok",
-            "result c3VtT8 ok",
-            "text: Three of your five recipes use g",
+            "call vHrsgV Bash @wraMNa",
+            "result vHrsgV ok",
+            "call nw9Mo6 Read @wraMNa",
+            "result nw9Mo6 ok",
+            "call Wt9Q34 Read @wraMNa",
+            "result Wt9Q34 ok",
+            "call VuEA77 Read @wraMNa",
+            "result VuEA77 ok",
+            "call QWgfsj Read @wraMNa",
+            "result QWgfsj ok",
+            "call d7MeSq Write @wraMNa",
+            "result d7MeSq ok",
+            "result wraMNa ok",
+            "text: The helper found two garlic reci",
             "turn ended",
         ]
     );
@@ -4367,7 +4543,7 @@ fn replay_subagent_foreground_runs_its_steps_inside_the_turn() {
         task_sets(&events),
         [
             "tasks: []".to_owned(),
-            format!("tasks: [{task}:Subagent@c3VtT8]")
+            format!("tasks: [{task}:Subagent@wraMNa]")
         ]
     );
     // Asked under the task's id, but no set listed it: the turn's.
@@ -4380,20 +4556,20 @@ fn replay_subagent_foreground_runs_its_steps_inside_the_turn() {
             _ => None,
         })
         .expect("the approval");
-    assert_eq!(short(&approval.0.unwrap().0), "58QyMG");
+    assert_eq!(short(&approval.0.unwrap().0), "d7MeSq");
     assert_eq!(approval.1, None);
 }
 
 #[test]
 fn replay_subagent_foreground_backgrounded_enters_the_set_with_its_call() {
     let events = replay_subagent("subagent_foreground_backgrounded");
-    let task = "ab29fccd426131025";
+    let task = "a03748b5d5785f3e1";
     assert_eq!(
         task_sets(&events),
         [
             "tasks: []".to_owned(),
             // Its `task_started` came long before.
-            format!("tasks: [{task}:Subagent@gfrK32]"),
+            format!("tasks: [{task}:Subagent@fRmZso]"),
             "tasks: []".to_owned(),
         ]
     );
@@ -4401,24 +4577,24 @@ fn replay_subagent_foreground_backgrounded_enters_the_set_with_its_call() {
         steps(&events),
         [
             "turn started",
-            "call gfrK32 Agent",
-            "call m6ypuV Bash @gfrK32",
-            "result m6ypuV ok",
-            "call bgdRAw Read @gfrK32",
-            "result bgdRAw ok",
+            "call fRmZso Agent",
+            "call pYG1M9 Bash @fRmZso",
+            "result pYG1M9 ok",
+            "call 1M5j9k Bash @fRmZso",
             // Backgrounded: the Agent call returns.
-            "result gfrK32 ok",
-            "call gpNeNx Read @gfrK32",
-            "result gpNeNx ok",
-            "text: I've started the helper agent. I",
+            "result fRmZso ok",
+            "result 1M5j9k ok",
+            "call BDYYXK Read @fRmZso",
+            "result BDYYXK ok",
+            "text: I started the helper agent, but ",
             "turn ended",
-            "call CeCqU2 Read @gfrK32",
-            "result CeCqU2 ok",
-            "call EQXtfq Read @gfrK32",
-            "result EQXtfq ok",
-            "call iSn3tT Read @gfrK32",
-            "result iSn3tT ok",
-            "text: 5 recipes read, in sorted path o @gfrK32",
+            "call 43LvMn Read @fRmZso",
+            "result 43LvMn ok",
+            "call E25Lgw Read @fRmZso",
+            "result E25Lgw ok",
+            "call MH5UZG Read @fRmZso",
+            "result MH5UZG ok",
+            "text: **Garlic bread** @fRmZso",
             "turn started on its own",
             "text: The helper finished and read all",
             "turn ended",
@@ -4429,19 +4605,19 @@ fn replay_subagent_foreground_backgrounded_enters_the_set_with_its_call() {
 #[test]
 fn replay_subagent_foreground_stop_fails_the_agent_call() {
     let events = replay_subagent("subagent_foreground_stop");
-    // The stop came between the subagent's steps: none of its calls is
-    // left open in the recording, and the adapter makes up no result.
+    // The stop came during the subagent's Read: the CLI fails that call
+    // and then the Agent call, and the adapter makes up no result.
     assert_eq!(
         steps(&events),
         [
             "turn started",
-            "call tfMpmg Agent",
-            "call WyAM99 Bash @tfMpmg",
-            "result WyAM99 ok",
-            "call 3aSzeM Read @tfMpmg",
-            "result 3aSzeM ok",
-            "result tfMpmg error",
-            "text: The helper agent didn't run. You",
+            "call prGkTr Agent",
+            "call XKeBmJ Bash @prGkTr",
+            "result XKeBmJ ok",
+            "call fGicmC Read @prGkTr",
+            "result fGicmC error",
+            "result prGkTr error",
+            "text: The helper agent was interrupted",
             "turn ended",
         ]
     );
@@ -4508,9 +4684,9 @@ fn replay_an_interrupt_spares_the_background_agent() {
         task_sets_and_interrupts(&events),
         [
             "tasks: []",
-            "tasks: [a2384c814f3a1cabf]",
+            "tasks: [ab4e694ec72a0663c]",
             // Again, once `task_started` names its call.
-            "tasks: [a2384c814f3a1cabf@tmkcrx]",
+            "tasks: [ab4e694ec72a0663c@YF5LA9]",
             // The interrupt ends the turn; the agent stays in the set.
             "interrupted",
             // It leaves only when it completes.
@@ -4529,8 +4705,8 @@ fn replay_an_interrupt_without_the_flag_kills_the_background_agent() {
         task_sets_and_interrupts(&events),
         [
             "tasks: []",
-            "tasks: [ade77bae3441b384c]",
-            "tasks: [ade77bae3441b384c@uRKL6V]",
+            "tasks: [a8c2a90f2faeb0311]",
+            "tasks: [a8c2a90f2faeb0311@3ysXZp]",
             // The task is gone before the interrupt's turn ends.
             "tasks: []",
             "interrupted",
@@ -4612,9 +4788,14 @@ fn the_stop_hook_is_answered_with_its_schedules_and_others_are_refused() {
 #[test]
 fn replay_stop_hook_reports_the_schedules_at_each_turn_end() {
     let events = replay("stop_hook", Uuid::new_v4(), false, &[]);
-    let tick = schedule("1363496f", "*/1 * * * *", "reply only TICK", Some(false));
+    let tick = schedule(
+        "a812db08",
+        "*/1 * * * *",
+        "peek at the oven and say only TICK",
+        Some(false),
+    );
     // Asked for durable, the CLI made it not durable all the same.
-    let daily = schedule("20244679", "0 4 * * *", "reply only DURABLE", Some(false));
+    let daily = schedule("8df5d40c", "0 4 * * *", "reply only DURABLE", Some(false));
     assert_eq!(
         schedule_sets(&events),
         [
@@ -4642,7 +4823,7 @@ fn replay_stop_hook_reports_the_schedules_at_each_turn_end() {
 fn replay_loop_keeps_whether_its_job_outlives_the_agent() {
     let mut records = fixture("loop");
     let crons = json!([
-        { "id": "b6841368", "schedule": "*/1 * * * *", "recurring": true, "prompt": "reply only TICK" },
+        { "id": "b1961ae5", "schedule": "*/1 * * * *", "recurring": true, "prompt": "peek at the oven and say only TICK" },
         { "id": "elsewhere", "schedule": "0 4 * * *", "recurring": false, "prompt": "x" },
     ]);
     records.push(json!({ "dir": "out", "msg": hook_call("h1", "skywave-stop", crons) }));
@@ -4651,33 +4832,65 @@ fn replay_loop_keeps_whether_its_job_outlives_the_agent() {
         "response": { "subtype": "success", "request_id": "h1", "response": {} },
     }}));
     let (events, _) = replay_records("loop", records, Uuid::new_v4(), false, &[], false);
+    let tick = schedule(
+        "b1961ae5",
+        "*/1 * * * *",
+        "peek at the oven and say only TICK",
+        Some(false),
+    );
+    // Asked for durable, the CLI made it not durable all the same.
+    let daily = schedule(
+        "56536b7e",
+        "0 4 * * *",
+        "feed the sourdough starter",
+        Some(false),
+    );
     let mut elsewhere = schedule("elsewhere", "0 4 * * *", "x", None);
     elsewhere.recurring = false;
     assert_eq!(
         schedule_sets(&events),
-        [vec![
-            // Several turns after the one that made it.
-            schedule("b6841368", "*/1 * * * *", "reply only TICK", Some(false)),
-            // Not made in this process: unknown.
-            elsewhere,
-        ]]
+        [
+            vec![tick.clone()],
+            // The loop's own tick.
+            vec![tick.clone()],
+            // Two turns after the one that made the tick.
+            vec![tick.clone(), daily],
+            vec![
+                tick, // Not made in this process: unknown.
+                elsewhere,
+            ],
+        ]
     );
 }
 
 // ---------------------------------------------------------------------------
 // Background approvals
 
-const SUBAGENT_APPROVAL: &str = "d8debad5-cc3b-4785-835c-f163b612eacc";
+/// The `subagent_approval` recording's one `can_use_tool`: its request id,
+/// and the `agent_id` (the subagent's task id) it was asked under.
+fn subagent_approval() -> (String, String) {
+    let request = fixture("subagent_approval")
+        .into_iter()
+        .find(|r| r["dir"] == "out" && r["msg"]["request"]["subtype"] == "can_use_tool")
+        .expect("the subagent's can_use_tool")["msg"]
+        .clone();
+    let id = |v: &Value| v.as_str().unwrap().to_owned();
+    (
+        id(&request["request_id"]),
+        id(&request["request"]["agent_id"]),
+    )
+}
 
 /// The `subagent_approval` recording with a main turn run while the
-/// subagent's approval waits: a user message, then the CLI's `init` and
-/// `result` for it (copies of the recording's second turn), just before the
-/// held answer.
+/// subagent's approval waits: a user message, the CLI's `started` for it,
+/// then its `init` and `result` (copies of the recording's second turn),
+/// just before the held answer.
 fn subagent_approval_with_a_turn_between() -> Vec<Value> {
     let records = fixture("subagent_approval");
+    let (request, _) = subagent_approval();
     let answer = records
         .iter()
-        .position(|r| r["dir"] == "in" && r["msg"]["response"]["request_id"] == SUBAGENT_APPROVAL)
+        .position(|r| r["dir"] == "in" && r["msg"]["response"]["request_id"] == request)
         .expect("the held answer");
     let out_of = |kind: &str| {
         records
@@ -4686,8 +4899,13 @@ fn subagent_approval_with_a_turn_between() -> Vec<Value> {
             .unwrap()
             .clone()
     };
+    let id = Uuid::new_v4();
+    let message = protocol::user_message("meanwhile", id);
     let turn = [
-        json!({ "dir": "in", "msg": protocol::user_message("meanwhile") }),
+        json!({ "dir": "in", "msg": message }),
+        json!({ "dir": "out", "msg": {
+            "type": "command_lifecycle", "command_uuid": id.to_string(), "state": "started",
+        } }),
         records
             .iter()
             .rfind(|r| r["msg"]["subtype"] == "init")
@@ -4712,11 +4930,12 @@ fn replay_a_subagent_approval_outlives_the_main_turns() {
     );
     // The replay checked that the held allow was written: an answer to an
     // approval no longer pending writes nothing.
+    let (request, task) = subagent_approval();
     let asked = events
         .iter()
         .position(|e| {
-            matches!(e, AdapterEvent::ApprovalRequested { request, task: Some(task), .. }
-                if request.0 == SUBAGENT_APPROVAL && task == "add5b3d5dc618eaff")
+            matches!(e, AdapterEvent::ApprovalRequested { request: r, task: Some(t), .. }
+                if r.0 == request && *t == task)
         })
         .expect("the subagent's approval, as its task's");
     let ends: Vec<usize> = events
@@ -4783,7 +5002,7 @@ fn running_protocol() -> Protocol {
 #[test]
 fn a_subagent_approval_outlives_main_turns_until_its_task_leaves() {
     let mut protocol = running_protocol();
-    protocol.send_message("one".to_owned());
+    send(&mut protocol, "one");
     protocol.on_line(&subagent_tasks(&["sub1"]));
     protocol.on_line(RESULT_OK);
     let asked = protocol.on_line(&can_use_tool("p1", Some("sub1")));
@@ -4792,7 +5011,7 @@ fn a_subagent_approval_outlives_main_turns_until_its_task_leaves() {
         [AdapterEvent::ApprovalRequested { task: Some(task), .. }] if task == "sub1"
     ));
     // A second turn's result cancels that turn's own approval only.
-    protocol.send_message("two".to_owned());
+    send(&mut protocol, "two");
     let main = protocol.on_line(&can_use_tool("p2", None));
     assert!(matches!(
         &main.events[..],
@@ -4807,7 +5026,7 @@ fn a_subagent_approval_outlives_main_turns_until_its_task_leaves() {
         ]
     );
     // An interrupted turn leaves it too.
-    protocol.send_message("three".to_owned());
+    send(&mut protocol, "three");
     protocol.interrupt();
     let end = protocol.on_line(
         r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools"}"#,
@@ -4845,7 +5064,7 @@ fn a_subagent_approval_is_withdrawn_by_the_cli_outside_a_turn() {
 #[test]
 fn an_approval_from_no_live_task_is_the_turns() {
     let mut protocol = running_protocol();
-    protocol.send_message("go".to_owned());
+    send(&mut protocol, "go");
     // A foreground subagent asks under an id no task set listed.
     let asked = protocol.on_line(&can_use_tool("p1", Some("foreground")));
     assert!(matches!(

@@ -1,20 +1,30 @@
 //! Full scenarios about turns: messages, approvals, interrupts.
 
+use serde_json::json;
 use skywave_proto::Decision;
+use skywaved::agent::claude_code::CliSession;
 use skywaved::agent::claude_code::protocol::INTERRUPT_REASON;
 use skywaved::agent::{
-    AdapterEvent, AgentCallId, AgentRequestId, RuleScope, RuleSuggestion, TurnOutcome,
+    AdapterEvent, AgentCallId, AgentRequestId, PermissionMode, RuleScope, RuleSuggestion,
+    TurnOutcome,
 };
 
 use super::Ctx;
+use super::controls::{expect_mode, set_mode};
 use crate::report::{Stop, ensure};
 use crate::session::{Session, Setup, Workdir};
 
 /// How long one turn may take.
 pub(super) const TURN: u64 = 120;
 
+/// Two turns in one process, then a second process resuming the
+/// conversation for a third. Its recording is the fixture `basic.ndjson`.
 pub fn basic(ctx: &mut Ctx) -> Result<(), Stop> {
-    let mut s = ctx.session(Setup::default())?;
+    let workdir = Workdir::new(None)?;
+    let mut s = ctx.session(Setup {
+        workdir: Some(workdir.clone()),
+        ..Setup::default()
+    })?;
     let from = s.mark();
     s.send(
         "Good morning! The bakery opens in five minutes and I'm testing the shop bell. When \
@@ -71,6 +81,187 @@ pub fn basic(ctx: &mut Ctx) -> Result<(), Stop> {
         "a second turn in the same process completes",
         completed(&outcome),
     );
+    let id = s.protocol.session_id();
+    drop(s);
+
+    let mut s = ctx.session(Setup {
+        session: Some(CliSession::Resume(id)),
+        workdir: Some(workdir),
+        ..Setup::default()
+    })?;
+    let from = s.mark();
+    s.send(
+        "Back after the lunch rush. Which two bells did we test this morning? Answer in one \
+         short line.",
+    );
+    let (_, outcome) = s.turn_end(from, TURN)?;
+    let init = s.find(from, |x| x.is("system/init"));
+    let checks = &mut ctx.checks;
+    checks.contract("a resumed process takes a turn", completed(&outcome));
+    checks.contract(
+        "a resumed process runs under the same session id",
+        ensure(
+            init.is_some_and(|at| s.seen[at].str("/session_id") == Some(&id.to_string())),
+            || format!("init at {init:?}"),
+        ),
+    );
+    Ok(())
+}
+
+/// With `--include-partial-messages`: an interrupt while text streams, a
+/// turn whose tool runs unasked, an interrupt while idle (written raw: the
+/// adapter sends none then), and a turn after it. Its recording is the
+/// fixture `interrupt.ndjson` (docs/agents/claude-code.md §4).
+pub fn interrupt(ctx: &mut Ctx) -> Result<(), Stop> {
+    let mut s = ctx.session(Setup {
+        args: vec!["--include-partial-messages".into()],
+        ..Setup::default()
+    })?;
+    let from = s.mark();
+    s.send(
+        "The flour delivery is late, so let's pass the time: count from 1 to 60, one number \
+         per line, each followed by a different pastry.",
+    );
+    s.wait("streamed text", TURN, from, |x| {
+        x.is("stream_event") && x.str("/event/delta/type") == Some("text_delta")
+    })?;
+    s.note("interrupting while text streams");
+    let out = s.protocol.interrupt();
+    s.apply(out);
+    let (end, outcome) = s.turn_end(from, TURN)?;
+    ctx.checks.contract(
+        "an interrupt while text streams ends the turn interrupted",
+        ensure(outcome == TurnOutcome::Interrupted, || {
+            format!("{outcome:?}")
+        }),
+    );
+    ctx.checks.contract(
+        "its result's terminal_reason is aborted_streaming",
+        ensure(
+            s.seen[end].str("/terminal_reason") == Some("aborted_streaming"),
+            || format!("{:?}", s.seen[end].str("/terminal_reason")),
+        ),
+    );
+
+    let from = s.mark();
+    s.send("The delivery is here. Use the Bash tool to run exactly: echo flour-arrived");
+    let (_, outcome) = s.turn_end(from, TURN)?;
+    let asked = (from..s.mark()).any(|at| s.seen[at].is_request("can_use_tool"));
+    ctx.checks.contract(
+        "a read-only echo runs unasked",
+        completed(&outcome).and_then(|()| ensure(!asked, || "it was asked".into())),
+    );
+
+    s.note("interrupting while idle");
+    let id = s.control(json!({ "subtype": "interrupt" }));
+    let answer = s.response(&id, 30)?;
+    ctx.checks.contract(
+        "an interrupt while idle is answered with success",
+        ensure(answer["subtype"] == "success", || answer.to_string()),
+    );
+
+    let from = s.mark();
+    s.send("All stocked up. Say just ok.");
+    let (_, outcome) = s.turn_end(from, TURN)?;
+    ctx.checks.contract(
+        "the process takes a turn after the interrupts",
+        completed(&outcome),
+    );
+    Ok(())
+}
+
+/// A `set_permission_mode` before turns, walking every mode, with each
+/// tool call approved; the last switch comes while an approval waits. Its
+/// recording is the fixture `permission_modes.ndjson`
+/// (docs/agents/claude-code.md §3.7); each turn starts at a `step:` note.
+pub fn permission_modes(ctx: &mut Ctx) -> Result<(), Stop> {
+    let mut s = ctx.session(Setup::default())?;
+    let write = |file: &str, text: &str| {
+        format!("Use the Write tool to create {file} containing exactly: {text}")
+    };
+    let rm = |file: &str| format!("Use the Bash tool to run exactly: rm {file}");
+    mode_step(&mut s, "default: Write", &write("menu-1.txt", "rye bread"))?;
+    switch_mode(ctx, &mut s, PermissionMode::AcceptEdits)?;
+    mode_step(
+        &mut s,
+        "acceptEdits: Write",
+        &write("menu-2.txt", "sourdough"),
+    )?;
+    mode_step(&mut s, "acceptEdits: Bash rm", &rm("menu-2.txt"))?;
+    switch_mode(ctx, &mut s, PermissionMode::Plan)?;
+    mode_step(
+        &mut s,
+        "plan: Write",
+        &format!(
+            "{} When your plan is ready, ask to leave plan mode and then do it.",
+            write("menu-3.txt", "baguette")
+        ),
+    )?;
+    switch_mode(ctx, &mut s, PermissionMode::Auto)?;
+    mode_step(&mut s, "auto: Write", &write("menu-4.txt", "brioche"))?;
+    mode_step(&mut s, "auto: Bash rm", &rm("menu-4.txt"))?;
+    switch_mode(ctx, &mut s, PermissionMode::DontAsk)?;
+    mode_step(&mut s, "dontAsk: Write", &write("menu-5.txt", "focaccia"))?;
+    switch_mode(ctx, &mut s, PermissionMode::Ask)?;
+    mode_step(
+        &mut s,
+        "default again: Write",
+        &write("menu-6.txt", "challah"),
+    )?;
+
+    // The switch comes while the Write's approval waits; the approval is
+    // answered only after it.
+    s.note("step: pending + switch to acceptEdits");
+    s.auto_approve = false;
+    let from = s.mark();
+    s.send(&write("menu-7.txt", "pretzel"));
+    let pending = asked(&mut s, from, "Write")?;
+    switch_mode(ctx, &mut s, PermissionMode::AcceptEdits)?;
+    let cancelled = (from..s.mark()).any(|at| s.seen[at].is("control_cancel_request"));
+    ctx.checks.contract(
+        "a mode switch leaves a waiting approval waiting",
+        ensure(!cancelled, || "the CLI cancelled it".into()),
+    );
+    answer(&mut s, &pending.request, Decision::Approve, None);
+    s.turn_end(from, TURN)?;
+    Ok(())
+}
+
+/// Plan from `default`: the approved `ExitPlanMode` returns to `default`.
+/// Its recording is the fixture `permission_modes_plan.ndjson`.
+pub fn permission_modes_plan(ctx: &mut Ctx) -> Result<(), Stop> {
+    let mut s = ctx.session(Setup::default())?;
+    switch_mode(ctx, &mut s, PermissionMode::Plan)?;
+    mode_step(
+        &mut s,
+        "plan (from default): Write",
+        "Use the Write tool to create specials.txt containing exactly: plum tart. When your \
+         plan is ready, ask to leave plan mode and then do it.",
+    )?;
+    mode_step(
+        &mut s,
+        "after plan: Write",
+        "Use the Write tool to create specials-2.txt containing exactly: pear tart",
+    )?;
+    Ok(())
+}
+
+/// Notes `step` and runs a turn of `message`, every approval allowed.
+fn mode_step(s: &mut Session, step: &str, message: &str) -> Result<(), Stop> {
+    s.note(&format!("step: {step}"));
+    let from = s.mark();
+    s.send(message);
+    s.turn_end(from, TURN)?;
+    Ok(())
+}
+
+fn switch_mode(ctx: &mut Ctx, s: &mut Session, mode: PermissionMode) -> Result<(), Stop> {
+    let answer = set_mode(s, mode);
+    if let Err(stop) = answer {
+        return Err(stop);
+    }
+    ctx.checks
+        .contract("each mode switch succeeds", expect_mode(answer, mode));
     Ok(())
 }
 
@@ -380,6 +571,27 @@ pub fn interrupt_pending(ctx: &mut Ctx) -> Result<(), Stop> {
     ctx.checks.contract(
         "the process takes a turn after the interrupt",
         completed(&outcome),
+    );
+
+    // The user closes the laptop while another approval waits: stdin
+    // closes, the CLI fails the approval and the turn goes on without it.
+    let from = s.mark();
+    s.send(
+        "Fine, one more try at the diary: use the Write tool to create starter-diary.txt \
+         containing exactly: day two, still bubbly",
+    );
+    let write = asked(&mut s, from, "Write")?;
+    s.close_stdin();
+    s.wait_closed(TURN)?;
+    let cancelled = s.find_event(from, |e| match e {
+        AdapterEvent::ApprovalCancelled { request, reason } if *request == write.request => {
+            Some(reason.clone())
+        }
+        _ => None,
+    });
+    ctx.checks.contract(
+        "closing stdin fails a waiting approval",
+        ensure(cancelled.is_some(), || "not cancelled".into()),
     );
     Ok(())
 }

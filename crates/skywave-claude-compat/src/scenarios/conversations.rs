@@ -119,6 +119,72 @@ pub fn fork(ctx: &mut Ctx) -> Result<(), Stop> {
     Ok(())
 }
 
+/// A fork with model turns: the parent is told one word, the fork another;
+/// resuming each then shows the fork left the parent's history alone. Its
+/// recording is the fixture `fork_turns.ndjson` (docs/agents/claude-code.md
+/// §5), four processes.
+pub fn fork_turns(ctx: &mut Ctx) -> Result<(), Stop> {
+    let workdir = Workdir::new(None)?;
+    let parent = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    turn(
+        ctx,
+        &workdir,
+        CliSession::New(parent),
+        "Remember this word for the order book: PELICAN. Reply only NOTED.",
+    )?;
+    let mut s = turn(
+        ctx,
+        &workdir,
+        CliSession::Fork { parent, id },
+        "Remember this second word too: OTTER. Then reply with every word I asked you to \
+         remember, in order, and nothing else.",
+    )?;
+    ctx.checks.contract(
+        "the fork runs under the session id we chose",
+        same_id(&s, id),
+    );
+    let handles: Vec<Uuid> = (s.seen.iter())
+        .flat_map(|m| &m.events)
+        .filter_map(|e| match e {
+            AdapterEvent::ResumeHandle(handle) => parse_resume_handle(handle).ok(),
+            _ => None,
+        })
+        .collect();
+    ctx.checks.contract(
+        "the fork reports one resume handle, naming its own id",
+        ensure(handles == [id], || format!("reported {handles:?}")),
+    );
+    s.note("ending the fork");
+    drop(s);
+    let ask = "List every word I asked you to remember, in order, and nothing else.";
+    turn(ctx, &workdir, CliSession::Resume(parent), ask)?;
+    turn(ctx, &workdir, CliSession::Resume(id), ask)?;
+    Ok(())
+}
+
+/// A process taking up `session` in `workdir`, after one turn of `message`,
+/// which must complete.
+fn turn(
+    ctx: &mut Ctx,
+    workdir: &std::rc::Rc<Workdir>,
+    session: CliSession,
+    message: &str,
+) -> Result<Session, Stop> {
+    let mut s = ctx.session(Setup {
+        session: Some(session),
+        workdir: Some(workdir.clone()),
+        ..Setup::default()
+    })?;
+    let from = s.mark();
+    s.send(message);
+    let (_, outcome) = s.turn_end(from, super::turns::TURN)?;
+    if outcome != TurnOutcome::Completed {
+        return Err(Stop::Stalled(format!("the turn ended {outcome:?}")));
+    }
+    Ok(s)
+}
+
 pub fn resume_unknown(ctx: &mut Ctx) -> Result<(), Stop> {
     let workdir = Workdir::new(None)?;
     let resumed = ctx.session_or_refusal(Setup {
@@ -286,20 +352,18 @@ fn begin(ctx: &mut Ctx, workdir: &std::rc::Rc<Workdir>, id: Uuid, title: &str) -
 
 /// Sends local command `command` and waits for its turn, which must
 /// complete; the session ids of the resume handles the adapter reported
-/// meanwhile. The first is reported as the message is sent, so it is in
-/// the send's events rather than in [`Session::seen`].
+/// meanwhile. A local command is taken up like a message, by its
+/// `command_lifecycle` `started`, which brings the first handle.
 fn local(s: &mut Session, command: &str) -> Result<Vec<Uuid>, Stop> {
     let from = s.mark();
-    let out = s.protocol.send_message(command.to_owned());
-    let mut events = out.events.clone();
-    s.apply(out);
+    s.send(command);
     let (_, outcome) = s.turn_end(from, LOCAL)?;
     if outcome != TurnOutcome::Completed {
         return Err(Stop::Stalled(format!("{command} ended {outcome:?}")));
     }
-    events.extend(s.seen[from..].iter().flat_map(|m| m.events.iter().cloned()));
-    Ok(events
+    Ok(s.seen[from..]
         .iter()
+        .flat_map(|m| &m.events)
         .filter_map(|e| match e {
             AdapterEvent::ResumeHandle(handle) => parse_resume_handle(handle).ok(),
             _ => None,

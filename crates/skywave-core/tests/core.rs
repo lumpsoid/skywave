@@ -1241,23 +1241,28 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
     .unwrap();
     let mut protocol = Protocol::new(uuid::Uuid::new_v4(), false);
     let mut events = protocol.start().events;
-    let initialize = protocol_initialize_id(&recording);
+    // The `uuid` the protocol gave each message, by the recorded one.
+    let mut ours = std::collections::HashMap::new();
     for line in recording.lines().filter(|l| !l.trim().is_empty()) {
         let record: serde_json::Value = serde_json::from_str(line).unwrap();
         let mut msg = record["msg"].clone();
         match record["dir"].as_str().unwrap() {
             "in" if msg["type"] == "user" => {
                 let text = msg["message"]["content"].as_str().unwrap().to_owned();
-                events.extend(protocol.send_message(text).events);
+                let out = protocol.send_message(text);
+                ours.insert(msg["uuid"].clone(), out.writes[0]["uuid"].clone());
+                events.extend(out.events);
             }
             "out" => {
-                // The CLI answers `initialize` under the id the protocol chose.
-                if msg["response"]["request_id"] == initialize {
-                    msg["response"]["request_id"] = "skywave_1".into();
+                // The CLI names our messages by the ids we gave them.
+                if let Some(id) = ours.get(&msg["command_uuid"]) {
+                    msg["command_uuid"] = id.clone();
                 }
                 events.extend(protocol.on_line(&msg.to_string()).events);
             }
-            // The protocol answers the CLI's hook calls itself.
+            // The protocol answers the CLI's hook calls itself. The
+            // subagent's Write approval was answered by the recording's
+            // head; this test is about where the steps land, not the answer.
             _ => {}
         }
     }
@@ -1282,7 +1287,7 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
         })
         .expect("the Agent call");
     assert!(
-        logged.contains(&(Some(agent_call), "PONG".to_owned())),
+        logged.contains(&(Some(agent_call), "WRITTEN".to_owned())),
         "{logged:?}"
     );
 
@@ -1293,12 +1298,9 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
     core.dispatch(Action::OpenSession(sid)).unwrap();
     let main = messages(&session_view(&core.view()).timeline);
     // Positive control: the main agent's own text is on the main timeline.
-    assert!(
-        main.contains(&(None, "The subagent replied: **PONG**".to_owned())),
-        "{main:?}"
-    );
+    assert!(main.contains(&(None, "NOTED".to_owned())), "{main:?}");
     assert!(main.iter().all(|(parent, _)| parent.is_none()), "{main:?}");
-    assert!(!main.iter().any(|(_, text)| text == "PONG"), "{main:?}");
+    assert!(!main.iter().any(|(_, text)| text == "WRITTEN"), "{main:?}");
     // The subagent's own view has it.
     core.dispatch(Action::ViewSubagent {
         session_id: sid,
@@ -1307,18 +1309,8 @@ fn a_claude_subagents_steps_are_logged_under_its_call_and_kept_off_the_main_time
     .unwrap();
     assert_eq!(
         messages(&session_view(&core.view()).timeline),
-        [(Some(agent_call), "PONG".to_owned())]
+        [(Some(agent_call), "WRITTEN".to_owned())]
     );
-}
-
-/// The request id of the `initialize` the recording's driver wrote.
-fn protocol_initialize_id(recording: &str) -> serde_json::Value {
-    recording
-        .lines()
-        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-        .find(|r| r["dir"] == "in" && r["msg"]["request"]["subtype"] == "initialize")
-        .map(|r| r["msg"]["request_id"].clone())
-        .unwrap()
 }
 
 /// A core over `dir` paired, with one session `sid` in its replica, open.
