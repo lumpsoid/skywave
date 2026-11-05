@@ -26,6 +26,9 @@ tokio-rustls.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 skywaved = { path = "../skywaved" }
 skywave-testkit = { path = "../skywave-testkit" }
