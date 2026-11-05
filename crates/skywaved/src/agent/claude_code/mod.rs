@@ -296,12 +296,11 @@ impl ClaudeCodeAdapter {
     /// granting `session_rules`, the session's flags
     /// ([`CliSession::args`]), then `agent.args`.
     pub fn command_args(&self, session: CliSession, session_rules: &[Value]) -> Vec<String> {
-        let allow_bypass = self.config.allow_bypass;
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
-        if allow_bypass {
+        if self.config.allow_bypass {
             args.push(ALLOW_BYPASS_ARG.to_owned());
         }
-        args.extend(rules::cli_args(session_rules, allow_bypass));
+        args.extend(rules::cli_args(session_rules));
         args.extend(session.args());
         args.extend(self.config.args.iter().cloned());
         args
@@ -426,9 +425,8 @@ impl AgentAdapter for ClaudeCodeAdapter {
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
         let child = self.spawn(&spec.workdir, session, &session_rules)?;
         let mut process = Process::new(child, &span, self.write_timeout, self.term_grace)?;
-        let mut protocol = Protocol::new(session.id(), session.handle_stored())
-            .with_session_rules(session_rules)
-            .with_bypass(self.config.allow_bypass);
+        let mut protocol =
+            Protocol::new(session.id(), session.handle_stored()).with_session_rules(session_rules);
 
         let mut early = Vec::new();
         let handshake = handshake(&mut process, &mut protocol, &mut early).instrument(span.clone());

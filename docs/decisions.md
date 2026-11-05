@@ -914,9 +914,11 @@ bypass the agent last ran in, so the agent's own mode replaces it.
 `--permission-mode bypassPermissions`), so `hello` always tells the truth.
 The list is the adapter's (`claude_code::bypass_arg`); the config only
 calls it.
-**Rule suggestions too.** The agent's own "always allow every tool"
-suggestion is dropped from approval prompts without the opt-in, and a grant
-of it from while it was on is not applied again after it is turned off.
+**Never a rule grant.** The agent's own "always allow every tool"
+suggestion is dropped from approval prompts even with the opt-in, and a
+stored grant of it is never applied: bypass is reached only through the
+mode switch above, so the one knob that unlocks it is the operator's, and
+an approval answered in a hurry cannot turn off every prompt.
 **Launch, not start, in bypass.** With the opt-in the agent is launched so
 that it may switch to bypass mid-session (Claude Code:
 `--allow-dangerously-skip-permissions`), never so that it starts there; a
@@ -925,7 +927,9 @@ opt-in says what it allows, not which CLI flag it sets.
 **Rejected:** offering bypass everywhere and leaving the refusal to the
 agent (an option shown only to fail, and the agent's flag the only guard);
 never offering it (an operator who wants it would have to start every
-session in it through `agent.args`).
+session in it through `agent.args`); offering the agent's bypass suggestion
+on approvals where the opt-in is on (a second, easier way in, one keypress
+on a prompt).
 
 ## D39. A long shell run's progress backs off further, and skips repeats
 A run's `ShellOutput` checks (D35) are at 2, 5, 10 and 30 s, then every

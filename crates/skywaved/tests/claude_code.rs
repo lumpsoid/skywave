@@ -247,7 +247,7 @@ fn granted_rule(offers: &HashMap<String, Value>, request: &str, response: &Value
     let [update] = granted.as_array().map(Vec::as_slice).unwrap_or_default() else {
         panic!("request {request}: expected one granted update, got {granted}");
     };
-    let offered = rules::offered(offers.get(request), false);
+    let offered = rules::offered(offers.get(request));
     let index = offered
         .iter()
         .position(|(_, u)| u == update)
@@ -841,30 +841,22 @@ fn granting_a_rule_sends_its_suggestion_as_updated_permissions() {
 }
 
 #[test]
-fn a_bypass_suggestion_is_offered_only_where_the_server_allows_it() {
+fn a_bypass_suggestion_is_never_offered() {
     // A recorded request, with the CLI's `bypassPermissions` suggestion
-    // (docs/agents/claude-code.md §3.6) added after its own.
+    // (docs/agents/claude-code.md §3.6) added after its own: bypass is a
+    // mode the operator unlocks, never a grant on an approval (D38).
     let mut request = permission_requests("permissions").remove(1);
     let every = json!({"type":"setMode","mode":"bypassPermissions","destination":"cliArg"});
     request["request"]["permission_suggestions"]
         .as_array_mut()
         .unwrap()
         .push(every);
-    let line = serde_json::to_string(&request).unwrap();
-    let labels = |protocol: Protocol| -> Vec<String> {
-        let mut protocol = protocol;
-        let out = protocol.on_line(&line);
-        let [AdapterEvent::ApprovalRequested { suggestions, .. }] = &out.events[..] else {
-            panic!("{:?}", out.events);
-        };
-        suggestions.iter().map(|s| s.label.clone()).collect()
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let out = protocol.on_line(&serde_json::to_string(&request).unwrap());
+    let [AdapterEvent::ApprovalRequested { suggestions, .. }] = &out.events[..] else {
+        panic!("{:?}", out.events);
     };
-    let without = labels(Protocol::new(Uuid::new_v4(), false));
-    assert_eq!(without.len(), 3, "the recorded ones: {without:?}");
-    assert!(!without.iter().any(|l| l == "every tool"), "{without:?}");
-    let with = labels(Protocol::new(Uuid::new_v4(), false).with_bypass(true));
-    assert_eq!(with[..3], without[..]);
-    assert_eq!(with[3..], ["every tool"]);
+    assert_eq!(suggestions.len(), 3, "the recorded ones: {suggestions:?}");
 }
 
 #[test]
