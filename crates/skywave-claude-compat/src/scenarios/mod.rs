@@ -134,8 +134,14 @@ pub const ALL: &[Scenario] = &[
     Scenario {
         name: "permissions",
         tier: Tier::Full,
-        about: "can_use_tool allow and deny, and whether a granted rule applies (d29758)",
+        about: "can_use_tool allow and deny, and a granted rule spares the next call",
         run: turns::permissions,
+    },
+    Scenario {
+        name: "rules_granted",
+        tier: Tier::Full,
+        about: "a tool rule, a directory and file edits, each granted, then applied by the CLI",
+        run: turns::rules_granted,
     },
     Scenario {
         name: "interrupt_pending",
