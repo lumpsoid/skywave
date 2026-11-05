@@ -214,7 +214,14 @@ Android only (the settings screen gets no switch elsewhere).
   `AppForegrounded` and on `AppReady`. Starting a running service re-reports
   `running`, which a fresh head (after a hub failure) needs.
 - The Flutter engine is app-owned (`FlutterEngineCache`), so the hub keeps
-  running once the Activity is gone.
+  running once the Activity is gone. The `start`/`stop` channel is bound
+  with the engine, not per Activity, so the hub can stop the service with
+  no Activity.
+- A hub failure off screen with the service holding the link restarts the
+  hub once without the user; a second one before the app is back on
+  screen stops the service and notifies "Skywave stopped". The service
+  never runs over a closed core for long, and a panic that repeats does
+  not loop in the background.
 - Doze needs no battery-optimisation exemption, so the app asks for none.
   Probed 2026-11-05 on a OnePlus 6 (Android 14, AOSP-based ROM) over Wi-Fi,
   forced into deep idle with the screen off and unplugged, toggle on, no

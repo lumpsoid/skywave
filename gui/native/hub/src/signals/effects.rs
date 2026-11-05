@@ -9,7 +9,8 @@ pub enum PlatformEffect {
     /// notification. `id` is the notification's, one per session and kind
     /// (showing it again replaces it); `title` is the session's, sanitised
     /// (may be empty); `body` the line to show, `approval needed · <title>`;
-    /// `session_id` the session to open on a tap.
+    /// `session_id` the session to open on a tap. Also the hub saying it
+    /// stopped off screen (`notify::STOPPED`, no session).
     Notify {
         id: i32,
         title: String,

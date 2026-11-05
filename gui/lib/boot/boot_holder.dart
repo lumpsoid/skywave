@@ -90,7 +90,8 @@ class BootHolder extends ChangeNotifier {
   /// the core; nothing sent reaches it until the next [Boot]. Answers at
   /// once with the failure's [epoch], before anything else is sent: Rust
   /// drops every intent sent before that answer, as meant for the hub that
-  /// failed.
+  /// failed. Off screen with the background service running, Rust reopens
+  /// the core itself and answers [Booted] (or [BootFailed]) unasked.
   void crashed(String panic, {required int epoch}) {
     _send(GuiIntentHubFailedSeen(epoch: epoch));
     _set(

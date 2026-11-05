@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 /// `<dir>/skywave`. `device_name` is what pairing shows the server.
 /// `reset_replica` first drops the local replica so it syncs again from
 /// the server (`Core::reset_replica`), after a [`BootFailed`] that was
-/// `unreadable`.
-#[derive(Deserialize, DartSignal)]
+/// `unreadable`. The hub keeps the last one, to reopen the core itself
+/// after a failure off screen.
+#[derive(Debug, Clone, Deserialize, DartSignal)]
 pub struct Boot {
     pub dir: String,
     pub device_name: String,
@@ -32,7 +33,9 @@ pub struct BootFailed {
 /// The hub panicked (its task, or the dispatch thread): `message` is the
 /// panic's. The core is closed and nothing the GUI sends is acted on until
 /// Dart sends [`Boot`] again, which opens the core afresh and answers
-/// [`Booted`] (or [`BootFailed`]).
+/// [`Booted`] (or [`BootFailed`]). Off screen with the background service
+/// holding the link, the hub reopens the core itself, once, and answers
+/// [`Booted`] (or [`BootFailed`]) unasked.
 ///
 /// `epoch` counts the failures in this process. Dart answers each at once
 /// with `GuiIntent::HubFailedSeen` of the same `epoch`: the intents it sent
