@@ -5,7 +5,7 @@
 //! one already waits for `Boot`. [`CORE_SLOT`] makes the new core wait until
 //! the old one has closed, so two engines never share the data dir.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, MutexGuard, oneshot};
 
 use crate::dispatcher::{Dispatcher, Report};
+use crate::prefs::{self, Prefs};
 use crate::signals::{Boot, BootFailed};
 
 /// The core's data dir under the directory Dart sends.
@@ -34,13 +35,18 @@ pub struct Running {
     pub views: UnboundedReceiver<ViewState>,
     pub results: UnboundedReceiver<Report>,
     pub failed: oneshot::Receiver<String>,
+    /// The head's preferences as read at boot.
+    pub prefs: Prefs,
+    /// Where they are written back: beside the core's data dir.
+    pub prefs_path: PathBuf,
     subscription: SubscriptionId,
     slot: MutexGuard<'static, ()>,
 }
 
 /// Opens the core in `<boot.dir>/skywave` under the device name Dart sent,
 /// first resetting its replica if Dart asked, subscribes to its snapshots
-/// and starts the dispatcher. The error is what Dart shows.
+/// and starts the dispatcher, and reads the head's preferences from
+/// `<boot.dir>/skywave-gui.json`. The error is what Dart shows.
 pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
     let failed = |message: String| BootFailed {
         message,
@@ -52,6 +58,7 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         dispatcher: None,
     };
     let dir = Path::new(&boot.dir).join(DATA_DIR);
+    let prefs_path = prefs::path_in(Path::new(&boot.dir));
     let config = EngineConfig {
         device_name: Some(boot.device_name),
         ..EngineConfig::default()
@@ -116,6 +123,8 @@ pub async fn open(boot: Boot) -> Result<Running, BootFailed> {
         views,
         results,
         failed: core_failed,
+        prefs: prefs::load(&prefs_path),
+        prefs_path,
         subscription,
         slot,
     })
@@ -161,6 +170,8 @@ impl Running {
             views,
             results,
             failed,
+            prefs: _,
+            prefs_path: _,
             subscription,
             slot,
         } = self;
@@ -271,6 +282,26 @@ pub(crate) mod tests {
         running.close();
         // A second open (a hot restart's) gets the slot and the same data.
         let running = open(boot_in(dir.path(), false)).await.unwrap();
+        running.close();
+    }
+
+    /// The preferences sit beside the data dir, so a replica reset keeps
+    /// them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_reads_the_preferences_beside_the_data_even_after_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = open(boot_in(dir.path(), false)).await.unwrap();
+        assert_eq!(running.prefs, Prefs::default(), "no file yet");
+        assert_eq!(running.prefs_path, dir.path().join(prefs::PREFS_FILE));
+        assert!(!running.prefs_path.starts_with(dir.path().join(DATA_DIR)));
+        let on = Prefs {
+            stay_connected: true,
+        };
+        prefs::save(&running.prefs_path, &on).unwrap();
+        running.close();
+
+        let running = open(boot_in(dir.path(), true)).await.unwrap();
+        assert_eq!(running.prefs, on);
         running.close();
     }
 

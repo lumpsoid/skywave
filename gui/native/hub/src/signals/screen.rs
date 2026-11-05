@@ -89,6 +89,10 @@ pub enum ScreenView {
         /// The pinned server CA fingerprint, to compare with what
         /// `skywaved` prints.
         fingerprint: Option<String>,
+        /// Whether the link stays open with the app in the background
+        /// (the head's own preference, not the core's); `None` where it
+        /// is not offered: everywhere but Android.
+        stay_connected: Option<bool>,
     },
     /// Cost and tokens across sessions, from the replica alone.
     Usage {

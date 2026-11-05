@@ -27,6 +27,7 @@ use crate::dispatcher::{Dispatched, Tag};
 use crate::lifecycle::Target;
 use crate::lifecycle::{Awake, Call, Moved};
 use crate::notify::{Kind, NotificationIds};
+use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
@@ -93,6 +94,8 @@ pub enum Out {
     Suspend,
     /// Start them again (`Core::resume`).
     Resume,
+    /// Write the head's preferences to their file.
+    SavePrefs(Prefs),
 }
 
 /// What a dispatched action was for, so its result reaches its owner.
@@ -260,6 +263,45 @@ struct Sent {
     search: Option<SearchUpdate>,
 }
 
+/// The Stay connected preference as the head keeps it (D21), offered on
+/// Android alone, where the background service is. Choosing it only asks
+/// Dart to start or stop the service: what holds the link is Kotlin's
+/// report that it runs ([`Awake::service`]), never the preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StayConnected {
+    offered: bool,
+    on: bool,
+}
+
+/// Whether this hub was built for Android.
+const ANDROID: bool = cfg!(target_os = "android");
+
+impl Default for StayConnected {
+    fn default() -> StayConnected {
+        StayConnected {
+            offered: ANDROID,
+            on: false,
+        }
+    }
+}
+
+impl StayConnected {
+    /// What the settings screen shows: `None` where not offered.
+    fn shown(self) -> Option<bool> {
+        self.offered.then_some(self.on)
+    }
+
+    /// Asks for the service again while it is wanted: on a fresh head
+    /// (after a hub failure too) and on coming back on screen. Starting a
+    /// running service starts nothing, but Kotlin reports `running` again,
+    /// which a fresh head, or one whose report was dropped, needs.
+    fn restart(self, out: &mut Vec<Out>) {
+        if self.offered && self.on {
+            out.push(Out::Effect(PlatformEffect::BackgroundService { run: true }));
+        }
+    }
+}
+
 /// The GUI head's state. See the module docs.
 #[derive(Debug, Default)]
 pub struct Head {
@@ -288,11 +330,19 @@ pub struct Head {
     sent: Sent,
     /// Who holds the link: whether the core runs.
     awake: Awake,
+    stay_connected: StayConnected,
 }
 
 impl Head {
-    pub fn new() -> Head {
-        Head::default()
+    /// A head with the preferences read at boot.
+    pub fn new(prefs: Prefs) -> Head {
+        Head {
+            stay_connected: StayConnected {
+                on: prefs.stay_connected,
+                ..StayConnected::default()
+            },
+            ..Head::default()
+        }
     }
 
     /// A head for `target` rather than the one built for.
@@ -300,6 +350,20 @@ impl Head {
     pub(crate) fn with_target(target: Target) -> Head {
         Head {
             awake: Awake::new(target),
+            ..Head::new(Prefs::default())
+        }
+    }
+
+    /// A head for `target`, on Android or not whatever it was built for,
+    /// with `prefs`.
+    #[cfg(test)]
+    pub(crate) fn with_platform(target: Target, android: bool, prefs: Prefs) -> Head {
+        Head {
+            awake: Awake::new(target),
+            stay_connected: StayConnected {
+                offered: android,
+                on: prefs.stay_connected,
+            },
             ..Head::default()
         }
     }
@@ -536,7 +600,10 @@ impl Head {
         out: &mut Vec<Out>,
     ) -> Result<(), String> {
         match intent {
-            GuiIntent::AppReady => self.sent = Sent::default(),
+            GuiIntent::AppReady => {
+                self.sent = Sent::default();
+                self.stay_connected.restart(out);
+            }
             GuiIntent::Act { action } => {
                 let action = intents::action(action)?;
                 self.dispatch_user(action, Purpose::Plain, clock, out);
@@ -1103,10 +1170,25 @@ impl Head {
                 );
             }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
-            GuiIntent::AppForegrounded => self.moved(Moved::Foregrounded, clock, out),
+            GuiIntent::AppForegrounded => {
+                self.moved(Moved::Foregrounded, clock, out);
+                // The system may have stopped the service while away.
+                self.stay_connected.restart(out);
+            }
             GuiIntent::BackgroundService { running } => {
                 let calls = self.awake.service(running);
                 self.call(calls, clock, out);
+            }
+            // Holders stay as they are: switched off, the service holds
+            // the link until Kotlin reports it stopped.
+            GuiIntent::SetStayConnected { on } => {
+                if !self.stay_connected.offered {
+                    tracing::debug!(on, "stay connected is not offered here");
+                    return Ok(());
+                }
+                self.stay_connected.on = on;
+                out.push(Out::SavePrefs(Prefs { stay_connected: on }));
+                out.push(Out::Effect(PlatformEffect::BackgroundService { run: on }));
             }
             // The hub task's, which keeps it from every head.
             GuiIntent::HubFailedSeen { .. } => {}
@@ -1317,6 +1399,7 @@ impl Head {
             usage: self.usage,
             wall_ms: clock.wall_ms,
             workdir_text,
+            stay_connected: self.stay_connected.shown(),
         };
         let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {

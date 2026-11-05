@@ -22,7 +22,9 @@ void main() {
       ..apply(const PlatformEffectCopyToClipboard(text: 'cargo test'))
       ..apply(const PlatformEffectOpenFile(path: '/tmp/blob'))
       ..apply(const PlatformEffectNotice(text: 'copied 10 B'))
-      ..apply(const PlatformEffectError(text: 'disk full'));
+      ..apply(const PlatformEffectError(text: 'disk full'))
+      ..apply(const PlatformEffectBackgroundService(run: true))
+      ..apply(const PlatformEffectBackgroundService(run: false));
 
     expect(sink.done, [
       'notify 6: approval needed · work (s1)',
@@ -31,6 +33,8 @@ void main() {
       'open: /tmp/blob',
       'notice: copied 10 B',
       'error: disk full',
+      'background: run',
+      'background: stop',
     ]);
   });
 

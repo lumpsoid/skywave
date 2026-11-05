@@ -226,6 +226,11 @@ pub enum GuiIntent {
     BackgroundService {
         running: bool,
     },
+    /// The user switched Settings → Stay connected. Only offered on
+    /// Android (`ScreenView::Settings::stay_connected`); ignored elsewhere.
+    SetStayConnected {
+        on: bool,
+    },
     /// Dart got `HubFailed` with this `epoch`: every intent sent before
     /// this one was for the head that failed. Sent once per `HubFailed`,
     /// before anything else; never reaches a head.

@@ -26,7 +26,8 @@ import io.flutter.plugin.common.MethodChannel
  * core stays awake; this service only tells it, through Dart, whether it
  * runs: `running` on [BACKGROUND_CHANNEL] after every successful
  * `startForeground` (a repeated start re-reports, so a fresh hub learns it),
- * `stopped` when it ends or its start is refused. No wakelock.
+ * `stopped` when it ends, or when its start is refused while no instance
+ * runs. No wakelock.
  *
  * Type `specialUse` on API 34+: a user-chosen, indefinite connection to the
  * user's own server fits none of the other types. `dataSync` is cut after
@@ -45,6 +46,7 @@ class StayConnectedService : Service() {
         // Foreground first: a service started with startForegroundService
         // must call it, or the app is killed.
         if (goForeground()) {
+            running = true
             report(RUNNING)
         } else {
             report(STOPPED)
@@ -54,6 +56,7 @@ class StayConnectedService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         report(STOPPED)
         super.onDestroy()
     }
@@ -124,16 +127,33 @@ class StayConnectedService : Service() {
         private const val RUNNING = "running"
         private const val STOPPED = "stopped"
 
-        /** Starts the service; a refused start is reported as stopped. */
+        /**
+         * An instance is in the foreground: set after its `startForeground`
+         * succeeded, cleared in its `onDestroy`. Main thread only, like
+         * every service callback; volatile all the same.
+         */
+        @Volatile
+        private var running = false
+
+        /**
+         * Starts the service, or asks a running one to report again. A
+         * refused start is reported as stopped only if no instance runs.
+         */
         fun start(context: Context) {
             val app = context.applicationContext
             try {
                 ContextCompat.startForegroundService(app, Intent(app, StayConnectedService::class.java))
             } catch (e: IllegalStateException) {
                 // ForegroundServiceStartNotAllowedException: only started
-                // from the foreground, so a race with leaving it.
+                // from the foreground, so a race with leaving it. A refused
+                // re-start leaves a running service running: reporting
+                // `stopped` then would let the hub suspend a core the
+                // service still holds. A running instance's onDestroy is
+                // the definitive `stopped`.
                 Log.w(TAG, "could not start", e)
-                report(STOPPED)
+                if (!running) {
+                    report(STOPPED)
+                }
             }
         }
 

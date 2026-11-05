@@ -25,6 +25,7 @@ use crate::boot::{self, Running};
 use crate::dispatcher::Report;
 use crate::head::{Clock, Head, Out};
 use crate::panics::panic_message;
+use crate::prefs;
 use crate::signals::{Boot, Booted, GuiIntent, HubFailed, ScreenUpdate, ScreenView};
 
 /// Waits for `Boot` and opens the core, answering `Booted`, or
@@ -189,7 +190,7 @@ async fn run(
     gate: &mut Gate,
     stop: &mut Stop,
 ) -> Result<(), String> {
-    let mut head = Head::new();
+    let mut head = Head::new(hub.prefs);
     let mut shown = None;
     loop {
         // Read afresh each turn: what is due changes with every step.
@@ -259,7 +260,8 @@ async fn catching<T>(work: impl Future<Output = T>) -> Result<T, String> {
 
 /// Carries out a step's outputs in order: signals to Dart, actions to the
 /// dispatcher, suspend and resume to the core (neither blocks: each only
-/// flips the engine's flag).
+/// flips the engine's flag), preferences to their file (a failed write is
+/// logged: the head keeps the choice until the hub stops).
 fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
     for out in outs {
         match out {
@@ -287,6 +289,11 @@ fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
             Out::Resume => {
                 tracing::info!("app foregrounded: resuming the engine");
                 hub.core.resume();
+            }
+            Out::SavePrefs(prefs) => {
+                if let Err(err) = prefs::save(&hub.prefs_path, &prefs) {
+                    tracing::warn!(path = %hub.prefs_path.display(), "cannot save the preferences: {err}");
+                }
             }
         }
     }
@@ -459,6 +466,36 @@ mod tests {
         // The core, its dispatcher and its engine were closed before the
         // slot was released: the data dir is not "in use".
         reopen(dir.path()).await.close();
+    }
+
+    /// The head's preferences go to `<boot.dir>/skywave-gui.json`, outside
+    /// the core's data dir, and the next boot reads them; a write that
+    /// fails is logged, not fatal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn saved_preferences_land_beside_the_data_and_a_failed_write_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = reopen(dir.path()).await;
+        let on = prefs::Prefs {
+            stay_connected: true,
+        };
+        perform(vec![Out::SavePrefs(on)], &hub, &mut None);
+        let file = dir.path().join("skywave-gui.json");
+        assert!(file.is_file());
+        assert!(
+            !dir.path()
+                .join(boot::DATA_DIR)
+                .join("skywave-gui.json")
+                .exists()
+        );
+        hub.close();
+        let hub = reopen(dir.path()).await;
+        assert_eq!(hub.prefs, on);
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("x"), b"").unwrap();
+        perform(vec![Out::SavePrefs(on)], &hub, &mut None);
+        hub.close();
     }
 
     #[test]

@@ -4,7 +4,8 @@ import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
-/// Settings: the blob policy, and the server and device this one is
+/// Settings: the blob policy, Stay connected where offered (Android), and
+/// the server and device this one is
 /// paired as, the link to it with its round trip, the fingerprint to
 /// compare with what `skywaved` prints, and Re-pair. A paired server's
 /// address can be changed in place, without re-pairing.
@@ -91,6 +92,21 @@ class SettingsPage extends StatelessWidget {
                 ],
               ),
             ),
+            if (screen.stayConnected case final on?) ...[
+              const _Section('Background'),
+              SwitchListTile(
+                key: const Key('stay-connected'),
+                secondary: const Icon(Icons.sync),
+                title: const Text('Stay connected'),
+                subtitle: const Text(
+                  'Keeps the link open with the app in the background, for '
+                  'approval alerts. Shows an ongoing notification.',
+                ),
+                value: on,
+                onChanged: (value) =>
+                    send(GuiIntentSetStayConnected(on: value)),
+              ),
+            ],
             const _Section('This device'),
             ListTile(
               leading: const Icon(Icons.dns),

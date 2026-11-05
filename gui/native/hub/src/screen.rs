@@ -60,6 +60,8 @@ pub struct Ui<'a> {
     pub wall_ms: i64,
     /// The text of the workdir blob shown ([`workdir::WorkdirText::of`]).
     pub workdir_text: Option<&'a Result<workdir::Text, String>>,
+    /// The Stay connected preference; `None` where it is not offered.
+    pub stay_connected: Option<bool>,
 }
 
 /// The new-session prompt: its input as the hub knows it and the
@@ -83,7 +85,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Session(session) => ScreenView::Session {
             session: session_view(session, view, ui),
         },
-        Screen::Settings(settings) => settings_view(settings),
+        Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
     };
@@ -796,7 +798,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
     }
 }
 
-fn settings_view(settings: &SettingsView) -> ScreenView {
+fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> ScreenView {
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
         BlobPolicy::Eager => (BlobPolicyView::Eager, "eager (download every tool blob)"),
         BlobPolicy::OnDemand => (BlobPolicyView::OnDemand, "on demand (download when opened)"),
@@ -815,6 +817,7 @@ fn settings_view(settings: &SettingsView) -> ScreenView {
             .device_id
             .map_or_else(|| "not paired".to_owned(), |id| id.0.to_string()),
         fingerprint: settings.server_fingerprint.map(|f| f.to_string()),
+        stay_connected,
     }
 }
 
@@ -923,6 +926,7 @@ mod tests {
             usage: Default::default(),
             wall_ms: 0,
             workdir_text: None,
+            stay_connected: None,
         };
         match update(&view, ui).screen {
             ScreenView::Session { session } => session,

@@ -612,7 +612,7 @@ fn an_adopted_session_row_says_its_history_is_importing() {
 
 impl Rig {
     fn new() -> Rig {
-        Rig::on(Head::new())
+        Rig::on(Head::new(Prefs::default()))
     }
 
     /// A rig whose head acts as on a phone, whatever this was built for.
@@ -909,11 +909,17 @@ fn backgrounding_without_an_unsaved_draft_dispatches_nothing() {
 
 #[test]
 fn a_fresh_head_holds_the_link_on_screen_without_the_service() {
-    for head in [Head::new(), Head::with_target(Target::Mobile)] {
+    for head in [
+        Head::new(Prefs::default()),
+        Head::with_target(Target::Mobile),
+    ] {
         assert!(head.awake().holds(Holder::Visible));
         assert!(!head.awake().holds(Holder::Service));
     }
-    assert_eq!(*Head::new().awake(), Awake::new(Target::BUILT));
+    assert_eq!(
+        *Head::new(Prefs::default()).awake(),
+        Awake::new(Target::BUILT)
+    );
 }
 
 /// The kinds of what `outs` does to the core, in order: the dispatched
@@ -1012,6 +1018,180 @@ fn a_desktop_never_suspends_whatever_the_reports() {
         outs.extend(rig.head.on_intent(intent, rig.clock));
     }
     assert_eq!(core_calls(&outs), Vec::<String>::new());
+}
+
+const ON: Prefs = Prefs {
+    stay_connected: true,
+};
+
+impl Rig {
+    /// A rig whose head acts as on an Android phone, whatever this was
+    /// built for, with `prefs` read at boot.
+    fn android(prefs: Prefs) -> Rig {
+        Rig::on(Head::with_platform(Target::Mobile, true, prefs))
+    }
+
+    /// Opens the settings screen.
+    fn settings(&mut self) {
+        self.intent(GuiIntent::Act {
+            action: ActionIntent::Navigate {
+                route: RouteView::Settings,
+            },
+        });
+        self.results();
+        self.view();
+    }
+}
+
+/// The background service starts and stops `outs` ask Dart for, in order.
+fn service_asks(outs: &[Out]) -> Vec<bool> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Effect(PlatformEffect::BackgroundService { run }) => Some(*run),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The preferences `outs` writes, in order.
+fn saved(outs: &[Out]) -> Vec<Prefs> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::SavePrefs(prefs) => Some(*prefs),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The Stay connected switch on the settings screen `outs` sends.
+fn stay_shown(outs: &[Out]) -> Option<Option<bool>> {
+    outs.iter().find_map(|out| match out {
+        Out::Screen(ScreenUpdate {
+            screen: ScreenView::Settings { stay_connected, .. },
+            ..
+        }) => Some(*stay_connected),
+        _ => None,
+    })
+}
+
+#[test]
+fn switching_stay_connected_on_saves_it_and_starts_the_service() {
+    let mut rig = Rig::android(Prefs::default());
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: true });
+    assert_eq!(saved(&outs), [ON]);
+    assert_eq!(service_asks(&outs), [true]);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+    // Asking is not running: only Kotlin's report holds the link.
+    assert!(!rig.head.awake().holds(Holder::Service));
+}
+
+#[test]
+fn switching_stay_connected_off_keeps_the_service_holding_until_it_stopped() {
+    let mut rig = Rig::android(ON);
+    rig.intent(GuiIntent::BackgroundService { running: true });
+    let outs = rig.intent(GuiIntent::AppBackgrounded);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: false });
+    assert_eq!(saved(&outs), [Prefs::default()]);
+    assert_eq!(service_asks(&outs), [false]);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+    assert!(rig.head.awake().holds(Holder::Service));
+    let outs = rig.intent(GuiIntent::BackgroundService { running: false });
+    assert_eq!(core_calls(&outs), ["Suspend"]);
+}
+
+#[test]
+fn with_stay_connected_on_ready_and_foregrounded_ask_for_the_service_again() {
+    let mut rig = Rig::android(ON);
+    assert_eq!(service_asks(&rig.intent(GuiIntent::AppReady)), [true]);
+    rig.intent(GuiIntent::AppBackgrounded);
+    let outs = rig.intent(GuiIntent::AppForegrounded);
+    assert_eq!(service_asks(&outs), [true]);
+    // Already on screen: asked again all the same, a no-op for a running
+    // service.
+    assert_eq!(
+        service_asks(&rig.intent(GuiIntent::AppForegrounded)),
+        [true]
+    );
+
+    // Switched off, nothing asks for it any more.
+    rig.intent(GuiIntent::SetStayConnected { on: false });
+    assert_eq!(service_asks(&rig.intent(GuiIntent::AppReady)), [false; 0]);
+    assert_eq!(
+        service_asks(&rig.intent(GuiIntent::AppForegrounded)),
+        [false; 0]
+    );
+}
+
+/// A head built after a hub failure starts without the service, which may
+/// run on: its `AppReady` asks for it, Kotlin's answer reports it running,
+/// and going away keeps the link.
+#[test]
+fn a_fresh_head_with_stay_connected_on_learns_the_service_runs_before_going_away() {
+    let mut rig = Rig::android(ON);
+    assert!(!rig.head.awake().holds(Holder::Service));
+    assert_eq!(service_asks(&rig.intent(GuiIntent::AppReady)), [true]);
+    rig.intent(GuiIntent::BackgroundService { running: true });
+    let outs = rig.intent(GuiIntent::AppBackgrounded);
+    assert_eq!(core_calls(&outs), Vec::<String>::new());
+}
+
+/// The preference is not a holder: until Kotlin reports the service
+/// running, going away suspends.
+#[test]
+fn stay_connected_on_without_a_running_report_suspends_when_backgrounded() {
+    let mut rig = Rig::android(ON);
+    rig.intent(GuiIntent::AppReady);
+    let outs = rig.intent(GuiIntent::AppBackgrounded);
+    assert_eq!(core_calls(&outs), ["Suspend"]);
+}
+
+#[test]
+fn the_settings_screen_shows_the_switch_and_is_sent_again_on_toggle() {
+    let mut rig = Rig::android(Prefs::default());
+    rig.settings();
+    let shown = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Settings { stay_connected, .. } => *stay_connected,
+        other => panic!("not settings: {other:?}"),
+    };
+    assert_eq!(shown(&rig), Some(false));
+    // No snapshot in between: the toggle alone sends the screen.
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: true });
+    assert_eq!(stay_shown(&outs), Some(Some(true)));
+    let outs = rig.intent(GuiIntent::SetStayConnected { on: false });
+    assert_eq!(stay_shown(&outs), Some(Some(false)));
+}
+
+/// Off Android there is no service: no switch, a stray toggle does
+/// nothing, and a preferences file saying on asks for nothing.
+#[test]
+fn off_android_stay_connected_is_not_offered_and_asks_for_nothing() {
+    for target in [Target::Mobile, Target::Desktop] {
+        let mut rig = Rig::on(Head::with_platform(target, false, ON));
+        rig.settings();
+        match &rig.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Settings { stay_connected, .. } => assert_eq!(*stay_connected, None),
+            other => panic!("not settings: {other:?}"),
+        }
+        let mut outs = Vec::new();
+        for intent in [
+            GuiIntent::AppReady,
+            GuiIntent::AppBackgrounded,
+            GuiIntent::AppForegrounded,
+            GuiIntent::SetStayConnected { on: true },
+            GuiIntent::SetStayConnected { on: false },
+        ] {
+            outs.extend(rig.intent(intent));
+        }
+        assert_eq!(service_asks(&outs), [false; 0], "{target:?}");
+        assert!(saved(&outs).is_empty(), "{target:?}");
+    }
+}
+
+#[test]
+fn stay_connected_is_offered_on_the_android_build_alone() {
+    let shown = Head::new(ON).stay_connected.shown();
+    assert_eq!(shown.is_some(), cfg!(target_os = "android"));
 }
 
 #[test]
@@ -1202,7 +1382,7 @@ fn a_pasted_pairing_uri_fills_the_form_and_a_malformed_one_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let core = Core::open_detached(dir.path()).unwrap();
     let clock = Clock::read();
-    let mut head = Head::new();
+    let mut head = Head::new(Prefs::default());
     head.on_view(core.view(), clock);
     let form = |head: &Head| match &head.sent.screen.as_ref().unwrap().screen {
         ScreenView::Pairing { form, .. } => form.clone(),
@@ -1245,7 +1425,7 @@ fn a_scanned_pairing_uri_fills_the_form_and_any_other_code_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let core = Core::open_detached(dir.path()).unwrap();
     let clock = Clock::read();
-    let mut head = Head::new();
+    let mut head = Head::new(Prefs::default());
     head.on_view(core.view(), clock);
     let form = |head: &Head| match &head.sent.screen.as_ref().unwrap().screen {
         ScreenView::Pairing { form, .. } => form.clone(),
@@ -1296,7 +1476,7 @@ fn a_new_approval_notifies_but_the_first_snapshot_does_not() {
         [(&"work".to_owned(), &"approval needed · work".to_owned())]
     );
     // A head that starts at that count does not alert.
-    let mut fresh = Head::new();
+    let mut fresh = Head::new(Prefs::default());
     let outs = fresh.on_view(rig.head.view.clone().unwrap(), rig.clock);
     assert!(
         !outs
@@ -3123,7 +3303,7 @@ fn a_long_shell_run_of_this_devices_notifies() {
             .any(|o| matches!(o, Out::Effect(PlatformEffect::Notify { .. })))
     );
     // A head whose first snapshot already counts it still says so.
-    let mut fresh = Head::new();
+    let mut fresh = Head::new(Prefs::default());
     let outs = fresh.on_view(view, rig.clock);
     assert!(
         outs.iter()

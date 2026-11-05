@@ -685,6 +685,7 @@ dependencies = [
  "chrono",
  "rinf",
  "serde",
+ "serde_json",
  "skywave-core",
  "skywave-present",
  "skywave-proto",
