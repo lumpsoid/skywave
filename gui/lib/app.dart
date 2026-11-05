@@ -21,6 +21,8 @@ class SkywaveApp extends StatefulWidget {
     required this.holders,
     required this.send,
     this.messenger,
+    this.finalize = finalizeRust,
+    this.onReattach,
     super.key,
   });
 
@@ -31,6 +33,13 @@ class SkywaveApp extends StatefulWidget {
   /// Where effects show snackbars.
   final GlobalKey<ScaffoldMessengerState>? messenger;
 
+  /// Stops Rust, which closes the core. Tests replace it.
+  final VoidCallback finalize;
+
+  /// A new Activity attached to the live engine (Android): whatever its
+  /// launch carried, such as a notification tap, is checked here.
+  final VoidCallback? onReattach;
+
   @override
   State<SkywaveApp> createState() => _SkywaveAppState();
 }
@@ -38,6 +47,7 @@ class SkywaveApp extends StatefulWidget {
 class _SkywaveAppState extends State<SkywaveApp> {
   late final AppLifecycleListener _lifecycle;
   bool _finalized = false;
+  bool _detached = false;
 
   @override
   void initState() {
@@ -49,14 +59,28 @@ class _SkywaveAppState extends State<SkywaveApp> {
         _finalize();
         return AppExitResponse.exit;
       },
-      // Mobile: the engine is going away without an exit request.
-      onDetach: _finalize,
+      // Android: the Activity went away, not the engine, which the app
+      // owns; the core stays open for the next Activity.
+      onDetach: () => _detached = true,
+      // A new Activity on the live engine: detached goes straight to
+      // resumed, past shown, so the return is reported here.
+      onResume: _reattached,
       // Leaving the screen is reported, not decided: Rust knows what it
-      // means on this platform. Pausing always passes through hidden and
-      // resuming through shown, so each move is reported once.
+      // means on this platform. Pausing always passes through hidden (also
+      // before a detach), and resuming through shown or, after a detach,
+      // through [_reattached], so each move is reported once.
       onHide: () => widget.send(const GuiIntentAppBackgrounded()),
       onShow: () => widget.send(const GuiIntentAppForegrounded()),
     );
+  }
+
+  /// After a detach only: the app is back on screen, and the new Activity
+  /// may have been launched by a notification tap.
+  void _reattached() {
+    if (!_detached) return;
+    _detached = false;
+    widget.send(const GuiIntentAppForegrounded());
+    widget.onReattach?.call();
   }
 
   /// Booted: ask Rust for the whole state.
@@ -68,7 +92,7 @@ class _SkywaveAppState extends State<SkywaveApp> {
   void _finalize() {
     if (_finalized) return;
     _finalized = true;
-    finalizeRust();
+    widget.finalize();
   }
 
   @override

@@ -31,6 +31,7 @@ Future<void> main() async {
       holders: holders,
       send: sendToRust,
       messenger: messenger,
+      onReattach: () => unawaited(notifications.openLaunching()),
     ),
   );
 }
