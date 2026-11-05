@@ -25,6 +25,7 @@ void main() {
             editableAddress: 'srv:7443',
             device: 'dev-1',
             fingerprint: 'AB:CD',
+            stayConnected: null,
           ),
           link: LinkHolder(),
           canGoBack: true,
@@ -60,21 +61,48 @@ void main() {
     ]);
   });
 
-  Widget settings(List<GuiIntent> sent, {String? editableAddress}) =>
-      MaterialApp(
-        home: SettingsPage(
-          screen: ScreenViewSettings(
-            blobPolicy: BlobPolicyView.onDemand,
-            blobPolicyLabel: 'on demand (download when opened)',
-            server: editableAddress ?? 'not paired',
-            editableAddress: editableAddress,
-            device: 'dev-1',
-            fingerprint: null,
-          ),
-          link: LinkHolder(),
-          send: sent.add,
-        ),
-      );
+  Widget settings(
+    List<GuiIntent> sent, {
+    String? editableAddress,
+    bool? stayConnected,
+  }) => MaterialApp(
+    home: SettingsPage(
+      screen: ScreenViewSettings(
+        blobPolicy: BlobPolicyView.onDemand,
+        blobPolicyLabel: 'on demand (download when opened)',
+        server: editableAddress ?? 'not paired',
+        editableAddress: editableAddress,
+        device: 'dev-1',
+        fingerprint: null,
+        stayConnected: stayConnected,
+      ),
+      link: LinkHolder(),
+      send: sent.add,
+    ),
+  );
+
+  testWidgets('stay connected shows only where offered, and toggles', (
+    tester,
+  ) async {
+    final toggle = find.byKey(const Key('stay-connected'));
+    await tester.pumpWidget(settings([]));
+    expect(toggle, findsNothing);
+    expect(find.text('Background'), findsNothing);
+
+    final sent = <GuiIntent>[];
+    await tester.pumpWidget(settings(sent, stayConnected: false));
+    expect(toggle, findsOneWidget);
+    expect(find.text('Stay connected'), findsOneWidget);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+    await tester.tap(toggle);
+    expect(sent, [const GuiIntentSetStayConnected(on: true)]);
+
+    sent.clear();
+    await tester.pumpWidget(settings(sent, stayConnected: true));
+    expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+    await tester.tap(toggle);
+    expect(sent, [const GuiIntentSetStayConnected(on: false)]);
+  });
 
   testWidgets('a paired server address is changed in place', (tester) async {
     final sent = <GuiIntent>[];

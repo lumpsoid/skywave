@@ -12,6 +12,7 @@
 //!   `boot`, `dispatcher`: opening the core and dispatching to it in order.
 //! - `lifecycle`: what the app leaving and returning to the screen does to
 //!   the core, per platform.
+//! - `prefs`: the head's own preferences, in a file beside the core's data.
 
 mod boot;
 mod clip;
@@ -23,6 +24,7 @@ mod link;
 mod logging;
 mod notify;
 mod panics;
+mod prefs;
 mod run;
 mod screen;
 mod search;

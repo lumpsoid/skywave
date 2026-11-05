@@ -321,8 +321,10 @@ Admin commands work on the database directly, so `serve` can keep running.
 5. **Get alerts.** Allow notifications when asked. The app posts a
    notification for new approvals while it is open, one per session, and
    removes it once that session's approvals are answered, from any
-   device. In the background it
-   suspends its connection, so alerts wait until you return to it.
+   device. To get them with the app in the background too, turn on
+   **Settings → Stay connected**: it keeps the link open behind an ongoing
+   notification. Otherwise the app suspends its connection in the
+   background, and alerts wait until you return to it.
 
 6. **Revoke.** `skywaved devices revoke <id>` on the server. Within about a
    minute (when its open request ends) the app shows **This device was

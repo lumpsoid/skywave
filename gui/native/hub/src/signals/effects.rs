@@ -30,4 +30,8 @@ pub enum PlatformEffect {
     /// Something failed: a dispatch the core refused, a malformed pairing
     /// URI, an unreadable file.
     Error { text: String },
+    /// Start (`run`) or stop the Android stay-connected service. Asked,
+    /// not assumed: Kotlin reports the outcome back as
+    /// `GuiIntent::BackgroundService`, and only that report holds the link.
+    BackgroundService { run: bool },
 }

@@ -57,6 +57,8 @@ class EffectsListener {
       sink.notice(effect.text);
     } else if (effect is PlatformEffectError) {
       sink.error(effect.text);
+    } else if (effect is PlatformEffectBackgroundService) {
+      sink.backgroundService(run: effect.run);
     }
   }
 

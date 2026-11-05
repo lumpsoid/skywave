@@ -801,7 +801,12 @@ skywave-core                 all logic, sync, replica
   it, and resumes it then retries the link when something holds it again
   (D21's rule); a report that changes no holder does nothing. Coming on
   screen while the service held the link only retries, to cut short a
-  backoff wait. Desktop never suspends. Every platform saves the
+  backoff wait. With Stay connected on (Android only; the hub keeps the
+  preference in `<app support>/skywave-gui.json`), the hub asks Dart to
+  start the service on the toggle, on `AppForegrounded` and on `AppReady`,
+  and only Kotlin's `running` report sets the service holder; switched
+  off, the service holds until its `stopped` report. Desktop never
+  suspends. Every platform saves the
   open session's unsaved draft and marks it read at once on leaving, and
   again whenever the hub task stops, before the core closes. On Android the
   app owns the Flutter engine (`MainActivity.engine`), so Dart and the core

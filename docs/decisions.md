@@ -199,6 +199,24 @@ service) and the core is suspended once none does.
 **Superseded by D28** for the Kotlin implementation. The hub's
 suspend-on-leave follows the first paragraph; the A15 design above is the
 reference for the Flutter head's deferred background work (D24).
+**Flutter head (2026-11-05):** the opt-in "Stay connected" is back, on
+Android only (the settings screen gets no switch elsewhere).
+- The hub owns the preference, in `<app support>/skywave-gui.json` beside
+  the core's data dir, so a replica reset keeps it. It is head-local: not
+  in the core, not in `SettingsView`, not in `SharedPreferences`.
+- The hub's `Awake` has two holders, `Visible` and `Service`. `Service` is
+  set only by Kotlin's report that `startForeground` succeeded, and cleared
+  by its report that the service stopped or was refused; the preference
+  itself never holds the link. Switched off, the service holds it until
+  that report.
+- The service (`StayConnectedService`, `specialUse`) is `START_NOT_STICKY`
+  and started only from the foreground: on the toggle, on
+  `AppForegrounded` and on `AppReady`. Starting a running service re-reports
+  `running`, which a fresh head (after a hub failure) needs.
+- The Flutter engine is app-owned (`FlutterEngineCache`), so the hub keeps
+  running once the Activity is gone.
+- Still deferred: the WorkManager catch-up. Doze and a battery-optimisation
+  exemption wait on a device probe.
 
 ## D22. Android device key in app-private `filesDir`
 MVP per D9: the core's data dir, including the device key, lives under
@@ -250,8 +268,9 @@ holder per signal and performs platform effects with one plugin call each.
   core on Android and iOS only.
 **Why:** one owner per rule (D2, D23) and a bridge thin enough to read;
 rinf's message passing keeps Rust's state off the Dart side.
-**Deferred:** Android background work (A15's service and periodic
-catch-up), notifications while suspended and deep links. QR scanning
+**Deferred:** A15's periodic background catch-up on Android,
+notifications while suspended and deep links. "Stay connected" returned on
+Android (D21). QR scanning
 returned on Android (D20).
 
 ## D25. The GUI has its own data dir and pairs as its own device
@@ -295,9 +314,9 @@ app. The acceptance rig in `scripts/android-acceptance/` targets it.
 the Kotlin one kept its own presentation outside `skywave-present` (D23).
 One head over the shared hub keeps one owner per rule (D2).
 **Lost until the Flutter head gains them (D24's deferred list):** periodic
-catch-up and "Stay connected" in the background (D21), approval
-notifications while suspended and `skywave://pair` links. QR scanning
-(D20) is back. Git history keeps the Kotlin implementation as a reference.
+catch-up in the background (D21), approval notifications while suspended
+and `skywave://pair` links. QR scanning (D20) and "Stay connected" (D21)
+are back. Git history keeps the Kotlin implementation as a reference.
 
 ## D29. Session contexts: sequential, stamped by the server
 A Skywave session owns an ordered list of contexts, each its own agent
