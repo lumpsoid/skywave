@@ -209,11 +209,7 @@ class ComposerState extends State<Composer> {
     final colors = SkyColors.of(context);
     final composer = widget.composer;
     final shell = _shell;
-    final notes = [
-      ?composer.toLabel,
-      ?composer.offlineLabel,
-      ?composer.historyLabel,
-    ];
+    final notes = [?composer.toLabel, ?composer.historyLabel];
     return Material(
       color: theme.colorScheme.surfaceContainer,
       child: SafeArea(
@@ -230,24 +226,18 @@ class ComposerState extends State<Composer> {
                   child: Row(
                     children: [
                       Icon(
-                        composer.offlineLabel != null
-                            ? Icons.cloud_off
-                            : composer.historyLabel != null
+                        composer.historyLabel != null
                             ? Icons.history
                             : Icons.call_made,
                         size: 14,
-                        color: composer.offlineLabel != null
-                            ? colors.warning
-                            : colors.muted,
+                        color: colors.muted,
                       ),
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
                           notes.join(' · '),
                           style: theme.textTheme.labelSmall?.copyWith(
-                            color: composer.offlineLabel != null
-                                ? colors.warning
-                                : colors.muted,
+                            color: colors.muted,
                           ),
                         ),
                       ),

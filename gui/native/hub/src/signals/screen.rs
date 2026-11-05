@@ -617,8 +617,6 @@ pub struct ComposerView {
     pub rev: u32,
     /// While browsing earlier prompts: `2 of 5`, 1 the newest.
     pub history_label: Option<String>,
-    /// `offline, sends when back online`, while reconnecting.
-    pub offline_label: Option<String>,
     /// `to the main agent` in a subagent's view, which takes no message
     /// of its own.
     pub to_label: Option<String>,
