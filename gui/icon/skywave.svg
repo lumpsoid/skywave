@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Skywave: a ray reflecting off the ionosphere's D, E and F layers.
+       The bands run past the edges so the Android adaptive background can bleed. -->
+  <rect x="-25" y="-25" width="150" height="150" fill="#0c0d1a"/>
+  <g fill="none" stroke-width="9" stroke-opacity=".8">
+    <path d="M-40 29.5 Q50 2.5 140 29.5" stroke="#ec4899"/>
+    <path d="M-40 40.5 Q50 13.5 140 40.5" stroke="#8b5cf6"/>
+    <path d="M-40 51.5 Q50 24.5 140 51.5" stroke="#3b82f6"/>
+  </g>
+  <path d="M21 81 L50 40 L79 81" fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

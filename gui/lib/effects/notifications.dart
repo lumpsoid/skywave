@@ -19,7 +19,8 @@ class SystemNotifications {
 
   static const _settings = InitializationSettings(
     // Android asks for POST_NOTIFICATIONS itself, in MainActivity.
-    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    // Named by string, so res/raw/keep.xml stops release shrinking dropping it.
+    android: AndroidInitializationSettings('@drawable/ic_stat_skywave'),
     // iOS and macOS ask for permission here, on first launch.
     iOS: DarwinInitializationSettings(),
     macOS: DarwinInitializationSettings(),
