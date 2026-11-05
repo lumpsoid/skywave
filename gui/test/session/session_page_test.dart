@@ -3,6 +3,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:skywave_gui/session/approval_panel.dart';
 import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/session_page.dart';
@@ -722,6 +723,132 @@ void main() {
       final row = tester.getCenter(find.text('Approve')).dy;
       expect(tester.getCenter(find.text('Deny')).dy, row);
       expect(tester.getCenter(find.text('Always allow…')).dy, row);
+    });
+
+    ApprovalPanel withPreview(int count) => ApprovalPanel(
+      approvalId: 'a1',
+      kind: ToolKindView.shell,
+      tool: 'Bash',
+      title: r'$ ./deploy.sh',
+      preview: lines([for (var i = 1; i <= count; i++) 'line $i']),
+      canAnswer: true,
+      suggestions: const [],
+      alwaysPicks: false,
+    );
+
+    testWidgets('expanded on a phone with the keyboard up: the title and the '
+        'buttons stay on screen, the preview scrolls between them', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      tester.view.viewInsets = const FakeViewPadding(bottom: 330);
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(60)),
+        timeline: holding([]),
+        sent: [],
+      );
+      await tester.ensureVisible(find.text('Show 52 more lines'));
+      await tester.tap(find.text('Show 52 more lines'));
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final card = tester.getRect(find.byType(Card).last);
+      for (final fixed in ['Approval needed', 'Approve', 'Deny']) {
+        final at = tester.getRect(find.text(fixed));
+        expect(
+          card.contains(at.topLeft) && card.contains(at.bottomRight),
+          isTrue,
+        );
+      }
+      expect(find.text('line 60'), findsOneWidget);
+      // Below what the panel shows until scrolled to.
+      expect(
+        tester.getTopLeft(find.text('line 60')).dy,
+        greaterThan(card.bottom),
+      );
+    });
+
+    testWidgets('scrolling the panel does not tint the app bar', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      tester.view.viewInsets = const FakeViewPadding(bottom: 330);
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(60)),
+        timeline: holding([]),
+        sent: [],
+      );
+      // The app bar tints on what the scaffold's observer hears.
+      final heard = <ScrollNotification>[];
+      ScrollNotificationObserver.of(
+        tester.element(find.text('Approval needed')),
+      ).addListener(heard.add);
+      await tester.drag(find.textContaining('deploy.sh'), const Offset(0, -80));
+      await tester.pump();
+      expect(heard, isEmpty);
+    });
+
+    testWidgets('a long preview shows its first lines until expanded', (
+      tester,
+    ) async {
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(20)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('line 8'), findsOneWidget);
+      expect(find.text('line 9'), findsNothing);
+      await tester.ensureVisible(find.text('Show 12 more lines'));
+      await tester.tap(find.text('Show 12 more lines'));
+      await tester.pump();
+      expect(find.text('line 20'), findsOneWidget);
+      await tester.ensureVisible(find.text('Show less'));
+      await tester.tap(find.text('Show less'));
+      await tester.pump();
+      expect(find.text('line 9'), findsNothing);
+
+      // Control: a short preview has nothing to expand.
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(approvalPreviewLines)),
+        timeline: holding([]),
+        sent: [],
+      );
+      expect(find.text('line 8'), findsOneWidget);
+      expect(find.textContaining('more line'), findsNothing);
+    });
+
+    testWidgets('a phone docks the panel to the composer, a wide screen not', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screenWith(approval: withPreview(1)),
+        timeline: holding([]),
+        sent: [],
+      );
+      Card panel() => tester.widget<Card>(
+        find.ancestor(
+          of: find.text('Approval needed'),
+          matching: find.byType(Card),
+        ),
+      );
+      expect(panel().margin, EdgeInsets.zero);
+      expect(panel().shape, isA<Border>());
+
+      tester.view.physicalSize = const Size(1200, 800);
+      await tester.pump();
+      expect(panel().margin, isNot(EdgeInsets.zero));
+      expect(panel().shape, isA<RoundedRectangleBorder>());
     });
 
     testWidgets('answered: the answer shows and the buttons go', (

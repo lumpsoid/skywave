@@ -521,12 +521,12 @@ class _SessionPageState extends State<SessionPage> {
                 if (screen.approval case final approval?)
                   Flexible(
                     child: _Column(
-                    child: ApprovalPanelView(
-                      approval: approval,
-                      send: widget.send,
-                      onShowCall: approval.gatedKey == null
-                          ? null
-                          : () => _showCall(approval.gatedKey!),
+                      child: ApprovalPanelView(
+                        approval: approval,
+                        send: widget.send,
+                        onShowCall: approval.gatedKey == null
+                            ? null
+                            : () => _showCall(approval.gatedKey!),
                       ),
                     ),
                   ),
