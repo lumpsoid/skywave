@@ -314,7 +314,10 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `Errored` reporting it, is logged. The adapter says which turns are a
   message's (`TurnStarted { message }`): a turn the agent starts on its
   own (a wakeup, a background job's report) answers no message, so a
-  message queued behind it stays owed. Each settling event is tied to its
+  message queued behind it stays owed. The agent may instead take that
+  message up inside its own turn (`TurnStarted { message: true }` while the
+  turn is open): no `AgentWorking` follows, so the message is settled as
+  that is read. Each settling event is tied to its
   message by position: the message is stored as *starting* (or
   *settling*, for an `Errored`) just before the event is logged, and a
   restart counts only such an event, logged after the stored rows, as

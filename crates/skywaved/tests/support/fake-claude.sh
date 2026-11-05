@@ -39,6 +39,9 @@
 # only when it is a level the CLI knows, and `get_settings` reads back
 # `applied.effort`, `medium` at first and `null` while the model is
 # "no-effort" (a model that takes none, whose level is kept for the next).
+# A user message carrying a `uuid` is taken up at once, as the real CLI
+# takes one up when idle (§3.11): `command_lifecycle` `queued` and
+# `started` name it before the turn's `system/init`.
 
 printf '%s\n' "$@" > argv.txt
 echo $$ > pid.txt
@@ -94,6 +97,9 @@ result_ok() {
 result_aborted() {
   printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":null,"terminal_reason":"%s","session_id":"%s"}\n' "$1" "$sid"
 }
+lifecycle() {
+  printf '{"type":"command_lifecycle","command_uuid":"%s","state":"%s","uuid":"00000000-0000-4000-8000-000000000000","session_id":"%s"}\n' "$1" "$2" "$sid"
+}
 tool_result() {
   printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"%s","is_error":%s}]},"session_id":"%s"}\n' "$1" "$2" "$sid"
 }
@@ -135,6 +141,11 @@ while IFS= read -r line; do
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"applied":{"model":"%s","effort":%s}}}}\n' "$(reqid "$line")" "$model" "$applied"
       ;;
     *'"type":"user"'*)
+      command=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+      if [ -n "$command" ]; then
+        lifecycle "$command" queued
+        lifecycle "$command" started
+      fi
       if [ -n "$model" ]; then
         printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","claude_code_version":"%s","model":"%s","permissionMode":"%s"}\n' "$PWD" "$sid" "$version" "$model" "$mode"
       else

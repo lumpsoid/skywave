@@ -13,6 +13,9 @@
 //! - [`Step::Hang`] blocks until interrupted, like a tool that never ends;
 //! - [`Step::Wait`] blocks until the test opens a [`Gate`].
 //!
+//! [`Step::TakeUp`] runs a queued message inside the open turn, as a CLI
+//! takes one up at a tool round.
+//!
 //! [`Step::Wake`] schedules a turn the agent starts on its own, with no
 //! message, like a CLI's scheduled wakeup: it runs once the session is idle
 //! and its time has come, before any queued message, and is lost with the
@@ -264,6 +267,11 @@ pub enum Step {
         after: Duration,
         events: Vec<AdapterEvent>,
     },
+    /// Takes the oldest queued message up inside this turn, as a CLI does
+    /// at a tool round: emits `TurnStarted { message: true }` and runs that
+    /// message's turn here, ended with this one. Nothing if none is queued.
+    /// For a session past its first message: no handle is reported.
+    TakeUp,
 }
 
 /// A shell task `id` for [`Step::tasks`]; `ambient` for one that is not
@@ -1112,6 +1120,17 @@ impl Runner {
                 Step::Later { after, events } => {
                     self.wakeups
                         .push((Instant::now() + after, Wakeup::Report(events)));
+                }
+                Step::TakeUp => {
+                    let Some(text) = self.queued.pop_front() else {
+                        continue;
+                    };
+                    if !self.emit(AdapterEvent::TurnStarted { message: true }).await {
+                        return Flow::Exit(None);
+                    }
+                    for step in self.next_turn(&text).into_iter().rev() {
+                        work.push_front(step);
+                    }
                 }
             }
         }
