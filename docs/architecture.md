@@ -794,9 +794,14 @@ skywave-core                 all logic, sync, replica
   the hub opens the core in `<dir>/skywave`. The GUI is its own device with
   its own data (D25). A hot restart reruns Rust's `main` and reopens the
   core behind `CORE_SLOT` (D27).
-- **Lifecycle:** Dart reports `AppBackgrounded`/`AppForegrounded`; on
-  Android and iOS the hub suspends the core, and resumes it then retries the
-  link (D21's rule, without A15's background work). Every platform saves the
+- **Lifecycle:** Dart reports `AppBackgrounded`/`AppForegrounded`, and
+  Kotlin `BackgroundService { running }` once the foreground service started
+  or stopped. Two things hold the link: the app on screen and the running
+  service. On Android and iOS the hub suspends the core when nothing holds
+  it, and resumes it then retries the link when something holds it again
+  (D21's rule); a report that changes no holder does nothing. Coming on
+  screen while the service held the link only retries, to cut short a
+  backoff wait. Desktop never suspends. Every platform saves the
   open session's unsaved draft and marks it read at once on leaving, and
   again whenever the hub task stops, before the core closes. On Android the
   app owns the Flutter engine (`MainActivity.engine`), so Dart and the core
