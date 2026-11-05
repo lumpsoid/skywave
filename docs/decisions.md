@@ -215,8 +215,14 @@ Android only (the settings screen gets no switch elsewhere).
   `running`, which a fresh head (after a hub failure) needs.
 - The Flutter engine is app-owned (`FlutterEngineCache`), so the hub keeps
   running once the Activity is gone.
-- Still deferred: the WorkManager catch-up. Doze and a battery-optimisation
-  exemption wait on a device probe.
+- Doze needs no battery-optimisation exemption, so the app asks for none.
+  Probed 2026-11-05 on a OnePlus 6 (Android 14, AOSP-based ROM) over Wi-Fi,
+  forced into deep idle with the screen off and unplugged, toggle on, no
+  exemption. The long-poll kept cycling every ~30 s, and an approval
+  notified within ~4 s. The client also noticed a no-RST black-holed flow in
+  deep idle and reconnected; after the flow came back, an approval notified
+  within 0.1 s of being raised, with the screen still off.
+- Still deferred: the WorkManager catch-up.
 
 ## D22. Android device key in app-private `filesDir`
 MVP per D9: the core's data dir, including the device key, lives under
