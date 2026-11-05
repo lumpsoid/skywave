@@ -46,6 +46,13 @@ pub enum Error {
         found: u32,
         current: u32,
     },
+    /// `PRAGMA quick_check` found the database file damaged.
+    #[error(
+        "database {} is damaged ({problems}); stop skywaved and restore the data \
+         directory from a backup",
+        path.display()
+    )]
+    DamagedDatabase { path: PathBuf, problems: String },
     #[error("blob {id}: stored size {expected}, file has {actual} bytes")]
     BlobSizeMismatch {
         id: String,

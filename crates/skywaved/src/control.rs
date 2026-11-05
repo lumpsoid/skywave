@@ -26,6 +26,9 @@
 //! executing its own binary again with the same arguments, so a binary
 //! replaced since is the one that starts.
 //!
+//! The same socket answers [`Request::Status`], `skywaved status`: the
+//! local health check.
+//!
 //! The socket is private to the daemon's user: it sits in the data dir,
 //! which only that user can enter.
 
@@ -50,6 +53,8 @@ pub enum Request {
     },
     /// Cancel a stop waiting for the running work, and take work again.
     Cancel,
+    /// Report how `serve` is ([`Reply::Status`]): the local health check.
+    Status,
 }
 
 /// When a [`Request::Stop`] stops `serve`.
@@ -91,6 +96,18 @@ pub enum Reply {
     Cancelled,
     /// [`Request::Cancel`] while no stop waits.
     NothingToCancel,
+    /// How `serve` is, for [`Request::Status`]. A `serve` already stopping
+    /// answers [`Reply::Stopping`] instead.
+    Status {
+        protocol_version: u32,
+        /// Waiting for the running work to stop ([`When::AfterWork`]).
+        stopping_after_work: bool,
+        /// The data dir's disk is below `disk.min_free`: agents are paused
+        /// and new work is refused.
+        disk_low: bool,
+        /// What runs now.
+        work: Vec<Work>,
+    },
     /// The request could not be handled.
     Failed { message: String },
 }
@@ -443,6 +460,15 @@ mod unix {
                 confirm: _,
             } => start_drain(shared, restart).await,
             Request::Cancel => Ok(cancel(shared)),
+            Request::Status => {
+                let work = read_work(shared).await?;
+                Ok(Reply::Status {
+                    protocol_version: skywave_proto::PROTOCOL_VERSION,
+                    stopping_after_work: matches!(*shared.drain.borrow(), Drain::Waiting { .. }),
+                    disk_low: shared.log.disk().is_low(),
+                    work,
+                })
+            }
         }
     }
 

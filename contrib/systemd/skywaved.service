@@ -1,0 +1,25 @@
+# skywaved as a systemd user service: the agent runs as you, with your
+# `claude` login and ~/.claude. See README.md, "Running it as a service".
+#
+#   cp contrib/systemd/skywaved.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now skywaved
+#   loginctl enable-linger "$USER"   # keep it running while you are logged out
+
+[Unit]
+Description=Skywave server daemon
+
+[Service]
+ExecStart=%h/.cargo/bin/skywaved serve
+# Reopens log_file (logrotate); without one, logs go to the journal.
+ExecReload=/bin/kill -HUP $MAINPID
+# `skywaved stop` exits 0, so it stays stopped; `skywaved restart` starts
+# serve again in the same process.
+Restart=on-failure
+RestartSec=5s
+# A user manager's PATH may lack where `claude` is installed; or set
+# `agent.command` to its absolute path.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
