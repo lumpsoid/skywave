@@ -26,7 +26,7 @@
     <!-- The core's data dir holds the device key (D22): no backup, no
          device-to-device transfer, as the Kotlin head does. -->
     <application
-        android:label="Skywave GUI"
+        android:label="Skywave"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
