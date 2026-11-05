@@ -5,7 +5,12 @@
 //! command run side by side on separate connections. A request that fails
 //! on a reused connection before any response (the server closed it while
 //! idle) is retried once on a fresh one; every v1 request is safe to repeat.
-//! A failed or timed-out request takes down only its own connection.
+//! A request that times out or whose connection breaks takes down its own
+//! connection and every idle one ([`Http::ended`]): they share its path, so
+//! a NAT that silently dropped one most likely dropped them all. On Linux
+//! and Android the kernel closes a connection whose sent bytes go
+//! unacknowledged for [`UNACKED_MAX`] ([`limit_unacked`]), so a request on
+//! a dead path fails then rather than at its own timeout.
 //!
 //! A command is timed by its upload's progress: the writes its socket
 //! takes ([`Metered`]). On Linux and Android the socket takes a write only
@@ -146,27 +151,56 @@ const UNSENT_MAX: usize = 16 * 1024;
 /// as sent. Best effort: a socket that refuses keeps the default.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn limit_unsent(tcp: &TcpStream) {
-    use std::os::fd::AsRawFd;
     let value = libc::c_int::try_from(UNSENT_MAX).expect("UNSENT_MAX fits a c_int");
+    set_tcp_option(tcp, libc::TCP_NOTSENT_LOWAT, value, "TCP_NOTSENT_LOWAT");
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn limit_unsent(_tcp: &TcpStream) {}
+
+/// How long a client socket may hold sent bytes the server has not
+/// acknowledged before the kernel closes it (`TCP_USER_TIMEOUT`,
+/// [`limit_unacked`]).
+const UNACKED_MAX: Duration = Duration::from_secs(20);
+
+/// Makes the kernel close the socket once what it sent has gone
+/// unacknowledged for [`UNACKED_MAX`], so a request on a connection whose
+/// path died silently (a NAT that dropped its mapping, a network that is
+/// gone) fails with [`TransportError::Io`] instead of waiting out its
+/// timeout. It measures acknowledgements, not replies: a server holding a
+/// long-poll has acknowledged the request, and a slow link that keeps
+/// acknowledging is never cut. Linux and Android only; elsewhere the
+/// request's own timeout finds the connection dead. Best effort.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn limit_unacked(tcp: &TcpStream) {
+    let value = libc::c_int::try_from(UNACKED_MAX.as_millis()).expect("UNACKED_MAX fits a c_int");
+    set_tcp_option(tcp, libc::TCP_USER_TIMEOUT, value, "TCP_USER_TIMEOUT");
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn limit_unacked(_tcp: &TcpStream) {}
+
+/// Sets the `IPPROTO_TCP` option `option` (`name` in the log) to `value`,
+/// logging a refusal.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_tcp_option(tcp: &TcpStream, option: libc::c_int, value: libc::c_int, name: &str) {
+    use std::os::fd::AsRawFd;
     let len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
         .expect("a c_int's size fits socklen_t");
-    // SAFETY: TCP_NOTSENT_LOWAT reads one c_int from `value`, `len` long.
+    // SAFETY: both options read one c_int from `value`, `len` long.
     let set = unsafe {
         libc::setsockopt(
             tcp.as_raw_fd(),
             libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
+            option,
             (&raw const value).cast(),
             len,
         )
     };
     if set == -1 {
-        tracing::debug!(error = %io::Error::last_os_error(), "cannot set TCP_NOTSENT_LOWAT");
+        tracing::debug!(error = %io::Error::last_os_error(), "cannot set {name}");
     }
 }
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn limit_unsent(_tcp: &TcpStream) {}
 
 /// A stream that signals every write it takes, so a request can be timed
 /// by its upload's progress ([`Conn::send`]). It sits under TLS, so what it
@@ -292,6 +326,7 @@ impl Http {
                 .map_err(|e| TransportError::Unreachable(e.to_string()))?;
             let _ = tcp.set_nodelay(true);
             limit_unsent(&tcp);
+            limit_unacked(&tcp);
             let (tcp, written) = Metered::new(tcp);
             let tls = self
                 .connector
@@ -323,6 +358,17 @@ impl Http {
         if idle.len() < self.config.max_idle {
             idle.push(conn);
         }
+    }
+
+    /// Notes how a request ended: one that timed out or whose connection
+    /// broke drops every idle connection too. They share its path, so if it
+    /// died silently they are dead the same way, and a request on one would
+    /// wait out its own timeout before the next got a fresh connection.
+    fn ended<T>(&self, result: Result<T, TransportError>) -> Result<T, TransportError> {
+        if let Err(TransportError::Timeout | TransportError::Io(_)) = &result {
+            self.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+        result
     }
 
     /// Sends a request and waits for the response head, timed by the
@@ -379,10 +425,13 @@ impl Http {
         headers: &[(header::HeaderName, HeaderValue)],
         body: Bytes,
     ) -> Result<Reply, TransportError> {
-        let head = self
-            .head(method, uri, headers, body, Some(self.request_timeout()))
-            .await?;
-        self.read(head).await
+        let exchange = async {
+            let head = self
+                .head(method, uri, headers, body, Some(self.request_timeout()))
+                .await?;
+            self.read(head).await
+        };
+        self.ended(exchange.await)
     }
 
     /// Sends a request and reads the whole response within `timeout`.
@@ -409,9 +458,11 @@ impl Http {
                 body,
             })
         };
-        tokio::time::timeout(timeout, exchange)
+        let ended = tokio::time::timeout(timeout, exchange)
             .await
-            .map_err(|_| TransportError::Timeout)?
+            .map_err(|_| TransportError::Timeout)
+            .flatten();
+        self.ended(ended)
     }
 
     /// Sends a request, waits up to `head_timeout` for the response head,
@@ -425,13 +476,34 @@ impl Http {
         headers: &[(header::HeaderName, HeaderValue)],
         head_timeout: Duration,
     ) -> Result<Reply, TransportError> {
+        let exchange = async {
+            let head = tokio::time::timeout(
+                head_timeout,
+                self.head(method, uri, headers, Bytes::new(), None),
+            )
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+            self.read(head).await
+        };
+        self.ended(exchange.await)
+    }
+
+    /// Sends a request and waits up to the request timeout for the
+    /// response head, leaving the body to the caller.
+    async fn request_head(
+        &self,
+        method: Method,
+        uri: &str,
+        headers: &[(header::HeaderName, HeaderValue)],
+    ) -> Result<Head, TransportError> {
         let head = tokio::time::timeout(
-            head_timeout,
+            self.request_timeout(),
             self.head(method, uri, headers, Bytes::new(), None),
         )
         .await
-        .map_err(|_| TransportError::Timeout)??;
-        self.read(head).await
+        .map_err(|_| TransportError::Timeout)
+        .flatten();
+        self.ended(head)
     }
 
     /// Reads the body of `head` with each chunk due within the request
@@ -707,13 +779,10 @@ impl HttpsTransport {
                 HeaderValue::from_str(&format!("bytes={from}-")).expect("a valid header"),
             ));
         }
-        let head = tokio::time::timeout(
-            self.http.request_timeout(),
-            self.http
-                .head(Method::GET, &path::blob(id), &headers, Bytes::new(), None),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)??;
+        let head = self
+            .http
+            .request_head(Method::GET, &path::blob(id), &headers)
+            .await?;
         let (offset, total) = match head.status {
             StatusCode::OK => {
                 let total = header_str(&head.headers, header::CONTENT_LENGTH)
@@ -1153,5 +1222,110 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(post(Uplink::Mute).await, Err(TransportError::Timeout));
         assert_eq!(started.elapsed(), STALL);
+    }
+
+    /// A client socket gives up on unacknowledged bytes after
+    /// [`UNACKED_MAX`].
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn a_client_socket_gives_up_on_unacknowledged_bytes() {
+        use std::os::fd::AsRawFd;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tcp, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (tcp, _peer) = (tcp.unwrap(), accepted.unwrap());
+        limit_unacked(&tcp);
+        let mut value: libc::c_int = 0;
+        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+        // SAFETY: TCP_USER_TIMEOUT writes one c_int to `value`, `len` long.
+        let got = unsafe {
+            libc::getsockopt(
+                tcp.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                (&raw mut value).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(got, 0, "{}", io::Error::last_os_error());
+        assert_eq!(u128::try_from(value).unwrap(), UNACKED_MAX.as_millis());
+    }
+
+    /// A plain HTTP/1.1 server on `io` that answers each request with `{}`
+    /// when `answers`, and otherwise reads it and says nothing, the
+    /// connection held either way.
+    async fn idle_server(mut io: tokio::io::DuplexStream, answers: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut got = Vec::new();
+        let mut buf = [0u8; PIECE];
+        loop {
+            let n = io.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if answers && let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                got.drain(..end + 4);
+                io.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    /// An [`Http`] whose pool holds a connection to a server that answers
+    /// and, taken first, one to a server that does not when `mute_first`,
+    /// or one that does.
+    async fn pooled(mute_first: bool) -> Http {
+        let tls =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+        let http = Http::new(
+            ServerAddress::parse("srv:443").unwrap(),
+            Arc::new(tls),
+            TransportConfig::default(),
+        );
+        for answers in [true, !mute_first] {
+            let (client, far) = tokio::io::duplex(PIECE);
+            tokio::spawn(idle_server(far, answers));
+            let (client, written) = Metered::new(client);
+            let mut conn = Conn::open(client, written).await.unwrap();
+            conn.sender.ready().await.unwrap();
+            http.put_idle(conn);
+        }
+        http
+    }
+
+    fn idle_count(http: &Http) -> usize {
+        http.idle.lock().unwrap().len()
+    }
+
+    /// A request that times out on a pooled connection drops the other
+    /// idle one too: whatever silently killed its path most likely killed
+    /// theirs, and the next request must open a fresh connection rather
+    /// than wait out another timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_request_drops_every_idle_connection() {
+        let http = pooled(true).await;
+        assert_eq!(idle_count(&http), 2);
+        let got = http
+            .request(Method::GET, "/v1/hello", &[], Bytes::new(), STALL)
+            .await;
+        assert_eq!(got.map(|r| r.status), Err(TransportError::Timeout));
+        assert_eq!(idle_count(&http), 0);
+    }
+
+    /// A request that gets its answer leaves the pool as it was.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_request_keeps_the_idle_connections() {
+        let http = pooled(false).await;
+        let got = http
+            .request(Method::GET, "/v1/hello", &[], Bytes::new(), STALL)
+            .await;
+        assert_eq!(got.map(|r| r.status), Ok(StatusCode::OK));
+        assert_eq!(idle_count(&http), 2);
     }
 }
