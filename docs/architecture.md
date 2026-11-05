@@ -108,6 +108,19 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   Elsewhere (desktop macOS and Windows) the send buffer, which can
   autotune to megabytes, counts as sent, so on an uplink too slow to
   drain it within 30 s a large command times out there and is resent.
+- **Dead connections:** the HTTPS transport keeps up to `max_idle` (4)
+  connections for reuse. A NAT or network that drops a connection
+  silently leaves it looking ready. So a request that times out or whose
+  connection breaks drops every idle connection with its own: they share
+  its path, and the reconnect's `hello` then opens a fresh one instead of
+  waiting out a timeout on each stale one in turn. On Linux and Android
+  the client socket also sets `TCP_USER_TIMEOUT` to 20 s: once sent bytes
+  go unacknowledged that long, the kernel closes the connection and its
+  request fails at once. A server holding a long-poll has acknowledged
+  the request, so the long-poll is not cut; a long-poll whose path dies
+  after that is still found only by its own timeout (wait + 30 s). This
+  also bounds an upload that stops being acknowledged at 20 s, under its
+  30 s stall bound. Elsewhere only the request timeouts apply.
 
 ## Protocol
 
