@@ -19,6 +19,13 @@ const timelineMaxWidth = 920.0;
 /// The open session's timeline: a lazily built list keyed by row key, so
 /// rows that arrive, change or move keep their place and scroll offset.
 ///
+/// The list is reversed: the newest row is its first item, at scroll
+/// offset 0 on the bottom edge. A viewport that shrinks (the keyboard
+/// opening) then keeps the newest rows in view, and a short timeline sits
+/// above the composer rather than under the app bar. While the user reads
+/// older rows, the scroll physics keeps the newest row in view where it
+/// was when the rows below it change.
+///
 /// It follows the newest row until the user scrolls away from it, and
 /// tells the hub whenever that changes (`FollowingChanged`: the read marks
 /// depend on it); a button brings it back. It scrolls to the current
@@ -62,6 +69,12 @@ class TimelineViewState extends State<TimelineView> {
   /// A row (and maybe its current match line) to bring into view, kept
   /// until it is in view or the user scrolls.
   ({String key, bool line})? _reveal;
+
+  /// The newest row in view and its offset in the list, taken when the
+  /// rows change while the user reads older ones, until they are laid out.
+  ({String key, double offset})? _held;
+
+  late final _physics = _HoldPhysics(shift: _heldShift);
 
   /// The search match last scrolled to.
   (String?, int?) _searchTarget = (null, null);
@@ -121,14 +134,45 @@ class TimelineViewState extends State<TimelineView> {
       _reveal = null;
       _setFollowing(true, force: true);
     }
+    if (!_following && _reveal == null && _held == null) {
+      final key = newestVisibleKey();
+      final offset = key == null ? null : _offsetOf(key);
+      if (offset != null) _held = (key: key!, offset: offset);
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      _held = null;
       if (_reveal != null) {
         _stepReveal(4);
       } else if (_following) {
         _jumpToEnd();
       }
     });
+  }
+
+  /// Where the row keyed [key] was last laid out, from the newest end.
+  double? _offsetOf(String key) {
+    // The list wraps each row (repaint boundary, semantics): the list's
+    // own child is a few boxes up.
+    var box = _slots[key]?.findRenderObject();
+    while (box != null) {
+      final parentData = box.parentData;
+      if (parentData is SliverMultiBoxAdaptorParentData) {
+        return parentData.layoutOffset;
+      }
+      box = box.parent;
+    }
+    return null;
+  }
+
+  /// How far the held row moved in this layout: the rows newer than it
+  /// grew by that much, and the view scrolls with it to keep it in place.
+  double _heldShift() {
+    final held = _held;
+    final offset = held == null ? null : _offsetOf(held.key);
+    if (held == null || offset == null) return 0;
+    _held = (key: held.key, offset: offset);
+    return offset - held.offset;
   }
 
   (String?, int?) _targetOf(SearchUpdate? search) =>
@@ -153,21 +197,27 @@ class TimelineViewState extends State<TimelineView> {
     if (note.depth != 0) return false;
     if (note is UserScrollNotification) _reveal = null;
     if (note is ScrollUpdateNotification || note is ScrollEndNotification) {
-      _setFollowing(note.metrics.extentAfter <= _endSlack);
+      _setFollowing(note.metrics.extentBefore <= _endSlack);
     }
     return false;
   }
 
-  /// Scrolls to the newest row; a lazily built list learns its full
+  /// Scrolls to the newest row, at offset 0.
+  void _jumpToEnd() {
+    if (!_scroll.hasClients || _scroll.position.pixels <= 0) return;
+    _scroll.jumpTo(0);
+  }
+
+  /// Scrolls to the oldest row; a lazily built list learns its full
   /// extent as it goes, so this checks again after each frame it jumped.
-  void _jumpToEnd([int tries = 6]) {
+  void _jumpToOldest([int tries = 6]) {
     if (!_scroll.hasClients) return;
     final position = _scroll.position;
     if (position.pixels >= position.maxScrollExtent) return;
     _scroll.jumpTo(position.maxScrollExtent);
     if (tries <= 0) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _following) _jumpToEnd(tries - 1);
+      if (mounted) _jumpToOldest(tries - 1);
     });
   }
 
@@ -182,7 +232,7 @@ class TimelineViewState extends State<TimelineView> {
   void page({required bool older}) {
     if (!_scroll.hasClients) return;
     final position = _scroll.position;
-    final step = position.viewportDimension * 0.85 * (older ? -1 : 1);
+    final step = position.viewportDimension * 0.85 * (older ? 1 : -1);
     _scroll.animateTo(
       (position.pixels + step).clamp(0, position.maxScrollExtent),
       duration: const Duration(milliseconds: 180),
@@ -203,9 +253,11 @@ class TimelineViewState extends State<TimelineView> {
     final lineContext = target.line ? _lineKey.currentContext : null;
     final rowContext = _slots[target.key];
     if (lineContext != null || rowContext != null) {
+      // Alignment runs from the bottom edge in a reversed list: these put
+      // the line 40% and the row 20% down from the top.
       Scrollable.ensureVisible(
         lineContext ?? rowContext!,
-        alignment: lineContext != null ? 0.4 : 0.2,
+        alignment: lineContext != null ? 0.6 : 0.8,
         alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
       );
       // A match line may show only once the hub expanded its row: keep
@@ -225,7 +277,8 @@ class TimelineViewState extends State<TimelineView> {
   }
 
   /// Where the row at [index] probably starts, from the rows that are
-  /// built: the nearest one's offset and their mean height.
+  /// built: the nearest one's offset and their mean height. Offsets grow
+  /// towards older rows.
   double? _estimate(int index) {
     var total = 0.0;
     var count = 0;
@@ -246,7 +299,7 @@ class TimelineViewState extends State<TimelineView> {
       }
     }
     if (nearest == null || count == 0) return null;
-    return nearest.offset + (index - nearest.index) * (total / count);
+    return nearest.offset + (nearest.index - index) * (total / count);
   }
 
   /// The newest row in view, for a search step that starts from it.
@@ -285,7 +338,8 @@ class TimelineViewState extends State<TimelineView> {
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.home) {
-      if (_scroll.hasClients) _scroll.jumpTo(0);
+      _reveal = null;
+      _jumpToOldest();
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.end) {
@@ -324,16 +378,18 @@ class TimelineViewState extends State<TimelineView> {
                     controller: _scroll,
                     child: ListView.builder(
                       controller: _scroll,
+                      physics: _physics,
+                      reverse: true,
                       padding: EdgeInsets.fromLTRB(side, 8, side, 24),
                       itemCount: rows.length,
                       findChildIndexCallback: (key) {
                         final index = widget.timeline.indexOf(
                           (key as ValueKey<String>).value,
                         );
-                        return index < 0 ? null : index;
+                        return index < 0 ? null : rows.length - 1 - index;
                       },
                       itemBuilder: (context, i) {
-                        final row = rows[i];
+                        final row = rows[rows.length - 1 - i];
                         final current = row.key == currentKey;
                         return _Slot(
                           key: ValueKey(row.key),
@@ -392,6 +448,34 @@ class TimelineViewState extends State<TimelineView> {
       ),
     );
   }
+}
+
+/// The platform's physics, plus a [shift] applied whenever a layout
+/// changes the list's extent: the newest end is at offset 0, so rows that
+/// arrive or grow there would otherwise push the rows in view up.
+class _HoldPhysics extends ScrollPhysics {
+  const _HoldPhysics({required this.shift, super.parent});
+
+  final double Function() shift;
+
+  @override
+  _HoldPhysics applyTo(ScrollPhysics? ancestor) =>
+      _HoldPhysics(shift: shift, parent: buildParent(ancestor));
+
+  @override
+  double adjustPositionForNewDimensions({
+    required ScrollMetrics oldPosition,
+    required ScrollMetrics newPosition,
+    required bool isScrolling,
+    required double velocity,
+  }) =>
+      super.adjustPositionForNewDimensions(
+        oldPosition: oldPosition,
+        newPosition: newPosition,
+        isScrolling: isScrolling,
+        velocity: velocity,
+      ) +
+      shift();
 }
 
 /// A built row, registered by key while it is mounted so the timeline can

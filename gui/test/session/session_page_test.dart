@@ -226,14 +226,13 @@ void main() {
     // Scroll back until the pending message shows.
     await tester.scrollUntilVisible(
       find.text('mine'),
-      -200,
+      200,
       scrollable: listScrollable(),
     );
     await tester.pumpAndSettle();
     await tester.tap(find.text('mine'));
     await tester.pump();
     expect(timeline.selectedKey, 'p:c1');
-    final offset = scrolled(tester);
     final where = tester.getTopLeft(find.text('mine'));
 
     timeline
@@ -249,7 +248,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(timeline.selectedKey, 's:99');
-    expect(scrolled(tester), offset);
     expect(tester.getTopLeft(find.text('mine')), where);
   });
 
@@ -1187,8 +1185,12 @@ void main() {
     expect(sent.last, const GuiIntentFollowingChanged(following: false));
     expect(find.byTooltip('Jump to newest'), findsOneWidget);
 
-    // New rows do not move a view scrolled back.
-    final offset = scrolled(tester);
+    // New rows do not move a view scrolled back: the rows in view stay put.
+    final newest = tester
+        .state<TimelineViewState>(find.byType(TimelineView))
+        .newestVisibleKey()!;
+    final shown = find.text('row ${newest.substring(2)}');
+    final where = tester.getTopLeft(shown);
     timeline.apply(
       TimelineUpdateUpserted(
         key: 's:60',
@@ -1197,7 +1199,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(scrolled(tester), offset);
+    expect(tester.getTopLeft(shown), where);
 
     await tester.drag(find.byType(ListView), const Offset(0, -4000));
     await tester.pumpAndSettle();
@@ -1218,6 +1220,33 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('row 61'), findsOneWidget);
+  });
+
+  testWidgets('the keyboard opening keeps the newest row in view', (
+    tester,
+  ) async {
+    tester.view
+      ..physicalSize = const Size(360, 780)
+      ..devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([for (var i = 0; i < 60; i++) row('s:$i', 'row $i')]),
+      sent: [],
+    );
+    final list = find.byType(ListView);
+    bool inView(String text) {
+      final box = tester.getRect(list);
+      final rect = tester.getRect(find.text(text));
+      return rect.top >= box.top && rect.bottom <= box.bottom;
+    }
+
+    expect(inView('row 59'), isTrue);
+
+    tester.view.viewInsets = const FakeViewPadding(bottom: 330);
+    await tester.pumpAndSettle();
+    expect(inView('row 59'), isTrue);
   });
 
   testWidgets('the current match scrolls into view, far from the end', (
