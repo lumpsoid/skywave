@@ -1,3 +1,4 @@
+import 'package:skywave_gui/crop/crop_lines_holder.dart';
 import 'package:skywave_gui/effects/effects.dart';
 import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/screen_holder.dart';
@@ -16,6 +17,7 @@ class Holders {
   final timeline = TimelineHolder();
   final shell = ShellHolder();
   final search = SearchHolder();
+  final cropLines = CropLinesHolder();
   final EffectsListener effects;
 
   void connect() {
@@ -24,6 +26,7 @@ class Holders {
     timeline.connect();
     shell.connect();
     search.connect();
+    cropLines.connect();
     effects.connect();
   }
 }

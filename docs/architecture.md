@@ -1072,6 +1072,17 @@ skywave-core                 all logic, sync, replica
   (1 MiB or 20,000 lines, lower than the TUI's 4 MiB because every line
   crosses to Dart), with a diff's line kinds from `diff_lines`. "Open"
   (`OpenFull`) opens the whole file.
+- **Crop lines** never travel whole. The crop page asks for a window
+  (`CropLines`, at most 1,000 lines) as its virtualised list scrolls; the
+  hub opens the content's `LineIndex` once per page and file, reads the
+  window once, and sends it (`CropLinesUpdate`, each line stripped and
+  marked kept) again when the window or the selection changes. A line
+  toggle (`CropToggle`) is turned into `SetCropKeep` by the hub, from the
+  selection it sent last, so two taps faster than a snapshot do not lose
+  one. Timeline rows, shell runs and storage rows carry a
+  `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and
+  crop menu decides nothing; every delete or crop goes through an
+  `AlertDialog` with present's question first.
 - **One hub task** owns the head's state and runs one `select!` loop over the
   intents, the core's snapshots, dispatch results and the policies' next
   wake-up. `dispatch` runs on one dedicated thread, in the order sent.

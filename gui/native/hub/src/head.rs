@@ -23,6 +23,7 @@ use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
+use crate::crop::{CropLines, toggle};
 use crate::dispatcher::{Dispatched, Tag};
 #[cfg(test)]
 use crate::lifecycle::Target;
@@ -31,9 +32,9 @@ use crate::notify::{Kind, NotificationIds};
 use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
-    ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
-    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
-    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView,
+    ComposerModeView, ComposerView, CopyWhat, CropLinesUpdate, GuiIntent, LinkUpdate, PairForm,
+    PlatformEffect, RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate,
+    StorageGroupingView, TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::workdir::{WorkdirText, shown_blob};
@@ -88,6 +89,8 @@ pub enum Out {
     Timeline(TimelineUpdate),
     Shell(ShellUpdate),
     Search(SearchUpdate),
+    /// The crop page's line window.
+    CropLines(CropLinesUpdate),
     Effect(PlatformEffect),
     /// Hand `action` to the dispatcher with `tag`.
     Dispatch(Tag, Action),
@@ -261,6 +264,7 @@ struct Sent {
     /// The session the shell runs are of, and the runs.
     shell: Option<(Option<SessionId>, Vec<ShellRunRow>)>,
     search: Option<SearchUpdate>,
+    crop_lines: Option<CropLinesUpdate>,
 }
 
 /// The Stay connected preference as the head keeps it (D21), offered on
@@ -328,6 +332,8 @@ pub struct Head {
     storage: StorageGrouping,
     /// The text of the workdir diff or file shown.
     workdir_text: WorkdirText,
+    /// The crop page's line window (`CropLines`).
+    crop_lines: CropLines,
     session: Option<SessionHead>,
     sent: Sent,
     /// Who holds the link: whether the core runs.
@@ -616,6 +622,11 @@ impl Head {
             }
             GuiIntent::Act { action } => {
                 let action = intents::action(action)?;
+                if let (Action::SetCropKeep(keep), Some(Screen::Crop(view))) =
+                    (&action, self.view.as_ref().map(|v| &v.screen))
+                {
+                    self.crop_lines.sent_keep(view.blob, keep.clone());
+                }
                 self.dispatch_user(action, Purpose::Plain, clock, out);
             }
             GuiIntent::DraftEdited {
@@ -1186,6 +1197,16 @@ impl Head {
                     StorageGroupingView::ShellRuns => StorageGrouping::ShellRuns,
                 };
             }
+            GuiIntent::CropLines { from, count } => self.crop_lines.ask(from, count),
+            GuiIntent::CropToggle { first, last } => {
+                // Off the crop page, a late tap has nothing to toggle.
+                let Some(Screen::Crop(view)) = self.view.as_ref().map(|v| &v.screen) else {
+                    return Ok(());
+                };
+                let keep = toggle(self.crop_lines.keep(view), first, last);
+                self.crop_lines.sent_keep(view.blob, keep.clone());
+                self.dispatch_user(Action::SetCropKeep(keep), Purpose::Plain, clock, out);
+            }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => {
                 self.moved(Moved::Foregrounded, clock, out);
@@ -1423,6 +1444,19 @@ impl Head {
         if self.sent.screen.as_ref() != Some(&shown) {
             self.sent.screen = Some(shown.clone());
             out.push(Out::Screen(shown));
+        }
+        // After the screen, so Dart knows the page its lines are of.
+        let lines = match &view.screen {
+            Screen::Crop(crop) => self.crop_lines.update(crop),
+            _ => {
+                self.crop_lines.close();
+                self.sent.crop_lines = None;
+                None
+            }
+        };
+        if let Some(lines) = lines.filter(|l| self.sent.crop_lines.as_ref() != Some(l)) {
+            self.sent.crop_lines = Some(lines.clone());
+            out.push(Out::CropLines(lines));
         }
         if !rows {
             return;

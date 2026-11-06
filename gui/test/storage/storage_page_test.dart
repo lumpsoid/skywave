@@ -51,6 +51,111 @@ void main() {
     ]);
   });
 
+  group('a blob row', () {
+    const question =
+        "Delete this output from the server and from every device? This "
+        "can't be undone.";
+    const target = BlobTargetView(
+      blobId: 'b1',
+      canCrop: true,
+      deleteQuestion: question,
+      sessionId: 's1',
+      holds: BlobUseView.toolOutput,
+      title: 'fix the build · tool output',
+    );
+
+    Future<List<GuiIntent>> pump(
+      WidgetTester tester,
+      BlobTargetView target,
+    ) async {
+      final sent = <GuiIntent>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: StoragePage(
+            screen: ScreenViewStorage(
+              grouping: StorageGroupingView.blobs,
+              totals: const [],
+              rows: [
+                StorageRowView(
+                  label: 'fix the build',
+                  detail: 'tool output · event 7',
+                  size: '4.0 KiB',
+                  target: target,
+                ),
+              ],
+            ),
+            send: sent.add,
+          ),
+        ),
+      );
+      return sent;
+    }
+
+    Future<void> choose(WidgetTester tester, String item) async {
+      await tester.tap(find.byKey(const Key('blob-menu-b1')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(Key(item)));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('deletes only once the question is confirmed', (tester) async {
+      final sent = await pump(tester, target);
+      await choose(tester, 'blob-delete');
+      expect(find.text(question), findsOneWidget);
+      expect(sent, isEmpty, reason: 'nothing before the answer');
+      await tester.tap(find.byKey(const Key('confirm-cancel')));
+      await tester.pumpAndSettle();
+      expect(find.text(question), findsNothing);
+      expect(sent, isEmpty, reason: 'cancel sends none');
+
+      await choose(tester, 'blob-delete');
+      await tester.tap(find.byKey(const Key('confirm-ok')));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(action: ActionIntentDeleteBlob(blobId: 'b1')),
+      ]);
+    });
+
+    testWidgets('crop opens the crop page with the target', (tester) async {
+      final sent = await pump(tester, target);
+      await choose(tester, 'blob-crop');
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentOpenCrop(
+            blobId: 'b1',
+            sessionId: 's1',
+            holds: BlobUseView.toolOutput,
+            title: 'fix the build · tool output',
+          ),
+        ),
+      ]);
+    });
+
+    testWidgets('a pending delete shows instead of the menu, and discards', (
+      tester,
+    ) async {
+      final sent = await pump(
+        tester,
+        const BlobTargetView(
+          blobId: 'b1',
+          canCrop: false,
+          pendingNote: 'Delete queued',
+          discardId: 'c1',
+          sessionId: 's1',
+          holds: BlobUseView.toolOutput,
+          title: 'fix the build · tool output',
+        ),
+      );
+      expect(find.byKey(const Key('blob-menu-b1')), findsNothing);
+      expect(find.text('Delete queued'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('blob-discard-b1')));
+      expect(sent, [
+        const GuiIntentAct(action: ActionIntentDiscard(commandId: 'c1')),
+      ]);
+    });
+  });
+
   testWidgets('an empty list says so', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

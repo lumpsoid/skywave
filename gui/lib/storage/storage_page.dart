@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -6,7 +7,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// Storage: what the server's data takes on its disk, with the free space,
 /// and the sessions, largest blobs or shell runs taking the most. Rust asks
 /// the server when the page opens; refresh asks again, and picking a list
-/// sends `StorageShow`.
+/// sends `StorageShow`. A blob or shell run row has the blob's delete and
+/// crop menu.
 class StoragePage extends StatelessWidget {
   const StoragePage({
     required this.screen,
@@ -111,9 +113,16 @@ class StoragePage extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                 ),
                 subtitle: Text(row.detail),
-                trailing: Text(
-                  row.size,
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      row.size,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    if (row.target case final target?)
+                      BlobMenu(target: target, send: send),
+                  ],
                 ),
               ),
           ],

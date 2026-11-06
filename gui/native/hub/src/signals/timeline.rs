@@ -1,6 +1,8 @@
 use rinf::{RustSignal, SignalPiece};
 use serde::Serialize;
 
+use super::crop::BlobTargetView;
+
 /// The open session's timeline: a snapshot, then keyed diffs against it.
 /// One type, so a snapshot and the diffs after it arrive in order.
 ///
@@ -85,6 +87,9 @@ pub struct TimelineRow {
     /// The content shown beneath the title, as it shows now (collapsed or
     /// expanded); empty for most messages.
     pub sections: Vec<SectionView>,
+    /// A tool call's output kept as a blob, and what may be done to it:
+    /// its menu goes beside the section whose `blob` is `blob_id`.
+    pub blob_target: Option<BlobTargetView>,
 }
 
 /// What kind of item a row is.

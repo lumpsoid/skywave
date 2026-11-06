@@ -1,6 +1,7 @@
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
+use super::crop::{BlobUseView, LineSpanView};
 use super::screen::{
     EffortView, PermissionModeView, StorageGroupingView, UsageGroupingView, UsageSpanView,
 };
@@ -221,6 +222,21 @@ pub enum GuiIntent {
     StorageShow {
         grouping: StorageGroupingView,
     },
+    /// The crop page's lines `from .. from + count` (0 the first) are
+    /// wanted: answered with a `CropLinesUpdate`, and again whenever they
+    /// or the selection change, until another window is asked for. At
+    /// most [`CROP_WINDOW_MAX`](crate::crop::CROP_WINDOW_MAX) lines.
+    CropLines {
+        from: u32,
+        count: u32,
+    },
+    /// Toggle the crop page's lines `first ..= last` (0 the first, in
+    /// either order): taken out of the selection when it keeps them all,
+    /// else added. A tap is one line; shift or a long press a range.
+    CropToggle {
+        first: u32,
+        last: u32,
+    },
     /// The app went off screen (hidden or paused). Reported, not decided:
     /// the hub knows what that means on this platform.
     AppBackgrounded,
@@ -365,6 +381,29 @@ pub enum ActionIntent {
     OpenNextApproval,
     DownloadBlob {
         blob_id: String,
+    },
+    /// Delete a blob (a target's `blob_id`) from the server and every
+    /// device. Sent only once its `delete_question` was confirmed.
+    DeleteBlob {
+        blob_id: String,
+    },
+    /// Crop a blob to the lines `keep` names. Sent only once the crop
+    /// page's `confirmation` was confirmed; the page then closes.
+    CropBlob {
+        blob_id: String,
+        keep: Vec<LineSpanView>,
+    },
+    /// Open the crop page on a target that offers it, with its fields.
+    OpenCrop {
+        blob_id: String,
+        session_id: String,
+        holds: BlobUseView,
+        title: String,
+    },
+    /// The crop page's selection, as a preset's `keep`; normalised before
+    /// the core keeps it.
+    SetCropKeep {
+        keep: Vec<LineSpanView>,
     },
     SetBlobPolicy {
         policy: BlobPolicyChoice,

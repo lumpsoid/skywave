@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use skywave_core::{
     Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
-    ImportedEntry, Outgoing, RuleSuggestion, Seq, SessionView, TimelineItem, ToolKind, ToolOutcome,
-    ToolView, read_head,
+    ImportedEntry, Outgoing, RuleSuggestion, Seq, SessionId, SessionView, TimelineItem, ToolKind,
+    ToolOutcome, ToolView, read_head,
 };
+use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
@@ -24,6 +25,7 @@ use skywave_present::sections::{
 };
 use skywave_present::text::{clean_line, clean_text};
 
+use crate::crop::target_view;
 use crate::signals::{
     BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
     SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
@@ -134,7 +136,7 @@ pub fn rows(
         };
         let key = ItemKey::of(item);
         let open = matches!(key, ItemKey::Logged(seq) if expanded.contains(&seq));
-        let mut row = row(item, open, heads, wall_ms);
+        let mut row = row(item, view.id, open, heads, wall_ms);
         row.time_label = time_label;
         row.unread_rule = rule == Some(index);
         row.turn_start = !row.unread_rule && index > 0 && starts_turn(item);
@@ -159,9 +161,15 @@ fn rule_index(view: &SessionView) -> Option<usize> {
         .position(|item| matches!(item, TimelineItem::Logged { seq, .. } if *seq >= from))
 }
 
-/// One item, `expanded` or not, without the facts that depend on its
-/// neighbours (time label, separators).
-fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64) -> TimelineRow {
+/// One item of `session`, `expanded` or not, without the facts that
+/// depend on its neighbours (time label, separators).
+fn row(
+    item: &TimelineItem,
+    session: SessionId,
+    expanded: bool,
+    heads: &mut BlobHeads,
+    wall_ms: i64,
+) -> TimelineRow {
     let key = ItemKey::of(item);
     let mut row = TimelineRow {
         key: key_string(key),
@@ -183,6 +191,7 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
         command_id: None,
         tool: None,
         sections: Vec::new(),
+        blob_target: None,
     };
     let (at, entry) = match item {
         TimelineItem::Pending {
@@ -378,6 +387,7 @@ fn row(item: &TimelineItem, expanded: bool, heads: &mut BlobHeads, wall_ms: i64)
         .filter(|s| row.expanded || !s.hidden)
         .filter_map(|s| section_view(s, row.expanded, heads))
         .collect();
+    row.blob_target = entry_target(entry, session).as_ref().map(target_view);
     row
 }
 

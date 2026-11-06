@@ -2,13 +2,15 @@
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
 use skywave_core::{
-    Action, BlobPolicy, Decision, Effort, PermissionMode, Route, ServerAddress, TaskId, WorkdirPane,
+    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, PermissionMode, Route, ServerAddress,
+    TaskId, WorkdirPane,
 };
+use skywave_present::crop::normalise;
 use uuid::Uuid;
 
 use crate::signals::{
-    ActionIntent, BlobPolicyChoice, DecisionView, EffortView, PermissionModeView, RouteView,
-    WorkdirPaneKind,
+    ActionIntent, BlobPolicyChoice, BlobUseView, DecisionView, EffortView, LineSpanView,
+    PermissionModeView, RouteView, WorkdirPaneKind,
 };
 
 /// `intent` as a core action, or why it is not one.
@@ -136,6 +138,23 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::RefreshWorkdir => Action::RefreshWorkdir,
         ActionIntent::OpenNextApproval => Action::OpenNextApproval,
         ActionIntent::DownloadBlob { blob_id } => Action::DownloadBlob(id("blob", &blob_id)?),
+        ActionIntent::DeleteBlob { blob_id } => Action::DeleteBlob(id("blob", &blob_id)?),
+        ActionIntent::CropBlob { blob_id, keep } => Action::CropBlob {
+            blob: id("blob", &blob_id)?,
+            keep: spans(&keep),
+        },
+        ActionIntent::OpenCrop {
+            blob_id,
+            session_id,
+            holds,
+            title,
+        } => Action::OpenCrop {
+            blob: id("blob", &blob_id)?,
+            session: id("session", &session_id)?,
+            holds: blob_use(holds),
+            title,
+        },
+        ActionIntent::SetCropKeep { keep } => Action::SetCropKeep(normalise(&spans(&keep))),
         ActionIntent::SetBlobPolicy { policy } => Action::SetBlobPolicy(match policy {
             BlobPolicyChoice::Eager => BlobPolicy::Eager,
             BlobPolicyChoice::OnDemand => BlobPolicy::OnDemand,
@@ -178,6 +197,26 @@ fn effort(effort: EffortView) -> Effort {
         EffortView::High => Effort::High,
         EffortView::XHigh => Effort::XHigh,
         EffortView::Max => Effort::Max,
+    }
+}
+
+/// Spans as Dart sent them, as core takes them.
+pub fn spans(keep: &[LineSpanView]) -> Vec<LineSpan> {
+    keep.iter()
+        .map(|s| LineSpan {
+            first: s.first,
+            count: s.count,
+        })
+        .collect()
+}
+
+fn blob_use(holds: BlobUseView) -> BlobUse {
+    match holds {
+        BlobUseView::ToolInput => BlobUse::ToolInput,
+        BlobUseView::ToolBody => BlobUse::ToolBody,
+        BlobUseView::ToolOutput => BlobUse::ToolOutput,
+        BlobUseView::ApprovalInput => BlobUse::ApprovalInput,
+        BlobUseView::ShellOutput => BlobUse::ShellOutput,
     }
 }
 

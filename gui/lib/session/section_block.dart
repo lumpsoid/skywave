@@ -5,8 +5,8 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// One section of an item's content: its lines in monospace with their
 /// colours (and line numbers for file content), then its note, the blob
-/// behind it with a Download button, and "Open full file" when the shown
-/// part was cut short.
+/// behind it with a Download button, "Open full file" when the shown part
+/// was cut short, and the blob's delete and crop menu when it has one.
 class SectionBlock extends StatelessWidget {
   const SectionBlock({
     required this.section,
@@ -16,6 +16,7 @@ class SectionBlock extends StatelessWidget {
     this.currentLineKey,
     this.onDownload,
     this.onOpenFull,
+    this.blobMenu,
     super.key,
   });
 
@@ -37,6 +38,10 @@ class SectionBlock extends StatelessWidget {
 
   /// `OpenFull` for this section's blob.
   final VoidCallback? onOpenFull;
+
+  /// What may be done to this section's blob (delete, crop), beside its
+  /// state; only the output section a row's target names has one.
+  final Widget? blobMenu;
 
   @override
   Widget build(BuildContext context) {
@@ -127,6 +132,7 @@ class SectionBlock extends StatelessWidget {
                     label: 'Open full file',
                     onPressed: onOpenFull,
                   ),
+                if (blob != null && blobMenu != null) blobMenu!,
               ],
             ),
           ),

@@ -1,6 +1,7 @@
 use rinf::{RustSignal, SignalPiece};
 use serde::Serialize;
 
+use super::crop::BlobTargetView;
 use super::timeline::{BlobFacts, OutgoingView};
 
 /// The open session's shell runs: a snapshot, then keyed diffs against it,
@@ -56,11 +57,18 @@ pub struct ShellRunRow {
     /// The output's tail (running) or preview (finished), ANSI stripped;
     /// empty before any output.
     pub tail: String,
-    /// The output's line count so far, or in all once finished.
+    /// The output's line count so far; once the server cropped it, the
+    /// lines the crop kept.
     pub lines: u32,
     /// The whole output, once finished, when the preview does not hold
     /// it (`truncated`).
     pub output: Option<BlobFacts>,
+    /// What became of a whole output the server no longer keeps: `Deleted
+    /// by laptop`; the preview is then all there is. `None` otherwise.
+    pub output_note: Option<String>,
+    /// The output blob and what may be done to it: delete, crop, or this
+    /// device's own pending delete or crop of it.
+    pub target: Option<BlobTargetView>,
     pub truncated: bool,
     /// `ExpandShellRun` asked for its whole output, until `CollapseShellRun`.
     pub expanded: bool,
