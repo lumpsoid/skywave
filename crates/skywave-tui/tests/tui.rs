@@ -1748,7 +1748,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
     let screen = h.screen();
     assert_contains(
         &screen,
-        &format!("12:01 device …{}: from the phone", tail(phone)),
+        &format!("12:01 ▌ device …{}: from the phone", tail(phone)),
     );
     assert_contains(&screen, &format!("approved on device …{}", tail(phone)));
 
@@ -1776,7 +1776,7 @@ fn other_devices_show_by_name_once_the_server_lists_them() {
         .unwrap();
     h.sync();
     let screen = h.screen();
-    assert_contains(&screen, "12:01 Pixel 8: from the phone");
+    assert_contains(&screen, "12:01 ▌ Pixel 8: from the phone");
     assert_contains(&screen, "approved on Pixel 8");
     assert!(!screen.contains("laptop"), "{screen}");
 }
@@ -1859,17 +1859,17 @@ fn every_timeline_entry_renders_distinctly() {
     let screen = h.screen();
     assert_contains(
         &screen,
-        &format!("12:01 device …{}: from the laptop", tail(other)),
+        &format!("12:01 ▌ device …{}: from the laptop", tail(other)),
     );
-    assert_contains(&screen, "12:02 agent: Looking.");
-    assert_contains(&screen, "        Second line");
+    assert_contains(&screen, "12:02 ▌ agent: Looking.");
+    assert_contains(&screen, "        ▌ Second line");
     // Standalone (v1) calls and results, in the tool block style.
     assert_contains(&screen, "12:03 • shell {\"command\":\"ls\"}");
     assert_contains(&screen, "12:04 ↳ result ");
     assert_contains(&screen, "        │ file-000 ");
     assert_contains(&screen, "        │ … full 9.8 KiB · not downloaded ");
     assert_contains(&screen, "12:05 interrupted · the agent stopped its turn");
-    assert_contains(&screen, "12:06 agent error: agent crashed");
+    assert_contains(&screen, "12:06 ▌ agent error: agent crashed");
     assert_contains(&screen, "/srv/work · error");
     assert!(!screen.contains(&me.0.simple().to_string()[24..]));
 }
@@ -1899,7 +1899,7 @@ fn own_messages_show_their_delivery_state() {
     let command = last_command(&h);
     let screen = h.screen();
     assert_contains(&screen, "you [queued]: q? line one");
-    assert_contains(&screen, "        line two");
+    assert_contains(&screen, "        ▌ line two");
 
     h.seam.command_sending(command).unwrap();
     h.sync();
@@ -1915,7 +1915,7 @@ fn own_messages_show_their_delivery_state() {
     );
     assert_contains(
         &line_with(&h.screen(), ": q? line one"),
-        "12:01 you [accepted]",
+        "12:01 ▌ you [accepted]",
     );
 
     // A refused message says why, in words.
@@ -2682,7 +2682,7 @@ fn imported_history_is_marked_dimmed_and_ends_at_a_divider() {
     assert_eq!(h.key(KeyCode::Enter), Some(Action::OpenSession(id)));
     let screen = h.screen();
     // By the agent's clock, marked, in the order the agent had them.
-    assert_contains(&screen, "09:10 imported you: why is the build red");
+    assert_contains(&screen, "09:10 imported ▌ you: why is the build red");
     assert_contains(
         &line_with(&screen, "cargo build"),
         "09:11 imported ❯ Bash $ cargo build",
@@ -2691,7 +2691,7 @@ fn imported_history_is_marked_dimmed_and_ends_at_a_divider() {
     assert_contains(&screen, "Finished dev");
     assert_contains(&screen, "09:13 imported ↳ result");
     assert_contains(&screen, "stray output");
-    assert_contains(&screen, "09:14 imported agent: it builds now");
+    assert_contains(&screen, "09:14 imported ▌ agent: it builds now");
     assert_contains(&screen, "── Continued in Skywave from here ──");
     // The session's own items are not imported.
     let live = line_with(&screen, "live question");
@@ -3447,7 +3447,7 @@ fn selecting_an_old_tool_item_scrolls_to_it() {
     assert_contains(&screen, "> 12:01 • early first");
     assert!(!screen.contains("late second"));
     h.key(KeyCode::Down);
-    assert_contains(&h.screen(), "> 12:02 agent: chatter 0");
+    assert_contains(&h.screen(), "> 12:02 ▌ agent: chatter 0");
     for _ in 0..40 {
         h.key(KeyCode::Down);
     }
@@ -4494,8 +4494,8 @@ fn colour_of(buffer: &Buffer, needle: &str) -> Color {
 const MOCKUP: &str = r#"connecting…
 ┌ add a hello binary and wire it into main · /srv/work · approval ───────────────────────┐
 │agent waiting for an approval                                                           │
-│  12:01 you: add a hello binary and wire it into main                                   │
-│        agent: I'll add the binary, run it, then use it from main.                      │
+│  12:01 ▌ you: add a hello binary and wire it into main                                 │
+│        ▌ agent: I'll add the binary, run it, then use it from main.                    │
 │        ✎ Write src/bin/hello.rs                          created · approved here · 3.0s│
 │        │  1 //! Says hello.                                                            │
 │        │  2                                                                            │
@@ -4518,10 +4518,10 @@ const MOCKUP: &str = r#"connecting…
 │        │ +    let code = run();                                                        │
 │        │ +    std::process::exit(code);                                                │
 │        │  }                                                                            │
-│        agent: Done: main now exits with run()'s code. A long reply wraps under its own │
-│        column instead of falling back to the left edge.                                │
+│        ▌ agent: Done: main now exits with run()'s code. A long reply wraps under its   │
+│        ▌ own column instead of falling back to the left edge.                          │
 │────────────────────────────────────────────────────────────────────────────────────────│
-│  12:04 device …c0ffee42: run the tests and clean up                                    │
+│  12:04 ▌ device …c0ffee42: run the tests and clean up                                  │
 │        ❯ Bash $ cargo test                                               exit 101 · 12s│
 │        │ running 3 tests                                                               │
 │        │ test tests::adds ... FAILED                                                   │
@@ -4529,13 +4529,13 @@ const MOCKUP: &str = r#"connecting…
 │        │ … +20 lines · full 2.0 KiB · not downloaded                                   │
 │        ❯ Bash $ rm -rf target                                               denied here│
 │          Clean the build directory                                                     │
-│        agent: One test fails; I left target/ alone.                                    │
+│        ▌ agent: One test fails; I left target/ alone.                                  │
 │────────────────────────────────────────────────────────────────────────────────────────│
-│  12:06 you: write it up in NOTES.md                                                    │
+│  12:06 ▌ you: write it up in NOTES.md                                                  │
 │        ✎ Write NOTES.md                                          cancelled: interrupted│
 │        interrupted · the agent stopped its turn                                        │
 │────────────────────────────────────────────────────────────────────────────────────────│
-│  12:08 you: fix the failing test                                                       │
+│  12:08 ▌ you: fix the failing test                                                     │
 │        ❯ Bash $ cargo test -- --nocapture                                   running 42s│
 │        ± Edit src/lib.rs                                                 needs approval│
 │        │ -    assert_eq!(add(2, 2), 5);                                                │
@@ -4595,6 +4595,37 @@ fn tool_timeline_mockup_at_90_columns() {
 }
 
 #[test]
+fn messages_carry_a_bar_and_calls_step_back() {
+    let (h, _, _, _) = mockup();
+    let frame = h.frame(90, 60, mockup_now());
+    let cell = |needle: &str| {
+        let screen = text(&frame);
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"));
+        let x = line[..line.find(needle).unwrap()].chars().count();
+        frame[(x as u16, y as u16)].clone()
+    };
+    let dim = |needle: &str| {
+        cell(needle)
+            .modifier
+            .contains(ratatui::style::Modifier::DIM)
+    };
+    // The bar takes its author's colour, on every row of the message.
+    assert_eq!(cell("▌ you: add a hello").fg, Color::Blue);
+    assert_eq!(cell("▌ device …c0ffee42").fg, Color::Magenta);
+    assert_eq!(cell("▌ agent: Done").fg, Color::Green);
+    assert_eq!(cell("▌ own column").fg, Color::Green);
+    assert!(!dim("agent: Done"));
+    // Calls are dimmed, but the one an approval waits on.
+    assert!(dim("✎ Write src/bin/hello.rs"));
+    assert!(dim("❯ Bash $ cargo test  "));
+    assert!(!dim("± Edit src/lib.rs   "));
+}
+
+#[test]
 fn a_running_call_counts_up() {
     let (h, _, _, _) = mockup();
     let later = mockup_now() + chrono::Duration::seconds(83);
@@ -4611,9 +4642,9 @@ fn select_the_write(h: &mut Harness) {
     assert_contains(&h.screen(), ">       ± Edit src/lib.rs");
     // A turn starts at its message.
     h.key(KeyCode::Char('['));
-    assert_contains(&h.screen(), "> 12:08 you: fix the failing test");
+    assert_contains(&h.screen(), "> 12:08 ▌ you: fix the failing test");
     h.key(KeyCode::Char('['));
-    assert_contains(&h.screen(), "> 12:06 you: write it up in NOTES.md");
+    assert_contains(&h.screen(), "> 12:06 ▌ you: write it up in NOTES.md");
     h.key(KeyCode::Char('['));
     h.key(KeyCode::Char('['));
     let screen = h.screen();
@@ -4622,11 +4653,11 @@ fn select_the_write(h: &mut Harness) {
             .lines()
             .nth(3)
             .unwrap()
-            .starts_with("│> 12:01 you: add a hello binary"),
+            .starts_with("│> 12:01 ▌ you: add a hello binary"),
         "the turn is at the top, its message selected:\n{screen}"
     );
     h.key(KeyCode::Down);
-    assert_contains(&h.screen(), ">       agent: I'll add the binary");
+    assert_contains(&h.screen(), ">       ▌ agent: I'll add the binary");
     h.key(KeyCode::Down);
     assert_contains(&h.screen(), ">       ✎ Write src/bin/hello.rs");
 }
@@ -4644,7 +4675,7 @@ fn turns_step_and_agent_messages_select() {
     assert_contains(screen.lines().nth(3).unwrap(), "────");
     // Agent messages expand to nothing.
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), ">       agent: Done:");
+    assert_contains(&h.screen(), ">       ▌ agent: Done:");
     assert_eq!(h.key(KeyCode::Enter), None);
     assert!(
         h.app
@@ -4815,9 +4846,9 @@ fn wrapped_text_hangs_under_its_column() {
     // and a preview line under their own columns.
     assert_contains(
         &screen,
-        "│        agent: I'll add the binary, run it, then use it ",
+        "│        ▌ agent: I'll add the binary, run it, then use it",
     );
-    assert_contains(&screen, "│        from main. ");
+    assert_contains(&screen, "│        ▌ from main. ");
     // A title too long beside its state wraps under the title.
     assert_contains(
         &screen,
@@ -5299,7 +5330,7 @@ fn user_messages_are_selectable() {
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
     assert_eq!(selected(&h), Some(ItemKey::Pending(command)));
-    assert_contains(&h.screen(), ">       you [queued]: not sent yet");
+    assert_contains(&h.screen(), ">       ▌ you [queued]: not sent yet");
     // A message expands to nothing and has nothing to download.
     assert_eq!(h.key(KeyCode::Enter), None);
     assert_eq!(h.key(KeyCode::Char('d')), None);
@@ -5314,9 +5345,9 @@ fn user_messages_are_selectable() {
             .is_empty()
     );
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), "> 12:03 you: and this");
+    assert_contains(&h.screen(), "> 12:03 ▌ you: and this");
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), "> 12:02 agent: on it");
+    assert_contains(&h.screen(), "> 12:02 ▌ agent: on it");
     h.key(KeyCode::Up);
     let line = line_with(&h.screen(), ": from the phone");
     assert_contains(&line, "> 12:01 ");
@@ -5345,10 +5376,10 @@ fn selection_follows_pending_to_logged() {
 
     pull(&mut h, vec![message(id, 2, command, me, "hello")]);
     assert_eq!(selected(&h), Some(ItemKey::Logged(seq)));
-    assert_contains(&h.screen(), "> 12:02 you [accepted]: hello");
+    assert_contains(&h.screen(), "> 12:02 ▌ you [accepted]: hello");
     // And moves on from there.
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), "> 12:01 agent: ready");
+    assert_contains(&h.screen(), "> 12:01 ▌ agent: ready");
 }
 
 /// Which `pending NN` message each screen row shows, if any; the session
@@ -5434,7 +5465,7 @@ fn selection_moves_to_neighbour_when_pending_vanishes() {
     let view = without(&h, ItemKey::Pending(first));
     h.app.set_view(view);
     assert_eq!(selected(&h), Some(ItemKey::Pending(second)));
-    assert_contains(&h.screen(), ">       you [queued]: second");
+    assert_contains(&h.screen(), ">       ▌ you [queued]: second");
     let view = without(&h, ItemKey::Pending(second));
     h.app.set_view(view);
     assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
@@ -5463,13 +5494,13 @@ fn turn_stepping_lands_on_the_user_message() {
     h.key(KeyCode::Esc);
     h.key(KeyCode::Up);
     h.key(KeyCode::Up);
-    assert_contains(&h.screen(), ">       agent: b");
+    assert_contains(&h.screen(), ">       ▌ agent: b");
     // Back from inside a turn: its message; from there, the turn before.
     h.key(KeyCode::Char('['));
     assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(4))));
     h.key(KeyCode::Char('['));
     assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
-    assert_contains(&h.screen(), "> 12:01 you: one");
+    assert_contains(&h.screen(), "> 12:01 ▌ you: one");
     h.key(KeyCode::Char(']'));
     assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(4))));
     // A pending message starts a turn too.
@@ -5950,7 +5981,7 @@ fn slash_searches_and_n_jumps_between_matches() {
     assert!(!h.app.typing());
     let screen = h.screen();
     assert_contains(&screen, "/test · 3 of 3");
-    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+    assert_contains(&screen, "> 12:05 ▌ agent: the TESTS pass now");
     assert_contains(&screen, "n/N older/newer match");
     h.key(KeyCode::Char('n'));
     let screen = h.screen();
@@ -5959,7 +5990,7 @@ fn slash_searches_and_n_jumps_between_matches() {
     h.key(KeyCode::Char('n'));
     let screen = h.screen();
     assert_contains(&screen, "/test · 1 of 3");
-    assert_contains(&screen, "> 12:01 you: run the tests");
+    assert_contains(&screen, "> 12:01 ▌ you: run the tests");
     h.key(KeyCode::Char('N'));
     assert_contains(&h.screen(), "/test · 2 of 3");
 
@@ -5969,7 +6000,7 @@ fn slash_searches_and_n_jumps_between_matches() {
     h.key(KeyCode::Enter);
     let screen = h.screen();
     assert_contains(&screen, "/TESTS · 1 of 1");
-    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+    assert_contains(&screen, "> 12:05 ▌ agent: the TESTS pass now");
 
     // Ctrl-F opens it from the composer too; `q` is text there.
     h.key(KeyCode::Char('i'));
@@ -5994,7 +6025,7 @@ fn n_wraps_and_says_so() {
     h.key(KeyCode::Char('n'));
     let screen = h.screen();
     assert_contains(&screen, "/test · 3 of 3 · search wrapped");
-    assert_contains(&screen, "> 12:05 agent: the TESTS pass now");
+    assert_contains(&screen, "> 12:05 ▌ agent: the TESTS pass now");
     // Said until the next key.
     h.key(KeyCode::Char('k'));
     assert!(!h.screen().contains("search wrapped"));
@@ -6002,7 +6033,7 @@ fn n_wraps_and_says_so() {
     h.key(KeyCode::Char('N'));
     let screen = h.screen();
     assert_contains(&screen, "/test · 1 of 3 · search wrapped");
-    assert_contains(&screen, "> 12:01 you: run the tests");
+    assert_contains(&screen, "> 12:01 ▌ you: run the tests");
 }
 
 #[test]

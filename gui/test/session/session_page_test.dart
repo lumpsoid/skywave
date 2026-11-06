@@ -149,6 +149,49 @@ void main() {
     );
   });
 
+  testWidgets('collapsed calls step back from the messages', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow('s:1', RowKind.agentMessage, 'on it', author: 'agent'),
+      anyRow('s:2', RowKind.tool, '', tool: shellFacts('cargo build')),
+      anyRow(
+        's:3',
+        RowKind.tool,
+        '',
+        tool: shellFacts('cargo test'),
+        expandable: true,
+        expanded: true,
+      ),
+      anyRow(
+        's:4',
+        RowKind.tool,
+        '',
+        tool: shellFacts('rm -rf target', state: ToolState.needsApproval),
+      ),
+    ]);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: <GuiIntent>[],
+    );
+    double opacityOf(String text) => tester
+        .widget<Opacity>(
+          find
+              .ancestor(
+                of: find.text(text, findRichText: true),
+                matching: find.byType(Opacity),
+              )
+              .first,
+        )
+        .opacity;
+    expect(opacityOf('on it'), 1);
+    expect(opacityOf('Bash  cargo build'), lessThan(1));
+    // Open, or waiting on the user: at full strength.
+    expect(opacityOf('Bash  cargo test'), 1);
+    expect(opacityOf('Bash  rm -rf target'), 1);
+  });
+
   testWidgets('imported history is marked beside its time and dimmed', (
     tester,
   ) async {
