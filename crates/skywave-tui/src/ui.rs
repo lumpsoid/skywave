@@ -6,6 +6,7 @@
 //! scroll ([`UiState::help_end`](crate::app::UiState::help_end)); the only
 //! I/O is reading downloaded blobs to show them.
 
+mod crop;
 mod session;
 mod shell;
 mod storage;
@@ -30,9 +31,9 @@ use ratatui::widgets::{
 };
 use skywave_core::{
     BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, ConversationPicker,
-    ConversationsStatus, FullView, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
-    PairingView, PendingSession, RuleSuggestion, Screen, SessionId, SessionListView, SessionRow,
-    SessionState, SettingsView, WorkdirPane,
+    ConversationsStatus, CropContent, FullView, Link, LinkRejection, ListKind, Outgoing,
+    PairingStatus, PairingView, PendingSession, RuleSuggestion, Screen, SessionId, SessionListView,
+    SessionRow, SessionState, SettingsView, WorkdirPane,
 };
 use skywave_present::format::{
     IMPORTING_HISTORY, adopting_note, blob_size, bytes, conversation_detail, conversation_link,
@@ -92,18 +93,19 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
             Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
-            Screen::Crop(_) => frame.render_widget(Paragraph::new("crop"), body),
+            Screen::Crop(view) => crop::render(frame, body, app, view),
         }
     }
 
-    let footer_line = match (&app.ui().error, app.delete_row()) {
-        (Some(error), _) => Line::from(format!("error: {}", clean(error))).red(),
-        (None, Some(row)) => Line::from(format!(
+    let footer_line = match (&app.ui().error, app.delete_row(), &app.ui().confirm) {
+        (Some(error), _, _) => Line::from(format!("error: {}", clean(error))).red(),
+        (None, Some(row), _) => Line::from(format!(
             "Delete {} from this device for good? It stays on the server and other devices. y/N",
             notify::sanitise(&row.title)
         ))
         .yellow(),
-        (None, None) => match &app.ui().notice {
+        (None, None, Some(confirm)) => Line::from(format!("{} y/N", confirm.question())).yellow(),
+        (None, None, None) => match &app.ui().notice {
             Some(notice) => Line::from(notice.as_str()).yellow(),
             None => Line::from(footer_hint(app)).dark_gray(),
         },
@@ -909,7 +911,9 @@ fn footer_keys(app: &App) -> &'static str {
             "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
         }
         Screen::Usage(_) => "r range · Tab group · ↑↓ scroll · Esc back · ? help · q quit",
-        Screen::Storage(_) => "r refresh · Tab list · ↑↓ scroll · Esc back · ? help · q quit",
+        Screen::Storage(_) => {
+            "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
+        }
         Screen::Workdir(view) => match view.pane {
             WorkdirPane::Changes | WorkdirPane::Dir { .. } => {
                 "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
@@ -918,7 +922,16 @@ fn footer_keys(app: &App) -> &'static str {
                 "↑↓ PgUp/PgDn scroll · d download · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
             }
         },
-        Screen::Crop(_) => "Esc back · ? help · q quit",
+        Screen::Crop(view) => match view.content {
+            CropContent::NotHere(_) => "d download · Esc back · ? help · q quit",
+            CropContent::Ready { .. } if app.ui().crop.anchor.is_some() => {
+                "↑↓ PgUp/PgDn extend · v keep or drop the range · Esc cancel the range · ? help"
+            }
+            CropContent::Ready { .. } => {
+                "↑↓ PgUp/PgDn move · 1-9 preset · v range · Enter crop · Esc back · ? help · q quit"
+            }
+            _ => "Esc back · ? help · q quit",
+        },
     }
 }
 
@@ -1115,7 +1128,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("", "output once downloaded, else what shows)"),
                     key("e", "edit your never-sent or refused command"),
                     key("Del", "take back your never-sent command, or dismiss"),
-                    key("", "a refused one"),
+                    key("", "a refused one; else your delete or crop of its output"),
+                    key(
+                        "D",
+                        "delete its output on the server and every device (y/N)",
+                    ),
+                    key("K", "crop its output: choose the lines every device keeps"),
                     key("a / x", "approve / deny the pending approval"),
                     key("w", "the session's workdir: git changes and files"),
                     key("Esc", "back to sessions"),
@@ -1150,6 +1168,18 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key(
                         "Del",
                         "cancel your never-sent message, or dismiss a refused one",
+                    ),
+                    key(
+                        "",
+                        "(on a call: take back your delete or crop of its output)",
+                    ),
+                    key(
+                        "D",
+                        "delete a call's output on the server and every device (y/N)",
+                    ),
+                    key(
+                        "K",
+                        "crop a call's output: choose the lines every device keeps",
                     ),
                     key("a / x", "approve / deny the pending approval"),
                     key("A", "approve, always allowing a rule the agent offers"),
@@ -1223,7 +1253,12 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             section("Storage"),
             key("r", "ask the server again"),
             key("Tab", "list sessions, the largest blobs or shell runs"),
-            key("↑↓ / k j", "scroll"),
+            key("↑↓ / k j", "select a row"),
+            key("Home g/End G", "first / last row"),
+            key("D", "delete its blob (a run's output) everywhere (y/N)"),
+            key("K", "crop a tool or run output: choose the lines to keep"),
+            key("", "(only for a session on this device)"),
+            key("Del", "take back your delete or crop of it"),
             key("Esc", "back to sessions"),
             Line::from(""),
             Line::from("  Read from the server when the screen opens, so only online."),
@@ -1248,7 +1283,21 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  Read on request only and kept here, so what was read shows"),
             Line::from("  offline, with when it was taken. Nothing here changes files."),
         ]),
-        Screen::Crop(_) => lines.extend([section("Crop"), key("Esc", "back")]),
+        Screen::Crop(_) => lines.extend([
+            section("Crop (K on an output)"),
+            key("↑↓ / k j", "move the cursor"),
+            key("PgUp / PgDn", "a page up / down"),
+            key("Home g/End G", "first / last line"),
+            key("1-9", "keep a ready-made selection, as listed"),
+            key("v", "start a range; v again keeps it, or drops it if"),
+            key("", "every line in it is kept"),
+            key("Enter", "crop to the lines marked + (y/N)"),
+            key("d", "download it, when it isn't on this device"),
+            key("Esc", "cancel the range, else back"),
+            Line::from(""),
+            Line::from("  A crop keeps only the marked lines, on the server and on"),
+            Line::from("  every device. It can't be undone."),
+        ]),
     }
     lines
 }

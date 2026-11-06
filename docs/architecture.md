@@ -957,6 +957,11 @@ logs) an event that no longer decodes rather than failing.
   its purge, makes it `Gone`. The selection is `SetCropKeep`, stored as
   given; `skywave_present::crop` normalises it, offers presets (first,
   last, first and last 50/200/1000) and says when the crop may be sent.
+  A `CropBlob` of the page's blob, once queued, leaves the page as back
+  does, so the user who cropped never sees it turn `Gone`.
+  `skywave_present::blob_actions` turns a timeline entry, a shell run or
+  a storage row into the blob to act on and the `OpenCrop` fields, so
+  every head offers the same.
   The view holds no content: heads read the lines they show from `path`
   through `LineIndex`, numbered as a crop numbers them, and strip each
   line by itself (an OSC string can swallow a `\n`).

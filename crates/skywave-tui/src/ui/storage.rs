@@ -7,6 +7,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skywave_core::StorageView;
+use skywave_present::blob_actions::pending_note;
 use skywave_present::storage::{Grouping, Row, rows, status_line, totals};
 
 use crate::app::App;
@@ -59,10 +60,11 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &App, view: &StorageVie
     } else if rows.is_empty() {
         vec![Line::from(ui.grouping.empty_label()).dark_gray()]
     } else {
-        table(&rows)
+        table(&rows, ui.selected.min(rows.len() - 1))
     };
     let end = lines.len().saturating_sub(usize::from(body.height));
     ui.end.set(end);
+    ui.page.set(usize::from(body.height));
     let top = ui.top.min(end);
     frame.render_widget(
         Paragraph::new(lines).scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
@@ -70,21 +72,38 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &App, view: &StorageVie
     );
 }
 
-/// Each row as its size and label, with what makes it up beneath.
-fn table(rows: &[Row]) -> Vec<Line<'static>> {
+/// Each row as its size and label, with what makes it up beneath; the
+/// `selected` one marked `>`, with this device's pending delete or crop of
+/// its blob beside it.
+fn table(rows: &[Row], selected: usize) -> Vec<Line<'static>> {
     let size = rows
         .iter()
         .map(|r| r.size.chars().count())
         .max()
         .unwrap_or(0);
     rows.iter()
-        .flat_map(|row| {
+        .enumerate()
+        .flat_map(|(i, row)| {
+            let mut head = vec![
+                Span::raw(if i == selected { "> " } else { "  " }),
+                Span::raw(format!("{:>size$}  ", row.size)).bold(),
+                Span::raw(cut(&notify::sanitise(&row.label))),
+            ];
+            if let Some(pending) = row.actions.as_ref().and_then(|a| a.pending.as_ref()) {
+                head.push(Span::raw(format!("  {}", pending_note(pending))).yellow());
+            }
+            let mut head = Line::from(head);
+            if i == selected {
+                head = head.reversed();
+            }
             [
-                Line::from(vec![
-                    Span::raw(format!("{:>size$}  ", row.size)).bold(),
-                    Span::raw(cut(&notify::sanitise(&row.label))),
-                ]),
-                Line::from(format!("{:>size$}  {}", "", notify::sanitise(&row.detail))).dark_gray(),
+                head,
+                Line::from(format!(
+                    "  {:>size$}  {}",
+                    "",
+                    notify::sanitise(&row.detail)
+                ))
+                .dark_gray(),
             ]
         })
         .collect()

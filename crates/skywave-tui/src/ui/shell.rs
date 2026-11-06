@@ -17,6 +17,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skywave_core::{BlobId, BlobState, BlobView, SessionView, ShellEnd, ShellRun, ShellRunState};
+use skywave_present::blob_actions::pending_note;
 use skywave_present::format::{
     blob_size, bytes, outgoing_label, queued_label, shell_end_label, shell_took, when_marker,
 };
@@ -254,8 +255,10 @@ fn output_lines(run: &ShellRun, shown: Shown) -> Vec<Span<'static>> {
 /// by laptop: kept 12 of 400 lines`, or nothing.
 fn changed(blob: &BlobView) -> String {
     change_note(blob)
+        .into_iter()
+        .chain(blob.pending.as_ref().map(pending_note))
         .map(|note| format!(" · {note}"))
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The output at `path` as it shows whole: its last [`OUTPUT_SHOW_BYTES`],

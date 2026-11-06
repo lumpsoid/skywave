@@ -295,7 +295,9 @@ pub enum Action {
     DeleteBlob(BlobId),
     /// Crop a blob to the lines of its content `keep` names, on the server
     /// and on every device. Only a tool's or a shell run's output. Queued and discardable as
-    /// [`Action::DeleteBlob`], and for the same `blob`.
+    /// [`Action::DeleteBlob`], and for the same `blob`. Sent while the
+    /// crop page of `blob` shows, the page is left once it is queued, as
+    /// [`Action::Back`] leaves it.
     CropBlob {
         blob: BlobId,
         keep: Vec<LineSpan>,
