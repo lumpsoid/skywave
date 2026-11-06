@@ -2662,6 +2662,48 @@ fn the_conversation_field_does_nothing_while_the_prompt_is_closed() {
     assert_eq!(queued_creations(&rig), [("/srv/app".to_owned(), None)]);
 }
 
+#[test]
+fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
+    let mut rig = Rig::new();
+    let read = skywave_proto::CallId::new();
+    rig.log(vec![
+        EventKind::AgentMessage {
+            parent: None,
+            text: "looking".into(),
+        },
+        a_call(
+            None,
+            read,
+            "Read",
+            skywave_proto::ToolKind::FileRead,
+            "a.txt",
+        ),
+    ]);
+    let kinds = |rig: &Rig| rig.rows().iter().map(|row| row.kind).collect::<Vec<_>>();
+    assert_eq!(kinds(&rig), [RowKind::AgentMessage, RowKind::Tool]);
+    assert!(!rig.open_session().conversation_only);
+
+    rig.intent(GuiIntent::ToggleConversationOnly);
+    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+    assert!(rig.open_session().conversation_only);
+    // A call logged while it is on stays out.
+    rig.log(vec![a_call(
+        None,
+        skywave_proto::CallId::new(),
+        "Bash",
+        skywave_proto::ToolKind::Shell,
+        "make",
+    )]);
+    assert_eq!(kinds(&rig), [RowKind::AgentMessage]);
+
+    rig.intent(GuiIntent::ToggleConversationOnly);
+    assert_eq!(
+        kinds(&rig),
+        [RowKind::AgentMessage, RowKind::Tool, RowKind::Tool]
+    );
+    assert!(!rig.open_session().conversation_only);
+}
+
 /// A call `call` of `kind` titled `title`, made by the subagent `parent`
 /// starts (`None`: the main agent).
 fn a_call(

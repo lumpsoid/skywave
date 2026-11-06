@@ -303,9 +303,8 @@ class RowTile extends StatelessWidget {
                 : null,
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-              // Imported history is dimmed: a record from outside Skywave.
               child: Opacity(
-                opacity: _imported(row) ? 0.65 : 1,
+                opacity: _opacity(row),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -322,6 +321,17 @@ class RowTile extends StatelessWidget {
     );
   }
 }
+
+/// How strongly a row shows. Imported history is dimmed: a record from
+/// outside Skywave. A collapsed call steps back too, so the messages stand
+/// out to someone skimming; not one an approval waits on.
+double _opacity(TimelineRow row) => switch (row.kind) {
+  _ when _imported(row) => 0.65,
+  RowKind.tool || RowKind.toolCall || RowKind.toolResult
+      when !row.expanded && row.tool?.state != ToolState.needsApproval =>
+    0.7,
+  _ => 1,
+};
 
 /// History imported from outside Skywave.
 bool _imported(TimelineRow row) => switch (row.kind) {

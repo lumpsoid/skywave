@@ -293,6 +293,24 @@ class _SessionPageState extends State<SessionPage> {
                             ),
                       icon: const Icon(Icons.folder_open),
                     ),
+                    // The button itself says the mode is on: filled, in
+                    // the accent colour, as a pressed toggle.
+                    IconButton(
+                      tooltip: screen.conversationOnly
+                          ? 'Conversation only is on: show tool calls'
+                          : 'Conversation only: hide tool calls',
+                      isSelected: screen.conversationOnly,
+                      style: screen.conversationOnly
+                          ? IconButton.styleFrom(
+                              backgroundColor: theme.colorScheme.primary,
+                              foregroundColor: theme.colorScheme.onPrimary,
+                            )
+                          : null,
+                      onPressed: () =>
+                          widget.send(const GuiIntentToggleConversationOnly()),
+                      icon: const Icon(Icons.forum_outlined),
+                      selectedIcon: const Icon(Icons.forum),
+                    ),
                     IconButton(
                       tooltip: 'Search (Ctrl+F)',
                       onPressed: _openSearch,

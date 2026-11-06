@@ -887,13 +887,13 @@ fn footer_keys(app: &App) -> &'static str {
                     "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.subagent.is_some() => {
-                    "↑↓ select · Enter expand · o open · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · S stop subagent · Tab write · Esc back out · ? help"
+                    "↑↓ select · Enter expand · o open · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · t tools · S stop subagent · Tab write · Esc back out · ? help"
                 }
                 None if ui.open_subagent(view).is_some() => {
-                    "↑↓ select · Enter expand · o open subagent · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · o open subagent · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · t tools · PgUp/PgDn · S stop · Tab write · Esc back · ? help"
                 }
                 None => {
-                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · PgUp/PgDn · w workdir · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
+                    "↑↓ select · Enter expand · d download · y/Y copy · / search · a/x approve/deny · [ ] turns · t tools · PgUp/PgDn · w workdir · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
                 }
             },
             // The toggle only where the server runs shell commands.
@@ -1185,6 +1185,10 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("A", "approve, always allowing a rule the agent offers"),
                     key("", "(several: ↑↓ Enter pick one, Esc back to a / x)"),
                     key("v", "select and expand the call it gates"),
+                    key(
+                        "t",
+                        "conversation only: hide tool calls, or show them again",
+                    ),
                     key("S", "stop the agent; a message restarts it"),
                     key("", "(with background work, y confirms)"),
                     key("", "(in a subagent's view: stop its task, y confirms)"),

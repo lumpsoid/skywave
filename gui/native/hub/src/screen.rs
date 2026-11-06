@@ -65,6 +65,8 @@ pub struct Ui<'a> {
     pub workdir_text: Option<&'a Result<workdir::Text, String>>,
     /// The Stay connected preference; `None` where it is not offered.
     pub stay_connected: Option<bool>,
+    /// Only the conversation shows: tool calls are hidden.
+    pub conversation_only: bool,
 }
 
 /// The new-session prompt: its input as the hub knows it and the
@@ -471,6 +473,7 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .rename
             .filter(|r| r.session_id == session.id.0.to_string())
             .cloned(),
+        conversation_only: ui.conversation_only,
     }
     .with_recipient(session)
 }
@@ -969,6 +972,7 @@ mod tests {
             wall_ms: 0,
             workdir_text: None,
             stay_connected: None,
+            conversation_only: false,
         };
         match update(&view, ui).screen {
             ScreenView::Session { session } => session,

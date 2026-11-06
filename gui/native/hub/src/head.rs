@@ -14,8 +14,9 @@ use skywave_core::{
     Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
+    AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
+    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
+    shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
 use skywave_present::storage::Grouping as StorageGrouping;
@@ -335,6 +336,9 @@ pub struct Head {
     /// The crop page's line window (`CropLines`).
     crop_lines: CropLines,
     session: Option<SessionHead>,
+    /// Only the conversation shows, in every session until switched off:
+    /// each snapshot of the open session is narrowed as it arrives.
+    conversation_only: ConversationOnly,
     sent: Sent,
     /// Who holds the link: whether the core runs.
     awake: Awake,
@@ -390,8 +394,11 @@ impl Head {
     }
 
     /// A snapshot from the core.
-    pub fn on_view(&mut self, view: ViewState, clock: Clock) -> Vec<Out> {
+    pub fn on_view(&mut self, mut view: ViewState, clock: Clock) -> Vec<Out> {
         let mut out = Vec::new();
+        if let Screen::Session(session) = &mut view.screen {
+            self.conversation_only.narrow(session);
+        }
         match &mut self.alerts {
             // The first snapshot's approvals need no alert.
             None => self.alerts = Some(AlertWatcher::new(&view.attention)),
@@ -843,6 +850,18 @@ impl Head {
                 session.end_history();
                 // Saving the draft first keeps the inserted text too.
                 self.dispatch_user(Action::UseSnippet(id), Purpose::Plain, clock, out);
+            }
+            GuiIntent::ToggleConversationOnly => {
+                let open = match self.view.as_mut().map(|v| &mut v.screen) {
+                    Some(Screen::Session(view)) => Some(&mut **view),
+                    _ => None,
+                };
+                self.conversation_only.toggle(open);
+                if let (Some(view), Some(session)) = (open_session(&self.view), &mut self.session)
+                    && let Some(search) = &mut session.search
+                {
+                    search.refresh(view, None, BlobText::read);
+                }
             }
             GuiIntent::FollowingChanged { following } => {
                 if let Some(session) = &mut self.session {
@@ -1439,6 +1458,7 @@ impl Head {
             wall_ms: clock.wall_ms,
             workdir_text,
             stay_connected: self.stay_connected.shown(),
+            conversation_only: self.conversation_only.on(),
         };
         let shown = screen::update(view, ui);
         if self.sent.screen.as_ref() != Some(&shown) {

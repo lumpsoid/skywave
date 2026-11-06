@@ -152,6 +152,7 @@ ScreenUpdate sessionScreen({SubagentHeaderView? subagent}) => ScreenUpdate(
       composer: _composer,
       snippets: const [],
       subagent: subagent,
+      conversationOnly: false,
     ),
   ),
   canGoBack: true,
