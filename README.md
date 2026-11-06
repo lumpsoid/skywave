@@ -233,6 +233,7 @@ session's cost and the model, and the session list shows each session's cost.
 | `Enter` | Send (`Shift`/`Alt`+`Enter` or `Ctrl-J` for a newline) |
 | `Tab` | Switch between composer and timeline |
 | `j` / `k`, `PgUp` / `PgDn` | Move through the timeline |
+| `t` | Conversation only: hide the tool calls, or show them again (in the desktop app, the speech-bubble button) |
 | `Enter` / `Space` | Expand a tool output |
 | `d` | Download a blob |
 | `y` / `Y` | Copy the selected output, diff, file or message / its command |
