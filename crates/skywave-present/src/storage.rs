@@ -10,7 +10,7 @@ use skywave_core::{
     StorageView,
 };
 
-use crate::blob_actions::{BlobAction, offers_for};
+use crate::blob_actions::{BlobAction, BlobTarget, offers_for};
 use crate::format;
 use crate::usage::short;
 
@@ -227,6 +227,36 @@ pub fn rows(view: &StorageView, grouping: Grouping) -> Vec<Row> {
     }
 }
 
+/// The blob the `at`th row of `grouping` ([`rows`]) acts on, with what the
+/// crop page needs: a blob row's own, titled by its session and what it
+/// holds; a shell run's output, titled by its command. `None` for a
+/// session row and a run kept as no blob.
+pub fn row_target(view: &StorageView, grouping: Grouping, at: usize) -> Option<BlobTarget> {
+    let report = view.report.as_ref()?;
+    let row = rows(view, grouping).into_iter().nth(at)?;
+    let actions = row.actions?;
+    let (session, holds, title) = match grouping {
+        Grouping::Sessions => return None,
+        Grouping::Blobs => {
+            let blob = report.blobs.get(at)?;
+            let title = format!("{} · {}", row.label, holds_label(blob.holds));
+            (blob.session, blob.holds, title)
+        }
+        Grouping::ShellRuns => {
+            let run = report.shell_runs.get(at)?;
+            (run.session, BlobUse::ShellOutput, run.command_line.clone())
+        }
+    };
+    Some(BlobTarget {
+        blob: actions.blob,
+        offers: actions.offers,
+        pending: actions.pending,
+        session,
+        holds,
+        title,
+    })
+}
+
 /// What a blob holds, in words.
 pub fn holds_label(holds: BlobUse) -> &'static str {
     match holds {
@@ -250,7 +280,9 @@ fn count(n: u64, what: &str) -> String {
 mod tests {
     use std::collections::HashMap;
 
-    use skywave_core::{BlobId, BlobStorage, CommandId, Seq, SessionStorage, ShellRunStorage};
+    use skywave_core::{
+        Action, BlobId, BlobStorage, CommandId, Seq, SessionStorage, ShellRunStorage,
+    };
 
     use super::*;
 
@@ -424,6 +456,57 @@ mod tests {
                 Some((elsewhere, vec![Delete])),
             ]
         );
+    }
+
+    #[test]
+    fn row_targets_name_the_rows_blob_and_what_the_crop_page_opens_on() {
+        use BlobAction::{Crop, Delete};
+        let (here, gone) = (SessionId::new(), SessionId::new());
+        let ran = BlobId::new();
+        let mut report = report();
+        report.blobs = vec![
+            blob(here, BlobUse::ToolOutput),
+            blob(gone, BlobUse::ToolOutput),
+        ];
+        report.shell_runs = vec![run(here, Some(ran)), run(here, None)];
+        report.sessions = vec![SessionStorage {
+            session: here,
+            events: 1,
+            event_bytes: 10,
+            blobs: 1,
+            blob_bytes: 1024,
+        }];
+        let own = report.blobs[0].id;
+        let mut view = view(Some(report), StorageStatus::Ready);
+        view.titles.insert(here, "Fix the log".into());
+
+        let target = row_target(&view, Grouping::Blobs, 0).unwrap();
+        assert_eq!(
+            target.open_crop(),
+            Action::OpenCrop {
+                blob: own,
+                session: here,
+                holds: BlobUse::ToolOutput,
+                title: "Fix the log · tool output".into(),
+            }
+        );
+        assert_eq!(target.offers, [Crop, Delete]);
+        let elsewhere = row_target(&view, Grouping::Blobs, 1).unwrap();
+        assert_eq!((elsewhere.session, elsewhere.offers), (gone, vec![Delete]));
+        // A run acts on its output blob, titled by its command.
+        let target = row_target(&view, Grouping::ShellRuns, 0).unwrap();
+        assert_eq!(
+            (
+                target.blob,
+                target.holds,
+                target.title.as_str(),
+                target.session
+            ),
+            (ran, BlobUse::ShellOutput, "make", here)
+        );
+        assert_eq!(row_target(&view, Grouping::ShellRuns, 1), None, "no blob");
+        assert_eq!(row_target(&view, Grouping::Sessions, 0), None);
+        assert_eq!(row_target(&view, Grouping::Blobs, 2), None, "past the end");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use skywave_core::{
     ImportedEntry, Outgoing, Query, RuleSuggestion, SessionView, TimelineItem, ToolKind,
     ToolOutcome, ToolView, read_head,
 };
+use skywave_present::blob_actions::pending_note;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     blob_size, bytes, context_moved_line, context_started_line, context_switched_line,
@@ -825,6 +826,7 @@ impl Layout<'_> {
                     BlobState::Available { .. } => "downloaded".to_owned(),
                 });
                 more.extend(change_note(blob));
+                more.extend(blob.pending.as_ref().map(pending_note));
             }
             note = match section.note() {
                 // Said in full and in colour: the preview is all there is.

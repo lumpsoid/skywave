@@ -757,7 +757,20 @@ impl Model {
             // show as the view's `pending`): this replica may not know of
             // a delete or crop another device sent.
             Action::DeleteBlob(blob) => self.enqueue(CommandKind::DeleteBlob { blob }),
-            Action::CropBlob { blob, keep } => self.enqueue(CommandKind::CropBlob { blob, keep }),
+            // Sent from its own crop page, the page goes where back goes:
+            // left open, it would turn to `Gone` once the crop lands.
+            Action::CropBlob { blob, keep } => {
+                let from_page = self.place == Place::Crop
+                    && self.crop.as_ref().is_some_and(|page| page.blob == blob);
+                let mut effects = self.enqueue(CommandKind::CropBlob { blob, keep });
+                if from_page
+                    && !effects.is_empty()
+                    && let Some(back) = self.back()
+                {
+                    effects.extend(self.dispatch(back));
+                }
+                effects
+            }
             Action::OpenCrop {
                 blob,
                 session,
@@ -11460,6 +11473,72 @@ mod tests {
 
                 live.core.dispatch(Action::Back).unwrap();
                 assert!(matches!(live.core.view().screen, Screen::Storage(_)));
+            }
+
+            /// A crop of the page's blob, once queued, leaves the page as
+            /// back does: to the session, or to the storage screen. A crop
+            /// of another blob leaves it open.
+            #[test]
+            fn crop_page_is_left_once_its_crop_is_queued() {
+                let keep = vec![LineSpan { first: 0, count: 1 }];
+                let queued = |live: &Live| {
+                    live.seam
+                        .pending_outbox()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| matches!(e.command.kind, CommandKind::CropBlob { .. }))
+                        .count()
+                };
+
+                let live = Live::new();
+                let output = blob(16);
+                opened(&live, &output);
+                live.core
+                    .dispatch(Action::CropBlob {
+                        blob: BlobId::new(),
+                        keep: keep.clone(),
+                    })
+                    .unwrap();
+                assert_eq!(queued(&live), 1);
+                page(&live);
+                live.core
+                    .dispatch(Action::CropBlob {
+                        blob: output.id,
+                        keep: keep.clone(),
+                    })
+                    .unwrap();
+                assert_eq!(queued(&live), 2);
+                assert!(matches!(
+                    live.core.view().screen,
+                    Screen::Session(view) if view.id == live.session
+                ));
+
+                // Opened from storage, back there, which asks again.
+                live.core
+                    .dispatch(Action::Navigate(Route::Storage))
+                    .unwrap();
+                live.core
+                    .dispatch(Action::OpenCrop {
+                        blob: output.id,
+                        session: live.session,
+                        holds: BlobUse::ToolOutput,
+                        title: "Bash ls".into(),
+                    })
+                    .unwrap();
+                live.requests();
+                live.core
+                    .dispatch(Action::CropBlob {
+                        blob: output.id,
+                        keep,
+                    })
+                    .unwrap();
+                assert!(matches!(live.core.view().screen, Screen::Storage(_)));
+                assert!(
+                    live.requests()
+                        .iter()
+                        .any(|r| matches!(r, Request::Storage { .. })),
+                    "the storage screen asks again"
+                );
             }
         }
     }

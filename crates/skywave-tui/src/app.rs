@@ -18,6 +18,7 @@ use skywave_core::{
     ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
     TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
+use skywave_present::blob_actions::{entry_target, run_target};
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
     offered_modes,
@@ -31,7 +32,7 @@ use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
     selectable, starts_turn, wanted_blob,
 };
-use skywave_present::storage::Grouping as StorageGrouping;
+use skywave_present::storage::{Grouping as StorageGrouping, row_target, rows as storage_rows};
 use skywave_present::usage::{Grouping, Span};
 
 use crate::clipboard::{Clip, CopyError};
@@ -39,8 +40,15 @@ use crate::composer::Composer;
 use crate::notify;
 use crate::ui::TimelineCache;
 
+mod blob;
+mod crop;
 mod workdir;
 
+use blob::key_on;
+
+pub use blob::BlobConfirm;
+pub(crate) use crop::CropIndex;
+pub use crop::CropUi;
 pub(crate) use workdir::{BlobLines, ReadLines};
 pub use workdir::{WorkdirPick, WorkdirRow, WorkdirUi, shown_blob, workdir_rows};
 
@@ -1326,11 +1334,36 @@ pub struct UsageUi {
 #[derive(Debug, Clone, Default)]
 pub struct StorageUi {
     pub grouping: StorageGrouping,
-    /// The first row shown; `j`/`k` scroll.
+    /// The row `D`, `K` and `Del` act on; `j`/`k` move it. The last row
+    /// when past it.
+    pub selected: usize,
+    /// The first line shown; it follows [`selected`](Self::selected).
     pub top: usize,
     /// The highest [`top`](Self::top) the last frame could use, as
     /// [`UiState::help_end`] is for the help.
     pub end: Cell<usize>,
+    /// Lines the last frame's list had, to keep the selected row in view.
+    pub page: Cell<usize>,
+}
+
+/// Lines a storage row takes: its label, then what makes it up.
+pub const STORAGE_ROW_LINES: usize = 2;
+
+impl StorageUi {
+    /// Selects row `row`, scrolling so both its lines show.
+    fn select(&mut self, row: usize) {
+        self.selected = row;
+        let first = row * STORAGE_ROW_LINES;
+        let page = self.page.get().max(STORAGE_ROW_LINES);
+        let top = self.top.min(self.end.get());
+        self.top = if first < top {
+            first
+        } else if first + STORAGE_ROW_LINES > top + page {
+            first + STORAGE_ROW_LINES - page
+        } else {
+            top
+        };
+    }
 }
 
 /// Presentation state owned by the head.
@@ -1356,6 +1389,10 @@ pub struct UiState {
     /// `D` on the archived list asks whether to delete this session from
     /// this device; `y` does, any other key does not.
     pub delete: Option<SessionId>,
+    /// `D` on an output, or `Enter` on the crop page, asks before the
+    /// delete or crop goes: `y` sends it, any other key does not. Dropped
+    /// when another screen shows.
+    pub confirm: Option<BlobConfirm>,
     /// The open session's focus, scroll, expanded items and composer.
     pub session: Option<SessionUi>,
     /// The usage screen's span, grouping and scroll; kept while away.
@@ -1364,6 +1401,8 @@ pub struct UiState {
     pub storage: StorageUi,
     /// The workdir screen's selection, scroll and read blob text.
     pub workdir: WorkdirUi,
+    /// The crop page's cursor, scroll, open range and line index.
+    pub crop: CropUi,
     /// The user chose to browse local data behind the re-pair screen.
     pub repair_dismissed: bool,
     /// The last failed dispatch, shown in the footer until the next key.
@@ -1410,10 +1449,12 @@ impl App {
                 prompt: None,
                 conversation: None,
                 delete: None,
+                confirm: None,
                 session: None,
                 usage: UsageUi::default(),
                 storage: StorageUi::default(),
                 workdir: WorkdirUi::default(),
+                crop: CropUi::default(),
                 repair_dismissed: false,
                 error: None,
                 notice: None,
@@ -1430,6 +1471,7 @@ impl App {
         app.keep_selection(None);
         app.follow_session();
         app.follow_workdir();
+        app.follow_crop();
         app
     }
 
@@ -1480,6 +1522,10 @@ impl App {
         let old_match = self
             .session()
             .and_then(|(view, ui)| find(view, ui.shown.search.as_ref()?.current?));
+        // The question goes with the screen it was asked on.
+        if std::mem::discriminant(&self.view.screen) != std::mem::discriminant(&view.screen) {
+            self.ui.confirm = None;
+        }
         self.view = view;
         if self.conversation_picker().is_none() {
             self.ui.conversation = None;
@@ -1498,6 +1544,7 @@ impl App {
         self.keep_selection(old_index);
         self.follow_session();
         self.follow_workdir();
+        self.follow_crop();
         if let (Screen::Session(view), Some(session)) = (&self.view.screen, &mut self.ui.session) {
             session.keep_selection(view, old_item);
             session.keep_scroll(view);
@@ -1956,6 +2003,9 @@ impl App {
             return matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
                 .then_some(Action::DeleteSessionLocally { session_id: id });
         }
+        if let Some(action) = self.answer_confirm(key.code) {
+            return action;
+        }
         // Help takes every key: none reaches the screen beneath.
         if self.ui.help {
             let end = self.ui.help_end.get();
@@ -2092,11 +2142,7 @@ impl App {
             },
             Screen::Session(_) => self.session_key(key, ctrl),
             Screen::Workdir(_) => self.workdir_key(key),
-            Screen::Crop(_) => match key.code {
-                KeyCode::Char('q') => self.quit(),
-                KeyCode::Esc => Some(Action::Back),
-                _ => None,
-            },
+            Screen::Crop(_) => self.crop_key(key),
             Screen::Usage(_) => {
                 let usage = &mut self.ui.usage;
                 match key.code {
@@ -2121,23 +2167,28 @@ impl App {
                 }
                 None
             }
-            Screen::Storage(_) => {
+            Screen::Storage(view) => {
+                let rows = storage_rows(view, self.ui.storage.grouping);
                 let storage = &mut self.ui.storage;
+                let last = rows.len().saturating_sub(1);
+                let at = storage.selected.min(last);
                 match key.code {
                     KeyCode::Char('q') => return self.quit(),
                     KeyCode::Esc => return Some(Action::Back),
                     KeyCode::Char('r') => return Some(Action::RefreshStorage),
                     KeyCode::Tab => {
                         storage.grouping = storage.grouping.next();
+                        storage.selected = 0;
                         storage.top = 0;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        storage.top = (storage.top + 1).min(storage.end.get());
+                    KeyCode::Down | KeyCode::Char('j') => storage.select((at + 1).min(last)),
+                    KeyCode::Up | KeyCode::Char('k') => storage.select(at.saturating_sub(1)),
+                    KeyCode::Home | KeyCode::Char('g') => storage.select(0),
+                    KeyCode::End | KeyCode::Char('G') => storage.select(last),
+                    KeyCode::Char('D' | 'K') | KeyCode::Delete => {
+                        let target = row_target(view, storage.grouping, at)?;
+                        return self.blob_key(key_on(target, key.code));
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        storage.top = storage.top.min(storage.end.get()).saturating_sub(1);
-                    }
-                    KeyCode::Home | KeyCode::Char('g') => storage.top = 0,
                     _ => {}
                 }
                 None
@@ -2604,10 +2655,16 @@ impl App {
                     .selected_run(view)
                     .filter(|run| run.discardable)
                     .map(|run| Action::EditQueued(run.run)),
-                KeyCode::Delete => session
-                    .selected_run(view)
-                    .filter(|run| run.discardable)
-                    .map(|run| Action::Discard(run.run)),
+                KeyCode::Delete if session.selected_run(view).is_some_and(|r| r.discardable) => {
+                    session
+                        .selected_run(view)
+                        .map(|run| Action::Discard(run.run))
+                }
+                // Its output's: delete, crop, or take back either.
+                KeyCode::Char('D' | 'K') | KeyCode::Delete => {
+                    let target = run_target(session.selected_run(view)?, view.id)?;
+                    self.blob_key(key_on(target, key.code))
+                }
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
@@ -2688,8 +2745,14 @@ impl App {
                 KeyCode::Char('e') => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::EditQueued(id))
                 }
-                KeyCode::Delete => {
+                KeyCode::Delete if discardable(view, session.shown.selected).is_some() => {
                     discardable(view, session.shown.selected).map(|(id, _)| Action::Discard(id))
+                }
+                // The selected call's output: delete, crop, or take back
+                // either. Shifted, as neither can be undone.
+                KeyCode::Char('D' | 'K') | KeyCode::Delete => {
+                    let target = entry_target(session.selected_entry(view)?, view.id)?;
+                    self.blob_key(key_on(target, key.code))
                 }
                 KeyCode::Char('a') => answer(view, Decision::Approve),
                 KeyCode::Char('x') => answer(view, Decision::Deny),

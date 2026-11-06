@@ -8935,3 +8935,329 @@ fn workdir_tab_to_files_and_into_a_directory_and_a_file() {
     assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
     assert!(matches!(h.app.view().screen, Screen::Session(_)));
 }
+
+/// A tool result whose whole output is `output`, `lines` lines long.
+fn output_result(lines: u32, output: BlobRef) -> EventKind {
+    EventKind::ToolResult(ToolResult {
+        call: None,
+        is_error: false,
+        status: None,
+        preview: "line 001".into(),
+        lines,
+        output: Some(Full::Blob(output)),
+    })
+}
+
+fn outbox_len(h: &Harness) -> usize {
+    h.seam.pending_outbox().unwrap().len()
+}
+
+/// `D` on a call's output asks first: `Esc` (any key but `y`) sends
+/// nothing, `y` sends the delete of the blob the item shows. While it is
+/// pending the item says so, `D` says how it stands, and `Del` takes it
+/// back. `K` opens the crop page, which offers the download of an output
+/// not here.
+#[test]
+fn shift_d_on_an_output_asks_and_only_y_deletes_it() {
+    let (mut h, id, _) = open_session();
+    let (blob_id, output) = blob(10_000);
+    pull(&mut h, vec![event(id, 1, output_result(40, output))]);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+
+    assert_eq!(
+        h.key(KeyCode::Char('K')),
+        Some(Action::OpenCrop {
+            blob: blob_id,
+            session: id,
+            holds: BlobUse::ToolOutput,
+            title: "line 001".into(),
+        })
+    );
+    let screen = h.screen();
+    assert_contains(
+        &screen,
+        "This output isn't on this device. Download 9.8 KiB to choose lines.",
+    );
+    assert_contains(&screen, "not downloaded · 9.8 KiB · press d to download");
+    assert_contains(&footer(&h), "d download");
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(blob_id))
+    );
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+    // Back on the session, it opens on the composer, as from any screen.
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+
+    let before = outbox_len(&h);
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_eq!(
+        footer(&h),
+        "Delete this output from the server and from every device? This can't be undone. y/N"
+    );
+    assert_eq!(h.key(KeyCode::Esc), None, "Esc answers no");
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+    assert!(!footer(&h).contains("y/N"), "{}", footer(&h));
+    assert_eq!(outbox_len(&h), before, "nothing sent");
+
+    h.key(KeyCode::Char('D'));
+    assert_eq!(h.key(KeyCode::Char('y')), Some(Action::DeleteBlob(blob_id)));
+    assert_eq!(outbox_len(&h), before + 1);
+    let delete = last_command(&h);
+    assert_contains(&h.screen(), "Delete queued");
+    // Pending: nothing more is offered; the keys say how it stands.
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_eq!(h.app.ui().notice.as_deref(), Some("Delete queued"));
+    assert!(h.app.ui().confirm.is_none());
+    assert_eq!(h.key(KeyCode::Char('K')), None);
+    assert_eq!(h.key(KeyCode::Delete), Some(Action::Discard(delete)));
+    assert!(!h.screen().contains("Delete queued"));
+}
+
+/// The keys beside `D` and `K` still do what they did.
+#[test]
+fn x_still_denies_and_shift_c_still_opens_contexts() {
+    let (mut h, id, _) = open_session();
+    let approval = ApprovalId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            1,
+            EventKind::ApprovalRequested {
+                id: approval,
+                call: None,
+                tool: "Bash".into(),
+                summary: "rm -rf target".into(),
+                input: None,
+                suggestions: Vec::new(),
+            },
+        )],
+    );
+    h.key(KeyCode::Esc);
+    // An approval has no output: `D` asks nothing.
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert!(h.app.ui().confirm.is_none());
+    assert_eq!(
+        h.key(KeyCode::Char('x')),
+        Some(Action::ResolveApproval {
+            id: approval,
+            decision: Decision::Deny,
+            rule: None,
+        })
+    );
+    assert_eq!(h.key(KeyCode::Char('C')), None);
+    assert!(matches!(
+        h.app.ui().session.as_ref().unwrap().picker,
+        Some(skywave_tui::app::Picker::Contexts { .. })
+    ));
+}
+
+/// The id of the line count the crop page asked for.
+fn count_request(h: &Harness) -> u64 {
+    match h.drain_requests().as_slice() {
+        [Request::CountLines { req, .. }] => *req,
+        other => panic!("expected one line count, got {other:?}"),
+    }
+}
+
+fn crop_keep(h: &Harness) -> Vec<LineSpan> {
+    match &h.app.view().screen {
+        Screen::Crop(view) => view.keep.clone(),
+        other => panic!("not on the crop page: {other:?}"),
+    }
+}
+
+fn span(first: u32, count: u32) -> LineSpan {
+    LineSpan { first, count }
+}
+
+/// On the crop page a number key keeps a preset and `v` … `v` toggles a
+/// range in or out; `Enter` asks, `Esc` sends nothing, and `y` crops to
+/// the selection.
+#[test]
+fn the_crop_page_keeps_a_preset_or_a_range_and_enter_crops_to_it() {
+    let (mut h, id, _) = open_session();
+    let (blob_id, output) = blob(3000);
+    pull(&mut h, vec![event(id, 1, output_result(300, output))]);
+    let content: String = (1..=300).map(|n| format!("line {n:03}\n")).collect();
+    let dir = tempfile::tempdir().unwrap();
+    downloaded(&mut h, &dir, "out", blob_id, content.as_bytes());
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.drain_requests();
+    assert!(matches!(
+        h.key(KeyCode::Char('K')),
+        Some(Action::OpenCrop { .. })
+    ));
+    assert_contains(&h.screen(), "Counting its lines");
+    let req = count_request(&h);
+    h.seam.lines_counted(req, Ok(300));
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "keeps 0 of 300 lines");
+    assert_contains(
+        &screen,
+        "1 First 50 · 2 Last 50 · 3 First and last 50 · 4 First 200 · 5 Last 200",
+    );
+    assert_contains(&screen, " >  1 │ line 001");
+    assert_contains(&screen, "    2 │ line 002");
+
+    assert_eq!(
+        h.key(KeyCode::Char('2')),
+        Some(Action::SetCropKeep(vec![span(250, 50)]))
+    );
+    assert_eq!(crop_keep(&h), [span(250, 50)]);
+    h.key(KeyCode::Char('1'));
+    assert_eq!(crop_keep(&h), [span(0, 50)]);
+    let screen = h.screen();
+    assert_contains(&screen, "keeps 50 of 300 lines");
+    assert_contains(&screen, "+>  1 │ line 001");
+    assert_contains(&screen, "+   2 │ line 002");
+
+    // Lines 2 to 3, all kept: taken out.
+    h.key(KeyCode::Char('j'));
+    assert_eq!(h.key(KeyCode::Char('v')), None);
+    h.key(KeyCode::Char('j'));
+    assert_contains(&footer(&h), "v keep or drop the range");
+    assert_eq!(
+        h.key(KeyCode::Char('v')),
+        Some(Action::SetCropKeep(vec![span(0, 1), span(3, 47)]))
+    );
+    assert_contains(&h.screen(), "    2 │ line 002");
+    // Lines 3 to 5, partly kept: put back in.
+    h.key(KeyCode::Char('v'));
+    h.key(KeyCode::Char('j'));
+    h.key(KeyCode::Char('j'));
+    h.key(KeyCode::Char('v'));
+    assert_eq!(crop_keep(&h), [span(0, 1), span(2, 48)]);
+    // Esc closes an open range before it leaves.
+    h.key(KeyCode::Char('v'));
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(matches!(h.app.view().screen, Screen::Crop(_)));
+
+    let before = outbox_len(&h);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert_eq!(
+        footer(&h),
+        "Keep 49 of 300 lines? Every device keeps only these. This can't be undone. y/N"
+    );
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert_eq!(outbox_len(&h), before, "nothing sent");
+    assert!(matches!(h.app.view().screen, Screen::Crop(_)));
+    h.key(KeyCode::Enter);
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::CropBlob {
+            blob: blob_id,
+            keep: vec![span(0, 1), span(2, 48)],
+        })
+    );
+    // Queued, the page is left for the session it was opened on, whose
+    // item says the crop is on its way.
+    assert!(matches!(h.app.view().screen, Screen::Session(_)));
+    assert_eq!(outbox_len(&h), before + 1);
+    h.key(KeyCode::Esc);
+    assert_contains(&h.screen(), "Crop queued");
+}
+
+/// The storage screen's rows: `j`/`k` move the cursor; `D` deletes the
+/// selected row's blob, a shell run's output blob, after asking; `K` crops
+/// only an output whose session this device has.
+#[test]
+fn storage_rows_move_with_j_k_and_act_on_their_blob() {
+    let mut h = Harness::paired();
+    let (here, gone) = (SessionId::new(), SessionId::new());
+    pull(&mut h, vec![created(here, 0, "/srv/a")]);
+    h.key(KeyCode::Char('S'));
+    let req = match h.drain_requests().as_slice() {
+        [Request::Storage { req }] => *req,
+        other => panic!("expected one storage request, got {other:?}"),
+    };
+    let (mine, theirs, run_output) = (BlobId::new(), BlobId::new(), BlobId::new());
+    let stored = |id, size, session, holds| skywave_proto::BlobStorage {
+        id,
+        size,
+        session,
+        seq: Seq(7),
+        holds,
+    };
+    let run = |command_line: &str, output_blob| skywave_proto::ShellRunStorage {
+        run: CommandId::new(),
+        session: here,
+        command_line: command_line.into(),
+        event_bytes: 100,
+        output: 2048,
+        output_blob,
+    };
+    let report = skywave_proto::StorageReport {
+        database: 0,
+        event_blobs: 0,
+        workdir_blobs: 0,
+        shell_running: 0,
+        log_file: None,
+        free: None,
+        min_free: 0,
+        sessions: vec![skywave_proto::SessionStorage {
+            session: here,
+            events: 3,
+            event_bytes: 100,
+            blobs: 1,
+            blob_bytes: 3 * 1024 * 1024,
+        }],
+        blobs: vec![
+            stored(mine, 3 * 1024 * 1024, here, BlobUse::ToolOutput),
+            stored(theirs, 2 * 1024 * 1024, gone, BlobUse::ToolOutput),
+        ],
+        shell_runs: vec![run("make all", Some(run_output)), run("true", None)],
+    };
+    h.seam.storage_reported(req, Ok(report));
+    h.sync();
+    h.key(KeyCode::Tab);
+    assert_contains(&line_with(&h.screen(), "> "), "3.0 MiB  a");
+    h.key(KeyCode::Char('j'));
+    assert_contains(&line_with(&h.screen(), "> "), "(not on this device)");
+    h.key(KeyCode::Char('k'));
+    assert_contains(&line_with(&h.screen(), "> "), "3.0 MiB  a");
+    h.key(KeyCode::Char('j'));
+
+    // Not on this device: nothing to crop it from.
+    assert_eq!(h.key(KeyCode::Char('K')), None);
+    let before = outbox_len(&h);
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert_contains(&footer(&h), "Delete this output from the server");
+    assert_eq!(h.key(KeyCode::Esc), None);
+    assert!(matches!(h.app.view().screen, Screen::Storage(_)));
+    assert_eq!(outbox_len(&h), before, "nothing sent");
+    h.key(KeyCode::Char('D'));
+    assert_eq!(h.key(KeyCode::Char('y')), Some(Action::DeleteBlob(theirs)));
+    assert_contains(&line_with(&h.screen(), "> "), "Delete queued");
+
+    // A run acts on its output blob; one kept as no blob offers nothing.
+    h.key(KeyCode::Tab);
+    assert_contains(&line_with(&h.screen(), "> "), "$ make all");
+    h.key(KeyCode::Char('D'));
+    assert_eq!(
+        h.key(KeyCode::Char('y')),
+        Some(Action::DeleteBlob(run_output))
+    );
+    h.key(KeyCode::Char('j'));
+    assert_contains(&line_with(&h.screen(), "> "), "$ true");
+    assert_eq!(h.key(KeyCode::Char('D')), None);
+    assert!(h.app.ui().confirm.is_none());
+
+    // The session's own output crops, from its row.
+    h.key(KeyCode::Tab);
+    h.key(KeyCode::Tab);
+    assert_eq!(
+        h.key(KeyCode::Char('K')),
+        Some(Action::OpenCrop {
+            blob: mine,
+            session: here,
+            holds: BlobUse::ToolOutput,
+            title: "a · tool output".into(),
+        })
+    );
+}
