@@ -101,7 +101,8 @@ pub fn cli_args(kept: &[Value]) -> Vec<String> {
     args
 }
 
-fn is_mode(update: &Value) -> bool {
+/// Whether `update` switches the permission mode.
+pub fn is_mode(update: &Value) -> bool {
     update["type"] == "setMode"
 }
 
