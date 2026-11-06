@@ -152,6 +152,17 @@ impl Disk {
         }
     }
 
+    /// The free space now, read whatever the floor; `None` when it cannot
+    /// be read. Records nothing: the storage report's reading.
+    pub fn free(&self) -> Option<u64> {
+        self.read()
+    }
+
+    /// The floor below which the disk is low; 0 when off.
+    pub fn floor(&self) -> u64 {
+        self.inner.floor
+    }
+
     /// Whether the disk was low at the last reading. Reads nothing.
     pub fn is_low(&self) -> bool {
         *self.inner.low.borrow()

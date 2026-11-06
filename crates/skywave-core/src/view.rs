@@ -19,6 +19,7 @@ pub use skywave_proto::{
     PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
     ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
 };
+pub use skywave_proto::{BlobStorage, BlobUse, SessionStorage, ShellRunStorage, StorageReport};
 
 pub use crate::projection::{SessionUsage, TurnRecord};
 
@@ -404,6 +405,7 @@ pub enum Screen {
     Session(Box<SessionView>),
     Settings(SettingsView),
     Usage(UsageView),
+    Storage(StorageView),
     Workdir(WorkdirView),
 }
 
@@ -710,6 +712,42 @@ pub struct UsageView {
     /// How many sessions were deleted from this device, whose turns no
     /// longer count.
     pub deleted: usize,
+}
+
+/// What the server's data takes on its disk, as the server last reported
+/// it ([`Route::Storage`](crate::Route::Storage)). In memory only: opening
+/// the screen asks again, and so does
+/// [`Action::RefreshStorage`](crate::Action::RefreshStorage).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageView {
+    pub status: StorageStatus,
+    /// The latest report; `None` until one arrives. A failed refresh keeps
+    /// the one before it.
+    pub report: Option<StorageReport>,
+    /// The replica's title (as [`SessionRow::title`]) of each session the
+    /// report names; one missing is not in this replica (deleted here, or
+    /// not pulled yet).
+    pub titles: std::collections::HashMap<SessionId, String>,
+}
+
+/// Where the storage screen's report stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageStatus {
+    /// Asked; the report shown, if any, is the one before.
+    Loading,
+    /// The report is the server's latest answer.
+    Ready,
+    /// The last ask failed; the report shown, if any, is older.
+    Unavailable(StorageUnavailable),
+}
+
+/// Why the storage screen has no fresh report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageUnavailable {
+    /// Not connected: nothing was asked.
+    Offline,
+    /// The request failed, worded by the transport.
+    Failed(String),
 }
 
 /// A session as the usage screen names it.

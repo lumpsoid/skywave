@@ -31,6 +31,7 @@ use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
     selectable, starts_turn, wanted_blob,
 };
+use skywave_present::storage::Grouping as StorageGrouping;
 use skywave_present::usage::{Grouping, Span};
 
 use crate::clipboard::{Clip, CopyError};
@@ -1318,6 +1319,17 @@ pub struct UsageUi {
     pub end: Cell<usize>,
 }
 
+/// What the storage screen shows.
+#[derive(Debug, Clone, Default)]
+pub struct StorageUi {
+    pub grouping: StorageGrouping,
+    /// The first row shown; `j`/`k` scroll.
+    pub top: usize,
+    /// The highest [`top`](Self::top) the last frame could use, as
+    /// [`UiState::help_end`] is for the help.
+    pub end: Cell<usize>,
+}
+
 /// Presentation state owned by the head.
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -1345,6 +1357,8 @@ pub struct UiState {
     pub session: Option<SessionUi>,
     /// The usage screen's span, grouping and scroll; kept while away.
     pub usage: UsageUi,
+    /// The storage screen's list and scroll; kept while away.
+    pub storage: StorageUi,
     /// The workdir screen's selection, scroll and read blob text.
     pub workdir: WorkdirUi,
     /// The user chose to browse local data behind the re-pair screen.
@@ -1395,6 +1409,7 @@ impl App {
                 delete: None,
                 session: None,
                 usage: UsageUi::default(),
+                storage: StorageUi::default(),
                 workdir: WorkdirUi::default(),
                 repair_dismissed: false,
                 error: None,
@@ -2068,6 +2083,7 @@ impl App {
                 }
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
                 KeyCode::Char('u') => Some(Action::Navigate(Route::Usage)),
+                KeyCode::Char('S') => Some(Action::Navigate(Route::Storage)),
                 KeyCode::Delete => dismissable(list).map(|p| Action::Discard(p.command_id)),
                 _ => None,
             },
@@ -2093,6 +2109,27 @@ impl App {
                         usage.top = usage.top.min(usage.end.get()).saturating_sub(1);
                     }
                     KeyCode::Home | KeyCode::Char('g') => usage.top = 0,
+                    _ => {}
+                }
+                None
+            }
+            Screen::Storage(_) => {
+                let storage = &mut self.ui.storage;
+                match key.code {
+                    KeyCode::Char('q') => return self.quit(),
+                    KeyCode::Esc => return Some(Action::Back),
+                    KeyCode::Char('r') => return Some(Action::RefreshStorage),
+                    KeyCode::Tab => {
+                        storage.grouping = storage.grouping.next();
+                        storage.top = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        storage.top = (storage.top + 1).min(storage.end.get());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        storage.top = storage.top.min(storage.end.get()).saturating_sub(1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => storage.top = 0,
                     _ => {}
                 }
                 None

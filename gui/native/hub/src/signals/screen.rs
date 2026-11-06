@@ -109,6 +109,20 @@ pub enum ScreenView {
         /// What the totals leave out: sessions deleted from this device.
         note: String,
     },
+    /// What the server's data takes on its disk, asked for on opening.
+    Storage {
+        /// Which list the rows are; `StorageShow` picks it.
+        grouping: StorageGroupingView,
+        /// Asking, offline or failed; `None` once the report is fresh.
+        status_label: Option<String>,
+        /// Free space first; empty until a report arrives.
+        totals: Vec<StorageTotalView>,
+        /// Largest first.
+        rows: Vec<StorageRowView>,
+        /// What an empty list says; `None` when it has rows or there is
+        /// no report.
+        empty_label: Option<String>,
+    },
     /// A session's workdir, read on request and kept for offline reading.
     Workdir {
         workdir: WorkdirScreen,
@@ -129,6 +143,32 @@ pub enum UsageGroupingView {
     Session,
     Workdir,
     Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
+pub enum StorageGroupingView {
+    Sessions,
+    Blobs,
+    ShellRuns,
+}
+
+/// One total of the storage screen: `Free`, `Database`, ….
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct StorageTotalView {
+    pub label: String,
+    /// `18.6 GiB`, `none (logs to stderr)`.
+    pub value: String,
+}
+
+/// One row of the storage screen: a session, a blob or a shell run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct StorageRowView {
+    /// A session's title, or `$ command`.
+    pub label: String,
+    /// What makes up the size.
+    pub detail: String,
+    /// `2.0 MiB`.
+    pub size: String,
 }
 
 /// One line of the usage screen: a day, session, directory or model, or

@@ -289,6 +289,7 @@ async fn serve(
     };
     let options = ServerOptions {
         outside,
+        log_file: config.log_file.clone(),
         ..ServerOptions::default()
     };
     #[cfg(unix)]

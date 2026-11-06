@@ -18,6 +18,7 @@ use skywave_present::policy::{
     ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
 };
 use skywave_present::sections::{ItemKey, call_content, find, main_content, sections, wanted_blob};
+use skywave_present::storage::Grouping as StorageGrouping;
 use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
@@ -31,8 +32,8 @@ use crate::prefs::Prefs;
 use crate::screen::{CreateUi, Ui, rename_initial, repair_notice};
 use crate::signals::{
     ComposerModeView, ComposerView, CopyWhat, GuiIntent, LinkUpdate, PairForm, PlatformEffect,
-    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, TimelineRow,
-    TimelineUpdate, UsageGroupingView, UsageSpanView,
+    RenamePrompt, ScreenUpdate, SearchUpdate, ShellRunRow, ShellUpdate, StorageGroupingView,
+    TimelineRow, TimelineUpdate, UsageGroupingView, UsageSpanView,
 };
 use crate::timeline::{BlobHeads, Rows, parse_key};
 use crate::workdir::{WorkdirText, shown_blob};
@@ -323,6 +324,8 @@ pub struct Head {
     repair_dismissed: bool,
     /// The usage screen's days and grouping (`UsageShow`).
     usage: (Span, Grouping),
+    /// The storage screen's list (`StorageShow`).
+    storage: StorageGrouping,
     /// The text of the workdir diff or file shown.
     workdir_text: WorkdirText,
     session: Option<SessionHead>,
@@ -1176,6 +1179,13 @@ impl Head {
                     },
                 );
             }
+            GuiIntent::StorageShow { grouping } => {
+                self.storage = match grouping {
+                    StorageGroupingView::Sessions => StorageGrouping::Sessions,
+                    StorageGroupingView::Blobs => StorageGrouping::Blobs,
+                    StorageGroupingView::ShellRuns => StorageGrouping::ShellRuns,
+                };
+            }
             GuiIntent::AppBackgrounded => self.moved(Moved::Backgrounded, clock, out),
             GuiIntent::AppForegrounded => {
                 self.moved(Moved::Foregrounded, clock, out);
@@ -1404,6 +1414,7 @@ impl Head {
             composer: composer.as_ref(),
             repair_dismissed: self.repair_dismissed,
             usage: self.usage,
+            storage: self.storage,
             wall_ms: clock.wall_ms,
             workdir_text,
             stay_connected: self.stay_connected.shown(),

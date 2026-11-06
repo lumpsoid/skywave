@@ -28,6 +28,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -53,7 +54,6 @@ use crate::EventLog;
 use crate::agent::import::IMPORT_DEADLINE;
 use crate::agent::{NoOutsideConversations, OutsideConversations};
 use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, PeerCert};
-use crate::blobs::BlobStore;
 use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::error::{Error, IoContext, Result};
@@ -90,6 +90,8 @@ pub struct ServerOptions {
     /// How many connections the server holds and how long a stalled peer
     /// keeps one.
     pub limits: ConnectionLimits,
+    /// Where the daemon logs, `None` for stderr: the storage report sizes it.
+    pub log_file: Option<PathBuf>,
 }
 
 impl Default for ServerOptions {
@@ -100,6 +102,7 @@ impl Default for ServerOptions {
             import_deadline: IMPORT_DEADLINE,
             conversations_timeout: CONVERSATIONS_TIMEOUT,
             limits: ConnectionLimits::DEFAULT,
+            log_file: None,
         }
     }
 }
@@ -116,7 +119,7 @@ pub struct Server {
 
 impl Server {
     /// Builds the TLS config from `identity`, opens the API's, workdir
-    /// reads' and pairing's own connections to the database in `dir`, and
+    /// reads', storage reports' and pairing's own connections to the database in `dir`, and
     /// binds `addr`.
     ///
     /// `log` is the process's one [`EventLog`]; other writers (the agent
@@ -157,15 +160,7 @@ impl Server {
         let tls = TlsAcceptor::from(tls_config(&identity)?);
         let limits = options.limits;
         let (stop, stopped) = watch::channel(false);
-        let api = Api::new(
-            Db::open(&dir.db_path())?,
-            Db::open(&dir.db_path())?,
-            log,
-            BlobStore::new(dir.blobs_dir()),
-            identity.server_id(),
-            stopped,
-            options,
-        );
+        let api = Api::new(dir, log, identity.server_id(), stopped, options)?;
         let pairing = PairService::new(
             Db::open(&dir.db_path())?,
             identity,

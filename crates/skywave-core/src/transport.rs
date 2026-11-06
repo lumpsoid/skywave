@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, RunId, WorkdirQuery,
+    EventsQuery, FileResult, HelloResponse, ListResult, RunId, StorageReport, WorkdirQuery,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -84,6 +84,13 @@ pub trait Transport: Send + Sync {
     /// to [`TransportError::NotFound`] like
     /// [`list_dirs`](Transport::list_dirs).
     fn list_conversations(&self) -> BoxFuture<'_, Result<ConversationsResult, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/storage`: what the server's data takes on its disk, for
+    /// the storage screen. Defaults to [`TransportError::NotFound`] like
+    /// [`list_dirs`](Transport::list_dirs).
+    fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

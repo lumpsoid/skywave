@@ -26,6 +26,7 @@ use crate::projection::{
 };
 use crate::seam::Request;
 use crate::snippets::Snippets;
+use crate::storage::Storage;
 use crate::store::WorkdirStored;
 use crate::store::{
     BlobPolicy, BlobRecord, BlobStatus, OutboxEntry, OutboxStatus, ReadMark, Settings, Snapshot,
@@ -41,8 +42,9 @@ use crate::view::{
     PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
     SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    SubagentHeader, SubagentStatus, TimelineItem, ToolApproval, ToolOutcome, ToolView,
-    UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane, WorkdirView,
+    StorageReport, StorageView, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval,
+    ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
+    WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -95,6 +97,7 @@ enum Place {
     Settings,
     Pairing,
     Usage,
+    Storage,
     Session(SessionId),
     /// The session's workdir, on [`Model::workdir_pane`].
     Workdir(SessionId),
@@ -108,6 +111,7 @@ impl From<Route> for Place {
             Route::Settings => Place::Settings,
             Route::Pairing => Place::Pairing,
             Route::Usage => Place::Usage,
+            Route::Storage => Place::Storage,
         }
     }
 }
@@ -202,6 +206,8 @@ pub(crate) struct Model {
     completer: Completer,
     /// The conversation picker on the session list; in memory only.
     conversations: Conversations,
+    /// The storage screen's report; in memory only.
+    storage: Storage,
     /// A [`Action::CreateSessionLike`] or [`Action::MoveContext`] whose
     /// new session is not in the replica yet: its command, and the session
     /// it was asked from, still on screen. In memory only.
@@ -262,6 +268,7 @@ impl Model {
             last_shell: None,
             completer: Completer::default(),
             conversations: Conversations::default(),
+            storage: Storage::default(),
             opening: None,
             devices: HashMap::new(),
             models: Vec::new(),
@@ -421,6 +428,17 @@ impl Model {
             Action::EndConversations => {
                 self.conversations.end();
                 Vec::new()
+            }
+            Action::RefreshStorage => {
+                if self.device().is_none() || self.place != Place::Storage {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.storage
+                    .refresh(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
             }
             Action::SendMessage { session_id, text } => {
                 let Some(summary) = self.summary(session_id) else {
@@ -726,7 +744,15 @@ impl Model {
                 self.subagent = None;
                 self.completer.end();
                 self.conversations.end();
-                Vec::new()
+                if self.place != Place::Storage || self.device().is_none() {
+                    return Vec::new();
+                }
+                let online = self.online();
+                self.storage
+                    .open(online)
+                    .map(Effect::Request)
+                    .into_iter()
+                    .collect()
             }
             Action::Back => {
                 // A subagent shown steps out to the one it runs under, then
@@ -772,7 +798,9 @@ impl Model {
         self.device()?;
         let route = match self.place {
             Place::SessionList => return None,
-            Place::Archived | Place::Settings | Place::Pairing | Place::Usage => Route::SessionList,
+            Place::Archived | Place::Settings | Place::Pairing | Place::Usage | Place::Storage => {
+                Route::SessionList
+            }
             Place::Session(id) => {
                 if self.archived(self.summary(id)?) {
                     Route::ArchivedSessions
@@ -1497,6 +1525,14 @@ impl Model {
         self.conversations.listed(req, result);
     }
 
+    pub(crate) fn storage_reported(
+        &mut self,
+        req: u64,
+        result: Result<StorageReport, TransportError>,
+    ) {
+        self.storage.reported(req, result);
+    }
+
     /// Whether `req` is the request `ask` still waits on: anything else is
     /// stale and must touch neither the replica nor the model.
     pub(crate) fn workdir_awaited(&self, req: u64, ask: &WorkdirAsk) -> bool {
@@ -1664,6 +1700,7 @@ impl Model {
             Place::SessionList => Screen::SessionList(self.session_list(ListKind::Active)),
             Place::Archived => Screen::SessionList(self.session_list(ListKind::Archived)),
             Place::Usage => Screen::Usage(self.usage_view()),
+            Place::Storage => Screen::Storage(self.storage_view()),
             Place::Session(id) => match self.session_view(id) {
                 Some(view) => Screen::Session(Box::new(view)),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
@@ -1823,6 +1860,20 @@ impl Model {
                 })
                 .collect(),
             deleted: self.deleted.len(),
+        }
+    }
+
+    fn storage_view(&self) -> StorageView {
+        let (status, report) = self.storage.shown();
+        let titles = report
+            .iter()
+            .flat_map(|report| report.sessions.iter().map(|s| s.session))
+            .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
+            .collect();
+        StorageView {
+            status,
+            report,
+            titles,
         }
     }
 
@@ -7855,7 +7906,9 @@ mod tests {
         assert_eq!(f.list_view().completion, None);
     }
 
-    use crate::view::{ConversationsStatus, ConversationsUnavailable};
+    use crate::view::{
+        ConversationsStatus, ConversationsUnavailable, StorageStatus, StorageUnavailable,
+    };
     use skywave_proto::OutsideConversation;
 
     /// Opens the conversation picker; the request it sends, if any.
@@ -8001,6 +8054,98 @@ mod tests {
         );
     }
 
+    fn storage_view(f: &Fixture) -> StorageView {
+        match f.model.view().screen {
+            Screen::Storage(view) => view,
+            other => panic!("expected the storage screen, got {other:?}"),
+        }
+    }
+
+    fn storage_req(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [] => None,
+            [Effect::Request(Request::Storage { req })] => Some(*req),
+            other => panic!("expected a storage request, got {other:?}"),
+        }
+    }
+
+    fn storage_report(sessions: &[SessionId]) -> StorageReport {
+        StorageReport {
+            database: 4096,
+            event_blobs: 0,
+            workdir_blobs: 0,
+            shell_running: 0,
+            log_file: None,
+            free: Some(1 << 30),
+            min_free: 0,
+            sessions: sessions
+                .iter()
+                .map(|&session| skywave_proto::SessionStorage {
+                    session,
+                    events: 1,
+                    event_bytes: 100,
+                    blobs: 0,
+                    blob_bytes: 0,
+                })
+                .collect(),
+            blobs: Vec::new(),
+            shell_runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_storage_screen_asks_on_opening_and_on_refresh() {
+        let mut f = Fixture::paired();
+        let known = f.session("/srv/a");
+        let unknown = SessionId::new();
+        assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+        assert_eq!(storage_view(&f).status, StorageStatus::Loading);
+        assert_eq!(storage_view(&f).report, None);
+        let report = storage_report(&[known, unknown]);
+        f.model.storage_reported(first, Ok(report.clone()));
+        let view = storage_view(&f);
+        assert_eq!(view.status, StorageStatus::Ready);
+        assert_eq!(view.report, Some(report.clone()));
+        // A session not in this replica has no title.
+        assert_eq!(view.titles.len(), 1);
+        assert!(view.titles.contains_key(&known));
+
+        // A refresh keeps the report until its answer, and a failure keeps it.
+        let second = storage_req(&f.dispatch(Action::RefreshStorage)).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(storage_view(&f).status, StorageStatus::Loading);
+        f.model
+            .storage_reported(second, Err(TransportError::BadStatus(503)));
+        let view = storage_view(&f);
+        assert_eq!(
+            view.status,
+            StorageStatus::Unavailable(StorageUnavailable::Failed(
+                TransportError::BadStatus(503).to_string()
+            ))
+        );
+        assert_eq!(view.report, Some(report));
+
+        // Offline nothing is asked.
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: chrono::Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+        assert_eq!(
+            storage_view(&f).status,
+            StorageStatus::Unavailable(StorageUnavailable::Offline)
+        );
+
+        // Elsewhere a refresh asks nothing.
+        f.model.set_link(Link::Online { latency_ms: 5 });
+        f.dispatch(Action::Navigate(Route::Settings));
+        assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+    }
+
     #[test]
     fn the_picker_needs_a_paired_device_on_the_session_list() {
         let mut model = Model::new(empty_snapshot(), None);
@@ -8088,6 +8233,7 @@ mod tests {
             Screen::Pairing(_) => "pairing",
             Screen::Settings(_) => "settings",
             Screen::Usage(_) => "usage",
+            Screen::Storage(_) => "storage",
             Screen::Workdir(_) => "workdir",
             Screen::Session(v) if v.archived => "archived session",
             Screen::Session(_) => "session",
@@ -8129,6 +8275,7 @@ mod tests {
         );
         assert_back(&mut f, nav(Route::Settings), "settings", "active list");
         assert_back(&mut f, nav(Route::Usage), "usage", "active list");
+        assert_back(&mut f, nav(Route::Storage), "storage", "active list");
         // Re-pairing a paired device can be cancelled.
         assert_back(&mut f, nav(Route::Pairing), "pairing", "active list");
         // A session goes back to the list it is on.

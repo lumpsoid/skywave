@@ -44,6 +44,13 @@ class SessionListPage extends StatelessWidget {
                 ),
               ),
               IconButton(
+                tooltip: 'Server storage',
+                icon: const Icon(Icons.storage),
+                onPressed: () => send.act(
+                  const ActionIntentNavigate(route: RouteView.storage),
+                ),
+              ),
+              IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings),
                 onPressed: () => send.act(

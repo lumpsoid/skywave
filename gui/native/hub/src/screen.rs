@@ -8,7 +8,7 @@ use skywave_core::{
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen,
     SessionId, SessionListView, SessionRow, SessionState, SessionUsage, SessionView, SettingsView,
-    Snippet, SubagentHeader, TimelineItem, UsageView, ViewState,
+    Snippet, StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -25,6 +25,7 @@ use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, gated_item, sections, tool_sections,
 };
+use skywave_present::storage::{self, Grouping as StorageGrouping};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
 use crate::link::count;
@@ -34,8 +35,8 @@ use crate::signals::{
     CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
     PairForm, PairingState, PermissionModeView, RenamePrompt, RepairNotice, RuleOption,
     ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
-    UsageSpanView,
+    StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView,
+    TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
 };
 use skywave_present::text::clean_line;
 
@@ -56,6 +57,8 @@ pub struct Ui<'a> {
     pub repair_dismissed: bool,
     /// The usage screen's days and grouping.
     pub usage: (Span, Grouping),
+    /// The storage screen's list.
+    pub storage: StorageGrouping,
     /// The wall clock in unix-epoch millis: the usage span ends on its day.
     pub wall_ms: i64,
     /// The text of the workdir blob shown ([`workdir::WorkdirText::of`]).
@@ -87,6 +90,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         },
         Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
+        Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
     };
     ScreenUpdate {
@@ -855,6 +859,39 @@ fn usage_view(view: &UsageView, (span, grouping): (Span, Grouping), wall_ms: i64
     }
 }
 
+fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
+    let rows: Vec<StorageRowView> = storage::rows(view, grouping)
+        .into_iter()
+        .map(|row| StorageRowView {
+            label: clean_line(&row.label),
+            detail: clean_line(&row.detail),
+            size: row.size,
+        })
+        .collect();
+    ScreenView::Storage {
+        grouping: match grouping {
+            StorageGrouping::Sessions => StorageGroupingView::Sessions,
+            StorageGrouping::Blobs => StorageGroupingView::Blobs,
+            StorageGrouping::ShellRuns => StorageGroupingView::ShellRuns,
+        },
+        status_label: storage::status_line(view),
+        totals: view
+            .report
+            .as_ref()
+            .map(storage::totals)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| StorageTotalView {
+                label: t.label.to_owned(),
+                value: t.value,
+            })
+            .collect(),
+        empty_label: (rows.is_empty() && view.report.is_some())
+            .then(|| grouping.empty_label().to_owned()),
+        rows,
+    }
+}
+
 /// A rule as listed: its label, then how far it reaches.
 fn rule_text(rule: &RuleSuggestion) -> String {
     format!("{} ({})", clean_line(&rule.label), scope_label(rule.scope))
@@ -921,6 +958,7 @@ mod tests {
             composer: None,
             repair_dismissed: false,
             usage: Default::default(),
+            storage: Default::default(),
             wall_ms: 0,
             workdir_text: None,
             stay_connected: None,

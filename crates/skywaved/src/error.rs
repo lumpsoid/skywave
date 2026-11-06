@@ -104,6 +104,10 @@ pub enum Error {
     /// the API answers 503.
     #[error("workdir snapshot passed its deadline")]
     WorkdirDeadline,
+    /// A storage report passed its deadline, waiting or reading; the API
+    /// answers 503.
+    #[error("storage report passed its deadline")]
+    StorageDeadline,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

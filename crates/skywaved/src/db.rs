@@ -400,6 +400,21 @@ const MIGRATIONS: &[&str] = &[
     UPDATE supervisor_owed SET state = 'settling' WHERE settling = 1;
     ALTER TABLE supervisor_owed DROP COLUMN settling;
     "#,
+    // v20: the storage report (protocol v22). Not backfilled: a database
+    // with events is stamped with an older protocol, which `open` refuses.
+    r#"
+    -- The event referencing each event blob (EventKind::blobs), written in
+    -- the append's transaction: what the storage report sums per session.
+    -- `holds` is the BlobUse. Workdir blobs have no row.
+    CREATE TABLE event_blobs (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output'))
+    ) STRICT;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
