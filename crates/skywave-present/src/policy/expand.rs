@@ -70,6 +70,7 @@ mod tests {
                 id,
                 state,
                 change: None,
+                pending: None,
             })),
         }
     }

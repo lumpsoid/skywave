@@ -279,9 +279,10 @@ impl Seam {
             let applied = state.store.apply_batch(batch, now)?;
             state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
+            let mut requests = Vec::new();
             for (id, seq) in &applied.settled {
                 let accepted = CommandResult::Accepted { seq: *seq };
-                state.model.command_result(*id, accepted, now);
+                requests.extend(state.model.command_result(*id, accepted, now));
             }
             // The batch is stored either way; a failed load leaves the
             // session empty until it is opened again.
@@ -294,7 +295,6 @@ impl Seam {
             for blob in &applied.purged {
                 remove_blob_files(&data_dir, *blob);
             }
-            let mut requests = Vec::new();
             if !applied.purged.is_empty() {
                 requests.push(Request::BlobsPurged(applied.purged.clone()));
             }
@@ -355,13 +355,15 @@ impl Seam {
         })
     }
 
-    /// The server answered the command; the first answer is final.
+    /// The server answered the command; the first answer is final. An
+    /// accepted blob delete or crop asks an open storage screen's report
+    /// again, as one the log settles does ([`Seam::apply_events`]).
     pub fn command_result(&self, id: CommandId, result: &CommandResult) -> Result<(), CoreError> {
         let now = Utc::now();
         self.update(|state| {
             state.store.record_result(id, result, now)?;
-            state.model.command_result(id, result.clone(), now);
-            Ok(((), Vec::new()))
+            let refresh = state.model.command_result(id, result.clone(), now);
+            Ok(((), refresh.into_iter().collect()))
         })
     }
 

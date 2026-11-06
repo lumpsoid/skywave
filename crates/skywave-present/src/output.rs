@@ -145,6 +145,7 @@ mod tests {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 9 },
             change: None,
+            pending: None,
         };
         long.output = Some(FullView::Blob(blob.clone()));
         assert_eq!(whole_output(&long), WholeOutput::Blob(&blob));
@@ -202,6 +203,7 @@ mod tests {
             state: BlobState::Available {
                 path: "/blobs/x".into(),
             },
+            pending: None,
             change: Some(skywave_core::BlobChange::Cropped {
                 kept: 5,
                 of: 400,

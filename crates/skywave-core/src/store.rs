@@ -574,8 +574,8 @@ pub struct OutboxEntry {
 
 impl OutboxEntry {
     /// Whether the user may take the command back ([`Store::withdraw`]): a
-    /// message, shell run, session creation or context move the server has
-    /// not answered, or refused. One already sent may have reached the
+    /// message, shell run, session creation, context move, or blob delete
+    /// or crop the server has not answered, or refused. One already sent may have reached the
     /// server, and withdrawing cannot stop it there; it only stops the
     /// resends, so a command whose request keeps failing no longer holds
     /// back every later one. If the server took it, its event shows it in
@@ -588,6 +588,8 @@ impl OutboxEntry {
                 | CommandKind::RunShell { .. }
                 | CommandKind::CreateSession { .. }
                 | CommandKind::MoveContext { .. }
+                | CommandKind::DeleteBlob { .. }
+                | CommandKind::CropBlob { .. }
         );
         kind && match &self.status {
             OutboxStatus::Done(result) => matches!(result, CommandResult::Rejected { .. }),

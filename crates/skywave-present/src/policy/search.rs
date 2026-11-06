@@ -297,6 +297,7 @@ mod tests {
                 path: "/nowhere".into(),
             },
             change: None,
+            pending: None,
         };
         let view = session(vec![
             message(1, "run it"),

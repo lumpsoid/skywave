@@ -575,6 +575,7 @@ mod tests {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 10 },
             change: None,
+            pending: None,
         });
 
         // A lost input stands where a kept one would, hidden, saying so.
@@ -649,6 +650,7 @@ mod tests {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 10 },
             change: None,
+            pending: None,
         });
         let view = call(Some(kept), Some(deleted));
         let shown = tool_sections(&view);
@@ -662,6 +664,7 @@ mod tests {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 10 },
             change: None,
+            pending: None,
         };
         assert_eq!(change_note(&blob), None);
         blob.change = Some(BlobChange::Cropped {
@@ -691,6 +694,7 @@ mod tests {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 10 },
             change: None,
+            pending: None,
         })
     }
 }
