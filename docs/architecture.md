@@ -156,9 +156,10 @@ every version.
   reply does (`MoveContext` also logs the new session's `SessionCreated`
   first; an adopting `CreateSession` logs its `SessionCreated` and the
   imported history first, and names itself on the `ImportFinished` after
-  them, D37). A `DeleteBlob`'s `BlobDeleted` is stamped with the session
-  and context of the event that referenced the blob, as an
-  `ApprovalResolved` takes its approval's (D42).
+  them, D37). A `DeleteBlob`'s `BlobDeleted` and a `CropBlob`'s
+  `BlobCropped` are stamped with the session and context of the event
+  that referenced the blob, as an `ApprovalResolved` takes its approval's
+  (D42).
 - **Every event carries its context** (`Event.context`), stamped by the
   server, never derived from position (D29). Session-level state (name,
   archived, mode, model, effort) folds per session regardless.
@@ -302,6 +303,33 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `BlobGone` from `UnknownBlob`; the referencing event and its preview are
   untouched. It starts no work, so it is taken while the disk is low and
   while `serve` stops: freeing space is what a low disk needs.
+- **Cropping an event blob** (D42): `CropBlob { blob, keep }` is refused
+  like a delete (`UnknownBlob`, `BlobGone`), then `NotCroppable` unless
+  the blob holds a tool output or a shell run's output, then `BadCrop`
+  for spans of the wrong shape (`skywave_proto::crop::check_spans`:
+  none, unsorted, overlapping, empty, more than `CROP_SPANS_MAX`). The
+  new blob is written before the transaction, like an adopting create's
+  history: the API checks all that briefly on its connection and opens
+  the blob, then streams it through `skywave_proto::crop::crop` into a
+  new blob file on a blocking thread, off the connection, within
+  `CROP_DEADLINE` (20 s, under the device's 30 s reply bound). The open
+  file survives a concurrent delete's unlink. Spans past the last line or
+  keeping every line are `BadCrop`, a write failing for space (`ENOSPC`,
+  `EDQUOT`) is `DiskLow`; both are stored like any refusal and leave no
+  file. Past the deadline the reply is a 503 and nothing is handled;
+  another I/O failure is a 500. A resend while the crop is written waits
+  for its reply, as for an import. The transaction checks again that
+  `blob` is stored (`BlobGone` if a delete or crop got there first),
+  records the new blob, deletes the old `blobs` row and appends
+  `BlobCropped { blob, holds, into, kept, lines, by }` (`kept` as asked:
+  spans that touch are not merged); the old file goes after the commit,
+  and a crop that does not commit removes its new one. `into`'s
+  `event_blobs` row takes the old row's session, seq and holds, not the
+  `BlobCropped`'s: the new blob is the content of the event that
+  referenced the old one, so the storage report counts it there (a shell
+  run finds its output by its `ShellFinished` seq) and a later crop or
+  delete is stamped like the first. Taken while the disk is low and while
+  `serve` stops, like a delete.
 - **Restart cost**: nothing prunes the log yet, so what a daemon start
   reads must not grow with it. Each lookup it makes, per session or over
   the log, reads a projection (`open_calls`: a `ToolCall` adds its call,
@@ -405,7 +433,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
     Control is taken as usual (`ResolveApproval`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
-    `SwitchContext`, `DeleteBlob`). Reads and long-polls are untouched. The refusal is
+    `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
     stored like any other; the heads show its reason, which is how a
     device learns the server is paused.
   - The supervisor stops reading its agents' events. An adapter reports on
@@ -444,8 +472,9 @@ the daemon's appends, which would otherwise stop `serve` (below).
   blob, session, seq and what it holds). A shell run's is its
   `ShellOutput` events (read per session through `events_session_type`)
   plus its output: the finished run's blob or the running one's file;
-  `output_blob` names the finished run's blob, the one a device deletes.
-  A deleted blob has no `blobs` row, so it counts nowhere. Summing every session's events reads the whole log, so a report costs
+  `output_blob` names the finished run's blob, the one a device deletes
+  or crops. A deleted blob has no `blobs` row, so it counts nowhere; a
+  cropped one's replacement counts where the original did. Summing every session's events reads the whole log, so a report costs
   the log's length: it runs on a connection of its own, one at a time,
   in one read transaction (appends go on beside it under WAL), and SQLite
   stops it at its 8 s deadline (a progress handler), a 503; the reply
@@ -504,7 +533,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   reusing a blob and the answer naming it. A device holding a replaced
   answer (lost reply, another device's refresh) gets a 404 for its blob
   and shows the download failed until a refresh. An event blob lives until
-  a device deletes it (`DeleteBlob`, above); nothing collects one. `serve`,
+  a device deletes or crops it (`DeleteBlob`, `CropBlob`, above); nothing
+collects one. `serve`,
   once its address is bound
   and before the supervisor, shell runner or API can write blobs, runs the
   same pass, then removes every `.tmp-*` file in `blobs/` and every blob

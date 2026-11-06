@@ -471,7 +471,8 @@ impl EventLog {
             // The adopting `CreateSession` logs the import, not the agent.
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
-            | EventKind::BlobDeleted { .. } => {
+            | EventKind::BlobDeleted { .. }
+            | EventKind::BlobCropped { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -806,7 +807,13 @@ pub(crate) fn append_in(
     ])?;
     // Which session's event holds each blob, for the storage report. An
     // event blob is written for one event only; a repeat keeps the first.
-    for (holds, blob) in kind.blobs() {
+    // A crop's new blob stands for the event that held the old one: its
+    // arm below writes it, since a row here would win the `OR IGNORE`.
+    let blobs = match kind {
+        EventKind::BlobCropped { .. } => None,
+        _ => Some(kind.blobs()),
+    };
+    for (holds, blob) in blobs.into_iter().flatten() {
         conn.prepare_cached(
             "INSERT OR IGNORE INTO event_blobs (blob_id, session_id, seq, holds)
              VALUES (?1, ?2, ?3, ?4)",
@@ -955,6 +962,25 @@ pub(crate) fn append_in(
         // blob's `event_blobs` row stays, naming the event that referenced
         // it: how a later command tells `BlobGone` from `UnknownBlob`.
         EventKind::BlobDeleted { .. } => {}
+        // `CropBlob` recorded `into` and removed `blob`'s `blobs` row before
+        // appending it. `into` takes `blob`'s `event_blobs` row's session,
+        // seq and holds: it is the content of the event that referenced
+        // `blob`, so the storage report (a shell run's output, found by its
+        // `ShellFinished` seq) and a later crop or delete find it there.
+        EventKind::BlobCropped { blob, into, .. } => {
+            let rows = conn
+                .prepare_cached(
+                    "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                     SELECT ?2, session_id, seq, holds FROM event_blobs WHERE blob_id = ?1",
+                )?
+                .execute(params![blob.0.to_string(), into.id.0.to_string()])?;
+            if rows != 1 {
+                return Err(Error::InvalidAppend(format!(
+                    "BlobCropped names blob {}, which no event referenced",
+                    blob.0
+                )));
+            }
+        }
         // The run's id is the command's: a `ShellRequested` naming none
         // has no run to track.
         EventKind::ShellRequested { when, .. } => {
@@ -1358,7 +1384,7 @@ pub(crate) struct EventBlobRow {
     /// The context the referencing event was logged in.
     pub context: ContextId,
     pub holds: BlobUse,
-    /// Whether the blob is still stored: `false` once deleted.
+    /// Whether the blob is still stored: `false` once deleted or cropped.
     pub stored: bool,
 }
 
@@ -1436,6 +1462,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::Imported { .. } => "Imported",
         EventKind::ImportFinished { .. } => "ImportFinished",
         EventKind::BlobDeleted { .. } => "BlobDeleted",
+        EventKind::BlobCropped { .. } => "BlobCropped",
     }
 }
 

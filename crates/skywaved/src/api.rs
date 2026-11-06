@@ -68,17 +68,27 @@
 //! work returns: stuck threads hold theirs, so at most [`FS_PERMITS`] can
 //! pile up. Hello, commands, events and blobs never take one.
 //!
+//! **Prepared commands** (an adopting create and a crop) are prepared off
+//! the API's connection, then handed to [`EventLog::handle_with`]. A
+//! command already handled is answered from its stored result without
+//! preparing anything; a resend that arrives while the first request is
+//! still preparing waits for that request's reply.
+//!
 //! **Adopting creates** (`CreateSession` with a `conversation`, D37): the
 //! conversation's history is read and bounded first, on a blocking thread
-//! and off the API's connection, then handed to
-//! [`EventLog::handle_with`]. A command already handled is answered from its
-//! stored result without reading anything; a resend that arrives while the
-//! first request is still preparing waits for that request's reply. The
+//! and off the API's connection. The
 //! import gets the server's import deadline
 //! ([`import::IMPORT_DEADLINE`]), after which the reply goes on with
 //! `Failed("timed out")`. Canonicalising the workdir first shares that
 //! deadline; past it the reply is a 503 and nothing is handled, so the
 //! device resends.
+//!
+//! **Crops** (`CropBlob`, D42): whether the blob can be cropped is read
+//! briefly on the API's connection, which opens it; the crop runs on a
+//! blocking thread off it ([`crate::crop`]), within the crop deadline
+//! ([`crop::CROP_DEADLINE`] by default). Past it the reply is a 503 and nothing
+//! is handled; the abandoned crop's file goes before its thread ends. An
+//! I/O failure other than a full disk is a 500, also unhandled.
 //!
 //! Errors are bare status codes: 400 malformed request, 404 unknown blob,
 //! 412 another run expected, 500 server fault.
@@ -100,25 +110,27 @@ use bytes::BytesMut;
 use chrono::Utc;
 use rustls_pki_types::CertificateDer;
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
+    BlobId, BlobUse, Command, CommandId, CommandKind, CommandResult, ConversationsResult, DeviceId,
     DeviceInfo, DirsQuery, EventsQuery, Fingerprint, HelloQuery, HelloResponse, ImportOutcome,
-    PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, WorkdirQuery, check_conversation_id, limits,
-    path,
+    LineSpan, PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, WorkdirQuery, check_conversation_id,
+    limits, path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
 use crate::agent::{self, OutsideConversations, SourceError};
 use crate::blobs::BlobStore;
+use crate::commands::Preparation;
+use crate::crop::{self, CropHook};
 use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
-use crate::event_log::{DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
-use crate::server::ServerOptions;
+use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
+use crate::server::{JoinedHook, ServerOptions};
 use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Snapshot, WorkdirReader};
 use crate::{EventLog, lock};
@@ -178,9 +190,14 @@ pub(crate) struct Api {
     outside: Arc<dyn OutsideConversations>,
     import_deadline: Duration,
     conversations_timeout: Duration,
-    /// The adopting creates whose import is being prepared, by command id:
-    /// each answers with the command's reply once it has one.
-    importing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
+    crop_deadline: Duration,
+    /// Run in every crop before it writes and when its thread ends (tests).
+    crop_hook: Option<Arc<dyn CropHook>>,
+    /// Run when a request waits for another's preparation (tests).
+    joined_hook: Option<JoinedHook>,
+    /// The commands being prepared (adopting creates and crops), by command
+    /// id: each answers with the command's reply once it has one.
+    preparing: Mutex<HashMap<CommandId, watch::Receiver<Option<Reply>>>>,
     /// [`FS_PERMITS`] permits; blocking file-system work holds one until it
     /// returns.
     fs: Arc<Semaphore>,
@@ -209,7 +226,8 @@ impl Api {
             )
             .with_git(options.git),
             storage: StorageReader::new(Db::open(&dir.db_path())?, dir.clone(), options.log_file),
-            // A `DeleteBlob` removes the file from the store served here.
+            // A `DeleteBlob` removes the file from the store served here
+            // (a `CropBlob` its own preparation's, the same store).
             log: log.with_blobs(blobs.clone()),
             blobs,
             server_id,
@@ -217,7 +235,10 @@ impl Api {
             outside: options.outside,
             import_deadline: options.import_deadline,
             conversations_timeout: options.conversations_timeout,
-            importing: Mutex::new(HashMap::new()),
+            crop_deadline: options.crop_deadline,
+            crop_hook: options.crop_hook,
+            joined_hook: options.joined_hook,
+            preparing: Mutex::new(HashMap::new()),
             fs: Arc::new(Semaphore::new(FS_PERMITS)),
         })
     }
@@ -388,15 +409,15 @@ async fn commands(
         }
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let adopting = matches!(
+    let prepares = matches!(
         command.kind,
         CommandKind::CreateSession {
             conversation: Some(_),
             ..
-        }
+        } | CommandKind::CropBlob { .. }
     );
-    let reply = if adopting {
-        adopt(&api, device, command).await
+    let reply = if prepares {
+        prepared(&api, device, command).await
     } else {
         api.blocking(move |api, db| api.log.handle(db, device, &command))
             .await
@@ -408,20 +429,21 @@ async fn commands(
     }
 }
 
-/// Handles an adopting `CreateSession`, whose history is read and bounded
-/// before its transaction, outside the API's connection: a slow read must
-/// not hold up every other device's commands. A resend that arrives while
-/// the import is being prepared waits for that one's reply, so a command
-/// is never imported twice.
-async fn adopt(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
+/// Handles a command prepared before its transaction, outside the API's
+/// connection: an adopting `CreateSession`, whose history is read and
+/// bounded, or a `CropBlob`, whose new blob is written. Slow file work
+/// must not hold up every other device's commands. A resend that arrives
+/// while the command is being prepared waits for that one's reply, so a
+/// command is never prepared twice.
+async fn prepared(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
     loop {
         let role = {
-            let mut importing = lock(&api.importing);
-            match importing.get(&command.id) {
+            let mut preparing = lock(&api.preparing);
+            match preparing.get(&command.id) {
                 Some(reply) => Err(reply.clone()),
                 None => {
                     let (reply, waiting) = watch::channel(None);
-                    importing.insert(command.id, waiting);
+                    preparing.insert(command.id, waiting);
                     Ok(Leading {
                         api,
                         id: command.id,
@@ -437,6 +459,9 @@ async fn adopt(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
                 return reply;
             }
             Err(mut waiting) => {
+                if let Some(joined) = &api.joined_hook {
+                    joined();
+                }
                 if let Ok(reply) = waiting.wait_for(Option::is_some).await {
                     return reply.clone().expect("waited for a reply");
                 }
@@ -447,7 +472,7 @@ async fn adopt(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
     }
 }
 
-/// The request preparing a command's import; dropped, its entry goes.
+/// The request preparing a command; dropped, its entry goes.
 struct Leading<'a> {
     api: &'a Api,
     id: CommandId,
@@ -456,12 +481,13 @@ struct Leading<'a> {
 
 impl Drop for Leading<'_> {
     fn drop(&mut self) {
-        lock(&self.api.importing).remove(&self.id);
+        lock(&self.api.preparing).remove(&self.id);
     }
 }
 
 async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) -> Reply {
-    // A command already handled is answered from the log: no second import.
+    // A command already handled is answered from the log: nothing is
+    // prepared a second time.
     let id = command.id;
     if let Some(stored) = api
         .blocking(move |api, db| api.log.command_result(db, id))
@@ -469,9 +495,72 @@ async fn prepare_and_handle(api: &Arc<Api>, device: DeviceId, command: Command) 
     {
         return Ok(stored);
     }
-    let prepared = prepare_import(api, &command).await?;
+    let prepared = match &command.kind {
+        CommandKind::CropBlob { blob, keep } => prepare_crop(api, id, *blob, keep.clone()).await?,
+        _ => prepare_import(api, &command).await?.map(Preparation::from),
+    };
     api.blocking(move |api, db| api.log.handle_with(db, device, &command, prepared))
         .await
+}
+
+/// The crop of `blob` to `keep`, or `None` when `handle_with` refuses the
+/// command without one: no event referenced the blob, it is gone, it holds
+/// something not croppable, or the spans have the wrong shape. Those are
+/// read briefly on the API's connection, which also opens the blob; the
+/// crop itself runs on a blocking thread, off it, reading that open file,
+/// so a delete in between unlinks nothing it reads. Past the crop deadline
+/// ([`crop::CROP_DEADLINE`] by default) the reply is a 503 and nothing is
+/// handled; the abandoned crop's new file is removed before its thread
+/// ends (it drops its [`crop::Prepared`]). An I/O failure other than a
+/// full disk is a 500.
+async fn prepare_crop(
+    api: &Arc<Api>,
+    id: CommandId,
+    blob: BlobId,
+    keep: Vec<LineSpan>,
+) -> std::result::Result<Option<Preparation>, StatusCode> {
+    let deadline = Instant::now() + api.crop_deadline;
+    let shape = skywave_proto::crop::check_spans(&keep);
+    let file = api
+        .blocking(move |api, db| {
+            let croppable = event_log::event_blob_in(db.conn(), blob)?.is_some_and(|row| {
+                row.stored && matches!(row.holds, BlobUse::ToolOutput | BlobUse::ShellOutput)
+            });
+            if !croppable || !shape {
+                return Ok(None);
+            }
+            api.blobs.open(db.conn(), blob)
+        })
+        .await?;
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let (blobs, hook) = (api.blobs.clone(), api.crop_hook.clone());
+    let (send, cropped) = oneshot::channel();
+    // The thread hands its crop over, or, the request gone past its
+    // deadline, drops it there, removing the file it wrote, before it ends.
+    tokio::task::spawn_blocking(move || {
+        let prepared = crop::prepare(file, blobs, blob, &keep, hook.as_deref());
+        drop(send.send(prepared));
+        if let Some(hook) = hook {
+            hook.ended();
+        }
+    });
+    match tokio::time::timeout_at(deadline.into(), cropped).await {
+        Ok(Ok(Ok(prepared))) => Ok(Some(prepared.into())),
+        Ok(Ok(Err(e))) => {
+            tracing::error!(blob = %blob.0, error = %e, "cropping a blob failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Ok(Err(_)) => {
+            tracing::error!("a crop's thread ended without a crop");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => {
+            tracing::warn!(command = %id.0, "cropping a blob timed out");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 /// The import of an adopting create, or `None` for a conversation id

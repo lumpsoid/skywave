@@ -21,11 +21,14 @@ use skywave_proto::{
     BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId, CommandKind,
     CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
     DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
-    ImportOutcome, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER,
+    ImportOutcome, LineSpan, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER,
     RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage,
     StorageReport, ToolResult, path,
 };
+use skywaved::agent::fake::Gate;
 use skywaved::blobs::BlobStore;
+use skywaved::crop::CropHook;
+use skywaved::disk::{Disk, FreeSpace};
 use skywaved::identity::ServerIdentity;
 use skywaved::server::{ConnectionLimits, Server, ServerOptions};
 use skywaved::workdir::Git;
@@ -84,21 +87,44 @@ impl Fixture {
     }
 
     async fn start_with(shell: bool, bypass: bool, git: Git, limits: ConnectionLimits) -> Fixture {
+        let options = ServerOptions {
+            git,
+            limits,
+            ..ServerOptions::default()
+        };
+        Fixture::start_configured(|log| log.with_shell(shell).with_bypass(bypass), options).await
+    }
+
+    /// [`Fixture::start`] with shell commands on, the log watching `disk`
+    /// and every crop running `hook`.
+    async fn start_cropping(disk: Disk, hook: Option<Arc<dyn CropHook>>) -> Fixture {
+        let options = ServerOptions {
+            crop_hook: hook,
+            ..ServerOptions::default()
+        };
+        Fixture::start_cropping_with(disk, options).await
+    }
+
+    /// [`Fixture::start_cropping`] with `options` (git isolated).
+    async fn start_cropping_with(disk: Disk, options: ServerOptions) -> Fixture {
+        let options = ServerOptions {
+            git: isolated_git(),
+            ..options
+        };
+        Fixture::start_configured(|log| log.with_shell(true).with_disk(disk), options).await
+    }
+
+    async fn start_configured(
+        configure: impl FnOnce(EventLog) -> EventLog,
+        options: ServerOptions,
+    ) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("project")).unwrap();
         let storage = Storage::open(tmp.path().join("data")).unwrap();
         let identity =
             Arc::new(ServerIdentity::bootstrap(&storage.dir, &["localhost".into()]).unwrap());
-        let log = EventLog::open(&storage.db, vec![root.clone()])
-            .unwrap()
-            .with_shell(shell)
-            .with_bypass(bypass);
-        let options = ServerOptions {
-            git,
-            limits,
-            ..ServerOptions::default()
-        };
+        let log = configure(EventLog::open(&storage.db, vec![root.clone()]).unwrap());
         let server = Server::bind_with(
             "127.0.0.1:0".parse().unwrap(),
             &storage.dir,
@@ -1354,6 +1380,670 @@ async fn deleting_a_shell_output_blob_frees_it_and_logs_it() {
         StatusCode::OK,
         "a refused delete leaves the blob"
     );
+}
+
+/// `seq first last`'s output.
+fn numbers(lines: std::ops::RangeInclusive<u32>) -> Vec<u8> {
+    lines.flat_map(|n| format!("{n}\n").into_bytes()).collect()
+}
+
+fn span(first: u32, count: u32) -> LineSpan {
+    LineSpan { first, count }
+}
+
+fn crop_command(blob: BlobId, keep: &[LineSpan]) -> Command {
+    Command {
+        id: CommandId::new(),
+        kind: CommandKind::CropBlob {
+            blob,
+            keep: keep.to_vec(),
+        },
+    }
+}
+
+fn accepted_seq(result: &CommandResult) -> Seq {
+    match result {
+        CommandResult::Accepted { seq } => *seq,
+        other => panic!("not accepted: {other:?}"),
+    }
+}
+
+fn rejected(reason: RejectReason) -> CommandResult {
+    CommandResult::Rejected { reason }
+}
+
+/// The names of the files in the blob store, temp files included.
+fn blob_files(f: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(f.storage.dir.blobs_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A new session of `device`'s.
+async fn new_session(f: &Fixture, device: &mut Client) -> SessionId {
+    let created = device.command(&f.create_session_command()).await;
+    session_of(&created, &device.events(Seq::ZERO, 0).await)
+}
+
+/// A finished shell run of `session`, requested by `by`, whose whole
+/// output `content` is a blob (logged by hand: nothing runs it here);
+/// returns the run, its blob and its `ShellFinished`'s seq and context.
+async fn finished_run(
+    f: &mut Fixture,
+    device: &mut Client,
+    by: DeviceId,
+    session: SessionId,
+    content: &[u8],
+) -> (CommandId, BlobRef, Seq, ContextId) {
+    let run = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id: session,
+            command: "seq 1 3000".into(),
+            when: Default::default(),
+        },
+    };
+    accepted_seq(&device.command(&run).await);
+    let output = f.storage.put_blob(content).unwrap();
+    for kind in [
+        EventKind::ShellStarted {
+            run: run.id,
+            cwd: "/".into(),
+        },
+        EventKind::ShellFinished {
+            run: run.id,
+            by,
+            started_at: None,
+            command_line: "seq 1 3000".into(),
+            end: ShellEnd::Exited { code: 0 },
+            cwd: None,
+            preview: "3000".into(),
+            lines: 3000,
+            output: Some(output.clone()),
+            truncated: true,
+        },
+    ] {
+        f.log.shell_event(&mut f.storage.db, kind).unwrap();
+    }
+    let batch = device.events(Seq::ZERO, 0).await;
+    let (seq, finished) = batch.iter().last().unwrap();
+    assert!(matches!(finished.kind, EventKind::ShellFinished { .. }));
+    (run.id, output, seq, finished.context)
+}
+
+/// A blob holding `content` for an agent event of `session`: a tool
+/// result's output, or a tool call's input.
+fn tool_blob(f: &mut Fixture, session: SessionId, holds: BlobUse, content: &[u8]) -> BlobRef {
+    let blob = f.storage.put_blob(content).unwrap();
+    let full = Some(skywave_proto::Full::Blob(blob.clone()));
+    let kind = match holds {
+        BlobUse::ToolOutput => EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: false,
+            status: None,
+            preview: "x".into(),
+            lines: 1,
+            output: full,
+        }),
+        BlobUse::ToolInput => EventKind::ToolCall(skywave_proto::ToolCall {
+            call: None,
+            parent: None,
+            name: "Bash".into(),
+            display: skywave_proto::ToolDisplay {
+                kind: skywave_proto::ToolKind::Shell,
+                title: "$ ls".into(),
+                detail: None,
+                body: None,
+            },
+            input: full,
+        }),
+        other => panic!("no tool blob holds {other:?}"),
+    };
+    f.log
+        .append(
+            &mut f.storage.db,
+            session,
+            ContextId::first_of(session),
+            kind,
+        )
+        .unwrap();
+    blob
+}
+
+/// A device crops a 3000-line shell output to its first and last ten
+/// lines: the new blob holds exactly those bytes, the old one is gone,
+/// and the log, the storage report and the run point at the new one, as
+/// the event that referenced the old one. A crop of the crop works the
+/// same; a crop or delete of a replaced blob is `BlobGone`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cropping_a_shell_output_keeps_only_the_chosen_lines() {
+    let mut f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let content = numbers(1..=3000);
+    let (run, output, finished_seq, finished_context) =
+        finished_run(&mut f, &mut device, creds.id, session, &content).await;
+    // A new current context: the crop is stamped with the run's.
+    let clear = Command {
+        id: CommandId::new(),
+        kind: CommandKind::ClearContext {
+            session_id: session,
+            context: ContextId::new(),
+            name: "next".into(),
+        },
+    };
+    accepted_seq(&device.command(&clear).await);
+
+    let keep = [span(0, 10), span(2990, 10)];
+    let crop = crop_command(output.id, &keep);
+    let seq = accepted_seq(&device.command(&crop).await);
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (logged_seq, event) = batch.iter().next().unwrap();
+    assert_eq!(logged_seq, seq);
+    let EventKind::BlobCropped {
+        blob,
+        holds,
+        into,
+        kept,
+        lines,
+        by,
+    } = &event.kind
+    else {
+        panic!("not a crop: {:?}", event.kind);
+    };
+    assert_eq!(
+        (*blob, *holds, kept.as_slice(), *lines, *by),
+        (output.id, BlobUse::ShellOutput, &keep[..], 3000, creds.id)
+    );
+    assert_eq!(event.command_id, Some(crop.id));
+    assert_eq!(
+        (event.session_id, event.context),
+        (session, finished_context)
+    );
+
+    let mut expected = numbers(1..=10);
+    expected.extend(numbers(2991..=3000));
+    let reply = device.get(&path::blob(into.id)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(&reply.body[..], &expected[..]);
+    assert_eq!(into.size, expected.len() as u64);
+    assert_eq!(into.sha256, skywave_proto::ContentHash::of(&expected));
+    assert_eq!(
+        device.get(&path::blob(output.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        blob_files(&f),
+        vec![into.id.0.to_string()],
+        "the old file went"
+    );
+
+    let report: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(report.event_blobs, into.size);
+    assert_eq!(report.sessions[0].blob_bytes, into.size);
+    assert_eq!(
+        report.blobs,
+        vec![BlobStorage {
+            id: into.id,
+            size: into.size,
+            session,
+            seq: finished_seq,
+            holds: BlobUse::ShellOutput,
+        }],
+        "the new blob stands where the old one did"
+    );
+    assert_eq!(report.shell_runs.len(), 1, "the run is listed once");
+    assert_eq!(
+        (
+            report.shell_runs[0].run,
+            report.shell_runs[0].output,
+            report.shell_runs[0].output_blob
+        ),
+        (run, into.size, Some(into.id))
+    );
+
+    // A crop of the crop: its first five lines.
+    let again = crop_command(into.id, &[span(0, 5)]);
+    let seq = accepted_seq(&device.command(&again).await);
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (_, event) = batch.iter().next().unwrap();
+    let EventKind::BlobCropped {
+        blob: second_blob,
+        into: second,
+        lines,
+        ..
+    } = &event.kind
+    else {
+        panic!("not a crop: {:?}", event.kind);
+    };
+    assert_eq!((*second_blob, *lines), (into.id, 20));
+    assert_eq!(
+        (event.session_id, event.context),
+        (session, finished_context)
+    );
+    let reply = device.get(&path::blob(second.id)).await;
+    assert_eq!(&reply.body[..], &numbers(1..=5)[..]);
+    let report: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(report.shell_runs.len(), 1, "still listed once");
+    assert_eq!(report.shell_runs[0].output_blob, Some(second.id));
+    assert_eq!(report.blobs[0].seq, finished_seq);
+
+    // Replaced blobs are gone; the newest one is deleted like any.
+    for blob in [output.id, into.id] {
+        assert_eq!(
+            device.command(&crop_command(blob, &[span(0, 1)])).await,
+            rejected(RejectReason::BlobGone)
+        );
+    }
+    let delete = Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteBlob { blob: second.id },
+    };
+    accepted_seq(&device.command(&delete).await);
+    assert_eq!(
+        device
+            .command(&crop_command(second.id, &[span(0, 1)]))
+            .await,
+        rejected(RejectReason::BlobGone),
+        "a crop after a delete"
+    );
+    assert!(blob_files(&f).is_empty());
+}
+
+/// A crop that does not fit is refused, and leaves every blob as it was:
+/// an unknown blob, a tool input, spans past the end, keeping every line,
+/// spans of the wrong shape. A refusal is stored like any. The same blob
+/// crops when the spans fit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_that_does_not_fit_is_refused_and_writes_nothing() {
+    let mut f = Fixture::start().await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=100));
+    let input = tool_blob(&mut f, session, BlobUse::ToolInput, &numbers(1..=100));
+    let before = blob_files(&f);
+    let head = f.log.head();
+
+    let refusals = [
+        (BlobId::new(), vec![span(0, 1)], RejectReason::UnknownBlob),
+        (input.id, vec![span(0, 1)], RejectReason::NotCroppable),
+        (
+            output.id,
+            vec![span(0, 1), span(99, 2)],
+            RejectReason::BadCrop,
+        ),
+        (output.id, vec![span(100, 1)], RejectReason::BadCrop),
+        (
+            output.id,
+            vec![span(0, 50), span(50, 50)],
+            RejectReason::BadCrop,
+        ),
+        (
+            output.id,
+            vec![span(5, 1), span(0, 1)],
+            RejectReason::BadCrop,
+        ),
+        (output.id, vec![], RejectReason::BadCrop),
+    ];
+    for (blob, keep, reason) in refusals {
+        let crop = crop_command(blob, &keep);
+        assert_eq!(
+            device.command(&crop).await,
+            rejected(reason),
+            "{blob:?} {keep:?}"
+        );
+        assert_eq!(device.command(&crop).await, rejected(reason), "stored");
+        assert_eq!(blob_files(&f), before, "no file left by {keep:?}");
+    }
+    assert_eq!(f.log.head(), head, "nothing logged");
+    for blob in [output.id, input.id] {
+        assert_eq!(device.get(&path::blob(blob)).await.status, StatusCode::OK);
+    }
+
+    // Control: the tool output crops with spans that fit.
+    let seq = accepted_seq(
+        &device
+            .command(&crop_command(output.id, &[span(99, 1)]))
+            .await,
+    );
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (_, event) = batch.iter().next().unwrap();
+    assert!(matches!(
+        &event.kind,
+        EventKind::BlobCropped { holds: BlobUse::ToolOutput, into, lines: 100, .. }
+            if into.size == 4
+    ));
+}
+
+/// A [`CropHook`] that holds every crop until `release` opens, then fails
+/// its write with `fail` if set. Counts the crops that reached it, and the
+/// temp files the blob store had then; `ended` opens once a crop's thread
+/// ends.
+#[derive(Default)]
+struct HeldCrops {
+    entered: Gate,
+    release: Gate,
+    ended: Gate,
+    fail: Option<i32>,
+    crops: std::sync::atomic::AtomicUsize,
+    dir: std::sync::OnceLock<PathBuf>,
+    temp_files: std::sync::atomic::AtomicUsize,
+}
+
+impl CropHook for HeldCrops {
+    fn writing(&self) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.crops.fetch_add(1, Ordering::SeqCst);
+        if let Some(dir) = self.dir.get() {
+            let temp = std::fs::read_dir(dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tmp-")
+                })
+                .count();
+            self.temp_files.store(temp, Ordering::SeqCst);
+        }
+        self.entered.open();
+        self.release.wait_blocking();
+        match self.fail {
+            Some(code) => Err(std::io::Error::from_raw_os_error(code)),
+            None => Ok(()),
+        }
+    }
+
+    fn ended(&self) {
+        self.ended.open();
+    }
+}
+
+impl HeldCrops {
+    fn crops(&self) -> usize {
+        self.crops.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Opens `gate` when dropped, so a failing test frees a held crop.
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A free space a test sets.
+#[derive(Default)]
+struct Free(std::sync::atomic::AtomicU64);
+
+impl FreeSpace for Free {
+    fn free(&self) -> std::io::Result<u64> {
+        Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// A resend that arrives while the crop is written joins it: one event,
+/// one new blob, one crop. A resend after it is answered from the log.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_resent_while_it_is_written_joins_the_first() {
+    let hook = Arc::new(HeldCrops::default());
+    let _open = OpenOnDrop(hook.release.clone());
+    let joined = Gate::new();
+    let options = ServerOptions {
+        crop_hook: Some(hook.clone()),
+        joined_hook: Some(Arc::new({
+            let joined = joined.clone();
+            move || joined.open()
+        })),
+        ..ServerOptions::default()
+    };
+    let mut f = Fixture::start_cropping_with(Disk::default(), options).await;
+    let creds = f.pair().await;
+    let mut first = f.client(&creds).await;
+    let mut second = f.client(&creds).await;
+    let session = new_session(&f, &mut first).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=30));
+    let crop = crop_command(output.id, &[span(0, 1)]);
+
+    let sent = crop.clone();
+    let first_reply = tokio::spawn(async move { first.command(&sent).await });
+    tokio::time::timeout(SOON, hook.entered.opened())
+        .await
+        .expect("the first request crops");
+    let sent = crop.clone();
+    let second_reply = tokio::spawn(async move { second.command(&sent).await });
+    tokio::time::timeout(SOON, joined.opened())
+        .await
+        .expect("the resend joins the first");
+    assert!(
+        !second_reply.is_finished(),
+        "it waits for the first's reply"
+    );
+    assert_eq!(hook.crops(), 1);
+    hook.release.open();
+
+    let first = tokio::time::timeout(SOON, first_reply)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(SOON, second_reply)
+        .await
+        .unwrap()
+        .unwrap();
+    let seq = accepted_seq(&first);
+    assert_eq!(second, first);
+    assert_eq!(f.log.head(), seq, "logged once");
+    assert_eq!(blob_files(&f).len(), 1, "one new blob, the old one gone");
+
+    let mut device = f.client(&creds).await;
+    assert_eq!(device.command(&crop).await, first, "a resend after");
+    assert_eq!(hook.crops(), 1, "answered from the log");
+    assert_eq!(blob_files(&f).len(), 1);
+}
+
+/// A delete taken while a crop of the same blob is written wins: the crop
+/// is `BlobGone`, and the blob it wrote is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_while_a_crop_is_written_makes_it_blob_gone() {
+    let hook = Arc::new(HeldCrops::default());
+    let _open = OpenOnDrop(hook.release.clone());
+    let mut f = Fixture::start_cropping(Disk::default(), Some(hook.clone())).await;
+    let creds = f.pair().await;
+    let mut cropping = f.client(&creds).await;
+    let mut deleting = f.client(&creds).await;
+    let session = new_session(&f, &mut cropping).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=3000));
+    let crop = crop_command(output.id, &[span(0, 1)]);
+
+    let sent = crop.clone();
+    let crop_reply = tokio::spawn(async move { cropping.command(&sent).await });
+    tokio::time::timeout(SOON, hook.entered.opened())
+        .await
+        .expect("the crop is being written");
+    let delete = Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteBlob { blob: output.id },
+    };
+    let deleted = accepted_seq(&deleting.command(&delete).await);
+    let files = blob_files(&f);
+    assert!(
+        files.len() == 1 && files[0].starts_with(".tmp-"),
+        "only the crop's file is left: {files:?}"
+    );
+    hook.release.open();
+
+    let result = tokio::time::timeout(SOON, crop_reply)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, rejected(RejectReason::BlobGone));
+    assert_eq!(f.log.head(), deleted, "the crop logged nothing");
+    assert!(blob_files(&f).is_empty(), "the crop's blob was removed");
+}
+
+/// A crop is how a low disk gets space back, and lets a stopping server
+/// end its work: it is taken in both, unlike new work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_is_taken_while_the_disk_is_low_or_the_server_stops() {
+    let free = Arc::new(Free::default());
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    let disk = Disk::new(free.clone(), 10);
+    let mut f = Fixture::start_cropping(disk.clone(), None).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=30));
+    let message = |text: &str| Command {
+        id: CommandId::new(),
+        kind: CommandKind::SendMessage {
+            session_id: session,
+            context: ContextId::first_of(session),
+            text: text.into(),
+        },
+    };
+
+    free.0.store(9, std::sync::atomic::Ordering::SeqCst);
+    assert!(disk.check());
+    assert_eq!(
+        device.command(&message("work")).await,
+        rejected(RejectReason::DiskLow),
+        "control: new work is refused"
+    );
+    let first = accepted_seq(
+        &device
+            .command(&crop_command(output.id, &[span(0, 20)]))
+            .await,
+    );
+    let batch = device.events(Seq(first.0 - 1), 0).await;
+    let (_, event) = batch.iter().next().unwrap();
+    let EventKind::BlobCropped { into, .. } = &event.kind else {
+        panic!("not a crop: {:?}", event.kind);
+    };
+
+    free.0.store(10, std::sync::atomic::Ordering::SeqCst);
+    assert!(!disk.check());
+    f.log.set_stopping(true);
+    assert_eq!(
+        device.command(&message("more")).await,
+        rejected(RejectReason::ServerStopping),
+        "control: new work is refused"
+    );
+    accepted_seq(&device.command(&crop_command(into.id, &[span(0, 10)])).await);
+}
+
+/// A crop whose new blob finds no room on the disk is `DiskLow`, stored
+/// like any refusal, and its partial file is removed; the blob it would
+/// crop stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_with_no_room_for_its_blob_is_disk_low_and_leaves_no_file() {
+    let hook = Arc::new(HeldCrops {
+        fail: Some(libc::ENOSPC),
+        ..HeldCrops::default()
+    });
+    hook.release.open();
+    let mut f = Fixture::start_cropping(Disk::default(), Some(hook.clone())).await;
+    hook.dir.set(f.storage.dir.blobs_dir()).unwrap();
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=30));
+    let head = f.log.head();
+
+    let crop = crop_command(output.id, &[span(0, 1)]);
+    assert_eq!(device.command(&crop).await, rejected(RejectReason::DiskLow));
+    assert_eq!(
+        hook.temp_files.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the crop had a file to remove"
+    );
+    assert_eq!(blob_files(&f), vec![output.id.0.to_string()]);
+    assert_eq!(f.log.head(), head);
+    assert_eq!(device.command(&crop).await, rejected(RejectReason::DiskLow));
+    assert_eq!(hook.crops(), 1, "the refusal is stored");
+    assert_eq!(
+        device.get(&path::blob(output.id)).await.status,
+        StatusCode::OK
+    );
+}
+
+/// Another failure to write a crop's blob is a 500 that stores nothing:
+/// the device resends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_that_fails_otherwise_is_a_500_and_stores_nothing() {
+    let hook = Arc::new(HeldCrops {
+        fail: Some(libc::EIO),
+        ..HeldCrops::default()
+    });
+    hook.release.open();
+    let mut f = Fixture::start_cropping(Disk::default(), Some(hook.clone())).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=30));
+
+    let crop = crop_command(output.id, &[span(0, 1)]);
+    for crops in [1, 2] {
+        let reply = device
+            .send(Method::POST, path::COMMANDS, &[], json(&crop))
+            .await;
+        assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(hook.crops(), crops, "nothing stored: cropped again");
+    }
+    assert_eq!(blob_files(&f), vec![output.id.0.to_string()]);
+}
+
+/// A crop past its deadline is a 503 and nothing is handled; the crop
+/// left running removes its file when it ends, and a resend crops anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_past_its_deadline_is_a_503_and_leaves_no_file() {
+    let hook = Arc::new(HeldCrops::default());
+    let _open = OpenOnDrop(hook.release.clone());
+    let options = ServerOptions {
+        crop_hook: Some(hook.clone()),
+        crop_deadline: Duration::from_millis(200),
+        ..ServerOptions::default()
+    };
+    let mut f = Fixture::start_cropping_with(Disk::default(), options).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let session = new_session(&f, &mut device).await;
+    let output = tool_blob(&mut f, session, BlobUse::ToolOutput, &numbers(1..=30));
+    let head = f.log.head();
+
+    let crop = crop_command(output.id, &[span(0, 1)]);
+    // Held until the reply is in: past any deadline.
+    let reply = device
+        .send(Method::POST, path::COMMANDS, &[], json(&crop))
+        .await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(f.log.head(), head, "nothing handled");
+    assert!(!hook.ended.is_open(), "the crop still runs");
+    hook.release.open();
+    tokio::time::timeout(SOON, hook.ended.opened())
+        .await
+        .expect("the abandoned crop ends");
+    assert_eq!(
+        blob_files(&f),
+        vec![output.id.0.to_string()],
+        "its file went with it"
+    );
+
+    let seq = accepted_seq(&device.command(&crop).await);
+    assert_eq!(hook.crops(), 2, "the resend cropped anew");
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (_, event) = batch.iter().next().unwrap();
+    let EventKind::BlobCropped { into, .. } = &event.kind else {
+        panic!("not a crop: {:?}", event.kind);
+    };
+    assert_eq!(blob_files(&f), vec![into.id.0.to_string()]);
 }
 
 /// `route?session=..&path=..`, with `path` percent-escaped.

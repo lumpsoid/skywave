@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 mod content_hash;
 pub mod context_name;
+pub mod crop;
 mod fingerprint;
 
 pub use content_hash::{ContentHash, InvalidContentHash};
@@ -628,6 +629,29 @@ pub enum EventKind {
         holds: BlobUse,
         by: DeviceId,
     },
+    /// `by`'s `CropBlob` replaced the event blob `blob` with `into`, a new
+    /// blob holding only the lines `kept` names ([`crop::crop`]); `blob` is
+    /// gone from the server. `holds` is what both hold (`ToolOutput` or
+    /// `ShellOutput`), `lines` how many lines `blob` had. The event that
+    /// referenced `blob` keeps its preview and now stands for `into`.
+    /// Logged in the session and context of that event. Not notable, not
+    /// activity.
+    BlobCropped {
+        blob: BlobId,
+        holds: BlobUse,
+        into: BlobRef,
+        kept: Vec<LineSpan>,
+        lines: u32,
+        by: DeviceId,
+    },
+}
+
+/// Lines `first .. first + count` (0-based) of a blob, cut at `b'\n'`
+/// ([`crop`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineSpan {
+    pub first: u32,
+    pub count: u32,
 }
 
 /// What an `EventKind::Imported` carries: the parts of an outside
@@ -717,7 +741,8 @@ impl EventKind {
             | EventKind::TaskStopRequested { by, .. }
             | EventKind::ShellRequested { by, .. }
             | EventKind::ShellStopRequested { by, .. }
-            | EventKind::BlobDeleted { by, .. } => Some(*by),
+            | EventKind::BlobDeleted { by, .. }
+            | EventKind::BlobCropped { by, .. } => Some(*by),
             // The daemon logs it, but copies the requester's device so a
             // device can tell its own runs apart from this one event.
             EventKind::ShellFinished { by, .. } => Some(*by),
@@ -777,7 +802,8 @@ impl EventKind {
             | EventKind::ShellRequested { .. }
             | EventKind::ShellStopRequested { .. }
             | EventKind::ImportFinished { .. }
-            | EventKind::BlobDeleted { .. } => true,
+            | EventKind::BlobDeleted { .. }
+            | EventKind::BlobCropped { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -849,14 +875,16 @@ impl EventKind {
             | EventKind::ShellFinished { .. }
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
-            | EventKind::BlobDeleted { .. } => None,
+            | EventKind::BlobDeleted { .. }
+            | EventKind::BlobCropped { .. } => None,
         }
     }
 
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
     /// approval's input, a finished shell run's whole output; the same for
-    /// an imported call or result. A [`Full::Lost`] references none.
+    /// an imported call or result. A [`Full::Lost`] references none. A
+    /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
             full.as_ref().and_then(Full::blob).map(|b| (holds, b))
@@ -882,6 +910,7 @@ impl EventKind {
             EventKind::ShellFinished { output, .. } => {
                 (output.as_ref().map(|b| (BlobUse::ShellOutput, b)), None)
             }
+            EventKind::BlobCropped { holds, into, .. } => (Some((*holds, into)), None),
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::AgentMessage { .. }
@@ -1044,6 +1073,9 @@ pub mod limits {
     /// Most blobs and most shell runs in one
     /// [`StorageReport`](crate::StorageReport): the largest.
     pub const STORAGE_TOP_MAX: usize = 50;
+    /// Most [`LineSpan`](crate::LineSpan)s one
+    /// [`CropBlob`](crate::CommandKind::CropBlob) keeps.
+    pub const CROP_SPANS_MAX: usize = 64;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -1707,9 +1739,17 @@ pub enum CommandKind {
     },
     /// Delete the event blob `blob` from the server. The preview in its
     /// event stays. Logged as `BlobDeleted`. `UnknownBlob` when no event
-    /// references it, `BlobGone` when it was already deleted. Taken while
-    /// the disk is low or the server is stopping: it frees space.
+    /// references it, `BlobGone` when it was already deleted or cropped.
+    /// Taken while the disk is low or the server is stopping: it frees
+    /// space.
     DeleteBlob { blob: BlobId },
+    /// Replace the event blob `blob` with the lines `keep` names, as a new
+    /// blob. Only a tool output or a shell run's output. Logged as
+    /// `BlobCropped`. Refused like `DeleteBlob`, plus `NotCroppable` for a
+    /// blob that holds something else and `BadCrop` for spans that do not
+    /// fit its lines ([`crop::check_spans`], [`crop::crop`]). Taken while
+    /// the disk is low or the server is stopping: it frees space.
+    CropBlob { blob: BlobId, keep: Vec<LineSpan> },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1921,19 +1961,26 @@ pub enum RejectReason {
     /// context, a setting, a shell run) while the server's disk is below
     /// its free-space floor: the server has paused its agents until space
     /// is freed. Control (interrupts, stops, approval answers) is still
-    /// taken. Send it again once the server has room.
+    /// taken. Send it again once the server has room. Also a `CropBlob`
+    /// whose new blob found no room to be written.
     DiskLow,
     /// A command that would start new work (the same ones as [`DiskLow`](
     /// RejectReason::DiskLow)) while the server is stopping once its
     /// running turns and shell runs have ended. Control is still taken, so
     /// they can finish. Send it again once the server is back.
     ServerStopping,
-    /// `DeleteBlob.blob` is referenced by no event: a workdir blob, a lost
-    /// one, or an id the server never minted.
+    /// `DeleteBlob.blob` (or `CropBlob.blob`) is referenced by no event: a
+    /// workdir blob, a lost one, or an id the server never minted.
     UnknownBlob,
-    /// `DeleteBlob.blob` was referenced by an event, but it has already
-    /// been deleted.
+    /// `DeleteBlob.blob` (or `CropBlob.blob`) was referenced by an event,
+    /// but it has already been deleted or cropped.
     BlobGone,
+    /// `CropBlob.blob` holds neither a tool output nor a shell run's output.
+    NotCroppable,
+    /// `CropBlob.keep` does not fit the blob: empty, unsorted, overlapping,
+    /// a span of no lines, more than [`limits::CROP_SPANS_MAX`] spans, a
+    /// span past the blob's last line, or every line kept.
+    BadCrop,
 }
 
 impl RejectReason {

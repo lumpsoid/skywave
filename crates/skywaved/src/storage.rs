@@ -8,7 +8,10 @@
 //! and the blobs `event_blobs` (written with each append) ties to them; a
 //! shell run's is its `ShellOutput` events and its output, the finished
 //! run's blob or the running one's file. A deleted event blob has no
-//! `blobs` row, so it counts nowhere; its `event_blobs` row stays.
+//! `blobs` row, so it counts nowhere; its `event_blobs` row stays. A
+//! cropped one's replacement has an `event_blobs` row of its own, with the
+//! seq, session and holds of the event that referenced the original, so it
+//! counts where the original did.
 //!
 //! **Cost.** Summing a session's events reads every event, so a report
 //! costs the log's length. It runs on a connection of its own, one at a
@@ -251,12 +254,15 @@ fn shell_runs(tx: &rusqlite::Transaction<'_>) -> Result<Vec<ShellRunStorage>> {
         }
     }
     drop(stmt);
-    // Joined to `blobs`: a deleted output is neither counted nor offered.
+    // Only a stored output: a deleted one is neither counted nor offered.
+    // A cropped run has an `event_blobs` row per crop at its `ShellFinished`
+    // seq, and only the last crop's blob is stored, so the stored one is
+    // picked before the join: joining the rows would list the run once each.
     let mut stmt = tx.prepare(
-        "SELECT r.command_id, r.session_id, json_extract(e.kind, '$.command'), b.size, b.id
+        "SELECT r.command_id, r.session_id, json_extract(e.kind, '$.command'), o.size, o.id
          FROM shell_runs r JOIN events e ON e.seq = r.seq
-         LEFT JOIN event_blobs o ON o.seq = r.finished_seq AND o.holds = 'shell_output'
-         LEFT JOIN blobs b ON b.id = o.blob_id",
+         LEFT JOIN (SELECT b.id, b.size, x.seq FROM event_blobs x JOIN blobs b ON b.id = x.blob_id
+                    WHERE x.holds = 'shell_output') o ON o.seq = r.finished_seq",
     )?;
     let mut rows = stmt.query([])?;
     let mut runs = Vec::new();

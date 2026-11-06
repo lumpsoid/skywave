@@ -54,6 +54,7 @@ use crate::EventLog;
 use crate::agent::import::IMPORT_DEADLINE;
 use crate::agent::{NoOutsideConversations, OutsideConversations};
 use crate::api::{self, Api, CONVERSATIONS_TIMEOUT, PeerCert};
+use crate::crop::{CROP_DEADLINE, CropHook};
 use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::error::{Error, IoContext, Result};
@@ -74,8 +75,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// What a server reads besides its data dir. The default runs git from
 /// `PATH`, reads no outside conversations and imports within
-/// [`IMPORT_DEADLINE`], and gives a conversations listing
-/// [`CONVERSATIONS_TIMEOUT`].
+/// [`IMPORT_DEADLINE`], crops within [`CROP_DEADLINE`], and gives a
+/// conversations listing [`CONVERSATIONS_TIMEOUT`].
 pub struct ServerOptions {
     /// How workdir changes run git.
     pub git: Git,
@@ -92,7 +93,20 @@ pub struct ServerOptions {
     pub limits: ConnectionLimits,
     /// Where the daemon logs, `None` for stderr: the storage report sizes it.
     pub log_file: Option<PathBuf>,
+    /// How long a crop may take before the reply is a 503; tests shorten
+    /// it.
+    pub crop_deadline: Duration,
+    /// Run in every crop before it writes and when its thread ends; tests
+    /// hold, fail or follow crops with it. `None` in the daemon.
+    pub crop_hook: Option<Arc<dyn CropHook>>,
+    /// Run each time a request waits for another request's preparation of
+    /// the same command (an adopting create or a crop); tests know a resend
+    /// joined from it. `None` in the daemon.
+    pub joined_hook: Option<JoinedHook>,
 }
+
+/// [`ServerOptions::joined_hook`].
+pub type JoinedHook = Arc<dyn Fn() + Send + Sync>;
 
 impl Default for ServerOptions {
     fn default() -> Self {
@@ -103,6 +117,9 @@ impl Default for ServerOptions {
             conversations_timeout: CONVERSATIONS_TIMEOUT,
             limits: ConnectionLimits::DEFAULT,
             log_file: None,
+            crop_deadline: CROP_DEADLINE,
+            crop_hook: None,
+            joined_hook: None,
         }
     }
 }

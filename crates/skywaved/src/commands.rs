@@ -26,7 +26,8 @@
 //!   source;
 //! - `RunShell` → `ShellRequested` with the command verbatim;
 //! - `StopShell` → `ShellStopRequested`;
-//! - `DeleteBlob` → `BlobDeleted` with what the blob held.
+//! - `DeleteBlob` → `BlobDeleted` with what the blob held;
+//! - `CropBlob` → `BlobCropped` with what the blob held and the new blob.
 //!
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
@@ -49,8 +50,8 @@
 //! control the user needs while the agents are paused, or one small event
 //! that starts nothing, and is handled as usual: `ResolveApproval`,
 //! `Interrupt`, `StopSession`, `StopTask`, `StopShell`, `RenameSession`,
-//! `SetSessionArchived`, `SwitchContext` and `DeleteBlob` (freeing space is
-//! what a low disk needs). The refusal is stored like any
+//! `SetSessionArchived`, `SwitchContext`, `DeleteBlob` and `CropBlob`
+//! (freeing space is what a low disk needs). The refusal is stored like any
 //! other, so the command keeps it; the user sends the work again once the
 //! server has room.
 //!
@@ -67,9 +68,9 @@
 //! they make current; `ApprovalResolved` with the approval's context;
 //! `TurnInterrupted` with the context of the running turn, which after a
 //! switch is the old context until its agent reports the turn over;
-//! `ContextMoved` with the context it moves; `BlobDeleted` with the session
-//! and context of the event that referenced the blob; every other event
-//! with the session's current context.
+//! `ContextMoved` with the context it moves; `BlobDeleted` and
+//! `BlobCropped` with the session and context of the event that referenced
+//! the blob; every other event with the session's current context.
 //!
 //! **CreateSession.** Refused, in this order: the workdir must canonicalise
 //! under a root (`WorkdirNotAllowed`, `WorkdirNotFound`); then a
@@ -198,19 +199,66 @@
 //! store, leaves a file without a row, which the startup sweep removes
 //! ([`BlobStore::sweep`](crate::blobs::BlobStore::sweep)). The referencing
 //! event keeps its preview; nothing else in the log changes.
+//!
+//! **CropBlob.** Refused like `DeleteBlob`, then `NotCroppable` unless the
+//! blob holds a tool output or a shell run's output, then `BadCrop` for
+//! spans of the wrong shape ([`skywave_proto::crop::check_spans`]). The
+//! new blob is written before the transaction ([`crate::crop`]), which
+//! hands [`EventLog::handle_with`] either the new blob or the refusal the
+//! crop came to (`BadCrop` for spans that do not fit the content,
+//! `DiskLow` for no room), stored like any. The transaction records the
+//! new blob, deletes the old `blobs` row and appends `BlobCropped`;
+//! `kept` is `keep` as sent. The new blob's `event_blobs` row takes the
+//! old row's session, seq and holds ([`event_log::append_in`]), so it
+//! stands for the event that referenced the old one. The old file goes
+//! after the commit, like a deleted one's. Without a preparation (plain
+//! [`EventLog::handle`]) a crop that passes its checks is an error.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
-    Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision, DeviceId,
-    EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId, SessionOrigin,
-    check_conversation_id, context_name, limits, normalise_context_name,
+    BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
+    DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId,
+    SessionOrigin, check_conversation_id, context_name, limits, normalise_context_name,
 };
 
-use crate::agent::import::{self, Prepared};
+use crate::agent::import;
+use crate::crop;
 use crate::db::Db;
 use crate::dirs;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::event_log::{self, Closed, EventLog};
+
+/// What a command needs done before its transaction, off the database
+/// ([`EventLog::handle_with`]). Each owns the blob files it wrote and
+/// removes them when dropped unless its transaction committed them.
+#[derive(Debug)]
+pub enum Preparation {
+    /// An adopting `CreateSession`'s history ([`import::prepare`]).
+    Import(import::Prepared),
+    /// A `CropBlob`'s new blob ([`crop::prepare`]).
+    Crop(crop::Prepared),
+}
+
+impl Preparation {
+    fn kept(self) {
+        match self {
+            Preparation::Import(prepared) => prepared.kept(),
+            Preparation::Crop(prepared) => prepared.kept(),
+        }
+    }
+}
+
+impl From<import::Prepared> for Preparation {
+    fn from(prepared: import::Prepared) -> Preparation {
+        Preparation::Import(prepared)
+    }
+}
+
+impl From<crop::Prepared> for Preparation {
+    fn from(prepared: crop::Prepared) -> Preparation {
+        Preparation::Crop(prepared)
+    }
+}
 
 impl EventLog {
     /// Handles `command` from `device` and returns its result.
@@ -223,6 +271,8 @@ impl EventLog {
     /// Blocking: it runs SQLite and, for `CreateSession`, file system calls.
     /// An adopting `CreateSession` imports nothing here: its
     /// `ImportFinished` says `Unavailable` (see [`EventLog::handle_with`]).
+    /// A `CropBlob` that passes its checks needs its crop prepared: here it
+    /// is an error, and nothing is recorded.
     pub fn handle(
         &self,
         db: &mut Db,
@@ -232,21 +282,26 @@ impl EventLog {
         self.handle_with(db, device, command, None)
     }
 
-    /// [`EventLog::handle`], with the history an adopting `CreateSession`
-    /// imports, prepared beforehand off the database ([`import::prepare`]).
-    /// Its blob rows and `Imported` events are logged in the command's
-    /// transaction. It is logged only for an accepted adopting create whose
-    /// workdir canonicalises to the one it was read for; one that
-    /// canonicalises elsewhere now logs `Failed("workdir changed")`, and
-    /// with none the outcome is `Unavailable`. Whatever is not logged and
-    /// committed, a stored or refused command or a failed transaction
-    /// included, has its blob files removed.
+    /// [`EventLog::handle`], with what the command needs prepared
+    /// beforehand off the database: the history an adopting
+    /// `CreateSession` imports ([`import::prepare`]) or the new blob of a
+    /// `CropBlob` ([`crop::prepare`]).
+    ///
+    /// An import's blob rows and `Imported` events are logged in the
+    /// command's transaction. It is logged only for an accepted adopting
+    /// create whose workdir canonicalises to the one it was read for; one
+    /// that canonicalises elsewhere now logs `Failed("workdir changed")`,
+    /// and with none the outcome is `Unavailable`. A crop's new blob is
+    /// recorded, and its old one's row deleted, only if the old blob is
+    /// still stored; its old file goes after the commit. Whatever is not
+    /// logged and committed, a stored or refused command or a failed
+    /// transaction included, has its blob files removed.
     pub fn handle_with(
         &self,
         db: &mut Db,
         device: DeviceId,
         command: &Command,
-        mut prepared: Option<Prepared>,
+        mut prepared: Option<Preparation>,
     ) -> Result<CommandResult> {
         let tx = event_log::begin(db)?;
         if let Some(stored) = stored_result(&tx, command.id)? {
@@ -299,7 +354,7 @@ impl EventLog {
         tx: &Connection,
         device: DeviceId,
         command: &Command,
-        prepared: Option<&mut Prepared>,
+        prepared: Option<&mut Preparation>,
     ) -> Result<Result<Seq, RejectReason>> {
         // Read only for work, at most once per check interval: control
         // and an idle server read nothing.
@@ -344,16 +399,18 @@ impl EventLog {
                     // `ImportFinished` after it, the last event it appends.
                     event_log::append_in(tx, session, context, None, &kind)?;
                     let outcome = match prepared {
-                        Some(prepared) if prepared.workdir() == Some(workdir.as_str()) => {
+                        Some(Preparation::Import(prepared))
+                            if prepared.workdir() == Some(workdir.as_str()) =>
+                        {
                             prepared.log(tx, session, context)?
                         }
                         // Renamed or relinked since it was read: the history
                         // read may be another directory's. Or refused then
                         // and accepted now: nothing was read.
-                        Some(_) => ImportOutcome::Failed {
+                        Some(Preparation::Import(_)) => ImportOutcome::Failed {
                             reason: import::WORKDIR_CHANGED.to_owned(),
                         },
-                        None => ImportOutcome::Unavailable,
+                        None | Some(Preparation::Crop(_)) => ImportOutcome::Unavailable,
                     };
                     (session, context, EventKind::ImportFinished { outcome })
                 }
@@ -651,6 +708,38 @@ impl EventLog {
                 };
                 (row.session_id, row.context, kind)
             }
+            CommandKind::CropBlob { blob, keep } => {
+                let Some(row) = event_log::event_blob_in(tx, *blob)? else {
+                    return Ok(Err(RejectReason::UnknownBlob));
+                };
+                // Deleted, or cropped already, while this crop was
+                // prepared: its new blob goes with the preparation.
+                if !row.stored {
+                    return Ok(Err(RejectReason::BlobGone));
+                }
+                if !matches!(row.holds, BlobUse::ToolOutput | BlobUse::ShellOutput) {
+                    return Ok(Err(RejectReason::NotCroppable));
+                }
+                if !skywave_proto::crop::check_spans(keep) {
+                    return Ok(Err(RejectReason::BadCrop));
+                }
+                let Some(Preparation::Crop(prepared)) = prepared else {
+                    return Err(Error::Unprepared("CropBlob"));
+                };
+                let (into, lines) = match prepared.log(tx)? {
+                    Ok(cropped) => cropped,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                let kind = EventKind::BlobCropped {
+                    blob: *blob,
+                    holds: row.holds,
+                    into,
+                    kept: keep.clone(),
+                    lines,
+                    by: device,
+                };
+                (row.session_id, row.context, kind)
+            }
         };
         Ok(Ok(event_log::append_in(
             tx,
@@ -668,7 +757,8 @@ impl EventLog {
 /// command. Everything else is control the user needs while the agents are
 /// paused (an interrupt, a stop, an approval answer) or one small event
 /// that starts nothing (a rename, an archive, a switch to a context that
-/// exists, a blob deletion). Exhaustive, so a new command must be placed.
+/// exists, a blob deleted or cropped). Exhaustive, so a new command must be
+/// placed.
 fn starts_work(kind: &CommandKind) -> bool {
     match kind {
         CommandKind::CreateSession { .. }
@@ -688,7 +778,8 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::SetSessionArchived { .. }
         | CommandKind::SwitchContext { .. }
         // Freeing space is what a low disk needs.
-        | CommandKind::DeleteBlob { .. } => false,
+        | CommandKind::DeleteBlob { .. }
+        | CommandKind::CropBlob { .. } => false,
     }
 }
 

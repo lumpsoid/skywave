@@ -2747,7 +2747,7 @@ impl Model {
                 | EventKind::ShellFinished { .. } => None,
                 // Nothing in the timeline: what it changes is the content of
                 // the event that referenced the blob.
-                EventKind::BlobDeleted { .. } => None,
+                EventKind::BlobDeleted { .. } | EventKind::BlobCropped { .. } => None,
                 EventKind::Imported { at, item } => self
                     .imported(&mut items, &mut imported_calls, *at, item)
                     .map(|entry| Entry::Imported {
@@ -3384,7 +3384,8 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopShell { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. }
         | CommandKind::ResolveApproval { .. }
-        | CommandKind::DeleteBlob { .. } => None,
+        | CommandKind::DeleteBlob { .. }
+        | CommandKind::CropBlob { .. } => None,
     }
 }
 
