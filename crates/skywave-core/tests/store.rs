@@ -8,8 +8,8 @@ use chrono::{TimeZone, Utc};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
     BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
-    OutboxStatus, PairedCredentials, ReadMark, RunWhen, Settings, Snippet, SnippetId, Store,
-    StoreError,
+    OutboxStatus, PairedCredentials, PendingCrop, ReadMark, RunWhen, Settings, Snippet, SnippetId,
+    Store, StoreError,
 };
 use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
@@ -3388,22 +3388,21 @@ fn cropped(session: SessionId, minute: u32, blob: BlobId, into: &BlobRef, by: De
     )
 }
 
-/// `BlobCropped` and `BlobDeleted` keep the blob's fate and purge its row,
-/// held or not; a crop's `into` registers, unless the same batch crops it
-/// in turn, and a blob with a fate never registers again. Fates survive a
-/// reopen and go with the session's local delete and with a reset.
+/// `BlobCropped` and `BlobDeleted` keep the blob's fate and purge the row
+/// of a blob not held; a crop's `into` registers, unless the same batch
+/// crops it in turn, and a blob with a fate never registers again. Fates
+/// survive a reopen and go with the session's local delete and with a
+/// reset. (A held blob is kept for a local crop: see
+/// `blob_fates_keep_a_held_blob_for_its_local_crop`.)
 #[test]
 fn blob_fates_fold_purge_and_go_with_the_replica() {
     let log = Log::new();
     let (_tmp, dir) = data_dir();
     let mut store = Store::open(&dir).unwrap();
     store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
-    let held = BlobStatus::Available {
-        path: "blobs/x".into(),
-    };
-    store.set_blob_status(log.blob.id, &held).unwrap();
 
-    // A crop of a crop in one batch: the middle blob registers and goes.
+    // A crop of a crop in one batch, the original not downloaded: the
+    // middle blob registers and goes.
     let by = DeviceId::new();
     let (b1, b2) = (blob_ref(20, b"b1"), blob_ref(10, b"b2"));
     let applied = store
@@ -3420,7 +3419,9 @@ fn blob_fates_fold_purge_and_go_with_the_replica() {
         .unwrap();
     assert_eq!(applied.blobs, [b2.id], "only what is left is queued");
     assert_eq!(applied.purged, [log.blob.id, b1.id]);
-    assert_eq!(store.blob(log.blob.id).unwrap(), None, "the held copy went");
+    assert!(applied.local_crops.is_empty(), "nothing here to crop");
+    assert!(store.pending_crops().unwrap().is_empty());
+    assert_eq!(store.blob(log.blob.id).unwrap(), None);
     assert_eq!(store.blob(b1.id).unwrap(), None);
     assert_eq!(
         store.blob(b2.id).unwrap().map(|b| b.status),
@@ -3504,6 +3505,115 @@ fn blob_fates_fold_purge_and_go_with_the_replica() {
         store.blobs().unwrap().is_empty(),
         "the crop's blob went too"
     );
+}
+
+/// A crop of a crop in one batch, the original held (`Available`): the
+/// original's row stays for the local crops, both `into`s register but are
+/// not queued for a fetch, and the batch names both crops, in log order.
+/// The pending crops are derived from the replica (`pending_crops`, the
+/// snapshot), each ends once, purging the blob it was made from, and a
+/// delete of what a pending crop makes purges the blob it would read.
+#[test]
+fn blob_fates_keep_a_held_blob_for_its_local_crop() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let held = BlobStatus::Available {
+        path: "blobs/x".into(),
+    };
+    store.set_blob_status(log.blob.id, &held).unwrap();
+
+    let by = DeviceId::new();
+    let (b1, b2) = (blob_ref(20, b"b1"), blob_ref(10, b"b2"));
+    let applied = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![
+                    cropped(log.a, 8, log.blob.id, &b1, by),
+                    cropped(log.a, 9, b1.id, &b2, by),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    let (first, second) = (
+        PendingCrop {
+            into: b1.id,
+            from: log.blob.id,
+        },
+        PendingCrop {
+            into: b2.id,
+            from: b1.id,
+        },
+    );
+    assert!(applied.blobs.is_empty(), "nothing queued for a fetch");
+    assert!(applied.purged.is_empty(), "nothing purged yet");
+    assert_eq!(applied.local_crops, [first, second]);
+    assert_eq!(
+        store.blob(log.blob.id).unwrap().map(|b| b.status),
+        Some(held),
+        "the held copy stays"
+    );
+    for into in [&b1, &b2] {
+        assert_eq!(
+            store.blob(into.id).unwrap().map(|b| b.status),
+            Some(BlobStatus::NotDownloaded)
+        );
+    }
+    assert_eq!(store.pending_crops().unwrap(), [first, second]);
+    assert_eq!(store.blob_fates().unwrap().len(), 2);
+
+    // A replay changes nothing.
+    let again = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![
+                    cropped(log.a, 8, log.blob.id, &b1, by),
+                    cropped(log.a, 9, b1.id, &b2, by),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(again.blobs.is_empty() && again.purged.is_empty() && again.local_crops.is_empty());
+    drop(store);
+
+    // A reopen finds them pending still.
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(store.load().unwrap().pending_crops, [first, second]);
+
+    // The first crop ends, once: the original goes.
+    assert_eq!(store.end_local_crop(first).unwrap(), [log.blob.id]);
+    assert!(store.end_local_crop(first).unwrap().is_empty());
+    assert_eq!(store.blob(log.blob.id).unwrap(), None);
+    assert_eq!(store.pending_crops().unwrap(), [second]);
+
+    // A delete of the last blob before its crop ran purges both.
+    let applied = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(10),
+                events: vec![event(
+                    log.a,
+                    10,
+                    EventKind::BlobDeleted {
+                        blob: b2.id,
+                        holds: BlobUse::ToolOutput,
+                        by,
+                    },
+                )],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(applied.purged, [b2.id, b1.id]);
+    assert!(applied.local_crops.is_empty());
+    assert!(store.pending_crops().unwrap().is_empty());
+    assert!(store.end_local_crop(second).unwrap().is_empty());
+    assert!(store.blobs().unwrap().is_empty());
 }
 
 /// The fates migration adds its table to a populated replica, which then
