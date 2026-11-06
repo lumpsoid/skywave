@@ -31,6 +31,8 @@
 # `--resume 00000000-0000-0000-0000-000000000000` fails like an unknown id,
 # with `--fork-session` too (the parent is unknown; §5). A fork otherwise
 # runs as its `--session-id`, as the real CLI does.
+# `--permission-mode` sets the mode the CLI starts in, which the initialize
+# answer reports as `current_permission_mode`.
 # `set_permission_mode` and `set_model` are answered like the real CLI's
 # (§3.7): bypassPermissions is refused unless the CLI was launched with
 # --allow-dangerously-skip-permissions (§3.6), and the model "bogus" is.
@@ -62,6 +64,7 @@ for arg in "$@"; do
   case "$prev" in
     --session-id) sid="$arg" ;;
     --resume) resume="$arg" ;;
+    --permission-mode) mode="$arg" ;;
     --fake-version) version="$arg" ;;
   esac
   case "$arg" in
@@ -107,7 +110,7 @@ tool_result() {
 while IFS= read -r line; do
   case "$line" in
     *'"subtype":"initialize"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":{"email":"user@example.com"},"session_state":"idle"}}}\n' "$(reqid "$line")" "$version"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"%s","account":{"email":"user@example.com"},"current_permission_mode":"%s","session_state":"idle"}}}\n' "$(reqid "$line")" "$version" "$mode"
       ;;
     *'"subtype":"interrupt"'*)
       ack "$line"

@@ -556,9 +556,18 @@ thinking capabilities are not used.
   `…Refused`, naming the command (`answers`). A session whose agent is not
   running is started for it (no message, so no model call).
 - Every agent start asks for the mode, model and effort the log wants (the
-  open request, else what the agent last ran with), in that order, with
-  these same control requests after `initialize`, so a resumed or restarted
-  process keeps all three (§3.2: they die with the process otherwise).
+  open request, else what the agent last ran with), so a resumed or
+  restarted process keeps all three (§3.2: they die with the process
+  otherwise). The mode is the start flag `--permission-mode <mode>`
+  (replacing a `setMode` grant's, §3.2), and the `initialize` answer's
+  `current_permission_mode` answers it: `PermissionModeChanged` when it is
+  that mode, else `PermissionModeRefused` and the mode it is. Asked after
+  `initialize` instead, the CLI would first report `default`, logged as a
+  change to `ask` and back on every start. **[C]** with 2.1.310:
+  `--permission-mode auto` makes `initialize` report `auto`, and of two
+  `--permission-mode` flags the last wins. Bypass is never a start flag
+  (§3.6): it, then the model and the effort, are asked for in that order
+  with these same control requests after `initialize`.
 - What the CLI says unasked is logged when it differs from the log:
   `current_permission_mode` from `initialize`, `permissionMode` and `model`
   from each `system/init`, and a `system/status` that is not the echo of a
