@@ -450,6 +450,49 @@ pub enum Screen {
     Usage(UsageView),
     Storage(StorageView),
     Workdir(WorkdirView),
+    Crop(CropView),
+}
+
+/// The page choosing which lines of a blob's content to keep
+/// ([`Action::OpenCrop`](crate::Action::OpenCrop)). It holds no content:
+/// a head reads the lines it shows from [`CropContent::Ready`]'s `path`
+/// through a [`LineIndex`](crate::LineIndex).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CropView {
+    /// The blob a crop names ([`BlobView::id`]).
+    pub blob: BlobId,
+    pub session: SessionId,
+    pub holds: BlobUse,
+    /// The item's title, or the run's command line, as the head opened it.
+    pub title: String,
+    pub content: CropContent,
+    /// The selection ([`Action::SetCropKeep`](crate::Action::SetCropKeep)),
+    /// as the head gave it; empty until chosen.
+    pub keep: Vec<LineSpan>,
+    /// This device's own delete or crop of the blob, as
+    /// [`BlobView::pending`] shows it.
+    pub pending: Option<BlobPending>,
+}
+
+/// Where the content a [`CropView`] chooses lines of stands on this device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CropContent {
+    /// This device doesn't hold the content, and opening the page
+    /// downloads nothing: [`Action::DownloadBlob`](crate::Action::DownloadBlob)
+    /// does. The state shows `NotDownloaded`, then its progress (paused
+    /// offline), or a failure to retry.
+    NotHere(BlobState),
+    /// Held; its lines are being counted.
+    Counting,
+    /// Held, with `lines` lines as a crop counts them
+    /// ([`skywave_proto::crop::count`]).
+    Ready { path: PathBuf, lines: u32 },
+    /// Held, but its file could not be read to count its lines; opening the
+    /// page again counts again.
+    Unreadable { reason: String },
+    /// Deleted or cropped meanwhile (a fate arrived), or gone from this
+    /// replica: nothing to crop here.
+    Gone,
 }
 
 /// Where the workdir screen is ([`Action::ShowWorkdir`](crate::Action::ShowWorkdir)).

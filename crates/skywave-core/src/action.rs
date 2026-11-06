@@ -2,8 +2,8 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CallId, CommandId, ComposerMode, ContextId, Decision, Effort, LineSpan,
-    PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId, WorkdirPane,
+    ApprovalId, BlobId, BlobUse, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
+    LineSpan, PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId, WorkdirPane,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +300,20 @@ pub enum Action {
         blob: BlobId,
         keep: Vec<LineSpan>,
     },
+    /// Show the page choosing which lines of `blob` to keep
+    /// ([`Screen::Crop`](crate::Screen::Crop)), from the item or storage row
+    /// naming it: `blob` as [`Action::CropBlob`] names it, the `session`
+    /// and what it `holds`, and the `title` the page shows. Downloads
+    /// nothing. Back returns to the session on screen, or to the storage
+    /// screen if it was opened there.
+    OpenCrop {
+        blob: BlobId,
+        session: SessionId,
+        holds: BlobUse,
+        title: String,
+    },
+    /// The crop page's selection, stored as given. A no-op elsewhere.
+    SetCropKeep(Vec<LineSpan>),
     SetBlobPolicy(BlobPolicy),
     /// While the link is `Reconnecting`, skip the rest of the wait and
     /// reconnect now. The attempt count and `offline_since` carry on.
@@ -318,7 +332,8 @@ pub enum Action {
     /// the agent that launched it, a workdir file to its directory, a diff
     /// to the changes, a directory to its parent, the changes or the
     /// workdir itself to the session, a session to the list it is on, the
-    /// archived list, settings and re-pairing to the active list. A no-op
+    /// archived list, settings and re-pairing to the active list, the crop
+    /// page to where it was opened. A no-op
     /// where [`ViewState::can_go_back`](crate::ViewState::can_go_back) is
     /// false (the active list, pairing an unpaired device): there back
     /// leaves the app, which is the head's to do.

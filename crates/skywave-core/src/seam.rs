@@ -92,6 +92,14 @@ pub enum Request {
         req: u64,
         ask: WorkdirAsk,
     },
+    /// Count the lines of the downloaded blob at `path`, for the crop page,
+    /// as a crop counts them ([`skywave_proto::crop::count`]), off the
+    /// model's thread: up to 64 MiB are read. Answer with
+    /// [`Seam::lines_counted`], naming `req`.
+    CountLines {
+        req: u64,
+        path: PathBuf,
+    },
 }
 
 /// Engine-side handle to a [`Core`]; see the module docs.
@@ -512,6 +520,19 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state| {
                 state.model.storage_reported(req, result);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::CountLines`] `req`, an error when the file
+    /// could not be read. Kept in memory only; an answer to any request but
+    /// the one the crop page on screen waits on is ignored.
+    pub fn lines_counted(&self, req: u64, result: std::io::Result<u64>) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.lines_counted(req, result);
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});

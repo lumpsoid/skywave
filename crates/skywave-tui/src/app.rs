@@ -2092,6 +2092,11 @@ impl App {
             },
             Screen::Session(_) => self.session_key(key, ctrl),
             Screen::Workdir(_) => self.workdir_key(key),
+            Screen::Crop(_) => match key.code {
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            },
             Screen::Usage(_) => {
                 let usage = &mut self.ui.usage;
                 match key.code {

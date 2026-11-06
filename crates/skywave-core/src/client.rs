@@ -613,6 +613,12 @@ impl Shared {
             let mut state = lock(&self.state);
             let result = change(&mut state);
             state.version += 1;
+            // Whatever made the crop page's blob available (a download, a
+            // local crop, opening the page), its count is asked here, once.
+            // Sent whether or not the change failed: the model counts on it.
+            if let Some(count) = state.model.count_wanted() {
+                self.requests.send(count);
+            }
             result.map(|(value, requests)| {
                 for request in requests {
                     self.requests.send(request);

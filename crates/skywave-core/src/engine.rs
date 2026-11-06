@@ -458,6 +458,17 @@ impl Engine {
                     answer_workdir(&seam, req, ask, result);
                 });
             }
+            Request::CountLines { req, path } => {
+                let seam = self.seam.clone();
+                self.seam.spawn("a line count", async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        skywave_proto::crop::count(std::fs::File::open(path)?)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
+                    seam.lines_counted(req, result);
+                });
+            }
         }
     }
 
