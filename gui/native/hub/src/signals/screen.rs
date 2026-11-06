@@ -1,6 +1,7 @@
 use rinf::{RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
 
+use super::crop::{BlobTargetView, CropScreen};
 use super::timeline::{OutgoingView, SectionView, ToolKindView};
 use super::workdir::WorkdirScreen;
 
@@ -127,6 +128,11 @@ pub enum ScreenView {
     Workdir {
         workdir: WorkdirScreen,
     },
+    /// Which lines of an output to keep (`OpenCrop`); back returns to the
+    /// session or storage screen it was opened from.
+    Crop {
+        crop: CropScreen,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SignalPiece)]
@@ -169,6 +175,9 @@ pub struct StorageRowView {
     pub detail: String,
     /// `2.0 MiB`.
     pub size: String,
+    /// The blob a blob or shell run row stands for, and what may be done
+    /// to it; `None` for a session row and a run kept as no blob.
+    pub target: Option<BlobTargetView>,
 }
 
 /// One line of the usage screen: a day, session, directory or model, or

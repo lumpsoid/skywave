@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
@@ -185,14 +186,22 @@ class ShellRunTile extends StatelessWidget {
                 child: Row(
                   children: [
                     Expanded(
-                      child: output == null
-                          ? const SizedBox.shrink()
-                          : Text(
-                              'whole output · ${output.label}',
-                              style: theme.textTheme.labelSmall?.copyWith(
-                                color: colors.muted,
-                              ),
-                            ),
+                      child: switch ((output, run.outputNote)) {
+                        (final output?, _) => Text(
+                          'whole output · ${output.label}',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: colors.muted,
+                          ),
+                        ),
+                        (null, final note?) => Text(
+                          note,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: colors.muted,
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                        _ => const SizedBox.shrink(),
+                      },
                     ),
                     if (output != null && output.canDownload)
                       TextButton(
@@ -201,6 +210,8 @@ class ShellRunTile extends StatelessWidget {
                         ),
                         child: const Text('Download'),
                       ),
+                    if (run.target case final target?)
+                      BlobMenu(target: target, send: send),
                     TextButton(
                       key: Key('shell-show-${run.key}'),
                       onPressed: () => showShellOutput(

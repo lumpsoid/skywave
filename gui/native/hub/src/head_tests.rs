@@ -1761,6 +1761,7 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
             label: rows[0].label.clone(),
             detail: "2 events · 2.0 KiB in the log · no blobs".into(),
             size: "2.0 KiB".into(),
+            target: None,
         }
     );
     assert_eq!(empty, None);
@@ -4102,5 +4103,435 @@ mod workdir {
                 Action::RefreshWorkdir,
             ]
         );
+    }
+}
+
+mod blob_actions {
+    use skywave_core::{BlobId, LineSpan};
+    use skywave_present::blob_actions::{DELETE_CONFIRMATION, crop_confirmation};
+
+    use super::*;
+    use crate::signals::{
+        BlobTargetView, BlobUseView, CropContentKind, CropLine, CropLinesUpdate, CropPresetView,
+        CropScreen, LineSpanView,
+    };
+
+    fn span(first: u32, count: u32) -> LineSpanView {
+        LineSpanView { first, count }
+    }
+
+    fn core_span(first: u32, count: u32) -> LineSpan {
+        LineSpan { first, count }
+    }
+
+    fn act(rig: &mut Rig, action: ActionIntent) -> Vec<Out> {
+        let mut outs = rig.intent(GuiIntent::Act { action });
+        outs.extend(rig.results());
+        outs.extend(rig.view());
+        outs
+    }
+
+    fn crop_screen(rig: &Rig) -> CropScreen {
+        match &rig.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Crop { crop } => crop.clone(),
+            other => panic!("not the crop page: {other:?}"),
+        }
+    }
+
+    fn crop_lines(outs: &[Out]) -> Vec<CropLinesUpdate> {
+        outs.iter()
+            .filter_map(|out| match out {
+                Out::CropLines(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A finished run of `make` by this device whose 60-line output is
+    /// downloaded; its id and the blob's.
+    fn downloaded_run(rig: &mut Rig) -> (CommandId, BlobId) {
+        rig.switch_to_shell();
+        let blob = skywave_proto::BlobId::new();
+        let output = skywave_proto::BlobRef {
+            id: blob,
+            size: 400,
+            sha256: skywave_proto::ContentHash::of(b""),
+        };
+        let run = rig.finished_run("make", "line 59\nline 60", 60, Some(output));
+        let mut text = String::from("\x1b[1mline 1\x1b[0m\nline\t2\n");
+        for n in 3..=60 {
+            text.push_str(&format!("line {n}\n"));
+        }
+        let path = rig._dir.path().join("make-output");
+        std::fs::write(&path, text).unwrap();
+        rig.seam
+            .blob_status(blob, skywave_core::BlobStatus::Available { path })
+            .unwrap();
+        rig.view();
+        (run, blob)
+    }
+
+    #[test]
+    fn a_runs_output_offers_a_crop_and_a_delete_with_its_question() {
+        let mut rig = Rig::new();
+        let (_, blob) = downloaded_run(&mut rig);
+        assert_eq!(
+            rig.runs()[0].target,
+            Some(BlobTargetView {
+                blob_id: blob.0.to_string(),
+                can_crop: true,
+                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                pending_note: None,
+                discard_id: None,
+                session_id: rig.session.0.to_string(),
+                holds: BlobUseView::ShellOutput,
+                title: "make".into(),
+            })
+        );
+        assert_eq!(rig.runs()[0].output_note, None);
+    }
+
+    #[test]
+    fn the_crop_page_sends_its_lines_a_window_at_a_time_and_each_intent_its_action() {
+        let mut rig = Rig::new();
+        let requests = rig.seam.take_requests().unwrap();
+        let (_, blob) = downloaded_run(&mut rig);
+        let target = rig.runs()[0].target.clone().unwrap();
+        rig.actions.clear();
+
+        let outs = act(
+            &mut rig,
+            ActionIntent::OpenCrop {
+                blob_id: target.blob_id.clone(),
+                session_id: target.session_id.clone(),
+                holds: target.holds,
+                title: target.title.clone(),
+            },
+        );
+        assert_eq!(
+            rig.actions,
+            [Action::OpenCrop {
+                blob,
+                session: rig.session,
+                holds: skywave_core::BlobUse::ShellOutput,
+                title: "make".into(),
+            }]
+        );
+        let page = crop_screen(&rig);
+        assert_eq!(page.content, CropContentKind::Counting);
+        assert_eq!(page.message.as_deref(), Some("Counting its lines…"));
+        assert!(crop_lines(&outs).is_empty(), "no window asked for");
+
+        let req = requests
+            .try_iter()
+            .find_map(|r| match r {
+                skywave_core::Request::CountLines { req, .. } => Some(req),
+                _ => None,
+            })
+            .expect("the core asked for a count");
+        rig.seam.lines_counted(req, Ok(60));
+        rig.view();
+        let page = crop_screen(&rig);
+        assert_eq!(
+            (page.content, page.lines, page.message),
+            (CropContentKind::Ready, 60, None)
+        );
+        assert_eq!(
+            page.presets,
+            [
+                CropPresetView {
+                    label: "First 50".into(),
+                    keep: vec![span(0, 50)],
+                },
+                CropPresetView {
+                    label: "Last 50".into(),
+                    keep: vec![span(10, 50)],
+                },
+            ]
+        );
+        assert_eq!(page.keeps_label.as_deref(), Some("keeps 0 of 60 lines"));
+        assert!(!page.can_crop && page.confirmation.is_none());
+
+        // A window: those lines alone, stripped and cleaned one by one.
+        let outs = rig.intent(GuiIntent::CropLines { from: 0, count: 3 });
+        let line = |index, text: &str, kept| CropLine {
+            index,
+            text: text.into(),
+            kept,
+        };
+        assert_eq!(
+            crop_lines(&outs),
+            [CropLinesUpdate {
+                blob_id: blob.0.to_string(),
+                from: 0,
+                lines: vec![
+                    line(0, "line 1", false),
+                    line(1, "line    2", false),
+                    line(2, "line 3", false),
+                ],
+                error: None,
+            }]
+        );
+        // Past the end, cut to the lines there are.
+        let outs = rig.intent(GuiIntent::CropLines {
+            from: 58,
+            count: 10,
+        });
+        let window = &crop_lines(&outs)[0];
+        assert_eq!((window.from, window.lines.len()), (58, 2));
+        assert_eq!(window.lines[1], line(59, "line 60", false));
+        rig.intent(GuiIntent::CropLines { from: 0, count: 3 });
+
+        // A preset: its spans, normalised, and the window marks them.
+        rig.actions.clear();
+        let outs = act(
+            &mut rig,
+            ActionIntent::SetCropKeep {
+                keep: vec![span(40, 10), span(0, 45)],
+            },
+        );
+        assert_eq!(rig.actions, [Action::SetCropKeep(vec![core_span(0, 50)])]);
+        let page = crop_screen(&rig);
+        assert_eq!(page.keep, [span(0, 50)]);
+        assert_eq!(page.keeps_label.as_deref(), Some("keeps 50 of 60 lines"));
+        assert!(page.can_crop);
+        assert_eq!(page.confirmation, Some(crop_confirmation(50, 60)));
+        let marked: Vec<bool> = crop_lines(&outs)[0].lines.iter().map(|l| l.kept).collect();
+        assert_eq!(marked, [true, true, true]);
+
+        // Two taps before the core's view of the first: the second builds
+        // on the first.
+        rig.actions.clear();
+        rig.intent(GuiIntent::CropToggle { first: 1, last: 1 });
+        rig.intent(GuiIntent::CropToggle { first: 2, last: 2 });
+        assert_eq!(
+            rig.actions,
+            [
+                Action::SetCropKeep(vec![core_span(0, 1), core_span(2, 48)]),
+                Action::SetCropKeep(vec![core_span(0, 1), core_span(3, 47)]),
+            ]
+        );
+        rig.results();
+        let outs = rig.view();
+        let marked: Vec<bool> = crop_lines(&outs)[0].lines.iter().map(|l| l.kept).collect();
+        assert_eq!(marked, [true, false, false]);
+        // A range, in either order, all kept: taken out.
+        rig.actions.clear();
+        rig.intent(GuiIntent::CropToggle { first: 9, last: 3 });
+        assert_eq!(
+            rig.actions,
+            [Action::SetCropKeep(vec![
+                core_span(0, 1),
+                core_span(10, 40)
+            ])]
+        );
+        rig.results();
+        rig.view();
+
+        // The confirmed crop: its spans, and the page leaves.
+        let keep = crop_screen(&rig).keep;
+        rig.actions.clear();
+        act(
+            &mut rig,
+            ActionIntent::CropBlob {
+                blob_id: blob.0.to_string(),
+                keep,
+            },
+        );
+        assert_eq!(
+            rig.actions,
+            [Action::CropBlob {
+                blob,
+                keep: vec![core_span(0, 1), core_span(10, 40)],
+            }]
+        );
+        assert!(
+            matches!(
+                rig.head.sent.screen.as_ref().unwrap().screen,
+                ScreenView::Session { .. }
+            ),
+            "back on the session"
+        );
+        // The run now says its crop is on its way, and offers nothing.
+        let target = rig.runs()[0].target.clone().unwrap();
+        assert_eq!(target.pending_note.as_deref(), Some("Crop queued"));
+        assert!(!target.can_crop && target.delete_question.is_none());
+    }
+
+    #[test]
+    fn a_storage_blob_row_carries_its_target_and_a_session_row_none() {
+        use crate::signals::StorageGroupingView;
+
+        let mut rig = Rig::new();
+        let requests = rig.seam.take_requests().unwrap();
+        rig.online_on_the_list();
+        act(
+            &mut rig,
+            ActionIntent::Navigate {
+                route: RouteView::Storage,
+            },
+        );
+        let req = requests
+            .try_iter()
+            .find_map(|r| match r {
+                skywave_core::Request::Storage { req } => Some(req),
+                _ => None,
+            })
+            .expect("the core asked for the report");
+        let blob = skywave_proto::BlobId::new();
+        rig.seam.storage_reported(
+            req,
+            Ok(skywave_proto::StorageReport {
+                database: 0,
+                event_blobs: 0,
+                workdir_blobs: 0,
+                shell_running: 0,
+                log_file: None,
+                free: None,
+                min_free: 0,
+                sessions: vec![skywave_proto::SessionStorage {
+                    session: rig.session,
+                    events: 2,
+                    event_bytes: 2048,
+                    blobs: 1,
+                    blob_bytes: 4096,
+                }],
+                blobs: vec![skywave_proto::BlobStorage {
+                    id: blob,
+                    size: 4096,
+                    session: rig.session,
+                    seq: Seq(7),
+                    holds: skywave_proto::BlobUse::ToolOutput,
+                }],
+                shell_runs: Vec::new(),
+            }),
+        );
+        rig.view();
+        let rows = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+            ScreenView::Storage { rows, .. } => rows.clone(),
+            other => panic!("not the storage screen: {other:?}"),
+        };
+        assert_eq!(rows(&rig)[0].target, None, "a session row");
+
+        rig.intent(GuiIntent::StorageShow {
+            grouping: StorageGroupingView::Blobs,
+        });
+        rig.view();
+        let target = rows(&rig)[0].target.clone().expect("a blob row's target");
+        assert_eq!(
+            target,
+            BlobTargetView {
+                blob_id: blob.0.to_string(),
+                can_crop: true,
+                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                pending_note: None,
+                discard_id: None,
+                session_id: rig.session.0.to_string(),
+                holds: BlobUseView::ToolOutput,
+                title: format!("{} · tool output", rows(&rig)[0].label),
+            }
+        );
+    }
+
+    #[test]
+    fn an_output_not_here_offers_its_download_and_no_lines() {
+        let mut rig = Rig::new();
+        rig.switch_to_shell();
+        let blob = skywave_proto::BlobId::new();
+        let output = skywave_proto::BlobRef {
+            id: blob,
+            size: 4096,
+            sha256: skywave_proto::ContentHash::of(b""),
+        };
+        rig.finished_run("make", "a\nb", 90, Some(output));
+        rig.intent(GuiIntent::Act {
+            action: ActionIntent::SetBlobPolicy {
+                policy: crate::signals::BlobPolicyChoice::OnDemand,
+            },
+        });
+        let target = rig.runs()[0].target.clone().unwrap();
+        act(
+            &mut rig,
+            ActionIntent::OpenCrop {
+                blob_id: target.blob_id,
+                session_id: target.session_id,
+                holds: target.holds,
+                title: target.title,
+            },
+        );
+        let page = crop_screen(&rig);
+        assert_eq!(page.content, CropContentKind::NotHere);
+        assert_eq!(
+            page.message.as_deref(),
+            Some("This output isn't on this device. Download 4.0 KiB to choose lines.")
+        );
+        let download = page.download.expect("its download");
+        assert!(download.can_download, "{download:?}");
+        assert_eq!(download.blob_id, blob.0.to_string());
+        assert!(page.presets.is_empty() && page.keeps_label.is_none() && !page.can_crop);
+        let outs = rig.intent(GuiIntent::CropLines { from: 0, count: 10 });
+        assert!(crop_lines(&outs).is_empty(), "nothing to read");
+    }
+
+    #[test]
+    fn a_tool_outputs_delete_is_its_action_and_its_pending_delete_discards() {
+        let mut rig = Rig::new();
+        let (kinds, output) = an_edit();
+        rig.log(kinds);
+        let row = rig
+            .rows()
+            .iter()
+            .find(|r| r.blob_target.is_some())
+            .expect("the edit's output is a target")
+            .clone();
+        let target = row.blob_target.unwrap();
+        assert_eq!(target.blob_id, output.0.to_string());
+        assert_eq!(target.holds, BlobUseView::ToolOutput);
+        assert!(target.can_crop);
+
+        rig.actions.clear();
+        act(
+            &mut rig,
+            ActionIntent::DeleteBlob {
+                blob_id: target.blob_id.clone(),
+            },
+        );
+        assert_eq!(rig.actions, [Action::DeleteBlob(output)]);
+        let pending = rig
+            .rows()
+            .iter()
+            .find_map(|r| r.blob_target.clone())
+            .unwrap();
+        assert_eq!(pending.pending_note.as_deref(), Some("Delete queued"));
+        assert!(!pending.can_crop && pending.delete_question.is_none());
+        let discard = pending.discard_id.expect("discardable while queued");
+
+        rig.actions.clear();
+        act(
+            &mut rig,
+            ActionIntent::Discard {
+                command_id: discard.clone(),
+            },
+        );
+        assert_eq!(
+            rig.actions,
+            [Action::Discard(intents::id("command", &discard).unwrap())]
+        );
+        let back = rig
+            .rows()
+            .iter()
+            .find_map(|r| r.blob_target.clone())
+            .unwrap();
+        assert_eq!(back, target, "the offers return");
+
+        // A malformed id is an error, not an action.
+        rig.actions.clear();
+        let outs = rig.intent(GuiIntent::Act {
+            action: ActionIntent::DeleteBlob {
+                blob_id: "nope".into(),
+            },
+        });
+        assert_eq!(errors(&outs), ["not a blob id: \"nope\""]);
+        assert!(rig.actions.is_empty());
     }
 }

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/crop/crop_page.dart';
 import 'package:skywave_gui/holders.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_banner.dart';
@@ -134,6 +135,12 @@ class ScreenNavigator extends StatelessWidget {
         ),
         ScreenViewWorkdir(:final workdir) => WorkdirPage(
           screen: workdir,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        ScreenViewCrop(:final crop) => CropPage(
+          screen: crop,
+          lines: holders.cropLines,
           canGoBack: update.canGoBack,
           send: send,
         ),

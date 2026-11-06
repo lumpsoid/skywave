@@ -13,9 +13,13 @@
 //! - [`search`]: the timeline search (`SearchUpdate`).
 //! - [`shell`]: the open session's shell runs, snapshot then keyed diffs.
 //! - [`workdir`]: the workdir screen's data (`ScreenView::Workdir`).
+//! - [`crop`]: the crop page (`ScreenView::Crop`), its line windows
+//!   (`CropLinesUpdate`), and the blob a delete or crop names
+//!   (`BlobTargetView`).
 //! - [`effects`]: one-shot platform effects (`PlatformEffect`).
 
 mod boot;
+mod crop;
 mod effects;
 mod intents;
 mod link;
@@ -26,6 +30,10 @@ mod timeline;
 mod workdir;
 
 pub use boot::{Boot, BootFailed, Booted, HubFailed};
+pub use crop::{
+    BlobTargetView, BlobUseView, CropContentKind, CropLine, CropLinesUpdate, CropPresetView,
+    CropScreen, LineSpanView,
+};
 pub use effects::PlatformEffect;
 pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, RouteView};
 pub use link::{LinkState, LinkUpdate};

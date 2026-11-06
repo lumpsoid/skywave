@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
@@ -245,6 +246,11 @@ class RowTile extends StatelessWidget {
             onOpenFull: section.blob == null
                 ? null
                 : () => send(GuiIntentOpenFull(blobId: section.blob!.blobId)),
+            blobMenu: switch (row.blobTarget) {
+              final target? when section.blob?.blobId == target.blobId =>
+                BlobMenu(target: target, send: send),
+              _ => null,
+            },
           ),
         ),
     ];

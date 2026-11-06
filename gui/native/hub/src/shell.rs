@@ -21,6 +21,9 @@ use skywave_present::output::{
 use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
 use skywave_present::text::{clean_line, clean_text};
 
+use skywave_present::sections::deleted_note;
+
+use crate::crop::run_target_view;
 use crate::timeline::{blob_facts, outgoing_view};
 
 /// The downloaded outputs expanded rows showed, by blob, as `whole` holds
@@ -69,6 +72,7 @@ pub fn rows(
         .iter()
         .map(|run| {
             let mut row = row(run, now);
+            row.target = run_target_view(run, view.id);
             if expanded.contains(&run.run) {
                 row.expanded = true;
                 (row.whole, row.whole_note) = whole(run, outputs);
@@ -136,6 +140,11 @@ fn row(run: &ShellRun, now: DateTime<Utc>) -> ShellRunRow {
         tail: clean_text(&run.tail_or_preview),
         lines: output_lines(run),
         output: run.output.as_ref().and_then(FullView::blob).map(blob_facts),
+        output_note: match &run.output {
+            Some(FullView::Deleted { by }) => Some(deleted_note(by)),
+            _ => None,
+        },
+        target: None,
         truncated: run.truncated,
         expanded: false,
         whole: None,
@@ -300,6 +309,8 @@ mod tests {
             tail: String::new(),
             lines: 0,
             output: None,
+            output_note: None,
+            target: None,
             truncated: false,
             expanded: false,
             whole: None,

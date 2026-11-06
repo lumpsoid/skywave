@@ -41,7 +41,7 @@ use crate::signals::{
 use skywave_present::text::clean_line;
 
 use crate::timeline::{key_string, outgoing_view, preview_view, tool_kind};
-use crate::workdir;
+use crate::{crop, workdir};
 
 /// Most lines of the gated call's content the approval panel shows.
 pub const APPROVAL_LINES: usize = 10;
@@ -92,17 +92,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
-        // The GUI opens no crop page yet: its own screen comes with the
-        // page. Until then an empty storage screen stands in for it.
-        Screen::Crop(_) => storage_view(
-            &StorageView {
-                status: skywave_core::StorageStatus::Loading,
-                report: None,
-                titles: Default::default(),
-                pending: Default::default(),
-            },
-            ui.storage,
-        ),
+        Screen::Crop(crop) => crop::screen(crop),
     };
     ScreenUpdate {
         screen,
@@ -873,10 +863,16 @@ fn usage_view(view: &UsageView, (span, grouping): (Span, Grouping), wall_ms: i64
 fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
     let rows: Vec<StorageRowView> = storage::rows(view, grouping)
         .into_iter()
-        .map(|row| StorageRowView {
+        .enumerate()
+        .map(|(at, row)| StorageRowView {
             label: clean_line(&row.label),
             detail: clean_line(&row.detail),
             size: row.size,
+            target: row
+                .actions
+                .and_then(|_| storage::row_target(view, grouping, at))
+                .as_ref()
+                .map(crop::target_view),
         })
         .collect();
     ScreenView::Storage {

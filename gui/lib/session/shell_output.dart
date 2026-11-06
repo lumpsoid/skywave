@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/look.dart';
 import 'package:skywave_gui/session/shell_holder.dart';
@@ -30,8 +31,9 @@ Future<void> showShellOutput(
 }
 
 /// One run's whole output, ANSI stripped, as its row carries it: line by
-/// line, selectable, with a copy of all of it. While the output is still
-/// downloading, where that stands and its Download button.
+/// line, selectable, with a copy of all of it and its delete and crop
+/// menu. While the output is still downloading, where that stands and its
+/// Download button.
 class ShellOutputView extends StatelessWidget {
   const ShellOutputView({
     required this.sessionId,
@@ -77,6 +79,14 @@ class ShellOutputView extends StatelessWidget {
                       ),
                 icon: const Icon(Icons.copy),
               ),
+              if (run?.target case final target?)
+                BlobMenu(
+                  target: target,
+                  send: send,
+                  // This view is a dialog over the session: it would
+                  // cover the crop page.
+                  beforeCrop: () => Navigator.of(context).pop(),
+                ),
             ],
           ),
           body: run == null

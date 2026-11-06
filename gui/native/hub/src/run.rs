@@ -414,6 +414,7 @@ fn perform(outs: Vec<Out>, hub: &Running, shown: &mut Option<&'static str>) {
             Out::Timeline(update) => update.send_signal_to_dart(),
             Out::Shell(update) => update.send_signal_to_dart(),
             Out::Search(update) => update.send_signal_to_dart(),
+            Out::CropLines(update) => update.send_signal_to_dart(),
             Out::Effect(effect) => effect.send_signal_to_dart(),
             Out::Dispatch(tag, action) => {
                 tracing::debug!(tag, ?action, "dispatch");
@@ -445,6 +446,7 @@ fn screen_kind(update: &ScreenUpdate) -> &'static str {
         ScreenView::Usage { .. } => "usage",
         ScreenView::Storage { .. } => "storage",
         ScreenView::Workdir { .. } => "workdir",
+        ScreenView::Crop { .. } => "crop",
     }
 }
 

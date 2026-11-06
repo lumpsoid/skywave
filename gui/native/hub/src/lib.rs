@@ -16,6 +16,7 @@
 
 mod boot;
 mod clip;
+mod crop;
 pub mod dispatcher;
 mod head;
 mod intents;
