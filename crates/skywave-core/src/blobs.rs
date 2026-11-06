@@ -85,6 +85,29 @@
 //! for the same id, which then stays queued, and after any earlier one,
 //! which it drops.
 //!
+//! **Local crops.** A server crop of a blob this device holds (available,
+//! or itself the `into` of a crop still pending: a crop of a crop) is made
+//! here, not fetched ([`PendingCrop`]). Its `into` is queued at the front,
+//! whatever the policy, as a job with the source `LocalCrop { from }`, and
+//! a worker claims it like any download, so no eager download or request
+//! of `into` writes its `.part` file meanwhile. Whatever queued `into` (a
+//! request or `Eager` can before the engine queues the crop), the worker
+//! claiming it asks the replica for a pending crop and makes that first.
+//! A job waits while the blob it reads is still queued or held, so a crop
+//! of a crop runs after the first. An eager worker backing off from a
+//! blob lets it go to a crop waiting (queued again behind the crops), so a
+//! crop never waits on a link that is down. The worker crops `from`'s file into `blobs/<into>.part` on a
+//! blocking thread, checks size and hash, renames it and marks `into`
+//! `Available` under its lease, as a download completes. Made or not, the
+//! old blob is then purged ([`Seam::local_crop_ended`]). A missing file, a
+//! mismatch or an I/O error deletes the `.part`, and the same claim falls
+//! through to a fetch of `into` if it is wanted (asked for, or `Eager`)
+//! and has no fate of its own (the server no longer has a crop's middle
+//! blob); otherwise `into` stays `NotDownloaded`. An `into` purged meanwhile fails
+//! the lease check: its files go, and the store purged the old blob with
+//! it. A pending crop is derived from the store (a `Cropped` fate whose
+//! blob still has a row), so a restart queues it again.
+//!
 //! **Status.** `Downloading { got, path }` (`path` the `.part` file) is
 //! reported when a response starts, then at most every
 //! [`PROGRESS_EVERY`] (also while the body stalls, if bytes arrived since
@@ -107,7 +130,7 @@ use crate::client::{BlobLease, CoreError, lock};
 use crate::engine::EngineConfig;
 use crate::identity::Identity;
 use crate::seam::Seam;
-use crate::store::{BlobPolicy, BlobRecord, BlobStatus};
+use crate::store::{BlobPolicy, BlobRecord, BlobStatus, PendingCrop};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::BlobId;
 
@@ -132,6 +155,17 @@ pub fn read_head(path: &Path, max: u64) -> std::io::Result<(String, u64)> {
     Ok((String::from_utf8_lossy(&head).into_owned(), size))
 }
 
+/// Where a queued blob's bytes come from first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The server.
+    Network,
+    /// A server crop of `from`, whose bytes this device holds: made here
+    /// (module docs, "Local crops"), then fetched only if that fails and
+    /// the blob is wanted.
+    LocalCrop { from: BlobId },
+}
+
 /// A blob waiting for a download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Queued {
@@ -142,6 +176,7 @@ struct Queued {
     /// Let go by an eager worker to the [`Slot::Wanted`] worker: only that
     /// one takes it.
     reserved: bool,
+    source: Source,
 }
 
 impl Queued {
@@ -150,15 +185,27 @@ impl Queued {
             id,
             wanted: false,
             reserved: false,
+            source: Source::Network,
         }
     }
 
     fn wanted(id: BlobId) -> Queued {
         Queued {
-            id,
             wanted: true,
-            reserved: false,
+            ..Queued::eager(id)
         }
+    }
+
+    fn local_crop(crop: PendingCrop) -> Queued {
+        Queued {
+            source: Source::LocalCrop { from: crop.from },
+            ..Queued::eager(crop.into)
+        }
+    }
+
+    /// A local crop waits under any policy: it needs no network.
+    fn kept_on_demand(&self) -> bool {
+        self.wanted || matches!(self.source, Source::LocalCrop { .. })
     }
 }
 
@@ -185,6 +232,44 @@ impl Queue {
             self.waiting.push_back(Queued::eager(id));
         }
     }
+
+    /// Whether a worker may take `item` now: a local crop waits while the
+    /// blob it reads is still queued or held (the `into` of an earlier
+    /// crop, a crop of a crop), so the two run in log order.
+    fn ready(&self, item: &Queued) -> bool {
+        match item.source {
+            Source::Network => true,
+            Source::LocalCrop { from } => !self.holds(from),
+        }
+    }
+
+    /// Queues local crops at the front, in the order given, ahead of
+    /// anything queued for the same blob. One a worker holds already is
+    /// left to it: it was queued after the batch that made the crop pending
+    /// was stored, so the worker, asking the replica on its claim, makes
+    /// it locally ([`worker`]).
+    fn push_crops(&mut self, crops: &[PendingCrop]) {
+        let fresh: Vec<_> = crops
+            .iter()
+            .filter(|crop| !self.active.contains(&crop.into))
+            .copied()
+            .collect();
+        for crop in fresh.iter().rev() {
+            let wanted = self.waiting.iter().any(|q| q.id == crop.into && q.wanted);
+            self.waiting.retain(|q| q.id != crop.into);
+            self.waiting.push_front(Queued {
+                wanted,
+                ..Queued::local_crop(*crop)
+            });
+        }
+    }
+
+    /// A local crop a worker may take now is waiting.
+    fn crop_ready(&self) -> bool {
+        self.waiting
+            .iter()
+            .any(|q| matches!(q.source, Source::LocalCrop { .. }) && self.ready(q))
+    }
 }
 
 /// The blobs waiting for the downloader; see the module docs.
@@ -195,12 +280,16 @@ pub(crate) struct BlobQueue {
 }
 
 impl BlobQueue {
-    /// The queue as the replica leaves it: blobs left `Downloading` first
-    /// (workdir ones too: the user asked for them), then, with `Eager`,
-    /// every event blob not downloaded yet.
+    /// The queue as the replica leaves it: pending local crops first, in
+    /// log order, then blobs left `Downloading` (workdir ones too: the user
+    /// asked for them), then, with `Eager`, every event blob not downloaded
+    /// yet.
     pub(crate) fn restore(seam: &Seam) -> BlobQueue {
         let this = BlobQueue::default();
-        let (settings, blobs) = match seam.settings().and_then(|s| Ok((s, seam.blobs()?))) {
+        let read = seam
+            .settings()
+            .and_then(|s| Ok((s, seam.blobs()?, seam.pending_crops()?)));
+        let (settings, blobs, crops) = match read {
             Ok(found) => found,
             Err(error) => {
                 tracing::warn!(%error, "cannot read blobs; none queued");
@@ -214,6 +303,7 @@ impl BlobQueue {
                     queue.waiting.push_back(Queued::wanted(blob.id));
                 }
             }
+            queue.push_crops(&crops);
         }
         this.set_policy(settings.blob_policy, &blobs);
         this
@@ -226,10 +316,13 @@ impl BlobQueue {
         if queue.active.contains(&id) {
             queue.again.insert(id);
         } else {
-            let reserved = queue.waiting.iter().any(|q| q.id == id && q.reserved);
+            let found = queue.waiting.iter().find(|q| q.id == id);
+            let reserved = found.is_some_and(|q| q.reserved);
+            let source = found.map_or(Source::Network, |q| q.source);
             queue.waiting.retain(|q| q.id != id);
             queue.waiting.push_front(Queued {
                 reserved,
+                source,
                 ..Queued::wanted(id)
             });
         }
@@ -242,7 +335,7 @@ impl BlobQueue {
         let mut queue = lock(&self.queue);
         queue.policy = policy;
         match policy {
-            BlobPolicy::OnDemand => queue.waiting.retain(|q| q.wanted),
+            BlobPolicy::OnDemand => queue.waiting.retain(Queued::kept_on_demand),
             BlobPolicy::Eager => {
                 // Newest first: ids are time-ordered. Workdir blobs only
                 // download when asked for.
@@ -272,6 +365,28 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
+    /// A pulled batch left these crops pending: they go to the front, under
+    /// any policy, as they need no network.
+    pub(crate) fn local_crops(&self, crops: &[PendingCrop]) {
+        if crops.is_empty() {
+            return;
+        }
+        lock(&self.queue).push_crops(crops);
+        self.wake.notify_waiters();
+    }
+
+    /// Whether a worker may take `item` now ([`Queue::ready`]).
+    fn ready(&self, item: &Queued) -> bool {
+        lock(&self.queue).ready(item)
+    }
+
+    /// Whether a blob a worker holds is fetched once its local crop failed:
+    /// asked for, or the policy is `Eager`.
+    fn fetch_wanted(&self, item: &Queued) -> bool {
+        let queue = lock(&self.queue);
+        item.wanted || queue.again.contains(&item.id) || queue.policy == BlobPolicy::Eager
+    }
+
     /// These blobs left the replica (a session deleted from this device, or
     /// a refreshed workdir answer no longer naming them): they wait no
     /// longer. One a worker holds is let go by the worker itself, when its
@@ -293,12 +408,13 @@ impl BlobQueue {
             notified.as_mut().enable();
             let became_idle = {
                 let mut queue = lock(&self.queue);
+                let ready = |q: &Queued| queue.ready(q);
                 let at = match slot {
-                    Slot::Any => queue.waiting.iter().position(|q| !q.reserved),
+                    Slot::Any => queue.waiting.iter().position(|q| !q.reserved && ready(q)),
                     // The blob handed over first: it was asked for before
                     // anything queued since, and nothing else may take it.
                     Slot::Wanted => (queue.waiting.iter().position(|q| q.reserved))
-                        .or_else(|| queue.waiting.iter().position(|q| q.wanted)),
+                        .or_else(|| queue.waiting.iter().position(|q| q.wanted && ready(q))),
                 };
                 if let Some(mut item) = at.and_then(|at| queue.waiting.remove(at)) {
                     item.reserved = false;
@@ -325,7 +441,9 @@ impl BlobQueue {
     /// the Wanted worker idle, hands the blob over to that worker and
     /// returns `None`. The hand-over takes the idle Wanted worker in the
     /// same critical section, so one idle period takes one blob, and that
-    /// worker takes it before anything else.
+    /// worker takes it before anything else. A local crop waiting takes
+    /// the worker too: the blob is let go, queued again behind the crops,
+    /// so a crop (which needs no network) never waits on a link down.
     async fn back_off<'a>(&'a self, mut claim: Claim<'a>, delay: Duration) -> Option<Claim<'a>> {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -339,6 +457,12 @@ impl BlobQueue {
                 if wanted && queue.wanted_idle {
                     queue.wanted_idle = false;
                     claim.let_go(&mut queue, LetGo::HandedOver);
+                    drop(queue);
+                    self.wake.notify_waiters();
+                    return None;
+                }
+                if queue.crop_ready() {
+                    claim.let_go(&mut queue, LetGo::Yielded);
                     drop(queue);
                     self.wake.notify_waiters();
                     return None;
@@ -390,13 +514,26 @@ enum LetGo {
     Unfinished,
     /// To the Wanted worker; see [`BlobQueue::back_off`].
     HandedOver,
+    /// To a local crop waiting, which needs no network; queued again
+    /// behind it.
+    Yielded,
 }
 
 impl Claim<'_> {
-    fn finish(mut self) {
+    fn finish(self) {
+        self.release(LetGo::Finished);
+    }
+
+    /// Lets go of a local crop that must wait for the blob it reads; it
+    /// waits in the queue, as it would have unclaimed.
+    fn wait(self) {
+        self.release(LetGo::Unfinished);
+    }
+
+    fn release(mut self, how: LetGo) {
         let owner = self.queue;
         let mut queue = lock(&owner.queue);
-        self.let_go(&mut queue, LetGo::Finished);
+        self.let_go(&mut queue, how);
         drop(queue);
         owner.wake.notify_waiters();
     }
@@ -412,11 +549,34 @@ impl Claim<'_> {
                 reserved: true,
                 ..Queued::wanted(id)
             }),
-            _ if again => queue.waiting.push_front(Queued::wanted(id)),
-            // Not asked for, it waits only while the policy is Eager: one
-            // switched to OnDemand while a worker held it goes, as the
-            // switch dropped the waiting ones.
-            LetGo::Unfinished if self.item.wanted || queue.policy == BlobPolicy::Eager => {
+            // Behind the local crops, which it let go for.
+            LetGo::Yielded
+                if again || self.item.kept_on_demand() || queue.policy == BlobPolicy::Eager =>
+            {
+                let at = (queue.waiting.iter())
+                    .rposition(|q| matches!(q.source, Source::LocalCrop { .. }))
+                    .map_or(0, |at| at + 1);
+                queue.waiting.insert(
+                    at,
+                    Queued {
+                        wanted: self.item.wanted || again,
+                        ..self.item
+                    },
+                );
+            }
+            LetGo::Yielded => {}
+            // A local crop not yet tried keeps its source.
+            _ if again => queue.waiting.push_front(Queued {
+                wanted: true,
+                reserved: false,
+                ..self.item
+            }),
+            // Not asked for, it waits only while the policy is Eager (or it
+            // is a local crop): one switched to OnDemand while a worker
+            // held it goes, as the switch dropped the waiting ones.
+            LetGo::Unfinished
+                if self.item.kept_on_demand() || queue.policy == BlobPolicy::Eager =>
+            {
                 queue.waiting.push_front(self.item);
             }
             LetGo::Unfinished | LetGo::Finished => {}
@@ -464,6 +624,37 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
     loop {
         let mut claim = ctx.queue.next(slot).await;
         let id = claim.item.id;
+        // However the blob was queued (a request or `Eager` may queue it
+        // before the engine queues its crop), a crop pending for it is
+        // made here first; the replica says which.
+        let pending = ctx.seam.pending_crop_into(id).unwrap_or_else(|error| {
+            tracing::warn!(?id, %error, "cannot read the blob's pending crop");
+            match claim.item.source {
+                Source::LocalCrop { from } => Some(PendingCrop { into: id, from }),
+                Source::Network => None,
+            }
+        });
+        let queued_as_crop = matches!(claim.item.source, Source::LocalCrop { .. });
+        claim.item.source = match pending {
+            Some(crop) => Source::LocalCrop { from: crop.from },
+            None => Source::Network,
+        };
+        if let Some(crop) = pending {
+            if !ctx.queue.ready(&claim.item) {
+                claim.wait();
+                continue;
+            }
+            let done = crop_locally(ctx, crop).await;
+            claim.item.source = Source::Network;
+            if done || !fetch_after_crop(ctx, &claim.item) {
+                claim.finish();
+                continue;
+            }
+        } else if queued_as_crop && !fetch_after_crop(ctx, &claim.item) {
+            // Made already, or gone: fetched only if wanted.
+            claim.finish();
+            continue;
+        }
         let mut attempt = 0u32;
         // A hash mismatch already seen in this hold (module docs, "Checked
         // by hash").
@@ -502,7 +693,7 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                 Slot::Any => match ctx.queue.back_off(claim, next_in).await {
                     Some(kept) => claim = kept,
                     None => {
-                        tracing::debug!(?id, "blob asked for: handed to the wanted slot");
+                        tracing::debug!(?id, "blob let go to the wanted slot or a local crop");
                         break;
                     }
                 },
@@ -605,6 +796,80 @@ pub(crate) fn remove_all_blob_files(data_dir: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(%error, "cannot remove the blob files"),
     }
+}
+
+/// Whether a blob whose local crop did not make it is fetched: when wanted
+/// (asked for, or `Eager`), and the server still has it. One with a fate
+/// of its own (the middle of a crop of a crop) is gone from the server;
+/// the next crop, reading it, purges it.
+fn fetch_after_crop(ctx: &BlobCtx, item: &Queued) -> bool {
+    ctx.queue.fetch_wanted(item)
+        && !ctx.seam.blob_fated(item.id).unwrap_or_else(|error| {
+            tracing::warn!(id = ?item.id, %error, "cannot read the blob's fate");
+            false
+        })
+}
+
+/// Makes `crop.into` from the bytes of `crop.from` (module docs, "Local
+/// crops"), then lets `crop.from` go, made or not. Whether `into` needs no
+/// fetch: made, or gone from the replica.
+async fn crop_locally(ctx: &BlobCtx, crop: PendingCrop) -> bool {
+    let done = match make_crop(ctx, crop).await {
+        Ok(()) => true,
+        Err(error) if error.is_purged() => {
+            // Whatever it wrote may have outlived the purge.
+            tracing::debug!(?crop, "cropped blob purged during its local crop");
+            remove_blob_files(&ctx.seam.data_dir(), crop.into);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(?crop, %error, "cannot crop the blob here");
+            let part = part_path(&blob_dir(&ctx.seam.data_dir()), crop.into);
+            let _ = tokio::fs::remove_file(&part).await;
+            false
+        }
+    };
+    match ctx.seam.local_crop_ended(crop) {
+        Ok(()) | Err(CoreError::Superseded) => {}
+        Err(error) => tracing::warn!(?crop, %error, "cannot purge the cropped blob"),
+    }
+    done
+}
+
+/// Crops `crop.from`'s file into `crop.into`'s `.part` file on a blocking
+/// thread, then checks and completes it as a download ([`complete`]),
+/// under `into`'s lease. `into` made already (before a restart) or gone
+/// needs nothing.
+async fn make_crop(ctx: &BlobCtx, crop: PendingCrop) -> Result<(), FetchError> {
+    let Some((record, lease, source)) = ctx.seam.local_crop(crop)? else {
+        return Ok(());
+    };
+    let dir = blob_dir(&ctx.seam.data_dir());
+    let done = dir.join(crop.into.0.to_string());
+    if let BlobStatus::Available { path } = &record.status
+        && tokio::fs::try_exists(path).await.unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let Some(source) = source else {
+        return Err(FetchError::File(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the cropped blob is not here",
+        )));
+    };
+    tokio::fs::create_dir_all(&dir).await?;
+    let part = part_path(&dir, crop.into);
+    let written = part.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let content = std::io::BufReader::new(File::open(&source.path)?);
+        let mut out = File::create(&written)?;
+        skywave_proto::crop::crop(content, &mut out, &source.kept)
+            .map_err(std::io::Error::other)?;
+        out.sync_all()
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    complete(ctx, crop.into, lease, &part, &done, &record).await
 }
 
 /// One try at a blob: resume its `.part` file and finish it. `lease` is
@@ -812,7 +1077,7 @@ mod tests {
     use chrono::Utc;
     use skywave_proto::{
         BlobId as ProtoBlobId, BlobRef, Command, CommandResult, Event, EventBatch, EventKind,
-        EventsQuery, Full, HelloResponse, Seq, SessionId, ToolResult,
+        EventsQuery, Full, HelloResponse, LineSpan, Seq, SessionId, ToolResult,
     };
 
     use super::*;
@@ -1152,6 +1417,184 @@ mod tests {
         }
     }
 
+    /// `count` lines of text.
+    fn text(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect()
+    }
+
+    impl Fixture {
+        /// Makes the fixture's blob `Available` with the server's content,
+        /// then applies, at `seq`, the server's crop of it to `keep`.
+        /// Returns the crop, pending, and what it makes.
+        fn held_and_cropped(&self, seq: u64, keep: &[LineSpan]) -> (PendingCrop, Vec<u8>) {
+            let dir = blob_dir(&self.seam.data_dir());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(self.blob.id.0.to_string());
+            std::fs::write(&path, &self.server.content).unwrap();
+            self.seam
+                .blob_status(self.blob.id, BlobStatus::Available { path })
+                .unwrap();
+            let mut made = Vec::new();
+            let lines = skywave_proto::crop::crop(&self.server.content[..], &mut made, keep)
+                .unwrap()
+                .lines;
+            let into = BlobRef {
+                id: ProtoBlobId::new(),
+                size: made.len() as u64,
+                sha256: ContentHash::of(&made),
+            };
+            let applied = self
+                .seam
+                .apply_events(&EventBatch {
+                    from: Seq(seq),
+                    events: vec![Event {
+                        session_id: self.session_id,
+                        at: Utc::now(),
+                        command_id: Some(skywave_proto::CommandId::new()),
+                        context: skywave_proto::ContextId::first_of(self.session_id),
+                        kind: EventKind::BlobCropped {
+                            blob: self.blob.id,
+                            holds: skywave_proto::BlobUse::ToolOutput,
+                            into,
+                            kept: keep.to_vec(),
+                            lines,
+                            by: DeviceId::new(),
+                        },
+                    }],
+                })
+                .unwrap();
+            let [crop] = applied.local_crops[..] else {
+                panic!("expected one pending crop: {applied:?}");
+            };
+            (crop, made)
+        }
+
+        /// Runs `downloader` until the local crop of `crop` ended (its old
+        /// blob gone) and every worker let go.
+        async fn until_crop_ended(&self, crop: PendingCrop) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.seam.blob(crop.from).unwrap().is_some()
+                    || !lock(&self.queue.queue).active.is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the crop never ended: {:?}", lock(&self.queue.queue)));
+        }
+    }
+
+    /// A worker that claims a blob queued for a fetch (asked for before
+    /// the engine queued its crop) makes the pending crop instead; the
+    /// crop queued late finds nothing left to do.
+    #[tokio::test]
+    async fn a_blob_claimed_for_a_fetch_is_cropped_locally_first() {
+        let bytes = text(40);
+        let f = Fixture::new(bytes.len() as u64, bytes.clone(), bytes.len() as u64);
+        let (crop, made) = f.held_and_cropped(3, &[LineSpan { first: 2, count: 5 }]);
+        f.queue.want(crop.into);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        f.until_crop_ended(crop).await;
+        f.queue.local_crops(&[crop]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !lock(&f.queue.queue).waiting.is_empty()
+                || !lock(&f.queue.queue).active.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the late crop is let go");
+        downloader.abort();
+
+        let BlobStatus::Available { path } = f.seam.blob(crop.into).unwrap().unwrap().status else {
+            panic!("the crop is made");
+        };
+        assert_eq!(std::fs::read(path).unwrap(), made);
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0, "nothing fetched");
+    }
+
+    /// Both eager workers backing off from blobs the server cannot serve
+    /// (here for a minute) let go of them for a local crop, which needs no
+    /// network: it is made at once.
+    #[tokio::test]
+    async fn a_local_crop_never_waits_on_eager_workers_backing_off() {
+        let bytes = text(40);
+        let f = Fixture::new(bytes.len() as u64, bytes.clone(), bytes.len() as u64);
+        let held = f.held_blobs(3, 2, Hold::Offline);
+        f.queue.set_policy(BlobPolicy::Eager, &[]);
+        f.queue.registered(&held);
+        let minute = Duration::from_secs(60);
+        let downloader = tokio::spawn(run_downloader(f.ctx_backing_off(minute, minute)));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while lock(&f.queue.queue).active.len() < 2 || f.server.calls.load(Ordering::SeqCst) < 2
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both eager slots back off from a held blob");
+
+        let (crop, made) = f.held_and_cropped(5, &[LineSpan { first: 0, count: 3 }]);
+        f.queue.local_crops(&[crop]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                f.seam.blob(crop.into).unwrap().unwrap().status,
+                BlobStatus::Available { .. }
+            ) || f.seam.blob(crop.from).unwrap().is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the crop is made while the eager workers back off");
+        let kept: Vec<_> = {
+            let queue = lock(&f.queue.queue);
+            let waiting = queue.waiting.iter().map(|q| q.id);
+            waiting.chain(queue.active.iter().copied()).collect()
+        };
+        downloader.abort();
+        let BlobStatus::Available { path } = f.seam.blob(crop.into).unwrap().unwrap().status else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), made);
+        for id in &held {
+            assert!(kept.contains(id), "{id:?} is queued again or taken back");
+        }
+    }
+
+    /// A held copy that no longer crops to the server's bytes, under
+    /// `OnDemand`: the bad crop is deleted, the old blob purged, and the
+    /// cropped blob, not asked for, is not fetched. Checked once the
+    /// worker let go of it, after it decided.
+    #[tokio::test]
+    async fn a_failed_local_crop_fetches_nothing_unless_wanted() {
+        let bytes = text(40);
+        let f = Fixture::new(bytes.len() as u64, bytes.clone(), bytes.len() as u64);
+        let (crop, _) = f.held_and_cropped(3, &[LineSpan { first: 2, count: 5 }]);
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        std::fs::write(&path, bytes.to_ascii_uppercase()).unwrap();
+        f.queue.local_crops(&[crop]);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        f.until_crop_ended(crop).await;
+        downloader.abort();
+
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0, "nothing fetched");
+        assert_eq!(
+            f.seam.blob(crop.into).unwrap().unwrap().status,
+            BlobStatus::NotDownloaded
+        );
+        let dir = blob_dir(&f.seam.data_dir());
+        for id in [crop.into, crop.from] {
+            assert!(!dir.join(id.0.to_string()).exists());
+            assert!(!part_path(&dir, id).exists());
+        }
+    }
+
     fn content(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -1167,6 +1610,42 @@ mod tests {
             ("ab\u{fffd}cdef".to_owned(), 7)
         );
         assert!(read_head(&dir.path().join("gone"), 4).is_err());
+    }
+
+    /// Local crops go to the front in log order, survive a switch to
+    /// `OnDemand` and a request (which keeps their source), and a crop of
+    /// a crop waits while the blob it reads is queued.
+    #[test]
+    fn local_crops_queue_in_order_under_any_policy() {
+        let queue = BlobQueue::default();
+        let (eager, a, b, c) = (
+            ProtoBlobId::new(),
+            ProtoBlobId::new(),
+            ProtoBlobId::new(),
+            ProtoBlobId::new(),
+        );
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[eager]);
+        let (first, second) = (
+            PendingCrop { into: b, from: a },
+            PendingCrop { into: c, from: b },
+        );
+        queue.local_crops(&[first, second]);
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+        queue.want(c);
+        let q = lock(&queue.queue);
+        assert_eq!(
+            Vec::from(q.waiting.clone()),
+            [
+                Queued {
+                    wanted: true,
+                    ..Queued::local_crop(second)
+                },
+                Queued::local_crop(first),
+            ]
+        );
+        assert!(!q.ready(&q.waiting[0]), "waits for the crop that makes b");
+        assert!(q.ready(&q.waiting[1]));
     }
 
     #[tokio::test]

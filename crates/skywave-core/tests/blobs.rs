@@ -23,7 +23,7 @@ use skywave_core::{
     blob_dir,
 };
 use skywave_proto::{
-    BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
+    BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
     EventsQuery, Full, HelloResponse, ImportedItem, LineSpan, Seq, SessionId,
 };
 use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript, Step};
@@ -1262,4 +1262,330 @@ async fn a_fresh_eager_device_fetches_only_what_a_crop_of_a_crop_left() {
         (*kept, *of, by.me),
         (2, line_count(output.as_bytes()), false)
     );
+}
+
+// ---- local crops ------------------------------------------------------------------
+
+/// A session whose one tool printed `output`, with `mine` (in its own
+/// directory) the device that sends deletes and crops through `spy`.
+struct Cropping {
+    daemon: Daemon,
+    proxy: Proxy,
+    _mine_dir: TempDir,
+    /// Kept running: it decided the session's turn.
+    _mine: Client,
+    spy: Spy,
+    session: SessionId,
+    output: String,
+    /// The output's blob.
+    original: BlobRef,
+}
+
+impl Cropping {
+    async fn start(output: String) -> Cropping {
+        let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+        let proxy = Proxy::start(daemon.addr).await;
+        let mine_dir = tempfile::tempdir().unwrap();
+        let spy = Spy::default();
+        let mine = Client::open(mine_dir.path(), &spy);
+        daemon.pair(&mine, &proxy).await;
+        let session = daemon.session_with_turn(&mine).await;
+        let original = daemon
+            .events()
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolResult(result) => {
+                    result.output.as_ref().and_then(Full::blob).cloned()
+                }
+                _ => None,
+            })
+            .expect("the tool output is a blob");
+        Cropping {
+            daemon,
+            proxy,
+            _mine_dir: mine_dir,
+            _mine: mine,
+            spy,
+            session,
+            output,
+            original,
+        }
+    }
+
+    /// A device in `dir` under `policy` that holds the output's blob,
+    /// `Available`, and its spy.
+    async fn holder(&self, dir: &Path, policy: BlobPolicy) -> (Client, Spy) {
+        let spy = Spy::default();
+        let client = Client::open(dir, &spy);
+        client.core.dispatch(Action::SetBlobPolicy(policy)).unwrap();
+        self.daemon.pair(&client, &self.proxy).await;
+        open_at_head(&self.daemon, &client, self.session).await;
+        // Eager fetches it unasked. Asking too would queue it again once
+        // fetched, and a core stopped while that claim reads the file
+        // system fails the blob (a known shutdown race, not a crop's).
+        if policy == BlobPolicy::OnDemand {
+            client
+                .core
+                .dispatch(Action::DownloadBlob(self.original.id))
+                .unwrap();
+        }
+        let path = client.wait_available(0).await;
+        assert_eq!(std::fs::read(path).unwrap(), self.output.as_bytes());
+        assert_eq!(spy.ids(), [self.original.id]);
+        (client, spy)
+    }
+
+    /// Crops `blob` on the server to `keep`, from `mine`; the blob it made.
+    async fn crop(&self, blob: BlobId, keep: &[LineSpan]) -> BlobRef {
+        assert!(matches!(
+            self.spy
+                .send(CommandKind::CropBlob {
+                    blob,
+                    keep: keep.to_vec(),
+                })
+                .await,
+            CommandResult::Accepted { .. }
+        ));
+        self.daemon
+            .events()
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::BlobCropped { blob: of, into, .. } if *of == blob => Some(into.clone()),
+                _ => None,
+            })
+            .expect("the crop is logged")
+    }
+
+    /// Applies the log past `dir`'s cursor in one batch, through a core
+    /// with no engine: no downloader runs. Returns what the batch applied.
+    fn apply_detached(&self, dir: &Path) -> skywave_core::Applied {
+        let core = Core::open_detached(dir).unwrap();
+        let seam = core.seam();
+        let cursor = seam.cursor().unwrap();
+        let events = self.daemon.events()[cursor.0 as usize..].to_vec();
+        let applied = seam
+            .apply_events(&EventBatch {
+                from: Seq(cursor.0 + 1),
+                events,
+            })
+            .unwrap();
+        drop(seam);
+        std::thread::spawn(move || core.shutdown(SOON))
+            .join()
+            .unwrap()
+            .unwrap();
+        applied
+    }
+}
+
+/// Waits until the open session shows `into` available in place of the
+/// output, and `old`'s row is gone. Returns `into`'s file.
+async fn wait_local_crop(client: &Client, into: BlobId, old: BlobId) -> PathBuf {
+    let view = client
+        .wait("the cropped blob made here", |c, view| {
+            matches!(
+                Client::shown_outputs(view).first(),
+                Some(FullView::Blob(blob))
+                    if blob.id == into && matches!(blob.state, BlobState::Available { .. })
+            ) && c.seam.blob(old).unwrap().is_none()
+        })
+        .await;
+    let FullView::Blob(shown) = &Client::shown_outputs(&view)[0] else {
+        unreachable!()
+    };
+    let BlobState::Available { path } = &shown.state else {
+        unreachable!()
+    };
+    path.clone()
+}
+
+/// Whether `id` left no file in `dir`, complete or partial.
+fn no_files(dir: &Path, id: BlobId) -> bool {
+    !part_file(dir, id).exists() && !blob_dir(dir).join(id.0.to_string()).exists()
+}
+
+/// A device that holds a blob makes the server's crop of it itself, even
+/// under `Eager` and though it did not decide the crop: the cropped blob is
+/// available, the server's bytes exactly, the old blob is purged, and the
+/// cropped blob was never requested (an eager download racing the crop
+/// would have been).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_crops_locally_and_fetches_nothing() {
+    let c = Cropping::start(big_output(200 * 1024, 10)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (theirs, spy) = c.holder(dir.path(), BlobPolicy::Eager).await;
+
+    let keep = [LineSpan { first: 2, count: 5 }];
+    let into = c.crop(c.original.id, &keep).await;
+    let path = wait_local_crop(&theirs, into.id, c.original.id).await;
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        cropped(c.output.as_bytes(), &keep)
+    );
+    assert!(no_files(dir.path(), c.original.id));
+    assert!(!part_file(dir.path(), into.id).exists());
+    assert_eq!(
+        spy.ids(),
+        [c.original.id],
+        "the cropped blob is never fetched"
+    );
+}
+
+/// A held copy that no longer hashes to what it was cannot make the crop:
+/// under `Eager` the server's crop is fetched, once, and the old blob is
+/// purged. (Under `OnDemand` nothing is fetched: the unit test
+/// `a_failed_local_crop_fetches_nothing_unless_wanted` checks that once
+/// the worker let go, which this test cannot see.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tampered_copy_is_fetched_under_eager() {
+    let c = Cropping::start(big_output(200 * 1024, 11)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (client, _) = c.holder(dir.path(), BlobPolicy::Eager).await;
+    let BlobStatus::Available { path } = client.status(c.original.id) else {
+        unreachable!()
+    };
+    client.stop();
+    // The same lines, other bytes on every one: the crop's hash cannot
+    // match. (Bytes outside the kept lines would still crop right.)
+    let bytes = std::fs::read(&path).unwrap();
+    let tampered: Vec<u8> = bytes
+        .iter()
+        .map(|b| match b {
+            b'\n' => b'\n',
+            b'x' => b'y',
+            _ => b'x',
+        })
+        .collect();
+    std::fs::write(&path, tampered).unwrap();
+    let keep = [LineSpan { first: 1, count: 3 }];
+    let into = c.crop(c.original.id, &keep).await;
+
+    let spy = Spy::default();
+    let eager = Client::open(dir.path(), &spy);
+    open_at_head(&c.daemon, &eager, c.session).await;
+    let path = wait_local_crop(&eager, into.id, c.original.id).await;
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        cropped(c.output.as_bytes(), &keep)
+    );
+    assert!(no_files(dir.path(), c.original.id));
+    assert_eq!(spy.ids(), [into.id], "fetched exactly once");
+}
+
+/// A crop of a crop arriving in one batch, the original held: both crops
+/// run here, in log order, and neither the middle blob nor the last is
+/// fetched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_of_a_crop_in_one_batch_runs_both_locally() {
+    let c = Cropping::start(big_output(64 * 1024, 12)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (theirs, _) = c.holder(dir.path(), BlobPolicy::Eager).await;
+    theirs.stop();
+    let (first, second) = (
+        [LineSpan {
+            first: 0,
+            count: 20,
+        }],
+        [LineSpan { first: 5, count: 2 }],
+    );
+    let middle = c.crop(c.original.id, &first).await;
+    let last = c.crop(middle.id, &second).await;
+
+    let spy = Spy::default();
+    let theirs = Client::open(dir.path(), &spy);
+    open_at_head(&c.daemon, &theirs, c.session).await;
+    let path = wait_local_crop(&theirs, last.id, middle.id).await;
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        cropped(&cropped(c.output.as_bytes(), &first), &second)
+    );
+    assert!(theirs.seam.blob(c.original.id).unwrap().is_none());
+    assert!(no_files(dir.path(), c.original.id));
+    assert!(no_files(dir.path(), middle.id));
+    assert!(spy.ids().is_empty(), "nothing fetched: {:?}", spy.ids());
+}
+
+/// A crop applied with no engine running stays pending in the replica; the
+/// next engine queues it at startup, and it runs: the cropped blob made
+/// here, the old one gone, nothing fetched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_local_crop_runs_after_a_restart() {
+    let c = Cropping::start(big_output(200 * 1024, 13)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (theirs, _) = c.holder(dir.path(), BlobPolicy::OnDemand).await;
+    theirs.stop();
+    let keep = [LineSpan { first: 4, count: 6 }];
+    let into = c.crop(c.original.id, &keep).await;
+
+    let applied = c.apply_detached(dir.path());
+    let pending = skywave_core::PendingCrop {
+        into: into.id,
+        from: c.original.id,
+    };
+    assert_eq!(applied.local_crops, [pending]);
+    assert!(!applied.blobs.contains(&into.id), "not queued for a fetch");
+    {
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.load().unwrap().pending_crops, [pending]);
+    }
+
+    let spy = Spy::default();
+    let theirs = Client::open(dir.path(), &spy);
+    open_at_head(&c.daemon, &theirs, c.session).await;
+    let path = wait_local_crop(&theirs, into.id, c.original.id).await;
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        cropped(c.output.as_bytes(), &keep)
+    );
+    assert!(no_files(dir.path(), c.original.id));
+    assert!(spy.ids().is_empty(), "nothing fetched: {:?}", spy.ids());
+    assert!(
+        Store::open(dir.path())
+            .unwrap()
+            .pending_crops()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The server deletes a crop's blob while this device's local crop of it
+/// is still pending: the old blob and the cropped one both go, with every
+/// file, and nothing is left to run.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_pending_crops_blob_purges_both() {
+    let c = Cropping::start(big_output(200 * 1024, 14)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (theirs, _) = c.holder(dir.path(), BlobPolicy::Eager).await;
+    theirs.stop();
+    let into = c
+        .crop(c.original.id, &[LineSpan { first: 0, count: 3 }])
+        .await;
+    let applied = c.apply_detached(dir.path());
+    assert_eq!(
+        applied.local_crops.len(),
+        1,
+        "the crop is pending: {applied:?}"
+    );
+    // A `.part` the crop may have begun.
+    std::fs::write(part_file(dir.path(), into.id), b"begun").unwrap();
+
+    assert!(matches!(
+        c.spy.send(CommandKind::DeleteBlob { blob: into.id }).await,
+        CommandResult::Accepted { .. }
+    ));
+    let applied = c.apply_detached(dir.path());
+    assert_eq!(applied.purged, [into.id, c.original.id]);
+    assert!(applied.local_crops.is_empty());
+    for id in [c.original.id, into.id] {
+        assert!(no_files(dir.path(), id), "{id:?} left a file");
+    }
+
+    let spy = Spy::default();
+    let theirs = Client::open(dir.path(), &spy);
+    open_at_head(&c.daemon, &theirs, c.session).await;
+    assert!(!theirs.wait_tombstone().await.me);
+    assert!(theirs.seam.blob(c.original.id).unwrap().is_none());
+    assert!(theirs.seam.blob(into.id).unwrap().is_none());
+    assert!(theirs.seam.pending_crops().unwrap().is_empty());
+    assert!(spy.ids().is_empty());
 }
