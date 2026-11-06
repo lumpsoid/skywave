@@ -452,6 +452,11 @@ fn all_event_kinds() -> Vec<EventKind> {
             .into_iter()
             .map(|outcome| EventKind::ImportFinished { outcome }),
     )
+    .chain([EventKind::BlobDeleted {
+        blob: blob_id(),
+        holds: BlobUse::ShellOutput,
+        by: device(),
+    }])
     .collect()
 }
 
@@ -562,13 +567,24 @@ fn storage_report() -> StorageReport {
             holds,
         })
         .collect(),
-        shell_runs: vec![ShellRunStorage {
-            run: command(),
-            session: session(),
-            command_line: "cargo test".into(),
-            event_bytes: 52_000,
-            output: 0,
-        }],
+        shell_runs: vec![
+            ShellRunStorage {
+                run: command(),
+                session: session(),
+                command_line: "cargo test".into(),
+                event_bytes: 52_000,
+                output: 0,
+                output_blob: None,
+            },
+            ShellRunStorage {
+                run: command(),
+                session: session(),
+                command_line: "cargo build".into(),
+                event_bytes: 8_000,
+                output: 2_000_000,
+                output_blob: Some(blob_id()),
+            },
+        ],
     }
 }
 
@@ -712,6 +728,7 @@ fn all_command_kinds() -> Vec<CommandKind> {
             session_id: session(),
             run: command(),
         },
+        CommandKind::DeleteBlob { blob: blob_id() },
     ]
 }
 
@@ -744,6 +761,8 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::MessageTooLong,
             RejectReason::DiskLow,
             RejectReason::ServerStopping,
+            RejectReason::UnknownBlob,
+            RejectReason::BlobGone,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );
@@ -1391,8 +1410,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v22() {
-    assert_eq!(PROTOCOL_VERSION, 22);
+fn protocol_is_v23() {
+    assert_eq!(PROTOCOL_VERSION, 23);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

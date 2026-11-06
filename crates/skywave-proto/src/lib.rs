@@ -130,7 +130,13 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// [`StorageReport`] (with [`SessionStorage`], [`BlobStorage`],
 /// [`BlobUse`] and [`ShellRunStorage`]), and
 /// [`limits::STORAGE_TOP_MAX`].
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// v23: storage actions. `CommandKind::DeleteBlob` logged as
+/// `EventKind::BlobDeleted`, and `CommandKind::CropBlob` (keeping
+/// `LineSpan`s) logged as `EventKind::BlobCropped`; the refusals
+/// `UnknownBlob`, `BlobGone`, `NotCroppable` and `BadCrop`; and
+/// `output_blob` on [`ShellRunStorage`], the run's blob a device acts on.
+pub const PROTOCOL_VERSION: u32 = 23;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -613,6 +619,15 @@ pub enum EventKind {
     ImportFinished {
         outcome: ImportOutcome,
     },
+    /// `by`'s `DeleteBlob` deleted the event blob `blob` from the server:
+    /// it can no longer be downloaded. `holds` is what it held. The event
+    /// that referenced it keeps its preview. Logged in the session and
+    /// context of that event. Not notable, not activity.
+    BlobDeleted {
+        blob: BlobId,
+        holds: BlobUse,
+        by: DeviceId,
+    },
 }
 
 /// What an `EventKind::Imported` carries: the parts of an outside
@@ -701,7 +716,8 @@ impl EventKind {
             | EventKind::ContextMoved { by, .. }
             | EventKind::TaskStopRequested { by, .. }
             | EventKind::ShellRequested { by, .. }
-            | EventKind::ShellStopRequested { by, .. } => Some(*by),
+            | EventKind::ShellStopRequested { by, .. }
+            | EventKind::BlobDeleted { by, .. } => Some(*by),
             // The daemon logs it, but copies the requester's device so a
             // device can tell its own runs apart from this one event.
             EventKind::ShellFinished { by, .. } => Some(*by),
@@ -760,7 +776,8 @@ impl EventKind {
             | EventKind::TaskStopRequested { .. }
             | EventKind::ShellRequested { .. }
             | EventKind::ShellStopRequested { .. }
-            | EventKind::ImportFinished { .. } => true,
+            | EventKind::ImportFinished { .. }
+            | EventKind::BlobDeleted { .. } => true,
             EventKind::AgentMessage { .. }
             | EventKind::ToolCall(_)
             | EventKind::ToolResult(_)
@@ -831,7 +848,8 @@ impl EventKind {
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
             | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => None,
+            | EventKind::ImportFinished { .. }
+            | EventKind::BlobDeleted { .. } => None,
         }
     }
 
@@ -899,6 +917,8 @@ impl EventKind {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ImportFinished { .. }
+            // It names a blob it deleted; it references none.
+            | EventKind::BlobDeleted { .. }
             | EventKind::Imported {
                 item: ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. },
                 ..
@@ -1685,6 +1705,11 @@ pub enum CommandKind {
         session_id: SessionId,
         run: CommandId,
     },
+    /// Delete the event blob `blob` from the server. The preview in its
+    /// event stays. Logged as `BlobDeleted`. `UnknownBlob` when no event
+    /// references it, `BlobGone` when it was already deleted. Taken while
+    /// the disk is low or the server is stopping: it frees space.
+    DeleteBlob { blob: BlobId },
 }
 
 /// A session name as `SessionRenamed` carries it: control characters
@@ -1903,6 +1928,12 @@ pub enum RejectReason {
     /// running turns and shell runs have ended. Control is still taken, so
     /// they can finish. Send it again once the server is back.
     ServerStopping,
+    /// `DeleteBlob.blob` is referenced by no event: a workdir blob, a lost
+    /// one, or an id the server never minted.
+    UnknownBlob,
+    /// `DeleteBlob.blob` was referenced by an event, but it has already
+    /// been deleted.
+    BlobGone,
 }
 
 impl RejectReason {
@@ -2182,6 +2213,9 @@ pub struct ShellRunStorage {
     pub event_bytes: u64,
     /// Its whole output's blob, once finished; 0 when it has none.
     pub output: u64,
+    /// That blob, the one a `DeleteBlob` names; `None` when it has none
+    /// or the blob was deleted.
+    pub output_blob: Option<BlobId>,
 }
 
 /// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,

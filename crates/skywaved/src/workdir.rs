@@ -718,7 +718,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
-    use skywave_proto::{Command, CommandId, CommandKind, DeviceId};
+    use skywave_proto::{
+        Command, CommandId, CommandKind, CommandResult, ContextId, DeviceId, EventKind,
+    };
 
     use super::*;
     use crate::{EventLog, Storage};
@@ -1154,9 +1156,39 @@ mod tests {
         std::fs::write(dir.join(orphan.0.to_string()), "renamed, never recorded").unwrap();
         std::fs::write(dir.join("not-a-blob"), "left alone").unwrap();
         assert!(t.stored(stray.id), "control: a store alone keeps it");
+        // A `DeleteBlob` that committed but never removed its file: a crash
+        // between the two, here a log with no store to remove it from.
+        let deleted = t.storage.put_blob(&b"shell output"[..]).unwrap();
+        let log = EventLog::open(&t.storage.db, vec![t.root.clone()]).unwrap();
+        log.append(
+            &mut t.storage.db,
+            t.session,
+            ContextId::first_of(t.session),
+            EventKind::ToolResult(skywave_proto::ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "shell".into(),
+                lines: 1,
+                output: Some(skywave_proto::Full::Blob(deleted.clone())),
+            }),
+        )
+        .unwrap();
+        let delete = Command {
+            id: CommandId::new(),
+            kind: CommandKind::DeleteBlob { blob: deleted.id },
+        };
+        assert!(matches!(
+            log.handle(&mut t.storage.db, DeviceId::new(), &delete)
+                .unwrap(),
+            CommandResult::Accepted { .. }
+        ));
+        let deleted_file = dir.join(deleted.id.0.to_string());
+        assert!(deleted_file.exists(), "control: the row went, the file not");
 
         t.storage.collect_blobs().unwrap();
         assert!(!t.stored(stray.id));
+        assert!(!deleted_file.exists());
         assert!(!dir.join(".tmp-interrupted").exists());
         assert!(!dir.join(orphan.0.to_string()).exists());
         assert!(dir.join("not-a-blob").exists());

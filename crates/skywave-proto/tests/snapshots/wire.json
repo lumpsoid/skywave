@@ -1,7 +1,7 @@
 {
-  "protocol_version": 22,
+  "protocol_version": 23,
   "hello": {
-    "protocol_version": 22,
+    "protocol_version": 23,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -1198,6 +1198,18 @@
             "kind": "unavailable"
           }
         }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "blob_deleted",
+          "blob": "01920000-0000-7000-8000-000000000005",
+          "holds": "shell_output",
+          "by": "01920000-0000-7000-8000-000000000003"
+        }
       }
     ]
   },
@@ -1392,6 +1404,13 @@
         "session_id": "01920000-0000-7000-8000-000000000001",
         "run": "01920000-0000-7000-8000-000000000002"
       }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
+        "type": "delete_blob",
+        "blob": "01920000-0000-7000-8000-000000000005"
+      }
     }
   ],
   "command_results": [
@@ -1498,6 +1517,14 @@
     {
       "result": "rejected",
       "reason": "server_stopping"
+    },
+    {
+      "result": "rejected",
+      "reason": "unknown_blob"
+    },
+    {
+      "result": "rejected",
+      "reason": "blob_gone"
     }
   ],
   "workdir_query": {
@@ -1841,7 +1868,16 @@
         "session": "01920000-0000-7000-8000-000000000001",
         "command_line": "cargo test",
         "event_bytes": 52000,
-        "output": 0
+        "output": 0,
+        "output_blob": null
+      },
+      {
+        "run": "01920000-0000-7000-8000-000000000002",
+        "session": "01920000-0000-7000-8000-000000000001",
+        "command_line": "cargo build",
+        "event_bytes": 8000,
+        "output": 2000000,
+        "output_blob": "01920000-0000-7000-8000-000000000005"
       }
     ]
   }

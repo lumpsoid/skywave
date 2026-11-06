@@ -6,10 +6,11 @@
 //! row never points at a partial file. A crash between rename and insert can
 //! leave an orphan file, which is never served.
 //!
-//! **Deleting.** Only workdir blobs are ever deleted (`workdir.rs`,
-//! "Garbage"): the row first, in the transaction that makes the blob
-//! unnamed, then the file. Event blobs live as long as the log, which is
-//! never pruned. At startup, before anything can be writing,
+//! **Deleting.** The row first, in a transaction, then the file once it
+//! commits: a workdir blob when it becomes unnamed (`workdir.rs`,
+//! "Garbage"), an event blob when a device's `DeleteBlob` deletes it
+//! (`commands.rs`). The event that referenced a deleted event blob keeps
+//! its preview, and its `event_blobs` row stays. At startup, before anything can be writing,
 //! [`BlobStore::sweep`] removes every `.tmp-*` file and every blob file
 //! without a row: what an interrupted write, a crash between rename and
 //! insert, or one between a deletion's commit and its unlink left behind.

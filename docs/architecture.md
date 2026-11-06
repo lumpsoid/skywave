@@ -156,7 +156,9 @@ every version.
   reply does (`MoveContext` also logs the new session's `SessionCreated`
   first; an adopting `CreateSession` logs its `SessionCreated` and the
   imported history first, and names itself on the `ImportFinished` after
-  them, D37).
+  them, D37). A `DeleteBlob`'s `BlobDeleted` is stamped with the session
+  and context of the event that referenced the blob, as an
+  `ApprovalResolved` takes its approval's (D42).
 - **Every event carries its context** (`Event.context`), stamped by the
   server, never derived from position (D29). Session-level state (name,
   archived, mode, model, effort) folds per session regardless.
@@ -288,7 +290,18 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Commands** are deduplicated, validated and appended in one transaction;
   rejected ones are stored too, so their answer stays stable. Validation
   reads projections of the log (`sessions`, `contexts`, `approvals`,
-  `shell_runs`) updated in the transaction that appends the event.
+  `shell_runs`, `event_blobs`) updated in the transaction that appends the
+  event.
+- **Deleting an event blob** (D42): `DeleteBlob { blob }` is `UnknownBlob`
+  when no event referenced the blob (no `event_blobs` row: a workdir blob,
+  an id never minted) and `BlobGone` when one did but its `blobs` row is
+  gone. Otherwise its transaction deletes the `blobs` row and appends
+  `BlobDeleted { blob, holds, by }`; the file is removed after the commit
+  (a crash in between leaves a file without a row, which the startup sweep
+  removes, Blob GC below). The `event_blobs` row stays, which is what tells
+  `BlobGone` from `UnknownBlob`; the referencing event and its preview are
+  untouched. It starts no work, so it is taken while the disk is low and
+  while `serve` stops: freeing space is what a low disk needs.
 - **Restart cost**: nothing prunes the log yet, so what a daemon start
   reads must not grow with it. Each lookup it makes, per session or over
   the log, reads a projection (`open_calls`: a `ToolCall` adds its call,
@@ -392,7 +405,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
     Control is taken as usual (`ResolveApproval`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
-    `SwitchContext`). Reads and long-polls are untouched. The refusal is
+    `SwitchContext`, `DeleteBlob`). Reads and long-polls are untouched. The refusal is
     stored like any other; the heads show its reason, which is how a
     device learns the server is paused.
   - The supervisor stops reading its agents' events. An adapter reports on
@@ -430,12 +443,14 @@ the daemon's appends, which would otherwise stop `serve` (below).
   `event_blobs` projection records with each append (`EventKind::blobs`:
   blob, session, seq and what it holds). A shell run's is its
   `ShellOutput` events (read per session through `events_session_type`)
-  plus its output: the finished run's blob or the running one's file.
-  Summing every session's events reads the whole log, so a report costs
+  plus its output: the finished run's blob or the running one's file;
+  `output_blob` names the finished run's blob, the one a device deletes.
+  A deleted blob has no `blobs` row, so it counts nowhere. Summing every session's events reads the whole log, so a report costs
   the log's length: it runs on a connection of its own, one at a time,
   in one read transaction (appends go on beside it under WAL), and SQLite
   stops it at its 8 s deadline (a progress handler), a 503; the reply
-  gives up at 10 s. Nothing is removed or cropped here.
+  gives up at 10 s. The report itself removes nothing: deleting a blob
+  is a command (`DeleteBlob`, above).
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
@@ -488,12 +503,13 @@ the daemon's appends, which would otherwise stop `serve` (below).
   connection under the snapshot mutex, so no pass falls between a store
   reusing a blob and the answer naming it. A device holding a replaced
   answer (lost reply, another device's refresh) gets a 404 for its blob
-  and shows the download failed until a refresh. Event blobs live as long
-  as the log, which is never pruned. `serve`, once its address is bound
+  and shows the download failed until a refresh. An event blob lives until
+  a device deletes it (`DeleteBlob`, above); nothing collects one. `serve`,
+  once its address is bound
   and before the supervisor, shell runner or API can write blobs, runs the
   same pass, then removes every `.tmp-*` file in `blobs/` and every blob
-  file without a row (an interrupted write, or a crash between a file and
-  its row). One `serve` per data dir is enforced: `serve` first takes an
+  file without a row (an interrupted write, a crash between a file and
+  its row, or one between a deletion's commit and its unlink). One `serve` per data dir is enforced: `serve` first takes an
   exclusive OS lock (`flock`) on `serve.lock` in the data dir, held for
   the process lifetime, so a second `serve` on the dir, on any address,
   fails at once naming the dir. `pair` and `devices` do not take it and

@@ -7,7 +7,8 @@
 //! event blobs every other. A session's share is its events' stored JSON
 //! and the blobs `event_blobs` (written with each append) ties to them; a
 //! shell run's is its `ShellOutput` events and its output, the finished
-//! run's blob or the running one's file.
+//! run's blob or the running one's file. A deleted event blob has no
+//! `blobs` row, so it counts nowhere; its `event_blobs` row stays.
 //!
 //! **Cost.** Summing a session's events reads every event, so a report
 //! costs the log's length. It runs on a connection of its own, one at a
@@ -52,7 +53,8 @@ pub(crate) fn holds_to_sql(holds: BlobUse) -> &'static str {
     }
 }
 
-fn holds_from_sql(text: &str) -> Result<BlobUse> {
+/// The [`BlobUse`] an `event_blobs.holds` names.
+pub(crate) fn holds_from_sql(text: &str) -> Result<BlobUse> {
     Ok(match text {
         "tool_input" => BlobUse::ToolInput,
         "tool_body" => BlobUse::ToolBody,
@@ -249,11 +251,12 @@ fn shell_runs(tx: &rusqlite::Transaction<'_>) -> Result<Vec<ShellRunStorage>> {
         }
     }
     drop(stmt);
+    // Joined to `blobs`: a deleted output is neither counted nor offered.
     let mut stmt = tx.prepare(
-        "SELECT r.command_id, r.session_id, json_extract(e.kind, '$.command'),
-                (SELECT b.size FROM event_blobs o JOIN blobs b ON b.id = o.blob_id
-                 WHERE o.seq = r.finished_seq AND o.holds = 'shell_output')
-         FROM shell_runs r JOIN events e ON e.seq = r.seq",
+        "SELECT r.command_id, r.session_id, json_extract(e.kind, '$.command'), b.size, b.id
+         FROM shell_runs r JOIN events e ON e.seq = r.seq
+         LEFT JOIN event_blobs o ON o.seq = r.finished_seq AND o.holds = 'shell_output'
+         LEFT JOIN blobs b ON b.id = o.blob_id",
     )?;
     let mut rows = stmt.query([])?;
     let mut runs = Vec::new();
@@ -261,6 +264,7 @@ fn shell_runs(tx: &rusqlite::Transaction<'_>) -> Result<Vec<ShellRunStorage>> {
         let run: String = row.get(0)?;
         let command: Option<String> = row.get(2)?;
         let output: Option<i64> = row.get(3)?;
+        let output_blob: Option<String> = row.get(4)?;
         runs.push(ShellRunStorage {
             run: CommandId(uuid(&run)?),
             session: session_id(&row.get::<_, String>(1)?)?,
@@ -271,6 +275,7 @@ fn shell_runs(tx: &rusqlite::Transaction<'_>) -> Result<Vec<ShellRunStorage>> {
             .0,
             event_bytes: progress.get(&run).copied().unwrap_or(0),
             output: output.map_or(0, count),
+            output_blob: output_blob.as_deref().map(uuid).transpose()?.map(BlobId),
         });
     }
     Ok(runs)

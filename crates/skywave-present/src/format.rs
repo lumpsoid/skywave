@@ -211,6 +211,8 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
         RejectReason::ServerStopping => {
             "the server is stopping once its running work ends; send it again after"
         }
+        RejectReason::UnknownBlob => "the server keeps no such content",
+        RejectReason::BlobGone => "that content was already deleted",
     }
 }
 
