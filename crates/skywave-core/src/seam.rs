@@ -22,12 +22,23 @@ use crate::blobs::{remove_all_blob_files, remove_blob_files};
 use crate::client::{BlobLease, Core, CoreError, State, failing_on_panic, lock};
 use crate::identity::{FileIdentity, Identity, PairedCredentials};
 use crate::model::Paired;
+use crate::projection::BlobFate;
 use crate::store::{
-    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, Settings, StoreError,
+    Applied, BlobPolicy, BlobRecord, BlobStatus, LogCheck, OutboxEntry, PendingCrop, Settings,
+    StoreError,
 };
 use crate::transport::TransportError;
 use crate::view::{ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+
+/// The bytes a local crop is made from ([`Seam::local_crop`]).
+#[derive(Debug, Clone)]
+pub(crate) struct CropSource {
+    /// The complete file of the cropped blob.
+    pub(crate) path: PathBuf,
+    /// The line spans the server kept.
+    pub(crate) kept: Vec<skywave_proto::LineSpan>,
+}
 
 /// Work the core asks the engine to do. Sent only after the action that
 /// caused it is persisted.
@@ -180,6 +191,74 @@ impl Seam {
         let state = lock(&self.core.shared.state);
         let lease = state.blob_lease(id);
         Ok(state.store.blob(id)?.map(|record| (record, lease)))
+    }
+
+    /// The crops this device still makes itself, in log order
+    /// ([`Store::pending_crops`](crate::Store::pending_crops)).
+    pub fn pending_crops(&self) -> Result<Vec<PendingCrop>, CoreError> {
+        Ok(lock(&self.core.shared.state).store.pending_crops()?)
+    }
+
+    /// The pending crop that makes `into`, if any: a worker claiming
+    /// `into` makes it locally first, however it was queued.
+    pub(crate) fn pending_crop_into(&self, into: BlobId) -> Result<Option<PendingCrop>, CoreError> {
+        Ok(lock(&self.core.shared.state)
+            .store
+            .pending_crop_into(into)?)
+    }
+
+    /// Whether the server deleted or cropped `id`: it no longer serves it.
+    pub(crate) fn blob_fated(&self, id: BlobId) -> Result<bool, CoreError> {
+        Ok(lock(&self.core.shared.state).store.blob_fate(id)?.is_some())
+    }
+
+    /// What a local crop needs: `crop.into`'s record with the lease its
+    /// job holds, as [`Seam::leased_blob`], and the bytes to crop — the
+    /// file of `crop.from` and the spans kept — if `from` is available and
+    /// its fate still names this crop. `None` if `into` is unknown.
+    pub(crate) fn local_crop(
+        &self,
+        crop: PendingCrop,
+    ) -> Result<Option<(BlobRecord, BlobLease, Option<CropSource>)>, CoreError> {
+        let state = lock(&self.core.shared.state);
+        let lease = state.blob_lease(crop.into);
+        let Some(record) = state.store.blob(crop.into)? else {
+            return Ok(None);
+        };
+        let path = match state.store.blob(crop.from)? {
+            Some(BlobRecord {
+                status: BlobStatus::Available { path },
+                ..
+            }) => Some(path),
+            _ => None,
+        };
+        let source = match (path, state.store.blob_fate(crop.from)?) {
+            (Some(path), Some(BlobFate::Cropped { into, kept, .. })) if into.id == crop.into => {
+                Some(CropSource { path, kept })
+            }
+            _ => None,
+        };
+        Ok(Some((record, lease, source)))
+    }
+
+    /// The local crop of `crop` ended, made or not: the blob it was made
+    /// from goes as a server purge does ([`Seam::apply_events`]) — its row
+    /// and files, a lease on it, the queue told — unless it went already.
+    pub(crate) fn local_crop_ended(&self, crop: PendingCrop) -> Result<(), CoreError> {
+        let data_dir = self.data_dir();
+        self.update(|state| {
+            let purged = state.store.end_local_crop(crop)?;
+            state.blobs_purged(&purged);
+            state.model.blobs_purged(&purged);
+            for blob in &purged {
+                remove_blob_files(&data_dir, *blob);
+            }
+            let mut requests = Vec::new();
+            if !purged.is_empty() {
+                requests.push(Request::BlobsPurged(purged));
+            }
+            Ok(((), requests))
+        })
     }
 
     /// Stores a pulled batch (one transaction, cursor included) and shows

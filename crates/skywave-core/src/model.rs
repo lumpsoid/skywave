@@ -1280,11 +1280,15 @@ impl Model {
             }
             self.note_shell_finish(event);
             self.turns.extend(TurnRecord::of(seq, event));
-            // As the store does: the old blob goes before a crop's `into`
-            // registers, and a blob with a fate never registers again.
+            // As the store decides it (`Store::apply_batch`): before a
+            // crop's `into` registers, the old blob goes unless a crop
+            // finds it held; a blob with a fate never registers again.
             if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+                let held = matches!(fate, BlobFate::Cropped { .. }) && self.blob_held(blob);
                 self.fates.entry(blob).or_insert(fate);
-                self.forget_blob(blob);
+                if !held {
+                    self.purge_blob(blob);
+                }
             }
             for blob in blob_refs(&event.kind) {
                 if self.fates.contains_key(&blob.id) {
@@ -1642,6 +1646,51 @@ impl Model {
         self.blobs.remove(&id);
         self.wanted.remove(&id);
         self.failed.remove(&id);
+    }
+
+    /// The `from` of each crop pending to produce `into`: a `Cropped` fate
+    /// naming `into` whose blob still has a record (`Store::pending_crops`).
+    fn crops_into(&self, into: BlobId) -> impl Iterator<Item = BlobId> + '_ {
+        self.fates
+            .iter()
+            .filter_map(move |(from, fate)| match fate {
+                BlobFate::Cropped { into: made, .. }
+                    if made.id == into && self.blobs.contains_key(from) =>
+                {
+                    Some(*from)
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether this device holds `blob`'s bytes, or will: available, or
+    /// the `into` of a pending crop (as `Store::apply_batch` decides).
+    fn blob_held(&self, blob: BlobId) -> bool {
+        match self.blobs.get(&blob) {
+            Some(record) => {
+                matches!(record.status, BlobStatus::Available { .. })
+                    || self.crops_into(blob).next().is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// `blob` left the replica, and so did any blob a pending crop would
+    /// have made it from (as `Store::apply_batch` and
+    /// `Store::end_local_crop` purge them).
+    fn purge_blob(&mut self, blob: BlobId) {
+        let mut next = vec![blob];
+        while let Some(blob) = next.pop() {
+            next.extend(self.crops_into(blob).collect::<Vec<_>>());
+            self.forget_blob(blob);
+        }
+    }
+
+    /// The store purged these blobs (`Store::end_local_crop`).
+    pub(crate) fn blobs_purged(&mut self, ids: &[BlobId]) {
+        for id in ids {
+            self.forget_blob(*id);
+        }
     }
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
@@ -3645,6 +3694,7 @@ mod tests {
             outbox: Vec::new(),
             blobs: Vec::new(),
             fates: HashMap::new(),
+            pending_crops: Vec::new(),
             settings: Settings::default(),
             drafts: HashMap::new(),
             composer_modes: HashMap::new(),
@@ -7521,6 +7571,7 @@ mod tests {
             outbox: model.outbox.clone(),
             blobs: model.blobs.values().cloned().collect(),
             fates: model.fates.clone(),
+            pending_crops: Vec::new(),
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             composer_modes: model.composer_modes.clone(),
@@ -10432,6 +10483,162 @@ mod tests {
                 state.resync();
             }
             assert_eq!(outputs(live.core.view()), shown);
+        }
+
+        /// A crop of a held blob keeps it for the local crop: the batch
+        /// queues no fetch of what the crop makes, the views show the crop
+        /// already, and the old blob goes when the crop ends. Deleting what
+        /// a pending crop of a crop makes purges the whole chain. The
+        /// store and the model agree at every step.
+        #[test]
+        fn blob_fates_a_held_blob_waits_for_its_local_crop() {
+            use crate::store::PendingCrop;
+
+            let live = Live::new();
+            let by = DeviceId::new();
+            let (one, two) = (blob(400), blob(800));
+            let result = |output: &BlobRef| ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "out".into(),
+                lines: 40,
+                output: Some(Full::Blob(output.clone())),
+            };
+            let event = |kind| Event {
+                session_id: live.session,
+                at: Utc::now(),
+                command_id: None,
+                context: ContextId::first_of(live.session),
+                kind,
+            };
+            let crop = |blob: &BlobRef, into: &BlobRef| {
+                event(EventKind::BlobCropped {
+                    blob: blob.id,
+                    holds: BlobUse::ToolOutput,
+                    into: into.clone(),
+                    kept: vec![LineSpan { first: 0, count: 2 }],
+                    lines: 40,
+                    by,
+                })
+            };
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![
+                        event(EventKind::ToolResult(result(&one))),
+                        event(EventKind::ToolResult(result(&two))),
+                    ],
+                })
+                .unwrap();
+            live.core
+                .dispatch(Action::OpenSession(live.session))
+                .unwrap();
+            let dir = crate::blobs::blob_dir(&live.seam.data_dir());
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = |blob: &BlobRef| dir.join(blob.id.0.to_string());
+            for held in [&one, &two] {
+                std::fs::write(file(held), b"held").unwrap();
+                live.seam
+                    .blob_status(held.id, BlobStatus::Available { path: file(held) })
+                    .unwrap();
+            }
+            live.requests();
+            // What the model holds, and that the store agrees.
+            let agreed = || {
+                let mut state = crate::client::lock(&live.core.shared.state);
+                let mut ids: Vec<_> = state.model.blobs.keys().copied().collect();
+                state.resync();
+                let mut again: Vec<_> = state.model.blobs.keys().copied().collect();
+                ids.sort();
+                again.sort();
+                assert_eq!(ids, again, "the store and the model agree");
+                ids
+            };
+
+            // `one` cropped, `two` cropped twice, in one batch.
+            let (one_into, middle, last) = (blob(10), blob(20), blob(5));
+            let applied = live
+                .seam
+                .apply_events(&EventBatch {
+                    from: Seq(4),
+                    events: vec![
+                        crop(&one, &one_into),
+                        crop(&two, &middle),
+                        crop(&middle, &last),
+                    ],
+                })
+                .unwrap();
+            let pending = [
+                PendingCrop {
+                    into: one_into.id,
+                    from: one.id,
+                },
+                PendingCrop {
+                    into: middle.id,
+                    from: two.id,
+                },
+                PendingCrop {
+                    into: last.id,
+                    from: middle.id,
+                },
+            ];
+            assert_eq!(applied.local_crops, pending);
+            assert!(applied.blobs.is_empty(), "nothing to fetch");
+            assert!(applied.purged.is_empty());
+            assert!(live.requests().is_empty());
+            assert_eq!(live.seam.pending_crops().unwrap(), pending);
+            let mut held = vec![one.id, two.id, one_into.id, middle.id, last.id];
+            held.sort();
+            assert_eq!(agreed(), held);
+            // The views show the crops already, never the held content.
+            let shown: Vec<_> = outputs(live.core.view())
+                .iter()
+                .map(|output| output.blob().map(|b| (b.id, b.state.clone())))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    Some((one_into.id, BlobState::NotDownloaded { size: 10 })),
+                    Some((last.id, BlobState::NotDownloaded { size: 5 })),
+                ]
+            );
+
+            // `one`'s crop ends: `one` goes as a server purge does, once.
+            live.seam.local_crop_ended(pending[0]).unwrap();
+            assert_eq!(live.requests(), [Request::BlobsPurged(vec![one.id])]);
+            assert!(!file(&one).exists());
+            assert!(live.seam.blob(one.id).unwrap().is_none());
+            live.seam.local_crop_ended(pending[0]).unwrap();
+            assert!(live.requests().is_empty(), "no longer pending");
+            assert_eq!(live.seam.pending_crops().unwrap(), pending[1..]);
+
+            // The server deletes the end of the chain before it is made:
+            // every blob that would have made it goes too.
+            let applied = live
+                .seam
+                .apply_events(&EventBatch {
+                    from: Seq(7),
+                    events: vec![event(EventKind::BlobDeleted {
+                        blob: last.id,
+                        holds: BlobUse::ToolOutput,
+                        by,
+                    })],
+                })
+                .unwrap();
+            assert_eq!(applied.purged, [last.id, middle.id, two.id]);
+            assert!(applied.local_crops.is_empty());
+            assert_eq!(
+                live.requests(),
+                [Request::BlobsPurged(vec![last.id, middle.id, two.id])]
+            );
+            assert!(!file(&two).exists());
+            assert!(live.seam.pending_crops().unwrap().is_empty());
+            assert_eq!(agreed(), [one_into.id]);
+            assert!(matches!(
+                outputs(live.core.view())[1],
+                FullView::Deleted { .. }
+            ));
         }
 
         #[test]

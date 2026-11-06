@@ -915,6 +915,7 @@ async fn pull(
         match ctx.seam.apply_events(&batch) {
             Ok(applied) => {
                 head = head.max(applied.cursor);
+                ctx.blobs.local_crops(&applied.local_crops);
                 ctx.blobs.registered(&applied.blobs);
                 // A command the log settled, or the log applied through a
                 // head, may be what the sender waits on ([`settled_by_log`]).

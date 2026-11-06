@@ -648,14 +648,29 @@ pub struct Applied {
     pub sessions: Vec<SessionId>,
     /// Blobs first referenced by this batch, now registered as
     /// [`BlobStatus::NotDownloaded`], in log order; none the batch also
-    /// purged.
+    /// purged, and none a [`local_crops`](Applied::local_crops) entry
+    /// produces.
     pub blobs: Vec<BlobId>,
     /// Blobs the batch deleted or cropped away on the server whose rows are
     /// gone, and whose files (complete and partial) the caller removes.
     pub purged: Vec<BlobId>,
+    /// Crops of held blobs the batch left pending, in log order: this
+    /// device makes their `into` from the bytes it has.
+    pub local_crops: Vec<PendingCrop>,
     /// Outbox commands still unanswered that the batch settled as accepted
     /// at the seq of their event, in log order.
     pub settled: Vec<(CommandId, Seq)>,
+}
+
+/// A server crop this device makes itself from the bytes it holds: `from`
+/// (the cropped blob, `Available` here or itself a pending crop's `into`)
+/// keeps its row until the device made `into` from it. Not stored on its
+/// own: a `Cropped` fate whose blob still has a row is one
+/// ([`Store::pending_crops`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCrop {
+    pub into: BlobId,
+    pub from: BlobId,
 }
 
 /// How far this device has read a session: through `seq`, when the session
@@ -679,6 +694,9 @@ pub struct Snapshot {
     /// What the server did to blobs, by the blob it names
     /// ([`Store::blob_fates`]).
     pub fates: HashMap<BlobId, BlobFate>,
+    /// Crops this device still makes itself, in log order
+    /// ([`Store::pending_crops`]).
+    pub pending_crops: Vec<PendingCrop>,
     pub settings: Settings,
     pub drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// Sessions whose composer does not write to the agent
@@ -776,6 +794,7 @@ impl Store {
             outbox: self.outbox()?,
             blobs: self.blobs()?,
             fates: self.blob_fates()?,
+            pending_crops: self.pending_crops()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
             composer_modes: self.composer_modes()?,
@@ -925,11 +944,16 @@ impl Store {
     /// first is kept; the other changes nothing.
     ///
     /// A `BlobDeleted` or `BlobCropped` keeps the blob's fate
-    /// ([`BlobFate`]) and purges the blob's row, whatever its state: its
-    /// content is gone from the server, so a download of it cannot finish,
-    /// and the fate says what to show instead ([`Applied::purged`]). A
-    /// crop's `into` registers like any referenced blob. A blob with a
-    /// fate never registers again.
+    /// ([`BlobFate`]), which says what to show instead. Its content is gone
+    /// from the server, so a download of it cannot finish: the blob's row
+    /// is purged ([`Applied::purged`]), unless a crop finds it held — its
+    /// row `available`, or itself the `into` of a pending crop (a crop of a
+    /// crop). A held blob keeps its row until the device made the crop's
+    /// `into` from it ([`Applied::local_crops`], [`PendingCrop`]); that
+    /// `into` registers but is left out of [`Applied::blobs`], so nothing
+    /// fetches it eagerly. A blob purged also purges the blob of any crop
+    /// pending to produce it. Otherwise a crop's `into` registers like any
+    /// referenced blob. A blob with a fate never registers again.
     ///
     /// Events of a session deleted from this device advance the cursor but
     /// are not stored, project no summary and register no blob. Contiguity
@@ -958,6 +982,7 @@ impl Store {
         let mut new_events = 0;
         let mut blobs = Vec::new();
         let mut purged = Vec::new();
+        let mut local_crops: Vec<PendingCrop> = Vec::new();
         let mut settled = Vec::new();
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
             new_cursor = seq;
@@ -999,12 +1024,22 @@ impl Store {
                     touched.insert(event.session_id, summary);
                 }
             }
-            // The old blob goes before a crop's `into` registers below.
-            if let Some((blob, fate)) = BlobFate::of(&event.kind)
-                && put_fate(&tx, seq, blob, &fate)?
-            {
-                blobs.retain(|id| *id != blob);
-                purged.push(blob);
+            // Decided before a crop's `into` registers below.
+            if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+                let into = match &fate {
+                    BlobFate::Cropped { into, .. } => Some(into.id),
+                    BlobFate::Deleted { .. } => None,
+                };
+                let held = into.is_some() && blob_held(&tx, blob)?;
+                put_fate(&tx, seq, blob, &fate)?;
+                if let (true, Some(into)) = (held, into) {
+                    local_crops.push(PendingCrop { into, from: blob });
+                } else {
+                    for gone in purge_blob(&tx, blob)? {
+                        blobs.retain(|id| *id != gone);
+                        purged.push(gone);
+                    }
+                }
             }
             for blob in blob_refs(&event.kind) {
                 if register_blob(&tx, blob)? {
@@ -1042,12 +1077,17 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        // A later event of the batch may have purged a crop's `into`, and
+        // with it the crop's blob.
+        local_crops.retain(|crop| !purged.contains(&crop.into) && !purged.contains(&crop.from));
+        blobs.retain(|id| !local_crops.iter().any(|crop| crop.into == *id));
         Ok(Applied {
             cursor: new_cursor,
             new_events,
             sessions: touched.into_keys().collect(),
             blobs,
             purged,
+            local_crops,
             settled,
         })
     }
@@ -1386,6 +1426,72 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT blob_id, fate FROM blob_fates")?;
         let rows = stmt.query_map([], |row| Ok((BlobId(uuid_col(row, 0)?), json_col(row, 1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// What the server did to `blob`, if anything.
+    pub fn blob_fate(&self, blob: BlobId) -> Result<Option<BlobFate>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT fate FROM blob_fates WHERE blob_id = ?1",
+                [blob.0.to_string()],
+                |row| json_col(row, 0),
+            )
+            .optional()?)
+    }
+
+    /// The crops this device still makes itself, in log order: a `Cropped`
+    /// fate whose blob still has a row ([`apply_batch`](Store::apply_batch)).
+    pub fn pending_crops(&self) -> Result<Vec<PendingCrop>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT from_id, into_id FROM ({PENDING_CROPS}) ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingCrop {
+                from: BlobId(uuid_col(row, 0)?),
+                into: BlobId(uuid_col(row, 1)?),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The pending crop that makes `into`, if any.
+    pub fn pending_crop_into(&self, into: BlobId) -> Result<Option<PendingCrop>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT from_id FROM ({PENDING_CROPS}) WHERE into_id = ?1"),
+                [into.0.to_string()],
+                |row| {
+                    Ok(PendingCrop {
+                        into,
+                        from: BlobId(uuid_col(row, 0)?),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The device made `crop`'s `into` or gave up on it: the blob it was
+    /// made from goes. Returns the blobs whose rows went; none if the crop
+    /// was no longer pending.
+    pub fn end_local_crop(&mut self, crop: PendingCrop) -> Result<Vec<BlobId>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let pending: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM ({PENDING_CROPS})
+                     WHERE from_id = ?1 AND into_id = ?2)"
+            ),
+            [crop.from.0.to_string(), crop.into.0.to_string()],
+            |row| row.get(0),
+        )?;
+        let purged = if pending {
+            purge_blob(&tx, crop.from)?
+        } else {
+            Vec::new()
+        };
+        tx.commit()?;
+        Ok(purged)
     }
 
     pub fn blob(&self, id: BlobId) -> Result<Option<BlobRecord>, StoreError> {
@@ -2200,22 +2306,65 @@ fn purge_workdir_blobs(
     Ok(purged)
 }
 
-/// Keeps `fate`, decided at `seq`, as `blob`'s and deletes the blob's row;
-/// whether a row was deleted. The first fate stays: the server decides one
-/// per blob.
+/// Keeps `fate`, decided at `seq`, as `blob`'s. The first fate stays: the
+/// server decides one per blob.
 fn put_fate(
     tx: &Transaction<'_>,
     seq: Seq,
     blob: BlobId,
     fate: &BlobFate,
-) -> Result<bool, StoreError> {
-    let id = blob.0.to_string();
+) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO blob_fates (blob_id, fate, seq) VALUES (?1, ?2, ?3)
          ON CONFLICT (blob_id) DO NOTHING",
-        params![id, to_json(fate)?, seq_sql(seq)?],
+        params![blob.0.to_string(), to_json(fate)?, seq_sql(seq)?],
     )?;
-    Ok(tx.execute("DELETE FROM blobs WHERE id = ?1", [id])? > 0)
+    Ok(())
+}
+
+/// The pending crops ([`PendingCrop`]), as `from_id`, `into_id` and their
+/// fate's `seq`: a `Cropped` fate whose blob still has a row.
+const PENDING_CROPS: &str = "SELECT f.blob_id AS from_id,
+         json_extract(f.fate, '$.into.id') AS into_id, f.seq AS seq
+     FROM blob_fates f JOIN blobs b ON b.id = f.blob_id
+     WHERE json_extract(f.fate, '$.type') = 'cropped'";
+
+/// Whether this device holds `blob`'s bytes, or will: its row is
+/// `available`, or it is the `into` of a pending crop (whose own row is
+/// there too).
+fn blob_held(tx: &Transaction<'_>, blob: BlobId) -> Result<bool, StoreError> {
+    Ok(tx.query_row(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM blobs WHERE id = ?1 AND state = 'available')
+                 OR (EXISTS (SELECT 1 FROM blobs WHERE id = ?1)
+                     AND EXISTS (SELECT 1 FROM ({PENDING_CROPS}) WHERE into_id = ?1))"
+        ),
+        [blob.0.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// Deletes `blob`'s row and, as nothing will produce `blob` any more, the
+/// row of any blob a pending crop would have made it from (and so on down
+/// a crop of a crop). Returns the blobs whose rows went.
+fn purge_blob(tx: &Transaction<'_>, blob: BlobId) -> Result<Vec<BlobId>, StoreError> {
+    let mut purged = Vec::new();
+    let mut next = vec![blob];
+    while let Some(blob) = next.pop() {
+        let id = blob.0.to_string();
+        let sources = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT from_id FROM ({PENDING_CROPS}) WHERE into_id = ?1"
+            ))?;
+            let rows = stmt.query_map([&id], |row| Ok(BlobId(uuid_col(row, 0)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if tx.execute("DELETE FROM blobs WHERE id = ?1", [&id])? > 0 {
+            purged.push(blob);
+        }
+        next.extend(sources);
+    }
+    Ok(purged)
 }
 
 /// Registers `blob` as `NotDownloaded`, with its hash, unless a blob with

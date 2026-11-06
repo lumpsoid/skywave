@@ -806,18 +806,51 @@ logs) an event that no longer decodes rather than failing.
   A server delete or crop reaches every replica as the log's `BlobDeleted`
   or `BlobCropped`, whoever decided it. `apply_batch` keeps the blob's
   fate (`blob_fates`, a `BlobFate` by blob id: who deleted it, or the
-  crop's `into`, kept spans and the old line count) and purges the old
-  blob's row in the same transaction, whatever its state: its content is
-  gone from the server, so a download of it could not finish, and the
-  fate says what to show. A crop's `into` registers like any referenced
-  blob; a blob with a fate never registers again (so its lease is never
-  needed to tell a new row apart). `Applied::purged` names the purged
-  blobs, and the seam handles them as a workdir refresh does: leases
-  bumped, files (complete and `.part`) removed, `Request::BlobsPurged`
-  sent; a download holding one stops at its next report.
-  `Applied::blobs`, the eager queue's input, leaves out what the same
-  batch purged: a crop of a crop pulled in one batch registers and
-  purges the middle blob there. The model folds the same fates from the
+  crop's `into`, kept spans and the old line count) and, in the same
+  transaction, purges the old blob's row: its content is gone from the
+  server, so a download of it could not finish, and the fate says what to
+  show. Purging a blob also purges any blob a pending crop would have made
+  it from. A crop's `into` registers like any referenced blob; a blob
+  with a fate never registers again (so its lease is never needed to tell
+  a new row apart). `Applied::purged` names the purged blobs, and the
+  seam handles them as a workdir refresh does: leases bumped, files
+  (complete and `.part`) removed, `Request::BlobsPurged` sent; a download
+  holding one stops at its next report. `Applied::blobs`, the eager
+  queue's input, leaves out what the same batch purged: a crop of a crop
+  pulled in one batch by a device not holding the original registers and
+  purges the middle blob there.
+
+  **Local crop.** A crop of a blob this device *holds* (its row
+  `available`, or itself the `into` of a pending crop: a crop of a crop)
+  keeps the old row instead, and the device makes `into` from those bytes
+  rather than fetching it, under any policy and offline too. The batch
+  returns it in `Applied::local_crops` (a `PendingCrop { into, from }`)
+  and leaves `into` out of `Applied::blobs`. The engine queues `into` at
+  the front as a blob-queue job with the source `LocalCrop { from }`; a
+  worker claims it as it would a download (so no eager download or
+  request writes `blobs/<into>.part` meanwhile; and a worker claiming
+  `into` however it was queued asks the replica for a pending crop and
+  makes that first), crops `from`'s file into
+  that `.part` on a blocking thread (`skywave_proto::crop`, the server's
+  own function, so the bytes hash to `into.sha256`), verifies size and
+  hash, renames, and marks `into` `Available` under its lease. Made or
+  not, `Seam::local_crop_ended` then purges the old blob in one update,
+  as above. A missing file, a mismatch or an I/O error deletes the `.part`
+  and the same claim falls through to a fetch of `into` if it is wanted
+  (asked for, or `Eager`) and has no fate of its own (the server no
+  longer has a crop's middle blob); otherwise `into` stays
+  `NotDownloaded`. An `into` purged meanwhile fails the lease check like
+  any download (and its purge took the old blob too). A crop job waits
+  while the blob it reads is queued or held, so a crop of a crop runs in
+  log order. An eager worker backing off from a blob lets it go when a
+  crop job is ready (it is queued again behind the crops), so a crop
+  never waits on a link that is down. Pending
+  crops are not stored on their own: a `Cropped` fate whose blob still
+  has a row is one (`Store::pending_crops`, also in `Snapshot`), and the
+  queue is restored with them at the front on startup, so an exit before
+  the job ran neither leaves the old blob behind nor fetches `into`. The
+  views never show the held blob's content: they resolve through the
+  fate to `into`, `NotDownloaded` until the crop is made. The model folds the same fates from the
   batch, so it agrees with the store (and with the store after a
   resync). Fates go with the events (a reset) and with their session's
   local delete. The views resolve an event's blob through the fates, a
@@ -827,8 +860,7 @@ logs) an event that no longer decodes rather than failing.
   `kept` the lines the last crop kept, `of` the original's line count
   (the first crop's `lines`; every crop keeps lines of the original) and
   `by` the last crop's device. A shell run's `output` resolves the same
-  (`ShellRun::output: Option<FullView>`). A device holding the old blob
-  purges it too, and downloads `into` like any blob.
+  (`ShellRun::output: Option<FullView>`).
 - **Imported history** (D37): an adopted session's `Imported` events are
   records. They are not activity (the session's `last_seq` and
   `last_activity` stay at its creation, so a read mark stops before them),
