@@ -291,6 +291,35 @@ void main() {
     expect(tester.getTopLeft(find.text('mine')), where);
   });
 
+  testWidgets('rows in view leaving while scrolled back lay out cleanly', (
+    tester,
+  ) async {
+    // As conversation only does: the rows on screen go at once.
+    final timeline = holding([
+      for (var i = 0; i < 60; i++) row('s:$i', 'row $i'),
+    ]);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: <GuiIntent>[],
+    );
+    await tester.scrollUntilVisible(
+      find.text('row 25'),
+      200,
+      scrollable: listScrollable(),
+    );
+    await tester.pumpAndSettle();
+
+    for (var i = 10; i < 50; i++) {
+      timeline.apply(TimelineUpdateRemoved(key: 's:$i'));
+    }
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('row 25'), findsNothing);
+  });
+
   testWidgets('a tap expands or collapses an item; Download fetches its blob', (
     tester,
   ) async {
