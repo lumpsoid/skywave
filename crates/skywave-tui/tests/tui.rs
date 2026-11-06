@@ -21,11 +21,12 @@ use skywave_core::{
 use skywave_present::format::took_label;
 use skywave_present::sections::{ItemKey, delivery, find};
 use skywave_proto::{
-    BlobRef, Body, BodyFormat, CallId, ChangeSet, ChangedFile, ChangesResult, CommandResult,
-    DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, Event, EventBatch, EventKind, FileBody,
-    FileChange, FileResult, Full, HelloResponse, LinkTarget, ListResult, ModelChoice,
-    PermissionMode, RejectReason, RuleScope, RuleSuggestion, SessionState as LogState, ShellEnd,
-    ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage, limits,
+    BlobRef, BlobUse, Body, BodyFormat, CallId, ChangeSet, ChangedFile, ChangesResult,
+    CommandResult, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind, Event, EventBatch,
+    EventKind, FileBody, FileChange, FileResult, Full, HelloResponse, LineSpan, LinkTarget,
+    ListResult, ModelChoice, PermissionMode, RejectReason, RuleScope, RuleSuggestion,
+    SessionState as LogState, ShellEnd, ToolCall, ToolDisplay, ToolKind, ToolResult, TurnUsage,
+    limits,
 };
 use skywave_tui::App;
 use skywave_tui::app::{Anchor, DRAFT_SAVE_AFTER, Field, READ_MARK_EVERY};
@@ -2064,6 +2065,85 @@ fn a_lost_output_says_so_under_its_preview() {
     let screen = h.screen();
     assert_contains(&screen, "│ … full 9.8 KiB · not downloaded");
     assert!(!screen.contains("could not store"), "{screen}");
+}
+
+fn blob_deleted(id: SessionId, minute: u32, blob: BlobId, by: DeviceId) -> Event {
+    event(
+        id,
+        minute,
+        EventKind::BlobDeleted {
+            blob,
+            holds: BlobUse::ToolOutput,
+            by,
+        },
+    )
+}
+
+/// `blob` cropped to 2 of its 40 lines, into `into`.
+fn blob_cropped(id: SessionId, minute: u32, blob: BlobId, into: BlobRef, by: DeviceId) -> Event {
+    event(
+        id,
+        minute,
+        EventKind::BlobCropped {
+            blob,
+            holds: BlobUse::ToolOutput,
+            into,
+            kept: vec![LineSpan { first: 4, count: 2 }],
+            lines: 40,
+            by,
+        },
+    )
+}
+
+/// A tool output deleted on the server says so under its preview, with
+/// nothing to download; a cropped one says what the crop kept beside its
+/// new blob's state.
+#[test]
+fn a_deleted_or_cropped_output_says_so_under_its_preview() {
+    let result = |output| {
+        EventKind::ToolResult(ToolResult {
+            call: None,
+            is_error: false,
+            status: None,
+            preview: "file-000".into(),
+            lines: 40,
+            output: Some(Full::Blob(output)),
+        })
+    };
+    let (mut h, id, me) = open_session();
+    let (gone, kept) = (blob(10_000), blob(9_000));
+    pull(&mut h, vec![event(id, 1, result(gone.1))]);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // Control: before the delete, its blob shows and downloads.
+    assert_contains(&h.screen(), "│ … full 9.8 KiB · not downloaded");
+    assert_contains(&footer(&h), "d download (9.8 KiB)");
+    pull(&mut h, vec![blob_deleted(id, 2, gone.0, me)]);
+    let screen = h.screen();
+    assert_contains(&screen, "│ … Deleted by you");
+    assert!(!screen.contains("not downloaded"), "{screen}");
+    assert!(!footer(&h).contains("d download ("), "{}", footer(&h));
+    assert_eq!(h.key(KeyCode::Char('d')), None, "nothing to download");
+
+    let (mut h, id, me) = open_session();
+    let (into_id, into) = blob(300);
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, result(kept.1)),
+            blob_cropped(id, 2, kept.0, into, me),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_contains(
+        &h.screen(),
+        "│ … full 300 B · not downloaded · Cropped by you: kept 2 of 40 lines",
+    );
+    assert_eq!(
+        h.key(KeyCode::Char('d')),
+        Some(Action::DownloadBlob(into_id))
+    );
 }
 
 #[test]
@@ -8370,6 +8450,60 @@ fn y_copies_a_runs_output_with_ansi_stripped() {
     let screen = h.screen();
     let red = line_with(&screen, "red");
     assert!(!red.contains('\u{1b}') && !red.contains("[31m"), "{red}");
+}
+
+/// A run whose output was deleted on the server shows the tombstone once
+/// expanded, with nothing to download; one whose output was cropped says
+/// what the crop kept, and downloads the cropped blob.
+#[test]
+fn a_runs_deleted_or_cropped_output_says_so() {
+    let shown = |change: &dyn Fn(SessionId, BlobId, DeviceId) -> Event| {
+        let (mut h, id, me) = shell_session();
+        let run = CommandId::new();
+        let (blob_id, output) = blob(4000);
+        let mut end = finished(id, at_s(1, 5), run, me, at(1), "the tail\n", Some(output));
+        if let EventKind::ShellFinished { lines, .. } = &mut end.kind {
+            *lines = 40;
+        }
+        pull(
+            &mut h,
+            vec![
+                requested(id, 1, run, me, "make test"),
+                started(id, at(1), run),
+                end,
+                change(id, blob_id, me),
+            ],
+        );
+        h.key_with(ctrl('t'));
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('k'));
+        let download = h.key(KeyCode::Enter);
+        (h.screen(), download, h)
+    };
+
+    let (screen, download, _) = shown(&|id, blob, me| blob_deleted(id, 3, blob, me));
+    assert_contains(&screen, "… 39 earlier lines · Deleted by you");
+    assert_eq!(download, None, "nothing to download");
+
+    let (into_id, into) = blob(300);
+    let (screen, download, mut h) =
+        shown(&|id, blob, me| blob_cropped(id, 3, blob, into.clone(), me));
+    assert_contains(
+        &screen,
+        "… 1 earlier lines · downloading 300 B · Cropped by you: kept 2 of 40 lines",
+    );
+    assert_eq!(download, Some(Action::DownloadBlob(into_id)));
+    // Downloaded, the two kept lines are all of it: none are earlier.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"kept one\nkept two\n").unwrap();
+    h.seam
+        .blob_status(into_id, BlobStatus::Available { path })
+        .unwrap();
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "kept two");
+    assert!(!screen.contains("earlier lines"), "{screen}");
 }
 
 #[test]

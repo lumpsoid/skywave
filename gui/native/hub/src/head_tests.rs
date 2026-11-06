@@ -3713,6 +3713,7 @@ mod workdir {
         BlobView {
             id: BlobId::new(),
             state: BlobState::Available { path },
+            change: None,
         }
     }
 
@@ -3883,6 +3884,7 @@ mod workdir {
                 size: 80,
                 reason: "offline".into(),
             },
+            change: None,
         };
         let screen = shown(
             &mut rig,

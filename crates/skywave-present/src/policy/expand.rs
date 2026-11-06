@@ -66,7 +66,11 @@ mod tests {
     fn result(id: BlobId, state: BlobState) -> Entry {
         Entry::ToolResult {
             summary: "out".into(),
-            output: Some(FullView::Blob(BlobView { id, state })),
+            output: Some(FullView::Blob(BlobView {
+                id,
+                state,
+                change: None,
+            })),
         }
     }
 

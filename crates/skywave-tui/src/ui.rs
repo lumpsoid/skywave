@@ -30,9 +30,9 @@ use ratatui::widgets::{
 };
 use skywave_core::{
     BlobPolicy, BlobState, CandidateSource, Completion, CompletionStatus, ConversationPicker,
-    ConversationsStatus, Link, LinkRejection, ListKind, Outgoing, PairingStatus, PairingView,
-    PendingSession, RuleSuggestion, Screen, SessionId, SessionListView, SessionRow, SessionState,
-    SettingsView, WorkdirPane,
+    ConversationsStatus, FullView, Link, LinkRejection, ListKind, Outgoing, PairingStatus,
+    PairingView, PendingSession, RuleSuggestion, Screen, SessionId, SessionListView, SessionRow,
+    SessionState, SettingsView, WorkdirPane,
 };
 use skywave_present::format::{
     IMPORTING_HISTORY, adopting_note, blob_size, bytes, conversation_detail, conversation_link,
@@ -741,7 +741,7 @@ fn footer_hint(app: &App) -> Cow<'static, str> {
         && ui.focus == Focus::Timeline
         && let Some(size) = if ui.shell() {
             ui.selected_run(view)
-                .and_then(|run| run.output.as_ref())
+                .and_then(|run| run.output.as_ref().and_then(FullView::blob))
                 .filter(|blob| !matches!(blob.state, BlobState::Available { .. }))
                 .and_then(|blob| blob_size(&blob.state))
         } else {

@@ -152,6 +152,7 @@ mod tests {
             blob: BlobView {
                 id: BlobId::new(),
                 state,
+                change: None,
             },
             strip: Some("$ "),
         };

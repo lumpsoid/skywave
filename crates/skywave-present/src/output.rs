@@ -3,8 +3,12 @@
 //! read, and how the raw bytes read become text. The heads read the file;
 //! the rules are here.
 
-use skywave_core::{BlobView, ShellRun, ShellRunState};
+use std::borrow::Cow;
+
+use skywave_core::{BlobView, FullView, ShellRun, ShellRunState};
 use skywave_proto::strip_ansi;
+
+use crate::sections::{deleted_note, whole_lines};
 
 /// Most of a downloaded output a head reads to show it whole: its newest
 /// bytes, so a huge output shows its end, where the result is. Past it the
@@ -12,7 +16,7 @@ use skywave_proto::strip_ansi;
 pub const OUTPUT_SHOW_BYTES: u64 = 512 * 1024;
 
 /// Where a run's whole output is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WholeOutput<'a> {
     /// All of it is this text, ANSI stripped already: a finished run whose
     /// preview holds it, or a run with no output yet.
@@ -22,8 +26,11 @@ pub enum WholeOutput<'a> {
     Blob(&'a BlobView),
     /// Only `text` is known, and `note` says why: the tail so far of a run
     /// still going, or the preview of a finished run whose output was not
-    /// kept.
-    Partial { text: &'a str, note: &'static str },
+    /// kept or was deleted on the server ([`deleted_note`]).
+    Partial {
+        text: &'a str,
+        note: Cow<'static, str>,
+    },
 }
 
 /// The note on a running run's output: its whole output is a blob only
@@ -37,17 +44,24 @@ pub const OUTPUT_LOST: &str = "the server could not keep the rest of the output"
 /// text, which is all of it unless it is cut.
 pub fn whole_output(run: &ShellRun) -> WholeOutput<'_> {
     let text = run.tail_or_preview.as_str();
-    if let Some(blob) = &run.output {
-        return WholeOutput::Blob(blob);
+    match &run.output {
+        Some(FullView::Blob(blob)) => return WholeOutput::Blob(blob),
+        Some(FullView::Deleted { by }) => {
+            return WholeOutput::Partial {
+                text,
+                note: Cow::Owned(deleted_note(by)),
+            };
+        }
+        Some(FullView::Lost) | None => {}
     }
     match run.state {
         ShellRunState::Finished(_) if run.truncated => WholeOutput::Partial {
             text,
-            note: OUTPUT_LOST,
+            note: Cow::Borrowed(OUTPUT_LOST),
         },
         ShellRunState::Running if lines_before(run, text) > 0 => WholeOutput::Partial {
             text,
-            note: OUTPUT_SO_FAR,
+            note: Cow::Borrowed(OUTPUT_SO_FAR),
         },
         _ => WholeOutput::Here(text),
     }
@@ -64,10 +78,16 @@ pub fn output_text(bytes: &[u8], cut: bool) -> String {
     }
 }
 
-/// How many of `run`'s output lines come before `text`, the newest of
-/// them: none when `text` holds them all.
+/// The line count of `run`'s whole output so far: what a crop kept once
+/// the server cropped it, else the run's own count ([`whole_lines`]).
+pub fn output_lines(run: &ShellRun) -> u32 {
+    whole_lines(run.lines, run.output.as_ref())
+}
+
+/// How many of `run`'s output lines ([`output_lines`]) come before `text`,
+/// the newest of them: none when `text` holds them all.
 pub fn lines_before(run: &ShellRun, text: &str) -> usize {
-    (run.lines as usize).saturating_sub(text.lines().count())
+    (output_lines(run) as usize).saturating_sub(text.lines().count())
 }
 
 #[cfg(test)]
@@ -118,15 +138,31 @@ mod tests {
             whole_output(&long),
             WholeOutput::Partial {
                 text: "y\nz",
-                note: OUTPUT_LOST
+                note: OUTPUT_LOST.into()
             }
         );
         let blob = BlobView {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 9 },
+            change: None,
         };
-        long.output = Some(blob.clone());
+        long.output = Some(FullView::Blob(blob.clone()));
         assert_eq!(whole_output(&long), WholeOutput::Blob(&blob));
+        // Deleted on the server: the preview is all there is, and says so.
+        long.output = Some(FullView::Deleted {
+            by: DeviceRef {
+                id: DeviceId::new(),
+                name: Some("laptop".into()),
+                me: false,
+            },
+        });
+        assert_eq!(
+            whole_output(&long),
+            WholeOutput::Partial {
+                text: "y\nz",
+                note: "Deleted by laptop".into()
+            }
+        );
 
         // Running: the tail is all of it only while no line is left out.
         let going = run(ShellRunState::Running, "a\nb", 2);
@@ -136,7 +172,7 @@ mod tests {
             whole_output(&going),
             WholeOutput::Partial {
                 text: "y\nz",
-                note: OUTPUT_SO_FAR
+                note: OUTPUT_SO_FAR.into()
             }
         );
     }
@@ -155,5 +191,35 @@ mod tests {
         assert_eq!(lines_before(&run(DONE, "y\nz\n", 40), "y\nz\n"), 38);
         assert_eq!(lines_before(&run(DONE, "a", 1), "a"), 0);
         assert_eq!(lines_before(&run(DONE, "", 0), ""), 0);
+    }
+
+    #[test]
+    fn a_cropped_output_counts_only_the_kept_lines() {
+        let mut cut = run(DONE, "out 399\nout 400\n", 400);
+        cut.truncated = true;
+        cut.output = Some(FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::Available {
+                path: "/blobs/x".into(),
+            },
+            change: Some(skywave_core::BlobChange::Cropped {
+                kept: 5,
+                of: 400,
+                by: DeviceRef {
+                    id: DeviceId::new(),
+                    name: None,
+                    me: true,
+                },
+            }),
+        }));
+        assert_eq!(output_lines(&cut), 5);
+        // The downloaded text holds every kept line: none are earlier.
+        let kept = "a\nb\nc\nd\ne\n";
+        assert_eq!(lines_before(&cut, kept), 0);
+        // The preview, from the original, leaves out at most what was kept.
+        assert_eq!(lines_before(&cut, "out 399\nout 400\n"), 3);
+        // Control: uncropped, the run's own count.
+        cut.output = None;
+        assert_eq!(lines_before(&cut, kept), 395);
     }
 }

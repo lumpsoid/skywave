@@ -14,9 +14,9 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq, ServerAddress,
-    SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId,
-    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, FullView, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq,
+    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
+    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
@@ -1260,7 +1260,10 @@ impl SessionUi {
             self.shell_expanded.remove(&run.run);
             return None;
         }
-        run.output.as_ref().and_then(output_download)
+        run.output
+            .as_ref()
+            .and_then(FullView::blob)
+            .and_then(output_download)
     }
 }
 
@@ -1660,7 +1663,7 @@ impl App {
     /// stripped; until then the preview, which holds all of it when there
     /// is no blob and is stripped already.
     fn copy_run(&mut self, run: &ShellRun) -> Option<Action> {
-        match &run.output {
+        match run.output.as_ref().and_then(FullView::blob) {
             Some(blob) if matches!(blob.state, BlobState::Available { .. }) => {
                 self.copy_blob('y', blob.clone(), |path| Clip::Output { path })
             }
@@ -2585,6 +2588,7 @@ impl App {
                     .selected_run(view)?
                     .output
                     .as_ref()
+                    .and_then(FullView::blob)
                     .and_then(output_download),
                 KeyCode::Char('y') => {
                     let run = session.selected_run(view)?.clone();

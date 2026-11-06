@@ -1879,7 +1879,10 @@ fn shell_runs_fold_from_the_log_and_this_devices_outbox() {
     assert_eq!(run.finished_at, Some(at(40)));
     assert_eq!((run.tail_or_preview.as_str(), run.lines), ("two", 900));
     assert_eq!(
-        run.output.as_ref().map(|b| (b.id, b.state.clone())),
+        run.output
+            .as_ref()
+            .and_then(FullView::blob)
+            .map(|b| (b.id, b.state.clone())),
         Some((blob.id, BlobState::NotDownloaded { size: 9000 }))
     );
     assert!(run.truncated);

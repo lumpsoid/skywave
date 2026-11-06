@@ -189,10 +189,16 @@ impl Seam {
     /// Its events settle the commands they name that are still unanswered,
     /// as [`Seam::command_result`] would with their `Accepted`: a command
     /// whose reply was lost settles from the log, and the sender moves on.
+    ///
+    /// The blobs its `BlobDeleted` and `BlobCropped` purged go as in
+    /// [`Seam::workdir_answered`]: a download of one stops at its next
+    /// report (the lease), and their files go.
     pub fn apply_events(&self, batch: &EventBatch) -> Result<Applied, CoreError> {
         let now = Utc::now();
+        let data_dir = self.data_dir();
         self.update(|state| {
             let applied = state.store.apply_batch(batch, now)?;
+            state.blobs_purged(&applied.purged);
             let alerted = state.model.apply_batch(batch);
             for (id, seq) in &applied.settled {
                 let accepted = CommandResult::Accepted { seq: *seq };
@@ -206,7 +212,14 @@ impl Seam {
                 state.model.session_loaded(id, events);
             }
             mark_alerted(state, &alerted);
-            Ok((applied, Vec::new()))
+            for blob in &applied.purged {
+                remove_blob_files(&data_dir, *blob);
+            }
+            let mut requests = Vec::new();
+            if !applied.purged.is_empty() {
+                requests.push(Request::BlobsPurged(applied.purged.clone()));
+            }
+            Ok((applied, requests))
         })
     }
 

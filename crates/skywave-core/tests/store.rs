@@ -7,15 +7,16 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use skywave_core::workdir::{WorkdirAnswer, WorkdirAsk};
 use skywave_core::{
-    BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError, OutboxStatus,
-    PairedCredentials, ReadMark, RunWhen, Settings, Snippet, SnippetId, Store, StoreError,
+    BlobFate, BlobPolicy, BlobStatus, ComposerMode, Core, CoreError, Draft, LockError,
+    OutboxStatus, PairedCredentials, ReadMark, RunWhen, Settings, Snippet, SnippetId, Store,
+    StoreError,
 };
 use skywave_proto::{
-    AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, ChangeSet, ChangedFile, ChangesResult,
-    Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId, Decision, DeviceId,
-    DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange, FileResult, Full,
-    ImportOutcome, ImportedItem, RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin,
-    SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
+    AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
+    ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
+    Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange,
+    FileResult, Full, ImportOutcome, ImportedItem, LineSpan, RejectReason, Schedule, ScheduleId,
+    Seq, SessionId, SessionOrigin, SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -819,7 +820,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -948,7 +949,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1364,7 +1365,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2257,7 +2258,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -2767,7 +2768,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3049,7 +3050,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -3175,7 +3176,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -3214,7 +3215,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 4);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -3361,5 +3362,187 @@ fn the_server_log_is_checked_against_what_the_replica_has_seen() {
         store.take_server_log(Seq(3), &other).unwrap(),
         LogCheck::Continues,
         "a fresh replica takes any log"
+    );
+}
+
+fn blob_ref(size: u64, content: &[u8]) -> BlobRef {
+    BlobRef {
+        id: BlobId::new(),
+        size,
+        sha256: ContentHash::of(content),
+    }
+}
+
+fn cropped(session: SessionId, minute: u32, blob: BlobId, into: &BlobRef, by: DeviceId) -> Event {
+    event(
+        session,
+        minute,
+        EventKind::BlobCropped {
+            blob,
+            holds: BlobUse::ToolOutput,
+            into: into.clone(),
+            kept: vec![LineSpan { first: 0, count: 2 }],
+            lines: 40,
+            by,
+        },
+    )
+}
+
+/// `BlobCropped` and `BlobDeleted` keep the blob's fate and purge its row,
+/// held or not; a crop's `into` registers, unless the same batch crops it
+/// in turn, and a blob with a fate never registers again. Fates survive a
+/// reopen and go with the session's local delete and with a reset.
+#[test]
+fn blob_fates_fold_purge_and_go_with_the_replica() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    let held = BlobStatus::Available {
+        path: "blobs/x".into(),
+    };
+    store.set_blob_status(log.blob.id, &held).unwrap();
+
+    // A crop of a crop in one batch: the middle blob registers and goes.
+    let by = DeviceId::new();
+    let (b1, b2) = (blob_ref(20, b"b1"), blob_ref(10, b"b2"));
+    let applied = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![
+                    cropped(log.a, 8, log.blob.id, &b1, by),
+                    cropped(log.a, 9, b1.id, &b2, by),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(applied.blobs, [b2.id], "only what is left is queued");
+    assert_eq!(applied.purged, [log.blob.id, b1.id]);
+    assert_eq!(store.blob(log.blob.id).unwrap(), None, "the held copy went");
+    assert_eq!(store.blob(b1.id).unwrap(), None);
+    assert_eq!(
+        store.blob(b2.id).unwrap().map(|b| b.status),
+        Some(BlobStatus::NotDownloaded)
+    );
+    let fates = store.blob_fates().unwrap();
+    assert_eq!(fates.len(), 2);
+    assert!(matches!(
+        &fates[&log.blob.id],
+        BlobFate::Cropped { into, lines: 40, .. } if *into == b1
+    ));
+
+    // A replay changes nothing, nor does a later reference to a purged blob.
+    let again = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![
+                    cropped(log.a, 8, log.blob.id, &b1, by),
+                    cropped(log.a, 9, b1.id, &b2, by),
+                    log.events[3].clone(),
+                ],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(again.blobs.is_empty() && again.purged.is_empty());
+    assert_eq!(
+        store.blob(log.blob.id).unwrap(),
+        None,
+        "not registered again"
+    );
+
+    // A delete of a blob not downloaded purges its row too.
+    let deleted = event(
+        log.a,
+        11,
+        EventKind::BlobDeleted {
+            blob: b2.id,
+            holds: BlobUse::ToolOutput,
+            by,
+        },
+    );
+    let applied = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(11),
+                events: vec![deleted],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(applied.purged, [b2.id]);
+    assert!(store.blobs().unwrap().is_empty());
+    drop(store);
+
+    let mut store = Store::open(&dir).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.fates.len(), 3);
+    assert_eq!(snapshot.fates[&b2.id], BlobFate::Deleted { by });
+
+    // A reset clears them with the events.
+    assert!(store.reset_for_lost_history().unwrap().is_empty());
+    assert!(store.blob_fates().unwrap().is_empty());
+
+    // And so does the local delete of their session.
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![cropped(log.a, 8, log.blob.id, &b1, by)],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(store.blob_fates().unwrap().len(), 1);
+    store.delete_session_locally(log.a, at(1)).unwrap();
+    assert!(store.blob_fates().unwrap().is_empty());
+    assert!(
+        store.blobs().unwrap().is_empty(),
+        "the crop's blob went too"
+    );
+}
+
+/// The fates migration adds its table to a populated replica, which then
+/// folds fates as a fresh one does.
+#[test]
+fn the_fates_migration_keeps_a_populated_replica() {
+    let log = Log::new();
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&log.batch(1, 7), Utc::now()).unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("DROP TABLE blob_fates;").unwrap();
+    drop(conn);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let mut store = Store::open(&dir).unwrap();
+    assert!(store.blob_fates().unwrap().is_empty());
+    let by = DeviceId::new();
+    let applied = store
+        .apply_batch(
+            &EventBatch {
+                from: Seq(8),
+                events: vec![event(
+                    log.a,
+                    8,
+                    EventKind::BlobDeleted {
+                        blob: log.blob.id,
+                        holds: BlobUse::ToolOutput,
+                        by,
+                    },
+                )],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(applied.purged, [log.blob.id]);
+    assert_eq!(
+        store.blob_fates().unwrap()[&log.blob.id],
+        BlobFate::Deleted { by }
     );
 }

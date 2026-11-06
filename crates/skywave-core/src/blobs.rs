@@ -62,8 +62,9 @@
 //! above (`Failed` with the mismatch as its reason), never looping on a
 //! server that keeps serving the wrong bytes; asking for it again starts
 //! over with a fresh allowance. A blob that leaves the replica
-//! (its session deleted from this device, or no stored workdir answer
-//! naming it any more) loses both files; a download of it stops, without a
+//! (its session deleted from this device, no stored workdir answer
+//! naming it any more, or deleted or cropped on the server) loses both
+//! files; a download of it stops, without a
 //! retry, when its next report finds the blob unknown, and removes what it
 //! wrote meanwhile.
 //!
@@ -533,8 +534,9 @@ enum FetchError {
 
 impl FetchError {
     /// The blob left the replica mid-download (its session was deleted from
-    /// this device, no workdir answer names it any more, or the device
-    /// paired with another server), even if its id is registered again
+    /// this device, no workdir answer names it any more, the server deleted
+    /// or cropped it, or the device paired with another server), even if
+    /// its id is registered again
     /// since: nothing to retry, and its files must go.
     fn is_purged(&self) -> bool {
         matches!(
