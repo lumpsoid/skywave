@@ -56,7 +56,9 @@
 //! status for a change the adapter asked for may come late, after a later
 //! answer, so such an echo is dropped rather than reported as the mode;
 //! any other status (an approved `ExitPlanMode` returning to the mode before
-//! plan) is reported.
+//! plan) is reported. A mode the process was started in with
+//! `--permission-mode` ([`Protocol::with_start_mode`]) is answered by the
+//! initialize answer's `current_permission_mode` instead.
 //!
 //! **Effort** (docs/agents/claude-code.md §3.10). A request is an
 //! `apply_flag_settings` setting `effortLevel`, but its ack proves nothing
@@ -462,6 +464,9 @@ pub struct Protocol {
     /// Modes switched to on request whose `system/status` echo has not
     /// come yet, oldest first.
     echoes: VecDeque<PermissionMode>,
+    /// The mode the process was started in with `--permission-mode`, until
+    /// the initialize answer says whether it runs in it.
+    start_mode: Option<PermissionMode>,
 }
 
 /// A control request waiting for its `control_response`.
@@ -512,12 +517,21 @@ impl Protocol {
             effort_in_flight: false,
             effort_unread: false,
             echoes: VecDeque::new(),
+            start_mode: None,
         }
     }
 
     /// The process was started with `rules`, the session's grants so far.
     pub fn with_session_rules(mut self, rules: Vec<Value>) -> Protocol {
         self.session_rules = rules;
+        self
+    }
+
+    /// The process was started with `--permission-mode mode`, a mode asked
+    /// for: the initialize answer answers it, as `PermissionModeSet` when
+    /// the CLI runs in it and `PermissionModeRefused` when not.
+    pub fn with_start_mode(mut self, mode: Option<PermissionMode>) -> Protocol {
+        self.start_mode = mode;
         self
     }
 
@@ -1393,12 +1407,23 @@ impl Protocol {
             let body = response.get("response").unwrap_or(&Value::Null);
             let version = body.get("claude_code_version").and_then(Value::as_str);
             self.check_version(version, out);
-            if let Some(mode) = body
+            let mode = body
                 .get("current_permission_mode")
                 .and_then(Value::as_str)
-                .and_then(parse_mode)
-            {
-                out.events.push(AdapterEvent::PermissionMode(mode));
+                .and_then(parse_mode);
+            match self.start_mode.take() {
+                Some(asked) if mode == Some(asked) => {
+                    out.events.push(AdapterEvent::PermissionModeSet(asked));
+                }
+                Some(asked) => {
+                    let started = mode.map_or("an unknown mode", mode_name);
+                    out.events.push(AdapterEvent::PermissionModeRefused {
+                        mode: asked,
+                        reason: format!("the agent started in {started}"),
+                    });
+                    out.events.extend(mode.map(AdapterEvent::PermissionMode));
+                }
+                None => out.events.extend(mode.map(AdapterEvent::PermissionMode)),
             }
             let models = offered_models(body.get("models"));
             if !models.is_empty() {

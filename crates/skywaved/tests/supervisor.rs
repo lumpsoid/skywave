@@ -2739,6 +2739,24 @@ fn setting_answers(kinds: &[EventKind]) -> Vec<EventKind> {
         .collect()
 }
 
+/// An answer about the model or the effort.
+fn is_model_or_effort_answer(kind: &EventKind) -> bool {
+    is_setting_answer(kind)
+        && !matches!(
+            kind,
+            EventKind::PermissionModeChanged { .. } | EventKind::PermissionModeRefused { .. }
+        )
+}
+
+/// The answers about model and effort in `kinds`, in order.
+fn model_and_effort_answers(kinds: &[EventKind]) -> Vec<EventKind> {
+    kinds
+        .iter()
+        .filter(|k| is_model_or_effort_answer(k))
+        .cloned()
+        .collect()
+}
+
 #[tokio::test]
 async fn a_setting_starts_an_idle_session_and_logs_the_answer() {
     let mut f = Fixture::new();
@@ -3228,11 +3246,11 @@ async fn a_claude_session_switches_its_effort_and_settles_each_request() {
     let mut f = Fixture::new();
     let supervisor = start_claude(&f).await;
     let high = f.set_effort(Effort::High);
-    let kinds = f.wait_count("answer", 1, is_setting_answer).await;
+    let kinds = f.wait_count("answer", 1, is_model_or_effort_answer).await;
     // The start asked for it, so the answer names the command; the look the
     // handshake wrote came back mid-chain and logged nothing before it.
     assert_eq!(
-        setting_answers(&kinds),
+        model_and_effort_answers(&kinds),
         [EventKind::EffortChanged {
             effort: Some(Effort::High),
             answers: Some(high),
@@ -3240,9 +3258,9 @@ async fn a_claude_session_switches_its_effort_and_settles_each_request() {
     );
     // While it runs, a request goes straight to it.
     let low = f.set_effort(Effort::Low);
-    let kinds = f.wait_count("answer", 2, is_setting_answer).await;
+    let kinds = f.wait_count("answer", 2, is_model_or_effort_answer).await;
     assert_eq!(
-        setting_answers(&kinds)[1],
+        model_and_effort_answers(&kinds)[1],
         EventKind::EffortChanged {
             effort: Some(Effort::Low),
             answers: Some(low),
@@ -3251,9 +3269,9 @@ async fn a_claude_session_switches_its_effort_and_settles_each_request() {
     // On a model that takes none, the look after the switch is logged
     // unasked, and an effort is refused.
     let model = f.set_model("no-effort");
-    let kinds = f.wait_count("answer", 4, is_setting_answer).await;
+    let kinds = f.wait_count("answer", 4, is_model_or_effort_answer).await;
     assert_eq!(
-        setting_answers(&kinds)[2..],
+        model_and_effort_answers(&kinds)[2..],
         [
             EventKind::ModelChanged {
                 model: "resolved-no-effort".into(),
@@ -3266,9 +3284,9 @@ async fn a_claude_session_switches_its_effort_and_settles_each_request() {
         ]
     );
     let max = f.set_effort(Effort::Max);
-    let kinds = f.wait_count("answer", 5, is_setting_answer).await;
+    let kinds = f.wait_count("answer", 5, is_model_or_effort_answer).await;
     assert_eq!(
-        setting_answers(&kinds)[4],
+        model_and_effort_answers(&kinds)[4],
         EventKind::EffortRefused {
             effort: Effort::Max,
             reason: "resolved-no-effort takes no effort level".into(),
@@ -3279,7 +3297,40 @@ async fn a_claude_session_switches_its_effort_and_settles_each_request() {
     supervisor.shutdown().await.unwrap();
     assert!(!process_exists(pid), "agent process {pid} still exists");
     // What the refusal's read showed was already in the log.
-    assert_eq!(setting_answers(&f.kinds()).len(), 5);
+    assert_eq!(model_and_effort_answers(&f.kinds()).len(), 5);
+}
+
+#[tokio::test]
+async fn a_resumed_claude_session_starts_in_its_mode_without_reporting_another() {
+    let mut f = Fixture::new();
+    let supervisor = start_claude(&f).await;
+    let auto = f.set_mode(PermissionMode::Auto);
+    f.send("one");
+    f.wait_count("reply", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+
+    let supervisor = start_claude(&f).await;
+    f.send("two");
+    let kinds = f.wait_count("reply", 2, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+    // The resumed CLI is started in the mode, so it never reports its
+    // default first: the log holds only the answer to the request.
+    let modes: Vec<_> = (kinds.iter())
+        .filter(|k| matches!(k, EventKind::PermissionModeChanged { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        modes,
+        [EventKind::PermissionModeChanged {
+            mode: PermissionMode::Auto,
+            answers: Some(auto),
+        }]
+    );
+    let argv = std::fs::read_to_string(f.root.join("project/argv.txt")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert!(argv.contains(&"--resume"), "{argv:?}");
+    let at = argv.iter().position(|a| *a == "--permission-mode").unwrap();
+    assert_eq!(argv[at + 1], "auto");
 }
 
 #[tokio::test]
