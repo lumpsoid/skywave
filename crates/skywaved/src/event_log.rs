@@ -44,13 +44,14 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, CallId, CommandId, ContextId, DeviceId, Event,
-    EventBatch, EventKind, LogId, LogRun, ModelChoice, RunId, RunWhen, RunsSince, Seq, SessionId,
-    SessionState, ShellEnd, ToolCall, ToolResult, limits,
+    AgentSettings, AgentWork, ApprovalId, BlobId, BlobUse, CallId, CommandId, ContextId, DeviceId,
+    Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, RunId, RunWhen, RunsSince, Seq,
+    SessionId, SessionState, ShellEnd, ToolCall, ToolResult, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::blobs::BlobStore;
 use crate::db::Db;
 use crate::disk::Disk;
 use crate::error::{Error, Result};
@@ -83,6 +84,10 @@ pub struct EventLog {
     /// Whether the data dir's disk is low ([`EventLog::with_disk`]); shared
     /// with whatever checks it. Beside `inner` like `shell_enabled`.
     disk: Disk,
+    /// Where a `DeleteBlob` removes the file of the blob it deleted, once
+    /// committed ([`EventLog::with_blobs`]). Beside `inner` like
+    /// `shell_enabled`.
+    blobs: Option<BlobStore>,
 }
 
 #[derive(Debug)]
@@ -227,7 +232,25 @@ impl EventLog {
             shell_enabled: false,
             bypass_allowed: false,
             disk: Disk::default(),
+            blobs: None,
         })
+    }
+
+    /// This log removing a deleted blob's file from `blobs` once the
+    /// `DeleteBlob` that deleted it commits. [`EventLog::open`] has no
+    /// store: its deletes remove the row only, and the file is swept at the
+    /// next start ([`BlobStore::sweep`]). The API sets the store it serves
+    /// blobs from. Set it before cloning, like [`EventLog::with_shell`].
+    pub fn with_blobs(self, blobs: BlobStore) -> EventLog {
+        EventLog {
+            blobs: Some(blobs),
+            ..self
+        }
+    }
+
+    /// The store deleted blobs' files are removed from, if this log has one.
+    pub(crate) fn blobs(&self) -> Option<&BlobStore> {
+        self.blobs.as_ref()
     }
 
     /// This log watching `disk`: while it is low, commands that start new
@@ -447,7 +470,8 @@ impl EventLog {
             | EventKind::ShellFinished { .. }
             // The adopting `CreateSession` logs the import, not the agent.
             | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => {
+            | EventKind::ImportFinished { .. }
+            | EventKind::BlobDeleted { .. } => {
                 return Err(Error::InvalidAppend(format!(
                     "{} is not an agent event",
                     kind_name(&kind)
@@ -927,6 +951,10 @@ pub(crate) fn append_in(
         | EventKind::ShellOutput { .. } => {}
         // Imported history is a record: an imported call opens nothing.
         EventKind::Imported { .. } | EventKind::ImportFinished { .. } => {}
+        // `DeleteBlob` removed the `blobs` row before appending it. The
+        // blob's `event_blobs` row stays, naming the event that referenced
+        // it: how a later command tells `BlobGone` from `UnknownBlob`.
+        EventKind::BlobDeleted { .. } => {}
         // The run's id is the command's: a `ShellRequested` naming none
         // has no run to track.
         EventKind::ShellRequested { when, .. } => {
@@ -1323,6 +1351,48 @@ pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<Ap
     .transpose()
 }
 
+/// What the log says of one event blob: the event that referenced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EventBlobRow {
+    pub session_id: SessionId,
+    /// The context the referencing event was logged in.
+    pub context: ContextId,
+    pub holds: BlobUse,
+    /// Whether the blob is still stored: `false` once deleted.
+    pub stored: bool,
+}
+
+/// Event blob `id` as the log has it; `None` when no event referenced it
+/// (a workdir blob, or an id never minted).
+pub(crate) fn event_blob_in(conn: &Connection, id: BlobId) -> Result<Option<EventBlobRow>> {
+    let row: Option<(String, String, String, bool)> = conn
+        .query_row(
+            "SELECT o.session_id, e.context, o.holds, b.id IS NOT NULL
+             FROM event_blobs o JOIN events e ON e.seq = o.seq
+             LEFT JOIN blobs b ON b.id = o.blob_id
+             WHERE o.blob_id = ?1",
+            [id.0.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(session, context, holds, stored)| {
+        Ok(EventBlobRow {
+            session_id: parse_id(&session)?,
+            context: parse_id(&context)?,
+            holds: storage::holds_from_sql(&holds)?,
+            stored,
+        })
+    })
+    .transpose()
+}
+
+/// Deletes event blob `id`'s `blobs` row, keeping its `event_blobs` row.
+/// The file is the caller's to remove, after commit.
+pub(crate) fn delete_blob_row_in(conn: &Connection, id: BlobId) -> Result<()> {
+    conn.execute("DELETE FROM blobs WHERE id = ?1", [id.0.to_string()])?;
+    Ok(())
+}
+
 fn kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::SessionCreated { .. } => "SessionCreated",
@@ -1365,6 +1435,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ShellFinished { .. } => "ShellFinished",
         EventKind::Imported { .. } => "Imported",
         EventKind::ImportFinished { .. } => "ImportFinished",
+        EventKind::BlobDeleted { .. } => "BlobDeleted",
     }
 }
 

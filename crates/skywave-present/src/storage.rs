@@ -269,6 +269,7 @@ mod tests {
             command_line: "make".into(),
             event_bytes: 1024,
             output: 0,
+            output_blob: None,
         }];
         let mut view = view(Some(report), StorageStatus::Ready);
         view.titles.insert(here, "Fix the log".into());

@@ -25,7 +25,8 @@
 //!   for the new session, naming no command, then `ContextMoved` in the
 //!   source;
 //! - `RunShell` → `ShellRequested` with the command verbatim;
-//! - `StopShell` → `ShellStopRequested`.
+//! - `StopShell` → `ShellStopRequested`;
+//! - `DeleteBlob` → `BlobDeleted` with what the blob held.
 //!
 //! Each appends exactly one event naming the command
 //! ([`Event::command_id`](skywave_proto::Event::command_id)), the last it
@@ -48,7 +49,8 @@
 //! control the user needs while the agents are paused, or one small event
 //! that starts nothing, and is handled as usual: `ResolveApproval`,
 //! `Interrupt`, `StopSession`, `StopTask`, `StopShell`, `RenameSession`,
-//! `SetSessionArchived` and `SwitchContext`. The refusal is stored like any
+//! `SetSessionArchived`, `SwitchContext` and `DeleteBlob` (freeing space is
+//! what a low disk needs). The refusal is stored like any
 //! other, so the command keeps it; the user sends the work again once the
 //! server has room.
 //!
@@ -65,8 +67,9 @@
 //! they make current; `ApprovalResolved` with the approval's context;
 //! `TurnInterrupted` with the context of the running turn, which after a
 //! switch is the old context until its agent reports the turn over;
-//! `ContextMoved` with the context it moves; every other event with the
-//! session's current context.
+//! `ContextMoved` with the context it moves; `BlobDeleted` with the session
+//! and context of the event that referenced the blob; every other event
+//! with the session's current context.
 //!
 //! **CreateSession.** Refused, in this order: the workdir must canonicalise
 //! under a root (`WorkdirNotAllowed`, `WorkdirNotFound`); then a
@@ -184,6 +187,17 @@
 //! (one of another session included) is `UnknownRun`, one whose run has its
 //! `ShellFinished` is `RunFinished`. A second stop of a running run is
 //! accepted and logged; the first is the one the runner acts on.
+//!
+//! **DeleteBlob.** `UnknownBlob` when no event referenced the blob (no
+//! `event_blobs` row: a workdir blob, an id never minted), `BlobGone` when
+//! one did but its `blobs` row is gone. Otherwise the `blobs` row is
+//! deleted and `BlobDeleted` appended in the command's transaction; the
+//! `event_blobs` row stays, so a repeat is `BlobGone`. The file is removed
+//! after the commit, from the store the log was given
+//! ([`EventLog::with_blobs`]): a crash between the two, or a log with no
+//! store, leaves a file without a row, which the startup sweep removes
+//! ([`BlobStore::sweep`](crate::blobs::BlobStore::sweep)). The referencing
+//! event keeps its preview; nothing else in the log changes.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
@@ -253,6 +267,13 @@ impl EventLog {
         tx.commit()?;
         if let Some(prepared) = prepared {
             prepared.kept();
+        }
+        // Only once its row is gone for good: a crash before this leaves a
+        // file without a row, which the startup sweep removes.
+        if let (CommandKind::DeleteBlob { blob }, CommandResult::Accepted { .. }, Some(blobs)) =
+            (&command.kind, &result, self.blobs())
+        {
+            blobs.discard(*blob);
         }
         match &result {
             CommandResult::Accepted { seq } => {
@@ -614,6 +635,22 @@ impl EventLog {
                 };
                 (*session_id, session.context, kind)
             }
+            CommandKind::DeleteBlob { blob } => {
+                let Some(row) = event_log::event_blob_in(tx, *blob)? else {
+                    return Ok(Err(RejectReason::UnknownBlob));
+                };
+                if !row.stored {
+                    return Ok(Err(RejectReason::BlobGone));
+                }
+                // The file goes once this commits (`handle_with`).
+                event_log::delete_blob_row_in(tx, *blob)?;
+                let kind = EventKind::BlobDeleted {
+                    blob: *blob,
+                    holds: row.holds,
+                    by: device,
+                };
+                (row.session_id, row.context, kind)
+            }
         };
         Ok(Ok(event_log::append_in(
             tx,
@@ -631,7 +668,7 @@ impl EventLog {
 /// command. Everything else is control the user needs while the agents are
 /// paused (an interrupt, a stop, an approval answer) or one small event
 /// that starts nothing (a rename, an archive, a switch to a context that
-/// exists). Exhaustive, so a new command must be placed.
+/// exists, a blob deletion). Exhaustive, so a new command must be placed.
 fn starts_work(kind: &CommandKind) -> bool {
     match kind {
         CommandKind::CreateSession { .. }
@@ -649,7 +686,9 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::StopShell { .. }
         | CommandKind::RenameSession { .. }
         | CommandKind::SetSessionArchived { .. }
-        | CommandKind::SwitchContext { .. } => false,
+        | CommandKind::SwitchContext { .. }
+        // Freeing space is what a low disk needs.
+        | CommandKind::DeleteBlob { .. } => false,
     }
 }
 

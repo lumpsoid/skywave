@@ -176,7 +176,8 @@ impl SessionSummary {
     /// tasks or schedules only the agent's work, a context cleared or
     /// switched only the current context, and the models an agent offers
     /// or a context moved away nothing here, imported history only an unset
-    /// `first_prompt`: none is activity, so they move
+    /// `first_prompt`, a deleted blob nothing here: none is activity, so
+    /// they move
     /// neither `last_seq` nor `last_activity` and the session keeps its
     /// place in the list.
     pub fn apply(&mut self, seq: Seq, event: &Event) {
@@ -211,7 +212,8 @@ impl SessionSummary {
             | EventKind::ShellStopRequested { .. }
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
-            | EventKind::ShellFinished { .. } => return,
+            | EventKind::ShellFinished { .. }
+            | EventKind::BlobDeleted { .. } => return,
             EventKind::ImportFinished { .. } => {
                 self.importing = false;
                 return;
@@ -296,7 +298,8 @@ impl SessionSummary {
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
             | EventKind::Imported { .. }
-            | EventKind::ImportFinished { .. } => {}
+            | EventKind::ImportFinished { .. }
+            | EventKind::BlobDeleted { .. } => {}
         }
     }
 
@@ -391,7 +394,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ShellOutput { .. }
         | EventKind::ShellFinished { .. }
         | EventKind::Imported { .. }
-        | EventKind::ImportFinished { .. } => false,
+        | EventKind::ImportFinished { .. }
+        | EventKind::BlobDeleted { .. } => false,
     }
 }
 
@@ -620,6 +624,43 @@ mod tests {
             event(sid, 0, EventKind::TurnInterrupted).at
         );
         assert_eq!(summary.notable, 0);
+    }
+
+    #[test]
+    fn a_deleted_blob_is_not_activity() {
+        let sid = SessionId::new();
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/app".into(),
+            context_name: "start".into(),
+            from: None,
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let deleted = EventKind::BlobDeleted {
+            blob: skywave_proto::BlobId::new(),
+            holds: skywave_proto::BlobUse::ShellOutput,
+            by: DeviceId::new(),
+        };
+        assert!(!is_notable(&deleted));
+        summary.apply(Seq(9), &event(sid, 30, deleted));
+        assert_eq!(summary.last_seq, Seq(1));
+        assert_eq!(
+            summary.last_activity,
+            event(sid, 0, EventKind::TurnInterrupted).at
+        );
+        assert_eq!(summary.notable, 0);
+        // Control: activity at the same time does move them.
+        summary.apply(
+            Seq(10),
+            &event(
+                sid,
+                30,
+                EventKind::AgentMessage {
+                    parent: None,
+                    text: "hi".into(),
+                },
+            ),
+        );
+        assert_eq!(summary.last_seq, Seq(10));
     }
 
     #[test]

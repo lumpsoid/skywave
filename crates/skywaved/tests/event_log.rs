@@ -1700,11 +1700,13 @@ fn a_server_stopping_refuses_new_work_and_takes_control() {
 }
 
 /// A session with something to stop and to answer: a background task, a
-/// turn with an approval pending and a shell run.
+/// turn with an approval pending and a shell run; and an event blob to
+/// delete.
 struct OpenWork {
     session: SessionId,
     approval: ApprovalId,
     run: CommandId,
+    blob: skywave_proto::BlobId,
 }
 
 impl OpenWork {
@@ -1718,6 +1720,23 @@ impl OpenWork {
         );
         f.start_turn(session);
         let approval = f.request_approval(session);
+        let blob = f
+            .storage
+            .blobs
+            .put(f.storage.db.conn(), &b"whole output"[..])
+            .unwrap()
+            .blob_ref();
+        f.agent(
+            session,
+            EventKind::ToolResult(ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "whole".into(),
+                lines: 1,
+                output: Some(skywave_proto::Full::Blob(blob.clone())),
+            }),
+        );
         let run = Command {
             id: CommandId::new(),
             kind: CommandKind::RunShell {
@@ -1735,6 +1754,7 @@ impl OpenWork {
             session,
             approval,
             run: run.id,
+            blob: blob.id,
         }
     }
 
@@ -1813,6 +1833,8 @@ impl OpenWork {
             CommandKind::StopSession {
                 session_id: session,
             },
+            // Freeing space is what a low disk needs.
+            CommandKind::DeleteBlob { blob: self.blob },
         ];
         for kind in taken {
             accepted(f.handle(kind));

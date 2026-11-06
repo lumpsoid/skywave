@@ -1035,3 +1035,51 @@ messages sent during the wait for after the restart (new delivery
 semantics for a minute's convenience); a restart action in the heads
 (wire, UI and a who-may-restart rule for a task done where the deploy
 is, on the server); an agent host that survives the restart (D8's deferral stands).
+
+## D42. Deleting and cropping an event blob: every device applies it
+The storage view (v22) shows what takes the server's disk; event blobs
+(tool inputs, outputs, diffs, approval inputs, shell output) are most of
+it. A device can now remove one, after the user confirms:
+- **Two commands, one event each** (v23). `DeleteBlob { blob }` removes
+  the whole blob and logs `BlobDeleted { blob, holds, by }`.
+  `CropBlob { blob, keep }` keeps the lines `keep` names, as a new blob,
+  and logs `BlobCropped { blob, holds, into, kept, lines, by }`. Only a
+  tool output or a shell run's output can be cropped (`NotCroppable`);
+  inputs, diffs and approval inputs can only be deleted. A blob no event
+  referenced is `UnknownBlob`; one already deleted or cropped is
+  `BlobGone`.
+- **The event stays; its blob changes.** The log is append-only: the
+  event that referenced the blob keeps its preview, and the new event is
+  stamped with that event's session and context (as `ApprovalResolved`
+  takes its approval's, D29), so it folds where the item is. Neither is
+  activity nor notable.
+- **The server mints `into`.** Every other blob id is the server's; a
+  client-chosen one would add a collision rule for no gain. The deciding
+  device needs only `into.sha256` to check its own crop.
+- **Line spans, not bytes.** `keep` is a list of `LineSpan { first,
+  count }` (at most `CROP_SPANS_MAX`). The command stays tiny: it fits the
+  command body limit, survives a bad uplink and is resent cheaply, and the
+  server's bytes are the authority. One pure function in `skywave-proto`
+  crops on the server and on every device, with one line definition (cut
+  at `\n`, bytes verbatim), so a device's crop hashes to `into.sha256`.
+- **Every device applies the event to what it holds.** The event reaches
+  every device through the log and carries all it takes: a device holding
+  a deleted blob removes it; one holding the whole of a cropped blob crops
+  its own copy and checks it against `into`; one holding nothing
+  downloads `into` or shows that the content was deleted. Nobody
+  downloads what it already has, the server never tracks who holds what,
+  and no convergence protocol is needed. Accepted consequence: after a
+  delete or crop no device keeps the full content. That is what the user
+  asked for when they freed the space.
+- **Not work.** Neither command starts work, so both are taken while the
+  disk is low or `serve` stops: freeing space is what a low disk needs.
+  A delete removes the `blobs` row in its transaction and the file after
+  the commit; a crash in between leaves a file without a row, which the
+  startup sweep removes. The blob's `event_blobs` row stays, which is how
+  a later command tells `BlobGone` from `UnknownBlob`.
+**Rejected:** devices that already hold the bits keeping them (the first
+answer, superseded by the user on 2026-11-06: every device applies the
+event alike, whichever device decided); uploading the kept bytes (large, and
+untrusted); rewriting or dropping the referencing event (the log is
+append-only; compaction, task 899242, is where history shrinks); cropping
+running shell output (no blob yet; its progress events are bounded).

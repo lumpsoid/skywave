@@ -22,8 +22,8 @@ use skywave_proto::{
     CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
     DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
     ImportOutcome, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER,
-    RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellRunStorage, StorageReport,
-    ToolResult, path,
+    RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellEnd, ShellRunStorage,
+    StorageReport, ToolResult, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -1181,7 +1181,178 @@ async fn storage_reports_sizes_by_session_blob_and_shell_run() {
             command_line: "cargo test…".into(),
             event_bytes: 2 * progress_bytes,
             output: 300,
+            output_blob: None,
         }]
+    );
+}
+
+/// A device deletes a finished shell run's output blob: the blob is no
+/// longer served or stored, the report stops counting it, and the log has a
+/// `BlobDeleted` stamped like the event that referenced it. A repeat is
+/// `BlobGone`; a blob no event referenced is `UnknownBlob`.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_shell_output_blob_frees_it_and_logs_it() {
+    let mut f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let created = device.command(&f.create_session_command()).await;
+    let session = session_of(&created, &device.events(Seq::ZERO, 0).await);
+
+    // A finished run whose whole output is a blob (logged by hand).
+    let run = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id: session,
+            command: "cargo build".into(),
+            when: Default::default(),
+        },
+    };
+    assert!(matches!(
+        device.command(&run).await,
+        CommandResult::Accepted { .. }
+    ));
+    let blobs = BlobStore::new(f.storage.dir.blobs_dir());
+    let output = blobs
+        .put(f.storage.db.conn(), &[3u8; 40_000][..])
+        .unwrap()
+        .blob_ref();
+    let file = f.storage.dir.blobs_dir().join(output.id.0.to_string());
+    for kind in [
+        EventKind::ShellStarted {
+            run: run.id,
+            cwd: "/".into(),
+        },
+        EventKind::ShellFinished {
+            run: run.id,
+            by: creds.id,
+            started_at: None,
+            command_line: "cargo build".into(),
+            end: ShellEnd::Exited { code: 0 },
+            cwd: None,
+            preview: "Finished".into(),
+            lines: 900,
+            output: Some(output.clone()),
+            truncated: true,
+        },
+    ] {
+        f.log.shell_event(&mut f.storage.db, kind).unwrap();
+    }
+    let batch = device.events(Seq::ZERO, 0).await;
+    let (finished_seq, finished) = batch.iter().last().unwrap();
+    assert!(matches!(finished.kind, EventKind::ShellFinished { .. }));
+    let finished_context = finished.context;
+    // A new current context: the delete is stamped with the run's, not it.
+    let clear = Command {
+        id: CommandId::new(),
+        kind: CommandKind::ClearContext {
+            session_id: session,
+            context: ContextId::new(),
+            name: "next".into(),
+        },
+    };
+    assert!(matches!(
+        device.command(&clear).await,
+        CommandResult::Accepted { .. }
+    ));
+
+    let report: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(report.event_blobs, 40_000);
+    assert_eq!(report.sessions[0].blob_bytes, 40_000);
+    assert_eq!(
+        (
+            report.shell_runs[0].output,
+            report.shell_runs[0].output_blob
+        ),
+        (40_000, Some(output.id)),
+        "before any delete the run offers its blob"
+    );
+    assert_eq!(
+        device.get(&path::blob(output.id)).await.status,
+        StatusCode::OK
+    );
+
+    let delete = Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteBlob { blob: output.id },
+    };
+    let CommandResult::Accepted { seq } = device.command(&delete).await else {
+        panic!("delete not accepted");
+    };
+    assert_eq!(
+        device.get(&path::blob(output.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(!file.exists(), "the file is gone");
+
+    let batch = device.events(Seq(seq.0 - 1), 0).await;
+    let (logged_seq, event) = batch.iter().next().unwrap();
+    assert_eq!(logged_seq, seq);
+    assert!(logged_seq > finished_seq);
+    assert_eq!(
+        event.kind,
+        EventKind::BlobDeleted {
+            blob: output.id,
+            holds: BlobUse::ShellOutput,
+            by: creds.id,
+        }
+    );
+    assert_eq!(event.command_id, Some(delete.id));
+    assert_eq!(
+        (event.session_id, event.context),
+        (session, finished_context)
+    );
+
+    let report: StorageReport = device.get(path::STORAGE).await.json();
+    assert_eq!(report.event_blobs, 0);
+    assert_eq!(report.sessions[0].blob_bytes, 0);
+    assert_eq!(
+        (
+            report.shell_runs[0].output,
+            report.shell_runs[0].output_blob
+        ),
+        (0, None)
+    );
+    assert!(report.blobs.is_empty());
+
+    let again = Command {
+        id: CommandId::new(),
+        kind: CommandKind::DeleteBlob { blob: output.id },
+    };
+    assert_eq!(
+        device.command(&again).await,
+        CommandResult::Rejected {
+            reason: RejectReason::BlobGone
+        }
+    );
+
+    // A workdir blob has a row but no event; a random id has neither.
+    std::fs::write(f.root.join("project").join("notes.txt"), "hello\n").unwrap();
+    let reply = device
+        .get(&workdir_uri(path::WORKDIR_FILE, session, "notes.txt"))
+        .await;
+    let FileResult::File {
+        content: FileBody::Blob(workdir_blob),
+        ..
+    } = reply.json::<FileResult>()
+    else {
+        panic!("expected a file: {:?}", reply.body);
+    };
+    for blob in [workdir_blob.id, BlobId::new()] {
+        let delete = Command {
+            id: CommandId::new(),
+            kind: CommandKind::DeleteBlob { blob },
+        };
+        assert_eq!(
+            device.command(&delete).await,
+            CommandResult::Rejected {
+                reason: RejectReason::UnknownBlob
+            }
+        );
+    }
+    assert_eq!(
+        device.get(&path::blob(workdir_blob.id)).await.status,
+        StatusCode::OK,
+        "a refused delete leaves the blob"
     );
 }
 

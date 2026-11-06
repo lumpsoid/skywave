@@ -209,7 +209,8 @@ impl Api {
             )
             .with_git(options.git),
             storage: StorageReader::new(Db::open(&dir.db_path())?, dir.clone(), options.log_file),
-            log,
+            // A `DeleteBlob` removes the file from the store served here.
+            log: log.with_blobs(blobs.clone()),
             blobs,
             server_id,
             shutdown,
