@@ -2,7 +2,7 @@
 
 use crate::store::BlobPolicy;
 use crate::view::{
-    ApprovalId, BlobId, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
+    ApprovalId, BlobId, CallId, CommandId, ComposerMode, ContextId, Decision, Effort, LineSpan,
     PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId, WorkdirPane,
 };
 
@@ -287,6 +287,19 @@ pub enum Action {
     RefreshWorkdir,
     /// Fetch a blob's content (e.g. to expand a tool output).
     DownloadBlob(BlobId),
+    /// Delete a blob from the server and from every device. Queued in the
+    /// outbox like any command, offline too, and discardable until the
+    /// server takes it. `BlobId` is the blob a view shows
+    /// ([`BlobView::id`](crate::BlobView::id)): after a crop that is the
+    /// crop's, not the event's original.
+    DeleteBlob(BlobId),
+    /// Crop a blob to the lines of its content `keep` names, on the server
+    /// and on every device. Only a tool's or a shell run's output. Queued and discardable as
+    /// [`Action::DeleteBlob`], and for the same `blob`.
+    CropBlob {
+        blob: BlobId,
+        keep: Vec<LineSpan>,
+    },
     SetBlobPolicy(BlobPolicy),
     /// While the link is `Reconnecting`, skip the rest of the wait and
     /// reconnect now. The attempt count and `offline_since` carry on.

@@ -1178,6 +1178,7 @@ mod tests {
             id: BlobId::new(),
             state,
             change: None,
+            pending: None,
         };
         let text = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
         let shown = |state, expanded| {

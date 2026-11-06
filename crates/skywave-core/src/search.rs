@@ -548,6 +548,7 @@ mod tests {
             id: BlobId::new(),
             state,
             change: None,
+            pending: None,
         }
     }
 

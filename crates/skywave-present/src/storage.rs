@@ -6,9 +6,11 @@
 //! shell run's command line) before writing them anywhere raw.
 
 use skywave_core::{
-    BlobUse, SessionId, StorageReport, StorageStatus, StorageUnavailable, StorageView,
+    BlobId, BlobPending, BlobUse, SessionId, StorageReport, StorageStatus, StorageUnavailable,
+    StorageView,
 };
 
+use crate::blob_actions::{BlobAction, offers_for};
 use crate::format;
 use crate::usage::short;
 
@@ -64,6 +66,45 @@ pub struct Row {
     /// What makes up the size, on one line; may hold a session title.
     pub detail: String,
     pub size: String,
+    /// What a head may do from this row; `None` for a session row and a
+    /// shell run whose output is kept as no blob.
+    pub actions: Option<RowActions>,
+}
+
+/// What may be done to the blob a storage row stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowActions {
+    /// The blob to act on: the row's own, or a shell run's `output_blob`.
+    pub blob: BlobId,
+    /// In the order a head offers them; empty while `pending`.
+    pub offers: Vec<BlobAction>,
+    /// This device's own delete or crop of the blob, as a timeline item
+    /// shows it ([`pending_note`](crate::blob_actions::pending_note)).
+    pub pending: Option<BlobPending>,
+}
+
+impl RowActions {
+    /// Delete any blob; crop one of a croppable kind
+    /// ([`croppable`](crate::blob_actions::croppable)) only
+    /// when its session is in this device's replica, whose timeline holds
+    /// the lines a crop is chosen from. Nothing while this device's own
+    /// delete or crop of it is pending, as
+    /// [`item_offers`](crate::blob_actions::item_offers).
+    fn of(view: &StorageView, blob: BlobId, holds: BlobUse, session: SessionId) -> RowActions {
+        let pending = view.pending.get(&blob).copied();
+        let offers = if pending.is_some() {
+            Vec::new()
+        } else if view.titles.contains_key(&session) {
+            offers_for(holds)
+        } else {
+            vec![BlobAction::Delete]
+        };
+        RowActions {
+            blob,
+            offers,
+            pending,
+        }
+    }
 }
 
 /// What the screen says above the report while it has no fresh one;
@@ -153,6 +194,7 @@ pub fn rows(view: &StorageView, grouping: Grouping) -> Vec<Row> {
                     }
                 ),
                 size: format::bytes(s.event_bytes + s.blob_bytes),
+                actions: None,
             })
             .collect(),
         Grouping::Blobs => report
@@ -162,6 +204,7 @@ pub fn rows(view: &StorageView, grouping: Grouping) -> Vec<Row> {
                 label: title(b.session),
                 detail: format!("{} · event {}", holds_label(b.holds), b.seq.0),
                 size: format::bytes(b.size),
+                actions: Some(RowActions::of(view, b.id, b.holds, b.session)),
             })
             .collect(),
         Grouping::ShellRuns => report
@@ -176,6 +219,9 @@ pub fn rows(view: &StorageView, grouping: Grouping) -> Vec<Row> {
                     format::bytes(r.output)
                 ),
                 size: format::bytes(r.event_bytes + r.output),
+                actions: r
+                    .output_blob
+                    .map(|blob| RowActions::of(view, blob, BlobUse::ShellOutput, r.session)),
             })
             .collect(),
     }
@@ -228,6 +274,7 @@ mod tests {
             status,
             report,
             titles: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -281,6 +328,7 @@ mod tests {
                 label: "Fix the log".into(),
                 detail: "1 event · 2.0 KiB in the log · 2 blobs 1.0 MiB".into(),
                 size: "1.0 MiB".into(),
+                actions: None,
             }]
         );
         let blobs = rows(&view, Grouping::Blobs);
@@ -291,6 +339,144 @@ mod tests {
         assert_eq!(
             runs[0].detail,
             "Fix the log · 1.0 KiB progress · 0 B output"
+        );
+    }
+
+    fn blob(session: SessionId, holds: BlobUse) -> BlobStorage {
+        BlobStorage {
+            id: BlobId::new(),
+            size: 1024,
+            session,
+            seq: Seq(3),
+            holds,
+        }
+    }
+
+    fn run(session: SessionId, output_blob: Option<BlobId>) -> ShellRunStorage {
+        ShellRunStorage {
+            run: CommandId::new(),
+            session,
+            command_line: "make".into(),
+            event_bytes: 10,
+            output: 2048,
+            output_blob,
+        }
+    }
+
+    fn offers(row: &Row) -> Option<(BlobId, Vec<BlobAction>)> {
+        row.actions.as_ref().map(|a| (a.blob, a.offers.clone()))
+    }
+
+    #[test]
+    fn blob_rows_offer_a_delete_and_a_crop_of_output_held_here() {
+        use BlobAction::{Crop, Delete};
+        let (here, gone) = (SessionId::new(), SessionId::new());
+        let mut report = report();
+        report.blobs = vec![
+            blob(here, BlobUse::ToolOutput),
+            blob(here, BlobUse::ShellOutput),
+            blob(here, BlobUse::ToolInput),
+            blob(here, BlobUse::ToolBody),
+            blob(here, BlobUse::ApprovalInput),
+            blob(gone, BlobUse::ToolOutput),
+        ];
+        let ids: Vec<BlobId> = report.blobs.iter().map(|b| b.id).collect();
+        let mut view = view(Some(report), StorageStatus::Ready);
+        view.titles.insert(here, "Fix the log".into());
+
+        let rows = rows(&view, Grouping::Blobs);
+        let got: Vec<_> = rows.iter().map(offers).collect();
+        assert_eq!(
+            got,
+            vec![
+                Some((ids[0], vec![Crop, Delete])),
+                Some((ids[1], vec![Crop, Delete])),
+                Some((ids[2], vec![Delete])),
+                Some((ids[3], vec![Delete])),
+                Some((ids[4], vec![Delete])),
+                // Not in this replica: no lines to choose a crop from.
+                Some((ids[5], vec![Delete])),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_rows_act_on_their_output_blob_and_offer_nothing_without_one() {
+        use BlobAction::{Crop, Delete};
+        let (here, gone) = (SessionId::new(), SessionId::new());
+        let (kept, elsewhere) = (BlobId::new(), BlobId::new());
+        let mut report = report();
+        report.shell_runs = vec![
+            run(here, Some(kept)),
+            run(here, None),
+            run(gone, Some(elsewhere)),
+        ];
+        let mut view = view(Some(report), StorageStatus::Ready);
+        view.titles.insert(here, "Fix the log".into());
+
+        let rows = rows(&view, Grouping::ShellRuns);
+        let got: Vec<_> = rows.iter().map(offers).collect();
+        assert_eq!(
+            got,
+            vec![
+                Some((kept, vec![Crop, Delete])),
+                None,
+                Some((elsewhere, vec![Delete])),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_whose_blob_has_an_own_delete_or_crop_pending_offers_nothing() {
+        use BlobAction::{Crop, Delete};
+        use skywave_core::{BlobCommand, FailReason, Outgoing, RejectReason};
+        let here = SessionId::new();
+        let (ran, cropped) = (BlobId::new(), BlobId::new());
+        let mut report = report();
+        report.blobs = vec![
+            blob(here, BlobUse::ToolOutput),
+            blob(here, BlobUse::ToolOutput),
+        ];
+        report.shell_runs = vec![run(here, Some(ran))];
+        let (refused_blob, free_blob) = (report.blobs[0].id, report.blobs[1].id);
+        let mut view = view(Some(report), StorageStatus::Ready);
+        view.titles.insert(here, "Fix the log".into());
+        let refused = BlobPending {
+            command: CommandId::new(),
+            kind: BlobCommand::Crop,
+            outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::BadCrop)),
+            discardable: true,
+        };
+        let queued = BlobPending {
+            command: CommandId::new(),
+            kind: BlobCommand::Delete,
+            outgoing: Outgoing::Queued,
+            discardable: true,
+        };
+        view.pending.insert(refused_blob, refused);
+        view.pending.insert(ran, queued);
+        // A pending command of a blob no row shows touches no row.
+        view.pending.insert(cropped, queued);
+
+        let blobs = rows(&view, Grouping::Blobs);
+        let actions: Vec<_> = blobs.iter().map(|r| r.actions.clone().unwrap()).collect();
+        assert_eq!(
+            (actions[0].offers.clone(), actions[0].pending),
+            (Vec::new(), Some(refused))
+        );
+        assert_eq!(
+            (
+                actions[1].blob,
+                actions[1].offers.clone(),
+                actions[1].pending
+            ),
+            (free_blob, vec![Crop, Delete], None)
+        );
+        let runs = rows(&view, Grouping::ShellRuns);
+        let run = runs[0].actions.clone().unwrap();
+        assert_eq!(
+            (run.blob, run.offers, run.pending),
+            (ran, Vec::new(), Some(queued))
         );
     }
 

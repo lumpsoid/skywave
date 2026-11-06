@@ -19,7 +19,9 @@ pub use skywave_proto::{
     PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
     ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
 };
-pub use skywave_proto::{BlobStorage, BlobUse, SessionStorage, ShellRunStorage, StorageReport};
+pub use skywave_proto::{
+    BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
+};
 
 pub use crate::projection::{SessionUsage, TurnRecord};
 
@@ -378,6 +380,30 @@ pub struct BlobView {
     pub state: BlobState,
     /// What the server did to this content, if anything.
     pub change: Option<BlobChange>,
+    /// This device's latest delete or crop of this blob until its effect is
+    /// in the replica; a refusal stays until discarded.
+    pub pending: Option<BlobPending>,
+}
+
+/// This device's own delete or crop of a blob
+/// ([`Action::DeleteBlob`](crate::Action::DeleteBlob),
+/// [`Action::CropBlob`](crate::Action::CropBlob)) on its way, or refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobPending {
+    /// For [`Action::Discard`](crate::Action::Discard).
+    pub command: CommandId,
+    pub kind: BlobCommand,
+    pub outgoing: Outgoing,
+    /// Whether [`Action::Discard`](crate::Action::Discard) takes it back:
+    /// until the server accepts it.
+    pub discardable: bool,
+}
+
+/// Which of the two a [`BlobPending`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobCommand {
+    Delete,
+    Crop,
 }
 
 /// What the server did to a blob's content that left some of it.
@@ -745,6 +771,9 @@ pub struct StorageView {
     /// report names; one missing is not in this replica (deleted here, or
     /// not pulled yet).
     pub titles: std::collections::HashMap<SessionId, String>,
+    /// This device's own delete or crop of each blob that has one, as a
+    /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
+    pub pending: std::collections::HashMap<BlobId, BlobPending>,
 }
 
 /// Where the storage screen's report stands.

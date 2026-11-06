@@ -1026,6 +1026,7 @@ mod tests {
             id: skywave_core::BlobId::new(),
             state: skywave_core::BlobState::NotDownloaded { size: 2048 },
             change: None,
+            pending: None,
         });
         let panel = approval_panel(&prompt(kept), &session);
         assert_eq!(panel.lost, None);
@@ -1042,6 +1043,7 @@ mod tests {
                 id: skywave_core::BlobId::new(),
                 state: skywave_core::BlobState::NotDownloaded { size: 2048 },
                 change: None,
+                pending: None,
             }))
         };
         let panel = |call_input: Option<FullView>, asked: Option<FullView>| {

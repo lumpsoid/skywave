@@ -7,6 +7,8 @@
 //! Nothing here names a UI toolkit or a key: a head composes these with
 //! its own hints, colours and layout.
 //!
+//! - [`blob_actions`]: when a blob may be deleted or cropped, and what a
+//!   head asks first.
 //! - [`sections`]: which items select, where turns start, what an item
 //!   shows beneath its title, and what a copy takes.
 //! - [`format`](mod@format): sizes, durations, token counts, costs, delivery and
@@ -28,6 +30,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod blob_actions;
 pub mod format;
 pub mod link;
 pub mod output;

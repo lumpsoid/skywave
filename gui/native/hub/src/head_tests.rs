@@ -3714,6 +3714,7 @@ mod workdir {
             id: BlobId::new(),
             state: BlobState::Available { path },
             change: None,
+            pending: None,
         }
     }
 
@@ -3885,6 +3886,7 @@ mod workdir {
                 reason: "offline".into(),
             },
             change: None,
+            pending: None,
         };
         let screen = shown(
             &mut rig,

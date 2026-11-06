@@ -695,7 +695,8 @@ logs) an event that no longer decodes rather than failing.
   either: the pull goes on, and the command is resent, same id, after a
   backoff for the failures in a row, as often as it takes. A link that
   is really down fails the pull, which ends the connection. The user may
-  take back any message, shell run, session creation or context move the
+  take back any message, shell run, session creation, context move, or
+  blob delete or crop the
   server has not accepted, sent or not (`OutboxEntry::discardable`): the
   row goes, the wait to resend it ends and the next command goes out. One
   already sent may have reached the server anyway; then its event shows it
@@ -921,7 +922,9 @@ logs) an event that no longer decodes rather than failing.
 
 - **Storage screen** (`Route::Storage`): opening it asks
   `GET /v1/storage` on the side transport within `STORAGE_TIMEOUT` (12 s,
-  above the server's 10 s), and `RefreshStorage` asks again.
+  above the server's 10 s), and `RefreshStorage` asks again, as does this
+  device's own `DeleteBlob` or `CropBlob` settling accepted while the
+  screen is open (by its reply or, the reply lost, by the log).
   `StorageView` shows `Loading`, `Ready` or `Unavailable(Offline |
   Failed)`, the latest report (a failed refresh keeps the one before) and
   the replica's title for each session it names; a session missing there
@@ -929,7 +932,15 @@ logs) an event that no longer decodes rather than failing.
   offline nothing is asked. Nothing is stored: opening the screen drops
   the last report and asks again. `skywave_present::storage` words the
   totals and the three lists (by session, largest blobs, shell runs) for
-  both heads.
+  both heads, with what a blob or run row may do (`RowActions`: delete
+  any blob, crop tool or shell output of a session in this replica; a
+  run acts on its `output_blob`). `skywave_present::blob_actions` holds
+  the same rule for a timeline item's content and the confirmation
+  texts. Either offers nothing while this device's own delete or crop of
+  the blob is pending, refused included: `BlobView.pending` and
+  `StorageView.pending` carry it as a `BlobPending` (command id, kind,
+  delivery, `discardable`), so a head can take it back with `Discard`,
+  after which the offers return.
 
 ## Testing
 

@@ -35,16 +35,16 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
-    BlobChange, BlobId, BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult,
-    CommandId, ComposerMode, ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef,
-    DiffBody, Draft, Entry, ErrorInfo, FailReason, FileBody, FileChange, FileResult, FullView,
-    ImportedEntry, Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
-    PairingView, PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq,
-    SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    StorageReport, StorageView, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval,
-    ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView,
+    BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobView, BodyView, CallId,
+    ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, Decision,
+    Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo, FailReason, FileBody,
+    FileChange, FileResult, FullView, ImportedEntry, Link, LinkRejection, ListKind, ModelChoice,
+    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, RunWhen,
+    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow,
+    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
+    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
+    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState,
+    WorkdirBody, WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -711,6 +711,11 @@ impl Model {
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
             },
+            // The server decides whether the blob may go (its refusals
+            // show as the view's `pending`): this replica may not know of
+            // a delete or crop another device sent.
+            Action::DeleteBlob(blob) => self.enqueue(CommandKind::DeleteBlob { blob }),
+            Action::CropBlob { blob, keep } => self.enqueue(CommandKind::CropBlob { blob, keep }),
             Action::SetBlobPolicy(policy) => {
                 if self.settings.blob_policy == policy {
                     return Vec::new();
@@ -1503,16 +1508,28 @@ impl Model {
     }
 
     /// The first result is final, as in the store.
+    ///
+    /// A delete or crop of a blob this settles as accepted changed what the
+    /// server stores, so an open storage screen asks for its report again;
+    /// that holds whether the reply or the log settled it.
     pub(crate) fn command_result(
         &mut self,
         id: CommandId,
         result: CommandResult,
         now: DateTime<Utc>,
-    ) {
-        if let Some(entry) = self.outbox_entry(id).filter(|e| e.status.is_pending()) {
-            entry.status = OutboxStatus::Done(result);
-            entry.answered_at = Some(now);
+    ) -> Option<Request> {
+        let entry = self.outbox_entry(id).filter(|e| e.status.is_pending())?;
+        let frees = matches!(
+            entry.command.kind,
+            CommandKind::DeleteBlob { .. } | CommandKind::CropBlob { .. }
+        ) && matches!(result, CommandResult::Accepted { .. });
+        entry.status = OutboxStatus::Done(result);
+        entry.answered_at = Some(now);
+        if !frees || self.place != Place::Storage || self.device().is_none() {
+            return None;
         }
+        let online = self.online();
+        self.storage.refresh(online)
     }
 
     /// Mirrors [`Store::record_undeliverable`](crate::Store::record_undeliverable).
@@ -1942,6 +1959,7 @@ impl Model {
             status,
             report,
             titles,
+            pending: self.blob_pendings(),
         }
     }
 
@@ -3108,12 +3126,38 @@ impl Model {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// This device's latest delete or crop of `blob` until its effect is in
+    /// the replica, as [`Model::title`] treats a rename. Accepted but not
+    /// yet pulled still shows; a refusal shows until it is discarded.
+    fn blob_pending(&self, blob: BlobId) -> Option<BlobPending> {
+        self.outbox
+            .iter()
+            .rev()
+            .filter_map(blob_command)
+            .find(|(target, _)| *target == blob)
+            .map(|(_, pending)| pending)
+            .filter(|pending| !self.in_replica(pending.outgoing))
+    }
+
+    /// [`Model::blob_pending`] of every blob that has one.
+    fn blob_pendings(&self) -> HashMap<BlobId, BlobPending> {
+        let mut latest = HashMap::new();
+        // Oldest first, so the latest of a blob's commands is kept.
+        for (blob, pending) in self.outbox.iter().filter_map(blob_command) {
+            latest.insert(blob, pending);
+        }
+        latest.retain(|_, pending| !self.in_replica(pending.outgoing));
+        latest
+    }
+
     fn blob_view(&self, blob: &BlobRef) -> BlobView {
+        let pending = self.blob_pending(blob.id);
         let Some(record) = self.blobs.get(&blob.id) else {
             return BlobView {
                 id: blob.id,
                 state: BlobState::NotDownloaded { size: blob.size },
                 change: None,
+                pending,
             };
         };
         let size = record.size;
@@ -3139,6 +3183,7 @@ impl Model {
             id: blob.id,
             state,
             change: None,
+            pending,
         }
     }
 
@@ -3189,6 +3234,24 @@ impl Model {
             ..self.blob_view(current)
         })
     }
+}
+
+/// The blob an outbox delete or crop names, and how it stands.
+fn blob_command(entry: &OutboxEntry) -> Option<(BlobId, BlobPending)> {
+    let (blob, kind) = match &entry.command.kind {
+        CommandKind::DeleteBlob { blob } => (*blob, BlobCommand::Delete),
+        CommandKind::CropBlob { blob, .. } => (*blob, BlobCommand::Crop),
+        _ => return None,
+    };
+    Some((
+        blob,
+        BlobPending {
+            command: entry.command.id,
+            kind,
+            outgoing: Outgoing::from(&entry.status),
+            discardable: entry.discardable(),
+        },
+    ))
 }
 
 /// The read a workdir pane shows: a diff's is the changes'.
@@ -4102,6 +4165,7 @@ mod tests {
             id: input.id,
             state: BlobState::NotDownloaded { size: 5000 },
             change: None,
+            pending: None,
         });
         assert_eq!(
             view.pending_approval,
@@ -6391,6 +6455,7 @@ mod tests {
                                 id: output.id,
                                 state: BlobState::NotDownloaded { size: 9000 },
                                 change: None,
+                                pending: None,
                             })),
                             took: Duration::from_secs(180),
                         },
@@ -7011,6 +7076,7 @@ mod tests {
                 id: b.id,
                 state: BlobState::NotDownloaded { size: b.size },
                 change: None,
+                pending: None,
             })
         };
         let waiting = ToolView {
@@ -8271,6 +8337,211 @@ mod tests {
         f.model.set_link(Link::Online { latency_ms: 5 });
         f.dispatch(Action::Navigate(Route::Settings));
         assert_eq!(storage_req(&f.dispatch(Action::RefreshStorage)), None);
+    }
+
+    fn crop(blob: BlobId) -> Action {
+        Action::CropBlob {
+            blob,
+            keep: vec![skywave_proto::LineSpan { first: 0, count: 1 }],
+        }
+    }
+
+    fn accept(f: &mut Fixture, id: CommandId, seq: u64) -> Option<Request> {
+        f.model
+            .command_result(id, CommandResult::Accepted { seq: Seq(seq) }, Utc::now())
+    }
+
+    #[test]
+    fn a_blob_delete_or_crop_queues_offline_and_is_discardable_until_accepted() {
+        let mut f = Fixture::paired();
+        f.model.set_link(Link::Reconnecting {
+            attempt: 1,
+            retry_at: Utc::now() + chrono::TimeDelta::seconds(1),
+            offline_since: Utc::now(),
+            reason: crate::view::LinkFailure::Unreachable,
+        });
+        let blob = BlobId::new();
+        let delete = queued(&f.dispatch(Action::DeleteBlob(blob)));
+        assert_eq!(delete.kind, CommandKind::DeleteBlob { blob });
+        let cropped = queued(&f.dispatch(crop(blob)));
+        assert!(matches!(cropped.kind, CommandKind::CropBlob { blob: b, .. } if b == blob));
+        assert!(f.model.outbox.iter().all(OutboxEntry::discardable));
+
+        // Accepted, it can no longer be taken back.
+        accept(&mut f, cropped.id, 9);
+        assert!(f.dispatch(Action::Discard(cropped.id)).is_empty());
+        assert_eq!(
+            f.dispatch(Action::Discard(delete.id)),
+            vec![
+                Effect::Withdraw {
+                    id: delete.id,
+                    draft: None
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        let left: Vec<CommandId> = f.model.outbox.iter().map(|e| e.command.id).collect();
+        assert_eq!(left, vec![cropped.id]);
+    }
+
+    /// Two tool outputs logged in an open session, and the first's blob.
+    fn two_outputs(f: &mut Fixture) -> (SessionId, BlobId) {
+        let sid = f.session("/srv/a");
+        let output = |preview: &str| {
+            let blob = BlobRef {
+                id: BlobId::new(),
+                size: 10,
+                sha256: skywave_proto::ContentHash::of(b""),
+            };
+            let id = blob.id;
+            let kind = EventKind::ToolResult(ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: preview.into(),
+                lines: 1,
+                output: Some(Full::Blob(blob)),
+            });
+            (id, kind)
+        };
+        let ((a, first), (_, second)) = (output("a"), output("b"));
+        f.log(sid, vec![first, second]);
+        f.open(sid);
+        (sid, a)
+    }
+
+    /// The `pending` of each tool output in the open session.
+    fn output_pending(f: &Fixture) -> Vec<Option<BlobPending>> {
+        f.session_view()
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry:
+                        Entry::ToolResult {
+                            output: Some(FullView::Blob(blob)),
+                            ..
+                        },
+                    ..
+                } => Some(blob.pending),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_refused_blob_delete_shows_as_failed_on_that_blob() {
+        let mut f = Fixture::paired();
+        let (_, output) = two_outputs(&mut f);
+        assert_eq!(output_pending(&f), vec![None, None]);
+
+        let delete = queued(&f.dispatch(Action::DeleteBlob(output)));
+        let mut pending = BlobPending {
+            command: delete.id,
+            kind: BlobCommand::Delete,
+            outgoing: Outgoing::Queued,
+            discardable: true,
+        };
+        assert_eq!(output_pending(&f), vec![Some(pending), None]);
+        let rejected = CommandResult::Rejected {
+            reason: RejectReason::BlobGone,
+        };
+        f.model.command_result(delete.id, rejected, Utc::now());
+        pending.outgoing = Outgoing::Failed(FailReason::Rejected(RejectReason::BlobGone));
+        assert_eq!(output_pending(&f), vec![Some(pending), None]);
+
+        // Accepted, it shows until pulled and can't be taken back.
+        let other = queued(&f.dispatch(Action::DeleteBlob(BlobId::new())));
+        accept(&mut f, other.id, 99);
+        let accepted = f.model.blob_pendings();
+        assert!(
+            accepted
+                .values()
+                .any(|p| p.command == other.id && !p.discardable)
+        );
+    }
+
+    #[test]
+    fn a_refused_crop_is_discarded_from_its_view_and_the_blob_is_free_again() {
+        let mut f = Fixture::paired();
+        let (sid, output) = two_outputs(&mut f);
+        let cropped = queued(&f.dispatch(crop(output)));
+        let rejected = CommandResult::Rejected {
+            reason: RejectReason::BadCrop,
+        };
+        f.model.command_result(cropped.id, rejected, Utc::now());
+        let [Some(pending), None] = output_pending(&f)[..] else {
+            panic!("expected the first output's crop pending");
+        };
+        assert_eq!(
+            pending,
+            BlobPending {
+                command: cropped.id,
+                kind: BlobCommand::Crop,
+                outgoing: Outgoing::Failed(FailReason::Rejected(RejectReason::BadCrop)),
+                discardable: true,
+            }
+        );
+        // The storage screen sees the same.
+        f.dispatch(Action::Navigate(Route::Storage));
+        assert_eq!(storage_view(&f).pending, HashMap::from([(output, pending)]));
+
+        // The view's id is all a head needs to take it back.
+        assert_eq!(
+            f.dispatch(Action::Discard(pending.command)),
+            vec![
+                Effect::Withdraw {
+                    id: cropped.id,
+                    draft: None
+                },
+                Effect::Request(Request::OutboxChanged),
+            ]
+        );
+        assert_eq!(storage_view(&f).pending, HashMap::new());
+        f.open(sid);
+        assert_eq!(output_pending(&f), vec![None, None]);
+    }
+
+    #[test]
+    fn an_accepted_blob_command_refreshes_an_open_storage_screen() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+
+        let delete = queued(&f.dispatch(Action::DeleteBlob(BlobId::new())));
+        let Some(Request::Storage { req }) = accept(&mut f, delete.id, 5) else {
+            panic!("expected a storage request");
+        };
+        assert_ne!(req, first);
+        assert_eq!(storage_view(&f).status, StorageStatus::Loading);
+        // Only the first answer counts.
+        assert_eq!(accept(&mut f, delete.id, 5), None);
+
+        // A refusal changed nothing on the server; nor did a rename.
+        let refused = queued(&f.dispatch(crop(BlobId::new())));
+        let rejected = CommandResult::Rejected {
+            reason: RejectReason::BlobGone,
+        };
+        assert_eq!(
+            f.model.command_result(refused.id, rejected, Utc::now()),
+            None
+        );
+        let rename = queued(&f.dispatch(Action::RenameSession {
+            session_id: sid,
+            name: "x".into(),
+        }));
+        assert_eq!(accept(&mut f, rename.id, 6), None);
+
+        let cropped = queued(&f.dispatch(crop(BlobId::new())));
+        assert!(matches!(
+            accept(&mut f, cropped.id, 7),
+            Some(Request::Storage { .. })
+        ));
+
+        // Closed, nothing is asked.
+        f.dispatch(Action::Navigate(Route::Settings));
+        let closed = queued(&f.dispatch(Action::DeleteBlob(BlobId::new())));
+        assert_eq!(accept(&mut f, closed.id, 8), None);
     }
 
     #[test]
@@ -10168,6 +10439,65 @@ mod tests {
                 device_cert_pem: "CERT".into(),
                 ca_cert_pem: ca.into(),
             }
+        }
+
+        /// The reply to a delete is lost; the log settles it, and the open
+        /// storage screen asks again all the same.
+        #[test]
+        fn a_blob_delete_the_log_settles_refreshes_an_open_storage_screen() {
+            let live = Live::new();
+            live.core
+                .dispatch(Action::Navigate(Route::Storage))
+                .unwrap();
+            assert!(matches!(&live.requests()[..], [Request::Storage { .. }]));
+            let output = blob(10);
+            live.core.dispatch(Action::DeleteBlob(output.id)).unwrap();
+            live.requests();
+            let outbox = crate::client::lock(&live.core.shared.state)
+                .store
+                .outbox()
+                .unwrap();
+            let delete = outbox.last().unwrap().command.id;
+
+            let event = |command_id, kind| Event {
+                session_id: live.session,
+                at: Utc::now(),
+                command_id,
+                context: ContextId::first_of(live.session),
+                kind,
+            };
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![
+                        event(
+                            None,
+                            EventKind::ToolResult(ToolResult {
+                                call: None,
+                                is_error: false,
+                                status: None,
+                                preview: "big".into(),
+                                lines: 1,
+                                output: Some(Full::Blob(output.clone())),
+                            }),
+                        ),
+                        event(
+                            Some(delete),
+                            EventKind::BlobDeleted {
+                                blob: output.id,
+                                holds: BlobUse::ToolOutput,
+                                by: DeviceId::new(),
+                            },
+                        ),
+                    ],
+                })
+                .unwrap();
+            assert!(
+                live.requests()
+                    .iter()
+                    .any(|r| matches!(r, Request::Storage { .. })),
+                "the log-settled delete asks for the report again"
+            );
         }
 
         #[test]

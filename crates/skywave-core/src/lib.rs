@@ -75,22 +75,22 @@ pub use store::{
 pub use transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
 pub use view::{
     AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
-    Attention, BackgroundTask, BlobChange, BlobId, BlobState, BlobView, BodyFormat, BodyView,
-    CallId, Candidate, CandidateSource, CommandId, Completion, CompletionStatus, ComposerMode,
-    ContextId, ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
-    ConversationsUnavailable, Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry,
-    ErrorInfo, FailReason, FullView, ImportOutcome, ImportedEntry, Link, LinkFailure,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason, RuleScope,
-    RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    Attention, BackgroundTask, BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobView,
+    BodyFormat, BodyView, CallId, Candidate, CandidateSource, CommandId, Completion,
+    CompletionStatus, ComposerMode, ContextId, ContextView, ConversationItem, ConversationPicker,
+    ConversationsStatus, ConversationsUnavailable, Decision, Delivery, DeviceId, DeviceRef, Draft,
+    Effort, Entry, ErrorInfo, FailReason, FullView, ImportOutcome, ImportedEntry, Link,
+    LinkFailure, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
+    PairingView, PendingApprovalRef, PendingSession, PermissionMode, Refusal, RejectReason,
+    RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId, Screen, Seq,
+    SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
     SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
     ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
     WorkdirFetch, WorkdirPane, WorkdirView,
 };
 pub use view::{
-    BlobStorage, BlobUse, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,
+    BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,
     StorageUnavailable, StorageView,
 };
 pub use view::{
