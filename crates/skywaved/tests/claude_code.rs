@@ -1425,6 +1425,66 @@ fn the_initialize_answer_offers_its_models() {
 }
 
 #[test]
+fn the_initialize_answer_answers_the_mode_the_cli_was_started_in() {
+    let answered = |start: Option<PermissionMode>, reported: &str| {
+        let mut protocol = Protocol::new(Uuid::new_v4(), false).with_start_mode(start);
+        let id = protocol.start().writes[0]["request_id"].clone();
+        let answer = json!({"type":"control_response","response":{
+            "subtype":"success","request_id":id,
+            "response":{"claude_code_version":"2.1.310","current_permission_mode":reported}}});
+        let events = protocol.on_line(&answer.to_string()).events;
+        events
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AdapterEvent::PermissionMode(_)
+                        | AdapterEvent::PermissionModeSet(_)
+                        | AdapterEvent::PermissionModeRefused { .. }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Started in it: the start's request is answered, and nothing is
+    // reported as changed first.
+    assert_eq!(
+        answered(Some(PermissionMode::Auto), "auto"),
+        [AdapterEvent::PermissionModeSet(PermissionMode::Auto)]
+    );
+    // Started in another: refused, then the mode it runs in.
+    assert_eq!(
+        answered(Some(PermissionMode::Auto), "default"),
+        [
+            AdapterEvent::PermissionModeRefused {
+                mode: PermissionMode::Auto,
+                reason: "the agent started in default".into(),
+            },
+            AdapterEvent::PermissionMode(PermissionMode::Ask),
+        ]
+    );
+    // Nothing asked: the mode is reported unasked.
+    assert_eq!(
+        answered(None, "default"),
+        [AdapterEvent::PermissionMode(PermissionMode::Ask)]
+    );
+}
+
+#[test]
+fn a_start_mode_is_a_flag_that_replaces_a_granted_mode() {
+    let edits = json!({"type":"setMode","mode":"acceptEdits","destination":"session"});
+    let session = CliSession::Resume(Uuid::new_v4());
+    let args = |mode| adapter().command_args(session, std::slice::from_ref(&edits), mode);
+    let modes = |args: Vec<String>| {
+        (args.iter().enumerate())
+            .filter(|(_, a)| *a == "--permission-mode")
+            .map(|(at, _)| args[at + 1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(modes(args(None)), ["acceptEdits"]);
+    assert_eq!(modes(args(Some(PermissionMode::Auto))), ["auto"]);
+}
+
+#[test]
 fn offered_efforts_skip_unknown_levels_and_need_supports_effort() {
     let models = protocol::offered_models(Some(&json!([
         {"value": "a", "supportsEffort": true, "supportedEffortLevels": ["low", "ultra", "max"]},
@@ -2423,7 +2483,7 @@ async fn another_cli_version_is_reported_once() {
 fn every_process_is_started_with_the_auto_updater_off() {
     // Read from the command, not the process: the variable may be set in
     // the environment the tests run in, which the process inherits.
-    let command = adapter().command(Path::new("/"), CliSession::New(Uuid::new_v4()), &[]);
+    let command = adapter().command(Path::new("/"), CliSession::New(Uuid::new_v4()), &[], None);
     let set: Vec<_> = command.as_std().get_envs().collect();
     assert_eq!(
         set,
@@ -2443,7 +2503,7 @@ fn every_process_keeps_its_transcripts_for_far_longer_than_the_cli_default() {
             id: Uuid::new_v4(),
         },
     ] {
-        let command = adapter().command(Path::new("/"), session, &[]);
+        let command = adapter().command(Path::new("/"), session, &[], None);
         let args: Vec<&OsStr> = command.as_std().get_args().collect();
         let at = args
             .iter()
@@ -3340,8 +3400,9 @@ async fn with_bypass_allowed_the_cli_is_launched_to_switch_to_it_later() {
         .await
         .unwrap();
     assert_eq!(
-        take_raw(&mut events, 2).await,
+        take_raw(&mut events, 3).await,
         [
+            AdapterEvent::PermissionMode(PermissionMode::Ask),
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
         ]
@@ -3373,19 +3434,23 @@ async fn a_session_starts_with_and_switches_its_mode_and_model() {
     spec.mode = Some(PermissionMode::Plan);
     spec.model = Some("sonnet".to_owned());
     let (mut session, mut events) = adapter().start(spec).await.unwrap();
-    // Asked for after the handshake, answered like any request; the
-    // status echo of the switch is not reported. The handshake and the
-    // model switch each read the effort back.
+    // The mode is a start flag, answered by the handshake, so the CLI never
+    // reports another one first. The model is asked for after the
+    // handshake, answered like any request. The handshake and the model
+    // switch each read the effort back.
     assert_eq!(
         take_raw(&mut events, 5).await,
         [
+            AdapterEvent::PermissionModeSet(PermissionMode::Plan),
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::Effort(Some(Effort::Medium)),
-            AdapterEvent::PermissionModeSet(PermissionMode::Plan),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
             AdapterEvent::Effort(Some(Effort::Medium)),
         ]
     );
+    let argv = argv(tmp.path());
+    let at = argv.iter().position(|a| a == "--permission-mode").unwrap();
+    assert_eq!(argv[at + 1], "plan");
 
     session.send_message("hello".to_owned()).await.unwrap();
     // The handle comes with the first turn.
@@ -3888,8 +3953,9 @@ async fn a_session_starts_with_and_switches_its_effort() {
     // The looks after the handshake and the model switch are answered while
     // the start's effort chain runs, so they report nothing.
     assert_eq!(
-        take_raw(&mut events, 3).await,
+        take_raw(&mut events, 4).await,
         [
+            AdapterEvent::PermissionMode(PermissionMode::Ask),
             AdapterEvent::BackgroundTasks(Vec::new()),
             AdapterEvent::ModelSet("resolved-sonnet".to_owned()),
             AdapterEvent::EffortSet(Some(Effort::High)),

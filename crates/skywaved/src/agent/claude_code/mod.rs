@@ -9,6 +9,7 @@
 //!   --verbose --permission-prompt-tool stdio \
 //!   --settings '{"cleanupPeriodDays":36500}' \
 //!   [--allow-dangerously-skip-permissions] [<session rules>] \
+//!   [--permission-mode <mode>] \
 //!   (--session-id <uuid> | --resume <uuid> |
 //!    --resume <parent> --fork-session --session-id <uuid>) <agent.args...>
 //! ```
@@ -41,9 +42,13 @@
 //! handshake; a CLI that fails before that is a start error, or
 //! [`AgentError::ConversationGone`](super::AgentError::ConversationGone)
 //! when it does not know the session resumed or forked (its transcript was
-//! deleted). The mode,
-//! model and effort the [`StartSpec`] names are then asked for, in that
-//! order, with control requests, like any later change
+//! deleted). The mode the [`StartSpec`] names is a start flag,
+//! `--permission-mode`, replacing any mode the session rules grant: a
+//! resumed CLI keeps no mode, and one asked for after the handshake would
+//! first report its default as the mode. The initialize answer's
+//! `current_permission_mode` answers it. Bypass is no start flag (§3.6); it
+//! is asked for like the model and effort, which follow in that order, with
+//! control requests, like any later change
 //! (docs/agents/claude-code.md §3.7, §3.10), so each gets the CLI's own
 //! answer. The CLI handles stdin in order,
 //! so the effort is applied after the model switch; the level is a flag that
@@ -130,7 +135,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use self::lines::{Line, LineReader, MAX_LINE};
-use self::protocol::{Output, Protocol};
+use self::protocol::{Output, Protocol, mode_name};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
     Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, StartSpec,
@@ -293,14 +298,30 @@ impl ClaudeCodeAdapter {
 
     /// The CLI arguments for a process taking up `session`: the required
     /// flags, [`ALLOW_BYPASS_ARG`] when `agent.allow_bypass`, the flags
-    /// granting `session_rules`, the session's flags
+    /// granting `session_rules`, `--permission-mode <mode>` for a `mode`
+    /// (which then replaces any mode the rules grant), the session's flags
     /// ([`CliSession::args`]), then `agent.args`.
-    pub fn command_args(&self, session: CliSession, session_rules: &[Value]) -> Vec<String> {
+    pub fn command_args(
+        &self,
+        session: CliSession,
+        session_rules: &[Value],
+        mode: Option<PermissionMode>,
+    ) -> Vec<String> {
         let mut args: Vec<String> = REQUIRED_ARGS.iter().map(|a| (*a).to_owned()).collect();
         if self.config.allow_bypass {
             args.push(ALLOW_BYPASS_ARG.to_owned());
         }
-        args.extend(rules::cli_args(session_rules));
+        match mode {
+            Some(mode) => {
+                let granted: Vec<Value> = (session_rules.iter())
+                    .filter(|update| !rules::is_mode(update))
+                    .cloned()
+                    .collect();
+                args.extend(rules::cli_args(&granted));
+                args.extend(["--permission-mode".to_owned(), mode_name(mode).to_owned()]);
+            }
+            None => args.extend(rules::cli_args(session_rules)),
+        }
         args.extend(session.args());
         args.extend(self.config.args.iter().cloned());
         args
@@ -309,10 +330,16 @@ impl ClaudeCodeAdapter {
     /// The command for a process taking up `session` in `workdir`: the
     /// [`command_args`](Self::command_args) and [`NO_AUTOUPDATE_ENV`] on
     /// top of the server's environment.
-    pub fn command(&self, workdir: &Path, session: CliSession, session_rules: &[Value]) -> Command {
+    pub fn command(
+        &self,
+        workdir: &Path,
+        session: CliSession,
+        session_rules: &[Value],
+        mode: Option<PermissionMode>,
+    ) -> Command {
         let mut command = Command::new(&self.config.command);
         command
-            .args(self.command_args(session, session_rules))
+            .args(self.command_args(session, session_rules, mode))
             .env(NO_AUTOUPDATE_ENV.0, NO_AUTOUPDATE_ENV.1)
             .current_dir(workdir);
         command
@@ -323,8 +350,9 @@ impl ClaudeCodeAdapter {
         workdir: &Path,
         session: CliSession,
         session_rules: &[Value],
+        mode: Option<PermissionMode>,
     ) -> Result<Child, AgentError> {
-        let mut command = self.command(workdir, session, session_rules);
+        let mut command = self.command(workdir, session, session_rules, mode);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -422,11 +450,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
             Some(grants) => rules::parse_grants(grants).map_err(AgentError::Start)?,
             None => Vec::new(),
         };
+        // The mode is a start flag, so the CLI never runs in another first;
+        // bypass is not one (§3.6) and is asked for after the handshake.
+        let (start_mode, asked_mode) = match spec.mode {
+            Some(PermissionMode::Bypass) => (None, spec.mode),
+            mode => (mode, None),
+        };
         let span = tracing::info_span!("agent", session = %spec.session_id.0);
-        let child = self.spawn(&spec.workdir, session, &session_rules)?;
+        let child = self.spawn(&spec.workdir, session, &session_rules, start_mode)?;
         let mut process = Process::new(child, &span, self.write_timeout, self.term_grace)?;
-        let mut protocol =
-            Protocol::new(session.id(), session.handle_stored()).with_session_rules(session_rules);
+        let mut protocol = Protocol::new(session.id(), session.handle_stored())
+            .with_session_rules(session_rules)
+            .with_start_mode(start_mode);
 
         let mut early = Vec::new();
         let handshake = handshake(&mut process, &mut protocol, &mut early).instrument(span.clone());
@@ -453,7 +488,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // the CLI and any answer known at once joins the early events.
         let mut wanted = Vec::new();
         let mut asked = Vec::new();
-        if let Some(mode) = spec.mode {
+        if let Some(mode) = asked_mode {
             asked.push(protocol.set_permission_mode(mode));
         }
         if let Some(model) = spec.model {
