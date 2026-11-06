@@ -3,6 +3,7 @@
 //! here, from present's sections and formatters, as the TUI words it
 //! without its key hints; the diff is transport only.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use skywave_present::format::{
     percent, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
-    ItemKey, PREVIEW_LINES, Section, delivery, sections, selectable, starts_turn,
+    ItemKey, PREVIEW_LINES, Section, change_note, delivery, sections, selectable, starts_turn,
 };
 use skywave_present::text::{clean_line, clean_text};
 
@@ -724,7 +725,7 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             // Where its download stands is the blob's label.
             Some(_) => preview.into_iter().map(clean_line).collect(),
             None => {
-                note = section.lost().map(str::to_owned);
+                note = section.note().map(Cow::into_owned);
                 preview.into_iter().map(clean_line).collect()
             }
         }
@@ -740,7 +741,7 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             .collect();
         note = match (
             more_note(section, preview.len(), shown.len()),
-            section.lost(),
+            section.note(),
         ) {
             (Some(more), Some(lost)) => Some(format!("{more} · {lost}")),
             (None, Some(lost)) => Some(format!("… {lost}")),
@@ -835,6 +836,11 @@ pub fn blob_facts(blob: &BlobView) -> BlobFacts {
             format!("download failed: {} · {}", clean_line(reason), bytes(*size)),
         ),
         BlobState::Available { .. } => (BlobStateKind::Available, "downloaded".to_owned()),
+    };
+    // What the server did to it is said beside where it stands.
+    let label = match change_note(blob) {
+        Some(note) => format!("{label} · {note}"),
+        None => label,
     };
     BlobFacts {
         blob_id: blob.id.0.to_string(),
@@ -1171,6 +1177,7 @@ mod tests {
         let blob = |state| BlobView {
             id: BlobId::new(),
             state,
+            change: None,
         };
         let text = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
         let shown = |state, expanded| {

@@ -16,13 +16,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use skywave_core::{BlobId, BlobState, SessionView, ShellEnd, ShellRun, ShellRunState};
+use skywave_core::{BlobId, BlobState, BlobView, SessionView, ShellEnd, ShellRun, ShellRunState};
 use skywave_present::format::{
     blob_size, bytes, outgoing_label, queued_label, shell_end_label, shell_took, when_marker,
 };
 use skywave_present::output::{
     OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
 };
+use skywave_present::sections::change_note;
 
 use super::outgoing_badge;
 use skywave_present::text::clean;
@@ -220,9 +221,11 @@ fn output_lines(run: &ShellRun, shown: Shown) -> Vec<Span<'static>> {
         (Shown::Whole(_), WholeOutput::Partial { text, note }) => {
             (text, true, format!(" · {note}"))
         }
-        (Shown::Whole(Some(read)), WholeOutput::Blob(_)) => {
-            (read, true, " · y copies them all".to_owned())
-        }
+        (Shown::Whole(Some(read)), WholeOutput::Blob(blob)) => (
+            read,
+            true,
+            " · y copies them all".to_owned() + &changed(blob),
+        ),
         (Shown::Whole(None), WholeOutput::Blob(blob)) => {
             let hint = match &blob.state {
                 BlobState::Available { .. } => " · y copies them all".to_owned(),
@@ -232,7 +235,7 @@ fn output_lines(run: &ShellRun, shown: Shown) -> Vec<Span<'static>> {
                 }
                 _ => " · d downloads them".to_owned(),
             };
-            (run.tail_or_preview.as_str(), true, hint)
+            (run.tail_or_preview.as_str(), true, hint + &changed(blob))
         }
     };
     let all: Vec<&str> = text.lines().collect();
@@ -245,6 +248,14 @@ fn output_lines(run: &ShellRun, shown: Shown) -> Vec<Span<'static>> {
     }
     spans.extend(shown.iter().map(|line| Span::raw(clean(line))));
     spans
+}
+
+/// What the server did to the output blob, for after a hint: ` · Cropped
+/// by laptop: kept 12 of 400 lines`, or nothing.
+fn changed(blob: &BlobView) -> String {
+    change_note(blob)
+        .map(|note| format!(" · {note}"))
+        .unwrap_or_default()
 }
 
 /// The output at `path` as it shows whole: its last [`OUTPUT_SHOW_BYTES`],

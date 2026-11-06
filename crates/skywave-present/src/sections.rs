@@ -4,11 +4,15 @@
 //! go through here, so what opening an item shows is what the screen shows,
 //! and what a copy takes is what it shows.
 
+use std::borrow::Cow;
+
 use skywave_core::{
-    ApprovalPrompt, BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery, Entry,
-    FullView, ImportedEntry, Outgoing, Query, Seq, SessionView, TimelineItem, ToolKind,
-    ToolOutcome, ToolView,
+    ApprovalPrompt, BlobChange, BlobState, BlobView, BodyFormat, BodyView, CommandId, Delivery,
+    DeviceRef, Entry, FullView, ImportedEntry, Outgoing, Query, Seq, SessionView, TimelineItem,
+    ToolKind, ToolOutcome, ToolView,
 };
+
+use crate::format::device_word;
 
 /// Most preview lines an item shows while collapsed.
 pub const PREVIEW_LINES: usize = 8;
@@ -132,7 +136,8 @@ pub fn starts_turn(item: &TimelineItem) -> bool {
 pub struct Section<'a> {
     /// Head of the content, with real newlines; may be empty.
     pub text: &'a str,
-    /// Line count of the whole content, when known.
+    /// Line count of the whole content, when known: what a crop kept once
+    /// the server cropped it ([`whole_lines`]).
     pub lines: Option<u32>,
     pub format: BodyFormat,
     /// File content: shown with line numbers.
@@ -195,6 +200,50 @@ impl<'a> Section<'a> {
             CONTENT_LOST
         })
     }
+
+    /// What to say beside this section when its preview is all there is:
+    /// the server could not keep the rest ([`Section::lost`]), or it was
+    /// deleted there and this device has no copy ([`deleted_note`]).
+    pub fn note(&self) -> Option<Cow<'static, str>> {
+        match self.full? {
+            FullView::Deleted { by } => Some(Cow::Owned(deleted_note(by))),
+            _ => self.lost().map(Cow::Borrowed),
+        }
+    }
+}
+
+/// The line count of the whole content behind a preview whose event says
+/// `lines`: what the crop kept once the server cropped it (the blob there
+/// holds only those), else `lines`. The one rule every count of
+/// "lines left out" goes through, so no head says lines exist that no
+/// download brings.
+pub fn whole_lines(lines: u32, full: Option<&FullView>) -> u32 {
+    match full
+        .and_then(FullView::blob)
+        .and_then(|b| b.change.as_ref())
+    {
+        Some(BlobChange::Cropped { kept, .. }) => *kept,
+        None => lines,
+    }
+}
+
+/// The tombstone on content deleted on the server that this device has no
+/// copy of: `Deleted by laptop`.
+pub fn deleted_note(by: &DeviceRef) -> String {
+    format!("Deleted by {}", device_word(by))
+}
+
+/// What a head says of a blob the server changed, beside its download
+/// state: `Cropped by laptop: kept 12 of 400 lines`. `None` for a blob as
+/// it was made.
+pub fn change_note(blob: &BlobView) -> Option<String> {
+    match blob.change.as_ref()? {
+        BlobChange::Cropped { kept, of, by } => Some(format!(
+            "Cropped by {}: kept {kept} of {of} {}",
+            device_word(by),
+            if *of == 1 { "line" } else { "lines" }
+        )),
+    }
 }
 
 /// The first of `sections` whose whole content the server could not keep,
@@ -255,7 +304,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     if let Some(body) = &view.body {
         out.push(Section {
             text: &body.preview,
-            lines: Some(body.lines),
+            lines: Some(whole_lines(body.lines, body.full.as_ref())),
             format: body.format,
             numbered: body.format == BodyFormat::Text && is_file(view.kind),
             error: false,
@@ -278,7 +327,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     {
         out.push(Section {
             text: preview,
-            lines: Some(*lines),
+            lines: Some(whole_lines(*lines, output.as_ref())),
             format: BodyFormat::Text,
             numbered: view.kind == ToolKind::FileRead && view.body.is_none() && !is_error,
             error: *is_error,
@@ -287,10 +336,10 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             input: false,
         });
     }
-    // A lost input always stands, so the loss is said: no other section's
-    // blob holds the input.
+    // A lost or deleted input always stands, so the loss is said: no other
+    // section's blob holds the input.
     if let Some(input) = &view.input
-        && (*input == FullView::Lost || out.iter().all(|s| s.blob().is_none()))
+        && (input.blob().is_none() || out.iter().all(|s| s.blob().is_none()))
     {
         out.push(Section::input(input));
     }
@@ -525,6 +574,7 @@ mod tests {
         let kept = FullView::Blob(BlobView {
             id: BlobId::new(),
             state: BlobState::NotDownloaded { size: 10 },
+            change: None,
         });
 
         // A lost input stands where a kept one would, hidden, saying so.
@@ -562,5 +612,85 @@ mod tests {
         let shown = tool_sections(&view);
         assert!(shown[0].blob().is_some());
         assert_eq!(lost(&shown), None);
+        assert_eq!(shown[0].note(), None);
+    }
+
+    fn device(name: &str, me: bool) -> DeviceRef {
+        DeviceRef {
+            id: skywave_core::DeviceId::new(),
+            name: Some(name.into()),
+            me,
+        }
+    }
+
+    #[test]
+    fn deleted_content_says_who_deleted_it_and_has_no_blob() {
+        let deleted = FullView::Deleted {
+            by: device("laptop", false),
+        };
+        let view = call(Some(deleted.clone()), None);
+        let shown = tool_sections(&view);
+        assert_eq!(shown[0].blob(), None, "nothing to download");
+        assert_eq!(shown[0].note().as_deref(), Some("Deleted by laptop"));
+        // Not the server's loss: an approval does not say it was.
+        assert_eq!(shown[0].lost(), None);
+
+        let mine = FullView::Deleted {
+            by: device("phone", true),
+        };
+        let view = call(Some(mine), None);
+        assert_eq!(
+            tool_sections(&view)[0].note().as_deref(),
+            Some("Deleted by you")
+        );
+
+        // A deleted input stands, saying so, even beside a kept body.
+        let kept = FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 10 },
+            change: None,
+        });
+        let view = call(Some(kept), Some(deleted));
+        let shown = tool_sections(&view);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[1].note().as_deref(), Some("Deleted by laptop"));
+    }
+
+    #[test]
+    fn a_cropped_blob_says_what_it_kept_of_the_original() {
+        let mut blob = BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 10 },
+            change: None,
+        };
+        assert_eq!(change_note(&blob), None);
+        blob.change = Some(BlobChange::Cropped {
+            kept: 12,
+            of: 400,
+            by: device("laptop", false),
+        });
+        assert_eq!(
+            change_note(&blob).as_deref(),
+            Some("Cropped by laptop: kept 12 of 400 lines")
+        );
+        // Still a blob to download: the preview is not all there is.
+        let full = FullView::Blob(blob);
+        let view = call(Some(full), None);
+        let shown = tool_sections(&view);
+        assert!(shown[0].blob().is_some());
+        assert_eq!(shown[0].note(), None);
+        // Its whole content is what the crop kept, not the original's 40.
+        assert_eq!(shown[0].lines, Some(12));
+        // Control: uncropped, the event's own count.
+        let view = call(Some(kept_blob()), None);
+        assert_eq!(tool_sections(&view)[0].lines, Some(40));
+    }
+
+    fn kept_blob() -> FullView {
+        FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 10 },
+            change: None,
+        })
     }
 }

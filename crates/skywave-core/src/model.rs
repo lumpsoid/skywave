@@ -22,7 +22,7 @@ use crate::completion::Completer;
 use crate::conversations::Conversations;
 use crate::identity::Identity;
 use crate::projection::{
-    FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
+    BlobFate, FIRST_PROMPT_MAX_CHARS, SessionSummary, TurnRecord, blob_refs, first_line, is_notable,
 };
 use crate::seam::Request;
 use crate::snippets::Snippets;
@@ -34,13 +34,13 @@ use crate::store::{
 use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
-    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention, BlobId,
-    BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult, CommandId, ComposerMode,
-    ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry,
-    ErrorInfo, FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, Link,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
-    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
+    BlobChange, BlobId, BlobState, BlobView, BodyView, CallId, ChangedFile, ChangesResult,
+    CommandId, ComposerMode, ContextId, ContextView, Decision, Delivery, DeviceId, DeviceRef,
+    DiffBody, Draft, Entry, ErrorInfo, FailReason, FileBody, FileChange, FileResult, FullView,
+    ImportedEntry, Link, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus,
+    PairingView, PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq,
+    SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
     StorageReport, StorageView, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval,
     ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
@@ -159,6 +159,9 @@ pub(crate) struct Model {
     /// Oldest first, finished entries included.
     outbox: Vec<OutboxEntry>,
     blobs: BTreeMap<BlobId, BlobRecord>,
+    /// What the server did to blobs, as stored: an event's blob resolves
+    /// through it ([`Model::full_view`]).
+    fates: HashMap<BlobId, BlobFate>,
     /// Blobs asked for and not yet taken by a download; in memory only, as
     /// the blob queue forgets un-started requests on a restart too.
     wanted: HashSet<BlobId>,
@@ -250,6 +253,7 @@ impl Model {
             sessions: Vec::new(),
             outbox: Vec::new(),
             blobs: BTreeMap::new(),
+            fates: HashMap::new(),
             wanted: HashSet::new(),
             failed: HashMap::new(),
             drafts: HashMap::new(),
@@ -292,6 +296,7 @@ impl Model {
         self.sessions = snapshot.sessions;
         self.outbox = snapshot.outbox;
         self.blobs = snapshot.blobs.into_iter().map(|b| (b.id, b)).collect();
+        self.fates = snapshot.fates;
         self.drafts = snapshot.drafts;
         self.composer_modes = snapshot.composer_modes;
         self.read_marks = snapshot.read_marks;
@@ -1275,7 +1280,16 @@ impl Model {
             }
             self.note_shell_finish(event);
             self.turns.extend(TurnRecord::of(seq, event));
+            // As the store does: the old blob goes before a crop's `into`
+            // registers, and a blob with a fate never registers again.
+            if let Some((blob, fate)) = BlobFate::of(&event.kind) {
+                self.fates.entry(blob).or_insert(fate);
+                self.forget_blob(blob);
+            }
             for blob in blob_refs(&event.kind) {
+                if self.fates.contains_key(&blob.id) {
+                    continue;
+                }
                 self.blobs.entry(blob.id).or_insert_with(|| BlobRecord {
                     id: blob.id,
                     size: blob.size,
@@ -1462,9 +1476,8 @@ impl Model {
         self.outbox
             .retain(|e| e.status.is_pending() || command_session(&e.command.kind) != Some(id));
         for blob in blobs {
-            self.blobs.remove(blob);
-            self.wanted.remove(blob);
-            self.failed.remove(blob);
+            self.forget_blob(*blob);
+            self.fates.remove(blob);
         }
         self.workdirs.forget(id);
         self.forget_resolved_alerts();
@@ -1576,9 +1589,7 @@ impl Model {
             }
         }
         for blob in &stored.purged {
-            self.blobs.remove(blob);
-            self.wanted.remove(blob);
-            self.failed.remove(blob);
+            self.forget_blob(*blob);
         }
         self.workdirs.answered(ask, answer);
         self.want_shown_blob().into_iter().collect()
@@ -1623,6 +1634,14 @@ impl Model {
                 reason,
             };
         }
+    }
+
+    /// The blob left the replica: its record goes, with the request for it
+    /// and why it last failed.
+    fn forget_blob(&mut self, id: BlobId) {
+        self.blobs.remove(&id);
+        self.wanted.remove(&id);
+        self.failed.remove(&id);
     }
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
@@ -2213,7 +2232,7 @@ impl Model {
                         r.finished_at = Some(event.at);
                         r.tail_or_preview.clone_from(preview);
                         r.lines = *lines;
-                        r.output = output.as_ref().map(|b| self.blob_view(b));
+                        r.output = output.as_ref().map(|b| self.fated_view(b));
                         r.truncated = *truncated;
                     }
                 }
@@ -3045,6 +3064,7 @@ impl Model {
             return BlobView {
                 id: blob.id,
                 state: BlobState::NotDownloaded { size: blob.size },
+                change: None,
             };
         };
         let size = record.size;
@@ -3066,14 +3086,59 @@ impl Model {
             },
             BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
-        BlobView { id: blob.id, state }
+        BlobView {
+            id: blob.id,
+            state,
+            change: None,
+        }
     }
 
     fn full_view(&self, full: &Full) -> FullView {
         match full {
-            Full::Blob(blob) => FullView::Blob(self.blob_view(blob)),
+            Full::Blob(blob) => self.fated_view(blob),
             Full::Lost => FullView::Lost,
         }
+    }
+
+    /// What is left of an event's `blob`, following its fates: nothing once
+    /// any step was deleted, else the last crop's blob (or `blob` itself).
+    /// Every crop names the then-current blob, so the chain is acyclic;
+    /// the walk is bounded all the same.
+    fn fated_view(&self, blob: &BlobRef) -> FullView {
+        let mut current = blob;
+        let mut change = None;
+        for _ in 0..=self.fates.len() {
+            match self.fates.get(&current.id) {
+                None => break,
+                Some(BlobFate::Deleted { by }) => {
+                    return FullView::Deleted {
+                        by: self.device_ref(*by),
+                    };
+                }
+                Some(BlobFate::Cropped {
+                    into,
+                    kept,
+                    lines,
+                    by,
+                }) => {
+                    // The first crop's `lines` is the original's count.
+                    let of = match change {
+                        Some(BlobChange::Cropped { of, .. }) => of,
+                        None => *lines,
+                    };
+                    change = Some(BlobChange::Cropped {
+                        kept: kept.iter().map(|span| span.count).sum(),
+                        of,
+                        by: self.device_ref(*by),
+                    });
+                    current = into;
+                }
+            }
+        }
+        FullView::Blob(BlobView {
+            change,
+            ..self.blob_view(current)
+        })
     }
 }
 
@@ -3579,6 +3644,7 @@ mod tests {
             sessions: Vec::new(),
             outbox: Vec::new(),
             blobs: Vec::new(),
+            fates: HashMap::new(),
             settings: Settings::default(),
             drafts: HashMap::new(),
             composer_modes: HashMap::new(),
@@ -3985,6 +4051,7 @@ mod tests {
         let blob = FullView::Blob(BlobView {
             id: input.id,
             state: BlobState::NotDownloaded { size: 5000 },
+            change: None,
         });
         assert_eq!(
             view.pending_approval,
@@ -6273,6 +6340,7 @@ mod tests {
                             output: Some(FullView::Blob(BlobView {
                                 id: output.id,
                                 state: BlobState::NotDownloaded { size: 9000 },
+                                change: None,
                             })),
                             took: Duration::from_secs(180),
                         },
@@ -6892,6 +6960,7 @@ mod tests {
             FullView::Blob(BlobView {
                 id: b.id,
                 state: BlobState::NotDownloaded { size: b.size },
+                change: None,
             })
         };
         let waiting = ToolView {
@@ -7451,6 +7520,7 @@ mod tests {
             sessions: model.sessions.clone(),
             outbox: model.outbox.clone(),
             blobs: model.blobs.values().cloned().collect(),
+            fates: model.fates.clone(),
             settings: model.settings.clone(),
             drafts: model.drafts.clone(),
             composer_modes: model.composer_modes.clone(),
@@ -9490,7 +9560,8 @@ mod tests {
         use std::sync::mpsc::Receiver;
 
         use skywave_proto::{
-            BlobId as ProtoBlobId, ChangeSet, DirEntry, EntryKind, ListResult, ToolResult,
+            BlobId as ProtoBlobId, BlobUse, ChangeSet, DirEntry, EntryKind, LineSpan, ListResult,
+            ToolResult,
         };
 
         use super::*;
@@ -10211,6 +10282,156 @@ mod tests {
                     .map(|b| (b.workdir, b.status.clone())),
                 Some((true, BlobStatus::NotDownloaded))
             );
+        }
+
+        /// The tool outputs of the session on screen, in log order.
+        fn outputs(view: crate::ViewState) -> Vec<FullView> {
+            let Screen::Session(session) = view.screen else {
+                panic!("expected the session screen");
+            };
+            session
+                .timeline
+                .into_iter()
+                .filter_map(|item| match item {
+                    TimelineItem::Logged {
+                        entry: Entry::ToolResult { output, .. },
+                        ..
+                    } => output,
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A server delete or crop purges the old blob in the update that
+        /// applies it, held or downloading: its row, its files and the
+        /// model's record go, the queue hears of it, a download holding a
+        /// lease on it fails its next report, and the views resolve the
+        /// event's blob through the fate. The store and the model agree.
+        #[test]
+        fn blob_fates_purge_through_the_seam_and_show_in_the_views() {
+            let live = Live::new();
+            let me = crate::client::lock(&live.core.shared.state)
+                .model
+                .device()
+                .unwrap();
+            let other = DeviceId::new();
+            let (kept, going) = (blob(400), blob(800));
+            let result = |output: &BlobRef| ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "out".into(),
+                lines: 40,
+                output: Some(Full::Blob(output.clone())),
+            };
+            let event = |kind| Event {
+                session_id: live.session,
+                at: Utc::now(),
+                command_id: None,
+                context: ContextId::first_of(live.session),
+                kind,
+            };
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![
+                        event(EventKind::ToolResult(result(&kept))),
+                        event(EventKind::ToolResult(result(&going))),
+                    ],
+                })
+                .unwrap();
+            live.core
+                .dispatch(Action::OpenSession(live.session))
+                .unwrap();
+            live.requests();
+
+            // One copy is here, the other half downloaded under a lease.
+            let dir = crate::blobs::blob_dir(&live.seam.data_dir());
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(kept.id.0.to_string());
+            let part = dir.join(format!("{}.part", going.id.0));
+            std::fs::write(&file, b"kept").unwrap();
+            std::fs::write(&part, b"go").unwrap();
+            live.seam
+                .blob_status(kept.id, BlobStatus::Available { path: file.clone() })
+                .unwrap();
+            let (_, lease) = live.seam.leased_blob(going.id).unwrap().unwrap();
+            let downloading = BlobStatus::Downloading {
+                got: 2,
+                path: part.clone(),
+            };
+            live.seam
+                .leased_blob_status(going.id, lease, downloading.clone())
+                .unwrap();
+
+            let into = blob(10);
+            let applied = live
+                .seam
+                .apply_events(&EventBatch {
+                    from: Seq(4),
+                    events: vec![
+                        event(EventKind::BlobDeleted {
+                            blob: kept.id,
+                            holds: BlobUse::ToolOutput,
+                            by: other,
+                        }),
+                        event(EventKind::BlobCropped {
+                            blob: going.id,
+                            holds: BlobUse::ToolOutput,
+                            into: into.clone(),
+                            kept: vec![
+                                LineSpan { first: 0, count: 2 },
+                                LineSpan { first: 2, count: 3 },
+                            ],
+                            lines: 40,
+                            by: me,
+                        }),
+                    ],
+                })
+                .unwrap();
+            assert_eq!(applied.blobs, [into.id]);
+            assert_eq!(
+                live.requests(),
+                [Request::BlobsPurged(vec![kept.id, going.id])]
+            );
+            assert!(!file.exists() && !part.exists(), "both files are gone");
+            assert!(live.seam.blob(kept.id).unwrap().is_none());
+            assert!(live.seam.blob(going.id).unwrap().is_none());
+            assert!(
+                live.seam
+                    .leased_blob_status(going.id, lease, downloading)
+                    .is_err(),
+                "the download stops at its next report"
+            );
+
+            let shown = outputs(live.core.view());
+            let FullView::Deleted { by } = &shown[0] else {
+                panic!("expected the tombstone, got {:?}", shown[0]);
+            };
+            assert_eq!((by.id, by.me), (other, false));
+            let FullView::Blob(cropped) = &shown[1] else {
+                panic!("expected the cropped blob, got {:?}", shown[1]);
+            };
+            assert_eq!(cropped.id, into.id);
+            assert_eq!(cropped.state, BlobState::NotDownloaded { size: 10 });
+            let Some(BlobChange::Cropped {
+                kept: lines,
+                of,
+                by,
+            }) = &cropped.change
+            else {
+                panic!("expected the crop, got {cropped:?}");
+            };
+            assert_eq!((*lines, *of, by.me), (5, 40, true));
+
+            // The model as rebuilt from the store shows the same.
+            {
+                let mut state = crate::client::lock(&live.core.shared.state);
+                assert!(!state.model.blobs.contains_key(&kept.id));
+                assert!(!state.model.blobs.contains_key(&going.id));
+                state.resync();
+            }
+            assert_eq!(outputs(live.core.view()), shown);
         }
 
         #[test]

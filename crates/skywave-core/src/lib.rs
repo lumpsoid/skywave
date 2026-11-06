@@ -63,7 +63,7 @@ pub use lock::LockError;
 pub use pairing::{
     PairError, PairUri, Paired, normalize_code, pair, pair_and_report, parse_pair_uri,
 };
-pub use projection::{SessionSummary, SessionUsage, TurnRecord};
+pub use projection::{BlobFate, SessionSummary, SessionUsage, TurnRecord};
 pub use seam::{Request, Seam};
 pub use search::Query;
 pub use skywave_proto::Fingerprint;
@@ -75,9 +75,9 @@ pub use store::{
 pub use transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
 pub use view::{
     AgentSetting, AgentView, AgentWork, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus,
-    Attention, BackgroundTask, BlobId, BlobState, BlobView, BodyFormat, BodyView, CallId,
-    Candidate, CandidateSource, CommandId, Completion, CompletionStatus, ComposerMode, ContextId,
-    ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
+    Attention, BackgroundTask, BlobChange, BlobId, BlobState, BlobView, BodyFormat, BodyView,
+    CallId, Candidate, CandidateSource, CommandId, Completion, CompletionStatus, ComposerMode,
+    ContextId, ContextView, ConversationItem, ConversationPicker, ConversationsStatus,
     ConversationsUnavailable, Decision, Delivery, DeviceId, DeviceRef, Draft, Effort, Entry,
     ErrorInfo, FailReason, FullView, ImportOutcome, ImportedEntry, Link, LinkFailure,
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,

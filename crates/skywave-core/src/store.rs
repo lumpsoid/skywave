@@ -26,7 +26,7 @@ use skywave_proto::{
 };
 use uuid::Uuid;
 
-use crate::projection::{SessionSummary, TurnRecord, blob_refs};
+use crate::projection::{BlobFate, SessionSummary, TurnRecord, blob_refs};
 use crate::view::{ComposerMode, Draft, RunWhen, Snippet, SnippetId};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
@@ -352,6 +352,17 @@ BEGIN
     DELETE FROM blob_hashes WHERE blob_id = old.id;
 END;
 "#,
+    r#"
+-- What the server did to a blob (crate::BlobFate, JSON), folded from the
+-- log's `BlobDeleted` and `BlobCropped` (protocol v23), with the seq of
+-- that event. Cleared with the events. A replica from before this holds no
+-- such events: nothing to backfill. `IF NOT EXISTS` as above.
+CREATE TABLE IF NOT EXISTS blob_fates (
+    blob_id TEXT PRIMARY KEY,
+    fate TEXT NOT NULL,
+    seq INTEGER NOT NULL
+);
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -636,8 +647,12 @@ pub struct Applied {
     /// Sessions whose summaries changed.
     pub sessions: Vec<SessionId>,
     /// Blobs first referenced by this batch, now registered as
-    /// [`BlobStatus::NotDownloaded`], in log order.
+    /// [`BlobStatus::NotDownloaded`], in log order; none the batch also
+    /// purged.
     pub blobs: Vec<BlobId>,
+    /// Blobs the batch deleted or cropped away on the server whose rows are
+    /// gone, and whose files (complete and partial) the caller removes.
+    pub purged: Vec<BlobId>,
     /// Outbox commands still unanswered that the batch settled as accepted
     /// at the seq of their event, in log order.
     pub settled: Vec<(CommandId, Seq)>,
@@ -661,6 +676,9 @@ pub struct Snapshot {
     /// Oldest first.
     pub outbox: Vec<OutboxEntry>,
     pub blobs: Vec<BlobRecord>,
+    /// What the server did to blobs, by the blob it names
+    /// ([`Store::blob_fates`]).
+    pub fates: HashMap<BlobId, BlobFate>,
     pub settings: Settings,
     pub drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// Sessions whose composer does not write to the agent
@@ -757,6 +775,7 @@ impl Store {
             sessions: self.sessions()?,
             outbox: self.outbox()?,
             blobs: self.blobs()?,
+            fates: self.blob_fates()?,
             settings: self.settings()?,
             drafts: self.drafts()?,
             composer_modes: self.composer_modes()?,
@@ -905,6 +924,13 @@ impl Store {
     /// readable ([`record_result`](Store::record_result)). Whichever comes
     /// first is kept; the other changes nothing.
     ///
+    /// A `BlobDeleted` or `BlobCropped` keeps the blob's fate
+    /// ([`BlobFate`]) and purges the blob's row, whatever its state: its
+    /// content is gone from the server, so a download of it cannot finish,
+    /// and the fate says what to show instead ([`Applied::purged`]). A
+    /// crop's `into` registers like any referenced blob. A blob with a
+    /// fate never registers again.
+    ///
     /// Events of a session deleted from this device advance the cursor but
     /// are not stored, project no summary and register no blob. Contiguity
     /// is the cursor's alone and events are read per session, so the holes
@@ -931,6 +957,7 @@ impl Store {
         let mut new_cursor = cursor;
         let mut new_events = 0;
         let mut blobs = Vec::new();
+        let mut purged = Vec::new();
         let mut settled = Vec::new();
         for (seq, event) in batch.iter().filter(|(seq, _)| *seq > cursor) {
             new_cursor = seq;
@@ -971,6 +998,13 @@ impl Store {
                     };
                     touched.insert(event.session_id, summary);
                 }
+            }
+            // The old blob goes before a crop's `into` registers below.
+            if let Some((blob, fate)) = BlobFate::of(&event.kind)
+                && put_fate(&tx, seq, blob, &fate)?
+            {
+                blobs.retain(|id| *id != blob);
+                purged.push(blob);
             }
             for blob in blob_refs(&event.kind) {
                 if register_blob(&tx, blob)? {
@@ -1013,6 +1047,7 @@ impl Store {
             new_events,
             sessions: touched.into_keys().collect(),
             blobs,
+            purged,
             settled,
         })
     }
@@ -1065,6 +1100,12 @@ impl Store {
         }
         for blob in &blobs {
             tx.execute("DELETE FROM blobs WHERE id = ?1", [blob.0.to_string()])?;
+            // The fates of its blobs: its events named every one, a crop's
+            // `into` included.
+            tx.execute(
+                "DELETE FROM blob_fates WHERE blob_id = ?1",
+                [blob.0.to_string()],
+            )?;
         }
         // Its workdir answers' blobs go only if no other session's names them.
         let workdir_blobs = {
@@ -1335,6 +1376,15 @@ impl Store {
             .conn
             .prepare(&format!("SELECT {BLOB_COLUMNS} FROM blobs ORDER BY id"))?;
         let rows = stmt.query_map([], blob_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// What the server did to blobs, by the blob each fate names: folded
+    /// from the log's `BlobDeleted` and `BlobCropped`
+    /// ([`apply_batch`](Store::apply_batch)).
+    pub fn blob_fates(&self) -> Result<HashMap<BlobId, BlobFate>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT blob_id, fate FROM blob_fates")?;
+        let rows = stmt.query_map([], |row| Ok((BlobId(uuid_col(row, 0)?), json_col(row, 1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1828,6 +1878,7 @@ fn clear_replica(tx: &Transaction<'_>) -> Result<(), StoreError> {
          UPDATE cursor SET seq = 0 WHERE id = 0;
          DELETE FROM outbox;
          DELETE FROM blobs;
+         DELETE FROM blob_fates;
          DELETE FROM devices;
          DELETE FROM offered_models;
          DELETE FROM workdir_snapshots;
@@ -2149,12 +2200,32 @@ fn purge_workdir_blobs(
     Ok(purged)
 }
 
+/// Keeps `fate`, decided at `seq`, as `blob`'s and deletes the blob's row;
+/// whether a row was deleted. The first fate stays: the server decides one
+/// per blob.
+fn put_fate(
+    tx: &Transaction<'_>,
+    seq: Seq,
+    blob: BlobId,
+    fate: &BlobFate,
+) -> Result<bool, StoreError> {
+    let id = blob.0.to_string();
+    tx.execute(
+        "INSERT INTO blob_fates (blob_id, fate, seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT (blob_id) DO NOTHING",
+        params![id, to_json(fate)?, seq_sql(seq)?],
+    )?;
+    Ok(tx.execute("DELETE FROM blobs WHERE id = ?1", [id])? > 0)
+}
+
 /// Registers `blob` as `NotDownloaded`, with its hash, unless a blob with
-/// its id is known already; whether it was new.
+/// its id is known already or has a fate; whether it was new.
 fn register_blob(tx: &Transaction<'_>, blob: &BlobRef) -> Result<bool, StoreError> {
     let id = blob.id.0.to_string();
     let inserted = tx.execute(
-        "INSERT INTO blobs (id, size, state) VALUES (?1, ?2, 'not_downloaded')
+        "INSERT INTO blobs (id, size, state)
+         SELECT ?1, ?2, 'not_downloaded'
+         WHERE NOT EXISTS (SELECT 1 FROM blob_fates WHERE blob_id = ?1)
          ON CONFLICT (id) DO NOTHING",
         params![id, u64_sql(blob.size)?],
     )?;

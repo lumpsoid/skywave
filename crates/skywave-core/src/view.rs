@@ -372,8 +372,22 @@ pub enum BlobState {
 /// A blob referenced from the timeline, with its download state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobView {
+    /// The blob holding what is left of the content: the event's own, or
+    /// the last crop's when [`change`](Self::change) says it was cropped.
     pub id: BlobId,
     pub state: BlobState,
+    /// What the server did to this content, if anything.
+    pub change: Option<BlobChange>,
+}
+
+/// What the server did to a blob's content that left some of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobChange {
+    /// Cropped to `kept` of the original content's `of` lines; the
+    /// [`BlobView`]'s `id` is the cropped blob. After a crop of a crop,
+    /// `kept` is what the last crop kept and `by` its device, while `of`
+    /// stays the original's count: every crop keeps lines of the original.
+    Cropped { kept: u32, of: u32, by: DeviceRef },
 }
 
 /// The whole of some content a preview or summary does not hold all of
@@ -385,14 +399,17 @@ pub enum FullView {
     Blob(BlobView),
     /// The server could not keep it: only the preview or summary is left.
     Lost,
+    /// Deleted on the server, and this device has no copy: only the
+    /// preview or summary is left.
+    Deleted { by: DeviceRef },
 }
 
 impl FullView {
-    /// The blob holding the whole content, unless it was lost.
+    /// The blob holding the whole content, unless there is none.
     pub fn blob(&self) -> Option<&BlobView> {
         match self {
             FullView::Blob(blob) => Some(blob),
-            FullView::Lost => None,
+            FullView::Lost | FullView::Deleted { .. } => None,
         }
     }
 }
@@ -966,7 +983,7 @@ pub struct ShellRun {
     /// The output's line count so far, or in all once finished.
     pub lines: u32,
     /// The whole output, once finished, when the preview does not hold it.
-    pub output: Option<BlobView>,
+    pub output: Option<FullView>,
     /// The preview is cut: [`output`](Self::output) has the rest.
     pub truncated: bool,
     /// This device's `RunShell`'s progress, while it is in the outbox.

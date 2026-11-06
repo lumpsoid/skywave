@@ -29,7 +29,7 @@ use skywave_present::format::{
     outgoing_label, percent, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
-    ItemKey, PREVIEW_LINES, Section, delivery, find, sections, selectable, starts_turn,
+    ItemKey, PREVIEW_LINES, Section, change_note, delivery, find, sections, selectable, starts_turn,
 };
 use skywave_present::text::clean;
 use unicode_width::UnicodeWidthChar;
@@ -780,7 +780,7 @@ impl Layout<'_> {
                     preview.into_iter().map(clean).collect()
                 }
                 None => {
-                    note = section.lost().map(|lost| Span::raw(lost).yellow());
+                    note = section.note().map(|note| Span::raw(note).yellow());
                     preview.into_iter().map(clean).collect()
                 }
             }
@@ -824,11 +824,12 @@ impl Layout<'_> {
                     }
                     BlobState::Available { .. } => "downloaded".to_owned(),
                 });
+                more.extend(change_note(blob));
             }
-            note = match section.lost() {
+            note = match section.note() {
                 // Said in full and in colour: the preview is all there is.
                 Some(lost) => {
-                    more.push(lost.to_owned());
+                    more.push(lost.into_owned());
                     Some(Span::raw(format!("… {}", more.join(" · "))).yellow())
                 }
                 None if !more.is_empty() => {

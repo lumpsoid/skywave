@@ -296,6 +296,7 @@ mod tests {
             state: BlobState::Available {
                 path: "/nowhere".into(),
             },
+            change: None,
         };
         let view = session(vec![
             message(1, "run it"),

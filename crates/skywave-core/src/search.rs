@@ -547,6 +547,7 @@ mod tests {
         BlobView {
             id: BlobId::new(),
             state,
+            change: None,
         }
     }
 

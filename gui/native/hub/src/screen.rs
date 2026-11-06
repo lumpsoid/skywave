@@ -1025,6 +1025,7 @@ mod tests {
         let kept = FullView::Blob(skywave_core::BlobView {
             id: skywave_core::BlobId::new(),
             state: skywave_core::BlobState::NotDownloaded { size: 2048 },
+            change: None,
         });
         let panel = approval_panel(&prompt(kept), &session);
         assert_eq!(panel.lost, None);
@@ -1040,6 +1041,7 @@ mod tests {
             Some(FullView::Blob(skywave_core::BlobView {
                 id: skywave_core::BlobId::new(),
                 state: skywave_core::BlobState::NotDownloaded { size: 2048 },
+                change: None,
             }))
         };
         let panel = |call_input: Option<FullView>, asked: Option<FullView>| {

@@ -17,13 +17,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use chrono::Utc;
 use skywave_core::{
-    Action, Backoff, BlobBody, BlobDownload, BlobPolicy, BlobState, BlobStatus, BoxFuture,
-    Connector, Core, EngineConfig, Entry, FullView, HttpsTransport, Jitter, Link, Screen, Seam,
-    TimelineItem, Transport, TransportConfig, TransportError, ViewState, blob_dir,
+    Action, Backoff, BlobBody, BlobChange, BlobDownload, BlobPolicy, BlobState, BlobStatus,
+    BoxFuture, Connector, Core, DeviceRef, EngineConfig, Entry, FullView, HttpsTransport, Jitter,
+    Link, Screen, Seam, Store, TimelineItem, Transport, TransportConfig, TransportError, ViewState,
+    blob_dir,
 };
 use skywave_proto::{
-    BlobId, Command, CommandResult, Event, EventBatch, EventKind, EventsQuery, Full, HelloResponse,
-    ImportedItem, Seq, SessionId,
+    BlobId, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
+    EventsQuery, Full, HelloResponse, ImportedItem, LineSpan, Seq, SessionId,
 };
 use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript, Step};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay};
@@ -349,8 +350,15 @@ impl Drop for Proxy {
 struct Spy {
     /// `from` of every blob request, in order.
     froms: Arc<Mutex<Vec<u64>>>,
+    /// The blob of every blob request, in order.
+    ids: Arc<Mutex<Vec<BlobId>>>,
     /// While `false`, blob bodies stop after their first chunk.
     flowing: Option<watch::Receiver<bool>>,
+    /// Held bodies a download let go of, by blob.
+    dropped: Arc<Mutex<Vec<BlobId>>>,
+    /// The newest transport the engine built, to send commands the core
+    /// has no action for yet.
+    transport: Arc<Mutex<Option<Arc<dyn Transport>>>>,
 }
 
 impl Spy {
@@ -365,12 +373,43 @@ impl Spy {
         self.froms.lock().unwrap().clone()
     }
 
+    fn ids(&self) -> Vec<BlobId> {
+        self.ids.lock().unwrap().clone()
+    }
+
+    fn dropped(&self) -> Vec<BlobId> {
+        self.dropped.lock().unwrap().clone()
+    }
+
+    /// Sends `kind` to the server as this client, and its answer.
+    async fn send(&self, kind: CommandKind) -> CommandResult {
+        let transport = self
+            .transport
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a transport: the client is paired");
+        transport
+            .send_command(&Command {
+                id: CommandId::new(),
+                kind,
+            })
+            .await
+            .unwrap()
+    }
+
     fn connector(&self) -> Connector {
         let spy = self.clone();
         Connector::new(move |address, identity, config, run| {
-            let inner = HttpsTransport::new(address, identity, config.clone(), run.clone())?;
+            let inner: Arc<dyn Transport> = Arc::new(HttpsTransport::new(
+                address,
+                identity,
+                config.clone(),
+                run.clone(),
+            )?);
+            *spy.transport.lock().unwrap() = Some(inner.clone());
             Ok(Arc::new(Spied {
-                inner: Arc::new(inner),
+                inner,
                 spy: spy.clone(),
             }) as Arc<dyn Transport>)
         })
@@ -404,12 +443,15 @@ impl Transport for Spied {
     fn blob(&self, id: BlobId, from: u64) -> BoxFuture<'_, Result<BlobDownload, TransportError>> {
         Box::pin(async move {
             self.spy.froms.lock().unwrap().push(from);
+            self.spy.ids.lock().unwrap().push(id);
             let mut download = self.inner.blob(id, from).await?;
             if let Some(flowing) = &self.spy.flowing {
                 download.body = Box::new(Held {
                     inner: download.body,
                     flowing: flowing.clone(),
                     chunks: 0,
+                    id,
+                    dropped: self.spy.dropped.clone(),
                 });
             }
             Ok(download)
@@ -422,6 +464,14 @@ struct Held {
     inner: Box<dyn BlobBody>,
     flowing: watch::Receiver<bool>,
     chunks: usize,
+    id: BlobId,
+    dropped: Arc<Mutex<Vec<BlobId>>>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.dropped.lock().unwrap().push(self.id);
+    }
 }
 
 impl BlobBody for Held {
@@ -530,6 +580,45 @@ impl Client {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The tool outputs as the open session shows them, in order.
+    fn shown_outputs(view: &ViewState) -> Vec<FullView> {
+        let Screen::Session(session) = &view.screen else {
+            return Vec::new();
+        };
+        session
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Logged {
+                    entry:
+                        Entry::ToolResult {
+                            output: Some(output),
+                            ..
+                        },
+                    ..
+                } => Some(output.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits until the open session shows its first tool output deleted,
+    /// and returns who it says deleted it.
+    async fn wait_tombstone(&self) -> DeviceRef {
+        let view = self
+            .wait("the tombstone", |_, view| {
+                matches!(
+                    Client::shown_outputs(view).first(),
+                    Some(FullView::Deleted { .. })
+                )
+            })
+            .await;
+        match &Client::shown_outputs(&view)[0] {
+            FullView::Deleted { by } => by.clone(),
+            _ => unreachable!(),
+        }
     }
 
     fn status(&self, id: BlobId) -> BlobStatus {
@@ -914,5 +1003,263 @@ async fn restart_resumes_from_the_recorded_progress_not_the_file_length() {
     assert!(
         std::fs::read(path).unwrap() == output.as_bytes(),
         "the blob is the tool's output, without the zeros"
+    );
+}
+
+// ---- server deletes and crops ---------------------------------------------------
+
+/// `output` cropped to `keep`, as the server makes it.
+fn cropped(output: &[u8], keep: &[LineSpan]) -> Vec<u8> {
+    let mut out = Vec::new();
+    skywave_proto::crop::crop(output, &mut out, keep).unwrap();
+    out
+}
+
+fn line_count(output: &[u8]) -> u32 {
+    u32::try_from(skywave_proto::crop::count(output).unwrap()).unwrap()
+}
+
+/// Waits until the open session holds the whole log, then shows it.
+async fn open_at_head(daemon: &Daemon, client: &Client, session: SessionId) {
+    let head = daemon.head();
+    client
+        .wait("the whole log", |c, _| c.seam.cursor().unwrap() >= head)
+        .await;
+    client.core.dispatch(Action::OpenSession(session)).unwrap();
+}
+
+/// A server delete purges the copy of every device, the one that decided
+/// it and another alike, and leaves the tombstone; a device that never
+/// fetched it shows the same and has nothing to download. A fresh device
+/// pulling the whole log, and a replica reset, fold to the same view.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_delete_purges_every_copy_and_leaves_the_tombstone() {
+    let output = big_output(200 * 1024, 7);
+    let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+    let proxy = Proxy::start(daemon.addr).await;
+    let dirs: Vec<TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let spies: Vec<Spy> = (0..4).map(|_| Spy::default()).collect();
+    let (mine, theirs, never) = (
+        Client::open(dirs[0].path(), &spies[0]),
+        Client::open(dirs[1].path(), &spies[1]),
+        Client::open(dirs[2].path(), &spies[2]),
+    );
+    for client in [&mine, &theirs, &never] {
+        daemon.pair(client, &proxy).await;
+    }
+    let session = daemon.session_with_turn(&mine).await;
+    for client in [&mine, &theirs, &never] {
+        open_at_head(&daemon, client, session).await;
+    }
+    let view = never
+        .wait("the tool output", |_, view| {
+            Client::shown_blobs(view).len() == 1
+        })
+        .await;
+    let id = Client::shown_blobs(&view)[0].0;
+    let mut copies = Vec::new();
+    for client in [&mine, &theirs] {
+        client.core.dispatch(Action::DownloadBlob(id)).unwrap();
+        copies.push(client.wait_available(0).await);
+    }
+
+    assert!(matches!(
+        spies[0].send(CommandKind::DeleteBlob { blob: id }).await,
+        CommandResult::Accepted { .. }
+    ));
+    for (client, me) in [(&mine, true), (&theirs, false), (&never, false)] {
+        assert_eq!(client.wait_tombstone().await.me, me);
+        assert!(client.seam.blob(id).unwrap().is_none(), "the row is gone");
+    }
+    for copy in &copies {
+        assert!(!copy.exists(), "{copy:?} is gone");
+    }
+    // Nothing to download: the view offers no blob.
+    assert_eq!(Client::shown_outputs(&never.core.view())[0].blob(), None);
+    assert_eq!(spies[0].ids(), [id]);
+    assert_eq!(spies[1].ids(), [id]);
+
+    // A device paired since pulls the whole log and shows the same.
+    let fresh = Client::open(dirs[3].path(), &spies[3]);
+    daemon.pair(&fresh, &proxy).await;
+    open_at_head(&daemon, &fresh, session).await;
+    assert!(!fresh.wait_tombstone().await.me);
+
+    // So does a replica reset, pulling it all again.
+    never.stop();
+    Store::reset_replica(dirs[2].path()).unwrap();
+    let never = Client::open(dirs[2].path(), &spies[2]);
+    open_at_head(&daemon, &never, session).await;
+    assert!(!never.wait_tombstone().await.me);
+    assert!(spies[2].ids().is_empty(), "it never fetched it");
+}
+
+/// A crop arriving mid-download stops the download at its next report
+/// (the lease), without a retry and leaving no file; the session then shows
+/// the cropped blob, not downloaded, with what the crop kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_mid_download_stops_it_and_shows_the_cropped_blob() {
+    let output = big_output(1024 * 1024, 8);
+    let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+    let proxy = Proxy::start(daemon.addr).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (flowing, held) = watch::channel(false);
+    let spy = Spy::holding(held);
+    let client = Client::open(dir.path(), &spy);
+    daemon.pair(&client, &proxy).await;
+    let session = daemon.session_with_turn(&client).await;
+    client.core.dispatch(Action::OpenSession(session)).unwrap();
+    let view = client
+        .wait("the tool output", |_, view| {
+            Client::shown_blobs(view).len() == 1
+        })
+        .await;
+    let id = Client::shown_blobs(&view)[0].0;
+    client.core.dispatch(Action::DownloadBlob(id)).unwrap();
+    client
+        .wait(
+            "progress recorded",
+            |c, _| matches!(c.status(id), BlobStatus::Downloading { got, .. } if got > 0),
+        )
+        .await;
+
+    let keep = [LineSpan { first: 3, count: 4 }];
+    assert!(matches!(
+        spy.send(CommandKind::CropBlob {
+            blob: id,
+            keep: keep.to_vec(),
+        })
+        .await,
+        CommandResult::Accepted { .. }
+    ));
+    let expected = cropped(output.as_bytes(), &keep);
+    let view = client
+        .wait("the cropped blob", |_, view| {
+            matches!(
+                Client::shown_outputs(view).first(),
+                Some(FullView::Blob(blob)) if blob.id != id
+            )
+        })
+        .await;
+    let FullView::Blob(shown) = &Client::shown_outputs(&view)[0] else {
+        unreachable!()
+    };
+    assert_eq!(
+        shown.state,
+        BlobState::NotDownloaded {
+            size: expected.len() as u64
+        }
+    );
+    let Some(BlobChange::Cropped { kept, of, by }) = &shown.change else {
+        panic!("expected the crop: {shown:?}");
+    };
+    assert_eq!(
+        (*kept, *of, by.me),
+        (4, line_count(output.as_bytes()), true)
+    );
+    assert!(client.seam.blob(id).unwrap().is_none(), "the row is gone");
+    assert!(
+        !part_file(dir.path(), id).exists(),
+        "the partial file is gone"
+    );
+
+    // The stalled body goes on; the download's next report finds the blob
+    // purged and lets go.
+    flowing.send_replace(true);
+    tokio::time::timeout(SOON, async {
+        while !spy.dropped().contains(&id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the download to let go");
+    // Asked for, the cropped blob downloads: the server's crop, byte for
+    // byte, and nothing of the old one was fetched again.
+    let into = shown.id;
+    client.core.dispatch(Action::DownloadBlob(into)).unwrap();
+    let path = client.wait_available(0).await;
+    assert_eq!(std::fs::read(path).unwrap(), expected);
+    assert_eq!(spy.ids(), [id, into]);
+    assert!(!part_file(dir.path(), id).exists());
+    assert!(!blob_dir(dir.path()).join(id.0.to_string()).exists());
+}
+
+/// Under `Eager`, a fresh device pulling a crop of a crop in one batch
+/// registers and purges the original and the middle blob in that batch, so
+/// it queues and fetches only the last; the note counts what that crop
+/// kept of the original's lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_eager_device_fetches_only_what_a_crop_of_a_crop_left() {
+    let output = big_output(64 * 1024, 9);
+    let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+    let proxy = Proxy::start(daemon.addr).await;
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let (spy, eager_spy) = (Spy::default(), Spy::default());
+    let client = Client::open(dirs[0].path(), &spy);
+    daemon.pair(&client, &proxy).await;
+    let session = daemon.session_with_turn(&client).await;
+    let original = daemon
+        .events()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolResult(result) => result.output.as_ref().and_then(Full::blob).cloned(),
+            _ => None,
+        })
+        .expect("the tool output is a blob");
+    let (first, second) = (
+        [LineSpan {
+            first: 0,
+            count: 20,
+        }],
+        [LineSpan { first: 5, count: 2 }],
+    );
+    assert!(matches!(
+        spy.send(CommandKind::CropBlob {
+            blob: original.id,
+            keep: first.to_vec(),
+        })
+        .await,
+        CommandResult::Accepted { .. }
+    ));
+    let middle = daemon
+        .events()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::BlobCropped { into, .. } => Some(into.id),
+            _ => None,
+        })
+        .expect("the first crop");
+    assert!(matches!(
+        spy.send(CommandKind::CropBlob {
+            blob: middle,
+            keep: second.to_vec(),
+        })
+        .await,
+        CommandResult::Accepted { .. }
+    ));
+
+    let eager = Client::open(dirs[1].path(), &eager_spy);
+    eager
+        .core
+        .dispatch(Action::SetBlobPolicy(BlobPolicy::Eager))
+        .unwrap();
+    daemon.pair(&eager, &proxy).await;
+    open_at_head(&daemon, &eager, session).await;
+    let path = eager.wait_available(0).await;
+    let view = eager.core.view();
+    let FullView::Blob(shown) = &Client::shown_outputs(&view)[0] else {
+        unreachable!()
+    };
+    let expected = cropped(&cropped(output.as_bytes(), &first), &second);
+    assert_eq!(std::fs::read(path).unwrap(), expected);
+    assert_eq!(eager_spy.ids(), [shown.id], "only the last crop is fetched");
+    assert!(eager.seam.blob(original.id).unwrap().is_none());
+    assert!(eager.seam.blob(middle).unwrap().is_none());
+    let Some(BlobChange::Cropped { kept, of, by }) = &shown.change else {
+        panic!("expected the crop: {shown:?}");
+    };
+    assert_eq!(
+        (*kept, *of, by.me),
+        (2, line_count(output.as_bytes()), false)
     );
 }

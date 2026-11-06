@@ -802,6 +802,33 @@ logs) an event that no longer decodes rather than failing.
   requests to the engine under the state lock, in the order of the changes
   that made them, so a purge never overtakes a later request for the same
   id.
+
+  A server delete or crop reaches every replica as the log's `BlobDeleted`
+  or `BlobCropped`, whoever decided it. `apply_batch` keeps the blob's
+  fate (`blob_fates`, a `BlobFate` by blob id: who deleted it, or the
+  crop's `into`, kept spans and the old line count) and purges the old
+  blob's row in the same transaction, whatever its state: its content is
+  gone from the server, so a download of it could not finish, and the
+  fate says what to show. A crop's `into` registers like any referenced
+  blob; a blob with a fate never registers again (so its lease is never
+  needed to tell a new row apart). `Applied::purged` names the purged
+  blobs, and the seam handles them as a workdir refresh does: leases
+  bumped, files (complete and `.part`) removed, `Request::BlobsPurged`
+  sent; a download holding one stops at its next report.
+  `Applied::blobs`, the eager queue's input, leaves out what the same
+  batch purged: a crop of a crop pulled in one batch registers and
+  purges the middle blob there. The model folds the same fates from the
+  batch, so it agrees with the store (and with the store after a
+  resync). Fates go with the events (a reset) and with their session's
+  local delete. The views resolve an event's blob through the fates, a
+  crop of a crop step by step: deleted at any step is
+  `FullView::Deleted { by }` (no blob, nothing to download); cropped is
+  the last crop's blob with `BlobView::change = Cropped { kept, of, by }`,
+  `kept` the lines the last crop kept, `of` the original's line count
+  (the first crop's `lines`; every crop keeps lines of the original) and
+  `by` the last crop's device. A shell run's `output` resolves the same
+  (`ShellRun::output: Option<FullView>`). A device holding the old blob
+  purges it too, and downloads `into` like any blob.
 - **Imported history** (D37): an adopted session's `Imported` events are
   records. They are not activity (the session's `last_seq` and
   `last_activity` stay at its creation, so a read mark stops before them),
@@ -941,6 +968,8 @@ enum BlobState {
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
+| `FullView::Deleted { by }` | The preview, and under it "Deleted by <device>" (`sections::deleted_note`); no download action. |
+| Blob with `change: Cropped` | Its state as any blob's, and beside it "Cropped by <device>: kept K of M lines" (`sections::change_note`). Every count of lines left out ("+N lines", "N earlier lines") counts the K kept lines, not the original's M (`sections::whole_lines`, `output::output_lines`). |
 
 ## Flutter head
 

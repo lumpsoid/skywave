@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, ImportedItem, Seq,
-    SessionId, SessionOrigin, SessionState, TurnUsage,
+    AgentSettings, AgentWork, ApprovalId, BlobId, BlobRef, ContextId, DeviceId, Event, EventKind,
+    ImportedItem, LineSpan, Seq, SessionId, SessionOrigin, SessionState, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -409,6 +409,53 @@ pub fn is_notable(kind: &EventKind) -> bool {
 /// policy that fetches everything fetches imported history too.
 pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
     kind.blobs().map(|(_, blob)| blob)
+}
+
+/// What the server did to a blob's content, as its `BlobDeleted` or
+/// `BlobCropped` says. Every replica keeps it by the blob it names, so an
+/// event's `BlobRef` resolves through it to what is left: nothing, or the
+/// cropped blob (which may have a fate of its own: a crop of a crop).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BlobFate {
+    Deleted {
+        by: DeviceId,
+    },
+    Cropped {
+        /// The blob holding what was kept.
+        into: BlobRef,
+        /// The line spans kept, as the command sent them.
+        kept: Vec<LineSpan>,
+        /// The line count of the cropped blob.
+        lines: u32,
+        by: DeviceId,
+    },
+}
+
+impl BlobFate {
+    /// The blob `kind` decides the fate of, with that fate.
+    pub(crate) fn of(kind: &EventKind) -> Option<(BlobId, BlobFate)> {
+        match kind {
+            EventKind::BlobDeleted { blob, by, .. } => Some((*blob, BlobFate::Deleted { by: *by })),
+            EventKind::BlobCropped {
+                blob,
+                into,
+                kept,
+                lines,
+                by,
+                ..
+            } => Some((
+                *blob,
+                BlobFate::Cropped {
+                    into: into.clone(),
+                    kept: kept.clone(),
+                    lines: *lines,
+                    by: *by,
+                },
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

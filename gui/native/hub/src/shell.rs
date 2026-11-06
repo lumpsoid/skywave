@@ -8,13 +8,14 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use skywave_core::{
-    Action, BlobId, BlobState, CommandId, RunWhen, SessionView, ShellEnd, ShellRun, ShellRunState,
+    Action, BlobId, BlobState, CommandId, FullView, RunWhen, SessionView, ShellEnd, ShellRun,
+    ShellRunState,
 };
 use skywave_present::format::{
     outgoing_label, queued_label, shell_end_label, shell_prompt, shell_took, when_marker,
 };
 use skywave_present::output::{
-    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_text, whole_output,
+    OUTPUT_SHOW_BYTES, WholeOutput, lines_before, output_lines, output_text, whole_output,
 };
 
 use crate::signals::{ShellPromptView, ShellRunKind, ShellRunRow, ShellUpdate};
@@ -88,7 +89,7 @@ fn whole(run: &ShellRun, outputs: &mut Outputs) -> (Option<String>, Option<Strin
         WholeOutput::Here(text) => (Some(clean_text(text)), None),
         WholeOutput::Partial { text, note } => (
             Some(clean_text(text)),
-            Some(earlier(text, Some(note)).unwrap_or_else(|| note.to_owned())),
+            Some(earlier(text, Some(&note)).unwrap_or_else(|| note.into_owned())),
         ),
         WholeOutput::Blob(blob) => match &blob.state {
             BlobState::Available { path } => match outputs.get(blob.id, path) {
@@ -109,7 +110,8 @@ pub fn output_fetch(view: &SessionView, run: CommandId) -> Option<Action> {
         .iter()
         .find(|r| r.run == run)?
         .output
-        .as_ref()?;
+        .as_ref()?
+        .blob()?;
     matches!(
         blob.state,
         BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
@@ -132,8 +134,8 @@ fn row(run: &ShellRun, now: DateTime<Utc>) -> ShellRunRow {
         state_label,
         by_label: (!run.by.me).then(|| format!("by {}", clean_line(&run.by.label()))),
         tail: clean_text(&run.tail_or_preview),
-        lines: run.lines,
-        output: run.output.as_ref().map(blob_facts),
+        lines: output_lines(run),
+        output: run.output.as_ref().and_then(FullView::blob).map(blob_facts),
         truncated: run.truncated,
         expanded: false,
         whole: None,
