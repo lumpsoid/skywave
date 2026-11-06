@@ -7,6 +7,7 @@
 //! [`ViewState`] is a pure function of the model.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use skywave_proto::{
@@ -35,16 +36,17 @@ use crate::tls;
 use crate::transport::TransportError;
 use crate::view::{
     AgentSetting, AgentView, Answer, ApprovalId, ApprovalPrompt, ApprovalStatus, Attention,
-    BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobView, BodyView, CallId,
-    ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, Decision,
-    Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo, FailReason, FileBody,
-    FileChange, FileResult, FullView, ImportedEntry, Link, LinkRejection, ListKind, ModelChoice,
-    Outgoing, PairedInfo, PairingStatus, PairingView, PendingApprovalRef, PendingSession, RunWhen,
-    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow,
-    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
-    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
-    TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState,
-    WorkdirBody, WorkdirPane, WorkdirView,
+    BlobChange, BlobCommand, BlobId, BlobPending, BlobState, BlobUse, BlobView, BodyView, CallId,
+    ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
+    CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
+    FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
+    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
+    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
+    StorageReport, StorageView, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval,
+    ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
+    WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -101,6 +103,39 @@ enum Place {
     Session(SessionId),
     /// The session's workdir, on [`Model::workdir_pane`].
     Workdir(SessionId),
+    /// The crop page, [`Model::crop`].
+    Crop,
+}
+
+/// The crop page ([`Action::OpenCrop`]), kept while it is on screen.
+#[derive(Debug, Clone, PartialEq)]
+struct CropPage {
+    blob: BlobId,
+    session: SessionId,
+    holds: BlobUse,
+    title: String,
+    /// Where back returns to.
+    from: CropFrom,
+    keep: Vec<LineSpan>,
+    lines: LineCount,
+}
+
+/// Where the crop page was opened from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropFrom {
+    Session(SessionId),
+    Storage,
+}
+
+/// Where the count of the crop page's lines stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineCount {
+    /// Not asked: the blob is not held yet.
+    Unasked,
+    /// [`Request::CountLines`] `req` is on its way.
+    Asked(u64),
+    Counted(u32),
+    Failed(String),
 }
 
 impl From<Route> for Place {
@@ -230,6 +265,11 @@ pub(crate) struct Model {
     /// The last directory the workdir screen showed, where its files pane
     /// opens; reset by [`Action::OpenWorkdir`].
     last_dir: String,
+    /// The crop page, shown while [`Model::place`] is [`Place::Crop`].
+    crop: Option<CropPage>,
+    /// Id of the latest [`Request::CountLines`]; never reused, so the
+    /// count of a page since closed or reopened is dropped.
+    count_req: u64,
 }
 
 impl Model {
@@ -280,6 +320,8 @@ impl Model {
             workdirs: Workdirs::default(),
             workdir_pane: WorkdirPane::Changes,
             last_dir: String::new(),
+            crop: None,
+            count_req: 0,
         };
         // An approval pending at start that no process alerted on yet (one
         // that came in during a catch-up cut short) alerts once online.
@@ -716,6 +758,49 @@ impl Model {
             // a delete or crop another device sent.
             Action::DeleteBlob(blob) => self.enqueue(CommandKind::DeleteBlob { blob }),
             Action::CropBlob { blob, keep } => self.enqueue(CommandKind::CropBlob { blob, keep }),
+            Action::OpenCrop {
+                blob,
+                session,
+                holds,
+                title,
+            } => {
+                if self.device().is_none() {
+                    return Vec::new();
+                }
+                let from = match self.place {
+                    Place::Storage => CropFrom::Storage,
+                    Place::Session(id) => CropFrom::Session(id),
+                    // Reopened over itself, it keeps where back goes.
+                    Place::Crop => match &self.crop {
+                        Some(page) => page.from,
+                        None => CropFrom::Session(session),
+                    },
+                    _ => CropFrom::Session(session),
+                };
+                self.place = Place::Crop;
+                self.open = None;
+                self.viewing = None;
+                self.subagent = None;
+                self.completer.end();
+                self.conversations.end();
+                self.crop = Some(CropPage {
+                    blob,
+                    session,
+                    holds,
+                    title,
+                    from,
+                    keep: Vec::new(),
+                    lines: LineCount::Unasked,
+                });
+                // Its count, once held, is asked by `count_wanted`.
+                Vec::new()
+            }
+            Action::SetCropKeep(keep) => {
+                if let Some(page) = self.crop.as_mut().filter(|_| self.place == Place::Crop) {
+                    page.keep = keep;
+                }
+                Vec::new()
+            }
             Action::SetBlobPolicy(policy) => {
                 if self.settings.blob_policy == policy {
                     return Vec::new();
@@ -830,6 +915,14 @@ impl Model {
                     WorkdirPane::Dir { path } if !path.is_empty() => up(path),
                     WorkdirPane::Diff { .. } => Action::ShowWorkdir(WorkdirPane::Changes),
                     WorkdirPane::Changes | WorkdirPane::Dir { .. } => Action::OpenSession(id),
+                });
+            }
+            Place::Crop => {
+                return Some(match self.crop.as_ref()?.from {
+                    CropFrom::Session(id) if self.summary(id).is_some() => Action::OpenSession(id),
+                    CropFrom::Session(_) => Action::Navigate(Route::SessionList),
+                    // Asked again: the crop may have changed it.
+                    CropFrom::Storage => Action::Navigate(Route::Storage),
                 });
             }
         };
@@ -1794,7 +1887,92 @@ impl Model {
                 Some(view) => Screen::Workdir(view),
                 None => Screen::SessionList(self.session_list(ListKind::Active)),
             },
+            Place::Crop => match self.crop_view() {
+                Some(view) => Screen::Crop(view),
+                None => Screen::SessionList(self.session_list(ListKind::Active)),
+            },
         }
+    }
+
+    /// The crop page's blob file, if this device holds its bytes now and
+    /// the blob is still the current one (no fate since).
+    fn crop_path(&self, page: &CropPage) -> Option<&PathBuf> {
+        if self.fates.contains_key(&page.blob) {
+            return None;
+        }
+        match &self.blobs.get(&page.blob)?.status {
+            BlobStatus::Available { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn crop_view(&self) -> Option<CropView> {
+        let page = self.crop.as_ref()?;
+        let content = match (self.crop_path(page), &page.lines) {
+            _ if self.fates.contains_key(&page.blob) => CropContent::Gone,
+            (Some(path), LineCount::Counted(lines)) => CropContent::Ready {
+                path: path.clone(),
+                lines: *lines,
+            },
+            (Some(_), LineCount::Failed(reason)) => CropContent::Unreadable {
+                reason: reason.clone(),
+            },
+            (Some(_), LineCount::Unasked | LineCount::Asked(_)) => CropContent::Counting,
+            (None, _) => match self.blobs.get(&page.blob) {
+                Some(record) => CropContent::NotHere(
+                    self.blob_view(&BlobRef {
+                        id: record.id,
+                        size: record.size,
+                        sha256: record.sha256,
+                    })
+                    .state,
+                ),
+                None => CropContent::Gone,
+            },
+        };
+        Some(CropView {
+            blob: page.blob,
+            session: page.session,
+            holds: page.holds,
+            title: page.title.clone(),
+            content,
+            keep: page.keep.clone(),
+            pending: self.blob_pending(page.blob),
+        })
+    }
+
+    /// The count of the crop page's lines, if it is on screen, holds its
+    /// blob and has not asked yet: asked once per page.
+    pub(crate) fn count_wanted(&mut self) -> Option<Request> {
+        if self.place != Place::Crop || self.device().is_none() {
+            return None;
+        }
+        let page = self.crop.as_ref()?;
+        if page.lines != LineCount::Unasked {
+            return None;
+        }
+        let path = self.crop_path(page)?.clone();
+        self.count_req += 1;
+        let req = self.count_req;
+        self.crop.as_mut()?.lines = LineCount::Asked(req);
+        Some(Request::CountLines { req, path })
+    }
+
+    /// The answer to [`Request::CountLines`] `req`; any but the one the
+    /// page waits on is ignored.
+    pub(crate) fn lines_counted(&mut self, req: u64, result: std::io::Result<u64>) {
+        let Some(page) = self
+            .crop
+            .as_mut()
+            .filter(|page| page.lines == LineCount::Asked(req))
+        else {
+            return;
+        };
+        page.lines = match result.map(u32::try_from) {
+            Ok(Ok(lines)) => LineCount::Counted(lines),
+            Ok(Err(_)) => LineCount::Failed("too many lines".to_owned()),
+            Err(error) => LineCount::Failed(error.to_string()),
+        };
     }
 
     fn workdir_view(&self, id: SessionId) -> Option<WorkdirView> {
@@ -8633,6 +8811,7 @@ mod tests {
             Screen::Usage(_) => "usage",
             Screen::Storage(_) => "storage",
             Screen::Workdir(_) => "workdir",
+            Screen::Crop(_) => "crop",
             Screen::Session(v) if v.archived => "archived session",
             Screen::Session(_) => "session",
             Screen::SessionList(l) if l.kind == ListKind::Archived => "archived list",
@@ -11087,6 +11266,201 @@ mod tests {
             answer(&mut f, req, ask, file("a", FileBody::Blob(content.clone())));
             assert!(!f.model.blobs[&output.id].workdir);
             assert!(f.model.blobs[&content.id].workdir);
+        }
+
+        mod crop {
+            use super::*;
+            use crate::view::{CropContent, CropView};
+
+            /// A tool output in the live session, opened on its crop page.
+            fn opened(live: &Live, output: &BlobRef) {
+                live.seam
+                    .apply_events(&EventBatch {
+                        from: Seq(2),
+                        events: vec![Event {
+                            session_id: live.session,
+                            at: Utc::now(),
+                            command_id: None,
+                            context: ContextId::first_of(live.session),
+                            kind: EventKind::ToolResult(ToolResult {
+                                call: None,
+                                is_error: false,
+                                status: None,
+                                preview: "out".into(),
+                                lines: 3,
+                                output: Some(Full::Blob(output.clone())),
+                            }),
+                        }],
+                    })
+                    .unwrap();
+                live.core
+                    .dispatch(Action::OpenSession(live.session))
+                    .unwrap();
+                live.core
+                    .dispatch(Action::OpenCrop {
+                        blob: output.id,
+                        session: live.session,
+                        holds: BlobUse::ToolOutput,
+                        title: "Bash ls".into(),
+                    })
+                    .unwrap();
+            }
+
+            fn page(live: &Live) -> CropView {
+                match live.core.view().screen {
+                    Screen::Crop(view) => view,
+                    other => panic!("expected the crop page, got {other:?}"),
+                }
+            }
+
+            /// Writes `content` as the blob's downloaded file.
+            fn held(live: &Live, output: &BlobRef, content: &[u8]) -> PathBuf {
+                let dir = crate::blobs::blob_dir(&live.seam.data_dir());
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join(output.id.0.to_string());
+                std::fs::write(&path, content).unwrap();
+                live.seam
+                    .blob_status(output.id, BlobStatus::Available { path: path.clone() })
+                    .unwrap();
+                path
+            }
+
+            /// The one line count the last change asked for.
+            fn count_asked(live: &Live, path: &std::path::Path) -> u64 {
+                match &live.requests()[..] {
+                    [Request::CountLines { req, path: asked }] if asked == path => *req,
+                    other => panic!("expected one line count of {path:?}, got {other:?}"),
+                }
+            }
+
+            /// Opening the page under `OnDemand` downloads nothing and says
+            /// the content isn't here; the download it offers shows its
+            /// progress there, and the content once held is counted once,
+            /// off the model, with a stale count dropped.
+            #[test]
+            fn crop_page_downloads_nothing_then_counts_what_it_downloads() {
+                let live = Live::new();
+                live.core
+                    .dispatch(Action::SetBlobPolicy(BlobPolicy::OnDemand))
+                    .unwrap();
+                let output = blob(16);
+                opened(&live, &output);
+                assert!(
+                    !live.requests().iter().any(|r| matches!(
+                        r,
+                        Request::DownloadBlob(_) | Request::CountLines { .. }
+                    )),
+                    "opening asks for nothing"
+                );
+                let shown = page(&live);
+                assert_eq!(
+                    (shown.blob, shown.session, shown.holds, shown.title.as_str()),
+                    (output.id, live.session, BlobUse::ToolOutput, "Bash ls")
+                );
+                assert_eq!(
+                    shown.content,
+                    CropContent::NotHere(BlobState::NotDownloaded { size: 16 })
+                );
+                assert!(shown.keep.is_empty());
+
+                live.core.dispatch(Action::DownloadBlob(output.id)).unwrap();
+                assert_eq!(live.requests(), [Request::DownloadBlob(output.id)]);
+                assert_eq!(
+                    page(&live).content,
+                    CropContent::NotHere(BlobState::Requested { size: 16 })
+                );
+                live.seam
+                    .blob_status(
+                        output.id,
+                        BlobStatus::Downloading {
+                            got: 4,
+                            path: live.seam.data_dir().join("part"),
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    page(&live).content,
+                    CropContent::NotHere(BlobState::Downloading {
+                        got: 4,
+                        size: 16,
+                        ..
+                    })
+                ));
+                assert!(live.requests().is_empty(), "nothing to count yet");
+
+                let content = b"one\ntwo\nthree\n";
+                let path = held(&live, &output, content);
+                let req = count_asked(&live, &path);
+                assert_eq!(page(&live).content, CropContent::Counting);
+                live.seam.lines_counted(req + 1, Ok(99));
+                assert_eq!(page(&live).content, CropContent::Counting, "a stale count");
+                let counted = skywave_proto::crop::count(std::fs::File::open(&path).unwrap());
+                live.seam.lines_counted(req, counted);
+                assert_eq!(
+                    page(&live).content,
+                    CropContent::Ready {
+                        path: path.clone(),
+                        lines: 3
+                    }
+                );
+                live.core
+                    .dispatch(Action::SetCropKeep(vec![LineSpan { first: 0, count: 1 }]))
+                    .unwrap();
+                assert!(live.requests().is_empty(), "counted once");
+                assert_eq!(page(&live).keep, [LineSpan { first: 0, count: 1 }]);
+
+                // Back to the item it was opened from.
+                live.core.dispatch(Action::Back).unwrap();
+                assert!(matches!(live.core.view().screen, Screen::Session(_)));
+            }
+
+            /// A delete from another device while the page is open leaves
+            /// nothing to crop; opened from the storage screen, back
+            /// returns there.
+            #[test]
+            fn crop_page_is_gone_once_its_blob_is_deleted_elsewhere() {
+                let live = Live::new();
+                let output = blob(16);
+                opened(&live, &output);
+                // `opened` passes through the session; open from storage.
+                live.core
+                    .dispatch(Action::Navigate(Route::Storage))
+                    .unwrap();
+                live.core
+                    .dispatch(Action::OpenCrop {
+                        blob: output.id,
+                        session: live.session,
+                        holds: BlobUse::ToolOutput,
+                        title: "Bash ls".into(),
+                    })
+                    .unwrap();
+                live.requests();
+                let path = held(&live, &output, b"a\nb");
+                let req = count_asked(&live, &path);
+                live.seam.lines_counted(req, Ok(2));
+                assert_eq!(page(&live).content, CropContent::Ready { path, lines: 2 });
+
+                live.seam
+                    .apply_events(&EventBatch {
+                        from: Seq(3),
+                        events: vec![Event {
+                            session_id: live.session,
+                            at: Utc::now(),
+                            command_id: None,
+                            context: ContextId::first_of(live.session),
+                            kind: EventKind::BlobDeleted {
+                                blob: output.id,
+                                holds: BlobUse::ToolOutput,
+                                by: DeviceId::new(),
+                            },
+                        }],
+                    })
+                    .unwrap();
+                assert_eq!(page(&live).content, CropContent::Gone);
+
+                live.core.dispatch(Action::Back).unwrap();
+                assert!(matches!(live.core.view().screen, Screen::Storage(_)));
+            }
         }
     }
 }

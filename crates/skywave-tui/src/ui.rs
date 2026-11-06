@@ -92,6 +92,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
             Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
+            Screen::Crop(_) => frame.render_widget(Paragraph::new("crop"), body),
         }
     }
 
@@ -917,6 +918,7 @@ fn footer_keys(app: &App) -> &'static str {
                 "↑↓ PgUp/PgDn scroll · d download · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
             }
         },
+        Screen::Crop(_) => "Esc back · ? help · q quit",
     }
 }
 
@@ -1246,6 +1248,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  Read on request only and kept here, so what was read shows"),
             Line::from("  offline, with when it was taken. Nothing here changes files."),
         ]),
+        Screen::Crop(_) => lines.extend([section("Crop"), key("Esc", "back")]),
     }
     lines
 }

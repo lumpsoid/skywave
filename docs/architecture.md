@@ -941,6 +941,25 @@ logs) an event that no longer decodes rather than failing.
   `StorageView.pending` carry it as a `BlobPending` (command id, kind,
   delivery, `discardable`), so a head can take it back with `Discard`,
   after which the offers return.
+- **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
+  `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
+  run's output to keep. The head opening it names the blob as `CropBlob`
+  will (a view's current blob) with its session, what it holds and the
+  title to show; back returns to the session on screen, or to the storage
+  screen (asked again) if it was opened there. Opening downloads nothing:
+  `CropContent::NotHere(BlobState)` offers `DownloadBlob` and shows its
+  progress. Once the blob is held the core asks `Request::CountLines`
+  once (checked after every core update, so a download, a local crop or
+  opening the page all lead to it); the engine runs `crop::count` on a
+  blocking task and answers `Seam::lines_counted`, a stale `req` dropped.
+  Meanwhile the page is `Counting`, then `Ready { path, lines }` (or
+  `Unreadable` if the file could not be read). A fate for the blob, or
+  its purge, makes it `Gone`. The selection is `SetCropKeep`, stored as
+  given; `skywave_present::crop` normalises it, offers presets (first,
+  last, first and last 50/200/1000) and says when the crop may be sent.
+  The view holds no content: heads read the lines they show from `path`
+  through `LineIndex`, numbered as a crop numbers them, and strip each
+  line by itself (an OSC string can swallow a `\n`).
 
 ## Testing
 
@@ -997,6 +1016,14 @@ enum BlobState {
     Failed { size: u64, reason: String },            // given up; asking again retries
     Available { path: PathBuf },
 }
+
+enum CropContent {
+    NotHere(BlobState),                // not on this device; opening downloads nothing
+    Counting,                          // held; its lines are being counted
+    Ready { path: PathBuf, lines: u32 },
+    Unreadable { reason: String },     // held, but its file could not be read
+    Gone,                              // deleted or cropped meanwhile, or purged
+}
 ```
 
 | Situation | Presentation |
@@ -1013,6 +1040,7 @@ enum BlobState {
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
 | `FullView::Deleted { by }` | The preview, and under it "Deleted by <device>" (`sections::deleted_note`); no download action. |
 | Blob with `change: Cropped` | Its state as any blob's, and beside it "Cropped by <device>: kept K of M lines" (`sections::change_note`). Every count of lines left out ("+N lines", "N earlier lines") counts the K kept lines, not the original's M (`sections::whole_lines`, `output::output_lines`). |
+| Crop page `NotHere` / `Counting` / `Ready` / `Gone` | Not here: says the output isn't on this device, with its size and one Download action, then the blob's progress or failure. Counting: a counting note. Ready: the lines from `LineIndex`, presets, "keeps K of M lines", and Crop only while `crop::crop_enabled`, after `crop_confirmation`. Gone: nothing to crop, back only. |
 
 ## Flutter head
 

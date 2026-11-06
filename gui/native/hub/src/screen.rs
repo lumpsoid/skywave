@@ -92,6 +92,17 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
+        // The GUI opens no crop page yet: its own screen comes with the
+        // page. Until then an empty storage screen stands in for it.
+        Screen::Crop(_) => storage_view(
+            &StorageView {
+                status: skywave_core::StorageStatus::Loading,
+                report: None,
+                titles: Default::default(),
+                pending: Default::default(),
+            },
+            ui.storage,
+        ),
     };
     ScreenUpdate {
         screen,
