@@ -457,6 +457,23 @@ fn all_event_kinds() -> Vec<EventKind> {
         holds: BlobUse::ShellOutput,
         by: device(),
     }])
+    .chain([EventKind::BlobCropped {
+        blob: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00b1).into(),
+        holds: BlobUse::ToolOutput,
+        into: blob(),
+        kept: vec![
+            LineSpan {
+                first: 0,
+                count: 10,
+            },
+            LineSpan {
+                first: 2990,
+                count: 10,
+            },
+        ],
+        lines: 3000,
+        by: device(),
+    }])
     .collect()
 }
 
@@ -729,6 +746,10 @@ fn all_command_kinds() -> Vec<CommandKind> {
             run: command(),
         },
         CommandKind::DeleteBlob { blob: blob_id() },
+        CommandKind::CropBlob {
+            blob: blob_id(),
+            keep: vec![LineSpan { first: 4, count: 2 }],
+        },
     ]
 }
 
@@ -763,6 +784,8 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ServerStopping,
             RejectReason::UnknownBlob,
             RejectReason::BlobGone,
+            RejectReason::NotCroppable,
+            RejectReason::BadCrop,
         ]
         .map(|reason| CommandResult::Rejected { reason }),
     );

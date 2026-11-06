@@ -455,7 +455,7 @@ fn each_accepted_command_logs_one_event_naming_it() {
     let before = f.log.head();
     let result = f
         .log
-        .handle_with(&mut f.storage.db, device, &adopt, Some(prepared))
+        .handle_with(&mut f.storage.db, device, &adopt, Some(prepared.into()))
         .unwrap();
     let seq = accepted(result);
     assert_eq!(
@@ -976,7 +976,7 @@ fn a_prepared_import_not_logged_leaves_no_blob() {
     assert_eq!(f.blobs(), (1, 0), "written, not recorded");
     let again = f
         .log
-        .handle_with(&mut f.storage.db, device, &answered, Some(prepared))
+        .handle_with(&mut f.storage.db, device, &answered, Some(prepared.into()))
         .unwrap();
     assert_eq!(again, result);
     assert_eq!(f.log.head(), head);
@@ -987,7 +987,7 @@ fn a_prepared_import_not_logged_leaves_no_blob() {
     let prepared = f.prepare_import(two_items());
     assert_eq!(
         f.log
-            .handle_with(&mut f.storage.db, device, &missing, Some(prepared))
+            .handle_with(&mut f.storage.db, device, &missing, Some(prepared.into()))
             .unwrap(),
         rejected(RejectReason::WorkdirNotFound)
     );
@@ -1000,7 +1000,7 @@ fn a_prepared_import_not_logged_leaves_no_blob() {
     let prepared = f.prepare_import(two_items());
     let seq = accepted(
         f.log
-            .handle_with(&mut f.storage.db, device, &moved, Some(prepared))
+            .handle_with(&mut f.storage.db, device, &moved, Some(prepared.into()))
             .unwrap(),
     );
     assert_eq!(seq, Seq(head.0 + 2), "the session, then its ImportFinished");
@@ -1020,7 +1020,7 @@ fn a_prepared_import_not_logged_leaves_no_blob() {
     let refused = Prepared::workdir_refused(f.storage.blobs.clone());
     accepted(
         f.log
-            .handle_with(&mut f.storage.db, device, &appeared, Some(refused))
+            .handle_with(&mut f.storage.db, device, &appeared, Some(refused.into()))
             .unwrap(),
     );
     assert_eq!(
@@ -1036,7 +1036,12 @@ fn a_prepared_import_not_logged_leaves_no_blob() {
     let prepared = f.prepare_import(two_items());
     let seq = accepted(
         f.log
-            .handle_with(&mut f.storage.db, device, &adopt(&project), Some(prepared))
+            .handle_with(
+                &mut f.storage.db,
+                device,
+                &adopt(&project),
+                Some(prepared.into()),
+            )
             .unwrap(),
     );
     assert_eq!(

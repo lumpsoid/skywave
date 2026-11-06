@@ -212,7 +212,9 @@ pub fn reject_reason(reason: RejectReason) -> &'static str {
             "the server is stopping once its running work ends; send it again after"
         }
         RejectReason::UnknownBlob => "the server keeps no such content",
-        RejectReason::BlobGone => "that content was already deleted",
+        RejectReason::BlobGone => "that content was already deleted or cropped",
+        RejectReason::NotCroppable => "only tool and shell output can be cropped",
+        RejectReason::BadCrop => "the kept lines do not fit that content",
     }
 }
 

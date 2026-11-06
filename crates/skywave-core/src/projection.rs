@@ -176,7 +176,8 @@ impl SessionSummary {
     /// tasks or schedules only the agent's work, a context cleared or
     /// switched only the current context, and the models an agent offers
     /// or a context moved away nothing here, imported history only an unset
-    /// `first_prompt`, a deleted blob nothing here: none is activity, so
+    /// `first_prompt`, a deleted or cropped blob nothing here: none is
+    /// activity, so
     /// they move
     /// neither `last_seq` nor `last_activity` and the session keeps its
     /// place in the list.
@@ -213,7 +214,8 @@ impl SessionSummary {
             | EventKind::ShellStarted { .. }
             | EventKind::ShellOutput { .. }
             | EventKind::ShellFinished { .. }
-            | EventKind::BlobDeleted { .. } => return,
+            | EventKind::BlobDeleted { .. }
+            | EventKind::BlobCropped { .. } => return,
             EventKind::ImportFinished { .. } => {
                 self.importing = false;
                 return;
@@ -299,7 +301,8 @@ impl SessionSummary {
             | EventKind::ShellFinished { .. }
             | EventKind::Imported { .. }
             | EventKind::ImportFinished { .. }
-            | EventKind::BlobDeleted { .. } => {}
+            | EventKind::BlobDeleted { .. }
+            | EventKind::BlobCropped { .. } => {}
         }
     }
 
@@ -395,7 +398,8 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::ShellFinished { .. }
         | EventKind::Imported { .. }
         | EventKind::ImportFinished { .. }
-        | EventKind::BlobDeleted { .. } => false,
+        | EventKind::BlobDeleted { .. }
+        | EventKind::BlobCropped { .. } => false,
     }
 }
 
@@ -627,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_blob_is_not_activity() {
+    fn a_deleted_or_cropped_blob_is_not_activity() {
         let sid = SessionId::new();
         let created = EventKind::SessionCreated {
             workdir: "/srv/app".into(),
@@ -640,8 +644,22 @@ mod tests {
             holds: skywave_proto::BlobUse::ShellOutput,
             by: DeviceId::new(),
         };
+        let cropped = EventKind::BlobCropped {
+            blob: skywave_proto::BlobId::new(),
+            holds: skywave_proto::BlobUse::ToolOutput,
+            into: skywave_proto::BlobRef {
+                id: skywave_proto::BlobId::new(),
+                size: 4,
+                sha256: skywave_proto::ContentHash::of(b"1\n3\n"),
+            },
+            kept: vec![skywave_proto::LineSpan { first: 0, count: 1 }],
+            lines: 3,
+            by: DeviceId::new(),
+        };
         assert!(!is_notable(&deleted));
+        assert!(!is_notable(&cropped));
         summary.apply(Seq(9), &event(sid, 30, deleted));
+        summary.apply(Seq(10), &event(sid, 30, cropped));
         assert_eq!(summary.last_seq, Seq(1));
         assert_eq!(
             summary.last_activity,
@@ -650,7 +668,7 @@ mod tests {
         assert_eq!(summary.notable, 0);
         // Control: activity at the same time does move them.
         summary.apply(
-            Seq(10),
+            Seq(11),
             &event(
                 sid,
                 30,
@@ -660,7 +678,7 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(summary.last_seq, Seq(10));
+        assert_eq!(summary.last_seq, Seq(11));
     }
 
     #[test]

@@ -67,6 +67,10 @@ pub enum Error {
     /// e.g. the supervisor appending a command-owned event kind.
     #[error("cannot append event: {0}")]
     InvalidAppend(String),
+    /// A command handed without the preparation it needs
+    /// (`EventLog::handle_with`), e.g. a `CropBlob` without its crop.
+    #[error("{0} needs its preparation")]
+    Unprepared(&'static str),
     #[error("logging: {0}")]
     Logging(String),
     #[error("certificate: {0}")]

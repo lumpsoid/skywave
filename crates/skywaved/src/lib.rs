@@ -9,6 +9,7 @@ pub mod blobs;
 pub mod commands;
 pub mod config;
 pub mod control;
+pub mod crop;
 pub mod data_dir;
 pub mod db;
 pub mod devices;

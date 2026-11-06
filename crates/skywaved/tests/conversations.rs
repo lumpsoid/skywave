@@ -52,6 +52,8 @@ struct Fixture {
     /// The canonical workdir the fake keeps conversations for.
     workdir: String,
     outside: FakeOutside,
+    /// Opens once a request joins another's preparation.
+    joined: Gate,
     addr: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<skywaved::Result<()>>>,
@@ -86,10 +88,15 @@ impl Fixture {
         let identity =
             Arc::new(ServerIdentity::bootstrap(&storage.dir, &["localhost".into()]).unwrap());
         let log = EventLog::open(&storage.db, vec![root.clone()]).unwrap();
+        let joined = Gate::new();
         let options = ServerOptions {
             outside: Arc::new(outside.clone()),
             import_deadline,
             conversations_timeout,
+            joined_hook: Some(Arc::new({
+                let joined = joined.clone();
+                move || joined.open()
+            })),
             ..ServerOptions::default()
         };
         let server = Server::bind_with(
@@ -113,6 +120,7 @@ impl Fixture {
             log,
             workdir,
             outside,
+            joined,
             addr,
             stop: Some(stop),
             task: Some(task),
@@ -449,13 +457,14 @@ async fn a_resend_while_the_history_is_read_joins_the_first() {
         .expect("the first request reads the history");
     let sent = adopt.clone();
     let second_reply = tokio::spawn(async move { second.command(&sent).await });
-    // A resend that did not join would begin a second read at once; give
-    // it the time to (it blocks on the same gate).
-    let until = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < until && f.outside.history_calls() < 2 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(f.outside.history_calls(), 1, "the resend joined the first");
+    tokio::time::timeout(SOON, f.joined.opened())
+        .await
+        .expect("the resend joins the first");
+    assert!(
+        !second_reply.is_finished(),
+        "it waits for the first's reply"
+    );
+    assert_eq!(f.outside.history_calls(), 1);
     gate.open();
 
     let first = tokio::time::timeout(SOON, first_reply)

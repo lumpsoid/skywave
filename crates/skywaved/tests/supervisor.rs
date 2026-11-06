@@ -134,7 +134,12 @@ impl Fixture {
         };
         let seq = accepted(
             f.log
-                .handle_with(&mut f.storage.db, DeviceId::new(), &command, prepared)
+                .handle_with(
+                    &mut f.storage.db,
+                    DeviceId::new(),
+                    &command,
+                    prepared.map(Into::into),
+                )
                 .unwrap(),
         );
         f.session_id = f.log.read(&f.storage.db, Seq(seq.0 - 1), 1).unwrap().events[0].session_id;

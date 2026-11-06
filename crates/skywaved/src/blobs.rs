@@ -8,8 +8,8 @@
 //!
 //! **Deleting.** The row first, in a transaction, then the file once it
 //! commits: a workdir blob when it becomes unnamed (`workdir.rs`,
-//! "Garbage"), an event blob when a device's `DeleteBlob` deletes it
-//! (`commands.rs`). The event that referenced a deleted event blob keeps
+//! "Garbage"), an event blob when a device's `DeleteBlob` deletes it or
+//! its `CropBlob` replaces it (`commands.rs`). The event that referenced a deleted event blob keeps
 //! its preview, and its `event_blobs` row stays. At startup, before anything can be writing,
 //! [`BlobStore::sweep`] removes every `.tmp-*` file and every blob file
 //! without a row: what an interrupted write, a crash between rename and
@@ -171,16 +171,41 @@ impl BlobStore {
         Ok(removed)
     }
 
+    /// [`write`](BlobStore::write) for content a producer writes rather
+    /// than one to read: `fill` writes the new blob's content to the writer
+    /// it is handed, and the file is synced and named only if it returns
+    /// `Ok`. On any `Err`, `fill`'s or the store's own, nothing is left:
+    /// the temp file goes. Errors stay bare, so a caller can tell a full
+    /// disk (`ENOSPC`) from another failure.
+    pub fn write_with<T, E: From<io::Error>>(
+        &self,
+        fill: impl FnOnce(&mut dyn Write) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(BlobMeta, T), E> {
+        let id = BlobId::new();
+        let mut out = Hashing {
+            file: tempfile::Builder::new()
+                .prefix(".tmp-")
+                .tempfile_in(&self.dir)?,
+            hasher: Sha256::new(),
+            size: 0,
+        };
+        let value = fill(&mut out)?;
+        let (size, sha256) = self.persist(out, &self.path(id))?;
+        Ok((BlobMeta { id, size, sha256 }, value))
+    }
+
     fn write_atomically(
         &self,
         path: &Path,
         content: &mut impl Read,
     ) -> io::Result<(u64, ContentHash)> {
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".tmp-")
-            .tempfile_in(&self.dir)?;
-        let mut hasher = Sha256::new();
-        let mut size = 0u64;
+        let mut out = Hashing {
+            file: tempfile::Builder::new()
+                .prefix(".tmp-")
+                .tempfile_in(&self.dir)?,
+            hasher: Sha256::new(),
+            size: 0,
+        };
         let mut buf = [0u8; 64 * 1024];
         loop {
             let n = match content.read(&mut buf) {
@@ -189,15 +214,26 @@ impl BlobStore {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            hasher.update(&buf[..n]);
-            tmp.write_all(&buf[..n])?;
-            size += n as u64;
+            out.write_all(&buf[..n])?;
         }
-        tmp.as_file().sync_all()?;
-        tmp.persist(path).map_err(|e| e.error)?;
+        self.persist(out, path)
+    }
+
+    /// Syncs `out`'s temp file and renames it to `path`, then syncs the
+    /// directory. On any error nothing is left: the temp file goes with
+    /// `out`, and a renamed file whose directory sync failed is removed.
+    fn persist(&self, out: Hashing, path: &Path) -> io::Result<(u64, ContentHash)> {
+        out.file.as_file().sync_all()?;
+        out.file.persist(path).map_err(|e| e.error)?;
         #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
-        Ok((size, ContentHash::from_digest(hasher.finalize().into())))
+        if let Err(e) = File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        Ok((
+            out.size,
+            ContentHash::from_digest(out.hasher.finalize().into()),
+        ))
     }
 
     /// The recorded metadata of `id`, if it exists.
@@ -254,6 +290,26 @@ impl BlobStore {
             });
         }
         Ok(Some(BlobFile { meta, file }))
+    }
+}
+
+/// A new blob's temp file, hashing and counting what is written to it.
+struct Hashing {
+    file: tempfile::NamedTempFile,
+    hasher: Sha256,
+    size: u64,
+}
+
+impl Write for Hashing {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.size += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 
