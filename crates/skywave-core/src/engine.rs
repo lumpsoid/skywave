@@ -22,6 +22,8 @@
 //! - `ListConversations` lists the agent's conversations the same way,
 //!   within [`CONVERSATIONS_TIMEOUT`], and answers with
 //!   [`Seam::conversations_listed`].
+//! - `Storage` asks for the server's storage report the same way, within
+//!   [`STORAGE_TIMEOUT`], and answers with [`Seam::storage_reported`].
 //! - `Workdir` reads a session's workdir the same way, within
 //!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
@@ -134,6 +136,9 @@ pub const DIRS_TIMEOUT: Duration = Duration::from_secs(5);
 /// included: above the server's own 10 s for the scan, so its `503` (or
 /// a truncated listing) arrives before this gives up.
 pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(12);
+/// Longest a storage report may take, connecting included: above the
+/// server's own 10 s, so its `503` arrives before this gives up.
+pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Longest the link sleeps in a reconnect wait before it looks at the wall
 /// clock again. The monotonic clock stops while a device sleeps (Android's
 /// deep sleep), so after waking the attempt comes at most this long after
@@ -424,6 +429,19 @@ impl Engine {
                             .await
                             .unwrap_or(Err(TransportError::Timeout));
                     seam.conversations_listed(req, result);
+                });
+            }
+            Request::Storage { req } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    seam.storage_reported(req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a storage report", async move {
+                    let result = tokio::time::timeout(STORAGE_TIMEOUT, transport.storage_report())
+                        .await
+                        .unwrap_or(Err(TransportError::Timeout));
+                    seam.storage_reported(req, result);
                 });
             }
             Request::Workdir { req, ask } => {

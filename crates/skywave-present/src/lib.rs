@@ -33,6 +33,7 @@ pub mod link;
 pub mod output;
 pub mod policy;
 pub mod sections;
+pub mod storage;
 pub mod text;
 pub mod usage;
 pub mod utf16;

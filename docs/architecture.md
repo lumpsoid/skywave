@@ -143,6 +143,7 @@ every version.
 | `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
+| `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
 | `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
@@ -188,9 +189,9 @@ every version.
   `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations` and
   `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
-  `/v1/conversations` and `/v1/workdir/*` answer 503 when they run out of
-  time, or when 8 of their file-system reads are already running (a wait
-  of at most 0.5 s first). Each read holds its permit until its blocking
+  `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
+  they run out of time, or when 8 of their file-system reads are already
+  running (a wait of at most 0.5 s first). Each read holds its permit until its blocking
   thread returns, even after its request gave up, so reads stuck on a hung
   mount stay capped at 8 and never exhaust the blocking threads that
   authentication, commands and events need.
@@ -419,6 +420,22 @@ the daemon's appends, which would otherwise stop `serve` (below).
   as a warning in the timeline. The Claude Code adapter also starts the CLI
   with its auto-updater off (docs/agents/claude-code.md), so the version
   changes only when the operator updates it.
+- **Storage report** (`GET /v1/storage`, `crates/skywaved/src/storage.rs`):
+  sizes, never content, for an operator deciding what to remove. The
+  file sizes come from the file system (database and WAL, `shell/`, the
+  configured `log_file`), blob sizes from the `blobs` rows (workdir blobs
+  are those `workdir_blobs` names, event blobs the rest), and the free
+  space from `statvfs` as read now, recorded nowhere. A session's share is
+  its events' stored JSON plus the blobs its events reference, which the
+  `event_blobs` projection records with each append (`EventKind::blobs`:
+  blob, session, seq and what it holds). A shell run's is its
+  `ShellOutput` events (read per session through `events_session_type`)
+  plus its output: the finished run's blob or the running one's file.
+  Summing every session's events reads the whole log, so a report costs
+  the log's length: it runs on a connection of its own, one at a time,
+  in one read transaction (appends go on beside it under WAL), and SQLite
+  stops it at its 8 s deadline (a progress handler), a 503; the reply
+  gives up at 10 s. Nothing is removed or cropped here.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
@@ -796,6 +813,18 @@ logs) an event that no longer decodes rather than failing.
   by local day, session, workdir or model. A turn with no cost is unpriced,
   never $0. Archived sessions count; a session deleted from this device took
   its turns with it, and the screen says so.
+
+- **Storage screen** (`Route::Storage`): opening it asks
+  `GET /v1/storage` on the side transport within `STORAGE_TIMEOUT` (12 s,
+  above the server's 10 s), and `RefreshStorage` asks again.
+  `StorageView` shows `Loading`, `Ready` or `Unavailable(Offline |
+  Failed)`, the latest report (a failed refresh keeps the one before) and
+  the replica's title for each session it names; a session missing there
+  is not on this device. Only the latest request's answer is kept;
+  offline nothing is asked. Nothing is stored: opening the screen drops
+  the last report and asks again. `skywave_present::storage` words the
+  totals and the three lists (by session, largest blobs, shell runs) for
+  both heads.
 
 ## Testing
 

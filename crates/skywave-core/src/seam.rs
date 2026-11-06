@@ -15,6 +15,7 @@ use std::sync::mpsc::Receiver;
 use chrono::Utc;
 use skywave_proto::{
     ChangesResult, CommandResult, ConversationsResult, DirsResult, EventBatch, HelloResponse,
+    StorageReport,
 };
 
 use crate::blobs::{remove_all_blob_files, remove_blob_files};
@@ -65,6 +66,12 @@ pub enum Request {
     /// [`CONVERSATIONS_TIMEOUT`](crate::CONVERSATIONS_TIMEOUT).
     /// Answer with [`Seam::conversations_listed`], naming `req`.
     ListConversations {
+        req: u64,
+    },
+    /// Ask the server for its storage report, for the storage screen,
+    /// within [`STORAGE_TIMEOUT`](crate::STORAGE_TIMEOUT). Answer with
+    /// [`Seam::storage_reported`], naming `req`.
+    Storage {
         req: u64,
     },
     /// Read the session's workdir as `ask` says, within
@@ -399,6 +406,18 @@ impl Seam {
             .shared
             .update::<(), Infallible>(|state| {
                 state.model.conversations_listed(req, result);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::Storage`] `req`. Kept in memory only; an
+    /// answer to an older request than the latest is ignored.
+    pub fn storage_reported(&self, req: u64, result: Result<StorageReport, TransportError>) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.storage_reported(req, result);
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});

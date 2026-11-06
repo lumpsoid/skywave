@@ -8,6 +8,7 @@
 
 mod session;
 mod shell;
+mod storage;
 mod timeline;
 mod usage;
 mod workdir;
@@ -89,6 +90,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             }
             Screen::Settings(settings) => render_settings(frame, body, app, settings),
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
+            Screen::Storage(view) => storage::render(frame, body, app, view),
             Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
         }
     }
@@ -906,6 +908,7 @@ fn footer_keys(app: &App) -> &'static str {
             "b toggle blob policy · a server address · p re-pair · Esc back · ? help · q quit"
         }
         Screen::Usage(_) => "r range · Tab group · ↑↓ scroll · Esc back · ? help · q quit",
+        Screen::Storage(_) => "r refresh · Tab list · ↑↓ scroll · Esc back · ? help · q quit",
         Screen::Workdir(view) => match view.pane {
             WorkdirPane::Changes | WorkdirPane::Dir { .. } => {
                 "↑↓ select · Enter open · Tab changes/files · r refresh · y copy · Esc back · ? help · q quit"
@@ -1045,6 +1048,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             key("Del", "dismiss the oldest refused new session"),
             key("s", "settings"),
             key("u", "usage: cost and tokens across sessions"),
+            key("S", "storage: what the server's data takes on its disk"),
             Line::from(""),
             section("Badges"),
             key("[idle]", "agent waiting for a message"),
@@ -1212,6 +1216,16 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  Totals come from this device's replica, so they work offline."),
             Line::from("  A turn whose agent reported no cost is unpriced, not free."),
             Line::from("  Archived sessions count; sessions deleted here do not."),
+        ]),
+        Screen::Storage(_) => lines.extend([
+            section("Storage"),
+            key("r", "ask the server again"),
+            key("Tab", "list sessions, the largest blobs or shell runs"),
+            key("↑↓ / k j", "scroll"),
+            key("Esc", "back to sessions"),
+            Line::from(""),
+            Line::from("  Read from the server when the screen opens, so only online."),
+            Line::from("  A session's size is its events in the log and their blobs."),
         ]),
         Screen::Workdir(_) => lines.extend([
             section("Workdir (w on a session's timeline)"),

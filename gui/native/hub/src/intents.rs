@@ -142,6 +142,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         }),
         ActionIntent::RetryNow => Action::RetryNow,
         ActionIntent::ResetReplica => Action::ResetReplica,
+        ActionIntent::RefreshStorage => Action::RefreshStorage,
         // Checked here too so a typo is shown, not silently dropped.
         ActionIntent::SetServerAddress { address } => {
             ServerAddress::parse(&address).map_err(|err| err.to_string())?;
@@ -153,6 +154,7 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             RouteView::Settings => Route::Settings,
             RouteView::Pairing => Route::Pairing,
             RouteView::Usage => Route::Usage,
+            RouteView::Storage => Route::Storage,
         }),
         ActionIntent::Back => Action::Back,
     })

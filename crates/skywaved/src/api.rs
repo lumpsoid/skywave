@@ -57,10 +57,11 @@
 //! [`WORKDIR_TIMEOUT`] is the outer bound, also a 503: it drops only the
 //! future, and the deadline is what stops the abandoned work.
 //!
-//! **Blocking file-system work** (dirs, the conversations scan and workdir
-//! reads) first takes one of [`FS_PERMITS`] permits, waiting at most
-//! [`FS_PERMIT_WAIT`], else the reply is a 503. A timeout drops only the
-//! future, never the blocking thread, so a root on a hung mount would strand
+//! **Blocking file-system work** (dirs, the conversations scan, workdir
+//! reads and storage reports) first takes one of [`FS_PERMITS`] permits,
+//! waiting at most [`FS_PERMIT_WAIT`], else the reply is a 503. A timeout
+//! drops only the future, never the blocking thread, so a root on a hung
+//! mount would strand
 //! one thread per call until tokio's blocking pool is full and
 //! [`authenticate`], itself on a blocking thread, stops every request. The
 //! permit moves into the blocking closure and is released only when the
@@ -111,12 +112,14 @@ use crate::agent::import::{self, Prepared};
 use crate::agent::mapper::cut_line;
 use crate::agent::{self, OutsideConversations, SourceError};
 use crate::blobs::BlobStore;
+use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::devices;
 use crate::dirs;
 use crate::error::{Error, Result};
 use crate::event_log::{DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::server::ServerOptions;
+use crate::storage::{self, StorageReader};
 use crate::workdir::{self, Snapshot, WorkdirReader};
 use crate::{EventLog, lock};
 
@@ -135,8 +138,12 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer than [`workdir::SNAPSHOT_DEADLINE`], which stops the snapshot
 /// itself; this only stops waiting for it.
 pub const WORKDIR_TIMEOUT: Duration = Duration::from_secs(20);
-/// Blocking file-system work (dirs, conversations and workdir reads) that
-/// may run at once; see the module docs, "Blocking file-system work".
+/// Longest a storage report may take before the reply gives up with a 503.
+/// Longer than [`storage::REPORT_DEADLINE`], which stops the report itself.
+pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Blocking file-system work (dirs, conversations, workdir reads and
+/// storage reports) that may run at once; see the module docs, "Blocking
+/// file-system work".
 pub const FS_PERMITS: usize = 8;
 /// Longest such a request waits for a permit before the reply is a 503.
 pub const FS_PERMIT_WAIT: Duration = Duration::from_millis(500);
@@ -160,6 +167,8 @@ pub(crate) struct Api {
     /// Workdir reads, on a second connection of their own (behind its own
     /// mutex), so file I/O never holds `db`.
     workdir: WorkdirReader,
+    /// Storage reports, on a third connection of their own.
+    storage: StorageReader,
     log: EventLog,
     blobs: BlobStore,
     server_id: ServerId,
@@ -181,20 +190,25 @@ pub(crate) struct Api {
 type Reply = std::result::Result<CommandResult, StatusCode>;
 
 impl Api {
-    /// `db` and `workdir_db` are two connections to the same database.
+    /// Opens three connections to `dir`'s database: the API's own, the
+    /// workdir reads' and the storage reports'.
     pub(crate) fn new(
-        db: Db,
-        workdir_db: Db,
+        dir: &DataDir,
         log: EventLog,
-        blobs: BlobStore,
         server_id: ServerId,
         shutdown: watch::Receiver<bool>,
         options: ServerOptions,
-    ) -> Api {
-        Api {
-            db: Mutex::new(db),
-            workdir: WorkdirReader::new(workdir_db, blobs.clone(), log.roots().to_vec())
-                .with_git(options.git),
+    ) -> Result<Api> {
+        let blobs = BlobStore::new(dir.blobs_dir());
+        Ok(Api {
+            db: Mutex::new(Db::open(&dir.db_path())?),
+            workdir: WorkdirReader::new(
+                Db::open(&dir.db_path())?,
+                blobs.clone(),
+                log.roots().to_vec(),
+            )
+            .with_git(options.git),
+            storage: StorageReader::new(Db::open(&dir.db_path())?, dir.clone(), options.log_file),
             log,
             blobs,
             server_id,
@@ -204,7 +218,7 @@ impl Api {
             conversations_timeout: options.conversations_timeout,
             importing: Mutex::new(HashMap::new()),
             fs: Arc::new(Semaphore::new(FS_PERMITS)),
-        }
+        })
     }
 
     /// A permit for blocking file-system work, waiting at most
@@ -255,6 +269,7 @@ pub(crate) fn router(api: Arc<Api>) -> Router {
         .route(path::EVENTS, get(events))
         .route(path::DIRS, get(list_dirs))
         .route(path::CONVERSATIONS, get(list_conversations))
+        .route(path::STORAGE, get(storage_report))
         .route(path::WORKDIR_CHANGES, get(workdir_changes))
         .route(path::WORKDIR_LIST, get(workdir_list))
         .route(path::WORKDIR_FILE, get(workdir_file))
@@ -649,6 +664,41 @@ fn to_wire(conversation: agent::OutsideConversation) -> skywave_proto::OutsideCo
         last_active: conversation.last_active,
         messages: conversation.messages,
         session: conversation.session,
+    }
+}
+
+/// The storage report (module `storage`) on a blocking thread: a 200, a
+/// passed deadline, [`STORAGE_TIMEOUT`] or no file-system permit a 503, any
+/// other error a 500.
+async fn storage_report(State(api): State<Arc<Api>>) -> Response {
+    let deadline = Instant::now() + storage::REPORT_DEADLINE;
+    let permit = match api.fs_permit().await {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
+    let api = api.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        api.storage.report(api.log.disk(), deadline)
+    });
+    match tokio::time::timeout(STORAGE_TIMEOUT, work).await {
+        Ok(Ok(Ok(report))) => Json(report).into_response(),
+        Ok(Ok(Err(Error::StorageDeadline))) => {
+            tracing::warn!("storage report passed its deadline");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::error!(error = %e, "storage report failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "storage report task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => {
+            tracing::warn!("storage report timed out");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 

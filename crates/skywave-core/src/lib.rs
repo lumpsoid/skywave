@@ -41,6 +41,7 @@ pub mod projection;
 pub mod seam;
 pub mod search;
 mod snippets;
+mod storage;
 pub mod store;
 mod tls;
 pub mod transport;
@@ -54,7 +55,7 @@ pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
     CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, MAX_SERVER_ERRORS,
-    WALL_CHECK, WallClock, default_device_name,
+    STORAGE_TIMEOUT, WALL_CHECK, WallClock, default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
@@ -87,6 +88,10 @@ pub use view::{
     SubagentHeader, SubagentStatus, TaskId, TaskKind, TimelineItem, ToolApproval, ToolKind,
     ToolOutcome, ToolView, TurnUsage, UsageSession, UsageView, ViewState, WorkdirBody,
     WorkdirFetch, WorkdirPane, WorkdirView,
+};
+pub use view::{
+    BlobStorage, BlobUse, SessionStorage, ShellRunStorage, StorageReport, StorageStatus,
+    StorageUnavailable, StorageView,
 };
 pub use view::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,

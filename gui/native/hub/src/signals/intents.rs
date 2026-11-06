@@ -1,7 +1,9 @@
 use rinf::{DartSignal, SignalPiece};
 use serde::Deserialize;
 
-use super::screen::{EffortView, PermissionModeView, UsageGroupingView, UsageSpanView};
+use super::screen::{
+    EffortView, PermissionModeView, StorageGroupingView, UsageGroupingView, UsageSpanView,
+};
 use super::workdir::WorkdirPaneKind;
 
 /// Everything the GUI tells the hub after boot, in one type: rinf orders
@@ -215,6 +217,10 @@ pub enum GuiIntent {
         span: UsageSpanView,
         grouping: UsageGroupingView,
     },
+    /// Which list the storage screen shows. Kept while away from it.
+    StorageShow {
+        grouping: StorageGroupingView,
+    },
     /// The app went off screen (hidden or paused). Reported, not decided:
     /// the hub knows what that means on this platform.
     AppBackgrounded,
@@ -364,6 +370,8 @@ pub enum ActionIntent {
         policy: BlobPolicyChoice,
     },
     RetryNow,
+    /// Ask the server for its storage report again (the storage screen).
+    RefreshStorage,
     /// After the server lost history ([`LinkState::HistoryLost`](crate::signals::LinkState)),
     /// start the replica over from its log; ignored otherwise.
     ResetReplica,
@@ -398,6 +406,7 @@ pub enum RouteView {
     Settings,
     Pairing,
     Usage,
+    Storage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, SignalPiece)]

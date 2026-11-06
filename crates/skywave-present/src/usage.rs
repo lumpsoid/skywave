@@ -271,7 +271,7 @@ impl Report {
     }
 }
 
-fn short(id: SessionId) -> String {
+pub(crate) fn short(id: SessionId) -> String {
     let text = id.0.simple().to_string();
     text[text.len().saturating_sub(8)..].to_owned()
 }

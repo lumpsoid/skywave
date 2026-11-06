@@ -54,6 +54,7 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::disk::Disk;
 use crate::error::{Error, Result};
+use crate::storage;
 
 /// Batch size used when `GET /v1/events` names no `limit`.
 pub const DEFAULT_BATCH_LIMIT: u32 = 500;
@@ -779,6 +780,20 @@ pub(crate) fn append_in(
         context,
         serde_json::to_string(kind)?
     ])?;
+    // Which session's event holds each blob, for the storage report. An
+    // event blob is written for one event only; a repeat keeps the first.
+    for (holds, blob) in kind.blobs() {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO event_blobs (blob_id, session_id, seq, holds)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![
+            blob.id.0.to_string(),
+            session,
+            sql_seq,
+            storage::holds_to_sql(holds)
+        ])?;
+    }
 
     match kind {
         // The sessions row first: the contexts row refers to it. A moved

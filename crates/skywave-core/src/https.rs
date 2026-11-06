@@ -37,7 +37,7 @@ use serde::de::DeserializeOwned;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
     EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, RUN_HEADER, RunId,
-    WorkdirQuery, path,
+    StorageReport, WorkdirQuery, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -745,6 +745,21 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `GET /v1/storage`, which takes no query.
+    async fn storage_report(&self) -> Result<StorageReport, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::GET,
+                path::STORAGE,
+                &self.run_header(),
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET <endpoint>?session=<id>&path=<path>`, bounded by
     /// [`WORKDIR_TIMEOUT`] rather than the request timeout: the server may
     /// take its full 20 s.
@@ -893,6 +908,10 @@ impl Transport for HttpsTransport {
 
     fn list_conversations(&self) -> BoxFuture<'_, Result<ConversationsResult, TransportError>> {
         Box::pin(HttpsTransport::list_conversations(self))
+    }
+
+    fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
+        Box::pin(HttpsTransport::storage_report(self))
     }
 
     fn workdir_changes<'a>(

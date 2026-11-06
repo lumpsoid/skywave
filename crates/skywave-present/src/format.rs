@@ -104,13 +104,14 @@ pub fn percent(got: u64, size: u64) -> u64 {
         .min(100)
 }
 
-/// A byte count in words: "812 B", "12.3 KiB", "4.0 MiB".
+/// A byte count in words: "812 B", "12.3 KiB", "4.0 MiB", "18.6 GiB".
 pub fn bytes(n: u64) -> String {
     const KIB: f64 = 1024.0;
     match n {
         0..1024 => format!("{n} B"),
         1024..1_048_576 => format!("{:.1} KiB", n as f64 / KIB),
-        _ => format!("{:.1} MiB", n as f64 / (KIB * KIB)),
+        1_048_576..1_073_741_824 => format!("{:.1} MiB", n as f64 / (KIB * KIB)),
+        _ => format!("{:.1} GiB", n as f64 / (KIB * KIB * KIB)),
     }
 }
 

@@ -7,8 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
-    AgentSettings, AgentWork, ApprovalId, BlobRef, Body, ContextId, Event, EventKind, Full,
-    ImportedItem, Seq, SessionId, SessionOrigin, SessionState, ToolCall, ToolResult, TurnUsage,
+    AgentSettings, AgentWork, ApprovalId, BlobRef, ContextId, Event, EventKind, ImportedItem, Seq,
+    SessionId, SessionOrigin, SessionState, TurnUsage,
 };
 
 /// What the session list needs to know about one session.
@@ -400,75 +400,14 @@ pub fn is_notable(kind: &EventKind) -> bool {
 /// run's whole output; the same for an imported call or result, so a
 /// policy that fetches everything fetches imported history too.
 pub(crate) fn blob_refs(kind: &EventKind) -> impl Iterator<Item = &BlobRef> {
-    let (first, second) = match kind {
-        EventKind::ToolCall(ToolCall { input, display, .. }) => (
-            input.as_ref().and_then(Full::blob),
-            display.body.as_ref().and_then(body_blob),
-        ),
-        EventKind::ApprovalRequested { input, .. } => (input.as_ref().and_then(Full::blob), None),
-        EventKind::ToolResult(ToolResult { output, .. }) => {
-            (output.as_ref().and_then(Full::blob), None)
-        }
-        EventKind::ShellFinished { output, .. } => (output.as_ref(), None),
-        EventKind::SessionCreated { .. }
-        | EventKind::UserMessage { .. }
-        | EventKind::AgentMessage { .. }
-        | EventKind::ApprovalResolved { .. }
-        | EventKind::ApprovalCancelled { .. }
-        | EventKind::TurnInterrupted
-        | EventKind::SessionStopped
-        | EventKind::SessionRenamed { .. }
-        | EventKind::SessionArchived { .. }
-        | EventKind::SessionStateChanged(_)
-        | EventKind::TurnUsage(_)
-        | EventKind::PermissionModeRequested { .. }
-        | EventKind::PermissionModeChanged { .. }
-        | EventKind::PermissionModeRefused { .. }
-        | EventKind::ModelRequested { .. }
-        | EventKind::ModelChanged { .. }
-        | EventKind::ModelRefused { .. }
-        | EventKind::ModelsOffered { .. }
-        | EventKind::AgentVersionUnconfirmed { .. }
-        | EventKind::EffortRequested { .. }
-        | EventKind::EffortChanged { .. }
-        | EventKind::EffortRefused { .. }
-        | EventKind::ContextStarted { .. }
-        | EventKind::ContextSwitched { .. }
-        | EventKind::ContextMoved { .. }
-        | EventKind::BackgroundTasksChanged { .. }
-        | EventKind::SchedulesChanged { .. }
-        | EventKind::TaskStopRequested { .. }
-        | EventKind::TaskStopRefused { .. }
-        | EventKind::CallsUnanswered { .. }
-        | EventKind::ShellRequested { .. }
-        | EventKind::ShellStopRequested { .. }
-        | EventKind::ShellStarted { .. }
-        | EventKind::ShellOutput { .. }
-        | EventKind::ImportFinished { .. } => (None, None),
-        EventKind::Imported { item, .. } => match item {
-            ImportedItem::ToolCall(ToolCall { input, display, .. }) => (
-                input.as_ref().and_then(Full::blob),
-                display.body.as_ref().and_then(body_blob),
-            ),
-            ImportedItem::ToolResult(ToolResult { output, .. }) => {
-                (output.as_ref().and_then(Full::blob), None)
-            }
-            ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. } => (None, None),
-        },
-    };
-    first.into_iter().chain(second)
-}
-
-/// The blob holding a display body's whole content, if it was kept.
-fn body_blob(body: &Body) -> Option<&BlobRef> {
-    body.full.as_ref().and_then(Full::blob)
+    kind.blobs().map(|(_, blob)| blob)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use skywave_proto::{Decision, DeviceId};
+    use skywave_proto::{Decision, DeviceId, Full, ToolCall};
 
     fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
         Event {

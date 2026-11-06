@@ -18,11 +18,12 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::de::DeserializeOwned;
 use skywave_proto::{
-    BlobId, BlobRef, ChangesResult, Command, CommandId, CommandKind, CommandResult, ContextId,
-    ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry, DirsResult, EntryKind,
-    EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse, ImportOutcome,
-    ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER, RejectReason, RunId,
-    RunsSince, Seq, SessionId, SessionOrigin, path,
+    BlobId, BlobRef, BlobStorage, BlobUse, ChangesResult, Command, CommandId, CommandKind,
+    CommandResult, ContextId, ConversationsResult, DeviceId, DeviceInfo, DiffBody, DirEntry,
+    DirsResult, EntryKind, EventBatch, EventKind, FileBody, FileChange, FileResult, HelloResponse,
+    ImportOutcome, ListResult, PROTOCOL_VERSION, PairRequest, PairResponse, RUN_HEADER,
+    RejectReason, RunId, RunsSince, Seq, SessionId, SessionOrigin, ShellRunStorage, StorageReport,
+    ToolResult, path,
 };
 use skywaved::blobs::BlobStore;
 use skywaved::identity::ServerIdentity;
@@ -1066,6 +1067,121 @@ async fn conversations_are_unavailable_without_a_source() {
     assert_eq!(
         reply.json::<ConversationsResult>(),
         ConversationsResult::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn storage_reports_sizes_by_session_blob_and_shell_run() {
+    let mut f = Fixture::start_with_shell(true).await;
+    let creds = f.pair().await;
+    let mut device = f.client(&creds).await;
+    let create = f.create_session_command();
+    let result = device.command(&create).await;
+    let big = session_of(&result, &device.events(Seq::ZERO, 0).await);
+    let create = f.create_session_command();
+    let result = device.command(&create).await;
+    let batch = device.events(Seq::ZERO, 0).await;
+    let small = session_of(&result, &batch);
+
+    // A tool result whose whole output is a blob, in the big session.
+    let blobs = BlobStore::new(f.storage.dir.blobs_dir());
+    let output = blobs.put(f.storage.db.conn(), &[7u8; 50_000][..]).unwrap();
+    let blob = output.blob_ref();
+    let seq = f
+        .log
+        .append(
+            &mut f.storage.db,
+            big,
+            ContextId::first_of(big),
+            EventKind::ToolResult(ToolResult {
+                call: None,
+                is_error: false,
+                status: None,
+                preview: "x".into(),
+                lines: 1,
+                output: Some(skywave_proto::Full::Blob(blob.clone())),
+            }),
+        )
+        .unwrap();
+    f.append(small, "hi");
+
+    // A running shell run (logged by hand: nothing runs it here) with two
+    // progress events and its output so far.
+    let run = Command {
+        id: CommandId::new(),
+        kind: CommandKind::RunShell {
+            session_id: small,
+            command: "cargo test\n--release".into(),
+            when: Default::default(),
+        },
+    };
+    assert!(matches!(
+        device.command(&run).await,
+        CommandResult::Accepted { .. }
+    ));
+    let progress = EventKind::ShellOutput {
+        run: run.id,
+        tail: "ok".into(),
+        lines: 1,
+        bytes: 300,
+    };
+    let progress_bytes = serde_json::to_string(&progress).unwrap().len() as u64;
+    for kind in [
+        EventKind::ShellStarted {
+            run: run.id,
+            cwd: "/".into(),
+        },
+        progress.clone(),
+        progress,
+    ] {
+        f.log.shell_event(&mut f.storage.db, kind).unwrap();
+    }
+    std::fs::write(
+        f.storage.dir.shell_dir().join(format!("{}.out", run.id.0)),
+        [1u8; 300],
+    )
+    .unwrap();
+
+    let reply = device.get(path::STORAGE).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let report: StorageReport = reply.json();
+    assert!(report.database > 0);
+    assert_eq!(report.event_blobs, 50_000);
+    assert_eq!(report.workdir_blobs, 0);
+    assert_eq!(report.shell_running, 300);
+    assert_eq!(report.log_file, None);
+    // The fixture's log has no disk to read.
+    assert_eq!((report.free, report.min_free), (None, 0));
+
+    let sessions: Vec<_> = report.sessions.iter().map(|s| s.session).collect();
+    assert_eq!(sessions, vec![big, small], "largest first");
+    let first = &report.sessions[0];
+    assert_eq!(
+        (first.events, first.blobs, first.blob_bytes),
+        (2, 1, 50_000)
+    );
+    assert!(first.event_bytes > 0);
+    assert_eq!(report.sessions[1].blobs, 0);
+
+    assert_eq!(
+        report.blobs,
+        vec![BlobStorage {
+            id: blob.id,
+            size: 50_000,
+            session: big,
+            seq,
+            holds: BlobUse::ToolOutput,
+        }]
+    );
+    assert_eq!(
+        report.shell_runs,
+        vec![ShellRunStorage {
+            run: run.id,
+            session: small,
+            command_line: "cargo test…".into(),
+            event_bytes: 2 * progress_bytes,
+            output: 300,
+        }]
     );
 }
 

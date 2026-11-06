@@ -3989,6 +3989,71 @@ fn usage_totals_turns_across_sessions_by_range_and_grouping() {
 }
 
 #[test]
+fn storage_asks_the_server_and_lists_what_takes_the_most() {
+    let mut h = Harness::paired();
+    let (a, gone) = (SessionId::new(), SessionId::new());
+    pull(&mut h, vec![created(a, 0, "/srv/a")]);
+    assert_eq!(
+        h.key(KeyCode::Char('S')),
+        Some(Action::Navigate(Route::Storage))
+    );
+    let req = match h.drain_requests().as_slice() {
+        [Request::Storage { req }] => *req,
+        other => panic!("expected one storage request, got {other:?}"),
+    };
+    assert_contains(&h.screen(), "Asking the server…");
+
+    let report = skywave_proto::StorageReport {
+        database: 3 * 1024 * 1024,
+        event_blobs: 2 * 1024 * 1024,
+        workdir_blobs: 0,
+        shell_running: 0,
+        log_file: Some(1024),
+        free: Some(8 * 1024 * 1024 * 1024),
+        min_free: 0,
+        sessions: vec![skywave_proto::SessionStorage {
+            session: a,
+            events: 12,
+            event_bytes: 4096,
+            blobs: 1,
+            blob_bytes: 2 * 1024 * 1024,
+        }],
+        blobs: vec![skywave_proto::BlobStorage {
+            id: skywave_proto::BlobId::new(),
+            size: 2 * 1024 * 1024,
+            session: gone,
+            seq: skywave_proto::Seq(7),
+            holds: skywave_proto::BlobUse::ShellOutput,
+        }],
+        shell_runs: Vec::new(),
+    };
+    h.seam.storage_reported(req, Ok(report));
+    h.sync();
+    let screen = h.screen();
+    assert_contains(&screen, "Free                  8.0 GiB");
+    assert_contains(&screen, "[by session]");
+    assert_contains(&screen, "2.0 MiB  a");
+    assert_contains(&screen, "12 events · 4.0 KiB in the log · 1 blob 2.0 MiB");
+
+    h.key(KeyCode::Tab);
+    let screen = h.screen();
+    assert_contains(&screen, "[largest blobs]");
+    assert_contains(&screen, "(not on this device)");
+    assert_contains(&screen, "shell output · event 7");
+    h.key(KeyCode::Tab);
+    assert_contains(&h.screen(), "No shell runs.");
+
+    assert_eq!(h.key(KeyCode::Char('r')), Some(Action::RefreshStorage));
+    assert!(matches!(
+        h.drain_requests().as_slice(),
+        [Request::Storage { .. }]
+    ));
+    assert_contains(&h.screen(), "Refreshing…");
+    assert_eq!(h.key(KeyCode::Esc), Some(Action::Back));
+    assert!(matches!(h.app.view().screen, Screen::SessionList(_)));
+}
+
+#[test]
 fn settings_explain_the_blob_policy() {
     let mut h = Harness::paired();
     h.key(KeyCode::Char('s'));

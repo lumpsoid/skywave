@@ -125,7 +125,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v21: [`RejectReason::ServerStopping`]: a command that would start new
 /// work, refused while the server waits for its running turns and shell
 /// runs to end before it stops.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// v22: the storage view. `GET` [`path::STORAGE`] answering
+/// [`StorageReport`] (with [`SessionStorage`], [`BlobStorage`],
+/// [`BlobUse`] and [`ShellRunStorage`]), and
+/// [`limits::STORAGE_TOP_MAX`].
+pub const PROTOCOL_VERSION: u32 = 22;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -829,6 +834,94 @@ impl EventKind {
             | EventKind::ImportFinished { .. } => None,
         }
     }
+
+    /// The blobs the event references, with what each holds: a tool call's
+    /// input and the whole of its display body, a result's output, an
+    /// approval's input, a finished shell run's whole output; the same for
+    /// an imported call or result. A [`Full::Lost`] references none.
+    pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
+        fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
+            full.as_ref().and_then(Full::blob).map(|b| (holds, b))
+        }
+        fn body(display: &ToolDisplay) -> Option<(BlobUse, &BlobRef)> {
+            let body = display.body.as_ref()?;
+            full(BlobUse::ToolBody, &body.full)
+        }
+        let (first, second) = match self {
+            EventKind::ToolCall(ToolCall { input, display, .. })
+            | EventKind::Imported {
+                item: ImportedItem::ToolCall(ToolCall { input, display, .. }),
+                ..
+            } => (full(BlobUse::ToolInput, input), body(display)),
+            EventKind::ToolResult(ToolResult { output, .. })
+            | EventKind::Imported {
+                item: ImportedItem::ToolResult(ToolResult { output, .. }),
+                ..
+            } => (full(BlobUse::ToolOutput, output), None),
+            EventKind::ApprovalRequested { input, .. } => {
+                (full(BlobUse::ApprovalInput, input), None)
+            }
+            EventKind::ShellFinished { output, .. } => {
+                (output.as_ref().map(|b| (BlobUse::ShellOutput, b)), None)
+            }
+            EventKind::SessionCreated { .. }
+            | EventKind::UserMessage { .. }
+            | EventKind::AgentMessage { .. }
+            | EventKind::ApprovalResolved { .. }
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::TurnInterrupted
+            | EventKind::SessionStopped
+            | EventKind::SessionRenamed { .. }
+            | EventKind::SessionArchived { .. }
+            | EventKind::SessionStateChanged(_)
+            | EventKind::TurnUsage(_)
+            | EventKind::PermissionModeRequested { .. }
+            | EventKind::PermissionModeChanged { .. }
+            | EventKind::PermissionModeRefused { .. }
+            | EventKind::ModelRequested { .. }
+            | EventKind::ModelChanged { .. }
+            | EventKind::ModelRefused { .. }
+            | EventKind::ModelsOffered { .. }
+            | EventKind::AgentVersionUnconfirmed { .. }
+            | EventKind::EffortRequested { .. }
+            | EventKind::EffortChanged { .. }
+            | EventKind::EffortRefused { .. }
+            | EventKind::ContextStarted { .. }
+            | EventKind::ContextSwitched { .. }
+            | EventKind::ContextMoved { .. }
+            | EventKind::BackgroundTasksChanged { .. }
+            | EventKind::SchedulesChanged { .. }
+            | EventKind::TaskStopRequested { .. }
+            | EventKind::TaskStopRefused { .. }
+            | EventKind::CallsUnanswered { .. }
+            | EventKind::ShellRequested { .. }
+            | EventKind::ShellStopRequested { .. }
+            | EventKind::ShellStarted { .. }
+            | EventKind::ShellOutput { .. }
+            | EventKind::ImportFinished { .. }
+            | EventKind::Imported {
+                item: ImportedItem::UserMessage { .. } | ImportedItem::AgentMessage { .. },
+                ..
+            } => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
+}
+
+/// What an event's blob holds ([`EventKind::blobs`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobUse {
+    /// A tool call's whole input.
+    ToolInput,
+    /// The whole of a tool call's display body (e.g. a diff).
+    ToolBody,
+    /// A tool result's whole output.
+    ToolOutput,
+    /// An approval request's whole input.
+    ApprovalInput,
+    /// A finished shell run's whole output.
+    ShellOutput,
 }
 
 /// Size caps on the bounded text in tool events. Producers (the server)
@@ -928,6 +1021,9 @@ pub mod limits {
     /// [`ConversationsResult::Listed`](crate::ConversationsResult::Listed);
     /// past it the listing is `truncated`.
     pub const CONVERSATIONS_MAX: usize = 100;
+    /// Most blobs and most shell runs in one
+    /// [`StorageReport`](crate::StorageReport): the largest.
+    pub const STORAGE_TOP_MAX: usize = 50;
 }
 
 /// How freely the agent acts without asking. Agent-agnostic (D3): the
@@ -2019,6 +2115,75 @@ pub struct OutsideConversation {
     pub session: Option<SessionId>,
 }
 
+/// Response to `GET /v1/storage` (no query): what the server's data takes
+/// on its disk, read when asked. Sizes are bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StorageReport {
+    /// The database file with its write-ahead log: the event log, its
+    /// projections and everything else the server records.
+    pub database: u64,
+    /// Blobs events reference ([`EventKind::blobs`]).
+    pub event_blobs: u64,
+    /// Blobs workdir reads keep for their latest answers.
+    pub workdir_blobs: u64,
+    /// Output of shell runs still running, not yet a blob.
+    pub shell_running: u64,
+    /// The server's log file; `None` when it logs to stderr.
+    pub log_file: Option<u64>,
+    /// Free space on the data directory's file system; `None` when it
+    /// could not be read.
+    pub free: Option<u64>,
+    /// The free-space floor below which the server pauses its agents
+    /// (`[disk] min_free`); 0 when off.
+    pub min_free: u64,
+    /// Every session in the log, largest first.
+    pub sessions: Vec<SessionStorage>,
+    /// The largest event blobs, largest first, at most
+    /// [`limits::STORAGE_TOP_MAX`].
+    pub blobs: Vec<BlobStorage>,
+    /// The shell runs taking the most, largest first, at most
+    /// [`limits::STORAGE_TOP_MAX`].
+    pub shell_runs: Vec<ShellRunStorage>,
+}
+
+/// One session of a [`StorageReport`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionStorage {
+    pub session: SessionId,
+    /// Its events in the log.
+    pub events: u64,
+    /// The stored JSON of those events: their share of the database.
+    pub event_bytes: u64,
+    /// Its events' blobs: how many and their size.
+    pub blobs: u64,
+    pub blob_bytes: u64,
+}
+
+/// One blob of a [`StorageReport`], named by the event referencing it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobStorage {
+    pub id: BlobId,
+    pub size: u64,
+    pub session: SessionId,
+    /// The event referencing it.
+    pub seq: Seq,
+    pub holds: BlobUse,
+}
+
+/// One shell run of a [`StorageReport`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShellRunStorage {
+    /// The `RunShell` command's id.
+    pub run: CommandId,
+    pub session: SessionId,
+    /// The command's first line, cut to [`limits::FIRST_PROMPT_MAX_CHARS`].
+    pub command_line: String,
+    /// The stored JSON of its progress events (`ShellOutput`).
+    pub event_bytes: u64,
+    /// Its whole output's blob, once finished; 0 when it has none.
+    pub output: u64,
+}
+
 /// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
@@ -2217,6 +2382,8 @@ pub mod path {
     pub const DIRS: &str = "/v1/dirs";
     /// The agent's conversations outside Skywave: [`crate::ConversationsResult`].
     pub const CONVERSATIONS: &str = "/v1/conversations";
+    /// What the server's data takes on its disk: [`crate::StorageReport`].
+    pub const STORAGE: &str = "/v1/storage";
     /// What changed in a session's workdir: [`crate::ChangesResult`].
     pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
     /// One directory of a session's workdir: [`crate::ListResult`].

@@ -1682,6 +1682,105 @@ fn the_usage_screen_totals_what_usage_show_picks() {
 }
 
 #[test]
+fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
+    use crate::signals::{StorageGroupingView, StorageRowView, StorageTotalView};
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::Storage,
+        },
+    });
+    rig.results();
+    rig.view();
+    let storage = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::Storage {
+            grouping,
+            status_label,
+            totals,
+            rows,
+            empty_label,
+        } => (
+            *grouping,
+            status_label.clone(),
+            totals.clone(),
+            rows.clone(),
+            empty_label.clone(),
+        ),
+        other => panic!("not the storage screen: {other:?}"),
+    };
+    let (_, status, totals, rows, empty) = storage(&rig);
+    assert_eq!(status.as_deref(), Some("Asking the server…"));
+    assert!(totals.is_empty() && rows.is_empty() && empty.is_none());
+
+    let req = requests
+        .try_iter()
+        .find_map(|r| match r {
+            skywave_core::Request::Storage { req } => Some(req),
+            _ => None,
+        })
+        .expect("the core asked for the report");
+    rig.seam.storage_reported(
+        req,
+        Ok(skywave_proto::StorageReport {
+            database: 1024 * 1024,
+            event_blobs: 0,
+            workdir_blobs: 0,
+            shell_running: 0,
+            log_file: None,
+            free: None,
+            min_free: 0,
+            sessions: vec![skywave_proto::SessionStorage {
+                session: rig.session,
+                events: 2,
+                event_bytes: 2048,
+                blobs: 0,
+                blob_bytes: 0,
+            }],
+            blobs: Vec::new(),
+            shell_runs: Vec::new(),
+        }),
+    );
+    rig.view();
+    let (grouping, status, totals, rows, empty) = storage(&rig);
+    assert_eq!(grouping, StorageGroupingView::Sessions);
+    assert_eq!(status, None);
+    assert_eq!(
+        totals[0],
+        StorageTotalView {
+            label: "Free".into(),
+            value: "unknown".into()
+        }
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        StorageRowView {
+            label: rows[0].label.clone(),
+            detail: "2 events · 2.0 KiB in the log · no blobs".into(),
+            size: "2.0 KiB".into(),
+        }
+    );
+    assert_eq!(empty, None);
+
+    rig.intent(GuiIntent::StorageShow {
+        grouping: StorageGroupingView::ShellRuns,
+    });
+    rig.view();
+    let (grouping, _, _, rows, empty) = storage(&rig);
+    assert_eq!(grouping, StorageGroupingView::ShellRuns);
+    assert!(rows.is_empty());
+    assert_eq!(empty.as_deref(), Some("No shell runs."));
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RefreshStorage,
+    });
+    assert_eq!(rig.actions.last(), Some(&Action::RefreshStorage));
+}
+
+#[test]
 fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {

@@ -530,6 +530,48 @@ fn all_conversations_results() -> Vec<ConversationsResult> {
     ]
 }
 
+fn storage_report() -> StorageReport {
+    StorageReport {
+        database: 48_000_000,
+        event_blobs: 310_000_000,
+        workdir_blobs: 2_000_000,
+        shell_running: 4096,
+        log_file: Some(1_500_000),
+        free: Some(20_000_000_000),
+        min_free: 1 << 30,
+        sessions: vec![SessionStorage {
+            session: session(),
+            events: 1200,
+            event_bytes: 900_000,
+            blobs: 14,
+            blob_bytes: 300_000_000,
+        }],
+        blobs: [
+            BlobUse::ToolInput,
+            BlobUse::ToolBody,
+            BlobUse::ToolOutput,
+            BlobUse::ApprovalInput,
+            BlobUse::ShellOutput,
+        ]
+        .into_iter()
+        .map(|holds| BlobStorage {
+            id: blob_id(),
+            size: 2_000_000,
+            session: session(),
+            seq: Seq(17),
+            holds,
+        })
+        .collect(),
+        shell_runs: vec![ShellRunStorage {
+            run: command(),
+            session: session(),
+            command_line: "cargo test".into(),
+            event_bytes: 52_000,
+            output: 0,
+        }],
+    }
+}
+
 fn all_shell_ends() -> Vec<ShellEnd> {
     vec![
         ShellEnd::Exited { code: 0 },
@@ -1307,6 +1349,12 @@ fn workdir_caps() {
     assert_eq!(limits::WORKDIR_DIFFS_MAX_BYTES, 8 * 1024 * 1024);
     assert_eq!(limits::WORKDIR_FILE_MAX_BYTES, 4 * 1024 * 1024);
     assert_eq!(limits::WORKDIR_LIST_MAX, 1000);
+    assert_eq!(limits::STORAGE_TOP_MAX, 50);
+}
+
+#[test]
+fn a_storage_report_round_trips() {
+    round_trip(&storage_report());
 }
 
 #[test]
@@ -1343,8 +1391,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v21() {
-    assert_eq!(PROTOCOL_VERSION, 21);
+fn protocol_is_v22() {
+    assert_eq!(PROTOCOL_VERSION, 22);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1524,6 +1572,7 @@ fn api_paths() {
     assert_eq!(path::COMMANDS, "/v1/commands");
     assert_eq!(path::EVENTS, "/v1/events");
     assert_eq!(path::CONVERSATIONS, "/v1/conversations");
+    assert_eq!(path::STORAGE, "/v1/storage");
     assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
@@ -1572,6 +1621,7 @@ fn wire_format_snapshot() {
         workdir_list: Vec<ListResult>,
         workdir_file: Vec<FileResult>,
         conversations: Vec<ConversationsResult>,
+        storage: StorageReport,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1603,6 +1653,7 @@ fn wire_format_snapshot() {
         workdir_list: all_list_results(),
         workdir_file: all_file_results(),
         conversations: all_conversations_results(),
+        storage: storage_report(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");

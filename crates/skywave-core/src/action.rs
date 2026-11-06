@@ -58,6 +58,10 @@ pub enum Action {
     ListConversations,
     /// The conversation picker closed: forget its listing.
     EndConversations,
+    /// Ask the server for its storage report again, on the storage screen
+    /// (paired only). The report shown stays until the answer; offline the
+    /// screen is `Unavailable` at once and nothing is asked later.
+    RefreshStorage,
     /// Queue a message, written for the session view's
     /// [`context`](crate::SessionView::context).
     SendMessage {
@@ -321,4 +325,7 @@ pub enum Route {
     Pairing,
     /// Cost and tokens totalled across sessions, from the replica alone.
     Usage,
+    /// What the server's data takes on its disk: opening it asks the
+    /// server for its report.
+    Storage,
 }

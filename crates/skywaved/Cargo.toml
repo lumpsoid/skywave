@@ -20,7 +20,7 @@ hyper = { workspace = true, features = ["server"] }
 hyper-util.workspace = true
 qrcode.workspace = true
 rcgen.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

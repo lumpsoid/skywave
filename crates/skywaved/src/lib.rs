@@ -22,6 +22,7 @@ pub mod pairing;
 mod process;
 pub mod server;
 pub mod shell;
+pub mod storage;
 pub mod supervisor;
 pub mod workdir;
 
