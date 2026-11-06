@@ -178,6 +178,7 @@ SessionScreen screenWith({
   List<TaskRow> tasks = const [],
   List<ScheduleRow> schedules = const [],
   SubagentHeaderView? subagent,
+  bool conversationOnly = false,
 }) => SessionScreen(
   sessionId: 's1',
   title: 'work',
@@ -219,6 +220,7 @@ SessionScreen screenWith({
   subagent: subagent,
   renamePrompt: renamePrompt,
   archivedLabel: archivedLabel,
+  conversationOnly: conversationOnly,
 );
 
 /// The session page over [timeline], [shell] and [search], recording what

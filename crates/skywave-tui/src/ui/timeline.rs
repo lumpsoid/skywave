@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
@@ -29,6 +29,7 @@ use skywave_present::format::{
     decision_label, delivery_label, dollars, fail_reason, import_finished_line, moved_from_line,
     outgoing_label, percent, seconds, subagent_status, took_label, turn_time,
 };
+use skywave_present::policy::in_conversation;
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, change_note, delivery, find, sections, selectable, starts_turn,
 };
@@ -435,7 +436,7 @@ impl Layout<'_> {
         let above = out.len();
         out.extend(match item {
             TimelineItem::Pending { text, outgoing, .. } => {
-                self.message(lead, you(Some(outgoing)), text, mark)
+                self.message(lead, you(Some(outgoing)), Color::Blue, text, mark)
             }
             // Dimmed: it happened outside Skywave.
             TimelineItem::Logged {
@@ -446,6 +447,16 @@ impl Layout<'_> {
                 .into_iter()
                 .map(|line| line.patch_style(Modifier::DIM))
                 .collect(),
+            // Dimmed while out of the way, so the messages stand out to
+            // someone skimming; at full strength once selected or open.
+            TimelineItem::Logged { entry, .. }
+                if !in_conversation(item) && !selected && !expanded =>
+            {
+                self.entry(lead, entry, expanded, mark)
+                    .into_iter()
+                    .map(|line| line.patch_style(Modifier::DIM))
+                    .collect()
+            }
             TimelineItem::Logged { entry, .. } => self.entry(lead, entry, expanded, mark),
         });
         if let Some(row) = self.matched.get() {
@@ -523,18 +534,20 @@ impl Layout<'_> {
                 outgoing,
                 ..
             } => {
-                let label = if from.me {
-                    you(outgoing.as_ref())
+                let (label, bar) = if from.me {
+                    (you(outgoing.as_ref()), Color::Blue)
                 } else {
-                    vec![
+                    let label = vec![
                         Span::raw(device_label(from)).magenta().bold(),
                         Span::raw(": "),
-                    ]
+                    ];
+                    (label, Color::Magenta)
                 };
-                return self.message(lead, label, text, mark);
+                return self.message(lead, label, bar, text, mark);
             }
             Entry::AgentMessage { text } => {
-                return self.message(lead, vec![Span::raw("agent: ").green().bold()], text, mark);
+                let label = vec![Span::raw("agent: ").green().bold()];
+                return self.message(lead, label, Color::Green, text, mark);
             }
             Entry::Interrupted => {
                 let mut spans = lead;
@@ -569,14 +582,14 @@ impl Layout<'_> {
                 ..
             } => {
                 let label = vec![Span::raw("you").blue().bold(), Span::raw(": ")];
-                return self.message(imported(lead), label, text, mark);
+                return self.message(imported(lead), label, Color::Blue, text, mark);
             }
             Entry::Imported {
                 entry: ImportedEntry::AgentMessage { text },
                 ..
             } => {
                 let label = vec![Span::raw("agent: ").green().bold()];
-                return self.message(imported(lead), label, text, mark);
+                return self.message(imported(lead), label, Color::Green, text, mark);
             }
             Entry::Imported {
                 entry: ImportedEntry::Tool(view),
@@ -654,6 +667,7 @@ impl Layout<'_> {
                 return self.message(
                     lead,
                     vec![Span::raw("agent error: ").red().bold()],
+                    Color::Red,
                     message,
                     mark,
                 );
@@ -708,26 +722,32 @@ impl Layout<'_> {
         out
     }
 
-    /// A message: `label` and the first line of `text` after the lead, every
-    /// further or wrapped line under the label.
+    /// A message: a bar in its author's colour down its every row, where a
+    /// tool item has its glyph, so messages stand out among the calls;
+    /// then `label` and the first line of `text`, every further or wrapped
+    /// line under the label.
     fn message(
         &self,
-        lead: Vec<Span<'static>>,
+        mut lead: Vec<Span<'static>>,
         label: Vec<Span<'static>>,
+        bar: Color,
         text: &str,
         mark: Option<Mark>,
     ) -> Vec<Line<'static>> {
+        let bar = Span::styled("▌ ", Style::new().fg(bar));
+        let rest = vec![indent(LEAD), bar.clone()];
+        lead.push(bar);
         let mut lines = text.split('\n');
         let mut content = label;
         content.extend(marked(
             vec![Span::raw(clean(lines.next().unwrap_or_default()))],
             mark,
         ));
-        let mut out = wrap(lead, vec![indent(LEAD)], content, self.width);
+        let mut out = wrap(lead, rest.clone(), content, self.width);
         for line in lines {
             out.extend(wrap(
-                vec![indent(LEAD)],
-                vec![indent(LEAD)],
+                rest.clone(),
+                rest.clone(),
                 marked(vec![Span::raw(clean(line))], mark),
                 self.width,
             ));

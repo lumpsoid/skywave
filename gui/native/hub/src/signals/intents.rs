@@ -105,6 +105,9 @@ pub enum GuiIntent {
         session_id: String,
         snippet_id: String,
     },
+    /// Show only the conversation, tool calls hidden, in every session; or
+    /// every row again.
+    ToggleConversationOnly,
     /// Whether the newest timeline row is on screen; what reaches the
     /// session while it is counts as read.
     FollowingChanged {

@@ -149,6 +149,49 @@ void main() {
     );
   });
 
+  testWidgets('collapsed calls step back from the messages', (tester) async {
+    tall(tester);
+    final timeline = holding([
+      anyRow('s:1', RowKind.agentMessage, 'on it', author: 'agent'),
+      anyRow('s:2', RowKind.tool, '', tool: shellFacts('cargo build')),
+      anyRow(
+        's:3',
+        RowKind.tool,
+        '',
+        tool: shellFacts('cargo test'),
+        expandable: true,
+        expanded: true,
+      ),
+      anyRow(
+        's:4',
+        RowKind.tool,
+        '',
+        tool: shellFacts('rm -rf target', state: ToolState.needsApproval),
+      ),
+    ]);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: <GuiIntent>[],
+    );
+    double opacityOf(String text) => tester
+        .widget<Opacity>(
+          find
+              .ancestor(
+                of: find.text(text, findRichText: true),
+                matching: find.byType(Opacity),
+              )
+              .first,
+        )
+        .opacity;
+    expect(opacityOf('on it'), 1);
+    expect(opacityOf('Bash  cargo build'), lessThan(1));
+    // Open, or waiting on the user: at full strength.
+    expect(opacityOf('Bash  cargo test'), 1);
+    expect(opacityOf('Bash  rm -rf target'), 1);
+  });
+
   testWidgets('imported history is marked beside its time and dimmed', (
     tester,
   ) async {
@@ -246,6 +289,35 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(tester.getTopLeft(find.text('mine')), where);
+  });
+
+  testWidgets('rows in view leaving while scrolled back lay out cleanly', (
+    tester,
+  ) async {
+    // As conversation only does: the rows on screen go at once.
+    final timeline = holding([
+      for (var i = 0; i < 60; i++) row('s:$i', 'row $i'),
+    ]);
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: timeline,
+      sent: <GuiIntent>[],
+    );
+    await tester.scrollUntilVisible(
+      find.text('row 25'),
+      200,
+      scrollable: listScrollable(),
+    );
+    await tester.pumpAndSettle();
+
+    for (var i = 10; i < 50; i++) {
+      timeline.apply(TimelineUpdateRemoved(key: 's:$i'));
+    }
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('row 25'), findsNothing);
   });
 
   testWidgets('a tap expands or collapses an item; Download fetches its blob', (
@@ -1709,6 +1781,42 @@ void main() {
         const GuiIntentAct(action: ActionIntentViewContext(sessionId: 's1')),
       ]);
     });
+  });
+
+  testWidgets('conversation only switches from a header button that shows it', (
+    tester,
+  ) async {
+    const off = 'Conversation only: hide tool calls';
+    const on = 'Conversation only is on: show tool calls';
+    IconButton button(String tooltip) => tester.widget<IconButton>(
+      find.ancestor(
+        of: find.byTooltip(tooltip),
+        matching: find.byType(IconButton),
+      ),
+    );
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button(off).isSelected, isFalse);
+    expect(button(off).style, isNull);
+    await tester.tap(find.byTooltip(off));
+    expect(sent.last, const GuiIntentToggleConversationOnly());
+
+    await pumpSession(
+      tester,
+      screen: screenWith(conversationOnly: true),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button(on).isSelected, isTrue);
+    expect(button(on).style, isNotNull, reason: 'filled while on');
+    expect(find.byIcon(Icons.forum), findsOneWidget);
+    await tester.tap(find.byTooltip(on));
+    expect(sent.last, const GuiIntentToggleConversationOnly());
   });
 
   testWidgets('header actions and the rename prompt', (tester) async {

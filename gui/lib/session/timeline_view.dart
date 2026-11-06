@@ -475,8 +475,10 @@ class _HoldPhysics extends ScrollPhysics {
       shift();
 }
 
-/// A built row, registered by key while it is mounted so the timeline can
-/// find where it is.
+/// A built row, registered by key while it is in the tree so the timeline
+/// can find where it is. A removed row leaves at once, when it is
+/// deactivated: it is disposed only at the end of the frame, and asking
+/// it for its render object during that frame's layout fails.
 class _Slot extends StatefulWidget {
   const _Slot({
     required this.rowKey,
@@ -501,11 +503,17 @@ class _SlotState extends State<_Slot> {
   }
 
   @override
-  void dispose() {
+  void activate() {
+    super.activate();
+    widget.slots[widget.rowKey] = context;
+  }
+
+  @override
+  void deactivate() {
     if (identical(widget.slots[widget.rowKey], context)) {
       widget.slots.remove(widget.rowKey);
     }
-    super.dispose();
+    super.deactivate();
   }
 
   @override

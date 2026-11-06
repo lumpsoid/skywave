@@ -415,6 +415,9 @@ pub struct SessionScreen {
     pub snippets: Vec<SnippetView>,
     /// The rename prompt, while open (`RenameOpen`).
     pub rename_prompt: Option<RenamePrompt>,
+    /// Only the conversation shows: the timeline's rows leave out tool
+    /// calls, but one an approval waits on (`ToggleConversationOnly`).
+    pub conversation_only: bool,
 }
 
 /// The questions the stop confirmations ask, one per action.
