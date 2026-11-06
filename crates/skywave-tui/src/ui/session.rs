@@ -68,6 +68,9 @@ pub(super) fn render(
     if session.archived {
         title.push(Span::raw("· archived · a message brings it back ").dark_gray());
     }
+    if app.ui().conversation_only.on() {
+        title.push(Span::raw("· tool calls hidden · t shows them ").yellow());
+    }
     let block = Block::bordered().title(Line::from(title));
     let inner = block.inner(area);
     frame.render_widget(block, area);

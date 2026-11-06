@@ -1711,6 +1711,42 @@ void main() {
     });
   });
 
+  testWidgets('conversation only switches from a header button that shows it', (
+    tester,
+  ) async {
+    const off = 'Conversation only: hide tool calls';
+    const on = 'Conversation only is on: show tool calls';
+    IconButton button(String tooltip) => tester.widget<IconButton>(
+      find.ancestor(
+        of: find.byTooltip(tooltip),
+        matching: find.byType(IconButton),
+      ),
+    );
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button(off).isSelected, isFalse);
+    expect(button(off).style, isNull);
+    await tester.tap(find.byTooltip(off));
+    expect(sent.last, const GuiIntentToggleConversationOnly());
+
+    await pumpSession(
+      tester,
+      screen: screenWith(conversationOnly: true),
+      timeline: holding([]),
+      sent: sent,
+    );
+    expect(button(on).isSelected, isTrue);
+    expect(button(on).style, isNotNull, reason: 'filled while on');
+    expect(find.byIcon(Icons.forum), findsOneWidget);
+    await tester.tap(find.byTooltip(on));
+    expect(sent.last, const GuiIntentToggleConversationOnly());
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(

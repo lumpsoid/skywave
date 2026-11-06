@@ -24,9 +24,9 @@ use skywave_present::format::{
     offered_modes,
 };
 use skywave_present::policy::{
-    AlertWatcher, CompletionSettle, DraftSaver, ExpandFetch, PromptHistory, ReadMarker, Recall,
-    ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal, shell_stop,
-    stop_needs_confirmation, unanswered,
+    AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
+    ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
+    shell_stop, stop_needs_confirmation, unanswered,
 };
 use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
@@ -1426,6 +1426,13 @@ pub struct UiState {
     /// Ctrl-G asked for the next approval's session: it opens on the
     /// timeline, so `a`/`x` answer at once.
     pub jumped: bool,
+    /// `t` shows only the conversation, tool calls hidden, in every session
+    /// until pressed again. Each snapshot of the open session is narrowed
+    /// as it arrives, so the rest of the TUI sees what is on screen.
+    pub conversation_only: ConversationOnly,
+    /// `t` was pressed: [`App::toggle_conversation`] runs once the key is
+    /// handled, as the session's keys borrow the view it changes.
+    toggle_conversation: bool,
     pub quit: bool,
 }
 
@@ -1463,6 +1470,8 @@ impl App {
                 shell_alerts: ShellAlertWatcher::new(),
                 alert: None,
                 jumped: false,
+                conversation_only: ConversationOnly::default(),
+                toggle_conversation: false,
                 quit: false,
             },
         };
@@ -1484,7 +1493,10 @@ impl App {
     }
 
     /// Takes a new snapshot from the core.
-    pub fn set_view(&mut self, view: ViewState) {
+    pub fn set_view(&mut self, mut view: ViewState) {
+        if let Screen::Session(session) = &mut view.screen {
+            self.ui.conversation_only.narrow(session);
+        }
         if !needs_repair(&view.link) {
             self.ui.repair_dismissed = false;
         }
@@ -2140,7 +2152,13 @@ impl App {
                 KeyCode::Delete => dismissable(list).map(|p| Action::Discard(p.command_id)),
                 _ => None,
             },
-            Screen::Session(_) => self.session_key(key, ctrl),
+            Screen::Session(_) => {
+                let action = self.session_key(key, ctrl);
+                if std::mem::take(&mut self.ui.toggle_conversation) {
+                    self.toggle_conversation();
+                }
+                action
+            }
             Screen::Workdir(_) => self.workdir_key(key),
             Screen::Crop(_) => self.crop_key(key),
             Screen::Usage(_) => {
@@ -2720,6 +2738,10 @@ impl App {
                     session.step_turn(view, false);
                     None
                 }
+                KeyCode::Char('t') => {
+                    self.ui.toggle_conversation = true;
+                    None
+                }
                 KeyCode::End | KeyCode::Char('G') => {
                     session.shown.scroll = None;
                     None
@@ -2814,6 +2836,38 @@ impl App {
                 }
                 _ => None,
             },
+        }
+    }
+
+    /// `t`: shows only the conversation, or the whole timeline again. A
+    /// selection or scroll anchor on a call that hides moves to the
+    /// nearest message.
+    fn toggle_conversation(&mut self) {
+        let Screen::Session(view) = &mut self.view.screen else {
+            return;
+        };
+        let only = &mut self.ui.conversation_only;
+        only.toggle(Some(view));
+        self.ui.notice = Some(
+            if only.on() {
+                "conversation only: tool calls hidden · t shows them"
+            } else {
+                "tool calls shown"
+            }
+            .into(),
+        );
+        let Some(session) = self.ui.session.as_mut().filter(|s| s.id == view.id) else {
+            return;
+        };
+        session.shown.selected = session.shown.selected.and_then(|key| only.stand_in(key));
+        if let Some(anchor) = &mut session.shown.scroll
+            && let Some(key) = only.stand_in(anchor.key)
+            && key != anchor.key
+        {
+            *anchor = Anchor { key, offset: 0 };
+        }
+        if let Some(search) = &mut session.shown.search {
+            search.refresh(view, None);
         }
     }
 

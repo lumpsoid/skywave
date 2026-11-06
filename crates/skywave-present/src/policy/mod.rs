@@ -20,12 +20,15 @@
 //!   match.
 //! - [`ExpandFetch`]: the downloads expanded items need, each asked for
 //!   once, including blobs that arrive while the item is open.
+//! - [`ConversationOnly`]: the timeline narrowed to the conversation, tool
+//!   calls hidden, while the user has it on.
 //!
 //! And small decisions: [`unanswered`], [`dismissable`],
 //! [`looks_like_pair_uri`], [`shell_stop`], [`message_refusal`].
 
 mod alert;
 mod completion;
+mod conversation;
 mod draft;
 mod expand;
 mod history;
@@ -37,6 +40,7 @@ pub use alert::{
     Alert, AlertUpdate, AlertWatcher, ShellAlertWatcher, ShellNotice, TITLE_MAX, sanitise,
 };
 pub use completion::CompletionSettle;
+pub use conversation::{ConversationOnly, in_conversation};
 pub use draft::{DRAFT_SAVE_AFTER, DraftSaver, message_refusal};
 pub use expand::ExpandFetch;
 pub use history::{PromptHistory, Recall};

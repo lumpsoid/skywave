@@ -5477,6 +5477,62 @@ fn turn_stepping_lands_on_the_user_message() {
     assert_eq!(selected(&h), Some(ItemKey::Pending(three)));
 }
 
+#[test]
+fn t_hides_tool_calls_until_pressed_again() {
+    let (mut h, id, me) = open_session();
+    let (read, write) = (CallId::new(), CallId::new());
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, user(me, "go")),
+            event(
+                id,
+                2,
+                EventKind::ToolCall(call(read, "Read", ToolKind::FileRead, "a.txt")),
+            ),
+            event(id, 2, EventKind::ToolResult(result(read, false, "", "x"))),
+            event(id, 3, agent("read it")),
+            event(
+                id,
+                4,
+                EventKind::ToolCall(call(write, "Write", ToolKind::FileWrite, "b.txt")),
+            ),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(6))));
+    assert_contains(&h.screen(), "Write b.txt");
+
+    h.key(KeyCode::Char('t'));
+    let screen = h.screen();
+    assert!(!screen.contains("Read a.txt"), "{screen}");
+    assert!(!screen.contains("Write b.txt"), "{screen}");
+    assert_contains(&screen, "tool calls hidden · t shows them");
+    // The selection was on the hidden write: it moves to the message above.
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(5))));
+    h.key(KeyCode::Up);
+    assert_eq!(selected(&h), Some(ItemKey::Logged(Seq(2))));
+
+    // A call arriving while hidden stays hidden.
+    let more = CallId::new();
+    pull(
+        &mut h,
+        vec![event(
+            id,
+            5,
+            EventKind::ToolCall(call(more, "Bash", ToolKind::Shell, "make")),
+        )],
+    );
+    assert!(!h.screen().contains("make"));
+
+    h.key(KeyCode::Char('t'));
+    let screen = h.screen();
+    assert_contains(&screen, "Read a.txt");
+    assert_contains(&screen, "Bash make");
+    assert!(!screen.contains("tool calls hidden"), "{screen}");
+}
+
 /// The footer line of the screen.
 fn footer(h: &Harness) -> String {
     h.screen().lines().last().unwrap().trim_end().to_owned()
