@@ -60,8 +60,13 @@ cargo test --workspace
 
 ## Rules
 
-- Alpha, with no release. Nothing earlier is supported: no old clients, data or
-  protocol versions. Don't add compatibility layers.
+- A protocol bump migrates stored data (D43). Since `MIGRATED_SINCE` (v23)
+  every `PROTOCOL_VERSION` bump adds one step to `PROTOCOL_STEPS` in both
+  `skywaved/src/db.rs` and `skywave-core/src/store.rs`, rewriting the
+  stored wire JSON from the previous version (a no-op that says so if
+  nothing stored changed). Test each step on data the previous version
+  wrote. The wire still needs an exact match: no compatibility layer for
+  old clients.
 - If code changes what `docs/architecture.md` (or another doc) says, update
   it in the same commit and say so in the report.
 - Agent-agnostic naming outside `src/agent/claude_code/` (D3).

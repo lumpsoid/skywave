@@ -7,10 +7,12 @@
 //! moves the schema from version `i` to `i + 1`. Append new migrations; never
 //! edit a released one.
 //!
-//! The JSON columns hold wire JSON, which a migration does not rewrite, so
-//! the database is also stamped with the `PROTOCOL_VERSION` that created it
-//! (`protocol_stamp`), and opening one stamped with another version fails
-//! with [`Error::ProtocolMismatch`] before anything reads it.
+//! The JSON columns hold wire JSON, which a schema migration does not
+//! rewrite, so the database is also stamped with the `PROTOCOL_VERSION` its
+//! JSON is in (`protocol_stamp`). Opening one stamped with an older version
+//! since [`MIGRATED_SINCE`] runs the [`PROTOCOL_STEPS`] from it (D43); any
+//! other stamp fails with [`Error::ProtocolMismatch`] before anything reads
+//! it.
 //!
 //! Column conventions: ids are hyphenated UUID text, timestamps are RFC 3339
 //! UTC text, `JSON` columns hold the serde_json encoding of the named
@@ -20,7 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use skywave_proto::{LogId, PROTOCOL_VERSION};
+use skywave_proto::{LogId, MIGRATED_SINCE, PROTOCOL_VERSION};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -423,6 +425,17 @@ const STAMPED_SINCE: u32 = 13;
 /// Schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
+/// Rewrites the wire JSON the database holds from one `PROTOCOL_VERSION` to
+/// the next. It runs in the open's write transaction, after the schema
+/// migrations, so it reads the current schema.
+type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
+
+/// Step `i` moves the stored wire JSON from protocol version
+/// `MIGRATED_SINCE + i` to the next (D43). Every bump adds one, a no-op
+/// saying so if nothing stored changed; the length makes a bump without one
+/// fail to compile. Append; never edit a released one.
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [];
+
 /// An open, migrated database connection.
 #[derive(Debug)]
 pub struct Db {
@@ -537,23 +550,23 @@ impl Db {
             .map_err(|e| Error::Corrupt(format!("log id {text:?}: {e}")))
     }
 
-    /// The protocol version the database was written with
-    /// (`protocol_stamp`); [`Db::open`] refuses any other.
+    /// The protocol version the database's wire JSON is in
+    /// (`protocol_stamp`); [`Db::open`] migrates it to this build's.
     pub fn protocol_version(&self) -> Result<u32> {
         stamped_protocol(&self.conn)?
             .ok_or_else(|| Error::Corrupt("protocol_stamp has no row".into()))
     }
 
-    /// Migrates the schema and checks the protocol stamp, before anything
-    /// reads a JSON column: a database written by another protocol version
-    /// is refused untouched, as its stored wire JSON may not parse.
+    /// Migrates the schema, then the stored wire JSON, checking the protocol
+    /// stamp before anything reads a JSON column: a database this build
+    /// cannot migrate is refused untouched, as its wire JSON may not parse.
     fn migrate(&mut self, path: &Path) -> Result<()> {
         // Fast path without a write lock, so admin commands don't contend
-        // with a running `serve` once the schema is current.
+        // with a running `serve` once the database is current.
         let found = user_version(&self.conn)?;
         check_supported(found)?;
-        if found == SCHEMA_VERSION {
-            return check_protocol(&self.conn, path);
+        if found == SCHEMA_VERSION && check_protocol(&self.conn, path)? == PROTOCOL_VERSION {
+            return Ok(());
         }
         // IMMEDIATE takes the write lock up front; re-read the version under
         // it in case another process migrated in between.
@@ -562,12 +575,17 @@ impl Db {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let found = user_version(&tx)?;
         check_supported(found)?;
-        if found >= STAMPED_SINCE {
-            check_protocol(&tx, path)?;
-        }
+        let stamp = if found >= STAMPED_SINCE {
+            Some(check_protocol(&tx, path)?)
+        } else {
+            None
+        };
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
             tracing::info!(from = i, to = i + 1, "migrating database schema");
             tx.execute_batch(sql)?;
+        }
+        if let Some(stamp) = stamp {
+            migrate_protocol(&tx, stamp, &PROTOCOL_STEPS)?;
         }
         // A fresh database, or one from before the stamp, gets this build's.
         tx.execute(
@@ -596,11 +614,11 @@ fn stamped_protocol(conn: &Connection) -> Result<Option<u32>> {
         .optional()?)
 }
 
-/// Refuses a database whose stamp is not [`PROTOCOL_VERSION`] (alpha: old
-/// data is not migrated, the operator wipes the data dir).
-fn check_protocol(conn: &Connection, path: &Path) -> Result<()> {
+/// The database's protocol stamp, refusing one this build cannot migrate:
+/// older than [`MIGRATED_SINCE`], or written by a newer build.
+fn check_protocol(conn: &Connection, path: &Path) -> Result<u32> {
     match stamped_protocol(conn)? {
-        Some(PROTOCOL_VERSION) => Ok(()),
+        Some(found) if (MIGRATED_SINCE..=PROTOCOL_VERSION).contains(&found) => Ok(found),
         Some(found) => Err(Error::ProtocolMismatch {
             path: path.to_owned(),
             found,
@@ -611,6 +629,26 @@ fn check_protocol(conn: &Connection, path: &Path) -> Result<()> {
             path.display()
         ))),
     }
+}
+
+/// Runs the `steps` from protocol version `stamp` on and restamps the
+/// database with the version they end at.
+fn migrate_protocol(
+    tx: &rusqlite::Transaction<'_>,
+    stamp: u32,
+    steps: &[ProtocolStep],
+) -> Result<()> {
+    let first = (stamp - MIGRATED_SINCE) as usize;
+    for (i, step) in steps.iter().enumerate().skip(first) {
+        let from = MIGRATED_SINCE + i as u32;
+        tracing::info!(from, to = from + 1, "migrating stored protocol data");
+        step(tx)?;
+    }
+    tx.execute(
+        "UPDATE protocol_stamp SET version = ?1 WHERE id = 1",
+        [MIGRATED_SINCE + steps.len() as u32],
+    )?;
+    Ok(())
 }
 
 fn check_supported(found: u32) -> Result<()> {
@@ -789,11 +827,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_database_of_another_protocol_version() {
+    fn rejects_a_database_of_a_protocol_version_it_cannot_migrate() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skywave.db");
         drop(Db::open(&path).unwrap());
-        for other in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        for other in [MIGRATED_SINCE - 1, PROTOCOL_VERSION + 1] {
             restamp(&path, other);
             let err = Db::open(&path).unwrap_err();
             assert!(
@@ -820,6 +858,53 @@ mod tests {
         // Positive control: restamped with this build's version, it opens.
         restamp(&path, PROTOCOL_VERSION);
         assert!(Db::open(&path).is_ok());
+    }
+
+    /// A database stamped with any version it migrates opens restamped,
+    /// through the fast path's check too (the schema is current).
+    #[test]
+    // Empty until the first bump after MIGRATED_SINCE.
+    #[allow(clippy::reversed_empty_ranges)]
+    fn opens_a_database_of_every_migrated_protocol_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        for older in MIGRATED_SINCE..PROTOCOL_VERSION {
+            restamp(&path, older);
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                db.protocol_version().unwrap(),
+                PROTOCOL_VERSION,
+                "from {older}"
+            );
+        }
+    }
+
+    /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records
+    /// that it ran.
+    const TEST_STEPS: [ProtocolStep; 3] = [
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (0)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (1)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (2)", []).map(drop)?),
+    ];
+
+    #[test]
+    fn protocol_steps_run_from_the_stamp_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let tx = db.conn_mut().transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE ran (step INTEGER)")
+            .unwrap();
+        migrate_protocol(&tx, MIGRATED_SINCE + 1, &TEST_STEPS).unwrap();
+        let ran: Vec<u32> = tx
+            .prepare("SELECT step FROM ran ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ran, [1, 2], "from the stamp's step on, in order");
+        assert_eq!(stamped_protocol(&tx).unwrap(), Some(MIGRATED_SINCE + 3));
     }
 
     /// A v12 database, from before the stamp, gets this build's protocol

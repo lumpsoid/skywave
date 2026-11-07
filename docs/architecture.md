@@ -128,7 +128,9 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 but pairing authenticated by the device's client certificate. The types'
 doc comments are the reference; `PROTOCOL_VERSION`'s lists what each
 version changed. Client and server must match it exactly (checked at
-`hello`); there is no compatibility layer. The device reads the hello's
+`hello`); there is no compatibility layer on the wire. Stored data does
+carry over a bump: both the server's database and a device's replica
+migrate from any version since `MIGRATED_SINCE` (D43). The device reads the hello's
 `protocol_version` alone before decoding the rest, so a server of another
 version, whatever its hello's other fields, is a protocol mismatch rather
 than an unreadable reply; that one field must keep its name and type in
@@ -246,12 +248,16 @@ collected between the two copies can be missing; fetching it fails until a
 refresh of its read replaces it. Copying with `serve` stopped is exact
 (README, "Running it as a service").
 
-Opening the database migrates its schema (`PRAGMA user_version`), but no
-migration rewrites the wire JSON its columns hold. So the database records
-the `PROTOCOL_VERSION` it was created with, and `serve` and the admin
-commands refuse one written by another version, before reading it, with an
-error telling the operator to delete the data directory (alpha: old data is
-not migrated). A database from before the stamp takes the current version.
+Opening the database migrates its schema (`PRAGMA user_version`); no
+schema migration rewrites the wire JSON its columns hold. So the database
+records the `PROTOCOL_VERSION` its JSON is in (`protocol_stamp`), and
+opening it then runs the protocol steps (`PROTOCOL_STEPS` in `db.rs`, one
+per version since `MIGRATED_SINCE`) from that version on, in the same
+transaction as the schema migrations and after them, and restamps it
+(D43). `serve` and the admin commands refuse a database stamped before
+`MIGRATED_SINCE` or after this build's version, before reading it, with an
+error naming the versions it reads. A database from before the stamp takes
+the current version.
 The database also holds its log's identity (`log_identity`, a `LogId`
 minted with it), and every `serve` is a new run (`RunId`), recorded in
 `log_runs` with the head it started from, in one statement. The record is
@@ -642,12 +648,14 @@ skywave client is using <dir>"), which the heads show; otherwise both would
 hit SQLite busy errors and each model would go stale against the other's
 writes.
 
-The replica, like the server's database, records the `PROTOCOL_VERSION` it
-was created with (`protocol_stamp`; one from before the stamp takes the
-current one). `Core::open` fails with `CoreError::ReplicaUnreadable` when
-the stamp differs, the schema is newer, the file is damaged, or a row it
-loads no longer decodes (`StoreError::unreadable`), instead of reading
-wire JSON another build wrote. Nothing migrates such a replica (alpha).
+The replica, like the server's database, records the `PROTOCOL_VERSION`
+its JSON is in (`protocol_stamp`; one from before the stamp takes the
+current one), and opening it runs its own protocol steps (`PROTOCOL_STEPS`
+in `store.rs`) from that version on, the outbox's unsent commands included
+(D43). `Core::open` fails with `CoreError::ReplicaUnreadable` when the
+stamp is before `MIGRATED_SINCE` or after this build's version, the schema
+is newer, the file is damaged, or a row it loads no longer decodes
+(`StoreError::unreadable`), instead of reading wire JSON it cannot migrate.
 `Core::reset_replica(data_dir)` needs no open core, only the data dir's
 lock: it drops what the server's log produced (events and their
 projections, cursor, outbox, blob rows and files, workdir answers, offered
