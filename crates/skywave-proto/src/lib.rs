@@ -139,6 +139,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `output_blob` on [`ShellRunStorage`], the run's blob a device acts on.
 pub const PROTOCOL_VERSION: u32 = 23;
 
+/// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
+/// a device's replica) this build migrates (D43). Each later version has
+/// one migration step on each side, from the version before it, and a bump
+/// does not compile until both have one. Data from before it is refused.
+pub const MIGRATED_SINCE: u32 = 23;
+
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*

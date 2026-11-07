@@ -1083,3 +1083,31 @@ event alike, whichever device decided); uploading the kept bytes (large, and
 untrusted); rewriting or dropping the referencing event (the log is
 append-only; compaction, task 899242, is where history shrinks); cropping
 running shell output (no blob yet; its progress events are bounded).
+
+## D43. A protocol bump migrates stored data; the wire still matches exactly
+Until v23 a bump made every server database and replica unreadable, and the
+fix was to delete them (the alpha stance). From v23 on (decided by the user
+on 2026-11-07), upgrading keeps the data:
+- **Stored data migrates; the wire does not.** Client and server still
+  match `PROTOCOL_VERSION` exactly at `hello`; you upgrade both. What a
+  new build reads from the old data is migrated: the server's database
+  and a device's replica, the outbox's unsent commands included.
+- **One step per version, on each side, chained.** `MIGRATED_SINCE`
+  (`skywave-proto`, 23) is the oldest version migrated. `db.rs` and
+  `store.rs` each hold `PROTOCOL_STEPS`, an array whose length is
+  `PROTOCOL_VERSION - MIGRATED_SINCE`, so a bump does not compile until
+  both sides have a step for it. Step `i` rewrites the stored wire JSON
+  from `MIGRATED_SINCE + i` to the next; a bump that changes nothing stored
+  adds a no-op that says so. Opening runs the steps from the stamp on, in
+  the schema migrations' transaction and after them, then restamps.
+- **Both sides rewrite events alike.** The replica holds the server's
+  events by seq; a step that changes `Event` JSON must change it the same
+  way on both sides, so that transform lives in `skywave-proto` and both
+  steps call it.
+- **Refused, untouched:** a stamp before `MIGRATED_SINCE` (from before this
+  decision) or after this build's version (a downgrade).
+**Rejected:** speaking the previous version to devices not yet upgraded (a
+wire compatibility layer, much larger, not needed while one person runs
+both sides); resetting the replica instead of migrating it (it would drop
+unsent commands); migrating only from the previous version (a skipped
+release would again mean deleting data).

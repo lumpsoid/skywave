@@ -1338,7 +1338,27 @@ fn stamp(dir: &Path) -> Vec<u32> {
 }
 
 #[test]
-fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() {
+// Empty until the first bump after MIGRATED_SINCE.
+#[allow(clippy::reversed_empty_ranges)]
+fn a_replica_of_every_migrated_protocol_version_opens_restamped() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    for older in skywave_proto::MIGRATED_SINCE..skywave_core::PROTOCOL_VERSION {
+        let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+        conn.execute("UPDATE protocol_stamp SET version = ?1", [older])
+            .unwrap();
+        drop(conn);
+        drop(Store::open(&dir).unwrap());
+        assert_eq!(
+            stamp(&dir),
+            vec![skywave_core::PROTOCOL_VERSION],
+            "from {older}"
+        );
+    }
+}
+
+#[test]
+fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_cannot_migrate() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
@@ -1347,7 +1367,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_another() 
 
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     for other in [
-        skywave_core::PROTOCOL_VERSION - 1,
+        skywave_proto::MIGRATED_SINCE - 1,
         skywave_core::PROTOCOL_VERSION + 1,
     ] {
         conn.execute("UPDATE protocol_stamp SET version = ?1", [other])

@@ -21,8 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, ContentHash,
-    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, ModelChoice,
-    PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
+    ContextId, DeviceId, DeviceInfo, Event, EventBatch, EventKind, LogId, LogRun, MIGRATED_SINCE,
+    ModelChoice, PROTOCOL_VERSION, RunId, RunsSince, Seq, SessionId,
 };
 use uuid::Uuid;
 
@@ -371,6 +371,18 @@ const STAMPED_SINCE: i64 = 21;
 /// Highest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
+/// Rewrites the wire JSON the replica holds (events, the outbox's commands,
+/// ...) from one `PROTOCOL_VERSION` to the next. It runs in the open's
+/// transaction, after the schema migrations, so it reads the current schema.
+type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
+
+/// Step `i` moves the stored wire JSON from protocol version
+/// `MIGRATED_SINCE + i` to the next (D43), as the server's step of the same
+/// bump moves its log. Every bump adds one, a no-op saying so if nothing
+/// stored changed; the length makes a bump without one fail to compile.
+/// Append; never edit a released one.
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [];
+
 /// The files SQLite keeps beside [`DB_FILE`] in WAL mode.
 const WAL_FILES: [&str; 2] = ["core.db-wal", "core.db-shm"];
 
@@ -392,10 +404,14 @@ pub enum StoreError {
     },
     #[error("database schema version {found} is newer than supported version {SCHEMA_VERSION}")]
     NewerSchema { found: i64 },
-    /// The replica was written by a build of another protocol version,
-    /// whose stored wire JSON this build may not read (alpha: never
-    /// migrated; [`Store::reset_replica`] starts it again).
-    #[error("the replica was written for protocol version {found}, this build speaks {current}")]
+    /// The replica was written by a protocol version this build cannot
+    /// migrate (older than `MIGRATED_SINCE`, or newer than its own), whose
+    /// stored wire JSON it may not read; [`Store::reset_replica`] starts it
+    /// again.
+    #[error(
+        "the replica was written for protocol version {found}, this build migrates versions {} to {current}",
+        MIGRATED_SINCE
+    )]
     ProtocolMismatch { found: u32, current: u32 },
     /// The replica breaks an invariant of its own schema.
     #[error("the replica is corrupt: {0}")]
@@ -741,8 +757,9 @@ impl Store {
     /// nothing is in flight after a restart, and the server dedups the
     /// resend (D7). Their `tries` are kept: they may have gone out.
     ///
-    /// A replica stamped with another `PROTOCOL_VERSION` is refused with
-    /// [`StoreError::ProtocolMismatch`] before anything reads it.
+    /// A replica stamped with an older `PROTOCOL_VERSION` since
+    /// `MIGRATED_SINCE` is migrated to this build's; any other is refused
+    /// with [`StoreError::ProtocolMismatch`] before anything reads it.
     pub fn open(data_dir: &Path) -> Result<Store, StoreError> {
         Store::init(connect(data_dir)?)
     }
@@ -1919,7 +1936,8 @@ fn connect(data_dir: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// Whether [`migrate`] refuses a replica of another protocol version.
+/// Whether [`migrate`] migrates the stored wire JSON from the replica's
+/// protocol stamp, refusing one it cannot migrate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stamp {
     Check,
@@ -1941,9 +1959,9 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
         return Err(StoreError::NewerSchema { found });
     }
     // Before any migration reads the stored JSON.
-    if stamp == Stamp::Check && found >= STAMPED_SINCE {
+    let protocol = if stamp == Stamp::Check && found >= STAMPED_SINCE {
         match stamped_protocol(tx)? {
-            Some(PROTOCOL_VERSION) => {}
+            Some(found) if (MIGRATED_SINCE..=PROTOCOL_VERSION).contains(&found) => Some(found),
             Some(found) => {
                 return Err(StoreError::ProtocolMismatch {
                     found,
@@ -1952,10 +1970,15 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
             }
             None => return Err(StoreError::Corrupt("protocol_stamp has no row")),
         }
-    }
+    } else {
+        None
+    };
     let start = usize::try_from(found).unwrap_or(0);
     for script in &MIGRATIONS[start..] {
         tx.execute_batch(script)?;
+    }
+    if let Some(protocol) = protocol {
+        migrate_protocol(tx, protocol, &PROTOCOL_STEPS)?;
     }
     // A fresh replica, or one from before the stamp, gets this build's.
     tx.execute(
@@ -1963,6 +1986,26 @@ fn migrate_in(tx: &Transaction<'_>, stamp: Stamp) -> Result<(), StoreError> {
         [PROTOCOL_VERSION],
     )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Runs the `steps` from protocol version `stamp` on and restamps the
+/// replica with the version they end at.
+fn migrate_protocol(
+    tx: &Transaction<'_>,
+    stamp: u32,
+    steps: &[ProtocolStep],
+) -> Result<(), StoreError> {
+    let first = (stamp - MIGRATED_SINCE) as usize;
+    for (i, step) in steps.iter().enumerate().skip(first) {
+        let from = MIGRATED_SINCE + i as u32;
+        tracing::info!(from, to = from + 1, "migrating the replica's protocol data");
+        step(tx)?;
+    }
+    tx.execute(
+        "UPDATE protocol_stamp SET version = ?1 WHERE id = 1",
+        [MIGRATED_SINCE + steps.len() as u32],
+    )?;
     Ok(())
 }
 
@@ -2478,4 +2521,35 @@ fn u64_sql(value: u64) -> Result<i64, StoreError> {
 fn path_sql(path: &Path) -> Result<&str, StoreError> {
     path.to_str()
         .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Steps that each record that they ran.
+    const TEST_STEPS: [ProtocolStep; 3] = [
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (0)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (1)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (2)", []).map(drop)?),
+    ];
+
+    #[test]
+    fn protocol_steps_run_from_the_stamp_on() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn, Stamp::Check).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE ran (step INTEGER)")
+            .unwrap();
+        migrate_protocol(&tx, MIGRATED_SINCE + 1, &TEST_STEPS).unwrap();
+        let ran: Vec<u32> = tx
+            .prepare("SELECT step FROM ran ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ran, [1, 2], "from the stamp's step on, in order");
+        assert_eq!(stamped_protocol(&tx).unwrap(), Some(MIGRATED_SINCE + 3));
+    }
 }
