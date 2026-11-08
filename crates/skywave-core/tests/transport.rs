@@ -17,6 +17,7 @@ use skywave_proto::{
     FileResult, HelloResponse, ListResult, OutsideConversation, PROTOCOL_VERSION, Seq, SessionId,
     WorkdirQuery,
 };
+use skywave_testkit::{LinkProfile, LinkProxy, Rng, seed};
 use skywaved::agent::fake::FakeOutside;
 use skywaved::agent::{self, Listed};
 use skywaved::identity::ServerIdentity;
@@ -518,9 +519,24 @@ impl Drop for SlowLink {
     }
 }
 
-/// A session with `messages` user messages of `len` bytes each: an events
-/// body of about `messages * len` bytes.
+/// A session with `messages` user messages of `len` random letters and
+/// digits each: an events body of about `messages * len` bytes that
+/// compresses (D45) only to some three quarters of that.
 async fn big_log(transport: &HttpsTransport, fx: &Fixture, messages: usize, len: usize) -> Seq {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = Rng::new(messages as u64);
+    let texts = (0..messages)
+        .map(|_| {
+            (0..len)
+                .map(|_| char::from(ALPHABET[rng.below(ALPHABET.len() as u64) as usize]))
+                .collect()
+        })
+        .collect();
+    log_of(transport, fx, texts).await
+}
+
+/// A session with one user message of each of `texts`; the last seq.
+async fn log_of(transport: &HttpsTransport, fx: &Fixture, texts: Vec<String>) -> Seq {
     let create = Command {
         id: CommandId::new(),
         kind: CommandKind::CreateSession {
@@ -540,13 +556,13 @@ async fn big_log(transport: &HttpsTransport, fx: &Fixture, messages: usize, len:
         .await
         .unwrap();
     let session_id = batch.events[0].session_id;
-    for i in 0..messages {
+    for text in texts {
         let send = Command {
             id: CommandId::new(),
             kind: CommandKind::SendMessage {
                 session_id,
                 context: ContextId::first_of(session_id),
-                text: format!("{i}").repeat(len),
+                text,
             },
         };
         let CommandResult::Accepted { seq: sent } = transport.send_command(&send).await.unwrap()
@@ -558,6 +574,49 @@ async fn big_log(transport: &HttpsTransport, fx: &Fixture, messages: usize, len:
     seq
 }
 
+/// D45: an events batch comes compressed, a fraction of its size on the
+/// wire, and decodes to the events the log holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_events_batch_comes_compressed() {
+    let fx = Fixture::start().await;
+    let (_data, identity) = paired_identity(&fx).await;
+    let direct =
+        HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
+    let texts: Vec<String> = (0..5)
+        .map(|i| format!("line {i} of a long paste\n").repeat(2000))
+        .collect();
+    let last = log_of(&direct, &fx, texts.clone()).await;
+
+    let upstream = std::net::SocketAddr::from(([127, 0, 0, 1], fx.port));
+    let link = LinkProxy::start(upstream, LinkProfile::clean(), seed()).await;
+    let transport =
+        HttpsTransport::new(&link.address(), &identity, config(), ExpectedRun::default()).unwrap();
+    let batch = transport
+        .events(EventsQuery {
+            after: Seq::ZERO,
+            wait: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch.last(), Some(last));
+    let sent: Vec<&str> = batch
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, texts);
+    let raw: usize = texts.iter().map(String::len).sum();
+    let down = link.stats().bytes_down;
+    assert!(
+        down < raw as u64 / 10,
+        "{down} bytes on the wire for {raw} of messages"
+    );
+}
+
 /// An events batch whose body takes longer to arrive than the request
 /// timeout, but whose every chunk arrives within it, is read whole: a slow
 /// but live link catches up instead of re-pulling the same batch forever.
@@ -567,7 +626,7 @@ async fn a_slow_events_body_arrives_whole() {
     let (_data, identity) = paired_identity(&fx).await;
     let direct =
         HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
-    let last = big_log(&direct, &fx, 5, 20 * 1024).await;
+    let last = big_log(&direct, &fx, 5, 32 * 1024).await;
 
     let link = SlowLink::start(fx.port, None).await;
     let slow = TransportConfig {
@@ -602,7 +661,7 @@ async fn a_stalled_events_body_times_out() {
     let (_data, identity) = paired_identity(&fx).await;
     let direct =
         HttpsTransport::new(&fx.addr, &identity, config(), ExpectedRun::default()).unwrap();
-    big_log(&direct, &fx, 5, 20 * 1024).await;
+    big_log(&direct, &fx, 5, 32 * 1024).await;
 
     // Past the handshake and the response head, well short of the body.
     let link = SlowLink::start(fx.port, Some(40 * 1024)).await;

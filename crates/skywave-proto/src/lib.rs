@@ -145,6 +145,8 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// text as a [`BlobUse::Message`] blob of a message longer than
 /// [`limits::MESSAGE_WHOLE_MAX_BYTES`], whose `text` is then its first
 /// [`limits::MESSAGE_PREVIEW_MAX_BYTES`].
+/// Compressed transport ([`encoding`]): event batches and blob bodies as
+/// zstd frames when asked for, blob ranges counting decoded bytes.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
@@ -2541,9 +2543,65 @@ pub mod path {
     }
 }
 
+/// Transport compression of event batches and blob bodies (D45).
+///
+/// A request that sends `Accept-Encoding: zstd` ([`ZSTD`]) gets a body of
+/// at least [`COMPRESS_MIN_BYTES`] from `GET` [`path::EVENTS`] or a blob
+/// download as one zstd frame, with `Content-Encoding: zstd`; a shorter
+/// body, or a request that does not ask, gets the bytes as they are. A
+/// batch's frame is sent whole, with its `Content-Length`; a blob's is
+/// streamed as it is made, without one. The frame is the transport's alone: hashes,
+/// sizes and progress all count the decoded bytes.
+///
+/// A blob's `Range` and `Content-Range` count decoded bytes too, unlike
+/// plain HTTP (where a range of a `Content-Encoding` counts encoded ones):
+/// a resumed download asks for the decoded bytes from where its `.part`
+/// file ends, and the server compresses exactly that range as a fresh
+/// frame. A compressed blob response names its decoded length in
+/// [`DECODED_LENGTH_HEADER`].
+pub mod encoding {
+    /// The `Accept-Encoding` and `Content-Encoding` token: one zstd frame.
+    pub const ZSTD: &str = "zstd";
+    /// Bodies shorter than this travel uncompressed: a frame's overhead
+    /// and the CPU would buy nothing on them.
+    pub const COMPRESS_MIN_BYTES: u64 = 1024;
+    /// On a compressed blob response, the number of decoded bytes its
+    /// frame holds: the blob's size for a 200, the range's length for a
+    /// 206 (which `Content-Range` also gives).
+    pub const DECODED_LENGTH_HEADER: &str = "skywave-decoded-length";
+
+    /// Whether an `Accept-Encoding` value lists [`ZSTD`] (any weight but
+    /// an explicit `q=0`).
+    pub fn accepts_zstd(accept_encoding: &str) -> bool {
+        accept_encoding.split(',').any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            parts
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(ZSTD))
+                && !parts.any(|param| {
+                    param
+                        .strip_prefix("q=")
+                        .and_then(|q| q.parse::<f32>().ok())
+                        .is_some_and(|q| q == 0.0)
+                })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_encoding_lists_zstd() {
+        use encoding::accepts_zstd;
+        for yes in ["zstd", "gzip, zstd", "ZSTD;q=0.5", " br , zstd ; q=1"] {
+            assert!(accepts_zstd(yes), "{yes}");
+        }
+        for no in ["", "gzip", "zstdx", "zstd;q=0", "zstd; q=0.0", "identity"] {
+            assert!(!accepts_zstd(no), "{no}");
+        }
+    }
 
     #[test]
     fn seq_next_saturates_instead_of_overflowing() {

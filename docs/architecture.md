@@ -93,6 +93,23 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
   server computes as it stores the blob; a device accepts no bytes that do
   not hash to it.
 - **Transport** sits behind a `Transport` trait: HTTPS today, QUIC later.
+- **Compression** (D45, `skywave_proto::encoding`): an event batch or a
+  blob body of at least 1 KiB (`COMPRESS_MIN_BYTES`) travels as one zstd
+  frame (level 3) to a request that sends `Accept-Encoding: zstd`, which
+  the device's every request does; a shorter body, or a request that does
+  not ask (curl, the server's own tests), gets the bytes as they are. The
+  transport decodes it, so everything above it (sizes, hashes, download
+  progress, `.part` offsets) counts decoded bytes. A blob's `Range` and
+  `Content-Range` count decoded bytes too, unlike plain HTTP: a resumed
+  download asks for the rest from its decoded offset and the server
+  compresses that range as a fresh frame, so nothing compressed is stored.
+  The decoder emits only bytes of the content, in order (a compressed
+  block once all of it arrived, a raw one possibly as it streams in), so
+  what a cut download got is a correct start of the content and resumes
+  from there. A compressed blob response is streamed with no
+  `Content-Length` and names its decoded length in
+  `skywave-decoded-length`; a compressed batch is sent whole, with the
+  frame's `Content-Length`.
 - **Slowest link:** an event batch or blob body is timed per chunk, not as
   a whole, so a slow link that keeps delivering bytes finishes. A chunk is
   one TLS record (up to 16 KB) and must arrive within `request_timeout`
@@ -142,8 +159,8 @@ every version.
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
 | `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
-| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. |
-| `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
+| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
+| `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -822,7 +839,7 @@ logs) an event that no longer decodes rather than failing.
   after a confirmation; the TUI says to restart with `--reset-replica`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
   link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
-  the recorded progress (each progress report follows an fsync, so a
+  the recorded progress (decoded bytes, D45; each progress report follows an fsync, so a
   power loss never resumes past durable bytes), verified by size and by
   the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
   renamed when complete. A blob already whole on disk (an empty one always

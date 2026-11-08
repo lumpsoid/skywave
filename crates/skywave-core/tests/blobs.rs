@@ -26,6 +26,7 @@ use skywave_proto::{
     BlobId, BlobRef, Command, CommandId, CommandKind, CommandResult, Event, EventBatch, EventKind,
     EventsQuery, Full, HelloResponse, ImportedItem, LineSpan, Seq, SessionId,
 };
+use skywave_testkit::Rng;
 use skywaved::agent::fake::{FakeAgent, FakeOutside, FakeScript, Step};
 use skywaved::agent::{AdapterEvent, AgentCallId, HistoryItem, HistoryRead, ResultDisplay};
 use skywaved::identity::ServerIdentity;
@@ -251,6 +252,22 @@ fn big_output(len: usize, seed: u8) -> String {
         .collect()
 }
 
+/// `len` bytes of random hex text in lines, from `seed`: text, so it
+/// compresses, but only about by half, so its frame stays large on the
+/// wire where [`big_output`]'s shrinks to almost nothing.
+fn noisy_output(len: usize, seed: u64) -> String {
+    let mut rng = Rng::new(seed);
+    (0..len)
+        .map(|i| {
+            if i % 80 == 79 {
+                '\n'
+            } else {
+                char::from(b"0123456789abcdef"[rng.below(16) as usize])
+            }
+        })
+        .collect()
+}
+
 // ---- proxy ------------------------------------------------------------------
 
 /// A TCP proxy in front of the server. Once armed with
@@ -260,6 +277,8 @@ struct Proxy {
     addr: String,
     /// Bytes after which to cut, 0 when disarmed.
     cut_after: Arc<AtomicU64>,
+    /// Bytes relayed to the client, every connection together.
+    down: Arc<AtomicU64>,
     live: Arc<Mutex<Vec<AbortHandle>>>,
     task: JoinHandle<()>,
 }
@@ -269,14 +288,17 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let cut_after = Arc::new(AtomicU64::new(0));
+        let down_total = Arc::new(AtomicU64::new(0));
         let live = Arc::new(Mutex::new(Vec::<AbortHandle>::new()));
-        let (accept_cut, accept_live) = (cut_after.clone(), live.clone());
+        let (accept_cut, accept_down, accept_live) =
+            (cut_after.clone(), down_total.clone(), live.clone());
         let task = tokio::spawn(async move {
             loop {
                 let Ok((inbound, _)) = listener.accept().await else {
                     return;
                 };
                 let cut = accept_cut.clone();
+                let down_total = accept_down.clone();
                 let pipe = tokio::spawn(async move {
                     let Ok(outbound) = TcpStream::connect(upstream).await else {
                         return;
@@ -305,6 +327,7 @@ impl Proxy {
                             if client_tx.write_all(&buf[..n]).await.is_err() {
                                 return;
                             }
+                            down_total.fetch_add(n as u64, Ordering::SeqCst);
                         }
                     };
                     tokio::select! {
@@ -320,6 +343,7 @@ impl Proxy {
         Proxy {
             addr,
             cut_after,
+            down: down_total,
             live,
             task,
         }
@@ -327,6 +351,11 @@ impl Proxy {
 
     fn cut_after(&self, bytes: u64) {
         self.cut_after.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Bytes relayed to the client so far.
+    fn down(&self) -> u64 {
+        self.down.load(Ordering::SeqCst)
     }
 
     fn armed(&self) -> bool {
@@ -707,12 +736,47 @@ async fn on_demand_downloads_only_when_asked() {
     assert!(!part_file(dir.path(), id).exists());
 }
 
+/// D45: a blob comes compressed, far smaller on the wire than its size,
+/// and lands as the tool's output, its hash checked on the decoded bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_comes_compressed() {
+    let output = big_output(3 * 1024 * 1024, 15);
+    let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
+    let proxy = Proxy::start(daemon.addr).await;
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Spy::default();
+    let client = Client::open(dir.path(), &spy);
+    daemon.pair(&client, &proxy).await;
+    let session = daemon.session_with_turn(&client).await;
+    client.core.dispatch(Action::OpenSession(session)).unwrap();
+    let view = client
+        .wait("the tool output", |_, view| {
+            Client::shown_blobs(view).len() == 1
+        })
+        .await;
+    let id = Client::shown_blobs(&view)[0].0;
+
+    let before = proxy.down();
+    client.core.dispatch(Action::DownloadBlob(id)).unwrap();
+    let path = client.wait_available(0).await;
+    let wire = proxy.down() - before;
+    assert!(
+        wire < output.len() as u64 / 20,
+        "{wire} bytes on the wire for {} of output",
+        output.len()
+    );
+    assert_eq!(spy.froms(), [0]);
+    assert_eq!(std::fs::read(&path).unwrap(), output.as_bytes());
+}
+
 /// An interrupted download resumes: the connection carrying the blob is cut
 /// mid-body, the next try asks for the rest with `Range`, and the file ends
-/// up byte for byte the tool's output.
+/// up byte for byte the tool's output. The body is compressed (D45), and
+/// the range counts decoded bytes: the cut came after 1 MiB on the wire,
+/// and more than that of the output had landed.
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupted_download_resumes() {
-    let output = big_output(3 * 1024 * 1024, 1);
+    let output = noisy_output(3 * 1024 * 1024, 1);
     let daemon = Daemon::start(agent_with_outputs(std::slice::from_ref(&output))).await;
     let proxy = Proxy::start(daemon.addr).await;
     let dir = tempfile::tempdir().unwrap();
@@ -737,6 +801,10 @@ async fn interrupted_download_resumes() {
     assert!(
         froms.len() >= 2 && froms[1] > 0 && froms[1] < output.len() as u64,
         "the second try resumed with a range: {froms:?}"
+    );
+    assert!(
+        froms[1] > 1024 * 1024,
+        "resumed from the decoded offset, past the wire's cut: {froms:?}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), output.as_bytes());
 }

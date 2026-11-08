@@ -407,6 +407,9 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 ///   `AgentMessage` (a long message's whole text as a blob): a new
 ///   optional field, which v23 JSON lacks and reads as `None`, so no event
 ///   is rewritten; v23's long messages stay whole in their events.
+/// - Compressed event batches and blob bodies (D45): transport only. A
+///   `.part` file and its recorded progress count decoded bytes, as they
+///   did, so a v23 download resumes unchanged; nothing stored changes.
 fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }

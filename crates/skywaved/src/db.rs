@@ -464,6 +464,8 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 ///   is rewritten; v23's long messages stay whole in their events. Its
 ///   `BlobUse::Message` came with schema migration v21, which lets
 ///   `event_blobs.holds` say `message`.
+/// - Compressed event batches and blob bodies (D45): transport only. Blobs
+///   are stored as they were, uncompressed; nothing stored changes.
 fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
