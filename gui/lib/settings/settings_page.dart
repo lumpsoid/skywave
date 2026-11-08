@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/link/link_holder.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
@@ -142,10 +143,7 @@ class SettingsPage extends StatelessWidget {
               ListTile(
                 leading: const Icon(Icons.fingerprint),
                 title: const Text('Server fingerprint'),
-                subtitle: SelectableText(
-                  fingerprint,
-                  style: const TextStyle(fontFamily: 'monospace'),
-                ),
+                subtitle: SelectableText(fingerprint, style: monoText),
               ),
             Padding(
               padding: const EdgeInsets.all(16),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:skywave_gui/session/look.dart' show monoText;
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/screen/readable_width.dart';
 import 'package:skywave_gui/sessions/conversation_picker.dart';
@@ -224,7 +225,7 @@ class _CreatingRow extends StatelessWidget {
             ),
       title: Text(
         creating.workdir,
-        style: const TextStyle(fontFamily: 'monospace'),
+        style: monoText,
         overflow: TextOverflow.ellipsis,
       ),
       subtitle: Text(
