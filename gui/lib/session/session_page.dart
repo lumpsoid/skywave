@@ -602,46 +602,40 @@ class _SessionPageState extends State<SessionPage> {
                   },
                 ),
                 Expanded(
-                  child: _shell
-                      ? ShellView(
-                          sessionId: screen.sessionId,
-                          shell: _shellRuns,
+                  child: _TimelineAndPanels(
+                    timeline: _shell
+                        ? ShellView(
+                            sessionId: screen.sessionId,
+                            shell: _shellRuns,
+                            send: widget.send,
+                          )
+                        : TimelineView(
+                            key: _timelineView,
+                            sessionId: screen.sessionId,
+                            timeline: widget.timeline,
+                            search: _search,
+                            send: widget.send,
+                          ),
+                    panels: [
+                      if (screen.question case final question?)
+                        QuestionPanelView(
+                          question: question,
                           send: widget.send,
-                        )
-                      : TimelineView(
-                          key: _timelineView,
-                          sessionId: screen.sessionId,
-                          timeline: widget.timeline,
-                          search: _search,
-                          send: widget.send,
+                          onShowCall: question.callKey == null
+                              ? null
+                              : () => _showCall(question.callKey!),
                         ),
+                      if (screen.approval case final approval?)
+                        ApprovalPanelView(
+                          approval: approval,
+                          send: widget.send,
+                          onShowCall: approval.gatedKey == null
+                              ? null
+                              : () => _showCall(approval.gatedKey!),
+                        ),
+                    ],
+                  ),
                 ),
-                // Flexible: with the keyboard up the panel shrinks to what
-                // the timeline leaves and scrolls, instead of overflowing.
-                if (screen.question case final question?)
-                  Flexible(
-                    child: _Column(
-                      child: QuestionPanelView(
-                        question: question,
-                        send: widget.send,
-                        onShowCall: question.callKey == null
-                            ? null
-                            : () => _showCall(question.callKey!),
-                      ),
-                    ),
-                  ),
-                if (screen.approval case final approval?)
-                  Flexible(
-                    child: _Column(
-                      child: ApprovalPanelView(
-                        approval: approval,
-                        send: widget.send,
-                        onShowCall: approval.gatedKey == null
-                            ? null
-                            : () => _showCall(approval.gatedKey!),
-                      ),
-                    ),
-                  ),
                 ColoredBox(
                   color: theme.colorScheme.surfaceContainer,
                   child: _Column(
@@ -794,6 +788,37 @@ class _QuickAction extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// The timeline over the panels the agent is blocked on. Each panel is as
+/// tall as it needs, up to an equal share with the timeline: with the
+/// keyboard up it shrinks and scrolls instead of overflowing. The timeline
+/// takes the rest. A `Flexible` panel would not give back what it leaves
+/// of its share, and that height would gape under the composer.
+class _TimelineAndPanels extends StatelessWidget {
+  const _TimelineAndPanels({required this.timeline, required this.panels});
+
+  final Widget timeline;
+  final List<Widget> panels;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final share = constraints.maxHeight / (panels.length + 1);
+        return Column(
+          children: [
+            Expanded(child: timeline),
+            for (final panel in panels)
+              ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: share),
+                child: _Column(child: panel),
+              ),
+          ],
+        );
+      },
     );
   }
 }
