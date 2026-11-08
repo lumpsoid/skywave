@@ -171,8 +171,6 @@ impl TurnRecord {
 /// backfill migration cuts at the same length, and the server cuts a shell
 /// run's `command_line` to it.
 pub const FIRST_PROMPT_MAX_CHARS: usize = skywave_proto::limits::FIRST_PROMPT_MAX_CHARS;
-/// Longest first prompt shown as a title, in chars, before an ellipsis.
-pub const TITLE_PROMPT_MAX_CHARS: usize = 48;
 
 impl SessionSummary {
     /// Summary of a session whose first seen event is `event` at `seq`.
@@ -358,18 +356,13 @@ impl SessionSummary {
     }
 
     /// The title of an unnamed session: the first line of its first
-    /// message, cut to [`TITLE_PROMPT_MAX_CHARS`] with an ellipsis, else
-    /// the last component of its directory, else the end of its id.
+    /// message, whole (each head fits it to its room), else the last
+    /// component of its directory, else the end of its id.
     pub fn default_title(&self) -> String {
         if let Some(prompt) = self.first_prompt.as_deref()
             && let Some(line) = first_line(prompt, usize::MAX)
         {
-            return if line.chars().count() > TITLE_PROMPT_MAX_CHARS {
-                let head: String = line.chars().take(TITLE_PROMPT_MAX_CHARS - 1).collect();
-                format!("{}…", head.trim_end())
-            } else {
-                line
-            };
+            return line;
         }
         self.workdir
             .as_deref()
@@ -757,8 +750,11 @@ mod tests {
         );
 
         summary.first_prompt = Some("x".repeat(60));
-        assert_eq!(summary.title(), format!("{}…", "x".repeat(47)));
-        assert_eq!(summary.title().chars().count(), TITLE_PROMPT_MAX_CHARS);
+        assert_eq!(
+            summary.title(),
+            "x".repeat(60),
+            "a head fits it, not the core"
+        );
     }
 
     #[test]

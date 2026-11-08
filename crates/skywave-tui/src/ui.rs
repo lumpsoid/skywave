@@ -554,7 +554,7 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
     let mut spans = vec![
         Span::styled(format!("{:<BADGE_WIDTH$}", format!("[{badge}]")), style),
         Span::raw(" "),
-        Span::raw(clean(&row.title)).bold(),
+        Span::raw(shown_title(&row.title, row.named)).bold(),
     ];
     spans.extend(rename_badge(row.rename.as_ref()));
     if let Some(workdir) = &row.workdir {
@@ -597,6 +597,21 @@ fn session_row_line(row: &SessionRow) -> ListItem<'static> {
         .dark_gray(),
     );
     ListItem::new(Line::from(spans))
+}
+
+/// Longest unnamed session's title a line shows, in chars, before an
+/// ellipsis: a first prompt can run to 200, and the row's markers follow
+/// it on the same line. A name is capped where it is set.
+const DEFAULT_TITLE_MAX_CHARS: usize = 48;
+
+/// A session's title as one line shows it: an unnamed session's, its
+/// first prompt, cut to [`DEFAULT_TITLE_MAX_CHARS`] with an ellipsis.
+pub(crate) fn shown_title(title: &str, named: bool) -> String {
+    if named || title.chars().count() <= DEFAULT_TITLE_MAX_CHARS {
+        return clean(title);
+    }
+    let head: String = title.chars().take(DEFAULT_TITLE_MAX_CHARS - 1).collect();
+    clean(&format!("{}…", head.trim_end()))
 }
 
 /// " queued" after a title this device's rename has not settled yet; why a
@@ -1433,4 +1448,22 @@ pub(crate) fn outgoing_badge(outgoing: &Outgoing) -> (&'static str, Style) {
 /// A rule as listed: its label, then how far it reaches.
 pub(crate) fn rule_text(rule: &RuleSuggestion) -> String {
     format!("{} ({})", clean(&rule.label), scope_label(rule.scope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unnamed_sessions_long_title_is_cut_and_a_name_is_not() {
+        let long = format!("{} tail", "x".repeat(60));
+        let shown = shown_title(&long, false);
+        assert_eq!(shown, format!("{}…", "x".repeat(47)));
+        assert_eq!(shown.chars().count(), DEFAULT_TITLE_MAX_CHARS);
+        assert_eq!(
+            shown_title("fix the flaky test", false),
+            "fix the flaky test"
+        );
+        assert_eq!(shown_title(&long, true), long);
+    }
 }

@@ -31,7 +31,7 @@ use skywave_present::text::clean;
 use super::timeline::{
     approval_state, detail_lines, glyph, head_lines, preview_lines, rule_index, title_spans, wrap,
 };
-use super::{outgoing_badge, rename_badge, render_prompt, rule_text, state_badge};
+use super::{outgoing_badge, rename_badge, render_prompt, rule_text, shown_title, state_badge};
 use crate::app::{App, Focus, Geometry, Picker, SessionUi, StopKind};
 
 /// Most composer rows on screen; longer drafts scroll.
@@ -48,7 +48,8 @@ pub(super) fn render(
     ui: &SessionUi,
     wall: SystemTime,
 ) {
-    let mut title = vec![Span::raw(format!(" {}", clean(&session.title))).bold()];
+    let mut title =
+        vec![Span::raw(format!(" {}", shown_title(&session.title, session.named))).bold()];
     if let Some(subagent) = &session.subagent {
         let path = [trail(&subagent.trail), subagent.title.clone()]
             .into_iter()
