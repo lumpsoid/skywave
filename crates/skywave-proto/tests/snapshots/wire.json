@@ -1,7 +1,7 @@
 {
-  "protocol_version": 26,
+  "protocol_version": 27,
   "hello": {
-    "protocol_version": 26,
+    "protocol_version": 27,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -2130,5 +2130,46 @@
         "output_blob": "01920000-0000-7000-8000-000000000005"
       }
     ]
-  }
+  },
+  "usage_limits": [
+    {
+      "result": "read",
+      "at": "2026-10-29T12:00:00Z",
+      "limits": [
+        {
+          "window": "session",
+          "scope": null,
+          "percent": 75,
+          "severity": "warning",
+          "resets_at": "2026-10-29T12:00:00Z"
+        },
+        {
+          "window": "weekly",
+          "scope": "Fable",
+          "percent": 0,
+          "severity": "normal",
+          "resets_at": null
+        },
+        {
+          "window": "weekly",
+          "scope": null,
+          "percent": null,
+          "severity": null,
+          "resets_at": null
+        }
+      ]
+    },
+    {
+      "result": "read",
+      "at": "2026-10-29T12:00:00Z",
+      "limits": []
+    },
+    {
+      "result": "unavailable"
+    },
+    {
+      "result": "failed",
+      "reason": "not logged in"
+    }
+  ]
 }

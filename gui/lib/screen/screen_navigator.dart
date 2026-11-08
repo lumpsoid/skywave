@@ -11,6 +11,7 @@ import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 import 'package:skywave_gui/storage/storage_page.dart';
+import 'package:skywave_gui/usage/limits_page.dart';
 import 'package:skywave_gui/usage/usage_page.dart';
 import 'package:skywave_gui/workdir/workdir_page.dart';
 
@@ -129,6 +130,11 @@ class ScreenNavigator extends StatelessWidget {
           send: send,
         ),
         final ScreenViewStorage screen => StoragePage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewUsageLimits screen => LimitsPage(
           screen: screen,
           canGoBack: update.canGoBack,
           send: send,

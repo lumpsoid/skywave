@@ -24,6 +24,9 @@
 //!   [`Seam::conversations_listed`].
 //! - `Storage` asks for the server's storage report the same way, within
 //!   [`STORAGE_TIMEOUT`], and answers with [`Seam::storage_reported`].
+//! - `UsageLimits` asks for the agent's usage limits the same way, within
+//!   [`USAGE_LIMITS_TIMEOUT`], and answers with
+//!   [`Seam::usage_limits_answered`].
 //! - `Workdir` reads a session's workdir the same way, within
 //!   [`WORKDIR_TIMEOUT`], and answers with [`Seam::workdir_answered`].
 //!
@@ -139,6 +142,9 @@ pub const CONVERSATIONS_TIMEOUT: Duration = Duration::from_secs(12);
 /// Longest a storage report may take, connecting included: above the
 /// server's own 10 s, so its `503` arrives before this gives up.
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Longest a usage limits read may take, connecting included: above the
+/// server's own 20 s, so its `503` arrives before this gives up.
+pub const USAGE_LIMITS_TIMEOUT: Duration = Duration::from_secs(25);
 /// Longest the link sleeps in a reconnect wait before it looks at the wall
 /// clock again. The monotonic clock stops while a device sleeps (Android's
 /// deep sleep), so after waking the attempt comes at most this long after
@@ -444,6 +450,20 @@ impl Engine {
                     seam.storage_reported(req, result);
                 });
             }
+            Request::UsageLimits { req } => {
+                let seam = self.seam.clone();
+                let Some(transport) = self.side_transport() else {
+                    answer_usage_limits(&seam, req, Err(not_connected()));
+                    return;
+                };
+                self.seam.spawn("a usage limits read", async move {
+                    let result =
+                        tokio::time::timeout(USAGE_LIMITS_TIMEOUT, transport.usage_limits())
+                            .await
+                            .unwrap_or(Err(TransportError::Timeout));
+                    answer_usage_limits(&seam, req, result);
+                });
+            }
             Request::Workdir { req, ask } => {
                 let seam = self.seam.clone();
                 let Some(transport) = self.side_transport() else {
@@ -594,6 +614,16 @@ fn answer_workdir(
 ) {
     if let Err(error) = seam.workdir_answered(req, ask, result) {
         tracing::warn!(%error, "cannot keep a workdir answer");
+    }
+}
+
+fn answer_usage_limits(
+    seam: &Seam,
+    req: u64,
+    result: Result<skywave_proto::UsageLimitsResult, TransportError>,
+) {
+    if let Err(error) = seam.usage_limits_answered(req, result) {
+        tracing::warn!(%error, "cannot keep the usage limits");
     }
 }
 

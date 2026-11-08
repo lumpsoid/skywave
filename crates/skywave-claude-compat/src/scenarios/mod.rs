@@ -92,6 +92,12 @@ pub const ALL: &[Scenario] = &[
         run: controls::effort_switch,
     },
     Scenario {
+        name: "get_usage",
+        tier: Tier::Quick,
+        about: "get_usage without a handshake: the limits the usage page reads, no conversation left",
+        run: controls::get_usage,
+    },
+    Scenario {
         name: "stop_task_unknown",
         tier: Tier::Quick,
         about: "stop_task on an unknown id gets exactly one answer",

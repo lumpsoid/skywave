@@ -164,6 +164,7 @@ every version.
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
+| `GET /v1/usage-limits` | The usage limits of the account the agent runs as, as a `UsageLimitsResult` read from the agent when asked: `Read { at, limits }` (each limit's window, `Session` or `Weekly`, its scope such as one model, percent used, severity and reset time, a figure the agent did not report left out), `Unavailable` for an agent that reports none, or `Failed { reason }`. Nothing is stored on the server. |
 | `GET /v1/workdir/changes?session=` | A session's git changes (D36) as a `ChangesResult`: every file changed against `HEAD` (staged and unstaged together) plus untracked ones, sorted by path and capped, each with its own diff blob (or `Binary` / `TooLarge` / `Omitted`). `NotGit` outside a work tree; `Failed { reason }` when git is missing, refuses, or runs past the deadline. |
 | `GET /v1/workdir/list?session=&path=` | One directory of a session's workdir (D36) as a `ListResult`: entries sorted by name, capped, with each symlink's target class. `path` is relative to the workdir; the answer names the canonical one. |
 | `GET /v1/workdir/file?session=&path=` | One file of a session's workdir (D36) as a `FileResult`: size and a content blob, or `Binary` / `TooLarge` without one. Unchanged content keeps its `BlobId`. |
@@ -209,8 +210,8 @@ every version.
   device unknown or revoked (checked on every request, so a revocation
   applies to an open connection's next request), 400 malformed, 404 unknown
   blob, 412 another run expected, 416 bad range, 500 server fault. `/v1/commands` answers 200 for
-  `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations` and
-  `/v1/workdir/*` 200 for every result (never 401/403 beyond
+  `Accepted` and `Rejected` alike, and `/v1/dirs`, `/v1/conversations`,
+  `/v1/usage-limits` and `/v1/workdir/*` 200 for every result (never 401/403 beyond
   authentication, which clients read as revoked). `/v1/dirs`,
   `/v1/conversations`, `/v1/storage` and `/v1/workdir/*` answer 503 when
   they run out of time, or when 8 of their file-system reads are already
@@ -511,6 +512,18 @@ the daemon's appends, which would otherwise stop `serve` (below).
   stops it at its 8 s deadline (a progress handler), a 503; the reply
   gives up at 10 s. The report itself removes nothing: deleting a blob
   is a command (`DeleteBlob`, above).
+- **Usage limits** (`GET /v1/usage-limits`): the account's limits belong to
+  no session, so the API asks a `UsageLimitsSource` (agent-agnostic;
+  `NoUsageLimits` answers `Unavailable`). The Claude Code one
+  (`agent/claude_code/limits.rs`) starts a process of its own for each
+  read, as a session's but under a new session id and in the first root
+  (the data dir with none), writes one `get_usage` with no handshake,
+  reads until its answer and kills it (docs/agents/claude-code.md §3.15).
+  A process sent no message keeps no conversation, so the read leaves
+  nothing behind; reads run one at a time. The source gets 15 s, past
+  which it answers `Failed`; the reply gives up with a 503 at 20 s. A
+  scope is cut to one line of `TITLE_MAX_CHARS`, a reason of
+  `REFUSAL_MAX_CHARS`.
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
@@ -712,8 +725,8 @@ is newer, the file is damaged, or a row it loads no longer decodes
 (`StoreError::unreadable`), instead of reading wire JSON it cannot migrate.
 `Core::reset_replica(data_dir)` needs no open core, only the data dir's
 lock: it drops what the server's log produced (events and their
-projections, cursor, outbox, blob rows and files, workdir answers, offered
-models, device names) and restamps, in one transaction, keeping the
+projections, cursor, outbox, blob rows and files, workdir answers, the
+stored usage limits, offered models, device names) and restamps, in one transaction, keeping the
 identity and everything that is this device's (settings, drafts, composer
 modes, snippets, read marks, local deletes, alerted approvals), so the
 next open pulls the whole log again from seq 0. A settings row this build
@@ -739,6 +752,7 @@ logs) an event that no longer decodes rather than failing.
   goes once no answer of any session names it (the server deduplicates
   workdir content across sessions). An answer for a session not in the
   replica (unknown, deleted here, or from before a re-pair) is dropped.
+  `usage_limits` keeps the latest answer to the usage limits read.
 - **Sync engine** (D7): the pull loop long-polls from the cursor and applies
   each batch and the new cursor in one transaction. The outbox sends oldest
   first, one command in flight, so the server sees commands in the order
@@ -1069,6 +1083,24 @@ logs) an event that no longer decodes rather than failing.
   device's delete pulled while the screen is open, or this device's own
   settled in the log before the refresh it asked for answers. The fate
   decides the row; nothing asks the server again for it.
+- **Usage limits page** (`Route::UsageLimits`): the replica keeps the
+  latest answer (`usage_limits`, one row, cleared with the replica), so
+  the page reads offline with the time the agent reported it. Opening it
+  asks `GET /v1/usage-limits` on the side transport within
+  `USAGE_LIMITS_TIMEOUT` (25 s, above the server's 20 s) only when no
+  answer is stored and none is on its way; `RefreshUsageLimits` asks
+  again. `Seam::usage_limits_answered` takes only the latest request's
+  answer: `Read` or `Unavailable` is stored, while a transport error or a
+  `Failed` stays in memory as `UsageLimitsStatus::Unavailable(Offline |
+  Failed)` beside the stored answer. Offline nothing is asked. Back
+  returns to the session the page was opened from, else the session
+  list. `skywave_present::limits` words a row per limit (label with its
+  scope, percent, bar fill, warning, `resets in 2 h 13 min`), when the
+  limits were read and why there is nothing to list; a figure the agent
+  did not report is left out. The TUI opens it with `L` (session list,
+  session timeline, usage screen); the GUI from the session's usage
+  summary on its status line, the session's More menu and the usage
+  page.
 - **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
   `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
   run's output to keep. The head opening it names the blob as `CropBlob`

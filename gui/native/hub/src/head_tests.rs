@@ -1785,6 +1785,84 @@ fn the_storage_screen_shows_the_report_and_the_list_storage_show_picks() {
 }
 
 #[test]
+fn the_usage_limits_page_shows_each_limit_with_its_bar() {
+    use crate::signals::LimitRowView;
+
+    let mut rig = Rig::new();
+    let requests = rig.seam.take_requests().unwrap();
+    rig.online_on_the_list();
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::Navigate {
+            route: RouteView::UsageLimits,
+        },
+    });
+    rig.results();
+    rig.view();
+    let page = |rig: &Rig| match &rig.head.sent.screen.as_ref().unwrap().screen {
+        ScreenView::UsageLimits {
+            status_label,
+            read_label,
+            rows,
+            empty_label,
+        } => (
+            status_label.clone(),
+            read_label.clone(),
+            rows.clone(),
+            empty_label.clone(),
+        ),
+        other => panic!("not the usage limits page: {other:?}"),
+    };
+    let (status, read, rows, empty) = page(&rig);
+    assert_eq!(status.as_deref(), Some("Asking the agent…"));
+    assert_eq!(read, None);
+    assert!(rows.is_empty());
+    assert_eq!(empty.as_deref(), Some("No usage limits read yet."));
+
+    let req = requests
+        .try_iter()
+        .find_map(|r| match r {
+            skywave_core::Request::UsageLimits { req } => Some(req),
+            _ => None,
+        })
+        .expect("the core asked for the limits");
+    rig.seam
+        .usage_limits_answered(
+            req,
+            Ok(skywave_proto::UsageLimitsResult::Read {
+                at: Utc::now(),
+                limits: vec![skywave_proto::UsageLimit {
+                    window: skywave_proto::LimitWindow::Weekly,
+                    scope: Some("Fable".into()),
+                    percent: Some(22),
+                    severity: Some(skywave_proto::LimitSeverity::Normal),
+                    resets_at: None,
+                }],
+            }),
+        )
+        .unwrap();
+    rig.view();
+    let (status, read, rows, empty) = page(&rig);
+    assert_eq!(status, None);
+    assert!(read.is_some_and(|read| read.starts_with("Read ")));
+    assert_eq!(
+        rows,
+        [LimitRowView {
+            label: "Weekly · Fable".into(),
+            percent_label: Some("22%".into()),
+            fill_percent: Some(22),
+            warning: false,
+            resets_label: None,
+        }]
+    );
+    assert_eq!(empty, None);
+
+    rig.intent(GuiIntent::Act {
+        action: ActionIntent::RefreshUsageLimits,
+    });
+    assert_eq!(rig.actions.last(), Some(&Action::RefreshUsageLimits));
+}
+
+#[test]
 fn a_tapped_candidate_fills_the_create_prompt() {
     let mut rig = Rig::new();
     let kind = EventKind::SessionCreated {

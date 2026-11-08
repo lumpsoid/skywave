@@ -2162,6 +2162,7 @@ impl App {
                 KeyCode::Char('s') => Some(Action::Navigate(Route::Settings)),
                 KeyCode::Char('u') => Some(Action::Navigate(Route::Usage)),
                 KeyCode::Char('S') => Some(Action::Navigate(Route::Storage)),
+                KeyCode::Char('L') => Some(Action::Navigate(Route::UsageLimits)),
                 KeyCode::Delete => dismissable(list).map(|p| Action::Discard(p.command_id)),
                 _ => None,
             },
@@ -2194,10 +2195,17 @@ impl App {
                         usage.top = usage.top.min(usage.end.get()).saturating_sub(1);
                     }
                     KeyCode::Home | KeyCode::Char('g') => usage.top = 0,
+                    KeyCode::Char('L') => return Some(Action::Navigate(Route::UsageLimits)),
                     _ => {}
                 }
                 None
             }
+            Screen::UsageLimits(_) => match key.code {
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Esc => Some(Action::Back),
+                KeyCode::Char('r') => Some(Action::RefreshUsageLimits),
+                _ => None,
+            },
             Screen::Storage(view) => {
                 let rows = storage_rows(view, self.ui.storage.grouping);
                 let storage = &mut self.ui.storage;
@@ -2696,6 +2704,7 @@ impl App {
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
                     session_id: view.id,
                 }),
+                KeyCode::Char('L') => Some(Action::Navigate(Route::UsageLimits)),
                 _ => None,
             },
             Focus::Timeline => match key.code {
@@ -2795,6 +2804,7 @@ impl App {
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
                     session_id: view.id,
                 }),
+                KeyCode::Char('L') => Some(Action::Navigate(Route::UsageLimits)),
                 // Shifted, so a stray key does not end the agent's run.
                 // In a subagent's view it stops that subagent's task instead,
                 // always asking: it ends one thing, not the run. A foreground
