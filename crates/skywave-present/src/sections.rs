@@ -155,7 +155,15 @@ pub struct Section<'a> {
     /// (`text` is empty): collapsed, it shows no lines, only where the
     /// whole stands; expanded, the whole beneath the head.
     pub message: bool,
+    /// The input its approval asked about, which differs from the call's
+    /// ([`ToolView::approval_input`]); `input` is set too. Heads head it
+    /// with [`Section::label`].
+    pub asked: bool,
 }
+
+/// What a head heads the input an approval asked about with, when it
+/// differs from its call's ([`Section::asked`]).
+pub const ASKED_LABEL: &str = "approval input: differs from the call's";
 
 /// What a head says of an input the server could not keep: the summary is
 /// all there is. Matters most on an approval, decided on that summary.
@@ -177,6 +185,7 @@ impl<'a> Section<'a> {
             hidden: false,
             input: false,
             message: false,
+            asked: false,
         }
     }
 
@@ -197,6 +206,21 @@ impl<'a> Section<'a> {
             input: true,
             ..Section::text("")
         }
+    }
+
+    /// The input an approval asked about, differing from its call's: shown
+    /// like a whole input, only when expanded.
+    fn asked(full: &'a FullView) -> Section<'a> {
+        Section {
+            asked: true,
+            ..Section::input(full)
+        }
+    }
+
+    /// The line a head shows above this section's content, if it has one:
+    /// [`ASKED_LABEL`] on the input an approval asked about.
+    pub fn label(&self) -> Option<&'static str> {
+        self.asked.then_some(ASKED_LABEL)
     }
 
     /// The blob holding the whole content, unless there is none or it was
@@ -290,6 +314,7 @@ pub fn unseen_blob(entry: &Entry) -> Option<String> {
     }
     let section = sections.iter().find(|s| s.elsewhere())?;
     let what = match (section.input, section.hidden) {
+        (true, _) if section.asked => "approval input",
         (true, _) => "input",
         (false, true) => "output",
         (false, false) => "full",
@@ -305,6 +330,25 @@ pub fn unseen_blob(entry: &Entry) -> Option<String> {
     Some(match download_brief(&blob.state) {
         Some(brief) => format!("{what} {size} · {brief}"),
         None => format!("{what} {size}"),
+    })
+}
+
+/// What an approval panel says of the input the approval asked about, when
+/// `sections` (the gated call's) carry one that differs from the call's:
+/// [`ASKED_LABEL`], then its size, or that it was deleted or not kept:
+/// `approval input: differs from the call's · 4.0 KiB`. A head adds how
+/// to see it.
+pub fn asked_note(sections: &[Section]) -> Option<String> {
+    let section = sections.iter().find(|s| s.asked)?;
+    let tail = match section.full? {
+        FullView::Blob(blob) => blob_size(&blob.state).map(bytes),
+        FullView::Deleted { by } => Some(deleted_note(by)),
+        FullView::Lost => Some("not stored".to_owned()),
+        FullView::Inline(_) => None,
+    };
+    Some(match tail {
+        Some(tail) => format!("{ASKED_LABEL} · {tail}"),
+        None => ASKED_LABEL.to_owned(),
     })
 }
 
@@ -333,8 +377,8 @@ pub fn lost(sections: &[Section]) -> Option<&'static str> {
 }
 
 /// What an approval prompt says up front when the server could not keep
-/// some of what the user decides on: the request's own input first (it
-/// can differ from its call's, which `sections`, the gated call's, show),
+/// some of what the user decides on: the request's own input first (when
+/// it differs from its call's, the gated call's `sections` carry it too),
 /// else the first lost section.
 pub fn approval_lost(prompt: &ApprovalPrompt, sections: &[Section]) -> Option<&'static str> {
     match prompt.input {
@@ -390,8 +434,9 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
 /// output. Output beside a body is shown only when it is an error or the
 /// body is a shell command; the rest waits for the item to expand. The
 /// whole input is offered when nothing else has a blob or an inline
-/// output, and a lost input
-/// always stands, so the loss is said.
+/// output, and a lost input always stands, so the loss is said. Last, the
+/// input its approval asked about when that differs from the call's
+/// ([`ToolView::approval_input`]).
 pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     let mut out = Vec::new();
     if let Some(body) = &view.body {
@@ -405,6 +450,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             hidden: false,
             input: false,
             message: false,
+            asked: false,
         });
     }
     if let ToolOutcome::Done {
@@ -429,6 +475,7 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
             hidden: !is_error && view.body.is_some() && view.kind != ToolKind::Shell,
             input: false,
             message: false,
+            asked: false,
         });
     }
     // A lost or deleted input always stands, so the loss is said: no other
@@ -442,6 +489,8 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     {
         out.push(Section::input(input));
     }
+    // What the approval asked, when no section of the call holds it.
+    out.extend(view.approval_input().map(Section::asked));
     out
 }
 
@@ -754,6 +803,66 @@ mod tests {
         assert!(shown[0].blob().is_some());
         assert_eq!(lost(&shown), None);
         assert_eq!(shown[0].note(), None);
+    }
+
+    #[test]
+    fn an_approvals_own_input_is_offered_only_when_it_differs() {
+        let blob = |size| {
+            FullView::Blob(BlobView {
+                id: BlobId::new(),
+                state: BlobState::NotDownloaded { size },
+                change: None,
+                pending: None,
+            })
+        };
+        let gated = |view: ToolView, asked: Option<FullView>| ToolView {
+            approval: Some(skywave_core::ToolApproval {
+                id: skywave_core::ApprovalId::new(),
+                status: skywave_core::ApprovalStatus::Pending,
+                answer: None,
+                input: asked,
+            }),
+            ..view
+        };
+        let asked = |sections: &[Section]| sections.iter().filter(|s| s.asked).count();
+
+        // The call has no input blob (its body holds it); the approval
+        // asked something else: offered last, hidden, labelled, fetched on
+        // expanding, and named while collapsed.
+        let own = blob(4096);
+        let view = gated(call(None, None), Some(own.clone()));
+        let shown = tool_sections(&view);
+        let last = shown.last().unwrap();
+        assert!(last.asked && last.input && last.hidden);
+        assert_eq!(last.full, Some(&own));
+        assert_eq!(last.label(), Some(ASKED_LABEL));
+        assert_eq!(shown[0].label(), None);
+        assert_eq!(
+            asked_note(&shown).as_deref(),
+            Some("approval input: differs from the call's · 4.0 KiB")
+        );
+        let entry = Entry::Tool(Box::new(view));
+        assert_eq!(unasked_blobs(&entry), vec![own.blob().unwrap()]);
+        assert_eq!(
+            unseen_blob(&entry).as_deref(),
+            Some("approval input 4.0 KiB")
+        );
+
+        // Beside the call's own input blob, a different one still stands.
+        let input = blob(10);
+        let view = gated(call(None, Some(input.clone())), Some(own));
+        assert_eq!(asked(&tool_sections(&view)), 1);
+
+        // The same blob as the call's input, or none asked: nothing extra.
+        let view = gated(call(None, Some(input.clone())), Some(input));
+        assert_eq!(asked(&tool_sections(&view)), 0);
+        let view = gated(call(None, None), None);
+        assert_eq!(asked(&tool_sections(&view)), 0);
+        assert_eq!(asked_note(&tool_sections(&view)), None);
+
+        // One the server could not keep says so, as an input.
+        let view = gated(call(None, None), Some(FullView::Lost));
+        assert_eq!(lost(&tool_sections(&view)), Some(INPUT_LOST));
     }
 
     fn device(name: &str, me: bool) -> DeviceRef {

@@ -1533,6 +1533,20 @@ pub struct ToolView {
     pub subagent: Option<SubagentStatus>,
 }
 
+impl ToolView {
+    /// The approval's own input ([`ToolApproval::input`]), unless it is the
+    /// very blob the call's input is: what the agent asked to run when that
+    /// differs from what the call says.
+    pub fn approval_input(&self) -> Option<&FullView> {
+        let asked = self.approval.as_ref()?.input.as_ref()?;
+        let call = self.input.as_ref().and_then(FullView::blob);
+        match (asked.blob(), call) {
+            (Some(asked), Some(call)) if asked.id == call.id => None,
+            _ => Some(asked),
+        }
+    }
+}
+
 /// How the subagent an `Agent` call runs stands, from its own items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentStatus {
@@ -1588,6 +1602,10 @@ pub struct ToolApproval {
     /// this is where an answer that did not apply stays in sight: refused
     /// because another device answered first or the approval was cancelled.
     pub answer: Option<Answer>,
+    /// The request's own input (a `BlobUse::ApprovalInput` blob): the
+    /// server logs one only when it differs from the call's input, so
+    /// `None` means the call's input is what was asked.
+    pub input: Option<FullView>,
 }
 
 /// How a tool call stands.

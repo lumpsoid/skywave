@@ -64,6 +64,11 @@ class SectionBlock extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (section.label case final label?)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(label, style: small?.copyWith(color: colors.warning)),
+          ),
         if (lines.isNotEmpty)
           Container(
             decoration: BoxDecoration(

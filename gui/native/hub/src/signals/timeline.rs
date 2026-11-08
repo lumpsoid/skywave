@@ -215,6 +215,9 @@ pub struct SectionView {
     pub first_line: u32,
     /// The call's whole input rather than what it did.
     pub input: bool,
+    /// Shown above the lines: what the section is, when its place does not
+    /// say (the input an approval asked about, differing from the call's).
+    pub label: Option<String>,
     pub lines: Vec<SectionLine>,
     /// What the lines leave out: `… +12 lines` collapsed, `cut short: 400
     /// lines of 1.2 MiB shown` expanded. Never the blob's state: that is

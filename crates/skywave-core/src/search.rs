@@ -213,8 +213,9 @@ pub fn find(
 }
 
 /// The blobs whose content an entry shows, in the order it shows them: a
-/// call's body and output, and its whole input only when it has neither
-/// nor an inline output (the input is then all there is to see); a long
+/// call's body and output, its whole input only when it has neither nor
+/// an inline output (the input is then all there is to see), and its
+/// approval's own input when that differs from the call's; a long
 /// message's whole text.
 pub fn blobs(entry: &Entry) -> Vec<&BlobView> {
     match entry {
@@ -267,6 +268,8 @@ fn tool_blobs(view: &ToolView) -> Vec<&BlobView> {
     if out.is_empty() && !inline {
         out.extend(view.input.as_ref().and_then(FullView::blob));
     }
+    // What the approval asked, when it differs from the call's input.
+    out.extend(view.approval_input().and_then(FullView::blob));
     out
 }
 
@@ -358,7 +361,7 @@ mod tests {
     use super::*;
     use crate::view::{
         BodyFormat, BodyView, CallId, CommandId, ContextId, DeviceId, DeviceRef, Outgoing, Seq,
-        ToolKind, ToolView,
+        ToolApproval, ToolKind, ToolView,
     };
 
     /// The matching items' indices, no blob downloaded.
@@ -757,6 +760,46 @@ mod tests {
         // An unreadable blob is skipped.
         let found = find(&timeline, &Query::new("warning"), &mut |_| None);
         assert!(found.hits.is_empty());
+    }
+
+    #[test]
+    fn an_approvals_own_input_is_searched_when_it_differs() {
+        let path = || BlobState::Available {
+            path: "/data/blobs/x".into(),
+        };
+        let (input, asked) = (blob(path()), blob(path()));
+        let approval = |own: &BlobView| ToolApproval {
+            id: crate::view::ApprovalId::new(),
+            status: crate::view::ApprovalStatus::Pending,
+            answer: None,
+            input: Some(FullView::Blob(own.clone())),
+        };
+        let mut view = tool(ToolOutcome::Running {
+            since: DateTime::UNIX_EPOCH,
+        });
+        view.body = None;
+        view.input = Some(FullView::Blob(input.clone()));
+        view.approval = Some(approval(&asked));
+        let texts = [(input.id, "rm -rf build\n"), (asked.id, "rm -rf /\n")];
+        let mut read = |view: &BlobView| {
+            let (_, text) = texts.iter().find(|(id, _)| *id == view.id).unwrap();
+            Some(BlobText {
+                text: (*text).into(),
+                cut: false,
+            })
+        };
+        let timeline = vec![logged(Entry::Tool(Box::new(view.clone())))];
+        let found = find(&timeline, &Query::new("rm -rf /"), &mut read);
+        assert_eq!(
+            found.hits[0].blob,
+            Some(BlobLine {
+                id: asked.id,
+                line: 0
+            })
+        );
+        // The call's own input blob over again is not searched twice.
+        view.approval = Some(approval(&input));
+        assert_eq!(blobs(&Entry::Tool(Box::new(view))), vec![&input]);
     }
 
     #[test]
