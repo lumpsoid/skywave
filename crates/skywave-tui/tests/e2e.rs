@@ -21,7 +21,9 @@ use serde_json::json;
 use skywave_core::{
     Backoff, Core, EngineConfig, Jitter, Link, Screen, Store, TransportConfig, ViewState,
 };
-use skywave_proto::{Event, EventKind, Seq, SessionState};
+use skywave_proto::{
+    Event, EventKind, Question, QuestionAnswer, QuestionOption, Seq, SessionState,
+};
 use skywave_testkit::{LinkProfile, LinkProxy, seed};
 use skywave_tui::{App, ui};
 use skywaved::agent::fake::{FakeAgent, FakeScript, Gate, Step};
@@ -399,6 +401,125 @@ async fn f5_converse() {
         !screen.contains("file-008.txt"),
         "only the preview: {screen}"
     );
+}
+
+/// A question the agent asks with options: `a` opens the picker; one
+/// option picked with Enter, two with Space and the user's own text
+/// beside them, and a decline with `x`. Each answer reaches the agent as
+/// picked.
+#[tokio::test(flavor = "multi_thread")]
+async fn f6_questions() {
+    let option = |label: &str, description: &str| QuestionOption {
+        label: label.into(),
+        description: description.into(),
+        preview: None,
+    };
+    let bread = Question {
+        header: "Bread".into(),
+        text: "Which bread for tomorrow?".into(),
+        options: vec![option("Rye", "dense"), option("Spelt", "nutty")],
+        multi_select: false,
+    };
+    let toppings = Question {
+        header: "Toppings".into(),
+        text: "Which toppings?".into(),
+        options: vec![option("Seeds", ""), option("Oats", ""), option("Salt", "")],
+        multi_select: true,
+    };
+    let ask = |request: &str, question: &Question| {
+        Step::question(request, vec![question.clone()])
+            .on_approve([Step::text("noted")])
+            .on_deny([Step::text("no answer then")])
+    };
+    let daemon = Daemon::start(
+        FakeScript::new()
+            .turn([ask("q-1", &bread)])
+            .turn([ask("q-2", &toppings)])
+            .turn([ask("q-3", &bread)]),
+    )
+    .await;
+    let mut tui = Tui::open();
+    tui.pair(&daemon, &daemon.addr.to_string()).await;
+    tui.create_session(&daemon).await;
+    let answered = |events: &[Event]| -> Vec<Vec<QuestionAnswer>> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::QuestionAnswered { answers, .. } => Some(answers.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // One of two: the second, with Enter.
+    tui.send("bake");
+    let screen = tui.wait_for("Bread · Which bread for tomorrow?").await;
+    assert!(
+        screen.contains("one of: Rye / Spelt · or your own"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Esc, then a answer · x decline"),
+        "{screen}"
+    );
+    tui.key(KeyCode::Esc);
+    tui.key(KeyCode::Char('a'));
+    let screen = tui.wait_for("( ) Spelt  nutty").await;
+    assert!(screen.contains("Question · Bread"), "{screen}");
+    tui.key(KeyCode::Down);
+    tui.key(KeyCode::Enter);
+    tui.wait("answered", |_, s| s.contains("agent: noted"))
+        .await;
+    daemon
+        .wait_log("the answer", |events| !answered(events).is_empty())
+        .await;
+    assert_eq!(
+        answered(&daemon.events()),
+        [vec![QuestionAnswer {
+            picked: vec![1],
+            other: None,
+        }]]
+    );
+
+    // Any of three: two toggled, and text of the user's own beside them.
+    tui.key(KeyCode::Char('i'));
+    tui.send("top it");
+    tui.wait_for("Toppings · Which toppings?").await;
+    tui.key(KeyCode::Esc);
+    tui.key(KeyCode::Char('a'));
+    tui.wait_for("[ ] Seeds").await;
+    tui.key(KeyCode::Char(' '));
+    tui.key(KeyCode::Down);
+    tui.key(KeyCode::Down);
+    tui.key(KeyCode::Char(' '));
+    tui.key(KeyCode::Down);
+    tui.type_text("a little honey");
+    let screen = tui.wait_for("[x] Other: a little honey").await;
+    assert!(screen.contains("[x] Seeds"), "{screen}");
+    assert!(screen.contains("[ ] Oats"), "{screen}");
+    tui.key(KeyCode::Enter);
+    tui.wait("answered", |_, s| s.matches("agent: noted").count() == 2)
+        .await;
+    daemon
+        .wait_log("the second answer", |events| answered(events).len() == 2)
+        .await;
+    assert_eq!(
+        answered(&daemon.events())[1],
+        [QuestionAnswer {
+            picked: vec![0, 2],
+            other: Some("a little honey".into()),
+        }]
+    );
+
+    // Declined.
+    tui.key(KeyCode::Char('i'));
+    tui.send("once more");
+    tui.wait_for("Bread · Which bread for tomorrow?").await;
+    tui.key(KeyCode::Esc);
+    tui.key(KeyCode::Char('x'));
+    tui.wait("declined", |_, s| s.contains("agent: no answer then"))
+        .await;
+    assert_eq!(answered(&daemon.events()).len(), 2);
 }
 
 /// F6: approve and deny from the TUI; an answer from a second device shows

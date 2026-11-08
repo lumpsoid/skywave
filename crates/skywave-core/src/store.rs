@@ -398,7 +398,7 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25];
+    [v23_to_v24, v24_to_v25, v25_to_v26];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
 /// what is stored, and how each is moved:
@@ -425,6 +425,17 @@ fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
 ///   next turn reports one.
 /// - `EventKind::SubagentUsage`: new, so no v24 event is one.
 fn v24_to_v25(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v25 to v26, as the server's step of the same name. What v26 changed of
+/// what is stored, and how each is moved:
+/// - `EventKind::QuestionAsked` and `QuestionAnswered`: new, so no v25
+///   event is one; a v25 pending approval in `sessions.pending_approvals`
+///   stays a plain one.
+/// - `CommandKind::AnswerQuestion` and `RejectReason::BadAnswer`: new, so
+///   no v25 outbox entry holds either.
+fn v25_to_v26(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

@@ -197,7 +197,8 @@ the final mapping.
   cut).
 - `user` `tool_result` → tool output, correlated by `tool_use_id`; status and
   preview from `tool_use_result` (§6b).
-- `can_use_tool` → `ApprovalRequested`.
+- `can_use_tool` → `ApprovalRequested`; for `AskUserQuestion`,
+  `QuestionAsked` (§3.14).
 - `control_cancel_request` → `ApprovalCancelled`.
 - `result` → turn ended (`is_error` / `terminal_reason` give the outcome).
 - `system/init` → session id and a check of the version and model.
@@ -1039,6 +1040,66 @@ works though the task was never in the level set: `task_updated`
 (`killed`), `task_notification` (`stopped`), then success `{}`. The `Agent`
 call's `tool_result` is an error, "[Request interrupted by user for tool
 use]", and the main turn ends normally (`result/success`).
+
+### 3.14 AskUserQuestion: a question with options [C]
+
+Probed and recorded with 2.1.310 on 2026-11-08 (`ask_user_question.ndjson`,
+recorded by `skywave-claude-compat --only ask_user_question --record`; the
+probes in `default`, `acceptEdits` and `dontAsk` mode used a script of the
+same shape). The model asks the user to pick through the `AskUserQuestion`
+tool. Over stdio it comes as a plain `can_use_tool`, after the `assistant`
+`tool_use` as every request does, with `requires_user_interaction: true` and
+no `permission_suggestions`:
+
+```json
+{"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool",
+ "tool_name":"AskUserQuestion","display_name":"AskUserQuestion",
+ "input":{"questions":[{"question":"Which bread should we bake for tomorrow?","header":"Bread",
+   "options":[{"label":"Rye","description":"Dense, earthy rye loaf"},
+              {"label":"Sourdough","description":"Tangy, open-crumb sourdough loaf"}],
+   "multiSelect":false}]},
+ "tool_use_id":"toolu_…","requires_user_interaction":true}}
+```
+
+- `questions` held one or two questions in the recordings (two when asked
+  for), each with 2–3 options. An option may carry `preview`, several
+  lines shown as written (the model drew ASCII mockups when asked for
+  them).
+- It asks in `default` and in `acceptEdits` alike. In `dontAsk` the CLI
+  denies it unasked (`system/permission_denied` and an error `tool_result`,
+  as for any tool, §3.7). Other modes were not probed. **[U]**
+
+**Answer** (stdin → CLI): an allow whose `updatedInput` is the input with an
+`answers` map from each question's text to the answer:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"…",
+ "response":{"behavior":"allow","updatedInput":{"questions":[…],
+  "answers":{"Which toppings should go on tomorrow's bread?":"Seeds, Oats"}}}}}
+```
+
+| answer | `answers` value | `tool_result` content |
+|--------|-----------------|-----------------------|
+| one option | its label (`"Rye"`) | `Your questions have been answered: "<question>"="Rye". You can now continue with these answers in mind.` |
+| several (multi-select) | the labels joined by `", "` (`"Seeds, Oats"`), as the CLI's own picker does | the same, with the joined labels |
+| text of the user's own | the text (`"Marmalade, homemade"`) | `The user answered: "<question>"="…". Read the answers carefully …`: the CLI notices it is no option |
+| two questions | one entry each | `… "<q1>"="Wheat", "<q2>"="Right". …` |
+| none (an allow without `answers`) | — | `The user did not answer the questions.` (not an error) |
+
+The `tool_result` is not an error, and its `tool_use_result` echoes
+`{questions, answers}`. A **deny** gives an error `tool_result` whose
+content is the deny message, as for any tool (§3.3), and the model goes on.
+
+**How the adapter maps it** (`protocol::ASK_TOOL`): a `can_use_tool` for
+`AskUserQuestion` whose input has at least one question with text and
+options is reported as `QuestionAsked` (D47), not `ApprovalRequested`; one
+without is asked as a plain approval. `answer_question` writes the allow
+above (`protocol::answered_input`): the labels picked, in the options'
+order, then the user's own text, joined by `", "`. A denial declines it.
+The call's display titles it with the first question, and its result reads
+`answered` with one `question → answer` line each, or `not answered`. The
+replay test `replay_questions_are_asked_and_answered` checks every recorded
+answer byte for byte.
 
 ## 4. Interrupt
 

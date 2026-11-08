@@ -847,6 +847,9 @@ fn footer_keys(app: &App) -> &'static str {
                     "↑↓ choose · Enter on a task stops it · o open a subagent · Esc close · ? help"
                 }
                 Some(Picker::Effort { .. }) => "↑↓ choose · Enter switch · Esc back · ? help",
+                Some(Picker::Question { .. }) => {
+                    "↑↓ move · Space pick · Enter next / send · ←→ question · type on Other · Esc close · F1 help"
+                }
                 _ => {
                     "↑↓ choose · type a name instead · Enter switch · Ctrl-U clear · Esc back · F1 help"
                 }
@@ -882,6 +885,9 @@ fn footer_keys(app: &App) -> &'static str {
                     .is_some_and(|p| !p.suggestions.is_empty()) =>
                 {
                     "a/x approve/deny · A always allow · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
+                }
+                None if view.pending_question.is_some() => {
+                    "a answer · x decline · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
                 }
                 None if view.pending_approval.is_some() => {
                     "a/x approve/deny · v show the call · ↑↓ select · Enter expand · d download · y/Y copy · / search · [ ] turns · PgUp/PgDn · p mode · m model/effort · C contexts · R rename · S stop · Tab write · Esc back · ? help"
@@ -1185,6 +1191,11 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("A", "approve, always allowing a rule the agent offers"),
                     key("", "(several: ↑↓ Enter pick one, Esc back to a / x)"),
                     key("v", "select and expand the call it gates"),
+                    key("a / x", "a question: pick an answer / decline it"),
+                    key(
+                        "",
+                        "(↑↓ move, Space picks, Enter next or send, type on Other, Esc closes)",
+                    ),
                     key(
                         "t",
                         "conversation only: hide tool calls, or show them again",

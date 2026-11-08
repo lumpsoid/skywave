@@ -19,8 +19,8 @@ use ratatui::text::{Line, Span};
 use skywave_core::search::BlobLine;
 use skywave_core::{
     Answer, ApprovalStatus, BlobId, BlobState, BodyFormat, Decision, DeviceRef, Entry,
-    ImportedEntry, Outgoing, Query, RuleSuggestion, SessionView, TimelineItem, ToolKind,
-    ToolOutcome, ToolView, read_head,
+    ImportedEntry, Outgoing, QUESTION_TOOL, Query, RuleSuggestion, SessionView, TimelineItem,
+    ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::pending_note;
 use skywave_present::format::{
@@ -708,6 +708,9 @@ impl Layout<'_> {
                 ..
             } => {
                 let (mut state, style) = approval_state(status);
+                if tool == QUESTION_TOOL && *status == ApprovalStatus::Pending {
+                    state = "needs an answer".to_owned();
+                }
                 if let Some(note) = unapplied(status, answer.as_ref()) {
                     state = format!("{state} · {note}");
                 }
@@ -1263,9 +1266,11 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
         Some(ApprovalStatus::Resolved { decision, by, rule }) => {
             Some(resolved_label(*decision, by, rule.as_ref()))
         }
+        Some(ApprovalStatus::Answered { by }) => Some(format!("answered {}", where_(by))),
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
+    let asks = view.approval.as_ref().is_some_and(|a| a.question);
     // The subagent's own state, not the launch's: a background subagent's
     // call is done long before it ends.
     if let Some(status) = &view.subagent
@@ -1288,7 +1293,12 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (String, Style) {
     }
     match &view.outcome {
         ToolOutcome::Running { .. } if approval == Some(&ApprovalStatus::Pending) => {
-            ("needs approval".to_owned(), Style::new().yellow().bold())
+            let words = if asks {
+                "needs an answer"
+            } else {
+                "needs approval"
+            };
+            (words.to_owned(), Style::new().yellow().bold())
         }
         ToolOutcome::Running { since } => {
             let elapsed = u64::try_from(wall_ms - since.timestamp_millis()).unwrap_or(0);
@@ -1369,7 +1379,9 @@ fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String>
     let answer = answer?;
     match (status, answer.outgoing) {
         (
-            ApprovalStatus::Resolved { .. } | ApprovalStatus::Cancelled { .. },
+            ApprovalStatus::Resolved { .. }
+            | ApprovalStatus::Answered { .. }
+            | ApprovalStatus::Cancelled { .. },
             Outgoing::Failed(reason),
         ) => Some(format!(
             "you {} · not applied: {}",
@@ -1391,6 +1403,9 @@ pub(super) fn approval_state(status: &ApprovalStatus) -> (String, Style) {
                 Decision::Deny => Style::new().magenta(),
             },
         ),
+        ApprovalStatus::Answered { by } => {
+            (format!("answered {}", where_(by)), Style::new().green())
+        }
         ApprovalStatus::Cancelled { reason } => {
             (format!("cancelled: {reason}"), Style::new().dark_gray())
         }

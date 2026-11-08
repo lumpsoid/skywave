@@ -45,8 +45,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use skywave_proto::{
     AgentSettings, AgentWork, ApprovalId, BlobId, BlobUse, CallId, CommandId, ContextId, DeviceId,
-    Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, RunId, RunWhen, RunsSince, Seq,
-    SessionId, SessionState, ShellEnd, ToolCall, ToolResult, limits,
+    Event, EventBatch, EventKind, LogId, LogRun, ModelChoice, Question, RunId, RunWhen, RunsSince,
+    Seq, SessionId, SessionState, ShellEnd, ToolCall, ToolResult, limits,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -432,6 +432,7 @@ impl EventLog {
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
             | EventKind::ApprovalRequested { .. }
+            | EventKind::QuestionAsked { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -450,6 +451,7 @@ impl EventLog {
             EventKind::SessionCreated { .. }
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
+            | EventKind::QuestionAnswered { .. }
             | EventKind::ApprovalCancelled { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
@@ -493,7 +495,7 @@ impl EventLog {
                 context.0, session_id.0
             )));
         }
-        if let EventKind::ApprovalRequested { id, .. } = &kind
+        if let EventKind::ApprovalRequested { id, .. } | EventKind::QuestionAsked { id, .. } = &kind
             && approval_in(&tx, *id)?.is_some()
         {
             return Err(Error::InvalidAppend(format!(
@@ -891,7 +893,15 @@ pub(crate) fn append_in(
                 ],
             )?;
         }
-        EventKind::ApprovalResolved { id, .. } | EventKind::ApprovalCancelled { id, .. } => {
+        EventKind::QuestionAsked { id, questions, .. } => {
+            conn.execute(
+                "INSERT INTO approvals (id, session_id, context, questions) VALUES (?1, ?2, ?3, ?4)",
+                params![id.0.to_string(), session, context, serde_json::to_string(questions)?],
+            )?;
+        }
+        EventKind::ApprovalResolved { id, .. }
+        | EventKind::QuestionAnswered { id, .. }
+        | EventKind::ApprovalCancelled { id, .. } => {
             conn.execute(
                 "UPDATE approvals SET closed_seq = ?2 WHERE id = ?1 AND closed_seq IS NULL",
                 params![id.0.to_string(), sql_seq],
@@ -1332,7 +1342,7 @@ pub(crate) fn context_in(conn: &Connection, id: ContextId) -> Result<Option<Cont
 }
 
 /// What the log says of one approval request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalRow {
     pub session_id: SessionId,
     /// The context the request was logged in.
@@ -1341,31 +1351,37 @@ pub(crate) struct ApprovalRow {
     pub closed: Option<Closed>,
     /// How many rule suggestions the request offers.
     pub rules: usize,
+    /// The questions of a `QuestionAsked`; `None` for a plain approval.
+    pub questions: Option<Vec<Question>>,
 }
 
 /// How an approval request was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Closed {
-    /// By an `ApprovalResolved`: an answer won.
+    /// By an `ApprovalResolved` or a `QuestionAnswered`: an answer won.
     Resolved,
     /// By an `ApprovalCancelled`: no answer ever will.
     Cancelled,
 }
 
+/// An `approvals` row as SQL has it: session, context, the type tag of
+/// the event that closed it, rules, questions.
+type ApprovalSql = (String, String, Option<String>, i64, Option<String>);
+
 /// Approval `id` as the log has it; `None` if unknown.
 pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<ApprovalRow>> {
     // The type tag of the event at `closed_seq` tells an answer from a
     // cancel.
-    let row: Option<(String, String, Option<String>, i64)> = conn
+    let row: Option<ApprovalSql> = conn
         .query_row(
-            "SELECT a.session_id, a.context, json_extract(e.kind, '$.type'), a.rules
+            "SELECT a.session_id, a.context, json_extract(e.kind, '$.type'), a.rules, a.questions
              FROM approvals a LEFT JOIN events e ON e.seq = a.closed_seq
              WHERE a.id = ?1",
             [id.0.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    row.map(|(session, context, closed_by, rules)| {
+    row.map(|(session, context, closed_by, rules, questions)| {
         Ok(ApprovalRow {
             session_id: parse_id(&session)?,
             context: parse_id(&context)?,
@@ -1374,6 +1390,7 @@ pub(crate) fn approval_in(conn: &Connection, id: ApprovalId) -> Result<Option<Ap
                 _ => Closed::Resolved,
             }),
             rules: usize::try_from(rules).unwrap_or(0),
+            questions: questions.as_deref().map(serde_json::from_str).transpose()?,
         })
     })
     .transpose()
@@ -1431,6 +1448,8 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::ApprovalRequested { .. } => "ApprovalRequested",
         EventKind::ApprovalResolved { .. } => "ApprovalResolved",
         EventKind::ApprovalCancelled { .. } => "ApprovalCancelled",
+        EventKind::QuestionAsked { .. } => "QuestionAsked",
+        EventKind::QuestionAnswered { .. } => "QuestionAnswered",
         EventKind::TurnInterrupted => "TurnInterrupted",
         EventKind::SessionStopped => "SessionStopped",
         EventKind::SessionRenamed { .. } => "SessionRenamed",

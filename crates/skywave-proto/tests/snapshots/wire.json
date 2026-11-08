@@ -1,7 +1,7 @@
 {
-  "protocol_version": 25,
+  "protocol_version": 26,
   "hello": {
-    "protocol_version": 25,
+    "protocol_version": 26,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -499,6 +499,73 @@
           "type": "approval_cancelled",
           "id": "01920000-0000-7000-8000-000000000004",
           "reason": "daemon restarted"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "question_asked",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "questions": [
+            {
+              "header": "Bread",
+              "text": "Which bread for tomorrow?",
+              "options": [
+                {
+                  "label": "Rye",
+                  "description": "Dense and earthy",
+                  "preview": null
+                },
+                {
+                  "label": "Sourdough",
+                  "description": "",
+                  "preview": "+------+\n| LOAF |\n+------+"
+                }
+              ],
+              "multi_select": false
+            },
+            {
+              "header": "",
+              "text": "Which toppings?",
+              "options": [
+                {
+                  "label": "Seeds",
+                  "description": "",
+                  "preview": null
+                }
+              ],
+              "multi_select": true
+            }
+          ]
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": "01920000-0000-7000-8000-000000000002",
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "question_answered",
+          "id": "01920000-0000-7000-8000-000000000004",
+          "by": "01920000-0000-7000-8000-000000000003",
+          "answers": [
+            {
+              "picked": [
+                1
+              ],
+              "other": null
+            },
+            {
+              "picked": [
+                0
+              ],
+              "other": "and a little salt"
+            }
+          ]
         }
       },
       {
@@ -1407,6 +1474,19 @@
     {
       "id": "01920000-0000-7000-8000-000000000002",
       "kind": {
+        "type": "answer_question",
+        "id": "01920000-0000-7000-8000-000000000004",
+        "answers": [
+          {
+            "picked": [],
+            "other": "marmalade"
+          }
+        ]
+      }
+    },
+    {
+      "id": "01920000-0000-7000-8000-000000000002",
+      "kind": {
         "type": "interrupt",
         "session_id": "01920000-0000-7000-8000-000000000001"
       }
@@ -1600,6 +1680,10 @@
     {
       "result": "rejected",
       "reason": "unknown_rule"
+    },
+    {
+      "result": "rejected",
+      "reason": "bad_answer"
     },
     {
       "result": "rejected",

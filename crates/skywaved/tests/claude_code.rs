@@ -23,11 +23,11 @@ use skywaved::agent::claude_code::{
     REQUIRED_ARGS,
 };
 use skywaved::agent::{
-    AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
-    AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation, DisplayBody, Effort,
-    Grants, INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
-    RuleScope, RuleSuggestion, StartSpec, SubagentFigures, ToolDisplay, ToolKind, TurnOutcome,
-    TurnUsage,
+    AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
+    AgentSchedule, AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation,
+    DisplayBody, Effort, Grants, INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, QuestionAnswer,
+    ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, SubagentFigures,
+    ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -134,6 +134,8 @@ fn replay_records(
     let mut n_in = 0;
     // The `permission_suggestions` of each recorded `can_use_tool`, by id.
     let mut offers: HashMap<String, Value> = HashMap::new();
+    // The `input` of each recorded `can_use_tool`, by id.
+    let mut inputs: HashMap<String, Value> = HashMap::new();
     // The id of each of our control requests, by the recorded one.
     let mut our_ids: HashMap<String, String> = HashMap::new();
     // The ids of the CLI's hook calls: the protocol answers those itself.
@@ -193,8 +195,16 @@ fn replay_records(
                             _ => Decision::Deny,
                         };
                         let request = response["request_id"].as_str().unwrap();
-                        let rule = granted_rule(&offers, request, &response["response"]);
-                        protocol.answer(&AgentRequestId::from(request), decision, rule)
+                        let answered = &response["response"]["updatedInput"]["answers"];
+                        match recorded_answers(inputs.get(request), answered) {
+                            Some(answers) => {
+                                protocol.answer_question(&AgentRequestId::from(request), &answers)
+                            }
+                            None => {
+                                let rule = granted_rule(&offers, request, &response["response"]);
+                                protocol.answer(&AgentRequestId::from(request), decision, rule)
+                            }
+                        }
                     }
                     other => panic!("{name}: unexpected stdin record {other:?}"),
                 };
@@ -235,6 +245,10 @@ fn replay_records(
                         msg["request_id"].as_str().unwrap().to_owned(),
                         msg["request"]["permission_suggestions"].clone(),
                     );
+                    inputs.insert(
+                        msg["request_id"].as_str().unwrap().to_owned(),
+                        msg["request"]["input"].clone(),
+                    );
                 }
                 // The CLI answers our control requests under the ids we
                 // chose, not the recorded driver's.
@@ -263,6 +277,41 @@ fn replay_records(
     assert!(written.is_empty(), "{name}: left over writes {written:?}");
     assert!(!protocol.turn_open(), "{name}: a turn is still open");
     (events, protocol.version().map(str::to_owned))
+}
+
+/// The answers a recorded allow of a question carries, read back from
+/// `answered` (its `updatedInput.answers`) against the request's `input`:
+/// an answer that is labels of the question's options joined by `", "`
+/// picks them, any other is the user's own text. `None` for an allow with
+/// no answers, or a request that asked no questions.
+fn recorded_answers(input: Option<&Value>, answered: &Value) -> Option<Vec<QuestionAnswer>> {
+    let questions = protocol::questions(input?)?;
+    let answered = answered.as_object()?;
+    let answers = questions
+        .iter()
+        .map(|q| {
+            let text = answered[&q.text].as_str().unwrap();
+            let picked: Option<Vec<u8>> = text
+                .split(", ")
+                .map(|label| q.options.iter().position(|o| o.label == label))
+                .map(|i| i.map(|i| u8::try_from(i).unwrap()))
+                .collect();
+            match picked {
+                Some(mut picked) => {
+                    picked.sort_unstable();
+                    QuestionAnswer {
+                        picked,
+                        other: None,
+                    }
+                }
+                None => QuestionAnswer {
+                    picked: Vec::new(),
+                    other: Some(text.to_owned()),
+                },
+            }
+        })
+        .collect();
+    Some(answers)
 }
 
 /// The `command_lifecycle` line by which the CLI takes up `written`, a user
@@ -344,6 +393,18 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             }
             AdapterEvent::ApprovalRequested { request, tool, .. } => {
                 format!("approval {}: {tool}", request.0)
+            }
+            AdapterEvent::QuestionAsked { questions, .. } => {
+                let asked: Vec<String> = questions
+                    .iter()
+                    .map(|q| {
+                        let labels: Vec<&str> =
+                            q.options.iter().map(|o| o.label.as_str()).collect();
+                        let pick = if q.multi_select { "any of" } else { "one of" };
+                        format!("{} [{pick} {}]", q.header, labels.join("/"))
+                    })
+                    .collect();
+                format!("question: {}", asked.join("; "))
             }
             AdapterEvent::ApprovalCancelled { request, reason } => {
                 format!("cancelled {}: {}", request.0, cut(reason))
@@ -970,6 +1031,162 @@ fn replay_permissions_allow_then_deny() {
             .output
             .contains("file state is current in your context")
     );
+}
+
+/// AskUserQuestion (docs/agents/claude-code.md §3.14): each `can_use_tool`
+/// is a question, not an approval, and the replay checks every answer
+/// byte for byte: one option, two of a multi-select question, the user's
+/// own text, then a denial that declines.
+#[test]
+fn replay_questions_are_asked_and_answered() {
+    let events = replay(
+        "ask_user_question",
+        first_session("ask_user_question"),
+        false,
+        &[],
+    );
+    let events = without_settings(events);
+    let shown: Vec<String> = describe(&events)
+        .into_iter()
+        .filter(|line| !line.starts_with("text:") && line != "turn usage")
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "resume handle: 493f5a52-3286-42e3-8779-d6824304e63d",
+            "turn started",
+            "tool call: AskUserQuestion",
+            "question: Bread [one of Rye/Sourdough]",
+            "tool result ok: Your questions have been answered: \"Which bread ",
+            "turn ended: Completed",
+            "turn started",
+            "tool call: AskUserQuestion",
+            "question: Toppings [any of Seeds/Oats/Salt]",
+            "tool result ok: Your questions have been answered: \"Which toppin",
+            "turn ended: Completed",
+            "turn started",
+            "tool call: AskUserQuestion",
+            "question: Jam [one of Apricot/Plum]",
+            "tool result ok: The user answered: \"Which jam should go on the c",
+            "turn ended: Completed",
+            "turn started",
+            "tool call: AskUserQuestion",
+            "question: Tea [one of Green/Black]",
+            "tool result error: The user denied this action.",
+            "turn ended: Completed",
+        ]
+    );
+    // Each question names the call asking, and each result that call.
+    let calls: Vec<&AgentCallId> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ToolCall { call: Some(c), .. } => Some(c),
+            _ => None,
+        })
+        .collect();
+    let asked: Vec<&AgentCallId> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::QuestionAsked { call: Some(c), .. } => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, calls);
+    let ended: Vec<&AgentCallId> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ToolResult { call: Some(c), .. } => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended, calls);
+    // The descriptions came along; a header names each question.
+    let Some(AdapterEvent::QuestionAsked { questions, .. }) = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::QuestionAsked { .. }))
+    else {
+        panic!("no question");
+    };
+    assert_eq!(
+        questions[0].text,
+        "Which bread should we bake for tomorrow?"
+    );
+    assert_eq!(
+        questions[0].options[0].description,
+        "Dense, earthy rye loaf"
+    );
+    assert_eq!(questions[0].options[0].preview, None);
+    // The call shows its question, the result what was answered.
+    let shown = displays(&events);
+    assert_eq!(
+        shown[..2],
+        [
+            r#"Other "Which bread should we bake for tomorrow?" detail=None body=None"#,
+            r#"error=false status=Some("answered") preview="Which bread should we bake for tomorrow? → Rye""#,
+        ]
+    );
+    assert_eq!(
+        shown[3],
+        r#"error=false status=Some("answered") preview="Which toppings should go on tomorrow's bread? → Seeds, Oats""#
+    );
+    assert_eq!(
+        shown[7],
+        r#"error=true status=Some("denied") preview="The user denied this action.""#
+    );
+}
+
+/// An AskUserQuestion input with no question to show is asked as a plain
+/// approval, and an allow then passes the input back unanswered.
+#[test]
+fn a_question_with_nothing_to_pick_is_an_approval() {
+    let input = json!({ "questions": [{ "question": "Which?", "header": "", "options": [] }] });
+    assert_eq!(protocol::questions(&input), None);
+    assert_eq!(protocol::questions(&json!({ "questions": [] })), None);
+    let mut protocol = Protocol::new(Uuid::new_v4(), false);
+    let out = protocol.on_line(
+        &json!({
+            "type": "control_request",
+            "request_id": "r1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": protocol::ASK_TOOL,
+                "input": input,
+                "tool_use_id": "toolu_1",
+            },
+        })
+        .to_string(),
+    );
+    assert!(
+        matches!(&out.events[..], [AdapterEvent::ApprovalRequested { tool, .. }] if tool == protocol::ASK_TOOL),
+        "{:?}",
+        out.events
+    );
+}
+
+/// The answers map labels in the options' order, then the user's own
+/// text; an answer to a question that is gone, or a pick past the options,
+/// adds nothing.
+#[test]
+fn answered_input_joins_labels_and_text() {
+    let input = json!({ "questions": [
+        { "question": "Toppings?", "options": [{ "label": "Seeds" }, { "label": "Oats" }], "multiSelect": true },
+    ] });
+    let answers = [
+        QuestionAnswer {
+            picked: vec![0, 1, 7],
+            other: Some("salt".into()),
+        },
+        QuestionAnswer {
+            picked: vec![0],
+            other: None,
+        },
+    ];
+    let answered = protocol::answered_input(&input, &answers);
+    assert_eq!(
+        answered["answers"],
+        json!({ "Toppings?": "Seeds, Oats, salt" })
+    );
+    assert_eq!(answered["questions"], input["questions"]);
 }
 
 /// The recorded `can_use_tool` requests of fixture `name`, in order.

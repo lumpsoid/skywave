@@ -11,8 +11,8 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use skywave_core::{
-    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, RuleSuggestion, RunWhen,
-    SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
+    ApprovalPrompt, ApprovalStatus, BlobView, Entry, Link, Outgoing, QuestionPrompt,
+    RuleSuggestion, RunWhen, SessionState, SessionUsage, SessionView, TimelineItem, ToolView,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
@@ -22,6 +22,7 @@ use skywave_present::format::{
     outgoing_label, repeat_word, session_usage_fields, shell_prompt, stop_heading, stop_warning,
     subagent_status, task_kind_word, trail, viewing_hint, work_summary,
 };
+use skywave_present::question::{QuestionDraft, question_label, reply_text};
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
@@ -79,17 +80,29 @@ pub(super) fn render(
     let composer_rows = ui.composer.rows(composer_width).len();
     let composer_height = composer_rows.clamp(1, COMPOSER_ROWS) as u16 + 2;
     let approval_rows = APPROVAL_ROWS.min(inner.height as usize / 3);
-    let approval = session.pending_approval.as_ref().map(|p| {
-        approval_lines(
-            p,
-            session,
-            ui.focus,
-            ui.rule_pick(session),
-            inner.width.saturating_sub(2) as usize,
-            approval_rows,
-        )
-    });
-    let approval_height = approval.as_ref().map_or(0, |lines| lines.len() as u16 + 2);
+    let panel_width = inner.width.saturating_sub(2) as usize;
+    let approval = session
+        .pending_approval
+        .as_ref()
+        .map(|p| {
+            let lines = approval_lines(
+                p,
+                session,
+                ui.focus,
+                ui.rule_pick(session),
+                panel_width,
+                approval_rows,
+            );
+            (" Approval needed ", lines)
+        })
+        .or_else(|| {
+            let prompt = session.pending_question.as_ref()?;
+            let lines = question_lines(prompt, ui.focus, panel_width, approval_rows);
+            Some((" Question ", lines))
+        });
+    let approval_height = approval
+        .as_ref()
+        .map_or(0, |(_, lines)| lines.len() as u16 + 2);
     let [status, timeline, approval_area, composer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -109,9 +122,9 @@ pub(super) fn render(
         Paragraph::new(status_line(session, ui, status.width as usize)),
         status,
     );
-    if let Some(lines) = approval {
+    if let Some((title, lines)) = approval {
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Approval needed ").yellow()),
+            Paragraph::new(lines).block(Block::bordered().title(title).yellow()),
             approval_area,
         );
     }
@@ -144,6 +157,9 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
         // Ctrl-X stops a shell run in shell mode.
         SessionState::AgentWorking if ui.shell() => Span::raw("agent working").cyan(),
         SessionState::AgentWorking => Span::raw("agent working · Ctrl-X interrupts").cyan(),
+        SessionState::AwaitingApproval(_) if session.pending_question.is_some() => {
+            Span::raw("agent waiting for an answer").yellow()
+        }
         SessionState::AwaitingApproval(_) => Span::raw("agent waiting for an approval").yellow(),
         SessionState::Errored(info) => Span::raw(format!("agent error: {}", info.message)).red(),
         SessionState::Stopped => Span::raw("agent stopped · a message restarts it").dark_gray(),
@@ -399,6 +415,181 @@ fn approval_lines(
         }
     });
     lines
+}
+
+/// The question prompt above the composer: who asks, each question and
+/// its options in short, at most `max_rows` of them, then the keys or this
+/// device's answer.
+fn question_lines(
+    prompt: &QuestionPrompt,
+    focus: Focus,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(from) = &prompt.from {
+        lines.push(Line::from(clean(&format!("from subagent: {from}"))).yellow());
+    }
+    let mut body = Vec::new();
+    for question in &prompt.questions {
+        let mut head = Vec::new();
+        if !question.header.trim().is_empty() {
+            head.push(Span::raw(format!("{} · ", clean(&question.header))).bold());
+        }
+        head.push(Span::raw(clean(&question.text)).bold());
+        body.extend(wrap(
+            vec![Span::raw("? ")],
+            vec![Span::raw("  ")],
+            head,
+            width,
+        ));
+        let pick = if question.multi_select {
+            "any of"
+        } else {
+            "one of"
+        };
+        let labels: Vec<String> = question.options.iter().map(|o| clean(&o.label)).collect();
+        let options =
+            Span::raw(format!("{pick}: {} · or your own", labels.join(" / "))).dark_gray();
+        body.extend(wrap(
+            vec![Span::raw("  ")],
+            vec![Span::raw("  ")],
+            vec![options],
+            width,
+        ));
+    }
+    body.truncate(max_rows.max(2));
+    lines.extend(body);
+    let keys = match focus {
+        Focus::Composer => "Esc, then a answer · x decline",
+        Focus::Timeline => "a answer · x decline",
+    };
+    lines.push(match &prompt.answer {
+        None => Line::from(keys).yellow().bold(),
+        Some(answer) => {
+            let label = match (&answer.outgoing, &answer.delivery) {
+                (Outgoing::Queued | Outgoing::Sending, Some(delivery)) => {
+                    delivery_label(delivery, &answer.outgoing)
+                }
+                _ => outgoing_label(&answer.outgoing),
+            };
+            let words = clean(&reply_text(prompt).unwrap_or_default());
+            let mut spans = vec![
+                Span::raw(format!("{words} · ")),
+                Span::styled(label, outgoing_badge(&answer.outgoing).1),
+            ];
+            if answer.retryable {
+                spans.push(Span::raw(format!(" · {keys} to answer again")).dark_gray());
+            }
+            Line::from(spans)
+        }
+    });
+    lines
+}
+
+/// The question picker's title, lines and typing position: the question
+/// in view, its options with their descriptions and the row for the
+/// user's own text, the highlighted option's preview, then the keys.
+fn question_picker(
+    prompt: &QuestionPrompt,
+    draft: &QuestionDraft,
+    selected: usize,
+    width: usize,
+    rows: usize,
+) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
+    let index = draft.current();
+    let Some(question) = prompt.questions.get(index) else {
+        return (" Question ".to_owned(), Vec::new(), None);
+    };
+    let answer = draft.answer(index);
+    let picked =
+        |i: usize| answer.is_some_and(|a| u8::try_from(i).is_ok_and(|i| a.picked.contains(&i)));
+    let mark = |on: bool| match (question.multi_select, on) {
+        (true, true) => "[x] ",
+        (true, false) => "[ ] ",
+        (false, true) => "(•) ",
+        (false, false) => "( ) ",
+    };
+    let mut lines = wrap(
+        Vec::new(),
+        Vec::new(),
+        vec![Span::raw(clean(&question.text)).bold()],
+        width,
+    );
+    let pick = if question.multi_select {
+        "pick any, Space toggles"
+    } else {
+        "pick one"
+    };
+    lines.push(Line::from(pick).dark_gray());
+    let mut items: Vec<Vec<Span<'static>>> = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let mut spans = vec![Span::raw(mark(picked(i))), Span::raw(clean(&option.label))];
+            if !option.description.is_empty() {
+                spans.push(Span::raw(format!("  {}", clean(&option.description))).dark_gray());
+            }
+            spans
+        })
+        .collect();
+    let own = answer.and_then(|a| a.other.as_deref());
+    items.push(match own {
+        Some(text) => vec![
+            Span::raw(mark(true)),
+            Span::raw(format!("Other: {}", clean(text))),
+        ],
+        None => vec![
+            Span::raw(mark(false)),
+            Span::raw("Other: "),
+            Span::raw("type your own").dark_gray(),
+        ],
+    });
+    let preview: Vec<Line<'static>> = question
+        .options
+        .get(selected)
+        .and_then(|o| o.preview.as_deref())
+        .map(|preview| {
+            preview
+                .lines()
+                .take(rows / 2)
+                .map(|line| Line::from(format!("  {}", clean(line))).dark_gray())
+                .collect()
+        })
+        .unwrap_or_default();
+    let room = rows.saturating_sub(lines.len() + preview.len() + 1).max(1);
+    let list = list_lines(items, selected, room);
+    let typing = selected == question.options.len();
+    let input = typing.then(|| {
+        let row = lines.len() + list.len().saturating_sub(1);
+        let column = 2 + 4 + "Other: ".len() + own.map_or(0, |t| clean(t).chars().count());
+        (row, column)
+    });
+    lines.extend(list);
+    lines.extend(preview);
+    let next = if draft.first_unanswered(&prompt.questions).is_none() {
+        "Enter send"
+    } else {
+        "Enter next"
+    };
+    let steps = if prompt.questions.len() > 1 {
+        " · ←→ question"
+    } else {
+        ""
+    };
+    lines.push(
+        Line::from(format!("↑↓ move · {next}{steps} · Esc close"))
+            .yellow()
+            .bold(),
+    );
+    let of = if prompt.questions.len() > 1 {
+        format!(" {}/{}", index + 1, prompt.questions.len())
+    } else {
+        String::new()
+    };
+    let title = format!(" Question{of} · {} ", clean(question_label(question)));
+    (title, lines, input)
 }
 
 /// What `A` does, when the agent offers lasting rules: grant the one it
@@ -773,6 +964,15 @@ fn render_picker(
             };
             (title, lines, None)
         }
+        Picker::Question { draft, selected } => match session
+            .pending_question
+            .as_ref()
+            .filter(|p| p.id == draft.id())
+        {
+            Some(prompt) => question_picker(prompt, draft, *selected, below.width as usize, rows),
+            // Answered or withdrawn: the next key closes it.
+            None => return,
+        },
         Picker::Effort { selected } => {
             let efforts = agent.efforts();
             let lines = if efforts.is_empty() {

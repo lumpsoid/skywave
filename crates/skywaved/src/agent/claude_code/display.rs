@@ -156,6 +156,14 @@ pub fn call_display(name: &str, input: &Value) -> Option<ToolDisplay> {
             text_body(str_field(input, "prompt").unwrap_or("")),
             &["description", "subagent_type", "prompt"],
         ),
+        // The question itself shows in the question prompt (§3.14).
+        "AskUserQuestion" => {
+            let questions = input.get("questions")?.as_array()?;
+            let first = questions.first()?.get("question")?.as_str()?;
+            let more =
+                (questions.len() > 1).then(|| count(questions.len(), "question", "questions"));
+            display(input, ToolKind::Other, first, more, None, &[])
+        }
         _ => None,
     }
 }
@@ -270,6 +278,19 @@ fn success(tool: Option<&str>, fields: &Map<String, Value>) -> (Option<String>, 
                 _ => code.to_string(),
             });
             (status, str_field(fields, "result").map(str::to_owned))
+        }
+        Some("AskUserQuestion") => {
+            let answers = fields.get("answers").and_then(Value::as_object);
+            match answers.filter(|answers| !answers.is_empty()) {
+                Some(answers) => {
+                    let lines: Vec<String> = answers
+                        .iter()
+                        .map(|(q, a)| format!("{q} → {}", a.as_str().unwrap_or("")))
+                        .collect();
+                    (Some("answered".to_owned()), Some(lines.join("\n")))
+                }
+                None => (Some("not answered".to_owned()), None),
+            }
         }
         _ => (None, None),
     }

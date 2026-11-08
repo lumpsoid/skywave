@@ -218,7 +218,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use skywave_proto::{
     BlobUse, Command, CommandId, CommandKind, CommandResult, ContextId, ContextRef, Decision,
     DeviceId, EventKind, ImportOutcome, PermissionMode, RejectReason, Seq, SessionId,
-    SessionOrigin, check_conversation_id, context_name, limits, normalise_context_name,
+    SessionOrigin, answers_fit, check_conversation_id, context_name, limits,
+    normalise_context_name,
 };
 
 use crate::agent::import;
@@ -450,11 +451,41 @@ impl EventLog {
                 if rule.is_some_and(|rule| *decision == Decision::Deny || !offered(rule)) {
                     return Ok(Err(RejectReason::UnknownRule));
                 }
+                // A question is answered with `AnswerQuestion`; a denial
+                // declines it.
+                if approval.questions.is_some() && *decision == Decision::Approve {
+                    return Ok(Err(RejectReason::BadAnswer));
+                }
                 let kind = EventKind::ApprovalResolved {
                     id: *id,
                     decision: *decision,
                     by: device,
                     rule: *rule,
+                };
+                (approval.session_id, approval.context, kind)
+            }
+            CommandKind::AnswerQuestion { id, answers } => {
+                let Some(approval) = event_log::approval_in(tx, *id)? else {
+                    return Ok(Err(RejectReason::UnknownApproval));
+                };
+                match approval.closed {
+                    Some(Closed::Resolved) => {
+                        return Ok(Err(RejectReason::ApprovalAlreadyResolved));
+                    }
+                    Some(Closed::Cancelled) => return Ok(Err(RejectReason::ApprovalCancelled)),
+                    None => {}
+                }
+                let fits = approval
+                    .questions
+                    .as_ref()
+                    .is_some_and(|questions| answers_fit(questions, answers));
+                if !fits {
+                    return Ok(Err(RejectReason::BadAnswer));
+                }
+                let kind = EventKind::QuestionAnswered {
+                    id: *id,
+                    by: device,
+                    answers: answers.clone(),
                 };
                 (approval.session_id, approval.context, kind)
             }
@@ -770,6 +801,7 @@ fn starts_work(kind: &CommandKind) -> bool {
         | CommandKind::MoveContext { .. }
         | CommandKind::RunShell { .. } => true,
         CommandKind::ResolveApproval { .. }
+        | CommandKind::AnswerQuestion { .. }
         | CommandKind::Interrupt { .. }
         | CommandKind::StopSession { .. }
         | CommandKind::StopTask { .. }

@@ -151,7 +151,12 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// v25: how full a context is and what a subagent ran. `context_tokens` and
 /// `context_window` on [`TurnUsage`], and `EventKind::SubagentUsage`
 /// ([`SubagentUsage`]): a finished subagent's own figures, by its call.
-pub const PROTOCOL_VERSION: u32 = 25;
+///
+/// v26: questions the agent asks with options to pick from:
+/// `EventKind::QuestionAsked` ([`Question`]) and `QuestionAnswered`
+/// ([`QuestionAnswer`]), sharing an approval's ids and life;
+/// `CommandKind::AnswerQuestion` and `RejectReason::BadAnswer`.
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -436,6 +441,25 @@ pub enum EventKind {
     ApprovalCancelled {
         id: ApprovalId,
         reason: String,
+    },
+    /// The agent asks the user `questions` and is blocked until a device
+    /// answers (D8): an approval whose answer is a choice. It shares an
+    /// approval's ids and life: `QuestionAnswered` answers it,
+    /// `ApprovalResolved` with [`Decision::Deny`] declines it, and
+    /// `ApprovalCancelled` withdraws it. `call` is the [`ToolCall`] that
+    /// asks, as on `ApprovalRequested`. `questions` holds at least one and
+    /// at most [`limits::QUESTIONS_MAX`].
+    QuestionAsked {
+        id: ApprovalId,
+        call: Option<CallId>,
+        questions: Vec<Question>,
+    },
+    /// First answer wins (D5), as for `ApprovalResolved`: `answers` holds
+    /// one per question, in order ([`answers_fit`]).
+    QuestionAnswered {
+        id: ApprovalId,
+        by: DeviceId,
+        answers: Vec<QuestionAnswer>,
     },
     /// The agent's current turn was stopped by an `Interrupt` command.
     TurnInterrupted,
@@ -766,6 +790,7 @@ impl EventKind {
         match self {
             EventKind::UserMessage { device_id, .. } => Some(*device_id),
             EventKind::ApprovalResolved { by, .. }
+            | EventKind::QuestionAnswered { by, .. }
             | EventKind::SessionRenamed { by, .. }
             | EventKind::SessionArchived { by, .. }
             | EventKind::PermissionModeRequested { by, .. }
@@ -788,6 +813,7 @@ impl EventKind {
             | EventKind::ToolResult(_)
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalCancelled { .. }
+            | EventKind::QuestionAsked { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionStateChanged(_)
@@ -825,6 +851,7 @@ impl EventKind {
             EventKind::SessionCreated { from, .. } => from.is_none(),
             EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
+            | EventKind::QuestionAnswered { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
@@ -846,6 +873,7 @@ impl EventKind {
             | EventKind::ToolResult(_)
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalCancelled { .. }
+            | EventKind::QuestionAsked { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
             | EventKind::SubagentUsage(_)
@@ -883,6 +911,8 @@ impl EventKind {
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
+            | EventKind::QuestionAsked { .. }
+            | EventKind::QuestionAnswered { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
@@ -962,6 +992,8 @@ impl EventKind {
             | EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
             | EventKind::ApprovalCancelled { .. }
+            | EventKind::QuestionAsked { .. }
+            | EventKind::QuestionAnswered { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::SessionRenamed { .. }
@@ -1070,6 +1102,28 @@ pub mod limits {
     pub const RULE_LABEL_MAX_CHARS: usize = 120;
     /// Most [`RuleSuggestion`](crate::RuleSuggestion)s on one approval.
     pub const RULE_SUGGESTIONS_MAX: usize = 8;
+    /// Most [`Question`](crate::Question)s in one `QuestionAsked`.
+    pub const QUESTIONS_MAX: usize = 8;
+    /// Most [`QuestionOption`](crate::QuestionOption)s of one question.
+    pub const QUESTION_OPTIONS_MAX: usize = 8;
+    /// Longest [`Question::header`](crate::Question::header), in chars.
+    pub const QUESTION_HEADER_MAX_CHARS: usize = 40;
+    /// Longest [`Question::text`](crate::Question::text), in chars.
+    pub const QUESTION_TEXT_MAX_CHARS: usize = 1000;
+    /// Longest [`QuestionOption::label`](crate::QuestionOption::label), in
+    /// chars.
+    pub const OPTION_LABEL_MAX_CHARS: usize = 120;
+    /// Longest
+    /// [`QuestionOption::description`](crate::QuestionOption::description),
+    /// in chars.
+    pub const OPTION_DESCRIPTION_MAX_CHARS: usize = 500;
+    /// Longest [`QuestionOption::preview`](crate::QuestionOption::preview),
+    /// in bytes; a longer one is cut at the last line break within it, if
+    /// any, else on a char boundary.
+    pub const OPTION_PREVIEW_MAX_BYTES: usize = 4096;
+    /// Longest [`QuestionAnswer::other`](crate::QuestionAnswer::other), in
+    /// bytes.
+    pub const ANSWER_TEXT_MAX_BYTES: usize = 8192;
     /// Most [`ModelChoice`](crate::ModelChoice)s in one `ModelsOffered`.
     pub const MODELS_MAX: usize = 32;
     /// Longest model id or name (`SetModel`, `ModelChoice::id`,
@@ -1510,6 +1564,77 @@ pub enum RuleScope {
     User,
 }
 
+/// A question the agent asks the user, with options to pick from
+/// (`EventKind::QuestionAsked`). Agent-agnostic (D3): the server cuts it to
+/// the [`limits`], and an answer names options by index.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// A short tag for the question, e.g. `Bread`, at most
+    /// [`limits::QUESTION_HEADER_MAX_CHARS`]; may be empty.
+    pub header: String,
+    /// The question, at most [`limits::QUESTION_TEXT_MAX_CHARS`].
+    pub text: String,
+    /// What to pick from, in the agent's order, at most
+    /// [`limits::QUESTION_OPTIONS_MAX`].
+    pub options: Vec<QuestionOption>,
+    /// Any number of options may be picked, not exactly one.
+    pub multi_select: bool,
+}
+
+/// One option of a [`Question`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    /// One line, at most [`limits::OPTION_LABEL_MAX_CHARS`].
+    pub label: String,
+    /// What picking it means, at most
+    /// [`limits::OPTION_DESCRIPTION_MAX_CHARS`]; may be empty.
+    pub description: String,
+    /// What it would look like (a mockup, a snippet), several lines shown
+    /// as written, at most [`limits::OPTION_PREVIEW_MAX_BYTES`].
+    pub preview: Option<String>,
+}
+
+/// The answer to one [`Question`]: the options picked, by index, and text
+/// of the user's own instead of (or, multi-select, besides) an option.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuestionAnswer {
+    /// Indexes into [`Question::options`], ascending, each at most once.
+    pub picked: Vec<u8>,
+    /// Not blank, at most [`limits::ANSWER_TEXT_MAX_BYTES`].
+    pub other: Option<String>,
+}
+
+impl Question {
+    /// Whether `answer` answers this question: every pick names an option,
+    /// ascending and once each; `other`, when given, is not blank and
+    /// within [`limits::ANSWER_TEXT_MAX_BYTES`]; a single-select question
+    /// takes exactly one of an option or `other`, a multi-select one at
+    /// least one of either.
+    pub fn takes(&self, answer: &QuestionAnswer) -> bool {
+        let named = answer.picked.windows(2).all(|w| w[0] < w[1])
+            && answer
+                .picked
+                .last()
+                .is_none_or(|last| usize::from(*last) < self.options.len());
+        let other = answer.other.as_ref().is_none_or(|text| {
+            !text.trim().is_empty() && text.len() <= limits::ANSWER_TEXT_MAX_BYTES
+        });
+        let given = answer.picked.len() + usize::from(answer.other.is_some());
+        let count = if self.multi_select {
+            given >= 1
+        } else {
+            given == 1
+        };
+        named && other && count
+    }
+}
+
+/// Whether `answers` answer `questions`: one each, in order, each one
+/// [`Question::takes`].
+pub fn answers_fit(questions: &[Question], answers: &[QuestionAnswer]) -> bool {
+    questions.len() == answers.len() && questions.iter().zip(answers).all(|(q, a)| q.takes(a))
+}
+
 /// The agent invoked a tool.
 ///
 /// `name` is the agent's own tool name, carried as data for display; clients
@@ -1729,6 +1854,14 @@ pub enum CommandKind {
         decision: Decision,
         #[serde(default)]
         rule: Option<u8>,
+    },
+    /// Answer a question (`EventKind::QuestionAsked`), one answer per
+    /// question in order. The server refuses answers that do not fit
+    /// ([`answers_fit`]) as `BadAnswer`. To decline, deny it with
+    /// `ResolveApproval`.
+    AnswerQuestion {
+        id: ApprovalId,
+        answers: Vec<QuestionAnswer>,
     },
     /// Stop the agent's current turn in this session.
     Interrupt { session_id: SessionId },
@@ -2012,6 +2145,11 @@ pub enum RejectReason {
     /// `ResolveApproval.rule` came with a denial, or names no suggestion of
     /// the approval.
     UnknownRule,
+    /// An `AnswerQuestion` whose answers do not fit the questions
+    /// ([`answers_fit`]) or that names a plain approval, or a
+    /// `ResolveApproval` approving a question (a question takes answers;
+    /// denying declines it).
+    BadAnswer,
     /// `SetModel.model` is blank.
     UnknownModel,
     /// `ClearContext.context` is already a context, of this session or
@@ -2081,10 +2219,11 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
-    /// Whether this refusal of a `ResolveApproval` rules out every answer:
-    /// the approval is unknown, already answered, or cancelled. Answering
-    /// again is pointless; only a refusal of the answer itself
-    /// ([`RejectReason::UnknownRule`]) leaves the approval open to another.
+    /// Whether this refusal of a `ResolveApproval` or `AnswerQuestion`
+    /// rules out every answer: the approval is unknown, already answered,
+    /// or cancelled. Answering again is pointless; only a refusal of the
+    /// answer itself ([`RejectReason::UnknownRule`],
+    /// [`RejectReason::BadAnswer`]) leaves the approval open to another.
     pub fn rules_out_answers(self) -> bool {
         matches!(
             self,
