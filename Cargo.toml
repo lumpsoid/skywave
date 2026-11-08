@@ -50,3 +50,6 @@ toml = "1.1.8"
 tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Transport compression (D45). The C library, built from source by `cc`
+# like rusqlite's bundled SQLite, so Android cross-builds need nothing more.
+zstd = { version = "0.14.0", default-features = false }

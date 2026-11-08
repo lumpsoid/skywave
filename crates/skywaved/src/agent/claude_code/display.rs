@@ -6,7 +6,7 @@
 //! the outcome from the structured `tool_use_result` the CLI sends next to
 //! each `tool_result`, not from the model-facing text: that text carries
 //! notes for the model ("file state is current in your context …") which
-//! stay in the output blob but not in the preview.
+//! stay in the whole output but not in the preview.
 //!
 //! Content is handed over uncut; the mapper applies the protocol's caps.
 

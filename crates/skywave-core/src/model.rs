@@ -40,7 +40,7 @@ use crate::view::{
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
     PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
     SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
@@ -198,10 +198,12 @@ pub(crate) struct Model {
     /// through it ([`Model::full_view`]).
     fates: HashMap<BlobId, BlobFate>,
     /// Blobs asked for and not yet taken by a download; in memory only, as
-    /// the blob queue forgets un-started requests on a restart too.
+    /// the blob queue forgets un-started requests on a restart too. A
+    /// `Failed` blob asked for again shows as requested.
     wanted: HashSet<BlobId>,
-    /// Why the last download of a blob was given up; in memory only.
-    failed: HashMap<BlobId, String>,
+    /// The blob queue paused every download on a full device disk; the
+    /// queue decides and reports it ([`Model::set_blobs_disk_full`]).
+    blobs_disk_full: bool,
     /// This device's unsent messages and shell commands, as stored.
     drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// What each session's composer writes where it is not the agent, as
@@ -295,7 +297,7 @@ impl Model {
             blobs: BTreeMap::new(),
             fates: HashMap::new(),
             wanted: HashSet::new(),
-            failed: HashMap::new(),
+            blobs_disk_full: false,
             drafts: HashMap::new(),
             composer_modes: HashMap::new(),
             draft_rev: 0,
@@ -746,10 +748,14 @@ impl Model {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
                     // A download already running shows its progress instead.
-                    if *status == BlobStatus::NotDownloaded {
+                    if matches!(
+                        status,
+                        BlobStatus::NotDownloaded
+                            | BlobStatus::Stopped { .. }
+                            | BlobStatus::Failed { .. }
+                    ) {
                         self.wanted.insert(id);
                     }
-                    self.failed.remove(&id);
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
             },
@@ -1006,10 +1012,11 @@ impl Model {
     fn want_shown_blob(&mut self) -> Option<Request> {
         let id = self.shown_blob()?.id;
         let record = self.blobs.get(&id)?;
-        if record.status != BlobStatus::NotDownloaded
-            || self.wanted.contains(&id)
-            || self.failed.contains_key(&id)
-        {
+        let not_here = matches!(
+            record.status,
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. }
+        );
+        if !not_here || self.wanted.contains(&id) {
             return None;
         }
         self.wanted.insert(id);
@@ -1730,7 +1737,6 @@ impl Model {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
         self.wanted.clear();
-        self.failed.clear();
         self.alerted.clear();
         self.alerted_at.clear();
         self.completer = Completer::default();
@@ -1763,12 +1769,10 @@ impl Model {
         }
     }
 
-    /// The blob left the replica: its record goes, with the request for it
-    /// and why it last failed.
+    /// The blob left the replica: its record goes, with the request for it.
     fn forget_blob(&mut self, id: BlobId) {
         self.blobs.remove(&id);
         self.wanted.remove(&id);
-        self.failed.remove(&id);
     }
 
     /// The `from` of each crop pending to produce `into`: a `Cropped` fate
@@ -1817,20 +1821,20 @@ impl Model {
     }
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
-        self.wanted.remove(&id);
-        self.failed.remove(&id);
+        // A request the queue has not seen yet may overtake a stop: it
+        // still shows as requested.
+        if !matches!(status, BlobStatus::Stopped { .. }) {
+            self.wanted.remove(&id);
+        }
         if let Some(blob) = self.blobs.get_mut(&id) {
             blob.status = status;
         }
     }
 
-    /// The download of `id` was given up: it is `NotDownloaded` again, and
-    /// says why until it is asked for again.
-    pub(crate) fn blob_failed(&mut self, id: BlobId, reason: String) {
-        self.blob_status(id, BlobStatus::NotDownloaded);
-        if self.blobs.contains_key(&id) {
-            self.failed.insert(id, reason);
-        }
+    /// The blob queue paused (or resumed) every download because the
+    /// device's disk is full; the views say so.
+    pub(crate) fn set_blobs_disk_full(&mut self, full: bool) {
+        self.blobs_disk_full = full;
     }
 
     fn outbox_entry(&mut self, id: CommandId) -> Option<&mut OutboxEntry> {
@@ -1884,6 +1888,7 @@ impl Model {
             Place::Pairing => Screen::Pairing(self.pairing_view()),
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
+                blobs_disk_full: self.blobs_disk_full,
                 server_address: self.settings.server_address.clone(),
                 device_id: self.device(),
                 server_fingerprint: self.paired.and_then(|p| p.server),
@@ -2146,11 +2151,20 @@ impl Model {
             .flat_map(|report| report.sessions.iter().map(|s| s.session))
             .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
             .collect();
+        let gone = report
+            .iter()
+            .flat_map(|report| {
+                let runs = report.shell_runs.iter().filter_map(|r| r.output_blob);
+                report.blobs.iter().map(|b| b.id).chain(runs)
+            })
+            .filter(|blob| self.fates.contains_key(blob))
+            .collect();
         StorageView {
             status,
             report,
             titles,
             pending: self.blob_pendings(),
+            gone,
         }
     }
 
@@ -2728,7 +2742,7 @@ impl Model {
                     Some(text)
                 }
                 EventKind::Imported {
-                    item: ImportedItem::UserMessage { text },
+                    item: ImportedItem::UserMessage { text, .. },
                     ..
                 } => Some(text),
                 _ => None,
@@ -2874,9 +2888,10 @@ impl Model {
                         delivery: sent.and_then(|e| Delivery::of(e)),
                     }
                 }),
-                EventKind::AgentMessage { text, .. } => {
-                    Some(Entry::AgentMessage { text: text.clone() })
-                }
+                EventKind::AgentMessage { text, full, .. } => Some(Entry::AgentMessage {
+                    text: text.clone(),
+                    full: full.as_ref().map(|full| self.full_view(full)),
+                }),
                 EventKind::ToolCall(
                     tool @ ToolCall {
                         call: Some(call), ..
@@ -2939,6 +2954,7 @@ impl Model {
                             id: *id,
                             status: ApprovalStatus::Pending,
                             answer: None,
+                            input: input.as_ref().map(|f| self.full_view(f)),
                         });
                         tools.approvals.insert(*id, item);
                         None
@@ -3242,12 +3258,14 @@ impl Model {
         item: &ImportedItem,
     ) -> Option<ImportedEntry> {
         match item {
-            ImportedItem::UserMessage { text } => {
-                Some(ImportedEntry::UserMessage { text: text.clone() })
-            }
-            ImportedItem::AgentMessage { text } => {
-                Some(ImportedEntry::AgentMessage { text: text.clone() })
-            }
+            ImportedItem::UserMessage { text, full } => Some(ImportedEntry::UserMessage {
+                text: text.clone(),
+                full: full.as_ref().map(|full| self.full_view(full)),
+            }),
+            ImportedItem::AgentMessage { text, full } => Some(ImportedEntry::AgentMessage {
+                text: text.clone(),
+                full: full.as_ref().map(|full| self.full_view(full)),
+            }),
             // The server gives every imported call a fresh id, so neither
             // a missing nor a repeated one occurs; such a call is not shown.
             ImportedItem::ToolCall(tool) => {
@@ -3353,20 +3371,33 @@ impl Model {
         };
         let size = record.size;
         let state = match &record.status {
-            BlobStatus::NotDownloaded => match self.failed.get(&blob.id) {
-                Some(reason) => BlobState::Failed {
-                    size,
-                    reason: reason.clone(),
-                },
-                None if self.wanted.contains(&blob.id) => BlobState::Requested { size },
-                None => BlobState::NotDownloaded { size },
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. } | BlobStatus::Failed { .. }
+                if self.wanted.contains(&blob.id) =>
+            {
+                BlobState::Requested { size }
+            }
+            // A stopped download is no download under way: nothing moves
+            // until it is asked for, which resumes from its kept bytes.
+            BlobStatus::NotDownloaded | BlobStatus::Stopped { .. } => {
+                BlobState::NotDownloaded { size }
+            }
+            BlobStatus::Failed { reason } => BlobState::Failed {
+                size,
+                reason: reason.clone(),
             },
             BlobStatus::Downloading { got, .. } => BlobState::Downloading {
                 got: *got,
                 size,
-                // Blob traffic needs the server too; while the link is down
-                // the download waits for it.
-                paused: !matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }),
+                // A full disk first: only the user can end it. Blob traffic
+                // needs the server too; while the link is down the download
+                // waits for it.
+                paused: if self.blobs_disk_full {
+                    Some(Pause::DiskFull)
+                } else if matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }) {
+                    None
+                } else {
+                    Some(Pause::Offline)
+                },
             },
             BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
@@ -3381,6 +3412,7 @@ impl Model {
     fn full_view(&self, full: &Full) -> FullView {
         match full {
             Full::Blob(blob) => self.fated_view(blob),
+            Full::Inline(text) => FullView::Inline(text.clone()),
             Full::Lost => FullView::Lost,
         }
     }
@@ -3599,6 +3631,7 @@ impl ToolIndex {
             EventKind::AgentMessage {
                 parent: Some(parent),
                 text,
+                ..
             } => {
                 if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
                     self.steps.entry(*parent).or_default().last = Some(line.to_owned());
@@ -4223,6 +4256,7 @@ mod tests {
                     EventKind::AgentMessage {
                         parent: None,
                         text: "hi".into(),
+                        full: None,
                     },
                 ),
             ],
@@ -4251,7 +4285,10 @@ mod tests {
                     outgoing: Some(Outgoing::Accepted(Seq(2))),
                     delivery: Some(done),
                 },
-                &Entry::AgentMessage { text: "hi".into() },
+                &Entry::AgentMessage {
+                    text: "hi".into(),
+                    full: None,
+                },
             ]
         );
     }
@@ -5909,8 +5946,12 @@ mod tests {
         assert_eq!(output_state(&f), BlobState::Requested { size: 10_000 });
 
         // A given-up download says why; asking again requests it again.
-        f.model
-            .blob_failed(output.id, "blob size mismatch".to_owned());
+        f.model.blob_status(
+            output.id,
+            BlobStatus::Failed {
+                reason: "blob size mismatch".to_owned(),
+            },
+        );
         assert_eq!(
             output_state(&f),
             BlobState::Failed {
@@ -5939,25 +5980,33 @@ mod tests {
             size: 10_000,
             paused,
         };
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
         f.model.set_link(Link::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
             reason: crate::view::LinkFailure::Unreachable,
         });
-        assert_eq!(output_state(&f), downloading(true));
+        assert_eq!(output_state(&f), downloading(Some(Pause::Offline)));
+        // A full disk says so over the link being down, until resumed.
+        f.model.set_blobs_disk_full(true);
+        assert_eq!(output_state(&f), downloading(Some(Pause::DiskFull)));
+        f.model.set_blobs_disk_full(false);
+        assert_eq!(output_state(&f), downloading(Some(Pause::Offline)));
         f.model.set_link(Link::CatchingUp {
             have: Seq(1),
             server: Seq(2),
         });
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
+        f.model.set_blobs_disk_full(true);
+        assert_eq!(output_state(&f), downloading(Some(Pause::DiskFull)));
+        f.model.set_blobs_disk_full(false);
         // A running download asked for again keeps showing its progress.
         assert_eq!(
             f.dispatch(Action::DownloadBlob(output.id)),
             vec![Effect::Request(Request::DownloadBlob(output.id))]
         );
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
         f.model
             .blob_status(output.id, BlobStatus::Available { path: path.clone() });
         assert_eq!(output_state(&f), BlobState::Available { path });
@@ -6529,9 +6578,9 @@ mod tests {
     fn imported_text(user: bool, text: &str) -> ImportedItem {
         let text = text.to_owned();
         if user {
-            ImportedItem::UserMessage { text }
+            ImportedItem::UserMessage { text, full: None }
         } else {
-            ImportedItem::AgentMessage { text }
+            ImportedItem::AgentMessage { text, full: None }
         }
     }
 
@@ -6621,14 +6670,16 @@ mod tests {
                 &Entry::Imported {
                     at: at(0),
                     entry: ImportedEntry::UserMessage {
-                        text: "fix the build".into()
+                        text: "fix the build".into(),
+                        full: None,
                     },
                 },
                 // No time recorded: when the server logged it.
                 &Entry::Imported {
                     at: logged[2].1,
                     entry: ImportedEntry::AgentMessage {
-                        text: "looking".into()
+                        text: "looking".into(),
+                        full: None,
                     },
                 },
                 // The call and its result are one row, timed by the agent.
@@ -6662,7 +6713,8 @@ mod tests {
                 },
                 shown[6],
                 &Entry::AgentMessage {
-                    text: "on it".into()
+                    text: "on it".into(),
+                    full: None,
                 },
             ]
         );
@@ -7288,6 +7340,7 @@ mod tests {
                 id: approval,
                 status: ApprovalStatus::Pending,
                 answer: None,
+                input: None,
             }),
             outcome: ToolOutcome::Running { since: minute(2) },
         };
@@ -7330,6 +7383,7 @@ mod tests {
                     rule: None,
                 },
                 answer: None,
+                input: None,
             }),
             outcome: ToolOutcome::Done {
                 is_error: false,
@@ -7343,6 +7397,63 @@ mod tests {
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(done))]);
         assert_eq!(f.session_view().pending_approval, None);
+    }
+
+    #[test]
+    fn an_approval_folded_into_its_call_keeps_its_own_input() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (call, approval, plain) = (CallId::new(), ApprovalId::new(), ApprovalId::new());
+        let asked = BlobRef {
+            id: BlobId::new(),
+            size: 5000,
+            sha256: skywave_proto::ContentHash::of(b""),
+        };
+        let other = CallId::new();
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::Shell, "make"),
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: Some(call),
+                    tool: "agent-tool".into(),
+                    summary: "make".into(),
+                    input: Some(Full::Blob(asked.clone())),
+                    suggestions: Vec::new(),
+                },
+                // Positive control: one asking what its call holds.
+                tool_call(Some(other), ToolKind::Shell, "ls"),
+                approval_requested(plain, Some(other)),
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: f.me,
+                    rule: None,
+                },
+            ],
+        );
+        f.open(sid);
+        let approvals: Vec<_> = tools(&f)
+            .into_iter()
+            .map(|v| (v.call, v.approval.and_then(|a| a.input)))
+            .collect();
+        assert_eq!(
+            approvals,
+            vec![
+                (
+                    call,
+                    Some(FullView::Blob(BlobView {
+                        id: asked.id,
+                        state: BlobState::NotDownloaded { size: asked.size },
+                        change: None,
+                        pending: None,
+                    }))
+                ),
+                (other, None),
+            ]
+        );
     }
 
     #[test]
@@ -7436,6 +7547,7 @@ mod tests {
                     rule: None,
                 },
                 answer: None,
+                input: None,
             })
         );
     }
@@ -7619,6 +7731,7 @@ mod tests {
         EventKind::AgentMessage {
             parent: None,
             text: text.into(),
+            full: None,
         }
     }
 
@@ -8736,6 +8849,102 @@ mod tests {
     }
 
     #[test]
+    fn the_storage_screen_marks_gone_each_listed_blob_the_log_deletes_or_crops() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (theirs, mine, run, kept, unlisted) = (
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+        );
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+        let mut report = storage_report(&[sid]);
+        report.blobs = [theirs, mine, kept]
+            .map(|id| skywave_proto::BlobStorage {
+                id,
+                size: 10,
+                session: sid,
+                seq: Seq(1),
+                holds: BlobUse::ToolOutput,
+            })
+            .into();
+        report.shell_runs = vec![skywave_proto::ShellRunStorage {
+            run: CommandId::new(),
+            session: sid,
+            command_line: "make".into(),
+            event_bytes: 10,
+            output: 10,
+            output_blob: Some(run),
+        }];
+        f.model.storage_reported(first, Ok(report));
+        assert_eq!(storage_view(&f).gone, HashSet::new());
+
+        // Another device deletes one blob and crops the run's output, and
+        // a blob the report doesn't list goes too; no request of this
+        // device is involved, and nothing asks the server again.
+        let other = DeviceId::new();
+        f.log(
+            sid,
+            vec![
+                EventKind::BlobDeleted {
+                    blob: theirs,
+                    holds: BlobUse::ToolOutput,
+                    by: other,
+                },
+                EventKind::BlobCropped {
+                    blob: run,
+                    holds: BlobUse::ShellOutput,
+                    into: BlobRef {
+                        id: BlobId::new(),
+                        size: 5,
+                        sha256: skywave_proto::ContentHash::of(b""),
+                    },
+                    kept: vec![skywave_proto::LineSpan { first: 0, count: 1 }],
+                    lines: 2,
+                    by: other,
+                },
+                EventKind::BlobDeleted {
+                    blob: unlisted,
+                    holds: BlobUse::ToolOutput,
+                    by: other,
+                },
+            ],
+        );
+        let view = storage_view(&f);
+        assert_eq!(view.status, StorageStatus::Ready);
+        assert_eq!(view.gone, HashSet::from([theirs, run]));
+
+        // This device's own delete, accepted: the refresh it asks for is
+        // still out when the log brings the delete, which ends its
+        // pending; the row stays gone until the new report.
+        let delete = queued(&f.dispatch(Action::DeleteBlob(mine)));
+        let at = f.events.len() as u64 + 1;
+        assert!(matches!(
+            accept(&mut f, delete.id, at),
+            Some(Request::Storage { .. })
+        ));
+        assert!(storage_view(&f).pending.contains_key(&mine));
+        f.log_commands(
+            sid,
+            vec![(
+                Some(delete.id),
+                EventKind::BlobDeleted {
+                    blob: mine,
+                    holds: BlobUse::ToolOutput,
+                    by: f.me,
+                },
+            )],
+        );
+        let view = storage_view(&f);
+        assert_eq!(view.status, StorageStatus::Loading);
+        assert!(!view.pending.contains_key(&mine));
+        assert_eq!(view.gone, HashSet::from([theirs, run, mine]));
+        assert!(!view.gone.contains(&kept));
+    }
+
+    #[test]
     fn the_picker_needs_a_paired_device_on_the_session_list() {
         let mut model = Model::new(empty_snapshot(), None);
         assert!(model.dispatch(Action::ListConversations).is_empty());
@@ -9715,6 +9924,7 @@ mod tests {
         EventKind::AgentMessage {
             parent: Some(parent),
             text: text.into(),
+            full: None,
         }
     }
 
@@ -9729,7 +9939,7 @@ mod tests {
             .into_iter()
             .map(|entry| match entry {
                 Entry::Tool(view) => view.title,
-                Entry::AgentMessage { text } => text,
+                Entry::AgentMessage { text, .. } => text,
                 Entry::ToolResult { summary, .. } => format!("result {summary}"),
                 Entry::Approval { summary, .. } => format!("approval {summary}"),
                 other => format!("{other:?}"),
@@ -9889,7 +10099,7 @@ mod tests {
                 .into_iter()
                 .map(|hit| match &view.timeline[hit.index] {
                     TimelineItem::Logged {
-                        entry: Entry::AgentMessage { text },
+                        entry: Entry::AgentMessage { text, .. },
                         ..
                     } => text.clone(),
                     other => panic!("hit {other:?}"),
@@ -10371,7 +10581,12 @@ mod tests {
             f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
             assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
             // A failed download is asked for again by hand only.
-            f.model.blob_failed(diff.id, "size mismatch".into());
+            f.model.blob_status(
+                diff.id,
+                BlobStatus::Failed {
+                    reason: "size mismatch".into(),
+                },
+            );
             f.dispatch(Action::Back);
             assert!(f.dispatch(Action::ShowWorkdir(pane)).is_empty());
 
@@ -10857,6 +11072,78 @@ mod tests {
             );
         }
 
+        /// Workdir refreshes purge and register blob ids without end; each
+        /// purge drops the blob's lease, so the leases kept stay those of
+        /// blobs in the replica, however long the run. A lease read before
+        /// any of those purges still fails once the same id is back, and
+        /// the current registration's lease still reports.
+        #[test]
+        fn workdir_refreshes_keep_only_the_leases_of_blobs_still_there() {
+            let live = Live::new();
+            let recurring = blob(3);
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            let diff = |blob: &BlobRef| {
+                changes(vec![changed(
+                    "a.rs",
+                    FileChange::Modified,
+                    DiffBody::Blob(blob.clone()),
+                )])
+            };
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(diff(&recurring)))
+                .unwrap();
+            let (_, first) = live.seam.leased_blob(recurring.id).unwrap().unwrap();
+            let held = || crate::client::lock(&live.core.shared.state).leases_held();
+            assert_eq!(held(), 1);
+
+            for round in 0..50 {
+                // Another blob, then the recurring id named again: each
+                // answer purges the one before, and a download reads each.
+                let other = blob(4);
+                for current in [&other, &recurring] {
+                    let (req, _) = live.asked(Action::RefreshWorkdir);
+                    live.seam
+                        .workdir_answered(req, ask.clone(), Ok(diff(current)))
+                        .unwrap();
+                    assert_eq!(live.requests().len(), 1, "one blob purged");
+                    live.seam.leased_blob(current.id).unwrap().unwrap();
+                    assert_eq!(held(), 1, "round {round}: only the blob shown has a lease");
+                }
+            }
+
+            let downloading = BlobStatus::Downloading {
+                got: 1,
+                path: "/blobs/a.part".into(),
+            };
+            assert!(
+                matches!(
+                    live.seam
+                        .leased_blob_status(recurring.id, first, downloading.clone()),
+                    Err(crate::CoreError::Store(
+                        crate::store::StoreError::UnknownBlob(_)
+                    ))
+                ),
+                "the first registration's download is refused"
+            );
+            assert_eq!(
+                live.seam.blob(recurring.id).unwrap().unwrap().status,
+                BlobStatus::NotDownloaded
+            );
+            let (_, current) = live.seam.leased_blob(recurring.id).unwrap().unwrap();
+            live.seam
+                .leased_blob_status(recurring.id, current, downloading.clone())
+                .unwrap();
+            assert_eq!(
+                live.seam.blob(recurring.id).unwrap().unwrap().status,
+                downloading
+            );
+            // An id nothing registers gets no lease at all.
+            assert!(live.seam.leased_blob(blob(5).id).unwrap().is_none());
+            assert_eq!(held(), 1);
+        }
+
         /// The tool outputs of the session on screen, in log order.
         fn outputs(view: crate::ViewState) -> Vec<FullView> {
             let Screen::Session(session) = view.screen else {
@@ -10873,6 +11160,98 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        /// A long message's whole text shows as its blob, live or imported,
+        /// and as deleted once the server deleted it; a whole message has
+        /// none.
+        #[test]
+        fn a_long_messages_blob_shows_and_its_delete_too() {
+            let live = Live::new();
+            let other = DeviceId::new();
+            let (agent, imported) = (blob(40_000), blob(30_000));
+            let event = |kind| Event {
+                session_id: live.session,
+                at: Utc::now(),
+                command_id: None,
+                context: ContextId::first_of(live.session),
+                kind,
+            };
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(2),
+                    events: vec![
+                        event(EventKind::Imported {
+                            at: None,
+                            item: ImportedItem::UserMessage {
+                                text: "log:".into(),
+                                full: Some(Full::Blob(imported.clone())),
+                            },
+                        }),
+                        event(EventKind::AgentMessage {
+                            text: "# Report".into(),
+                            parent: None,
+                            full: Some(Full::Blob(agent.clone())),
+                        }),
+                        event(EventKind::AgentMessage {
+                            text: "short".into(),
+                            parent: None,
+                            full: None,
+                        }),
+                    ],
+                })
+                .unwrap();
+            live.core
+                .dispatch(Action::OpenSession(live.session))
+                .unwrap();
+            let fulls = |view: crate::ViewState| -> Vec<Option<FullView>> {
+                let Screen::Session(session) = view.screen else {
+                    panic!("expected the session screen");
+                };
+                session
+                    .timeline
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        TimelineItem::Logged {
+                            entry:
+                                Entry::AgentMessage { full, .. }
+                                | Entry::Imported {
+                                    entry: ImportedEntry::UserMessage { full, .. },
+                                    ..
+                                },
+                            ..
+                        } => Some(full),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let shown = fulls(live.core.view());
+            assert!(
+                matches!(&shown[..], [
+                    Some(FullView::Blob(i)),
+                    Some(FullView::Blob(a)),
+                    None,
+                ] if i.id == imported.id && a.id == agent.id
+                    && a.state == BlobState::NotDownloaded { size: 40_000 }),
+                "{shown:?}"
+            );
+
+            live.seam
+                .apply_events(&EventBatch {
+                    from: Seq(5),
+                    events: vec![event(EventKind::BlobDeleted {
+                        blob: agent.id,
+                        holds: BlobUse::Message,
+                        by: other,
+                    })],
+                })
+                .unwrap();
+            let shown = fulls(live.core.view());
+            assert!(
+                matches!(&shown[1], Some(FullView::Deleted { by }) if by.id == other),
+                "{shown:?}"
+            );
+            assert!(matches!(&shown[0], Some(FullView::Blob(_))), "{shown:?}");
         }
 
         /// A server delete or crop purges the old blob in the update that

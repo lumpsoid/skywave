@@ -353,11 +353,11 @@ pub enum BlobState {
     Requested {
         size: u64,
     },
-    /// `paused` while the link is down: the download waits for it.
+    /// `paused` names what the download waits for, if anything.
     Downloading {
         got: u64,
         size: u64,
-        paused: bool,
+        paused: Option<Pause>,
     },
     /// The last download was given up (e.g. the sizes disagree); asking
     /// again retries it.
@@ -369,6 +369,16 @@ pub enum BlobState {
     Available {
         path: PathBuf,
     },
+}
+
+/// What a download in progress waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pause {
+    /// The link is down; it resumes once the link is back.
+    Offline,
+    /// This device's disk is full: every blob download stopped, keeping
+    /// what it got, until a download is asked for (or the app restarts).
+    DiskFull,
 }
 
 /// A blob referenced from the timeline, with its download state.
@@ -423,6 +433,8 @@ pub enum BlobChange {
 pub enum FullView {
     /// Kept as a blob, with its download state.
     Blob(BlobView),
+    /// Carried in the event, so here already: small content, never a blob.
+    Inline(String),
     /// The server could not keep it: only the preview or summary is left.
     Lost,
     /// Deleted on the server, and this device has no copy: only the
@@ -435,7 +447,15 @@ impl FullView {
     pub fn blob(&self) -> Option<&BlobView> {
         match self {
             FullView::Blob(blob) => Some(blob),
-            FullView::Lost | FullView::Deleted { .. } => None,
+            FullView::Inline(_) | FullView::Lost | FullView::Deleted { .. } => None,
+        }
+    }
+
+    /// The whole content when it came inline in the event.
+    pub fn inline(&self) -> Option<&str> {
+        match self {
+            FullView::Inline(text) => Some(text),
+            FullView::Blob(_) | FullView::Lost | FullView::Deleted { .. } => None,
         }
     }
 }
@@ -817,6 +837,10 @@ pub struct StorageView {
     /// This device's own delete or crop of each blob that has one, as a
     /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
     pub pending: std::collections::HashMap<BlobId, BlobPending>,
+    /// Each blob the report lists that this replica's log has already
+    /// deleted or cropped, by any device: the report predates that, so a
+    /// row of it offers nothing.
+    pub gone: std::collections::HashSet<BlobId>,
 }
 
 /// Where the storage screen's report stands.
@@ -1362,8 +1386,11 @@ pub enum Entry {
         /// How it went out, when this device sent it.
         delivery: Option<Delivery>,
     },
+    /// `text` is the whole message unless `full` is set: then it is the
+    /// message's head, and `full` the whole of it.
     AgentMessage {
         text: String,
+        full: Option<FullView>,
     },
     /// One tool call with its approval and result folded in, placed at the
     /// call's seq.
@@ -1398,16 +1425,10 @@ pub enum Entry {
     Stopped,
     /// A device cleared the session's context: the context `name` started
     /// afresh and became current.
-    ContextStarted {
-        name: String,
-        by: DeviceRef,
-    },
+    ContextStarted { name: String, by: DeviceRef },
     /// A device made the earlier context `name` current again. A switch to
     /// the context already current has no entry.
-    ContextSwitched {
-        name: String,
-        by: DeviceRef,
-    },
+    ContextSwitched { name: String, by: DeviceRef },
     /// A device moved the context `name` into the session `to`, where it
     /// goes on; here it is never current again.
     ContextMoved {
@@ -1417,17 +1438,12 @@ pub enum Entry {
     },
     /// The session's first item when it was made by moving the context
     /// `name` out of `from`: its conversation goes on here.
-    MovedFrom {
-        from: SessionRef,
-        name: String,
-    },
+    MovedFrom { from: SessionRef, name: String },
     /// The session's first item when it was made by adopting the agent's
     /// outside conversation `conversation`. What the server could read of
     /// that conversation follows as [`Entry::Imported`] items, then one
     /// [`Entry::ImportFinished`]; the session's own entries come after.
-    Adopted {
-        conversation: String,
-    },
+    Adopted { conversation: String },
     /// One item of an adopted conversation's history, as the agent kept it
     /// outside Skywave: a record, never unread news and never running.
     /// `at` is when the agent recorded it, or when the server logged it if
@@ -1439,30 +1455,17 @@ pub enum Entry {
     /// Where an adopted conversation's imported history ends and the
     /// session's own begins, and how the import went. Not shown when the
     /// timeline is narrowed to one context.
-    ImportFinished {
-        outcome: ImportOutcome,
-    },
+    ImportFinished { outcome: ImportOutcome },
     /// The session was renamed; `None` restored its default title.
-    Renamed {
-        name: Option<String>,
-        by: DeviceRef,
-    },
+    Renamed { name: Option<String>, by: DeviceRef },
     /// The session was archived (`true`) or brought back from the archive.
     /// A message brings it back too, without an entry of its own.
-    Archived {
-        archived: bool,
-        by: DeviceRef,
-    },
+    Archived { archived: bool, by: DeviceRef },
     /// The agent reported an error.
-    AgentErrored {
-        message: String,
-    },
+    AgentErrored { message: String },
     /// The agent started as `version`, not `confirmed`, the version the
     /// server was checked against: a warning that its turns may misbehave.
-    AgentVersionUnconfirmed {
-        version: String,
-        confirmed: String,
-    },
+    AgentVersionUnconfirmed { version: String, confirmed: String },
     /// A turn ended and its agent reported what it took. A figure the agent
     /// does not report is `None`.
     TurnUsage(TurnUsage),
@@ -1481,11 +1484,14 @@ pub enum Entry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportedEntry {
     /// A prompt the user gave the agent outside Skywave; no device sent it.
+    /// `text` and `full` as on [`Entry::AgentMessage`].
     UserMessage {
         text: String,
+        full: Option<FullView>,
     },
     AgentMessage {
         text: String,
+        full: Option<FullView>,
     },
     /// An imported call with its imported result folded in. Without a
     /// result its outcome is [`ToolOutcome::NoResult`], never `Running`:
@@ -1525,6 +1531,20 @@ pub struct ToolView {
     /// What the subagent a [`ToolKind::Subagent`] call runs is doing;
     /// `None` for any other call.
     pub subagent: Option<SubagentStatus>,
+}
+
+impl ToolView {
+    /// The approval's own input ([`ToolApproval::input`]), unless it is the
+    /// very blob the call's input is: what the agent asked to run when that
+    /// differs from what the call says.
+    pub fn approval_input(&self) -> Option<&FullView> {
+        let asked = self.approval.as_ref()?.input.as_ref()?;
+        let call = self.input.as_ref().and_then(FullView::blob);
+        match (asked.blob(), call) {
+            (Some(asked), Some(call)) if asked.id == call.id => None,
+            _ => Some(asked),
+        }
+    }
 }
 
 /// How the subagent an `Agent` call runs stands, from its own items.
@@ -1582,6 +1602,10 @@ pub struct ToolApproval {
     /// this is where an answer that did not apply stays in sight: refused
     /// because another device answered first or the approval was cancelled.
     pub answer: Option<Answer>,
+    /// The request's own input (a `BlobUse::ApprovalInput` blob): the
+    /// server logs one only when it differs from the call's input, so
+    /// `None` means the call's input is what was asked.
+    pub input: Option<FullView>,
 }
 
 /// How a tool call stands.
@@ -1669,6 +1693,9 @@ pub struct Answer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
     pub blob_policy: BlobPolicy,
+    /// Blob downloads, `Eager` ones included, are paused because this
+    /// device's disk is full ([`Pause::DiskFull`]).
+    pub blobs_disk_full: bool,
     pub server_address: Option<String>,
     pub device_id: Option<DeviceId>,
     /// The fingerprint of the server CA pinned at pairing, to compare with
@@ -1731,7 +1758,13 @@ mod tests {
             state: SessionState::Idle,
             timeline: vec![
                 message(1, "first", true),
-                logged(2, Entry::AgentMessage { text: "ok".into() }),
+                logged(
+                    2,
+                    Entry::AgentMessage {
+                        text: "ok".into(),
+                        full: None,
+                    },
+                ),
                 message(3, "again", false),
                 message(4, "again", true),
                 logged(5, Entry::Interrupted),

@@ -1083,3 +1083,113 @@ event alike, whichever device decided); uploading the kept bytes (large, and
 untrusted); rewriting or dropping the referencing event (the log is
 append-only; compaction, task 899242, is where history shrinks); cropping
 running shell output (no blob yet; its progress events are bounded).
+
+## D43. A protocol bump migrates stored data; the wire still matches exactly
+Until v23 a bump made every server database and replica unreadable, and the
+fix was to delete them (the alpha stance). From v23 on (decided by the user
+on 2026-11-07), upgrading keeps the data:
+- **Stored data migrates; the wire does not.** Client and server still
+  match `PROTOCOL_VERSION` exactly at `hello`; you upgrade both. What a
+  new build reads from the old data is migrated: the server's database
+  and a device's replica, the outbox's unsent commands included.
+- **One step per version, on each side, chained.** `MIGRATED_SINCE`
+  (`skywave-proto`, 23) is the oldest version migrated. `db.rs` and
+  `store.rs` each hold `PROTOCOL_STEPS`, an array whose length is
+  `PROTOCOL_VERSION - MIGRATED_SINCE`, so a bump does not compile until
+  both sides have a step for it. Step `i` rewrites the stored wire JSON
+  from `MIGRATED_SINCE + i` to the next; a bump that changes nothing stored
+  adds a no-op that says so. Opening runs the steps from the stamp on, in
+  the schema migrations' transaction and after them, then restamps.
+- **Both sides rewrite events alike.** The replica holds the server's
+  events by seq; a step that changes `Event` JSON must change it the same
+  way on both sides, so that transform lives in `skywave-proto` and both
+  steps call it.
+- **Refused, untouched:** a stamp before `MIGRATED_SINCE` (from before this
+  decision) or after this build's version (a downgrade).
+**Rejected:** speaking the previous version to devices not yet upgraded (a
+wire compatibility layer, much larger, not needed while one person runs
+both sides); resetting the replica instead of migrating it (it would drop
+unsent commands); migrating only from the previous version (a skipped
+release would again mean deleting data).
+
+## D44. Event blobs are not deduplicated by content
+Every event blob is its own: the server mints a fresh `BlobId` for each
+one, even when another event already stored the same bytes. Reading one
+large file ten times stores ten blobs, and `Eager` downloads all ten.
+Workdir blobs are deduplicated by `(sha256, size)` (D36); event blobs are
+not, and this is an accepted cost:
+- **A blob id is one item's content.** `DeleteBlob` and `CropBlob` (D42)
+  act on a blob id, and every device applies `BlobDeleted` and
+  `BlobCropped` by that id: it purges the row and keeps the fate
+  (`blob_fates`, keyed by blob id; a blob with a fate never registers
+  again). With one blob per event, deleting or cropping one item's
+  content touches only that item, which is what the user chose.
+- **Sharing would cost refcounts and cross-item effects.** If two events
+  named one blob, a delete on one would remove the other's content, and a
+  crop would rewrite it. Keeping the effect per item would need refcounted
+  `event_blobs` rows on the server, delete and crop commands and events
+  that name the item (event, field) and not only the blob, a fate per
+  item rather than per id on every device, and the file removed only when
+  its last item lets go: a wire and storage change through the server,
+  the replica, the eager queue and every head, for a saving only repeated
+  large content gets.
+- **The common case is already small.** A tool output of at most
+  `limits::INLINE_MAX_BYTES` (4 KiB) travels inline with no blob, and a
+  call's input is no blob when its body's blob already holds it whole, so
+  a big Write, Edit or command is stored once. What still repeats is large
+  content the agent produces more than once: the same big file read
+  again, the same long command output. The storage view (v22) shows it,
+  and `DeleteBlob` or `CropBlob` frees it per item.
+**Reopen if:** repeated large outputs are a real share of the server's
+disk or of eager traffic in use (the storage view's largest event blobs
+show the same size again and again), or compaction (task
+899242) changes how event content is kept anyway.
+**Rejected:** looking up event blobs by hash like workdir blobs (a delete
+or crop on one item would reach every item sharing the bytes); sharing
+across workdir and event blobs (D36 keeps them apart for the same reason).
+
+## D45. Event batches and blobs travel zstd-compressed; ranges count decoded bytes
+Most of what a device downloads is text (tool output, diffs, file
+contents, the log's JSON), which shrinks several times, and the link is
+the cost on a bad network. So `GET /v1/events` and `GET /v1/blobs/{id}`
+send a body as one zstd frame (`Content-Encoding: zstd`, level 3) to a
+request that sends `Accept-Encoding: zstd`; the device's transport sends
+it on every request and decodes every reply that is marked
+(`skywave_proto::encoding`).
+- **A blob range counts decoded bytes.** Plain HTTP ranges a
+  `Content-Encoding` by its encoded bytes, which per-response compression
+  makes useless for resuming (another response's frame differs). Here
+  `Range` and `Content-Range` count the blob's own bytes: the server seeks
+  to the decoded offset and compresses the rest as a fresh frame, the
+  device decodes and appends. Downloads resume from `.part` files as
+  before, progress (`Downloading { got, size }`) and the SHA-256 check stay
+  on decoded bytes, and nothing compressed is stored. A compressed blob
+  response names its decoded length (`skywave-decoded-length`) instead of
+  a `Content-Length`. Only Skywave's own client reads these responses, so
+  departing from RFC 9110 here costs nothing.
+- **One simple skip rule:** bodies under 1 KiB (`COMPRESS_MIN_BYTES`)
+  travel as they are, an empty long-poll answer among them. There is no
+  sniffing for content already compressed: binary workdir files are never
+  blobs (`FileBody::Binary`), event blobs are text, and zstd stores
+  incompressible blocks raw at a few bytes' cost.
+- **Asked for, not assumed.** The wire is exact-match versioned, so the
+  header is not version negotiation; it keeps a request that does not ask
+  (curl while debugging, the server's API tests) reading plain bytes, at
+  the cost of one header check.
+- **Modest CPU.** Level 3 is zstd's default: hundreds of MB/s on a desktop
+  and still far above any link on a small server; decoding is faster
+  still, with a window of at most 2 MiB per download at this level. The
+  server encodes on blocking threads (a batch after its read, off the
+  database connection; a blob a piece at a time), never on a connection's
+  task.
+- **zstd through the `zstd` crate**, which builds the C library with
+  `cc`, as rusqlite's bundled SQLite already is on every target the hub
+  builds for (Android included).
+**Rejected:** storing blobs compressed (the store, its hashes, crops and
+the storage report would all change, for a CPU saving the server does not
+need); tower-http's compression layer (it knows nothing of ranges counting
+decoded bytes or of the decoded-length header, and adds
+`async-compression`); gzip (`flate2` is pure
+Rust, but compresses text worse and slower than zstd); compressing
+commands and the other JSON replies (small, or rare; the device would
+decode them already, so the server could start any time).

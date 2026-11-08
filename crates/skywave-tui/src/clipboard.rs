@@ -8,14 +8,14 @@
 //! I/O for [`run`](crate::run).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use crossterm::execute;
 use crossterm::style::Print;
-use skywave_proto::strip_ansi;
+use skywave_present::clip::{ClipError, file_clip, output_clip};
 
 /// Most raw bytes sent: about 100 KB once base64-encoded, which common
 /// terminals accept. [`MAX_VAR`] overrides it.
@@ -81,53 +81,37 @@ pub fn load(clip: &Clip, max: usize) -> Result<Vec<u8>, CopyError> {
         }),
         Clip::Text(text) => Ok(text.as_bytes().to_vec()),
         Clip::File { path, strip } => {
-            let mut bytes = read_capped(path, max)?;
-            if let Some(strip) = strip
-                && bytes.starts_with(strip.as_bytes())
-            {
-                bytes.drain(..strip.len());
-            }
-            Ok(bytes)
+            read_file(path, max, |file, size| file_clip(file, size, *strip, max))
         }
-        // The cap holds for the raw file, so a huge output is never read
-        // whole; stripping only shrinks it, bar invalid UTF-8 decoded to
-        // replacement characters, hence the second check.
-        Clip::Output { path } => {
-            let bytes = read_capped(path, max)?;
-            let text = strip_ansi(&String::from_utf8_lossy(&bytes));
-            if text.len() > max {
-                return Err(CopyError::TooLarge {
-                    size: text.len() as u64,
-                    max,
-                    file: Some(path.clone()),
-                });
-            }
-            Ok(text.into_bytes())
-        }
+        Clip::Output { path } => read_file(path, max, |file, size| {
+            output_clip(file, size, max).map(String::into_bytes)
+        }),
     }
 }
 
-/// The file at `path`, if it holds at most `max` bytes: it is read no
-/// further than `max + 1`.
-fn read_capped(path: &Path, max: usize) -> Result<Vec<u8>, CopyError> {
-    let read = |error| CopyError::Read {
+/// What `read` makes of the file at `path` (present's [`clip`] rules,
+/// given the file and its size).
+///
+/// [`clip`]: skywave_present::clip
+fn read_file(
+    path: &Path,
+    max: usize,
+    read: impl FnOnce(File, u64) -> Result<Vec<u8>, ClipError>,
+) -> Result<Vec<u8>, CopyError> {
+    let failed = |error| CopyError::Read {
         file: path.to_owned(),
         error,
     };
-    let file = File::open(path).map_err(read)?;
-    let size = file.metadata().map_err(read)?.len();
-    let mut bytes = Vec::new();
-    file.take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(read)?;
-    if bytes.len() > max {
-        return Err(CopyError::TooLarge {
-            size: size.max(bytes.len() as u64),
+    let file = File::open(path).map_err(failed)?;
+    let size = file.metadata().map_err(failed)?.len();
+    read(file, size).map_err(|err| match err {
+        ClipError::TooLarge { size } => CopyError::TooLarge {
+            size,
             max,
             file: Some(path.to_owned()),
-        });
-    }
-    Ok(bytes)
+        },
+        ClipError::Read(error) => failed(error),
+    })
 }
 
 /// Sends `clip` to the terminal's clipboard through `out`; returns how many

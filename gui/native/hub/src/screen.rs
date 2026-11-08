@@ -23,7 +23,7 @@ use skywave_present::format::{
 };
 use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
 use skywave_present::sections::{
-    ItemKey, Section, approval_lost, gated_item, sections, tool_sections,
+    ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
 use skywave_present::storage::{self, Grouping as StorageGrouping};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
@@ -731,7 +731,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
         .map(|s| preview_view(s, APPROVAL_LINES));
     let input_label = preview
         .is_none()
-        .then(|| sections.iter().find_map(Section::blob))
+        .then(|| sections.iter().filter(|s| !s.asked).find_map(Section::blob))
         .flatten()
         .map(|blob| {
             blob_size(&blob.state).map_or_else(
@@ -779,6 +779,7 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
         detail,
         preview,
         input_label,
+        asked_label: asked_note(&sections),
         lost: approval_lost(prompt, &sections).map(str::to_owned),
         can_answer,
         suggestions: prompt
@@ -1112,6 +1113,70 @@ mod tests {
         );
         // Control: all kept, nothing said.
         assert_eq!(panel(kept(), kept()), None);
+    }
+
+    /// A gated call whose approval asked about an input other than the
+    /// call's names that input in the panel; one asking what the call
+    /// holds names nothing extra.
+    #[test]
+    fn an_approval_names_its_own_input_when_it_differs() {
+        let panel = |asked: Option<FullView>| {
+            let call = skywave_core::CallId::new();
+            let id = skywave_core::ApprovalId::new();
+            let mut session = session_view(AgentWork::default(), Vec::new());
+            session.timeline = vec![TimelineItem::Logged {
+                parent: None,
+                seq: Seq(1),
+                at: chrono::Utc::now(),
+                context: session.context,
+                entry: Entry::Tool(Box::new(skywave_core::ToolView {
+                    call,
+                    name: "Bash".into(),
+                    kind: skywave_core::ToolKind::Shell,
+                    title: "$ make".into(),
+                    detail: None,
+                    body: None,
+                    input: None,
+                    approval: Some(skywave_core::ToolApproval {
+                        id,
+                        status: ApprovalStatus::Pending,
+                        answer: None,
+                        input: asked.clone(),
+                    }),
+                    outcome: skywave_core::ToolOutcome::Running {
+                        since: chrono::Utc::now(),
+                    },
+                    subagent: None,
+                })),
+            }];
+            let prompt = ApprovalPrompt {
+                id,
+                call: Some(call),
+                from: None,
+                tool: "Bash".into(),
+                summary: "$ make".into(),
+                input: asked,
+                suggestions: Vec::new(),
+                answer: None,
+            };
+            session.pending_approval = Some(prompt.clone());
+            approval_panel(&prompt, &session)
+        };
+        let asked = FullView::Blob(skywave_core::BlobView {
+            id: skywave_core::BlobId::new(),
+            state: skywave_core::BlobState::NotDownloaded { size: 2048 },
+            change: None,
+            pending: None,
+        });
+        let shown = panel(Some(asked));
+        assert_eq!(
+            shown.asked_label.as_deref(),
+            Some("approval input: differs from the call's · 2.0 KiB")
+        );
+        // Not offered as the call's own whole input.
+        assert_eq!(shown.input_label, None);
+        // Control: nothing asked beyond the call, nothing named.
+        assert_eq!(panel(None).asked_label, None);
     }
 
     #[test]

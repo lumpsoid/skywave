@@ -138,10 +138,18 @@ fn logged_messages(events: &[Event], session: SessionId) -> Vec<String> {
 }
 
 /// A message of about `len` bytes, unique by `i`.
+/// A message of `len` bytes: its tag and number, then random words, so
+/// that a batch of them stays large on the wire, compressed (D45).
 fn message(tag: &str, i: usize, len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = Rng::new((i as u64) ^ ((tag.len() as u64) << 32));
     let mut text = format!("{tag} {i} ");
     while text.len() < len {
-        text.push_str("lorem ipsum dolor sit amet ");
+        let c = match rng.below(8) {
+            0 => ' ',
+            _ => char::from(ALPHABET[rng.below(ALPHABET.len() as u64) as usize]),
+        };
+        text.push(c);
     }
     text
 }

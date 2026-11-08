@@ -228,17 +228,24 @@ pub(crate) struct State {
     /// Bumped whenever pairing with another server resets the replica; a
     /// [`Seam`] bound to an older one may no longer write.
     pub(crate) server_epoch: u64,
-    /// How often each blob left the replica in this process
-    /// ([`State::blobs_purged`]): a download holds the count it read
-    /// ([`BlobLease`]), so its reports fail once the blob is purged, even
-    /// if a workdir answer registers the same id again meanwhile.
-    purges: HashMap<BlobId, u64>,
+    /// The lease handed out for each blob's current registration
+    /// ([`State::blob_lease`]), from `last_lease`. A download holds the
+    /// one it read ([`BlobLease`]); purging the blob drops its entry
+    /// ([`State::blobs_purged`]), so the download's reports fail from then
+    /// on, even if a workdir answer registers the same id again meanwhile:
+    /// a later lease on it is a fresh number. Only blobs in the replica
+    /// that a download read have an entry, however often workdir
+    /// refreshes purge and register ids.
+    leases: HashMap<BlobId, u64>,
+    /// The last lease handed out; never reused in this process.
+    last_lease: u64,
     /// Bumped for every change, so delivery never goes back in time.
     pub(crate) version: u64,
 }
 
-/// Which registration of a blob a download writes for: the blob's purge
-/// count when the download read its record ([`Seam`]'s leased reports).
+/// Which registration of a blob a download writes for: the lease the
+/// blob's registration had when the download read its record ([`Seam`]'s
+/// leased reports).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobLease(u64);
 
@@ -568,7 +575,8 @@ impl Shared {
                 model,
                 identity,
                 server_epoch: 0,
-                purges: HashMap::new(),
+                leases: HashMap::new(),
+                last_lease: 0,
                 version: 0,
             }),
             requests,
@@ -737,16 +745,35 @@ impl Shared {
 
 impl State {
     /// These blobs left the replica: a download that read one before now
-    /// writes for a registration that is gone ([`BlobLease`]).
+    /// writes for a registration that is gone ([`BlobLease`]). Their
+    /// leases go with them; nothing can be current for a purged blob.
     pub(crate) fn blobs_purged(&mut self, ids: &[BlobId]) {
         for id in ids {
-            *self.purges.entry(*id).or_default() += 1;
+            self.leases.remove(id);
         }
     }
 
-    /// The lease a download of `id` reading its record now holds.
-    pub(crate) fn blob_lease(&self, id: BlobId) -> BlobLease {
-        BlobLease(self.purges.get(&id).copied().unwrap_or(0))
+    /// The lease a download of `id` reading its record now holds: the
+    /// one this registration of `id` has, or a fresh one. Call it only
+    /// for a blob in the replica, so every entry goes with a purge.
+    pub(crate) fn blob_lease(&mut self, id: BlobId) -> BlobLease {
+        let next = self.last_lease + 1;
+        let lease = *self.leases.entry(id).or_insert(next);
+        if lease == next {
+            self.last_lease = next;
+        }
+        BlobLease(lease)
+    }
+
+    /// Whether `lease` is for the registration of `id` in the replica now.
+    pub(crate) fn lease_current(&self, id: BlobId, lease: BlobLease) -> bool {
+        self.leases.get(&id) == Some(&lease.0)
+    }
+
+    /// How many blobs have a lease: the bound that purging keeps.
+    #[cfg(test)]
+    pub(crate) fn leases_held(&self) -> usize {
+        self.leases.len()
     }
 
     /// Rebuilds the model from the store after a failed write, so it never

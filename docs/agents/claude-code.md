@@ -1287,7 +1287,9 @@ mapper summarises by the call's title) shows the same thing, an edit's diff
 included, before the tool runs. Content is handed over uncut; the mapper cuts
 it and blobs what was cut. `shows_all_input` is false when the input has a
 non-null field the display does not show (e.g. Bash `timeout`), so the mapper
-keeps the input as a blob.
+keeps the input as a blob. Otherwise a big `Write` content, `Edit` diff or
+long command is stored once, as the body's blob (or the cut title's stand-in
+body), not again as the input.
 
 | tool | kind | title | detail | body |
 |------|------|-------|--------|------|
@@ -1311,8 +1313,9 @@ shows all old lines removed and all new ones added.
 (when the message holds one `tool_result`, as the CLI sends them), by the
 tool its `tool_use_id` named. The model-facing `tool_result` content is
 always the whole `output`; the display sets a separate `preview` (and the
-mapper then blobs the output) so notes such as "file state is current in your
-context" or "STOP what you are doing" stay out of the preview.
+mapper then keeps the whole output beside it, inline up to 4 KiB, else as a
+blob) so notes such as "file state is current in your context" or "STOP what
+you are doing" stay out of the preview.
 
 | `tool_use_result` | status | preview |
 |-------------------|--------|---------|

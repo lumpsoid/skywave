@@ -201,6 +201,7 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
             EventKind::AgentMessage {
                 parent: None,
                 text: i.to_string(),
+                full: None,
             },
         );
         assert_eq!(seq, Seq(2 + i));
@@ -214,7 +215,8 @@ fn seqs_start_at_one_and_reads_page_by_cursor() {
         page.events[1].kind,
         EventKind::AgentMessage {
             parent: None,
-            text: "1".into()
+            text: "1".into(),
+            full: None,
         }
     );
     let rest = f
@@ -242,6 +244,7 @@ fn events_round_trip_unchanged() {
         EventKind::AgentMessage {
             parent: None,
             text: "hi".into(),
+            full: None,
         },
     );
     let first = f.log.read(&f.storage.db, Seq::ZERO, 10).unwrap();
@@ -282,7 +285,14 @@ fn reads_stop_at_the_byte_budget() {
     let count = 2 * BATCH_MAX_BYTES / SIZE + 2;
     for i in 0..count {
         let text = format!("{i:04}{}", "x".repeat(SIZE - 4));
-        f.agent(session, EventKind::AgentMessage { parent: None, text });
+        f.agent(
+            session,
+            EventKind::AgentMessage {
+                parent: None,
+                text,
+                full: None,
+            },
+        );
     }
     let (sizes, events) = read_all(&f, start);
     // Far under the count limit, the budget alone cuts the batches: each
@@ -308,7 +318,14 @@ fn an_event_over_the_byte_budget_goes_alone() {
     let huge = "x".repeat(BATCH_MAX_BYTES + 1);
     for text in ["before", huge.as_str(), "after", "last"] {
         let text = text.to_owned();
-        f.agent(session, EventKind::AgentMessage { parent: None, text });
+        f.agent(
+            session,
+            EventKind::AgentMessage {
+                parent: None,
+                text,
+                full: None,
+            },
+        );
     }
     let (sizes, events) = read_all(&f, start);
     // The small one first, as it would not fit beside the huge one; the
@@ -614,7 +631,11 @@ fn concurrent_writers_get_contiguous_seqs_in_commit_order() {
                             &mut conn.db,
                             session,
                             context,
-                            EventKind::AgentMessage { parent: None, text },
+                            EventKind::AgentMessage {
+                                parent: None,
+                                text,
+                                full: None,
+                            },
                         )
                         .unwrap()
                     };
@@ -2594,6 +2615,7 @@ fn agent_appends_are_checked() {
         EventKind::AgentMessage {
             parent: None,
             text: "x".into(),
+            full: None,
         },
     );
     assert!(matches!(unknown, Err(Error::InvalidAppend(_))));
@@ -2610,6 +2632,7 @@ fn agent_appends_are_checked() {
             EventKind::AgentMessage {
                 parent: None,
                 text: "x".into(),
+                full: None,
             },
         );
         assert!(matches!(appended, Err(Error::InvalidAppend(_))));
@@ -2666,7 +2689,10 @@ fn agent_appends_are_checked() {
         },
         EventKind::Imported {
             at: None,
-            item: ImportedItem::UserMessage { text: "x".into() },
+            item: ImportedItem::UserMessage {
+                text: "x".into(),
+                full: None,
+            },
         },
         EventKind::ImportFinished {
             outcome: ImportOutcome::Unavailable,
@@ -2700,6 +2726,7 @@ fn agent_appends_are_checked() {
         EventKind::AgentMessage {
             parent: None,
             text: "x".into(),
+            full: None,
         },
     );
     assert_eq!(f.log.head(), Seq(4));
@@ -3010,6 +3037,7 @@ fn session_wide_events_are_stamped_with_the_current_context() {
         EventKind::AgentMessage {
             parent: None,
             text: "x".into(),
+            full: None,
         },
     );
     assert_eq!(f.last_event().context, first);
@@ -3019,6 +3047,7 @@ fn session_wide_events_are_stamped_with_the_current_context() {
         EventKind::AgentMessage {
             parent: None,
             text: "y".into(),
+            full: None,
         },
     );
     assert_eq!(f.last_event().context, second);

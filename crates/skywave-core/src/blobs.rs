@@ -4,12 +4,24 @@
 //! **What gets downloaded.** [`BlobQueue`] holds the blobs waiting for a
 //! download. A blob the user asks for (`Action::DownloadBlob`) goes to the
 //! front. With [`BlobPolicy::Eager`], every blob a pulled batch registers
-//! goes to the back, as does every blob not yet available when the policy
-//! switches to `Eager`; switching back to `OnDemand` drops the waiting
-//! blobs nobody asked for (a download in progress finishes, but is not
-//! queued again if the downloader stops first). On startup a blob left
-//! `Downloading` in the replica is queued again, under either policy: the
-//! restart resumes what the store says was under way.
+//! goes to the back, as does every blob neither available nor failed when
+//! the policy switches to `Eager` (on startup too); switching back to `OnDemand` drops the waiting
+//! blobs nobody asked for, and stops those a worker holds: a download in
+//! progress at its next chunk (or as its request waits), one backing off
+//! at once. Bytes are dear over a bad network, so a dropped blob keeps
+//! what it got: its `.part` file stays and its row goes from `Downloading`
+//! to `BlobStatus::Stopped` with the recorded progress, which the views
+//! show as not downloaded (no download under way). Asking for it, or
+//! `Eager` again, resumes from those bytes. On startup a blob left
+//! `Downloading` in the replica is queued again under either policy: the
+//! restart resumes what the store says was under way. The store does not
+//! say who started it, so the policy decides: under `OnDemand` it resumes
+//! as asked for (only a request could have started it, bar a kill
+//! between a switch and its stop), under `Eager` as a background download
+//! (a workdir blob's always as asked for), which a later switch to
+//! `OnDemand` stops; a user who asked before the restart asks again. A
+//! `Stopped` one is queued only by `Eager`, so a restart under `OnDemand`
+//! does not resume a download nobody asked for.
 //! Workdir blobs (named by a stored workdir answer, `BlobRecord::workdir`)
 //! are never fetched eagerly, whatever the policy: only a request for one
 //! queues it, so a Changes refresh never starts megabytes of diffs.
@@ -48,8 +60,30 @@
 //! over. The content must have exactly the size the event's `BlobRef`
 //! gave, and the server must agree on it; a mismatch, an unknown blob or a
 //! local file error deletes the `.part` file, logs an error and leaves the
-//! blob `NotDownloaded`, failed with that reason, until it is asked for
-//! again.
+//! blob `BlobStatus::Failed` with that reason until it is asked for again.
+//! The store keeps it, so a restart neither resumes it nor, with `Eager`,
+//! queues it: a blob that keeps failing its hash or is gone from the server
+//! costs nothing more until someone asks.
+//!
+//! **Disk full.** A blob file write that finds the device's disk full
+//! (`ENOSPC`, `ErrorKind::StorageFull`, or a quota: `QuotaExceeded`), or a
+//! progress report the replica refuses with `SQLITE_FULL`, is no failure
+//! of the blob: deleting its `.part` would free the space for the next
+//! eager blob to fill, so the whole queue would be fetched and thrown away
+//! in turn, and retrying a full replica would refetch the same span
+//! forever. The blob keeps its `.part` and its recorded progress (it stays
+//! `Downloading`, or `NotDownloaded` if no report made it; a file write
+//! that fails records what the synced file holds, never more, as tokio
+//! reports a failed background write only on the next one), goes back to
+//! the front of the queue, and every download pauses:
+//! no worker takes a blob, and one backing off lets its blob go the same
+//! way. Nothing measures free space. The pause ends on a definitive signal
+//! only: a download asked for ([`BlobQueue::want`], the user acting once
+//! space may be free; if it is not, the next write pauses again), or a
+//! restart (the pause is in memory; the store resumes what was
+//! `Downloading`). The views show it (`Pause::DiskFull` on a download in
+//! progress, `SettingsView::blobs_disk_full`), reported by the queue under
+//! its lock so they follow it in order.
 //!
 //! **Checked by hash.** The complete `.part` file must hash to the
 //! `BlobRef`'s `sha256` before it is renamed; nothing else checks the
@@ -68,12 +102,21 @@
 //! retry, when its next report finds the blob unknown, and removes what it
 //! wrote meanwhile.
 //!
+//! **Startup sweep.** A purge commits the rows first and removes the files
+//! after, so a crash in between leaves files no row owns. On startup,
+//! before the downloader runs, [`BlobQueue::restore`] removes them
+//! ([`sweep_blob_files`]), from the rows it reads anyway: a row owns its
+//! complete file when `Available`, its `.part` when `Downloading` or
+//! `Stopped`. A `.part` beside a `NotDownloaded` or `Failed` row goes too:
+//! no recorded progress points into it, so a try would truncate it.
+//!
 //! **Purged, then registered again.** Workdir blob ids recur: the server
 //! names content by its hash, so a refresh can drop a blob and the next
 //! one name it again while a worker still writes the old download. A row
 //! with that id existing again is no proof the download is current, so
-//! each try reads the blob's record together with a lease (the blob's
-//! purge count, kept beside the replica under the same lock), and every
+//! each try reads the blob's record together with a lease (a number for
+//! that registration, kept beside the replica under the same lock and
+//! dropped when the blob is purged, never reused), and every
 //! report carries it: once the blob was purged, the report fails as for
 //! an unknown blob, whatever row has the id now, and the worker lets go
 //! as above. A request for the blob made while a worker holds it is kept
@@ -130,7 +173,7 @@ use crate::client::{BlobLease, CoreError, lock};
 use crate::engine::EngineConfig;
 use crate::identity::Identity;
 use crate::seam::Seam;
-use crate::store::{BlobPolicy, BlobRecord, BlobStatus, PendingCrop};
+use crate::store::{BlobPolicy, BlobRecord, BlobStatus, PendingCrop, io_disk_full};
 use crate::transport::{ExpectedRun, Transport, TransportError};
 use crate::view::BlobId;
 
@@ -209,10 +252,89 @@ impl Queued {
     }
 }
 
+/// The blobs waiting, in the order workers take them, each at most once,
+/// with their ids beside for a constant-time membership check. Every
+/// change goes through these methods, so the two never disagree.
+#[derive(Debug, Default)]
+struct Waiting {
+    order: VecDeque<Queued>,
+    ids: HashSet<BlobId>,
+}
+
+impl Waiting {
+    fn contains(&self, id: BlobId) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Queued> + ExactSizeIterator {
+        self.order.iter()
+    }
+
+    fn admit(&mut self, id: BlobId) {
+        let fresh = self.ids.insert(id);
+        debug_assert!(fresh, "{id:?} waits twice");
+    }
+
+    fn push_front(&mut self, item: Queued) {
+        self.admit(item.id);
+        self.order.push_front(item);
+    }
+
+    fn push_back(&mut self, item: Queued) {
+        self.admit(item.id);
+        self.order.push_back(item);
+    }
+
+    fn insert(&mut self, at: usize, item: Queued) {
+        self.admit(item.id);
+        self.order.insert(at, item);
+    }
+
+    fn remove_at(&mut self, at: usize) -> Option<Queued> {
+        let item = self.order.remove(at)?;
+        self.ids.remove(&item.id);
+        Some(item)
+    }
+
+    /// Takes `id` out; a scan only when it is there.
+    fn remove(&mut self, id: BlobId) -> Option<Queued> {
+        if !self.ids.remove(&id) {
+            return None;
+        }
+        let at = self.order.iter().position(|q| q.id == id);
+        at.and_then(|at| self.order.remove(at))
+    }
+
+    /// Keeps the entries `keep` says, in order.
+    fn retain(&mut self, mut keep: impl FnMut(&Queued) -> bool) {
+        let ids = &mut self.ids;
+        self.order.retain(|q| {
+            let kept = keep(q);
+            if !kept {
+                ids.remove(&q.id);
+            }
+            kept
+        });
+        debug_assert_eq!(self.order.len(), self.ids.len());
+    }
+
+    /// The order and the ids name the same blobs, each once.
+    #[cfg(test)]
+    fn consistent(&self) -> bool {
+        self.order.len() == self.ids.len() && self.order.iter().all(|q| self.ids.contains(&q.id))
+    }
+}
+
 #[derive(Debug, Default)]
 struct Queue {
     policy: BlobPolicy,
-    waiting: VecDeque<Queued>,
+    waiting: Waiting,
+    /// Blobs whose download may have started since the store was read: a
+    /// worker took them, or the store left them `Downloading`. Only these
+    /// can be `Downloading` with nobody holding them, so only these are
+    /// stopped when `OnDemand` drops them ([`BlobQueue::set_policy`]),
+    /// rather than one replica read per blob dropped.
+    started: HashSet<BlobId>,
     /// Blobs a worker holds.
     active: HashSet<BlobId>,
     /// Blobs asked for while a worker held them: queued again, as asked
@@ -220,11 +342,22 @@ struct Queue {
     again: HashSet<BlobId>,
     /// The [`Slot::Wanted`] worker waits for a blob.
     wanted_idle: bool,
+    /// A write failed on a full device disk: no worker takes a blob until
+    /// one is asked for (module docs, "Disk full").
+    disk_full: bool,
 }
 
 impl Queue {
     fn holds(&self, id: BlobId) -> bool {
-        self.active.contains(&id) || self.waiting.iter().any(|q| q.id == id)
+        self.active.contains(&id) || self.waiting.contains(id)
+    }
+
+    /// Whether a worker holding `item` lets it go now: the policy is
+    /// `OnDemand`, and nobody asked for it (nor is it a local crop).
+    fn drops(&self, item: &Queued) -> bool {
+        self.policy == BlobPolicy::OnDemand
+            && !item.kept_on_demand()
+            && !self.again.contains(&item.id)
     }
 
     fn push_back(&mut self, id: BlobId) {
@@ -255,8 +388,7 @@ impl Queue {
             .copied()
             .collect();
         for crop in fresh.iter().rev() {
-            let wanted = self.waiting.iter().any(|q| q.id == crop.into && q.wanted);
-            self.waiting.retain(|q| q.id != crop.into);
+            let wanted = self.waiting.remove(crop.into).is_some_and(|q| q.wanted);
             self.waiting.push_front(Queued {
                 wanted,
                 ..Queued::local_crop(*crop)
@@ -273,19 +405,32 @@ impl Queue {
 }
 
 /// The blobs waiting for the downloader; see the module docs.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct BlobQueue {
     queue: Mutex<Queue>,
     wake: Notify,
+    /// Where the queue says it paused on a full disk, or resumed, under
+    /// its lock, so the views follow it in order; none in tests that only
+    /// drive the queue.
+    view: Option<Seam>,
+    /// How many times [`BlobQueue::stop`] was called.
+    #[cfg(test)]
+    stops: std::sync::atomic::AtomicUsize,
 }
 
 impl BlobQueue {
     /// The queue as the replica leaves it: pending local crops first, in
-    /// log order, then blobs left `Downloading` (workdir ones too: the user
-    /// asked for them), then, with `Eager`, every event blob not downloaded
-    /// yet.
+    /// log order, then blobs left `Downloading` (as asked for under
+    /// `OnDemand`, and workdir ones always; under `Eager` an event blob's
+    /// as the background's), then, with `Eager`, every event blob not
+    /// downloaded yet. It reports a disk-full pause to `seam`'s views.
+    /// First it sweeps the blob files no row owns ([`sweep_blob_files`]):
+    /// it runs once per engine, before the downloader starts.
     pub(crate) fn restore(seam: &Seam) -> BlobQueue {
-        let this = BlobQueue::default();
+        let this = BlobQueue {
+            view: Some(seam.clone()),
+            ..BlobQueue::default()
+        };
         let read = seam
             .settings()
             .and_then(|s| Ok((s, seam.blobs()?, seam.pending_crops()?)));
@@ -296,11 +441,27 @@ impl BlobQueue {
                 return this;
             }
         };
+        // Before any worker writes a blob file: the rows just read say
+        // which files are owned.
+        sweep_blob_files(&seam.data_dir(), &blobs);
         {
             let mut queue = lock(&this.queue);
+            // The store does not say who started a download. Under
+            // `OnDemand` only a request could have (bar a kill between a
+            // switch and its stop); under `Eager` an event blob's may be
+            // the background's, so it resumes as one and a later switch to
+            // `OnDemand` stops it, `Stopped` with its bytes: a user who
+            // asked before the restart asks again. A workdir blob is never
+            // fetched in the background: asked for.
+            let on_demand = settings.blob_policy == BlobPolicy::OnDemand;
             for blob in &blobs {
                 if matches!(blob.status, BlobStatus::Downloading { .. }) {
-                    queue.waiting.push_back(Queued::wanted(blob.id));
+                    queue.started.insert(blob.id);
+                    queue.waiting.push_back(if on_demand || blob.workdir {
+                        Queued::wanted(blob.id)
+                    } else {
+                        Queued::eager(blob.id)
+                    });
                 }
             }
             queue.push_crops(&crops);
@@ -311,15 +472,16 @@ impl BlobQueue {
 
     /// The user asked for this blob: it goes first. One a worker holds is
     /// marked asked for, and an eager worker backing off from it lets it go.
+    /// A disk-full pause ends: the user may have freed space.
     pub(crate) fn want(&self, id: BlobId) {
         let mut queue = lock(&self.queue);
+        self.set_disk_full(&mut queue, false);
         if queue.active.contains(&id) {
             queue.again.insert(id);
         } else {
-            let found = queue.waiting.iter().find(|q| q.id == id);
+            let found = queue.waiting.remove(id);
             let reserved = found.is_some_and(|q| q.reserved);
             let source = found.map_or(Source::Network, |q| q.source);
-            queue.waiting.retain(|q| q.id != id);
             queue.waiting.push_front(Queued {
                 reserved,
                 source,
@@ -330,17 +492,52 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
-    /// The policy changed; `blobs` is every blob the replica knows.
+    /// The policy changed; `blobs` is every blob the replica knows. With
+    /// `OnDemand`, the waiting blobs nobody asked for go, a download one
+    /// had started becoming `Stopped`; workers holding one let it go
+    /// ([`BlobQueue::dropped`], [`BlobQueue::back_off`]).
     pub(crate) fn set_policy(&self, policy: BlobPolicy, blobs: &[BlobRecord]) {
         let mut queue = lock(&self.queue);
         queue.policy = policy;
         match policy {
-            BlobPolicy::OnDemand => queue.waiting.retain(Queued::kept_on_demand),
+            BlobPolicy::OnDemand => {
+                let mut dropped = Vec::new();
+                queue.waiting.retain(|q| {
+                    let kept = q.kept_on_demand();
+                    if !kept {
+                        dropped.push(q.id);
+                    }
+                    kept
+                });
+                // Every dropped one that may have started, whatever
+                // `blobs` says: that snapshot was read before this lock,
+                // and a worker may have recorded progress and let the blob
+                // go since (or the read failed and `blobs` is empty).
+                // `stop` reads the row itself, so it is called only for
+                // the few started ones ([`Queue::started`]), not for each
+                // of a big eager queue. Under the queue's lock, so a
+                // request made meanwhile resumes from the stopped row,
+                // never races its stop.
+                for id in dropped {
+                    if queue.started.remove(&id) {
+                        self.stop(id);
+                    }
+                }
+            }
             BlobPolicy::Eager => {
                 // Newest first: ids are time-ordered. Workdir blobs only
-                // download when asked for.
+                // download when asked for, as does a blob that failed.
                 for blob in blobs.iter().rev() {
-                    if !blob.workdir && !matches!(blob.status, BlobStatus::Available { .. }) {
+                    let eager = matches!(
+                        blob.status,
+                        BlobStatus::NotDownloaded
+                            | BlobStatus::Stopped { .. }
+                            | BlobStatus::Downloading { .. }
+                    );
+                    if !blob.workdir && eager {
+                        if matches!(blob.status, BlobStatus::Downloading { .. }) {
+                            queue.started.insert(blob.id);
+                        }
                         queue.push_back(blob.id);
                     }
                 }
@@ -375,6 +572,60 @@ impl BlobQueue {
         self.wake.notify_waiters();
     }
 
+    /// Pauses (or resumes) every download for a full device disk, under
+    /// the queue's lock, which `queue` is; a change reaches the views in the
+    /// same critical section, so they never disagree with the queue for
+    /// long.
+    fn set_disk_full(&self, queue: &mut Queue, full: bool) {
+        if std::mem::replace(&mut queue.disk_full, full) == full {
+            return;
+        }
+        if let Some(view) = &self.view {
+            view.blobs_disk_full(full);
+        }
+    }
+
+    /// Marks `id`, dropped under `OnDemand` with nobody holding it,
+    /// `Stopped` if its download had started ([`Seam::blob_stopped`]).
+    /// Called under the queue's lock (queue, then state, as
+    /// [`BlobQueue::set_disk_full`]), so a request for it waits until the
+    /// row says what it kept.
+    fn stop(&self, id: BlobId) {
+        #[cfg(test)]
+        self.stops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(view) = &self.view else { return };
+        match view.blob_stopped(id) {
+            Ok(()) | Err(CoreError::Superseded) => {}
+            Err(error) => tracing::warn!(?id, %error, "cannot mark the blob's download stopped"),
+        }
+    }
+
+    /// Resolves once a worker holding `item` must let it go under
+    /// `OnDemand` ([`Queue::drops`]); never for a blob asked for.
+    async fn dropped(&self, item: &Queued) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock(&self.queue).drops(item) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// A worker's write failed on a full device disk: it lets go of the
+    /// blob, which waits at the front, and every download pauses until one
+    /// is asked for. What the blob got stays, `.part` and recorded progress.
+    fn disk_full(&self, mut claim: Claim<'_>) {
+        let mut queue = lock(&self.queue);
+        claim.let_go(&mut queue, LetGo::Unfinished);
+        self.set_disk_full(&mut queue, true);
+        drop(queue);
+        self.wake.notify_waiters();
+    }
+
     /// Whether a worker may take `item` now ([`Queue::ready`]).
     fn ready(&self, item: &Queued) -> bool {
         lock(&self.queue).ready(item)
@@ -392,9 +643,16 @@ impl BlobQueue {
     /// longer. One a worker holds is let go by the worker itself, when its
     /// next report finds the blob unknown.
     pub(crate) fn purged(&self, ids: &[BlobId]) {
+        let ids: HashSet<BlobId> = ids.iter().copied().collect();
         let mut queue = lock(&self.queue);
         queue.waiting.retain(|q| !ids.contains(&q.id));
         queue.again.retain(|id| !ids.contains(id));
+        // One a worker holds may record progress (on a row registered
+        // again) until it lets go: it stays started.
+        let Queue {
+            started, active, ..
+        } = &mut *queue;
+        started.retain(|id| !ids.contains(id) || active.contains(id));
     }
 
     /// Waits for the next blob `slot` takes and holds it.
@@ -410,15 +668,18 @@ impl BlobQueue {
                 let mut queue = lock(&self.queue);
                 let ready = |q: &Queued| queue.ready(q);
                 let at = match slot {
+                    // Paused: whatever it takes would write to the full disk.
+                    _ if queue.disk_full => None,
                     Slot::Any => queue.waiting.iter().position(|q| !q.reserved && ready(q)),
                     // The blob handed over first: it was asked for before
                     // anything queued since, and nothing else may take it.
                     Slot::Wanted => (queue.waiting.iter().position(|q| q.reserved))
                         .or_else(|| queue.waiting.iter().position(|q| q.wanted && ready(q))),
                 };
-                if let Some(mut item) = at.and_then(|at| queue.waiting.remove(at)) {
+                if let Some(mut item) = at.and_then(|at| queue.waiting.remove_at(at)) {
                     item.reserved = false;
                     queue.active.insert(item.id);
+                    queue.started.insert(item.id);
                     return Claim {
                         queue: self,
                         item,
@@ -443,7 +704,9 @@ impl BlobQueue {
     /// same critical section, so one idle period takes one blob, and that
     /// worker takes it before anything else. A local crop waiting takes
     /// the worker too: the blob is let go, queued again behind the crops,
-    /// so a crop (which needs no network) never waits on a link down.
+    /// so a crop (which needs no network) never waits on a link down. A
+    /// blob nobody asked for, once the policy is `OnDemand`, is let go
+    /// for good ([`Queue::drops`]).
     async fn back_off<'a>(&'a self, mut claim: Claim<'a>, delay: Duration) -> Option<Claim<'a>> {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -453,6 +716,22 @@ impl BlobQueue {
             notified.as_mut().enable();
             {
                 let mut queue = lock(&self.queue);
+                if queue.disk_full {
+                    // Paused meanwhile: the blob waits at the front, as
+                    // the one whose write found the disk full does.
+                    claim.let_go(&mut queue, LetGo::Unfinished);
+                    drop(queue);
+                    self.wake.notify_waiters();
+                    return None;
+                }
+                if queue.drops(&claim.item) {
+                    // `OnDemand` now and nobody asked: no more tries. The
+                    // blob goes, stopped with what it got (`let_go`).
+                    claim.let_go(&mut queue, LetGo::Unfinished);
+                    drop(queue);
+                    self.wake.notify_waiters();
+                    return None;
+                }
                 let wanted = claim.item.wanted || queue.again.contains(&claim.item.id);
                 if wanted && queue.wanted_idle {
                     queue.wanted_idle = false;
@@ -510,7 +789,8 @@ struct Claim<'a> {
 #[derive(Debug, Clone, Copy)]
 enum LetGo {
     Finished,
-    /// The downloader stopped.
+    /// The downloader stopped, the disk is full, or (under `OnDemand`,
+    /// nobody asking) the blob is dropped.
     Unfinished,
     /// To the Wanted worker; see [`BlobQueue::back_off`].
     HandedOver,
@@ -527,6 +807,13 @@ impl Claim<'_> {
     /// Lets go of a local crop that must wait for the blob it reads; it
     /// waits in the queue, as it would have unclaimed.
     fn wait(self) {
+        self.release(LetGo::Unfinished);
+    }
+
+    /// Lets go of a blob whose try stopped as it was dropped
+    /// ([`BlobQueue::dropped`]): it goes, `Stopped`, unless asked for or
+    /// `Eager` again meanwhile, when it waits at the front.
+    fn stopped(self) {
         self.release(LetGo::Unfinished);
     }
 
@@ -564,7 +851,10 @@ impl Claim<'_> {
                     },
                 );
             }
-            LetGo::Yielded => {}
+            LetGo::Yielded => {
+                queue.started.remove(&id);
+                self.queue.stop(id);
+            }
             // A local crop not yet tried keeps its source.
             _ if again => queue.waiting.push_front(Queued {
                 wanted: true,
@@ -579,7 +869,15 @@ impl Claim<'_> {
             {
                 queue.waiting.push_front(self.item);
             }
-            LetGo::Unfinished | LetGo::Finished => {}
+            // Dropped under `OnDemand`: what it got stays, `Stopped`.
+            LetGo::Unfinished => {
+                queue.started.remove(&id);
+                self.queue.stop(id);
+            }
+            // Available, failed or gone: nothing left to stop.
+            LetGo::Finished => {
+                queue.started.remove(&id);
+            }
         }
     }
 }
@@ -662,8 +960,13 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
         loop {
             let mut progressed = false;
             let mut lease = None;
-            let error = match fetch(ctx, transport, id, &mut lease, &mut progressed).await {
+            let tried = fetch(ctx, transport, &claim.item, &mut lease, &mut progressed).await;
+            let error = match tried {
                 Ok(()) => break claim.finish(),
+                Err(FetchError::Stopped) => {
+                    tracing::debug!(?id, "blob download stopped: nobody asked for it");
+                    break claim.stopped();
+                }
                 Err(error) => error,
             };
             if error.is_purged() {
@@ -671,6 +974,13 @@ async fn worker(ctx: &BlobCtx, transport: &OnceCell<Arc<dyn Transport>>, slot: S
                 tracing::debug!(?id, "blob purged during its download");
                 remove_blob_files(&ctx.seam.data_dir(), id);
                 break claim.finish();
+            }
+            if error.is_disk_full() {
+                // Not a failure of this blob: give_up would delete what it
+                // got, freeing the space the next blob then fills.
+                tracing::warn!(?id, %error, "device disk full: blob downloads paused");
+                ctx.queue.disk_full(claim);
+                break;
             }
             if matches!(error, FetchError::Hash { .. }) && !mismatched {
                 // `complete` deleted the file: the next try starts at zero.
@@ -721,6 +1031,10 @@ enum FetchError {
         expected: ContentHash,
         actual: ContentHash,
     },
+    /// Nobody wants the blob any more ([`BlobQueue::dropped`]): no
+    /// failure, and no retry.
+    #[error("blob download stopped: nobody asked for it")]
+    Stopped,
 }
 
 impl FetchError {
@@ -738,6 +1052,20 @@ impl FetchError {
         )
     }
 
+    /// A write, to the blob file or to the replica recording its progress,
+    /// found the device's disk (or the user's quota) full: nothing wrong
+    /// with the blob, and no try succeeds until space is freed. Checked
+    /// before [`FetchError::is_retryable`], which would retry a full
+    /// replica forever, refetching the span since the last report each
+    /// time.
+    fn is_disk_full(&self) -> bool {
+        match self {
+            FetchError::File(error) => io_disk_full(error),
+            FetchError::Core(CoreError::Store(error)) => error.disk_full(),
+            _ => false,
+        }
+    }
+
     fn is_retryable(&self) -> bool {
         match self {
             // A rejection is the link's to report; wait for it to stop us.
@@ -746,13 +1074,15 @@ impl FetchError {
             FetchError::File(_)
             | FetchError::Size { .. }
             | FetchError::Offset { .. }
-            | FetchError::Hash { .. } => false,
+            | FetchError::Hash { .. }
+            | FetchError::Stopped => false,
         }
     }
 }
 
-/// Deletes what was fetched of a blob and leaves it `NotDownloaded`, with
-/// the reason shown until it is asked for again.
+/// Deletes what was fetched of a blob and leaves it `Failed`, stored with
+/// its reason, until it is asked for again: a restart does not queue it,
+/// nor does `Eager`.
 async fn give_up(ctx: &BlobCtx, id: BlobId, lease: Option<BlobLease>, error: &FetchError) {
     tracing::error!(?id, %error, "blob download failed");
     let part = part_path(&blob_dir(&ctx.seam.data_dir()), id);
@@ -796,6 +1126,117 @@ pub(crate) fn remove_all_blob_files(data_dir: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(%error, "cannot remove the blob files"),
     }
+}
+
+/// A file name in the blob directory, as the downloader and local crops
+/// write them: `<id>` or `<id>.part`, the id hyphenated as `Display` gives
+/// it. Anything else is not ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobFile {
+    Complete(BlobId),
+    Part(BlobId),
+}
+
+impl BlobFile {
+    fn parse(name: &str) -> Option<BlobFile> {
+        let (stem, part) = match name.strip_suffix(".part") {
+            Some(stem) => (stem, true),
+            None => (name, false),
+        };
+        let id = uuid::Uuid::try_parse(stem).ok()?;
+        // Only the exact spelling we write: `try_parse` also takes the
+        // simple, braced and URN forms, and upper case.
+        if id.to_string() != stem {
+            return None;
+        }
+        let id = BlobId(id);
+        Some(if part {
+            BlobFile::Part(id)
+        } else {
+            BlobFile::Complete(id)
+        })
+    }
+
+    /// Whether a row in `status` owns this file: an `Available` blob its
+    /// complete file, a `Downloading` or `Stopped` one its `.part`, which
+    /// holds the recorded progress. `NotDownloaded` and `Failed` own none:
+    /// a try for them starts from zero and truncates any `.part`, so one
+    /// left beside them (a disk-full pause before the first report, a crash
+    /// before a failure's delete) holds nothing anybody resumes from. A
+    /// complete file whose row is not `Available` (a crash between the
+    /// rename and the report) is fetched again over.
+    fn owned_by(self, status: &BlobStatus) -> bool {
+        matches!(
+            (self, status),
+            (BlobFile::Complete(_), BlobStatus::Available { .. })
+                | (
+                    BlobFile::Part(_),
+                    BlobStatus::Downloading { .. } | BlobStatus::Stopped { .. }
+                )
+        )
+    }
+}
+
+/// Removes every file in `data_dir`'s blob directory that no row in
+/// `blobs` (the whole replica's, event and workdir blobs alike) owns
+/// ([`BlobFile::owned_by`]): what a crash between a purge's commit and its
+/// file removal leaves, as the server's `BlobStore::sweep` does on its
+/// side. Returns how many went. Startup only, before the downloader runs:
+/// a download or a crop in flight writes exactly such files. A purge
+/// meanwhile only removes files, and a row registered meanwhile has none.
+/// A name that is not a blob file's, or a directory, is left alone and
+/// logged.
+pub(crate) fn sweep_blob_files(data_dir: &Path, blobs: &[BlobRecord]) -> usize {
+    let dir = blob_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            tracing::warn!(%error, "cannot list the blob files; none swept");
+            return 0;
+        }
+    };
+    let statuses: std::collections::HashMap<BlobId, &BlobStatus> =
+        blobs.iter().map(|b| (b.id, &b.status)).collect();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "cannot list the blob files; sweep cut short");
+                break;
+            }
+        };
+        let path = entry.path();
+        let file = entry.file_name().to_str().and_then(BlobFile::parse);
+        let Some(file) = file.filter(|_| entry.file_type().is_ok_and(|t| t.is_file())) else {
+            tracing::info!(path = %path.display(), "not a blob file; left alone");
+            continue;
+        };
+        let id = match file {
+            BlobFile::Complete(id) | BlobFile::Part(id) => id,
+        };
+        if statuses
+            .get(&id)
+            .is_some_and(|status| file.owned_by(status))
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::debug!(path = %path.display(), "removed a blob file no row owns");
+                removed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot remove a blob file")
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "swept blob files no row owns");
+    }
+    removed
 }
 
 /// Whether a blob whose local crop did not make it is fetched: when wanted
@@ -872,16 +1313,20 @@ async fn make_crop(ctx: &BlobCtx, crop: PendingCrop) -> Result<(), FetchError> {
     complete(ctx, crop.into, lease, &part, &done, &record).await
 }
 
-/// One try at a blob: resume its `.part` file and finish it. `lease` is
-/// set once the record is read; every report holds it. `progressed` is set
-/// once some bytes arrived.
+/// One try at `item`, a blob its worker holds: resume its `.part` file and
+/// finish it. `lease` is set once the record is read; every report holds
+/// it. `progressed` is set once some bytes arrived. Once nobody wants it
+/// ([`BlobQueue::dropped`]), a request waiting or a body under way ends
+/// the try with [`FetchError::Stopped`], a body after recording what it
+/// got; checking and completing a whole file is never cut short.
 async fn fetch(
     ctx: &BlobCtx,
     transport: &OnceCell<Arc<dyn Transport>>,
-    id: BlobId,
+    item: &Queued,
     lease_out: &mut Option<BlobLease>,
     progressed: &mut bool,
 ) -> Result<(), FetchError> {
+    let id = item.id;
     let Some((record, lease)) = ctx.seam.leased_blob(id)? else {
         tracing::warn!(?id, "asked to download an unknown blob");
         return Ok(());
@@ -902,17 +1347,21 @@ async fn fetch(
     // last report) and, after a power loss, hold a kept length over lost
     // data; the excess is truncated below.
     let recorded = match &record.status {
-        BlobStatus::Downloading { got, .. } => *got,
-        BlobStatus::NotDownloaded | BlobStatus::Available { .. } => 0,
+        BlobStatus::Downloading { got, .. } | BlobStatus::Stopped { got, .. } => *got,
+        BlobStatus::NotDownloaded | BlobStatus::Failed { .. } | BlobStatus::Available { .. } => 0,
     };
     let from = match tokio::fs::metadata(&part).await {
         Ok(meta) => recorded.min(meta.len()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
+    // A whole kept file needs no request, only its check. An empty blob is
+    // whole before any byte arrives, with no `.part` file yet: create it.
     if from == size {
         let file = tokio::fs::OpenOptions::new()
+            .create(true)
             .write(true)
+            .truncate(false)
             .open(&part)
             .await?;
         file.set_len(size).await?;
@@ -931,7 +1380,14 @@ async fn fetch(
             )
         })
         .await?;
-    let mut download = match transport.blob(id, from).await {
+    // Dropped first, here and below: a blob dropped meanwhile takes no
+    // more bytes, however fast they come.
+    let asked = tokio::select! {
+        biased;
+        () = ctx.queue.dropped(item) => return Err(FetchError::Stopped),
+        asked = transport.blob(id, from) => asked,
+    };
+    let mut download = match asked {
         Ok(download) => download,
         Err(TransportError::RangeNotSatisfiable { size: actual }) => {
             return Err(FetchError::Size {
@@ -965,6 +1421,8 @@ async fn fetch(
     let report = async |file: &mut tokio::fs::File, got: u64| -> Result<(), FetchError> {
         file.flush().await?;
         file.sync_data().await?;
+        #[cfg(test)]
+        tests::replica_room(id, got)?;
         ctx.seam.leased_blob_status(
             id,
             lease,
@@ -985,6 +1443,14 @@ async fn fetch(
             let mut next = download.body.next_chunk();
             loop {
                 tokio::select! {
+                    biased;
+                    () = ctx.queue.dropped(item) => {
+                        // Keep what it paid for: the blob stops from here.
+                        if got > recorded {
+                            report(&mut file, got).await?;
+                        }
+                        return Err(FetchError::Stopped);
+                    }
                     chunk = &mut next => break chunk,
                     () = tokio::time::sleep_until(reported + PROGRESS_EVERY), if got > recorded => {
                         report(&mut file, got).await?;
@@ -1008,7 +1474,35 @@ async fn fetch(
                 actual: got + len,
             });
         }
-        file.write_all(&chunk).await?;
+        if let Err(error) = write_chunk(&mut file, id, got, &chunk).await {
+            let error = FetchError::from(error);
+            if error.is_disk_full() {
+                // Keep what made it, if the disk lets the sync through, so
+                // the try resumes from there once space is freed. Only what
+                // the synced file holds: tokio's write returns once it
+                // queued the bytes, and a background write that failed
+                // reports on the next one, so `got` may count bytes that
+                // never landed.
+                let held = async {
+                    file.flush().await?;
+                    file.sync_data().await?;
+                    file.metadata().await.map(|meta| meta.len())
+                }
+                .await;
+                match held {
+                    Ok(len) if len.min(got) > recorded => {
+                        if let Err(report_error) = report(&mut file, len.min(got)).await {
+                            tracing::debug!(?id, %report_error, "cannot record progress on a full disk");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(sync_error) => {
+                        tracing::debug!(?id, %sync_error, "cannot sync a blob on a full disk");
+                    }
+                }
+            }
+            return Err(error);
+        }
         got += len;
         *progressed |= len > 0;
         if reported.elapsed() >= PROGRESS_EVERY {
@@ -1024,6 +1518,24 @@ async fn fetch(
     file.sync_all().await?;
     drop(file);
     complete(ctx, id, lease, &part, &done, &record).await
+}
+
+/// Appends `chunk`, which starts at byte `at` of blob `id`, to its `.part`
+/// file. Tests fill the disk here (`tests::disk_room`), the write failing
+/// at once or, as tokio's background write does, only on the next one.
+async fn write_chunk(
+    file: &mut tokio::fs::File,
+    id: BlobId,
+    at: u64,
+    chunk: &[u8],
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::disk_room(id, at + chunk.len() as u64)? == tests::Write::Lost {
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    let _ = (id, at);
+    file.write_all(chunk).await
 }
 
 /// The `.part` file holds the whole blob: check its size and hash, move it
@@ -1085,7 +1597,7 @@ mod tests {
     use crate::engine::Connector;
     use crate::identity::PairedCredentials;
     use crate::transport::{BlobBody, BlobDownload, BoxFuture};
-    use crate::view::{BlobState, DeviceId, Entry, FullView, Screen, TimelineItem};
+    use crate::view::{BlobState, DeviceId, Entry, FullView, Pause, Screen, TimelineItem};
     use crate::{Action, Core};
 
     /// Serves one blob's content (claiming `total` as its size), honouring
@@ -1271,6 +1783,8 @@ mod tests {
                 mid_body: Mutex::new(None),
                 held: Mutex::new(HashMap::new()),
             });
+            // As the engine builds it: the views follow its pauses.
+            let queue = Arc::new(BlobQueue::restore(&seam));
             Fixture {
                 _dir: dir,
                 core,
@@ -1278,7 +1792,7 @@ mod tests {
                 session_id,
                 blob,
                 server,
-                queue: Arc::new(BlobQueue::default()),
+                queue,
             }
         }
 
@@ -1323,6 +1837,36 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("blob status stuck at {:?}", self.status()));
             downloader.abort();
+            // Gone once this returns, with the core handle it held.
+            let _ = downloader.await;
+        }
+
+        /// The device restarts: the core opens the same data directory
+        /// again and the blob queue is restored from it, as the engine does.
+        /// The server stays.
+        fn restarted(self) -> Fixture {
+            let Fixture {
+                _dir: dir,
+                core,
+                seam,
+                session_id,
+                blob,
+                server,
+                queue,
+            } = self;
+            drop((core, seam, queue));
+            let core = Core::open_detached(dir.path()).unwrap();
+            let seam = core.seam();
+            let queue = Arc::new(BlobQueue::restore(&seam));
+            Fixture {
+                _dir: dir,
+                core,
+                seam,
+                session_id,
+                blob,
+                server,
+                queue,
+            }
         }
 
         /// The blob as the open session shows it.
@@ -1499,9 +2043,7 @@ mod tests {
         f.until_crop_ended(crop).await;
         f.queue.local_crops(&[crop]);
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !lock(&f.queue.queue).waiting.is_empty()
-                || !lock(&f.queue.queue).active.is_empty()
-            {
+            while !waiting(&f.queue).is_empty() || !lock(&f.queue.queue).active.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -1599,6 +2141,287 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
+    /// A blob's disk filling up: its `.part` writes find it full once they
+    /// would reach past `room` bytes.
+    #[derive(Debug, Clone, Copy)]
+    struct FullDisk {
+        id: BlobId,
+        room: u64,
+        /// The first write past `room` returns as if it landed and is
+        /// lost, as tokio's background write does; the next one fails.
+        late: bool,
+    }
+
+    /// The full disks, by blob id. Ids are fresh per test, so tests
+    /// running at once never share an entry.
+    static FULL_DISK: Mutex<Vec<FullDisk>> = Mutex::new(Vec::new());
+
+    /// Blobs whose progress reports find the replica full (`SQLITE_FULL`)
+    /// once they count more than the bytes given; by id, as above.
+    static FULL_REPLICA: Mutex<Vec<(BlobId, u64)>> = Mutex::new(Vec::new());
+
+    /// What a write [`write_chunk`] makes does, as [`disk_room`] says.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Write {
+        Lands,
+        /// Returns as if written; nothing reaches the file.
+        Lost,
+    }
+
+    /// The fault [`write_chunk`] injects: a write of `id` up to byte `end`
+    /// fails as `ENOSPC` does once that blob's disk is full (a late disk
+    /// loses that write and fails the next).
+    pub(super) fn disk_room(id: BlobId, end: u64) -> std::io::Result<Write> {
+        let mut disks = lock(&FULL_DISK);
+        let Some(disk) = disks.iter_mut().find(|d| d.id == id && end > d.room) else {
+            return Ok(Write::Lands);
+        };
+        if std::mem::replace(&mut disk.late, false) {
+            return Ok(Write::Lost);
+        }
+        Err(std::io::ErrorKind::StorageFull.into())
+    }
+
+    /// The fault a progress report injects: the replica refuses a report
+    /// of `got` bytes of `id` as SQLite does on a full disk.
+    pub(super) fn replica_room(id: BlobId, got: u64) -> Result<(), CoreError> {
+        let full = (lock(&FULL_REPLICA).iter()).any(|&(blob, room)| blob == id && got > room);
+        if !full {
+            return Ok(());
+        }
+        let full = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL);
+        Err(crate::StoreError::Sqlite(rusqlite::Error::SqliteFailure(full, None)).into())
+    }
+
+    fn fill_disk(id: BlobId, room: u64) {
+        lock(&FULL_DISK).push(FullDisk {
+            id,
+            room,
+            late: false,
+        });
+    }
+
+    fn free_disk(id: BlobId) {
+        lock(&FULL_DISK).retain(|disk| disk.id != id);
+        lock(&FULL_REPLICA).retain(|&(blob, _)| blob != id);
+    }
+
+    impl Fixture {
+        /// Neither worker slot would take a blob now: asked directly, the
+        /// queue's `next` hands out nothing on its first look.
+        async fn takes_nothing(&self) -> bool {
+            for slot in [Slot::Any, Slot::Wanted] {
+                let first_look = tokio::time::timeout(Duration::ZERO, self.queue.next(slot));
+                if first_look.await.is_ok() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    /// Waits for `done`, polling.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never {what}"));
+    }
+
+    impl Fixture {
+        /// The queue paused on a full disk, every worker idle.
+        fn paused_idle(&self) -> bool {
+            let queue = lock(&self.queue.queue);
+            queue.disk_full && queue.active.is_empty()
+        }
+
+        fn settings(&self) -> crate::SettingsView {
+            self.core
+                .dispatch(Action::Navigate(crate::Route::Settings))
+                .unwrap();
+            match self.core.view().screen {
+                Screen::Settings(view) => view,
+                other => panic!("expected settings, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fault the disk-full rule reads: the OS's `ENOSPC` and quota
+    /// errors, nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_full_disk_or_quota_is_disk_full() {
+        let file = |raw| FetchError::File(std::io::Error::from_raw_os_error(raw));
+        assert!(file(libc::ENOSPC).is_disk_full());
+        assert!(file(libc::EDQUOT).is_disk_full());
+        assert!(!file(libc::EACCES).is_disk_full());
+        assert!(!file(libc::ENOENT).is_disk_full());
+        let size = FetchError::Size {
+            expected: 1,
+            actual: 2,
+        };
+        assert!(!size.is_disk_full());
+        // The replica's own writes: SQLite's full disk, not its other faults.
+        let sqlite = |code| {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            FetchError::Core(crate::StoreError::Sqlite(error).into())
+        };
+        assert!(sqlite(rusqlite::ffi::SQLITE_FULL).is_disk_full());
+        assert!(!sqlite(rusqlite::ffi::SQLITE_BUSY).is_disk_full());
+        assert!(!FetchError::Core(CoreError::Superseded).is_disk_full());
+    }
+
+    /// A report the replica refuses as full (`SQLITE_FULL`) pauses like a
+    /// full blob file, instead of retrying it forever; the `.part` stays.
+    #[tokio::test]
+    async fn a_full_replica_pauses_downloads_too() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        // Two chunks, then the body breaks: the try reports what it got.
+        *f.server.break_after.lock().unwrap() = Some(2);
+        lock(&FULL_REPLICA).push((f.blob.id, 0));
+        f.queue.want(f.blob.id);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("paused", || f.paused_idle()).await;
+        assert!(f.takes_nothing().await);
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
+        let started = BlobStatus::Downloading {
+            got: 0,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), started, "only the report that made it");
+        assert_eq!(std::fs::metadata(f.part()).unwrap().len(), 2000, "kept");
+
+        free_disk(f.blob.id);
+        f.queue.want(f.blob.id);
+        until("downloaded", || {
+            matches!(f.status(), BlobStatus::Available { .. })
+        })
+        .await;
+        downloader.abort();
+    }
+
+    /// A write that failed in the background reports on the next one: the
+    /// progress recorded then counts only what the synced file holds, not
+    /// the lost chunk the write before had counted.
+    #[tokio::test]
+    async fn a_late_disk_full_records_only_what_landed() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        lock(&FULL_DISK).push(FullDisk {
+            id: f.blob.id,
+            room: 2500,
+            late: true,
+        });
+        f.queue.want(f.blob.id);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("paused", || f.paused_idle()).await;
+        downloader.abort();
+        let _ = downloader.await;
+        // Chunk three "landed", chunk four failed: 3000 counted, 2000 held.
+        let kept = BlobStatus::Downloading {
+            got: 2000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), kept);
+        assert_eq!(std::fs::metadata(f.part()).unwrap().len(), 2000);
+
+        free_disk(f.blob.id);
+        f.queue.want(f.blob.id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+    }
+
+    /// A write that finds the disk full keeps what the blob got (`.part`
+    /// and recorded progress, `Downloading`, not `Failed`) and pauses every
+    /// download, eager ones registered meanwhile too; the views say so.
+    /// Asking for a download resumes them all, the blob from what it kept.
+    #[tokio::test]
+    async fn a_full_disk_keeps_the_download_and_pauses_every_download() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        fill_disk(f.blob.id, 2500);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("paused", || f.paused_idle()).await;
+
+        let kept = BlobStatus::Downloading {
+            got: 2000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), kept, "the two chunks written are recorded");
+        assert!(std::fs::metadata(f.part()).unwrap().len() >= 2000);
+        assert_eq!(waiting(&f.queue), [(f.blob.id, false)], "at the front");
+        assert_eq!(
+            f.shown(),
+            BlobState::Downloading {
+                got: 2000,
+                size: 5000,
+                paused: Some(Pause::DiskFull),
+            }
+        );
+        assert!(f.settings().blobs_disk_full);
+
+        // Eager blobs registered while paused wait too.
+        let later = f.held_blobs(3, 2, Hold::Offline);
+        f.queue.registered(&later);
+        let queued = [(f.blob.id, false), (later[0], false), (later[1], false)];
+        assert_eq!(waiting(&f.queue), queued);
+        assert!(f.takes_nothing().await, "no slot takes one while paused");
+        assert_eq!(waiting(&f.queue), queued, "and none is taken");
+        assert!(lock(&f.queue.queue).active.is_empty());
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "none tried");
+
+        // The user frees space and asks for it.
+        free_disk(f.blob.id);
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        f.queue.want(f.blob.id);
+        assert!(!f.settings().blobs_disk_full, "resumed at once");
+        until("downloaded, eager blobs tried", || {
+            matches!(f.status(), BlobStatus::Available { .. })
+                && f.server.calls.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+        downloader.abort();
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+    }
+
+    /// A disk still full when asked again pauses again at the first write,
+    /// keeping the same progress; a restart, which forgets the pause,
+    /// resumes what the store says was downloading.
+    #[tokio::test]
+    async fn a_restart_resumes_a_download_paused_on_a_full_disk() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        fill_disk(f.blob.id, 2500);
+        f.queue.want(f.blob.id);
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("paused", || f.paused_idle()).await;
+        assert_eq!(waiting(&f.queue), [(f.blob.id, true)]);
+
+        f.queue.want(f.blob.id);
+        until("tried again", || f.server.calls.load(Ordering::SeqCst) >= 2).await;
+        until("paused again", || f.paused_idle()).await;
+        downloader.abort();
+        let _ = downloader.await;
+        let kept = BlobStatus::Downloading {
+            got: 2000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), kept);
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000]);
+
+        let f = f.restarted();
+        assert!(!lock(&f.queue.queue).disk_full);
+        assert!(!f.settings().blobs_disk_full);
+        assert_eq!(waiting(&f.queue), [(f.blob.id, true)]);
+        free_disk(f.blob.id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000, 2000]);
+    }
+
     #[test]
     fn read_head_reads_at_most_max_bytes_lossily() {
         let dir = tempfile::tempdir().unwrap();
@@ -1634,8 +2457,9 @@ mod tests {
         queue.set_policy(BlobPolicy::OnDemand, &[]);
         queue.want(c);
         let q = lock(&queue.queue);
+        let waiting: Vec<Queued> = q.waiting.iter().copied().collect();
         assert_eq!(
-            Vec::from(q.waiting.clone()),
+            waiting,
             [
                 Queued {
                     wanted: true,
@@ -1644,8 +2468,9 @@ mod tests {
                 Queued::local_crop(first),
             ]
         );
-        assert!(!q.ready(&q.waiting[0]), "waits for the crop that makes b");
-        assert!(q.ready(&q.waiting[1]));
+        assert!(q.waiting.consistent());
+        assert!(!q.ready(&waiting[0]), "waits for the crop that makes b");
+        assert!(q.ready(&waiting[1]));
     }
 
     #[tokio::test]
@@ -1724,18 +2549,18 @@ mod tests {
             [0, 0],
             "two tries, no more"
         );
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        let actual = ContentHash::of(&content(5000));
+        let reason = format!("blob content hash mismatch: expected {promised}, got {actual}");
+        assert_eq!(
+            f.status(),
+            BlobStatus::Failed {
+                reason: reason.clone()
+            }
+        );
         assert!(!f.part().exists());
         let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
         assert!(!done.exists(), "never renamed");
-        let actual = ContentHash::of(&content(5000));
-        assert_eq!(
-            f.shown(),
-            BlobState::Failed {
-                size: 5000,
-                reason: format!("blob content hash mismatch: expected {promised}, got {actual}"),
-            }
-        );
+        assert_eq!(f.shown(), BlobState::Failed { size: 5000, reason });
         // Asking again starts over with a fresh allowance.
         f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
         assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
@@ -1748,7 +2573,7 @@ mod tests {
         f.queue.want(f.blob.id);
         f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
             .await;
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(matches!(f.status(), BlobStatus::Failed { .. }));
         assert!(!f.part().exists());
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
         // It says why it stopped, until asked for again.
@@ -1763,6 +2588,82 @@ mod tests {
         assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
     }
 
+    /// The reason a blob of the fixture's fails with: the server has more
+    /// than the event promised.
+    const TOO_BIG: &str = "blob size mismatch: expected 5000 bytes, the server has 6000";
+
+    /// A fixture whose blob was asked for and given up on at the first try.
+    async fn failed_fixture() -> Fixture {
+        let f = Fixture::new(5000, content(6000), 6000);
+        f.queue.want(f.blob.id);
+        f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
+            .await;
+        let failed = BlobStatus::Failed {
+            reason: TOO_BIG.into(),
+        };
+        assert_eq!(f.status(), failed);
+        f
+    }
+
+    /// A blob given up on stays `Failed`, with its reason, over a restart,
+    /// and `Eager` does not queue it again, on startup or when switched
+    /// to; a blob that never failed is queued as ever.
+    #[tokio::test]
+    async fn a_failed_blob_stays_failed_over_a_restart() {
+        let f = failed_fixture().await;
+        let [never_tried] = f.held_blobs(3, 1, Hold::Offline)[..] else {
+            unreachable!()
+        };
+        f.core
+            .dispatch(Action::SetBlobPolicy(BlobPolicy::Eager))
+            .unwrap();
+
+        let f = f.restarted();
+        let failed = BlobStatus::Failed {
+            reason: TOO_BIG.into(),
+        };
+        assert_eq!(f.status(), failed);
+        assert_eq!(waiting(&f.queue), [(never_tried, false)]);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(never_tried, false)], "nor switched to");
+        assert_eq!(
+            f.server.calls.load(Ordering::SeqCst),
+            1,
+            "never tried again"
+        );
+    }
+
+    /// Only asking again tries a blob that failed before a restart: it is
+    /// fetched once more, and fails again for the same reason.
+    #[tokio::test]
+    async fn asking_for_a_failed_blob_after_a_restart_tries_it_again() {
+        let f = failed_fixture().await.restarted();
+        assert!(waiting(&f.queue).is_empty(), "nothing queued it");
+        assert_eq!(
+            f.shown(),
+            BlobState::Failed {
+                size: 5000,
+                reason: TOO_BIG.into()
+            },
+            "and it still says why"
+        );
+
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
+        // The engine's part: the request reaches the queue.
+        f.queue.want(f.blob.id);
+        f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 2)
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 0]);
+        assert_eq!(
+            f.status(),
+            BlobStatus::Failed {
+                reason: TOO_BIG.into()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_body_longer_than_the_blob_is_refused() {
         // The server claims the right size but sends more bytes.
@@ -1770,8 +2671,48 @@ mod tests {
         f.queue.want(f.blob.id);
         f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
             .await;
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(matches!(f.status(), BlobStatus::Failed { .. }));
         assert!(!f.part().exists());
+    }
+
+    /// An empty blob (the server makes them, e.g. a conflicted file's diff)
+    /// is whole before any byte arrives: it settles without a request,
+    /// through the same size and hash check, as an empty file.
+    #[tokio::test]
+    async fn an_empty_blob_settles_available_without_a_request() {
+        let f = Fixture::new(0, Vec::new(), 0);
+        f.queue.want(f.blob.id);
+        f.run_until(|s| matches!(s, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0);
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert!(!f.part().exists());
+        assert_eq!(f.shown(), BlobState::Available { path });
+    }
+
+    /// The empty blob still goes through the hash check: one promising
+    /// other content fails rather than settling.
+    #[tokio::test]
+    async fn an_empty_blob_promising_other_content_fails() {
+        let promised = ContentHash::of(b"other content");
+        let f = Fixture::hashed(0, promised, Vec::new(), 0);
+        f.queue.want(f.blob.id);
+        f.run_until(|_| matches!(f.shown(), BlobState::Failed { .. }))
+            .await;
+        let actual = ContentHash::of(b"");
+        let reason = format!("blob content hash mismatch: expected {promised}, got {actual}");
+        assert_eq!(
+            f.status(),
+            BlobStatus::Failed {
+                reason: reason.clone()
+            }
+        );
+        assert!(!f.part().exists());
+        assert_eq!(f.shown(), BlobState::Failed { size: 0, reason });
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1830,7 +2771,7 @@ mod tests {
         downloader.abort();
 
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
-        assert!(lock(&f.queue.queue).waiting.is_empty());
+        assert!(waiting(&f.queue).is_empty());
         assert_eq!(f.seam.blob(f.blob.id).unwrap(), None);
         assert!(!f.part().exists(), "the part file it wrote is gone");
         let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
@@ -2272,6 +3213,9 @@ mod tests {
         let a = record(BlobStatus::NotDownloaded);
         let b = record(BlobStatus::Available { path: "/x".into() });
         let c = record(BlobStatus::NotDownloaded);
+        let failed = record(BlobStatus::Failed {
+            reason: "gone".into(),
+        });
 
         // OnDemand: registered blobs wait for the user.
         queue.registered(&[a.id]);
@@ -2279,9 +3223,12 @@ mod tests {
         queue.want(a.id);
         assert_eq!(waiting(&queue), [(a.id, true)]);
 
-        // Eager: everything not available, newest first, no duplicates;
-        // a user request jumps the queue.
-        queue.set_policy(BlobPolicy::Eager, &[a.clone(), b.clone(), c.clone()]);
+        // Eager: everything neither available nor failed, newest first, no
+        // duplicates; a user request jumps the queue.
+        queue.set_policy(
+            BlobPolicy::Eager,
+            &[a.clone(), b.clone(), c.clone(), failed.clone()],
+        );
         assert_eq!(waiting(&queue), [(a.id, true), (c.id, false)]);
         let d = ProtoBlobId::new();
         queue.registered(&[d, c.id]);
@@ -2299,11 +3246,59 @@ mod tests {
     }
 
     fn waiting(queue: &BlobQueue) -> Vec<(BlobId, bool)> {
-        lock(&queue.queue)
-            .waiting
-            .iter()
-            .map(|q| (q.id, q.wanted))
-            .collect()
+        let queue = lock(&queue.queue);
+        assert!(queue.waiting.consistent(), "order and ids agree");
+        queue.waiting.iter().map(|q| (q.id, q.wanted)).collect()
+    }
+
+    fn stops(queue: &BlobQueue) -> usize {
+        queue.stops.load(Ordering::Relaxed)
+    }
+
+    /// A first sync's worth of blobs: registering them (twice), switching
+    /// to `Eager` over them, purging half and switching to `OnDemand` each
+    /// check membership per blob, which must not scan the queue (50k
+    /// blobs scanned per blob would be billions of comparisons, minutes in
+    /// a debug build). The switch to `OnDemand` stops only the one blob a
+    /// worker took, not every blob it drops.
+    #[tokio::test]
+    async fn a_large_queue_registers_switches_and_purges_without_scanning() {
+        const COUNT: usize = 50_000;
+        let queue = BlobQueue::default();
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        let ids: Vec<BlobId> = (0..COUNT).map(|_| ProtoBlobId::new()).collect();
+        queue.registered(&ids);
+        queue.registered(&ids);
+        let records: Vec<BlobRecord> = (ids.iter())
+            .map(|&id| BlobRecord {
+                id,
+                size: 1,
+                sha256: ContentHash::of(b""),
+                status: BlobStatus::NotDownloaded,
+                workdir: false,
+            })
+            .collect();
+        queue.set_policy(BlobPolicy::Eager, &records);
+        let ids_waiting: Vec<BlobId> = waiting(&queue).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids_waiting, ids, "registration order, no duplicates");
+
+        // A worker takes the first and lets it go unfinished: it waits at
+        // the front again, started.
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!(claim.item.id, ids[0]);
+        drop(claim);
+        assert_eq!(waiting(&queue).len(), COUNT);
+
+        let (gone, kept) = ids.split_at(COUNT / 2);
+        queue.purged(&gone[1..]);
+        let left: Vec<BlobId> = waiting(&queue).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(left[0], ids[0]);
+        assert_eq!(left[1..], *kept);
+
+        let before = stops(&queue);
+        queue.set_policy(BlobPolicy::OnDemand, &records);
+        assert!(waiting(&queue).is_empty());
+        assert_eq!(stops(&queue) - before, 1, "only the started blob");
     }
 
     #[test]
@@ -2434,5 +3429,433 @@ mod tests {
             waiting(&queue),
             [(diff_blob.id, true), (event_blob.id, false)]
         );
+    }
+
+    /// Startup removes the blob files no row owns, by the row's status,
+    /// workdir blobs included, and leaves names that are no blob file's.
+    #[test]
+    fn restore_sweeps_the_blob_files_no_row_owns() {
+        use crate::store::Store;
+        use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+        use skywave_proto::{FileBody, FileResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = blob_dir(dir.path());
+        let session_id = SessionId::new();
+        let blob = |size| BlobRef {
+            id: ProtoBlobId::new(),
+            size,
+            sha256: ContentHash::of(b""),
+        };
+        let [available, downloading, stopped, failed, not_downloaded] = [1, 2, 3, 4, 5].map(blob);
+        let workdir = blob(6);
+        let orphan = blob(7);
+        let done = |b: &BlobRef| blobs.join(b.id.0.to_string());
+        let part = |b: &BlobRef| part_path(&blobs, b.id);
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            let event = |kind: EventKind| Event {
+                session_id,
+                at: Utc::now(),
+                command_id: None,
+                context: skywave_proto::ContextId::first_of(session_id),
+                kind,
+            };
+            let mut events = vec![event(EventKind::SessionCreated {
+                workdir: "/srv".into(),
+                context_name: "start".into(),
+                from: None,
+            })];
+            for b in [&available, &downloading, &stopped, &failed, &not_downloaded] {
+                events.push(event(EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "big".into(),
+                    lines: 1,
+                    output: Some(Full::Blob(b.clone())),
+                })));
+            }
+            store
+                .apply_batch(
+                    &EventBatch {
+                        from: Seq(1),
+                        events,
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            let file = FileResult::File {
+                at: Utc::now(),
+                path: "a.txt".into(),
+                size: 6,
+                content: FileBody::Blob(workdir.clone()),
+            };
+            let ask = WorkdirAsk::File {
+                session: session_id,
+                path: "a.txt".into(),
+            };
+            store
+                .put_workdir(&ask, &WorkdirAnswer::File(file))
+                .unwrap()
+                .unwrap();
+            for (b, status) in [
+                (
+                    &available,
+                    BlobStatus::Available {
+                        path: done(&available),
+                    },
+                ),
+                (
+                    &downloading,
+                    BlobStatus::Downloading {
+                        got: 1,
+                        path: part(&downloading),
+                    },
+                ),
+                (
+                    &stopped,
+                    BlobStatus::Stopped {
+                        got: 1,
+                        path: part(&stopped),
+                    },
+                ),
+                (
+                    &failed,
+                    BlobStatus::Failed {
+                        reason: "gone".into(),
+                    },
+                ),
+                (
+                    &workdir,
+                    BlobStatus::Available {
+                        path: done(&workdir),
+                    },
+                ),
+            ] {
+                store.set_blob_status(b.id, &status).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&blobs).unwrap();
+        let every = [
+            &available,
+            &downloading,
+            &stopped,
+            &failed,
+            &not_downloaded,
+            &workdir,
+            &orphan,
+        ];
+        for b in every {
+            std::fs::write(done(b), b"x").unwrap();
+            std::fs::write(part(b), b"x").unwrap();
+        }
+        let others = [
+            blobs.join("notes.txt"),
+            blobs.join(orphan.id.0.to_string().to_uppercase()),
+            blobs.join(orphan.id.0.simple().to_string()),
+            blobs.join(format!("{}.part.tmp", orphan.id.0)),
+        ];
+        for path in &others {
+            std::fs::write(path, b"x").unwrap();
+        }
+        // A directory under a blob's name is no blob file either.
+        let subdir = blobs.join(ProtoBlobId::new().0.to_string());
+        std::fs::create_dir(&subdir).unwrap();
+
+        let core = Core::open_detached(dir.path()).unwrap();
+        let _queue = BlobQueue::restore(&core.seam());
+
+        let kept = |path: &PathBuf| path.exists();
+        let expect = [
+            (done(&available), true),
+            (part(&available), false),
+            (done(&downloading), false),
+            (part(&downloading), true),
+            (done(&stopped), false),
+            (part(&stopped), true),
+            (done(&failed), false),
+            (part(&failed), false),
+            (done(&not_downloaded), false),
+            (part(&not_downloaded), false),
+            (done(&workdir), true),
+            (part(&workdir), false),
+            (done(&orphan), false),
+            (part(&orphan), false),
+        ];
+        for (path, want) in &expect {
+            assert_eq!(kept(path), *want, "{}", path.display());
+        }
+        for path in &others {
+            assert!(kept(path), "{} is no blob file", path.display());
+        }
+        assert!(subdir.is_dir());
+        // The statuses the sweep read are untouched.
+        assert!(matches!(
+            core.seam().blob(stopped.id).unwrap().unwrap().status,
+            BlobStatus::Stopped { got: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_missing_blob_directory_sweeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_blob_files(dir.path(), &[]), 0);
+        assert!(!blob_dir(dir.path()).exists());
+    }
+
+    impl Fixture {
+        /// The blob is `Stopped` and no worker holds it.
+        fn stopped_idle(&self) -> bool {
+            matches!(self.status(), BlobStatus::Stopped { .. })
+                && lock(&self.queue.queue).active.is_empty()
+        }
+
+        /// Switches the queue to `OnDemand` before the first response's
+        /// second chunk, as the engine does on the setting.
+        fn on_demand_mid_body(&self) {
+            let queue = self.queue.clone();
+            *self.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+                queue.set_policy(BlobPolicy::OnDemand, &[])
+            }));
+        }
+    }
+
+    /// An eager download in flight when the policy turns `OnDemand` stops
+    /// at its next chunk, keeping what it got (`.part` and progress,
+    /// `Stopped`), and shows as not downloaded. A restart under `OnDemand`
+    /// leaves it; asking for it resumes from the kept bytes.
+    #[tokio::test]
+    async fn an_eager_download_in_flight_stops_when_the_policy_turns_on_demand() {
+        let bytes = content(5000);
+        let f = Fixture::new(5000, bytes.clone(), 5000);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        f.on_demand_mid_body();
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("stopped", || f.stopped_idle()).await;
+        let stopped = BlobStatus::Stopped {
+            got: 2000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), stopped, "the two chunks it took are kept");
+        assert_eq!(std::fs::metadata(f.part()).unwrap().len(), 2000);
+        assert!(waiting(&f.queue).is_empty(), "not queued again");
+        assert!(f.takes_nothing().await);
+        assert_eq!(f.shown(), BlobState::NotDownloaded { size: 5000 });
+        downloader.abort();
+        let _ = downloader.await;
+
+        // The store keeps `OnDemand`: a restart resumes nothing.
+        let f = f.restarted();
+        assert_eq!(f.status(), stopped);
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+
+        f.queue.want(f.blob.id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    /// Positive control: a download the user asked for keeps going when
+    /// the policy turns `OnDemand` mid-body.
+    #[tokio::test]
+    async fn a_download_asked_for_keeps_going_when_the_policy_turns_on_demand() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        f.queue.want(f.blob.id);
+        f.on_demand_mid_body();
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0], "one try, whole");
+    }
+
+    /// An eager worker retrying a blob while the link is down lets it go
+    /// once the policy turns `OnDemand`, keeping the bytes an earlier try
+    /// got; asking for it resumes from them.
+    #[tokio::test]
+    async fn an_eager_worker_retrying_offline_drops_its_blob_on_demand() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        // The first try gets two chunks, then the link goes down.
+        *f.server.break_after.lock().unwrap() = Some(2);
+        let server = f.server.clone();
+        let id = f.blob.id;
+        *f.server.mid_body.lock().unwrap() = Some(Box::new(move || {
+            server.held.lock().unwrap().insert(id, Hold::Offline);
+        }));
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        let downloader = tokio::spawn(run_downloader(f.ctx()));
+        until("retrying offline", || {
+            f.server.calls.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+        assert!(lock(&f.queue.queue).active.contains(&id), "still held");
+
+        f.queue
+            .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+        until("stopped", || f.stopped_idle()).await;
+        assert_eq!(
+            f.status(),
+            BlobStatus::Stopped {
+                got: 2000,
+                path: f.part()
+            }
+        );
+        assert!(waiting(&f.queue).is_empty());
+        assert!(f.takes_nothing().await);
+        downloader.abort();
+        let _ = downloader.await;
+
+        f.server.held.lock().unwrap().clear();
+        f.queue.want(id);
+        f.run_until(|status| matches!(status, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 2000], "resumed");
+    }
+
+    /// The backoff itself: under `OnDemand`, an eager worker lets a blob
+    /// nobody asked for go at once and for good; one asked for it keeps
+    /// (the Wanted worker busy) and waits out its backoff.
+    #[tokio::test(start_paused = true)]
+    async fn backing_off_under_on_demand_drops_only_a_blob_nobody_asked_for() {
+        let queue = BlobQueue::default();
+        let (busy, eager, asked) = (ProtoBlobId::new(), ProtoBlobId::new(), ProtoBlobId::new());
+        let hour = Duration::from_secs(3600);
+        queue.want(busy);
+        let _busy = ready_now(queue.next(Slot::Wanted))
+            .await
+            .expect("asked for");
+        queue.set_policy(BlobPolicy::Eager, &[]);
+        queue.registered(&[eager, asked]);
+        let claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        let asked_claim = ready_now(queue.next(Slot::Any)).await.expect("queued");
+        assert_eq!((claim.item.id, asked_claim.item.id), (eager, asked));
+        queue.want(asked);
+        queue.set_policy(BlobPolicy::OnDemand, &[]);
+
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(claim, hour).await.is_none(), "dropped");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(!lock(&queue.queue).holds(eager), "for good");
+
+        let start = tokio::time::Instant::now();
+        assert!(queue.back_off(asked_claim, hour).await.is_some(), "kept");
+        assert_eq!(start.elapsed(), hour);
+    }
+
+    /// A waiting blob the switch to `OnDemand` drops is `Stopped` if its
+    /// download had started (here: let go when a downloader stopped under
+    /// `Eager`); a restart under `OnDemand` leaves it, `Eager` queues it.
+    #[tokio::test]
+    async fn a_waiting_started_download_dropped_on_demand_is_stopped() {
+        let f = Fixture::new(5000, content(5000), 5000);
+        let started = BlobStatus::Downloading {
+            got: 1000,
+            path: f.part(),
+        };
+        f.seam.blob_status(f.blob.id, started).unwrap();
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+
+        f.queue
+            .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+        assert!(waiting(&f.queue).is_empty());
+        let stopped = BlobStatus::Stopped {
+            got: 1000,
+            path: f.part(),
+        };
+        assert_eq!(f.status(), stopped);
+        assert_eq!(f.shown(), BlobState::NotDownloaded { size: 5000 });
+        // Asked for, it shows requested until a worker reports.
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
+
+        let f = f.restarted();
+        assert!(waiting(&f.queue).is_empty(), "not resumed under OnDemand");
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(f.blob.id, false)], "Eager takes it");
+    }
+
+    /// The engine reads the blobs before the queue's lock: a blob whose
+    /// worker recorded progress and let it go after that read (a yield to
+    /// a crop, a full disk) is still stopped, as is every dropped blob a
+    /// worker took when the read failed and the list is empty.
+    #[tokio::test]
+    async fn the_switch_to_on_demand_stops_what_a_stale_snapshot_missed() {
+        for empty in [false, true] {
+            let f = Fixture::new(5000, content(5000), 5000);
+            let before = f.seam.blobs().unwrap();
+            f.queue.set_policy(BlobPolicy::Eager, &before);
+            assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+            // A worker takes it, records progress and lets it go, unfinished:
+            // under `Eager` it waits at the front again.
+            let claim = ready_now(f.queue.next(Slot::Any)).await.expect("queued");
+            let started = BlobStatus::Downloading {
+                got: 1000,
+                path: f.part(),
+            };
+            f.seam.blob_status(f.blob.id, started).unwrap();
+            drop(claim);
+            assert_eq!(waiting(&f.queue), [(f.blob.id, false)]);
+
+            let snapshot: &[BlobRecord] = if empty { &[] } else { &before };
+            assert_eq!(
+                snapshot.first().map(|b| &b.status),
+                (!empty).then_some(&BlobStatus::NotDownloaded),
+                "stale"
+            );
+            f.queue.set_policy(BlobPolicy::OnDemand, snapshot);
+            assert!(waiting(&f.queue).is_empty());
+            assert_eq!(
+                f.status(),
+                BlobStatus::Stopped {
+                    got: 1000,
+                    path: f.part()
+                },
+                "empty snapshot: {empty}"
+            );
+        }
+    }
+
+    /// A restart under `Eager` resumes an event blob's download as a
+    /// background one, which a switch to `OnDemand` then stops, keeping
+    /// its bytes; under `OnDemand` it resumes as asked for and is kept.
+    #[tokio::test]
+    async fn a_download_resumed_under_eager_stops_on_demand() {
+        for policy in [BlobPolicy::Eager, BlobPolicy::OnDemand] {
+            let f = Fixture::new(5000, content(5000), 5000);
+            f.core.dispatch(Action::SetBlobPolicy(policy)).unwrap();
+            let started = BlobStatus::Downloading {
+                got: 1000,
+                path: f.part(),
+            };
+            f.seam.blob_status(f.blob.id, started.clone()).unwrap();
+
+            let f = f.restarted();
+            let asked = policy == BlobPolicy::OnDemand;
+            assert_eq!(waiting(&f.queue), [(f.blob.id, asked)], "{policy:?}");
+            f.queue
+                .set_policy(BlobPolicy::OnDemand, &f.seam.blobs().unwrap());
+            if asked {
+                assert_eq!(waiting(&f.queue), [(f.blob.id, true)], "kept");
+                assert_eq!(f.status(), started);
+            } else {
+                assert!(waiting(&f.queue).is_empty(), "dropped");
+                let stopped = BlobStatus::Stopped {
+                    got: 1000,
+                    path: f.part(),
+                };
+                assert_eq!(f.status(), stopped);
+            }
+        }
     }
 }

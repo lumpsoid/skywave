@@ -117,6 +117,7 @@ mod tests {
                     id: ApprovalId::new(),
                     status,
                     answer: None,
+                    input: None,
                 }),
                 outcome: ToolOutcome::Running {
                     since: chrono::Utc::now(),
@@ -131,6 +132,7 @@ mod tests {
             seq,
             Entry::AgentMessage {
                 text: text.to_owned(),
+                full: None,
             },
         )
     }

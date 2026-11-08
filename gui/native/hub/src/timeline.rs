@@ -17,11 +17,12 @@ use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     bytes, context_moved_line, context_started_line, context_switched_line, decision_label,
-    delivery_label, dollars, fail_reason, import_finished_line, moved_from_line, outgoing_label,
-    percent, seconds, subagent_status, took_label, turn_time,
+    delivery_label, dollars, download_state, fail_reason, import_finished_line, moved_from_line,
+    outgoing_label, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, change_note, delivery, sections, selectable, starts_turn,
+    unseen_blob,
 };
 use skywave_present::text::{clean_line, clean_text};
 
@@ -84,7 +85,22 @@ impl BlobHeads {
 fn read(path: &Path) -> Result<Head, String> {
     let (text, size) = read_head(path, SHOW_BYTES)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let all = content_lines(&text);
+    Ok(shown_head(&text, size))
+}
+
+/// What an expanded section shows of whole content kept inline: the same
+/// head and cut as a downloaded blob's.
+fn inline_head(whole: &str) -> Head {
+    let mut end = whole.len().min(SHOW_BYTES as usize);
+    while !whole.is_char_boundary(end) {
+        end -= 1;
+    }
+    shown_head(&whole[..end], whole.len() as u64)
+}
+
+/// The head shown of `text`, the first bytes of content `size` long.
+fn shown_head(text: &str, size: u64) -> Head {
+    let all = content_lines(text);
     let cut = (all.len() > SHOW_LINES || size > SHOW_BYTES).then(|| {
         let shown = if all.len() > SHOW_LINES {
             format!("{SHOW_LINES} lines")
@@ -93,10 +109,10 @@ fn read(path: &Path) -> Result<Head, String> {
         };
         format!("cut short: {shown} of {} shown", bytes(size))
     });
-    Ok(Head {
+    Head {
         lines: all.into_iter().take(SHOW_LINES).map(clean_line).collect(),
         cut,
-    })
+    }
 }
 
 /// A session's rows, and for each the pending key its logged message
@@ -232,7 +248,7 @@ fn row(
             });
             row.outgoing = outgoing.as_ref().map(outgoing_view);
         }
-        Entry::AgentMessage { text } => {
+        Entry::AgentMessage { text, .. } => {
             set(&mut row, RowKind::AgentMessage, clean_text(text));
             row.author = Some("agent".to_owned());
         }
@@ -283,11 +299,11 @@ fn row(
         Entry::Imported { entry: item, .. } => {
             row.mark = Some(IMPORTED_MARK.to_owned());
             match item {
-                ImportedEntry::UserMessage { text } => {
+                ImportedEntry::UserMessage { text, .. } => {
                     set(&mut row, RowKind::ImportedUserMessage, clean_text(text));
                     row.author = Some("you".to_owned());
                 }
-                ImportedEntry::AgentMessage { text } => {
+                ImportedEntry::AgentMessage { text, .. } => {
                     set(&mut row, RowKind::ImportedAgentMessage, clean_text(text));
                     row.author = Some("agent".to_owned());
                 }
@@ -679,39 +695,6 @@ pub fn outgoing_view(outgoing: &Outgoing) -> OutgoingView {
     }
 }
 
-/// While collapsed, the state of a blob no visible section shows: `input
-/// 4.2 KiB`, `output 1.0 MiB · requested`; or that the server could not
-/// keep it: `input not stored`.
-fn unseen_blob(entry: &Entry) -> Option<String> {
-    let sections = sections(entry);
-    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
-        return None;
-    }
-    let section = sections.iter().find(|s| s.full.is_some())?;
-    let what = match (section.input, section.hidden) {
-        (true, _) => "input",
-        (false, true) => "output",
-        (false, false) => "full",
-    };
-    let Some(blob) = section.blob() else {
-        return Some(format!("{what} not stored"));
-    };
-    let state = match &blob.state {
-        BlobState::NotDownloaded { size } => bytes(*size),
-        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
-        BlobState::Downloading { got, size, paused } => format!(
-            "{} · downloading {}%{}",
-            bytes(*size),
-            percent(*got, *size),
-            if *paused { " · paused, offline" } else { "" }
-        ),
-        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
-        BlobState::Available { .. } => return None,
-    };
-    Some(format!("{what} {state}"))
-}
-
 /// One section as shown: collapsed, its preview's head and what more
 /// there is; expanded, all of it (the blob's head once here). `None` for
 /// a collapsed section with nothing to show.
@@ -734,14 +717,24 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             },
             // Where its download stands is the blob's label.
             Some(_) => preview.into_iter().map(clean_line).collect(),
-            None => {
-                note = section.note().map(Cow::into_owned);
-                preview.into_iter().map(clean_line).collect()
-            }
+            None => match section.inline() {
+                Some(whole) => {
+                    let head = inline_head(whole);
+                    cut_short = head.cut.is_some();
+                    note = head.cut;
+                    head.lines
+                }
+                None => {
+                    note = section.note().map(Cow::into_owned);
+                    preview.into_iter().map(clean_line).collect()
+                }
+            },
         }
     } else {
-        if preview.is_empty() {
+        if preview.is_empty() && !section.message {
             // Nothing worth a line, e.g. a write's output beside its status.
+            // A long message's whole still says where it stands, under the
+            // head the message shows.
             return None;
         }
         let shown: Vec<String> = preview
@@ -785,6 +778,7 @@ fn view_of(
         numbered: section.numbered,
         first_line: 1,
         input: section.input,
+        label: section.label().map(str::to_owned),
         lines: lines
             .into_iter()
             .map(|text| SectionLine {
@@ -812,41 +806,20 @@ fn more_note(section: &Section, preview: usize, shown: usize) -> Option<String> 
     ))
 }
 
-/// A section's blob with where its download stands, worded as the TUI
-/// words an expanded section's: `not downloaded · 4.0 KiB`, `downloading
-/// · 1.0 KiB of 4.0 KiB (25%)`.
+/// A section's blob with where its download stands ([`download_state`]):
+/// `not downloaded · 4.0 KiB`, `downloading · 1.0 KiB of 4.0 KiB (25%)`.
 pub fn blob_facts(blob: &BlobView) -> BlobFacts {
-    let (state, label) = match &blob.state {
-        BlobState::NotDownloaded { size } => (
-            BlobStateKind::NotDownloaded,
-            format!("not downloaded · {}", bytes(*size)),
-        ),
-        BlobState::Requested { size } => (
-            BlobStateKind::Requested,
-            format!("requested · waiting for a slot · {}", bytes(*size)),
-        ),
-        BlobState::Downloading { got, size, paused } => {
-            let progress = format!(
-                "downloading · {} of {} ({}%)",
-                bytes(*got),
-                bytes(*size),
-                percent(*got, *size)
-            );
-            if *paused {
-                (
-                    BlobStateKind::Paused,
-                    format!("{progress} · paused, offline"),
-                )
-            } else {
-                (BlobStateKind::Downloading, progress)
-            }
-        }
-        BlobState::Failed { size, reason } => (
-            BlobStateKind::Failed,
-            format!("download failed: {} · {}", clean_line(reason), bytes(*size)),
-        ),
-        BlobState::Available { .. } => (BlobStateKind::Available, "downloaded".to_owned()),
+    let state = match &blob.state {
+        BlobState::NotDownloaded { .. } => BlobStateKind::NotDownloaded,
+        BlobState::Requested { .. } => BlobStateKind::Requested,
+        BlobState::Downloading {
+            paused: Some(_), ..
+        } => BlobStateKind::Paused,
+        BlobState::Downloading { paused: None, .. } => BlobStateKind::Downloading,
+        BlobState::Failed { .. } => BlobStateKind::Failed,
+        BlobState::Available { .. } => BlobStateKind::Available,
     };
+    let label = download_state(&blob.state);
     // What the server did to it is said beside where it stands.
     let label = match change_note(blob) {
         Some(note) => format!("{label} · {note}"),
@@ -901,7 +874,7 @@ pub fn content_lines(text: &str) -> Vec<&str> {
 mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, PermissionMode,
+        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, Pause, PermissionMode,
         SessionId, SessionState,
     };
     use skywave_present::sections::CONTENT_LOST;
@@ -949,7 +922,10 @@ mod tests {
             seq: Seq(seq),
             at: Utc.with_ymd_and_hms(2026, 10, 31, 12, minute, 0).unwrap(),
             context: ContextId::new(),
-            entry: Entry::AgentMessage { text: text.into() },
+            entry: Entry::AgentMessage {
+                text: text.into(),
+                full: None,
+            },
         }
     }
 
@@ -1165,6 +1141,57 @@ mod tests {
         );
     }
 
+    /// The input an approval asked about, other than its call's, shows
+    /// labelled once the call is expanded, and not before.
+    #[test]
+    fn an_approvals_own_input_shows_labelled_when_expanded() {
+        let asked = FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 2048 },
+            change: None,
+            pending: None,
+        });
+        let view = session(vec![TimelineItem::Logged {
+            parent: None,
+            seq: Seq(1),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            context: ContextId::new(),
+            entry: Entry::Tool(Box::new(ToolView {
+                call: skywave_core::CallId::new(),
+                name: "Bash".into(),
+                kind: skywave_core::ToolKind::Shell,
+                title: "$ make".into(),
+                detail: None,
+                body: None,
+                input: None,
+                approval: Some(skywave_core::ToolApproval {
+                    id: skywave_core::ApprovalId::new(),
+                    status: skywave_core::ApprovalStatus::Pending,
+                    answer: None,
+                    input: Some(asked),
+                }),
+                outcome: ToolOutcome::Running { since: Utc::now() },
+                subagent: None,
+            })),
+        }]);
+        let labels = |expanded: &HashSet<Seq>| {
+            let rows = rows(&view, expanded, &mut BlobHeads::default(), 0).rows;
+            rows[0]
+                .sections
+                .iter()
+                .map(|s| (s.label.clone(), s.blob.is_some()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&HashSet::new()), []);
+        assert_eq!(
+            labels(&HashSet::from([Seq(1)])),
+            [(
+                Some("approval input: differs from the call's".to_owned()),
+                true
+            )]
+        );
+    }
+
     #[test]
     fn the_unread_rule_stands_in_for_the_turn_separator() {
         let mut view = session(vec![
@@ -1202,6 +1229,8 @@ mod tests {
                 full: Some(&blob),
                 hidden: false,
                 input: false,
+                message: false,
+                asked: false,
             };
             let view = section_view(&section, expanded, &mut BlobHeads::default()).unwrap();
             (view.note, view.blob.unwrap().label)
@@ -1227,9 +1256,17 @@ mod tests {
                 BlobState::Downloading {
                     got: size / 2,
                     size,
-                    paused: true,
+                    paused: Some(Pause::Offline),
                 },
                 "downloading · 35.0 KiB of 70.0 KiB (50%) · paused, offline",
+            ),
+            (
+                BlobState::Downloading {
+                    got: size / 2,
+                    size,
+                    paused: Some(Pause::DiskFull),
+                },
+                "downloading · 35.0 KiB of 70.0 KiB (50%) · paused, device disk full",
             ),
             (
                 BlobState::Failed {
@@ -1256,6 +1293,8 @@ mod tests {
             full,
             hidden: false,
             input: false,
+            message: false,
+            asked: false,
         };
         let view = |full, expanded| {
             section_view(&section(full), expanded, &mut BlobHeads::default()).unwrap()

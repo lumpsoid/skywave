@@ -1225,6 +1225,32 @@ async fn the_blob_is_raw_and_the_preview_a_stripped_tail() {
 }
 
 #[tokio::test]
+async fn the_output_file_becomes_the_blob_without_a_copy() {
+    use std::os::unix::fs::MetadataExt;
+    let mut f = Fixture::new();
+    let runner = f.start().await;
+    // The command reports its own output file's inode as its last line.
+    let shell = f.data.join("shell");
+    let run = f.run(&format!("seq 1 20; ls -i '{}'/*.out", shell.display()));
+    let finished = f.finished(run).await;
+    let blob = finished.output.expect("a blob");
+    let content = f.blob(&blob);
+    assert_eq!(blob.size, content.len() as u64);
+    let text = String::from_utf8(content).unwrap();
+    let inode: u64 = text
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no inode in {text:?}"));
+    let stored = std::fs::metadata(f.data.join("blobs").join(blob.id.0.to_string())).unwrap();
+    assert_eq!(stored.ino(), inode, "the blob is the output file, renamed");
+    let left: Vec<_> = std::fs::read_dir(&shell).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn output_whose_blob_cannot_be_stored_is_logged_truncated() {
     let mut f = Fixture::new();
     let mut runner = f.start().await;

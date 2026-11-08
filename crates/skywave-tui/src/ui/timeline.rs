@@ -26,12 +26,13 @@ use skywave_present::blob_actions::pending_note;
 use skywave_present::format::{
     IMPORTED_MARK, adopted_line, agent_setting_line, agent_version_line, answer_words, asked_by,
     blob_size, bytes, context_moved_line, context_started_line, context_switched_line,
-    decision_label, delivery_label, dollars, fail_reason, import_finished_line, moved_from_line,
-    outgoing_label, percent, seconds, subagent_status, took_label, turn_time,
+    decision_label, delivery_label, dollars, download_state, fail_reason, import_finished_line,
+    moved_from_line, outgoing_label, seconds, subagent_status, took_label, turn_time,
 };
 use skywave_present::policy::in_conversation;
 use skywave_present::sections::{
-    ItemKey, PREVIEW_LINES, Section, change_note, delivery, find, sections, selectable, starts_turn,
+    ItemKey, PREVIEW_LINES, Section, change_note, collapsed_download, delivery, find, sections,
+    selectable, starts_turn, unseen_blob,
 };
 use skywave_present::text::clean;
 use unicode_width::UnicodeWidthChar;
@@ -545,9 +546,13 @@ impl Layout<'_> {
                 };
                 return self.message(lead, label, bar, text, mark);
             }
-            Entry::AgentMessage { text } => {
+            // A long message's whole is a section beneath it.
+            Entry::AgentMessage { text, .. } => {
                 let label = vec![Span::raw("agent: ").green().bold()];
-                return self.message(lead, label, Color::Green, text, mark);
+                (
+                    self.message(lead, label, Color::Green, text, mark),
+                    Style::new().green(),
+                )
             }
             Entry::Interrupted => {
                 let mut spans = lead;
@@ -578,18 +583,24 @@ impl Layout<'_> {
             }
             // The outside conversation's user wrote it, not a device.
             Entry::Imported {
-                entry: ImportedEntry::UserMessage { text },
+                entry: ImportedEntry::UserMessage { text, .. },
                 ..
             } => {
                 let label = vec![Span::raw("you").blue().bold(), Span::raw(": ")];
-                return self.message(imported(lead), label, Color::Blue, text, mark);
+                (
+                    self.message(imported(lead), label, Color::Blue, text, mark),
+                    Style::new().blue(),
+                )
             }
             Entry::Imported {
-                entry: ImportedEntry::AgentMessage { text },
+                entry: ImportedEntry::AgentMessage { text, .. },
                 ..
             } => {
                 let label = vec![Span::raw("agent: ").green().bold()];
-                return self.message(imported(lead), label, Color::Green, text, mark);
+                (
+                    self.message(imported(lead), label, Color::Green, text, mark),
+                    Style::new().green(),
+                )
             }
             Entry::Imported {
                 entry: ImportedEntry::Tool(view),
@@ -800,14 +811,36 @@ impl Layout<'_> {
                     note = blob_note(state);
                     preview.into_iter().map(clean).collect()
                 }
-                None => {
-                    note = section.note().map(|note| Span::raw(note).yellow());
-                    preview.into_iter().map(clean).collect()
-                }
+                None => match section.inline() {
+                    // Capped like a downloaded blob's head.
+                    Some(whole) => {
+                        let shown = head_of(whole, SHOW_BYTES as usize);
+                        let lines = content_lines(shown);
+                        note = (lines.len() > SHOW_LINES || shown.len() < whole.len()).then(|| {
+                            Span::raw(format!(
+                                "… cut short: {} of {} shown",
+                                if lines.len() > SHOW_LINES {
+                                    format!("{SHOW_LINES} lines")
+                                } else {
+                                    bytes(SHOW_BYTES)
+                                },
+                                bytes(whole.len() as u64)
+                            ))
+                            .dark_gray()
+                        });
+                        lines.into_iter().take(SHOW_LINES).map(clean).collect()
+                    }
+                    None => {
+                        note = section.note().map(|note| Span::raw(note).yellow());
+                        preview.into_iter().map(clean).collect()
+                    }
+                },
             }
-        } else if preview.is_empty() {
+        } else if preview.is_empty() && !section.message {
             // Nothing worth a line, e.g. a write's output beside its status;
-            // `lines` then counts what the agent was told, not content.
+            // `lines` then counts what the agent was told, not content. A
+            // long message's whole still says where it stands, under the
+            // head the message shows.
             return (Vec::new(), None);
         } else {
             let shown: Vec<String> = preview
@@ -825,25 +858,10 @@ impl Layout<'_> {
                 ));
             }
             if let Some(blob) = section.blob() {
-                more.push(match &blob.state {
-                    BlobState::NotDownloaded { size } => {
-                        format!("full {} · not downloaded", bytes(*size))
-                    }
-                    BlobState::Requested { size } => {
-                        format!("full {} · requested", bytes(*size))
-                    }
-                    BlobState::Downloading { got, size, paused } => {
-                        let progress = format!("downloading {}%", percent(*got, *size));
-                        if *paused {
-                            format!("{progress} · paused, offline")
-                        } else {
-                            progress
-                        }
-                    }
-                    BlobState::Failed { size, .. } => {
-                        format!("full {} · download failed · d retries", bytes(*size))
-                    }
-                    BlobState::Available { .. } => "downloaded".to_owned(),
+                let state = collapsed_download(&blob.state);
+                more.push(match blob.state {
+                    BlobState::Failed { .. } => format!("{state} · d retries"),
+                    _ => state,
                 });
                 more.extend(change_note(blob));
                 more.extend(blob.pending.as_ref().map(pending_note));
@@ -864,6 +882,14 @@ impl Layout<'_> {
 
         let bar = || vec![indent(LEAD), Span::styled("│ ", gutter)];
         let mut out: Vec<Line<'static>> = Vec::new();
+        if let Some(label) = section.label() {
+            out.extend(wrap(
+                bar(),
+                bar(),
+                vec![Span::raw(label).yellow()],
+                self.width,
+            ));
+        }
         if skipped > 0 {
             let above = format!(
                 "… {skipped} {} above",
@@ -886,8 +912,30 @@ impl Layout<'_> {
             }
             out.extend(rows);
         }
-        if let Some(note) = note {
-            out.extend(wrap(bar(), bar(), vec![note], self.width));
+        // Expanded, what the server did to the blob and a crop or delete
+        // still pending stay said, as they are collapsed, after the note.
+        let facts: Vec<String> = section
+            .blob()
+            .filter(|_| expanded)
+            .map(|blob| {
+                change_note(blob)
+                    .into_iter()
+                    .chain(blob.pending.as_ref().map(pending_note))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let note: Vec<Span<'static>> = match (note, facts.is_empty()) {
+            (note, true) => note.into_iter().collect(),
+            (Some(note), false) => {
+                vec![
+                    note,
+                    Span::raw(format!(" · {}", facts.join(" · "))).dark_gray(),
+                ]
+            }
+            (None, false) => vec![Span::raw(format!("… {}", facts.join(" · "))).dark_gray()],
+        };
+        if !note.is_empty() {
+            out.extend(wrap(bar(), bar(), note, self.width));
         }
         (out, row)
     }
@@ -977,34 +1025,19 @@ struct BlobPart {
 /// not downloaded (`d` downloads it), waiting, how far its download got,
 /// or why it failed (`d` retries). `None` once it is here.
 pub(super) fn blob_note(state: &BlobState) -> Option<Span<'static>> {
+    let words = download_state(state);
     Some(match state {
         BlobState::Available { .. } => return None,
-        BlobState::NotDownloaded { size } => Span::raw(format!(
-            "not downloaded · {} · press d to download",
-            bytes(*size)
-        ))
-        .dark_gray(),
-        BlobState::Requested { size } => {
-            Span::raw(format!("requested · waiting for a slot · {}", bytes(*size))).cyan()
+        BlobState::NotDownloaded { .. } => {
+            Span::raw(format!("{words} · press d to download")).dark_gray()
         }
-        BlobState::Downloading { got, size, paused } => {
-            let progress = format!(
-                "downloading · {} of {} ({}%)",
-                bytes(*got),
-                bytes(*size),
-                percent(*got, *size)
-            );
-            if *paused {
-                Span::raw(format!("{progress} · paused, offline")).yellow()
-            } else {
-                Span::raw(progress).cyan()
-            }
+        BlobState::Requested { .. } | BlobState::Downloading { paused: None, .. } => {
+            Span::raw(words).cyan()
         }
-        BlobState::Failed { size, reason } => Span::raw(format!(
-            "download failed: {reason} · {} · d retries",
-            bytes(*size)
-        ))
-        .red(),
+        BlobState::Downloading {
+            paused: Some(_), ..
+        } => Span::raw(words).yellow(),
+        BlobState::Failed { .. } => Span::raw(format!("{words} · d retries")).red(),
     })
 }
 
@@ -1015,40 +1048,6 @@ fn head_of(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// While collapsed, the state of an item's blob when no section on screen
-/// carries one (a hidden input or output, an empty preview), so `d` on it
-/// shows what it did: `input 4.2 KiB`, `output 4.2 KiB · requested`; or
-/// that the server could not keep it: `input not stored`.
-fn unseen_blob(entry: &Entry) -> Option<String> {
-    let sections = sections(entry);
-    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
-        return None;
-    }
-    let section = sections.iter().find(|s| s.full.is_some())?;
-    let what = match (section.input, section.hidden) {
-        (true, _) => "input",
-        (false, true) => "output",
-        (false, false) => "full",
-    };
-    let Some(blob) = section.blob() else {
-        return Some(format!("{what} not stored"));
-    };
-    let state = match &blob.state {
-        BlobState::NotDownloaded { size } => bytes(*size),
-        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
-        BlobState::Downloading { got, size, paused } => format!(
-            "{} · downloading {}%{}",
-            bytes(*size),
-            percent(*got, *size),
-            if *paused { " · paused, offline" } else { "" }
-        ),
-        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
-        BlobState::Available { .. } => return None,
-    };
-    Some(format!("{what} {state}"))
 }
 
 /// A section's head as the approval panel shows it: its preview's lines

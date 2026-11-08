@@ -87,11 +87,29 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 - **Ordering:** concurrent sends from several devices are ordered by server
   acceptance.
 - **Payloads:** event metadata is small; large content (tool outputs, file
-  contents, logs) is a blob referenced by id and fetched separately. The
+  contents, logs, long agent messages) is a blob referenced by id and
+  fetched separately. The
   reference (`BlobRef`) carries the content's size and SHA-256, which the
   server computes as it stores the blob; a device accepts no bytes that do
   not hash to it.
 - **Transport** sits behind a `Transport` trait: HTTPS today, QUIC later.
+- **Compression** (D45, `skywave_proto::encoding`): an event batch or a
+  blob body of at least 1 KiB (`COMPRESS_MIN_BYTES`) travels as one zstd
+  frame (level 3) to a request that sends `Accept-Encoding: zstd`, which
+  the device's every request does; a shorter body, or a request that does
+  not ask (curl, the server's own tests), gets the bytes as they are. The
+  transport decodes it, so everything above it (sizes, hashes, download
+  progress, `.part` offsets) counts decoded bytes. A blob's `Range` and
+  `Content-Range` count decoded bytes too, unlike plain HTTP: a resumed
+  download asks for the rest from its decoded offset and the server
+  compresses that range as a fresh frame, so nothing compressed is stored.
+  The decoder emits only bytes of the content, in order (a compressed
+  block once all of it arrived, a raw one possibly as it streams in), so
+  what a cut download got is a correct start of the content and resumes
+  from there. A compressed blob response is streamed with no
+  `Content-Length` and names its decoded length in
+  `skywave-decoded-length`; a compressed batch is sent whole, with the
+  frame's `Content-Length`.
 - **Slowest link:** an event batch or blob body is timed per chunk, not as
   a whole, so a slow link that keeps delivering bytes finishes. A chunk is
   one TLS record (up to 16 KB) and must arrive within `request_timeout`
@@ -128,7 +146,9 @@ core.subscribe(|ViewState| ..) // immutable per-screen snapshots
 but pairing authenticated by the device's client certificate. The types'
 doc comments are the reference; `PROTOCOL_VERSION`'s lists what each
 version changed. Client and server must match it exactly (checked at
-`hello`); there is no compatibility layer. The device reads the hello's
+`hello`); there is no compatibility layer on the wire. Stored data does
+carry over a bump: both the server's database and a device's replica
+migrate from any version since `MIGRATED_SINCE` (D43). The device reads the hello's
 `protocol_version` alone before decoding the rest, so a server of another
 version, whatever its hello's other fields, is a protocol mismatch rather
 than an unreadable reply; that one field must keep its name and type in
@@ -139,8 +159,8 @@ every version.
 | `POST /v1/pair` | No client certificate. A one-time code, a CSR and a device name; returns the device certificate, the CA certificate and the `DeviceId`. |
 | `GET /v1/hello` | Protocol version, server id, the caller's `DeviceId`, the committed log head, the log's identity, this run of the server and, for `?since=<RunId>`, what became of that run (`LogRun`, see "A log that went backwards"), every paired device with its name, whether the server runs shell commands, and whether it allows bypass mode (`agent.allow_bypass`, D38). |
 | `POST /v1/commands` | One `Command`; returns `Accepted { seq }` or `Rejected { reason }` (a closed `RejectReason`). Resending a `CommandId` returns the stored result. |
-| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. |
-| `GET /v1/blobs/{id}` | Blob content; one `bytes=` range as 206, so downloads resume. |
+| `GET /v1/events?after=&wait=&limit=` | Events with `seq > after` as an `EventBatch { from, events }`; blocks up to `wait` when there are none. `wait` ≤ 60 s, `limit` ≤ 5000 (default 500). A batch also stops before the event that would take it past 4 MiB of stored events (`BATCH_MAX_BYTES`), but always holds the first, so an event larger than that comes alone; a short batch is not the end of the log, and the client just pulls again from its last seq. An `after` above `i64::MAX` (the highest seq the log can hold) is a 400. Compressed when asked (D45, Sync model). |
+| `GET /v1/blobs/{id}` | Blob content; one `bytes=` range (of decoded bytes) as 206, so downloads resume. Compressed when asked (D45, Sync model). |
 | `GET /v1/dirs?dir=` | Workdir completion: subdirectories of `dir` under a root (canonicalised; `..` and symlinks cannot escape), else the roots. |
 | `GET /v1/conversations` | The agent's own conversations, those had outside Skywave included (D37), as a `ConversationsResult`: those whose workdir is under a root, newest first, at most `CONVERSATIONS_MAX`, `truncated` when the cap or the scan's deadline (8 s; 503 at 10 s) cut it short. Each has the agent's id (what an adopting `CreateSession` names), workdir, title and first prompt cut to one line, last activity, message count, and the session already running it, if any. `Unavailable` when the agent keeps none Skywave can read. |
 | `GET /v1/storage` | What the server's data takes on its disk, as a `StorageReport` read when asked: the database with its WAL, event and workdir blobs, running shell output, the log file, the free space and the `min_free` floor; every session (its events' stored JSON, its events' blobs), the largest event blobs and the shell runs taking the most (`STORAGE_TOP_MAX` each), largest first. |
@@ -246,12 +266,16 @@ collected between the two copies can be missing; fetching it fails until a
 refresh of its read replaces it. Copying with `serve` stopped is exact
 (README, "Running it as a service").
 
-Opening the database migrates its schema (`PRAGMA user_version`), but no
-migration rewrites the wire JSON its columns hold. So the database records
-the `PROTOCOL_VERSION` it was created with, and `serve` and the admin
-commands refuse one written by another version, before reading it, with an
-error telling the operator to delete the data directory (alpha: old data is
-not migrated). A database from before the stamp takes the current version.
+Opening the database migrates its schema (`PRAGMA user_version`); no
+schema migration rewrites the wire JSON its columns hold. So the database
+records the `PROTOCOL_VERSION` its JSON is in (`protocol_stamp`), and
+opening it then runs the protocol steps (`PROTOCOL_STEPS` in `db.rs`, one
+per version since `MIGRATED_SINCE`) from that version on, in the same
+transaction as the schema migrations and after them, and restamps it
+(D43). `serve` and the admin commands refuse a database stamped before
+`MIGRATED_SINCE` or after this build's version, before reading it, with an
+error naming the versions it reads. A database from before the stamp takes
+the current version.
 The database also holds its log's identity (`log_identity`, a `LogId`
 minted with it), and every `serve` is a new run (`RunId`), recorded in
 `log_runs` with the head it started from, in one statement. The record is
@@ -483,14 +507,41 @@ the daemon's appends, which would otherwise stop `serve` (below).
 - **Event mapper** (agent-agnostic): gives each tool call a fresh `CallId`,
   cuts every text to the limits on char boundaries, and makes a blob only for
   content that was cut, so a large payload costs a bounded event plus a blob
-  fetched on demand (D11). Each such field (`ToolCall::input`,
+  fetched on demand (D11). A call's input is a blob only when its display
+  does not carry all of it (the adapter's display left a field out, or the
+  detail, or a title beside a body, was cut); a cut body's blob already
+  holds it whole, so a big Write, Edit or command is stored once and
+  deleting that blob frees its bytes. Each such field (`ToolCall::input`,
   `Body::full`, `ToolResult::output`, `ApprovalRequested::input`) is a
   `Full`: `None` when the preview holds it all, `Blob` with the reference,
-  or `Lost` when the blob could not be stored (a full disk, its row
-  refused). A lost one is logged at error; the event keeps its cut
+  `Inline` with the content itself, or `Lost` when the blob could not be
+  stored (a full disk, its row refused). A tool result's whole output of
+  at most `limits::INLINE_MAX_BYTES` (4 KiB) is `Inline` rather than a
+  blob: an adapter's preview nearly always differs from the output (an
+  edit's note to the model, a read's line numbers, a grep's header), and
+  a blob that small costs a file, two fsyncs, a row and, under the eager
+  policy, a request per device for less than its own overhead. Heads
+  treat it as content already here: an expanded section shows it, a copy
+  takes it and a search looks through it; it has no blob actions. A lost one is logged at error; the event keeps its cut
   preview and whole `lines` count, the turn goes on, and every head says
   the rest is gone (`skywave_present::sections`), up front in an approval
   prompt, since the user decides on the summary.
+  Agent text travels whole in its `AgentMessage` up to
+  `limits::MESSAGE_WHOLE_MAX_BYTES` (16 KiB, several screens: nearly
+  every reply); a longer one (a report, a dump) is its first
+  `limits::MESSAGE_PREVIEW_MAX_BYTES` (2 KiB, cut after its last line
+  break) with `full`, a `BlobUse::Message` blob of the whole (or `Lost`),
+  so it does not reach every device as event data. An import bounds its
+  user and agent messages the same way. A typed `UserMessage` stays whole:
+  `SendMessage` caps it at `limits::MESSAGE_MAX_BYTES`, and the supervisor
+  hands the event's text to the agent. Heads show a long message's head
+  as the message and its whole as a section beneath it
+  (`Section::message`): collapsed it shows only where the blob stands
+  (download state, deleted, not stored); expanded it fetches the blob and
+  shows its head (capped like any blob's), so the head shows twice. A
+  copy takes the whole once here, a search looks through it, and its blob
+  may be deleted like any other but not cropped (a message cut to some of
+  its lines says something else).
 - **Shell runner** (D35): a sibling of the supervisor that follows the log on
   its own thread and connection. One FIFO per session, one run at a time,
   sessions in parallel. A run is `<program> -c <wrapper>` in the session's
@@ -502,7 +553,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   file (capped by `output_max`), reported as a tail at 2, 5, 10, 30 s,
   then every minute up to 10 min, every 5 min up to 1 h and every 15 min
   after (D39), only when the tail changed, and becomes a blob unless the
-  preview holds all of it;
+  preview holds all of it: the file is hashed in place and renamed into
+  `blobs/`, not copied (copied only if `shell/` is on another file system);
   output that cannot become a blob is logged `truncated` without one.
   On start, runs left running are finished `Lost` and queued ones run; if
   the runner fails, `serve` stops rather than accept runs nothing would
@@ -521,7 +573,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   503 for list and file; changes answers `Failed { "timed out" }`, its git
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
-  keeps its blob across refreshes; event blobs are never reused for them.
+  keeps its blob across refreshes; event blobs are never reused for them,
+  nor deduplicated among themselves (D44).
   **Blob GC**: a workdir blob lives while the latest answer to some read
   names it, any session: `workdir_answer_blobs` keeps the blobs of each
   read's latest answer, keyed as the core keys its stored answers
@@ -642,12 +695,14 @@ skywave client is using <dir>"), which the heads show; otherwise both would
 hit SQLite busy errors and each model would go stale against the other's
 writes.
 
-The replica, like the server's database, records the `PROTOCOL_VERSION` it
-was created with (`protocol_stamp`; one from before the stamp takes the
-current one). `Core::open` fails with `CoreError::ReplicaUnreadable` when
-the stamp differs, the schema is newer, the file is damaged, or a row it
-loads no longer decodes (`StoreError::unreadable`), instead of reading
-wire JSON another build wrote. Nothing migrates such a replica (alpha).
+The replica, like the server's database, records the `PROTOCOL_VERSION`
+its JSON is in (`protocol_stamp`; one from before the stamp takes the
+current one), and opening it runs its own protocol steps (`PROTOCOL_STEPS`
+in `store.rs`) from that version on, the outbox's unsent commands included
+(D43). `Core::open` fails with `CoreError::ReplicaUnreadable` when the
+stamp is before `MIGRATED_SINCE` or after this build's version, the schema
+is newer, the file is damaged, or a row it loads no longer decodes
+(`StoreError::unreadable`), instead of reading wire JSON it cannot migrate.
 `Core::reset_replica(data_dir)` needs no open core, only the data dir's
 lock: it drops what the server's log produced (events and their
 projections, cursor, outbox, blob rows and files, workdir answers, offered
@@ -783,22 +838,60 @@ logs) an event that no longer decodes rather than failing.
   pulls the log from seq 0. The GUI's banner offers "Reset local data"
   after a confirmation; the TUI says to restart with `--reset-replica`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
-  link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
-  the recorded progress (each progress report follows an fsync, so a
+  link by three workers (two take any blob, the third only blobs the user
+  asked for, so a request never waits behind eager downloads), into
+  `blobs/<id>.part`, resumed with `Range` from
+  the recorded progress (decoded bytes, D45; each progress report follows an fsync, so a
   power loss never resumes past durable bytes), verified by size and by
   the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
-  renamed when complete. A wrong hash deletes the file; the first one a
+  renamed when complete. A blob already whole on disk (an empty one always
+  is) is checked the same way without a request. A wrong hash deletes the file; the first one a
   worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is
   the server's (every byte came from it since) and leaves the blob
-  `Failed` until it is asked for again; `Link` ignores them (synced
-  metadata counts as synced). Workdir blobs (diffs and file contents a
+  `Failed` until it is asked for again, as does a size mismatch, an
+  unknown blob or a local file error. The replica keeps the failure and
+  its reason (`blob_failures`), so a restart neither resumes it nor, under
+  `Eager`, queues it; only asking for it tries again. A file write that
+  finds the device's disk full (`ENOSPC`, or a quota), or a progress
+  report the replica refuses with `SQLITE_FULL`, is no local file error:
+  deleting the `.part` would only free room for the next eager blob to
+  fill and lose in turn. The blob keeps its `.part` and recorded progress
+  (still `Downloading`, or `NotDownloaded` if no report made it; a failed
+  write records only what the synced file holds), waits at the front of
+  the queue, and
+  every download pauses (no worker takes a blob) until a download is
+  asked for or the app restarts; nothing measures free space, and a disk
+  still full pauses again at the first write. The queue reports the
+  pause to the views under its lock: `BlobState::Downloading { paused:
+  Some(Pause::DiskFull) }` (over `Offline`) and
+  `SettingsView::blobs_disk_full`. `Link` ignores them
+  (synced metadata counts as synced). Switching to `OnDemand` drops every
+  download nobody asked for: waiting ones leave the queue, one in progress
+  stops at its next chunk (or while its request waits), one backing off
+  at once. Bytes over a bad network are dear, so a dropped blob keeps its
+  `.part` and recorded progress as `BlobStatus::Stopped` (stored as
+  `not_downloaded` with `got` and `path` set), which the views show as
+  `NotDownloaded`; asking for it, or `Eager` again, resumes from there. A
+  restart queues `Downloading` rows, and `Stopped` ones only under
+  `Eager`, so it never resumes under `OnDemand` what nobody asked for;
+  only a kill between the
+  switch and the stop leaves a row `Downloading`. The store keeps no
+  "asked for" mark, so the restored policy decides how a `Downloading`
+  row resumes: as asked for under `OnDemand` (only a request starts one
+  there), as a background download under `Eager` (workdir blobs always as
+  asked for), which a later switch to `OnDemand` stops; a user who asked
+  before the restart asks again. A download the user asked for keeps
+  going. Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server
   names content by hash), so a refresh can purge a blob a download holds
   and the next one register it again: each try reads the blob with a lease
-  (its purge count, beside the replica under the same lock), and a report
-  under an older lease fails as for an unknown blob. A request for a blob a
+  (a number for that registration, beside the replica under the same
+  lock, never reused), and a report under a lease the blob no longer has
+  fails as for an unknown blob. Purging a blob drops its lease, so leases
+  are kept only for blobs in the replica that a download read, however
+  many refreshes come and go. A request for a blob a
   download holds is kept and queued once it lets go. The core hands
   requests to the engine under the state lock, in the order of the changes
   that made them, so a purge never overtakes a later request for the same
@@ -814,12 +907,24 @@ logs) an event that no longer decodes rather than failing.
   it from. A crop's `into` registers like any referenced blob; a blob
   with a fate never registers again (so its lease is never needed to tell
   a new row apart). `Applied::purged` names the purged blobs, and the
-  seam handles them as a workdir refresh does: leases bumped, files
+  seam handles them as a workdir refresh does: leases dropped, files
   (complete and `.part`) removed, `Request::BlobsPurged` sent; a download
   holding one stops at its next report. `Applied::blobs`, the eager
   queue's input, leaves out what the same batch purged: a crop of a crop
   pulled in one batch by a device not holding the original registers and
   purges the middle blob there.
+
+  Every purge (a batch's fates, a workdir refresh, a local session
+  delete) commits the rows first and removes the files after, so a crash
+  in between leaves files without a row. As the server does (Blob GC),
+  the device sweeps them on startup, before the downloader runs
+  (`BlobQueue::restore`, from the one read of every blob row, event and
+  workdir alike): a row owns `blobs/<id>` when `Available` and
+  `blobs/<id>.part` when `Downloading` or `Stopped`; every other `<id>`
+  or `<id>.part` goes, a `.part` beside a `NotDownloaded` or `Failed`
+  row included (no recorded progress points into it, so a try would
+  truncate it anyway). Any other name in `blobs/` is left alone and
+  logged.
 
   **Local crop.** A crop of a blob this device *holds* (its row
   `available`, or itself the `into` of a pending crop: a crop of a crop)
@@ -940,7 +1045,12 @@ logs) an event that no longer decodes rather than failing.
   the blob is pending, refused included: `BlobView.pending` and
   `StorageView.pending` carry it as a `BlobPending` (command id, kind,
   delivery, `discardable`), so a head can take it back with `Discard`,
-  after which the offers return.
+  after which the offers return. A storage row also offers nothing once
+  the replica's log holds a fate for its blob (`StorageView.gone`: a
+  delete or crop by any device), since the report may predate it: another
+  device's delete pulled while the screen is open, or this device's own
+  settled in the log before the refresh it asked for answers. The fate
+  decides the row; nothing asks the server again for it.
 - **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
   `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
   run's output to keep. The head opening it names the blob as `CropBlob`
@@ -1017,7 +1127,7 @@ enum SessionState {
 enum BlobState {
     NotDownloaded { size: u64 },
     Requested { size: u64 },                         // asked for, waiting for a slot
-    Downloading { got: u64, size: u64, paused: bool }, // paused: the link is down
+    Downloading { got: u64, size: u64, paused: Option<Pause> }, // Offline | DiskFull
     Failed { size: u64, reason: String },            // given up; asking again retries
     Available { path: PathBuf },
 }
@@ -1043,6 +1153,7 @@ enum CropContent {
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
+| Blob `Downloading` with `paused` | Its progress, then `format::pause_note`: "paused, offline" or "paused, device disk full". |
 | `FullView::Deleted { by }` | The preview, and under it "Deleted by <device>" (`sections::deleted_note`); no download action. |
 | Blob with `change: Cropped` | Its state as any blob's, and beside it "Cropped by <device>: kept K of M lines" (`sections::change_note`). Every count of lines left out ("+N lines", "N earlier lines") counts the K kept lines, not the original's M (`sections::whole_lines`, `output::output_lines`). |
 | Crop page `NotHere` / `Counting` / `Ready` / `Gone` | Not here: says the output isn't on this device, with its size and one Download action, then the blob's progress or failure. Counting: a counting note. Ready: the lines from `LineIndex`, presets, "keeps K of M lines", and Crop only while `crop::crop_enabled`, after `crop_confirmation`. Gone: nothing to crop, back only. |
@@ -1077,7 +1188,8 @@ skywave-core                 all logic, sync, replica
   hub opens the content's `LineIndex` once per page and file, reads the
   window once, and sends it (`CropLinesUpdate`, each line stripped and
   marked kept) again when the window or the selection changes. A line
-  toggle (`CropToggle`) is turned into `SetCropKeep` by the hub, from the
+  toggle (`CropToggle`) is turned into `SetCropKeep` by the hub (present's
+  `crop::toggle`, the rule the TUI's `v` range uses too), from the
   selection it sent last, so two taps faster than a snapshot do not lose
   one. Timeline rows, shell runs and storage rows carry a
   `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and

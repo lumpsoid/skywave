@@ -125,12 +125,14 @@ fn imported_history_has_its_own_row_kinds_at_the_agents_time() {
         adopted_created("3f2a"),
         imported(ImportedItem::UserMessage {
             text: "fix the build".into(),
+            full: None,
         }),
         imported(ImportedItem::ToolCall(tool_call)),
         imported(ImportedItem::ToolResult(result(Some(call)))),
         imported(ImportedItem::ToolResult(result(None))),
         imported(ImportedItem::AgentMessage {
             text: "fixed".into(),
+            full: None,
         }),
         EventKind::ImportFinished {
             outcome: ImportOutcome::Imported { items: 5 },
@@ -138,6 +140,7 @@ fn imported_history_has_its_own_row_kinds_at_the_agents_time() {
         EventKind::AgentMessage {
             parent: None,
             text: "live again".into(),
+            full: None,
         },
     ];
     rig.seam
@@ -2101,6 +2104,7 @@ fn a_context_moves_once_the_core_offers_it_and_a_queued_move_can_be_discarded() 
         EventKind::AgentMessage {
             parent: None,
             text: "done".into(),
+            full: None,
         },
     ]);
     let row = rig.open_session().contexts[0].clone();
@@ -2204,9 +2208,10 @@ fn a_malformed_context_id_is_an_error_not_an_action() {
     assert_eq!(errors(&outs), ["not a context id: \"not-an-id\""]);
 }
 
-/// An edit's call and result as skywaved logs them for the stub agent:
-/// a diff body whole in its preview, the input as a blob, and a result
-/// with no preview whose whole text is a 70 B blob.
+/// An edit's call and result: a diff body whole in its preview, the input
+/// as a blob, and a result with no preview whose whole text is a 70 B
+/// blob (skywaved now carries one that small inline, `an_inline_edit`
+/// below; a blob stands for any larger output).
 fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
     use skywave_proto::{BlobId, BlobRef, Body, CallId, Full, ToolCall, ToolDisplay, ToolResult};
     let call = CallId::new();
@@ -2266,6 +2271,36 @@ fn expanding_an_edit_downloads_its_output() {
 }
 
 #[test]
+fn expanding_downloads_every_blob_the_item_needs_at_once() {
+    use skywave_proto::{BlobId, BlobRef, Full};
+    let mut rig = Rig::new();
+    let (mut kinds, output) = an_edit();
+    let body = BlobId::new();
+    let EventKind::ToolCall(call) = &mut kinds[0] else {
+        panic!("an edit starts with its call");
+    };
+    call.display.body.as_mut().unwrap().full = Some(Full::Blob(BlobRef {
+        id: body,
+        size: 90,
+        sha256: skywave_proto::ContentHash::of(b""),
+    }));
+    rig.log(kinds);
+    rig.actions.clear();
+    let key = rig.rows().last().unwrap().key.clone();
+    // The intent alone, with no view after it: the tap yields both.
+    rig.intent(GuiIntent::ExpandItem { key });
+    let asked: Vec<_> = rig
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::DownloadBlob(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, [body, output], "dispatched {:?}", rig.actions);
+}
+
+#[test]
 fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
     let mut rig = Rig::new();
     let (mut kinds, output) = an_edit();
@@ -2288,6 +2323,115 @@ fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
     rig.results();
     rig.view();
     assert_eq!(rig.actions.len(), 1, "dispatched {:?}", rig.actions);
+}
+
+/// A long message: its head as the row's text, where its whole stands as
+/// a section beneath; expanding fetches the whole and shows it, a copy
+/// takes it, and its blob may be deleted but not cropped.
+#[test]
+fn a_long_message_shows_its_head_and_expands_to_its_whole() {
+    use crate::signals::{BlobUseView, CopyWhat};
+    use skywave_proto::{BlobId, BlobRef, ContentHash, EventKind, Full};
+    let mut rig = Rig::new();
+    let blob = BlobId::new();
+    rig.log(vec![EventKind::AgentMessage {
+        text: "# Report\nhead line".into(),
+        parent: None,
+        full: Some(Full::Blob(BlobRef {
+            id: blob,
+            size: 40_000,
+            sha256: ContentHash::of(b""),
+        })),
+    }]);
+    let row = rig.rows().last().unwrap().clone();
+    assert_eq!(row.kind, RowKind::AgentMessage);
+    assert_eq!(row.text, "# Report\nhead line");
+    assert!(row.expandable && !row.expanded);
+    // Collapsed: no lines, only where the whole stands.
+    assert_eq!(row.sections.len(), 1, "{row:?}");
+    assert!(row.sections[0].lines.is_empty());
+    let facts = row.sections[0].blob.as_ref().expect("its blob");
+    assert_eq!(facts.label, "not downloaded · 39.1 KiB");
+    let target = row.blob_target.as_ref().expect("a target");
+    assert!(!target.can_crop && target.delete_question.is_some());
+    assert_eq!(target.holds, BlobUseView::Message);
+
+    rig.actions.clear();
+    rig.intent(GuiIntent::ExpandItem {
+        key: row.key.clone(),
+    });
+    assert_eq!(rig.actions, [Action::DownloadBlob(blob)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob");
+    std::fs::write(&path, b"# Report\nhead line\nthe deep finding\n").unwrap();
+    rig.seam
+        .blob_status(blob, skywave_core::BlobStatus::Available { path })
+        .unwrap();
+    rig.view();
+    let row = rig.rows().last().unwrap().clone();
+    let lines: Vec<&str> = row.sections[0]
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(lines, ["# Report", "head line", "the deep finding"]);
+    let outs = rig.intent(GuiIntent::Copy {
+        key: row.key,
+        what: CopyWhat::Main,
+    });
+    assert_eq!(copied(&outs), ["# Report\nhead line\nthe deep finding\n"]);
+}
+
+#[test]
+fn an_inline_edit_output_expands_whole_without_a_download() {
+    use skywave_proto::{EventKind, Full, ToolResult};
+    let mut rig = Rig::new();
+    let (mut kinds, _) = an_edit();
+    let note = "The file /srv/work/demo.txt has been updated.";
+    if let Some(EventKind::ToolResult(ToolResult { output, .. })) = kinds.last_mut() {
+        *output = Some(Full::Inline(note.into()));
+    }
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    let row = rig.rows().last().unwrap();
+    assert!(row.expanded);
+    let lines: Vec<&str> = row.sections[1]
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(lines, [note]);
+    assert_eq!(row.sections[1].blob, None);
+    assert_eq!(row.sections[1].note, None);
+    assert!(
+        !rig.actions
+            .iter()
+            .any(|a| matches!(a, Action::DownloadBlob(_))),
+        "dispatched {:?}",
+        rig.actions
+    );
+}
+
+#[test]
+fn an_inline_output_expanded_is_cut_short_like_a_blob() {
+    use skywave_proto::{EventKind, Full, ToolResult};
+    let mut rig = Rig::new();
+    let (mut kinds, _) = an_edit();
+    let whole: String = (0..500).map(|i| format!("l{i:03}\n")).collect();
+    if let Some(EventKind::ToolResult(ToolResult { output, .. })) = kinds.last_mut() {
+        *output = Some(Full::Inline(whole));
+    }
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    let section = &rig.rows().last().unwrap().sections[1];
+    assert_eq!(section.lines.len(), crate::timeline::SHOW_LINES);
+    assert!(section.cut_short);
+    assert_eq!(
+        section.note.as_deref(),
+        Some("cut short: 400 lines of 2.4 KiB shown")
+    );
 }
 
 #[test]
@@ -2670,6 +2814,7 @@ fn conversation_only_leaves_tool_calls_out_of_the_rows_until_switched_off() {
         EventKind::AgentMessage {
             parent: None,
             text: "looking".into(),
+            full: None,
         },
         a_call(
             None,
@@ -3656,6 +3801,52 @@ fn an_expanded_run_carries_its_whole_downloaded_output_stripped() {
     assert_eq!(row.tail, "line 3\nline 4");
 }
 
+fn notices(outs: &[Out]) -> Vec<String> {
+    outs.iter()
+        .filter_map(|out| match out {
+            Out::Effect(PlatformEffect::Notice { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A run whose output was deleted on the server copies the tail it kept,
+/// and the notice says that is all it is, and why.
+#[test]
+fn copying_a_run_whose_output_was_deleted_says_so() {
+    let mut rig = Rig::new();
+    rig.switch_to_shell();
+    let blob = skywave_proto::BlobId::new();
+    let output = skywave_proto::BlobRef {
+        id: blob,
+        size: 4000,
+        sha256: skywave_proto::ContentHash::of(b""),
+    };
+    let run = rig.finished_run("make test", "line 39\nline 40", 40, Some(output));
+    let at = Utc.with_ymd_and_hms(2026, 10, 31, 12, 3, 0).unwrap();
+    let me = rig.me;
+    rig.log_shell(
+        CommandId::new(),
+        at,
+        EventKind::BlobDeleted {
+            blob,
+            holds: skywave_core::BlobUse::ShellOutput,
+            by: me,
+        },
+    );
+    let outs = rig.copy_run(run);
+    assert_eq!(copied(&outs), ["line 39\nline 40"]);
+    assert!(rig.actions.is_empty(), "nothing to download");
+    assert_eq!(
+        notices(&outs),
+        ["copied 15 B · only the kept tail · Deleted by you"]
+    );
+
+    // Positive control: a run with all of its output says only how much.
+    let whole = rig.finished_run("ls", "a\nb", 2, None);
+    assert_eq!(notices(&rig.copy_run(whole)), ["copied 3 B"]);
+}
+
 #[test]
 fn an_expanded_run_without_a_blob_shows_its_own_text_and_what_is_missing() {
     let mut rig = Rig::new();
@@ -4150,7 +4341,7 @@ mod workdir {
 
 mod blob_actions {
     use skywave_core::{BlobId, LineSpan};
-    use skywave_present::blob_actions::{DELETE_CONFIRMATION, crop_confirmation};
+    use skywave_present::blob_actions::crop_confirmation;
 
     use super::*;
     use crate::signals::{
@@ -4222,7 +4413,11 @@ mod blob_actions {
             Some(BlobTargetView {
                 blob_id: blob.0.to_string(),
                 can_crop: true,
-                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                delete_question: Some(
+                    "Delete this shell output from the server and from every device? \
+                     This can't be undone."
+                        .into()
+                ),
                 pending_note: None,
                 discard_id: None,
                 session_id: rig.session.0.to_string(),
@@ -4443,7 +4638,7 @@ mod blob_actions {
                     size: 4096,
                     session: rig.session,
                     seq: Seq(7),
-                    holds: skywave_proto::BlobUse::ToolOutput,
+                    holds: skywave_proto::BlobUse::ToolInput,
                 }],
                 shell_runs: Vec::new(),
             }),
@@ -4464,13 +4659,17 @@ mod blob_actions {
             target,
             BlobTargetView {
                 blob_id: blob.0.to_string(),
-                can_crop: true,
-                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                can_crop: false,
+                delete_question: Some(
+                    "Delete this tool input from the server and from every device? \
+                     This can't be undone."
+                        .into()
+                ),
                 pending_note: None,
                 discard_id: None,
                 session_id: rig.session.0.to_string(),
-                holds: BlobUseView::ToolOutput,
-                title: format!("{} · tool output", rows(&rig)[0].label),
+                holds: BlobUseView::ToolInput,
+                title: format!("{} · tool input", rows(&rig)[0].label),
             }
         );
     }

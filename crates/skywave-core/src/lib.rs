@@ -31,6 +31,7 @@ mod blobs;
 mod client;
 mod completion;
 mod conversations;
+mod encoding;
 mod engine;
 mod https;
 pub mod identity;
@@ -83,7 +84,7 @@ pub use view::{
     ConversationsStatus, ConversationsUnavailable, CropContent, CropView, Decision, Delivery,
     DeviceId, DeviceRef, Draft, Effort, Entry, ErrorInfo, FailReason, FullView, ImportOutcome,
     ImportedEntry, Link, LinkFailure, LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo,
-    PairingStatus, PairingView, PendingApprovalRef, PendingSession, PermissionMode, Refusal,
+    PairingStatus, PairingView, Pause, PendingApprovalRef, PendingSession, PermissionMode, Refusal,
     RejectReason, RuleScope, RuleSuggestion, RunWhen, SHELL_ALERT_AFTER, Schedule, ScheduleId,
     Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow, SessionState, SessionView,
     SettingChange, SettingsView, ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Snippet,

@@ -7,10 +7,12 @@
 //! moves the schema from version `i` to `i + 1`. Append new migrations; never
 //! edit a released one.
 //!
-//! The JSON columns hold wire JSON, which a migration does not rewrite, so
-//! the database is also stamped with the `PROTOCOL_VERSION` that created it
-//! (`protocol_stamp`), and opening one stamped with another version fails
-//! with [`Error::ProtocolMismatch`] before anything reads it.
+//! The JSON columns hold wire JSON, which a schema migration does not
+//! rewrite, so the database is also stamped with the `PROTOCOL_VERSION` its
+//! JSON is in (`protocol_stamp`). Opening one stamped with an older version
+//! since [`MIGRATED_SINCE`] runs the [`PROTOCOL_STEPS`] from it (D43); any
+//! other stamp fails with [`Error::ProtocolMismatch`] before anything reads
+//! it.
 //!
 //! Column conventions: ids are hyphenated UUID text, timestamps are RFC 3339
 //! UTC text, `JSON` columns hold the serde_json encoding of the named
@@ -20,7 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use skywave_proto::{LogId, PROTOCOL_VERSION};
+use skywave_proto::{LogId, MIGRATED_SINCE, PROTOCOL_VERSION};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -415,6 +417,24 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX event_blobs_seq ON event_blobs (seq);
     "#,
+    // v21: a long message's blob (protocol v24, `BlobUse::Message`). SQLite
+    // cannot change a CHECK in place, so the table is made again, its rows
+    // copied as they are.
+    r#"
+    CREATE TABLE event_blobs_v21 (
+        blob_id    TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        holds      TEXT NOT NULL CHECK (holds IN
+            ('tool_input', 'tool_body', 'tool_output', 'approval_input', 'shell_output',
+             'message'))
+    ) STRICT;
+    INSERT INTO event_blobs_v21 (blob_id, session_id, seq, holds)
+        SELECT blob_id, session_id, seq, holds FROM event_blobs;
+    DROP TABLE event_blobs;
+    ALTER TABLE event_blobs_v21 RENAME TO event_blobs;
+    CREATE INDEX event_blobs_seq ON event_blobs (seq);
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -422,6 +442,33 @@ const STAMPED_SINCE: u32 = 13;
 
 /// Schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+
+/// Rewrites the wire JSON the database holds from one `PROTOCOL_VERSION` to
+/// the next. It runs in the open's write transaction, after the schema
+/// migrations, so it reads the current schema.
+type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
+
+/// Step `i` moves the stored wire JSON from protocol version
+/// `MIGRATED_SINCE + i` to the next (D43). Every bump adds one, a no-op
+/// saying so if nothing stored changed; the length makes a bump without one
+/// fail to compile. Append; never edit a released one.
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+
+/// v23 to v24. What v24 changed of what is stored, and how each is moved:
+/// - `Full::Inline` (a small tool output carried in its event): new, so no
+///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged
+///   and its small output blobs stay blobs.
+/// - `full` on `AgentMessage` and on an imported `UserMessage` or
+///   `AgentMessage` (a long message's whole text as a blob): a new
+///   optional field, which v23 JSON lacks and reads as `None`, so no event
+///   is rewritten; v23's long messages stay whole in their events. Its
+///   `BlobUse::Message` came with schema migration v21, which lets
+///   `event_blobs.holds` say `message`.
+/// - Compressed event batches and blob bodies (D45): transport only. Blobs
+///   are stored as they were, uncompressed; nothing stored changes.
+fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
 
 /// An open, migrated database connection.
 #[derive(Debug)]
@@ -537,23 +584,23 @@ impl Db {
             .map_err(|e| Error::Corrupt(format!("log id {text:?}: {e}")))
     }
 
-    /// The protocol version the database was written with
-    /// (`protocol_stamp`); [`Db::open`] refuses any other.
+    /// The protocol version the database's wire JSON is in
+    /// (`protocol_stamp`); [`Db::open`] migrates it to this build's.
     pub fn protocol_version(&self) -> Result<u32> {
         stamped_protocol(&self.conn)?
             .ok_or_else(|| Error::Corrupt("protocol_stamp has no row".into()))
     }
 
-    /// Migrates the schema and checks the protocol stamp, before anything
-    /// reads a JSON column: a database written by another protocol version
-    /// is refused untouched, as its stored wire JSON may not parse.
+    /// Migrates the schema, then the stored wire JSON, checking the protocol
+    /// stamp before anything reads a JSON column: a database this build
+    /// cannot migrate is refused untouched, as its wire JSON may not parse.
     fn migrate(&mut self, path: &Path) -> Result<()> {
         // Fast path without a write lock, so admin commands don't contend
-        // with a running `serve` once the schema is current.
+        // with a running `serve` once the database is current.
         let found = user_version(&self.conn)?;
         check_supported(found)?;
-        if found == SCHEMA_VERSION {
-            return check_protocol(&self.conn, path);
+        if found == SCHEMA_VERSION && check_protocol(&self.conn, path)? == PROTOCOL_VERSION {
+            return Ok(());
         }
         // IMMEDIATE takes the write lock up front; re-read the version under
         // it in case another process migrated in between.
@@ -562,12 +609,17 @@ impl Db {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let found = user_version(&tx)?;
         check_supported(found)?;
-        if found >= STAMPED_SINCE {
-            check_protocol(&tx, path)?;
-        }
+        let stamp = if found >= STAMPED_SINCE {
+            Some(check_protocol(&tx, path)?)
+        } else {
+            None
+        };
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
             tracing::info!(from = i, to = i + 1, "migrating database schema");
             tx.execute_batch(sql)?;
+        }
+        if let Some(stamp) = stamp {
+            migrate_protocol(&tx, stamp, &PROTOCOL_STEPS)?;
         }
         // A fresh database, or one from before the stamp, gets this build's.
         tx.execute(
@@ -596,11 +648,11 @@ fn stamped_protocol(conn: &Connection) -> Result<Option<u32>> {
         .optional()?)
 }
 
-/// Refuses a database whose stamp is not [`PROTOCOL_VERSION`] (alpha: old
-/// data is not migrated, the operator wipes the data dir).
-fn check_protocol(conn: &Connection, path: &Path) -> Result<()> {
+/// The database's protocol stamp, refusing one this build cannot migrate:
+/// older than [`MIGRATED_SINCE`], or written by a newer build.
+fn check_protocol(conn: &Connection, path: &Path) -> Result<u32> {
     match stamped_protocol(conn)? {
-        Some(PROTOCOL_VERSION) => Ok(()),
+        Some(found) if (MIGRATED_SINCE..=PROTOCOL_VERSION).contains(&found) => Ok(found),
         Some(found) => Err(Error::ProtocolMismatch {
             path: path.to_owned(),
             found,
@@ -611,6 +663,26 @@ fn check_protocol(conn: &Connection, path: &Path) -> Result<()> {
             path.display()
         ))),
     }
+}
+
+/// Runs the `steps` from protocol version `stamp` on and restamps the
+/// database with the version they end at.
+fn migrate_protocol(
+    tx: &rusqlite::Transaction<'_>,
+    stamp: u32,
+    steps: &[ProtocolStep],
+) -> Result<()> {
+    let first = (stamp - MIGRATED_SINCE) as usize;
+    for (i, step) in steps.iter().enumerate().skip(first) {
+        let from = MIGRATED_SINCE + i as u32;
+        tracing::info!(from, to = from + 1, "migrating stored protocol data");
+        step(tx)?;
+    }
+    tx.execute(
+        "UPDATE protocol_stamp SET version = ?1 WHERE id = 1",
+        [MIGRATED_SINCE + steps.len() as u32],
+    )?;
+    Ok(())
 }
 
 fn check_supported(found: u32) -> Result<()> {
@@ -789,11 +861,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_database_of_another_protocol_version() {
+    fn rejects_a_database_of_a_protocol_version_it_cannot_migrate() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skywave.db");
         drop(Db::open(&path).unwrap());
-        for other in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        for other in [MIGRATED_SINCE - 1, PROTOCOL_VERSION + 1] {
             restamp(&path, other);
             let err = Db::open(&path).unwrap_err();
             assert!(
@@ -820,6 +892,199 @@ mod tests {
         // Positive control: restamped with this build's version, it opens.
         restamp(&path, PROTOCOL_VERSION);
         assert!(Db::open(&path).is_ok());
+    }
+
+    /// A database stamped with any version it migrates opens restamped,
+    /// through the fast path's check too (the schema is current).
+    #[test]
+    fn opens_a_database_of_every_migrated_protocol_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        for older in MIGRATED_SINCE..PROTOCOL_VERSION {
+            restamp(&path, older);
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                db.protocol_version().unwrap(),
+                PROTOCOL_VERSION,
+                "from {older}"
+            );
+        }
+    }
+
+    /// The tool results v23 wrote (its wire snapshot's) read unchanged once
+    /// v24's step ran: a whole output stays the blob or loss it was.
+    #[test]
+    fn v24_reads_the_tool_results_v23_wrote() {
+        use skywave_proto::{EventKind, Full, ToolResult};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        let v23 = [
+            r#"{"type":"tool_result","call":"01920000-0000-7000-8000-000000000007","is_error":false,"status":"exit 0","preview":"running","lines":40,"output":{"blob":{"id":"01920000-0000-7000-8000-000000000005","size":48213,"sha256":"7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"}}}"#,
+            r#"{"type":"tool_result","call":null,"is_error":false,"status":null,"preview":"running","lines":40,"output":"lost"}"#,
+            r#"{"type":"tool_result","call":null,"is_error":true,"status":"exit 1","preview":"no such file","lines":1,"output":null}"#,
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (seq, kind) in (1i64..).zip(v23) {
+                conn.execute(
+                    "INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (?1, 's', 't', 'c', ?2)",
+                    rusqlite::params![seq, kind],
+                )
+                .unwrap();
+            }
+        }
+        restamp(&path, 23);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), 24);
+        let kinds: Vec<EventKind> = db
+            .conn()
+            .prepare("SELECT kind FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|kind| serde_json::from_str(&kind.unwrap()).unwrap())
+            .collect();
+        let outputs: Vec<Option<Full>> = kinds
+            .into_iter()
+            .map(|kind| match kind {
+                EventKind::ToolResult(ToolResult { output, .. }) => output,
+                other => panic!("not a result: {other:?}"),
+            })
+            .collect();
+        assert!(matches!(outputs[0], Some(Full::Blob(ref b)) if b.size == 48213));
+        assert_eq!(outputs[1..], [Some(Full::Lost), None]);
+    }
+
+    /// The messages a v23 build wrote (its wire snapshot's) read as whole
+    /// messages once v24's step ran, and the v20 schema it ran on keeps its
+    /// blob rows while v21 lets a message's blob have one.
+    #[test]
+    fn v24_reads_the_messages_v23_wrote() {
+        use skywave_proto::{EventKind, ImportedItem};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v23 = [
+            r#"{"type":"agent_message","text":"Running cargo test.","parent":null}"#,
+            r#"{"type":"agent_message","text":"Found three call sites.","parent":"01920000-0000-7000-8000-000000000007"}"#,
+            r#"{"type":"imported","at":null,"item":{"type":"user_message","text":"Where is the event log?"}}"#,
+            r#"{"type":"imported","at":null,"item":{"type":"agent_message","text":"In crates/skywaved/src/event_log.rs."}}"#,
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..20] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 20).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 23)",
+                [],
+            )
+            .unwrap();
+            for (seq, kind) in (1i64..).zip(v23) {
+                conn.execute(
+                    "INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (?1, 's', 't', 'c', ?2)",
+                    rusqlite::params![seq, kind],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('b1', 's', 1, 'tool_output')",
+                [],
+            )
+            .unwrap();
+            // v20 refuses a message's blob.
+            assert!(
+                conn.execute(
+                    "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                     VALUES ('b2', 's', 1, 'message')",
+                    [],
+                )
+                .is_err()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), 24);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let kinds: Vec<EventKind> = db
+            .conn()
+            .prepare("SELECT kind FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|kind| serde_json::from_str(&kind.unwrap()).unwrap())
+            .collect();
+        let texts: Vec<(&str, bool)> = kinds
+            .iter()
+            .map(|kind| match kind {
+                EventKind::AgentMessage { text, full, .. }
+                | EventKind::Imported {
+                    item:
+                        ImportedItem::UserMessage { text, full }
+                        | ImportedItem::AgentMessage { text, full },
+                    ..
+                } => (text.as_str(), full.is_none()),
+                other => panic!("not a message: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("Running cargo test.", true),
+                ("Found three call sites.", true),
+                ("Where is the event log?", true),
+                ("In crates/skywaved/src/event_log.rs.", true),
+            ]
+        );
+        let holds: Vec<(String, String)> = db
+            .conn()
+            .prepare("SELECT blob_id, holds FROM event_blobs ORDER BY blob_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(holds, [("b1".to_owned(), "tool_output".to_owned())]);
+        db.conn()
+            .execute(
+                "INSERT INTO event_blobs (blob_id, session_id, seq, holds)
+                 VALUES ('b2', 's', 1, 'message')",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records
+    /// that it ran.
+    const TEST_STEPS: [ProtocolStep; 3] = [
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (0)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (1)", []).map(drop)?),
+        |tx| Ok(tx.execute("INSERT INTO ran VALUES (2)", []).map(drop)?),
+    ];
+
+    #[test]
+    fn protocol_steps_run_from_the_stamp_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&tmp.path().join("skywave.db")).unwrap();
+        let tx = db.conn_mut().transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE ran (step INTEGER)")
+            .unwrap();
+        migrate_protocol(&tx, MIGRATED_SINCE + 1, &TEST_STEPS).unwrap();
+        let ran: Vec<u32> = tx
+            .prepare("SELECT step FROM ran ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ran, [1, 2], "from the stamp's step on, in order");
+        assert_eq!(stamped_protocol(&tx).unwrap(), Some(MIGRATED_SINCE + 3));
     }
 
     /// A v12 database, from before the stamp, gets this build's protocol

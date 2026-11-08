@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use skywave_core::{
     AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView,
     ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable, Decision,
-    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, PendingSession,
+    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, Pause, PendingSession,
     PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, SessionId,
     SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId, TaskKind,
 };
@@ -92,6 +92,65 @@ pub fn blob_size(state: &BlobState) -> Option<u64> {
         | BlobState::Downloading { size, .. }
         | BlobState::Failed { size, .. } => Some(*size),
         BlobState::Available { .. } => None,
+    }
+}
+
+/// Where a blob's download stands, in full: what a head shows in place of
+/// content that is not here (an expanded section, the crop page, a workdir
+/// file): `not downloaded · 4.0 KiB`, `requested · waiting for a slot ·
+/// 4.0 KiB`, `downloading · 1.0 KiB of 4.0 KiB (25%)`, with ` · paused,
+/// offline` while the link is down (or another [`pause_note`]),
+/// `download failed: {reason} · 4.0 KiB`,
+/// `downloaded`. A head adds its own hint (how to download, to retry).
+pub fn download_state(state: &BlobState) -> String {
+    match state {
+        BlobState::NotDownloaded { size } => format!("not downloaded · {}", bytes(*size)),
+        BlobState::Requested { size } => {
+            format!("requested · waiting for a slot · {}", bytes(*size))
+        }
+        BlobState::Downloading { got, size, paused } => format!(
+            "downloading · {} of {} ({}%){}",
+            bytes(*got),
+            bytes(*size),
+            percent(*got, *size),
+            paused_word(*paused)
+        ),
+        BlobState::Failed { size, reason } => format!(
+            "download failed: {} · {}",
+            crate::text::clean_line(reason),
+            bytes(*size)
+        ),
+        BlobState::Available { .. } => "downloaded".to_owned(),
+    }
+}
+
+/// Where a blob's download stands once it started, briefly, for a note
+/// that names its size beside it: `requested`, `downloading 25%`,
+/// `downloading 25% · paused, offline`, `download failed`. `None` before
+/// it started and once the blob is here.
+pub fn download_brief(state: &BlobState) -> Option<String> {
+    match state {
+        BlobState::Requested { .. } => Some("requested".to_owned()),
+        BlobState::Downloading { got, size, paused } => Some(format!(
+            "downloading {}%{}",
+            percent(*got, *size),
+            paused_word(*paused)
+        )),
+        BlobState::Failed { .. } => Some("download failed".to_owned()),
+        BlobState::NotDownloaded { .. } | BlobState::Available { .. } => None,
+    }
+}
+
+fn paused_word(paused: Option<Pause>) -> String {
+    paused.map_or(String::new(), |pause| format!(" · {}", pause_note(pause)))
+}
+
+/// What a paused download waits for, as every head words it after its
+/// progress: "paused, offline", "paused, device disk full".
+pub fn pause_note(pause: Pause) -> &'static str {
+    match pause {
+        Pause::Offline => "paused, offline",
+        Pause::DiskFull => "paused, device disk full",
     }
 }
 
