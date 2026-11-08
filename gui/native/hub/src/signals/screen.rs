@@ -348,6 +348,8 @@ pub struct SessionScreen {
     pub session_id: String,
     pub title: String,
     pub workdir: Option<String>,
+    /// The workdir's last component, `skywave`, for a narrow header.
+    pub workdir_name: Option<String>,
     pub state: AgentState,
     pub badge_label: String,
     pub rename: Option<OutgoingView>,

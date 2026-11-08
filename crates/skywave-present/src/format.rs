@@ -819,6 +819,12 @@ pub fn short_path(path: &str) -> String {
     format!("…/{}", parts[parts.len() - 2..].join("/"))
 }
 
+/// A server path's last component, `skywave`, for a header too narrow for
+/// the path; `/` whole.
+pub fn dir_name(path: &str) -> &str {
+    path.rsplit('/').find(|p| !p.is_empty()).unwrap_or(path)
+}
+
 /// What a conversation picker row is called: the agent's title, else its
 /// first prompt, else its id.
 pub fn conversation_title(item: &ConversationItem) -> &str {
@@ -1130,6 +1136,14 @@ mod tests {
             session: None,
             continued_in: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_dir_name_is_the_paths_last_component() {
+        assert_eq!(dir_name("/home/me/Projects/personal/skywave"), "skywave");
+        assert_eq!(dir_name("/srv/app/"), "app");
+        assert_eq!(dir_name("app"), "app");
+        assert_eq!(dir_name("/"), "/");
     }
 
     #[test]

@@ -188,7 +188,8 @@ SessionScreen screenWith({
 }) => SessionScreen(
   sessionId: 's1',
   title: 'work',
-  workdir: '/home/me/work',
+  workdir: '/home/me/skywave',
+  workdirName: 'skywave',
   state: state,
   badgeLabel: _badges[state]!,
   agentLabel: 'agent ${_badges[state]}',

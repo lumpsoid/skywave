@@ -169,6 +169,95 @@ class _SessionPageState extends State<SessionPage> {
     widget.send.act(ActionIntentInterrupt(sessionId: _screen.sessionId));
   }
 
+  /// The More sheet of a narrow window: the session's name and workdir
+  /// in full, the header's view actions, then [menu]. Each tap closes it
+  /// first.
+  void _showActions(
+    SessionScreen screen,
+    List<_MenuItem> menu, {
+    required VoidCallback? openWorkdir,
+    required VoidCallback rename,
+    required VoidCallback toggleConversationOnly,
+  }) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheet) {
+        final theme = Theme.of(sheet);
+        VoidCallback? closing(VoidCallback? action) => action == null
+            ? null
+            : () {
+                Navigator.of(sheet).pop();
+                action();
+              };
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SelectableText(
+                        screen.title,
+                        style: theme.textTheme.titleMedium,
+                      ),
+                      if (screen.workdir case final workdir?)
+                        SelectableText(
+                          workdir,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: SkyColors.of(sheet).muted,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _QuickAction(
+                        icon: Icons.search,
+                        label: 'Search',
+                        onPressed: closing(_openSearch),
+                      ),
+                      _QuickAction(
+                        icon: Icons.folder_open,
+                        label: 'Workdir',
+                        onPressed: closing(openWorkdir),
+                      ),
+                      _QuickAction(
+                        icon: Icons.drive_file_rename_outline,
+                        label: 'Rename',
+                        onPressed: closing(rename),
+                      ),
+                      _QuickAction(
+                        icon: screen.conversationOnly
+                            ? Icons.forum
+                            : Icons.forum_outlined,
+                        label: 'Conversation only',
+                        selected: screen.conversationOnly,
+                        onPressed: closing(toggleConversationOnly),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 24),
+                for (final item in menu) item.tile(onTap: closing(item.onTap)),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   void _openSearch() {
     final search = _search.search;
     if (search != null && search.open) {
@@ -248,10 +337,80 @@ class _SessionPageState extends State<SessionPage> {
   Widget build(BuildContext context) {
     final screen = _screen;
     final theme = Theme.of(context);
-    final rename = screen.renamePrompt;
+    final renamePrompt = screen.renamePrompt;
     // Only a stopped agent surely has no process: an idle one stays warm a
     // while, an errored one may have failed a turn and still run.
     final stopped = screen.state == AgentState.stopped;
+    final compact = isCompact(context);
+    final VoidCallback? openWorkdir = screen.workdir == null
+        ? null
+        : () => widget.send.act(
+            ActionIntentOpenWorkdir(sessionId: screen.sessionId),
+          );
+    void rename() =>
+        widget.send(GuiIntentRenameOpen(sessionId: screen.sessionId));
+    void toggleConversationOnly() =>
+        widget.send(const GuiIntentToggleConversationOnly());
+    // The More menu on a wide window, the sheet's list on a narrow one.
+    final menu = [
+      _MenuItem(
+        icon: Icons.add,
+        title: 'New session here',
+        subtitle: 'In the same workdir',
+        enabled: screen.workdir != null,
+        onTap: () => widget.send.act(
+          ActionIntentCreateSessionLike(sessionId: screen.sessionId),
+        ),
+      ),
+      _MenuItem(
+        icon: Icons.alt_route,
+        title: 'New context',
+        subtitle:
+            screen.clearLabel ??
+            (screen.canClear
+                ? "Clear the agent's context"
+                : 'This context is empty'),
+        enabled: screen.canClear,
+        onTap: () => _stopping(
+          (h) => h.newContext,
+          'New context',
+          () => widget.send.act(
+            ActionIntentClearContext(sessionId: screen.sessionId),
+          ),
+        ),
+      ),
+      _MenuItem(
+        icon: Icons.account_tree_outlined,
+        title: 'Contexts…',
+        subtitle: switch (screen.switchLabel) {
+          final label? => 'switch $label',
+          null => null,
+        },
+        onTap: () => pickContext(context, screen, widget.send),
+      ),
+      _MenuItem(
+        icon: Icons.pending_actions,
+        title: 'Background work',
+        subtitle: screen.workLabel ?? 'nothing running',
+        onTap: () => showBackgroundWork(context, _work, widget.send),
+      ),
+      _MenuItem(
+        icon: Icons.power_settings_new,
+        color: stopped ? null : theme.colorScheme.error,
+        title: 'Stop agent',
+        subtitle: stopped
+            ? 'Already stopped · a message restarts it'
+            : screen.stopLabel,
+        enabled: !stopped,
+        onTap: () => _stopping(
+          (h) => h.stopAgent,
+          'Stop agent',
+          () => widget.send.act(
+            ActionIntentStopSession(sessionId: screen.sessionId),
+          ),
+        ),
+      ),
+    ];
 
     return Stack(
       children: [
@@ -272,7 +431,9 @@ class _SessionPageState extends State<SessionPage> {
                           widget.send.act(const ActionIntentBack()),
                     ),
                     const SizedBox(width: 4),
-                    Expanded(child: _Title(screen: screen)),
+                    Expanded(
+                      child: _Title(screen: screen, compact: compact),
+                    ),
                     if (screen.subagent case final subagent?)
                       if (subagent.taskId case final task?)
                         IconButton(
@@ -283,147 +444,68 @@ class _SessionPageState extends State<SessionPage> {
                             color: theme.colorScheme.error,
                           ),
                         ),
-                    IconButton(
-                      tooltip: 'Workdir',
-                      onPressed: screen.workdir == null
-                          ? null
-                          : () => widget.send.act(
-                              ActionIntentOpenWorkdir(
-                                sessionId: screen.sessionId,
-                              ),
-                            ),
-                      icon: const Icon(Icons.folder_open),
-                    ),
-                    // The button itself says the mode is on: filled, in
-                    // the accent colour, as a pressed toggle.
-                    IconButton(
-                      tooltip: screen.conversationOnly
-                          ? 'Conversation only is on: show tool calls'
-                          : 'Conversation only: hide tool calls',
-                      isSelected: screen.conversationOnly,
-                      style: screen.conversationOnly
-                          ? IconButton.styleFrom(
-                              backgroundColor: theme.colorScheme.primary,
-                              foregroundColor: theme.colorScheme.onPrimary,
-                            )
-                          : null,
-                      onPressed: () =>
-                          widget.send(const GuiIntentToggleConversationOnly()),
-                      icon: const Icon(Icons.forum_outlined),
-                      selectedIcon: const Icon(Icons.forum),
-                    ),
-                    IconButton(
-                      tooltip: 'Search (Ctrl+F)',
-                      onPressed: _openSearch,
-                      icon: const Icon(Icons.search),
-                    ),
+                    if (!compact) ...[
+                      IconButton(
+                        tooltip: 'Workdir',
+                        onPressed: openWorkdir,
+                        icon: const Icon(Icons.folder_open),
+                      ),
+                      // The button itself says the mode is on: filled, in
+                      // the accent colour, as a pressed toggle.
+                      IconButton(
+                        tooltip: screen.conversationOnly
+                            ? 'Conversation only is on: show tool calls'
+                            : 'Conversation only: hide tool calls',
+                        isSelected: screen.conversationOnly,
+                        style: screen.conversationOnly
+                            ? IconButton.styleFrom(
+                                backgroundColor: theme.colorScheme.primary,
+                                foregroundColor: theme.colorScheme.onPrimary,
+                              )
+                            : null,
+                        onPressed: toggleConversationOnly,
+                        icon: const Icon(Icons.forum_outlined),
+                        selectedIcon: const Icon(Icons.forum),
+                      ),
+                      IconButton(
+                        tooltip: 'Search (Ctrl+F)',
+                        onPressed: _openSearch,
+                        icon: const Icon(Icons.search),
+                      ),
+                    ],
                     _InterruptButton(screen: screen, onPressed: _interrupt),
-                    PopupMenuButton<VoidCallback>(
-                      tooltip: 'More',
-                      onSelected: (action) => action(),
-                      itemBuilder: (context) => [
-                        PopupMenuItem(
-                          value: () => widget.send(
-                            GuiIntentRenameOpen(sessionId: screen.sessionId),
-                          ),
-                          child: const ListTile(
-                            leading: Icon(Icons.drive_file_rename_outline),
-                            title: Text('Rename'),
-                          ),
+                    if (compact)
+                      IconButton(
+                        tooltip: 'More',
+                        onPressed: () => _showActions(
+                          screen,
+                          menu,
+                          openWorkdir: openWorkdir,
+                          rename: rename,
+                          toggleConversationOnly: toggleConversationOnly,
                         ),
-                        PopupMenuItem(
-                          enabled: screen.workdir != null,
-                          value: () => widget.send.act(
-                            ActionIntentCreateSessionLike(
-                              sessionId: screen.sessionId,
+                        icon: const Icon(Icons.more_vert),
+                      )
+                    else
+                      PopupMenuButton<VoidCallback>(
+                        tooltip: 'More',
+                        onSelected: (action) => action(),
+                        itemBuilder: (context) => [
+                          for (final item in [
+                            _MenuItem(
+                              icon: Icons.drive_file_rename_outline,
+                              title: 'Rename',
+                              onTap: rename,
                             ),
-                          ),
-                          child: ListTile(
-                            enabled: screen.workdir != null,
-                            leading: const Icon(Icons.add),
-                            title: const Text('New session here'),
-                            subtitle: const Text('In the same workdir'),
-                          ),
-                        ),
-                        PopupMenuItem(
-                          enabled: screen.canClear,
-                          value: () => _stopping(
-                            (h) => h.newContext,
-                            'New context',
-                            () => widget.send.act(
-                              ActionIntentClearContext(
-                                sessionId: screen.sessionId,
-                              ),
+                            ...menu,
+                          ])
+                            PopupMenuItem(
+                              enabled: item.enabled,
+                              value: item.onTap,
+                              child: item.tile(),
                             ),
-                          ),
-                          child: ListTile(
-                            enabled: screen.canClear,
-                            leading: const Icon(Icons.alt_route),
-                            title: const Text('New context'),
-                            subtitle: Text(
-                              screen.clearLabel ??
-                                  (screen.canClear
-                                      ? "Clear the agent's context"
-                                      : 'This context is empty'),
-                            ),
-                          ),
-                        ),
-                        PopupMenuItem(
-                          value: () =>
-                              pickContext(this.context, screen, widget.send),
-                          child: ListTile(
-                            leading: const Icon(Icons.account_tree_outlined),
-                            title: const Text('Contexts…'),
-                            subtitle: switch (screen.switchLabel) {
-                              final label? => Text('switch $label'),
-                              null => null,
-                            },
-                          ),
-                        ),
-                        PopupMenuItem(
-                          value: () => showBackgroundWork(
-                            this.context,
-                            _work,
-                            widget.send,
-                          ),
-                          child: ListTile(
-                            leading: const Icon(Icons.pending_actions),
-                            title: const Text('Background work'),
-                            subtitle: Text(
-                              screen.workLabel ?? 'nothing running',
-                            ),
-                          ),
-                        ),
-                        PopupMenuItem(
-                          enabled: !stopped,
-                          value: () => _stopping(
-                            (h) => h.stopAgent,
-                            'Stop agent',
-                            () => widget.send.act(
-                              ActionIntentStopSession(
-                                sessionId: screen.sessionId,
-                              ),
-                            ),
-                          ),
-                          child: ListTile(
-                            enabled: !stopped,
-                            leading: Icon(
-                              Icons.power_settings_new,
-                              color: stopped ? null : theme.colorScheme.error,
-                            ),
-                            title: const Text('Stop agent'),
-                            subtitle: stopped
-                                ? const Text(
-                                    'Already stopped · a message restarts it',
-                                  )
-                                : switch (screen.stopLabel) {
-                                    final label? => Text(label),
-                                    null => null,
-                                  },
-                          ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
                     const SizedBox(width: 4),
                   ],
                 ),
@@ -577,11 +659,11 @@ class _SessionPageState extends State<SessionPage> {
             backgroundColor: theme.colorScheme.surface,
           ),
         ),
-        if (rename != null)
+        if (renamePrompt != null)
           Positioned.fill(
             child: RenameDialog(
-              key: ValueKey(rename.sessionId),
-              prompt: rename,
+              key: ValueKey(renamePrompt.sessionId),
+              prompt: renamePrompt,
               send: widget.send,
             ),
           ),
@@ -629,6 +711,93 @@ class _InterruptButton extends StatelessWidget {
   }
 }
 
+/// A session action: an item of the More menu, or a row of the More
+/// sheet.
+class _MenuItem {
+  const _MenuItem({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.subtitle,
+    this.color,
+    this.enabled = true,
+  });
+
+  final IconData icon;
+
+  /// The icon's colour: the error one for a destructive action.
+  final Color? color;
+  final String title;
+  final String? subtitle;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  /// Its row; a menu item takes the tap itself, so passes no [onTap].
+  Widget tile({VoidCallback? onTap}) => ListTile(
+    enabled: enabled,
+    leading: Icon(icon, color: color),
+    title: Text(title),
+    subtitle: switch (subtitle) {
+      final subtitle? => Text(subtitle),
+      null => null,
+    },
+    onTap: onTap,
+  );
+}
+
+/// A labelled round button in the More sheet's top row: filled in the
+/// accent colour while [selected], as the header's toggle is.
+class _QuickAction extends StatelessWidget {
+  const _QuickAction({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    this.selected = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onPressed;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Expanded(
+      child: Column(
+        children: [
+          IconButton(
+            tooltip: label,
+            isSelected: selected,
+            onPressed: onPressed,
+            style: IconButton.styleFrom(
+              backgroundColor: selected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.secondaryContainer,
+              foregroundColor: selected
+                  ? theme.colorScheme.onPrimary
+                  : theme.colorScheme.onSecondaryContainer,
+              disabledBackgroundColor: theme.colorScheme.onSurface.withValues(
+                alpha: 0.12,
+              ),
+            ),
+            icon: Icon(icon),
+          ),
+          const SizedBox(height: 4),
+          ExcludeSemantics(
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              style: theme.textTheme.labelMedium,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// The timeline's column width, for what sits over and under it.
 class _Column extends StatelessWidget {
   const _Column({required this.child});
@@ -653,9 +822,13 @@ class _Column extends StatelessWidget {
 /// it stands, then where it is (`work › outer`). The agent's state is on
 /// the status line.
 class _Title extends StatelessWidget {
-  const _Title({required this.screen});
+  const _Title({required this.screen, required this.compact});
 
   final SessionScreen screen;
+
+  /// Under the title the workdir's last component, not its path: the
+  /// More sheet shows the path whole.
+  final bool compact;
 
   /// The toolbar's height: the standard one, or taller when the text
   /// scale makes the title's two lines and a margin (8) need more.
@@ -674,7 +847,8 @@ class _Title extends StatelessWidget {
     final rename = screen.rename;
     final sub = theme.textTheme.labelMedium?.copyWith(color: colors.muted);
     final subagent = screen.subagent;
-    final under = subagent?.trail ?? screen.workdir;
+    final under =
+        subagent?.trail ?? (compact ? screen.workdirName : screen.workdir);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
