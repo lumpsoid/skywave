@@ -2912,6 +2912,46 @@ impl Rig {
 }
 
 #[test]
+fn the_footer_shows_the_context_fill_and_a_finished_subagent_its_own_figures() {
+    use skywave_proto::{CallId, SubagentUsage, ToolKind, ToolResult, TurnUsage};
+    let mut rig = Rig::new();
+    let agent = CallId::new();
+    rig.log(vec![
+        a_call(None, agent, "Agent", ToolKind::Subagent, "Check flour"),
+        a_call(Some(agent), CallId::new(), "Bash", ToolKind::Shell, "ls"),
+        EventKind::SubagentUsage(SubagentUsage {
+            call: agent,
+            duration_ms: Some(4_284),
+            tool_uses: Some(1),
+            context_tokens: Some(11_850),
+        }),
+        EventKind::ToolResult(ToolResult {
+            call: Some(agent),
+            is_error: false,
+            status: None,
+            preview: "flour ok".into(),
+            lines: 1,
+            output: None,
+        }),
+        EventKind::TurnUsage(TurnUsage {
+            duration_ms: Some(9_000),
+            model: Some("model-a".into()),
+            context_tokens: Some(18_976),
+            context_window: Some(1_000_000),
+            ..TurnUsage::default()
+        }),
+    ]);
+    let status = "finished · 1 step · 4.3s · ctx 12k";
+    assert_eq!(rig.tool_row("Agent").status.as_deref(), Some(status));
+    // The two numbers stay apart: the footer shows the main thread's only.
+    let usage = rig.open_session().usage;
+    assert!(usage.contains(&"ctx 19k/1M · 2%".to_owned()), "{usage:?}");
+    rig.view_subagent(Some(agent));
+    let header = rig.open_session().subagent.expect("a subagent's view");
+    assert_eq!(header.status_label, status);
+}
+
+#[test]
 fn a_subagent_row_opens_its_view_and_switching_views_sends_a_snapshot() {
     use skywave_proto::{CallId, ToolKind};
     let mut rig = Rig::new();

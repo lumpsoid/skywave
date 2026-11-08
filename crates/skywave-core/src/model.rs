@@ -44,9 +44,9 @@ use crate::view::{
     PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
     SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    StorageReport, StorageView, SubagentHeader, SubagentStatus, TimelineItem, ToolApproval,
-    ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody, WorkdirPane,
-    WorkdirView,
+    StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem,
+    ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody,
+    WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -3018,6 +3018,8 @@ impl Model {
                     LogState::Idle | LogState::AgentWorking => None,
                 },
                 EventKind::TurnUsage(usage) => Some(Entry::TurnUsage(usage.clone())),
+                // Folded into its call's subagent status (`Tools::step`).
+                EventKind::SubagentUsage(_) => None,
                 // Folded into the session summary; nothing in the timeline.
                 EventKind::BackgroundTasksChanged { .. } | EventKind::SchedulesChanged { .. } => {
                     None
@@ -3637,6 +3639,9 @@ impl ToolIndex {
                     self.steps.entry(*parent).or_default().last = Some(line.to_owned());
                 }
             }
+            EventKind::SubagentUsage(usage) => {
+                self.steps.entry(usage.call).or_default().usage = Some(usage.clone());
+            }
             _ => {}
         }
     }
@@ -3659,6 +3664,7 @@ impl ToolIndex {
                 task,
                 steps: steps.map_or(0, |s| s.count),
                 last: steps.and_then(|s| s.last.clone()),
+                usage: steps.and_then(|s| s.usage.clone()),
             });
         }
     }
@@ -3671,6 +3677,8 @@ struct Steps {
     count: u32,
     /// Its newest tool call's title or message's first line.
     last: Option<String>,
+    /// What its agent reported once it finished.
+    usage: Option<SubagentUsage>,
 }
 
 /// The item of the linked call `call` in a folded timeline: the subagent it
@@ -10197,15 +10205,25 @@ mod tests {
                 live: true,
                 steps: 2,
                 last: Some("found it".into()),
+                usage: None,
             }
         );
         // Its own outcome is how its launch went.
         assert!(matches!(tools(&f)[0].outcome, ToolOutcome::Done { .. }));
         assert_eq!(tools(&f)[1].subagent, None, "not a subagent's call");
-        // Its task leaving ends it.
+        // Its task leaving ends it; its figures come outside any turn.
+        let figures = SubagentUsage {
+            call: bg,
+            duration_ms: Some(2_770),
+            tool_uses: Some(2),
+            context_tokens: Some(10_592),
+        };
         f.log(
             sid,
-            vec![EventKind::BackgroundTasksChanged { tasks: vec![] }],
+            vec![
+                EventKind::SubagentUsage(figures.clone()),
+                EventKind::BackgroundTasksChanged { tasks: vec![] },
+            ],
         );
         assert_eq!(
             status_of(&f, bg),
@@ -10214,6 +10232,7 @@ mod tests {
                 live: false,
                 steps: 2,
                 last: Some("found it".into()),
+                usage: Some(figures),
             }
         );
 
@@ -10230,16 +10249,32 @@ mod tests {
             live: true,
             steps: 0,
             last: None,
+            usage: None,
         };
         assert_eq!(status_of(&f, fg), idle);
-        f.log(sid, vec![tool_result(Some(fg), false, "report")]);
+        // Its figures come before its result, inside the turn.
+        let figures = SubagentUsage {
+            call: fg,
+            duration_ms: Some(4_284),
+            tool_uses: Some(1),
+            context_tokens: Some(11_850),
+        };
+        f.log(
+            sid,
+            vec![
+                EventKind::SubagentUsage(figures.clone()),
+                tool_result(Some(fg), false, "report"),
+            ],
+        );
         assert_eq!(
             status_of(&f, fg),
             SubagentStatus {
                 live: false,
+                usage: Some(figures),
                 ..idle
             }
         );
+        assert_eq!(status_of(&f, bg).usage.unwrap().call, bg, "each its own");
     }
 
     #[test]

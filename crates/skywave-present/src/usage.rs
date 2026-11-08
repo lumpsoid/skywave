@@ -340,6 +340,7 @@ mod tests {
                 tokens_out: Some(100),
                 cost_usd: cost,
                 model: model.map(str::to_owned),
+                ..TurnUsage::default()
             },
         }
     }
