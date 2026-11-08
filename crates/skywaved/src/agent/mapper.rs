@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use skywave_proto::limits::{
-    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS,
-    MODEL_MAX_CHARS, MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS,
-    RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX,
-    STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
+    AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, INLINE_MAX_BYTES, MODEL_DETAIL_MAX_CHARS,
+    MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS, MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES,
+    REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS, RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS,
+    SCHEDULES_MAX, STATUS_MAX_CHARS, TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
 use skywave_proto::{
     self as proto, AgentSettings, AgentWork, ApprovalId, BackgroundTask, Body, BodyFormat, CallId,
@@ -952,7 +952,10 @@ pub(crate) fn display_body(
 }
 
 /// A result's preview (of the adapter's preview text, else of the output),
-/// with the output as a blob when the preview does not hold all of it.
+/// with the whole output when the preview does not hold all of it: inline
+/// up to [`INLINE_MAX_BYTES`], else as a blob. An adapter's preview nearly
+/// always differs from its output (notes for the model, line numbers, a
+/// header), so without the inline case nearly every result made a blob.
 pub(crate) fn tool_result(
     put: &mut impl FnMut(&[u8]) -> Result<Full>,
     call: Option<CallId>,
@@ -960,10 +963,14 @@ pub(crate) fn tool_result(
 ) -> Result<ToolResult> {
     let shown = result.preview.as_deref().unwrap_or(&result.output);
     let (preview, cut) = cut_preview(shown);
-    let output = if cut || shown != result.output {
-        Some(put(result.output.as_bytes())?)
-    } else {
+    let whole = !cut && shown == result.output;
+    let lines = line_count(&result.output);
+    let output = if whole {
         None
+    } else if result.output.len() <= INLINE_MAX_BYTES {
+        Some(Full::Inline(result.output))
+    } else {
+        Some(put(result.output.as_bytes())?)
     };
     Ok(ToolResult {
         call,
@@ -972,7 +979,7 @@ pub(crate) fn tool_result(
             .status
             .map(|status| cut_line(&status, STATUS_MAX_CHARS).0),
         preview,
-        lines: line_count(&result.output),
+        lines,
         output,
     })
 }
@@ -1240,6 +1247,52 @@ mod tests {
         assert_eq!(short.preview, "a\nb\n");
 
         assert_eq!(stored, vec![long.into_bytes()]);
+    }
+
+    #[test]
+    fn a_small_output_travels_inline_and_only_a_large_one_makes_a_blob() {
+        let mut stored: Vec<Vec<u8>> = Vec::new();
+        let blob = Full::Blob(proto::BlobRef {
+            id: proto::BlobId::new(),
+            size: 0,
+            sha256: proto::ContentHash::of(b""),
+        });
+        let mut put = |bytes: &[u8]| {
+            stored.push(bytes.to_vec());
+            Ok(blob.clone())
+        };
+        let result = |preview: Option<&str>, output: &str| ResultDisplay {
+            is_error: false,
+            status: None,
+            preview: preview.map(str::to_owned),
+            output: output.to_owned(),
+        };
+
+        // An edit: an empty preview beside the note to the model.
+        let note = "The file a.txt has been updated. file state is current in your context";
+        let edit = tool_result(&mut put, None, result(Some(""), note)).unwrap();
+        assert_eq!(edit.preview, "");
+        assert_eq!(edit.output, Some(Full::Inline(note.to_owned())));
+
+        // Cut, but small enough to carry: the whole of it, inline.
+        let long: String = (0..=PREVIEW_MAX_LINES).map(|i| format!("{i}\n")).collect();
+        let cut = tool_result(&mut put, None, result(None, &long)).unwrap();
+        assert_eq!(cut.output, Some(Full::Inline(long.clone())));
+        assert_eq!(cut.lines, line_count(&long));
+
+        // At the threshold still inline; one byte past it, a blob.
+        let at = "x".repeat(INLINE_MAX_BYTES);
+        let inline = tool_result(&mut put, None, result(Some(""), &at)).unwrap();
+        assert_eq!(inline.output, Some(Full::Inline(at)));
+        let past = "x".repeat(INLINE_MAX_BYTES + 1);
+        let large = tool_result(&mut put, None, result(Some(""), &past)).unwrap();
+        assert_eq!(large.output, Some(blob.clone()));
+
+        // The preview holds it all: nothing more.
+        let whole = tool_result(&mut put, None, result(None, "ok\n")).unwrap();
+        assert_eq!((whole.preview.as_str(), whole.output), ("ok\n", None));
+
+        assert_eq!(stored, vec![past.into_bytes()], "only the large one");
     }
 
     #[test]

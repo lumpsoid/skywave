@@ -222,7 +222,8 @@ pub struct ResultDisplay {
     pub status: Option<String>,
     /// What to preview, uncut, when it is not `output` itself, e.g. the
     /// tool's own output without notes meant for the model. `None` previews
-    /// `output`. When set and different, `output` is kept as a blob.
+    /// `output`. When set and different, `output` is kept whole beside it
+    /// (inline when small, else as a blob).
     pub preview: Option<String>,
     /// The whole output.
     pub output: String,

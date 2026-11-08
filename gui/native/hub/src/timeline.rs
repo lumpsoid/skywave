@@ -85,7 +85,22 @@ impl BlobHeads {
 fn read(path: &Path) -> Result<Head, String> {
     let (text, size) = read_head(path, SHOW_BYTES)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let all = content_lines(&text);
+    Ok(shown_head(&text, size))
+}
+
+/// What an expanded section shows of whole content kept inline: the same
+/// head and cut as a downloaded blob's.
+fn inline_head(whole: &str) -> Head {
+    let mut end = whole.len().min(SHOW_BYTES as usize);
+    while !whole.is_char_boundary(end) {
+        end -= 1;
+    }
+    shown_head(&whole[..end], whole.len() as u64)
+}
+
+/// The head shown of `text`, the first bytes of content `size` long.
+fn shown_head(text: &str, size: u64) -> Head {
+    let all = content_lines(text);
     let cut = (all.len() > SHOW_LINES || size > SHOW_BYTES).then(|| {
         let shown = if all.len() > SHOW_LINES {
             format!("{SHOW_LINES} lines")
@@ -94,10 +109,10 @@ fn read(path: &Path) -> Result<Head, String> {
         };
         format!("cut short: {shown} of {} shown", bytes(size))
     });
-    Ok(Head {
+    Head {
         lines: all.into_iter().take(SHOW_LINES).map(clean_line).collect(),
         cut,
-    })
+    }
 }
 
 /// A session's rows, and for each the pending key its logged message
@@ -702,10 +717,18 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
             },
             // Where its download stands is the blob's label.
             Some(_) => preview.into_iter().map(clean_line).collect(),
-            None => {
-                note = section.note().map(Cow::into_owned);
-                preview.into_iter().map(clean_line).collect()
-            }
+            None => match section.inline() {
+                Some(whole) => {
+                    let head = inline_head(whole);
+                    cut_short = head.cut.is_some();
+                    note = head.cut;
+                    head.lines
+                }
+                None => {
+                    note = section.note().map(Cow::into_owned);
+                    preview.into_iter().map(clean_line).collect()
+                }
+            },
         }
     } else {
         if preview.is_empty() {

@@ -42,7 +42,9 @@ pub fn offers_for(holds: BlobUse) -> Vec<BlobAction> {
 pub fn item_offers(full: &FullView, holds: BlobUse) -> Vec<BlobAction> {
     match full {
         FullView::Blob(blob) if blob.pending.is_none() => offers_for(holds),
-        FullView::Blob(_) | FullView::Lost | FullView::Deleted { .. } => Vec::new(),
+        FullView::Blob(_) | FullView::Inline(_) | FullView::Lost | FullView::Deleted { .. } => {
+            Vec::new()
+        }
     }
 }
 

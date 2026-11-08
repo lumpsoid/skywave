@@ -333,7 +333,8 @@ mod tests {
                 text: "hi".into(),
             },
             call("t1", "ls".into()),
-            result("t1", long(500)),
+            // Past `INLINE_MAX_BYTES`, so a blob.
+            result("t1", long(1000)),
             HistoryItem::Agent {
                 at: None,
                 event: AdapterEvent::TurnStarted { message: true },

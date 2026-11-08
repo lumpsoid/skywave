@@ -423,6 +423,8 @@ pub enum BlobChange {
 pub enum FullView {
     /// Kept as a blob, with its download state.
     Blob(BlobView),
+    /// Carried in the event, so here already: small content, never a blob.
+    Inline(String),
     /// The server could not keep it: only the preview or summary is left.
     Lost,
     /// Deleted on the server, and this device has no copy: only the
@@ -435,7 +437,15 @@ impl FullView {
     pub fn blob(&self) -> Option<&BlobView> {
         match self {
             FullView::Blob(blob) => Some(blob),
-            FullView::Lost | FullView::Deleted { .. } => None,
+            FullView::Inline(_) | FullView::Lost | FullView::Deleted { .. } => None,
+        }
+    }
+
+    /// The whole content when it came inline in the event.
+    pub fn inline(&self) -> Option<&str> {
+        match self {
+            FullView::Inline(text) => Some(text),
+            FullView::Blob(_) | FullView::Lost | FullView::Deleted { .. } => None,
         }
     }
 }

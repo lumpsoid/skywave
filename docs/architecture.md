@@ -492,8 +492,15 @@ the daemon's appends, which would otherwise stop `serve` (below).
   fetched on demand (D11). Each such field (`ToolCall::input`,
   `Body::full`, `ToolResult::output`, `ApprovalRequested::input`) is a
   `Full`: `None` when the preview holds it all, `Blob` with the reference,
-  or `Lost` when the blob could not be stored (a full disk, its row
-  refused). A lost one is logged at error; the event keeps its cut
+  `Inline` with the content itself, or `Lost` when the blob could not be
+  stored (a full disk, its row refused). A tool result's whole output of
+  at most `limits::INLINE_MAX_BYTES` (4 KiB) is `Inline` rather than a
+  blob: an adapter's preview nearly always differs from the output (an
+  edit's note to the model, a read's line numbers, a grep's header), and
+  a blob that small costs a file, two fsyncs, a row and, under the eager
+  policy, a request per device for less than its own overhead. Heads
+  treat it as content already here: an expanded section shows it, a copy
+  takes it and a search looks through it; it has no blob actions. A lost one is logged at error; the event keeps its cut
   preview and whole `lines` count, the turn goes on, and every head says
   the rest is gone (`skywave_present::sections`), up front in an approval
   prompt, since the user decides on the summary.

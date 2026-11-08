@@ -1,7 +1,7 @@
 {
-  "protocol_version": 23,
+  "protocol_version": 24,
   "hello": {
-    "protocol_version": 23,
+    "protocol_version": 24,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -306,6 +306,23 @@
           "preview": "running 3 tests\ntest a ... ok",
           "lines": 40,
           "output": "lost"
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "tool_result",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "is_error": false,
+          "status": "updated +1 -1",
+          "preview": "",
+          "lines": 1,
+          "output": {
+            "inline": "The file a.txt has been updated. file state is current in your context"
+          }
         }
       },
       {

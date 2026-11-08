@@ -46,6 +46,8 @@ pub fn whole_output(run: &ShellRun) -> WholeOutput<'_> {
     let text = run.tail_or_preview.as_str();
     match &run.output {
         Some(FullView::Blob(blob)) => return WholeOutput::Blob(blob),
+        // A run's output is never inline; were it, it would be all of it.
+        Some(FullView::Inline(whole)) => return WholeOutput::Here(whole),
         Some(FullView::Deleted { by }) => {
             return WholeOutput::Partial {
                 text,

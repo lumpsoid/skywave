@@ -2067,6 +2067,86 @@ fn a_lost_output_says_so_under_its_preview() {
     assert!(!screen.contains("could not store"), "{screen}");
 }
 
+#[test]
+fn an_inline_output_expands_to_all_of_it_without_a_download() {
+    let (mut h, id, _) = open_session();
+    let whole: String = (0..12).map(|i| format!("file-{i:03}\n")).collect();
+    let c = CallId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(c, "Glob", ToolKind::Search, "*")),
+            ),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(ToolResult {
+                    output: Some(Full::Inline(whole)),
+                    lines: 12,
+                    ..result(c, false, "12 files", "file-000")
+                }),
+            ),
+        ],
+    );
+    let screen = h.screen();
+    assert_contains(&screen, "│ file-000 ");
+    assert_contains(&screen, "│ … +11 lines ");
+    assert!(!screen.contains("file-011"), "collapsed: {screen}");
+    assert!(!screen.contains("not downloaded"), "{screen}");
+    assert!(!screen.contains("not stored"), "{screen}");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    // Nothing to fetch, and `d` asks for nothing.
+    assert_eq!(h.key(KeyCode::Char('d')), None);
+    assert_eq!(h.key(KeyCode::Enter), None);
+    assert!(h.drain_requests().is_empty());
+    let screen = h.screen();
+    assert_contains(&screen, "│ file-011 ");
+    assert!(!screen.contains("+11 lines"), "expanded: {screen}");
+}
+
+#[test]
+fn an_inline_output_expanded_is_cut_short_like_a_blob() {
+    let (mut h, id, _) = open_session();
+    let whole: String = (0..500).map(|i| format!("l{i:03}\n")).collect();
+    let c = CallId::new();
+    pull(
+        &mut h,
+        vec![
+            event(
+                id,
+                1,
+                EventKind::ToolCall(call(c, "Glob", ToolKind::Search, "*")),
+            ),
+            event(
+                id,
+                2,
+                EventKind::ToolResult(ToolResult {
+                    output: Some(Full::Inline(whole)),
+                    lines: 500,
+                    ..result(c, false, "500 files", "l000")
+                }),
+            ),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    let mut screen = h.screen();
+    for _ in 0..100 {
+        if screen.contains("cut short") {
+            break;
+        }
+        h.key(KeyCode::PageDown);
+        screen = h.screen();
+    }
+    assert_contains(&screen, "… cut short: 400 lines of 2.4 KiB shown");
+    assert!(!screen.contains("l400"), "past the cap: {screen}");
+}
+
 fn blob_deleted(id: SessionId, minute: u32, blob: BlobId, by: DeviceId) -> Event {
     event(
         id,

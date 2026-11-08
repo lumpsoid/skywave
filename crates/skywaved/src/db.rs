@@ -434,7 +434,15 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// `MIGRATED_SINCE + i` to the next (D43). Every bump adds one, a no-op
 /// saying so if nothing stored changed; the length makes a bump without one
 /// fail to compile. Append; never edit a released one.
-const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [];
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+
+/// v23 to v24. What v24 changed of what is stored, and how each is moved:
+/// - `Full::Inline` (a small tool output carried in its event): new, so no
+///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged
+///   and its small output blobs stay blobs.
+fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
 
 /// An open, migrated database connection.
 #[derive(Debug)]
@@ -863,8 +871,6 @@ mod tests {
     /// A database stamped with any version it migrates opens restamped,
     /// through the fast path's check too (the schema is current).
     #[test]
-    // Empty until the first bump after MIGRATED_SINCE.
-    #[allow(clippy::reversed_empty_ranges)]
     fn opens_a_database_of_every_migrated_protocol_version() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skywave.db");
@@ -878,6 +884,53 @@ mod tests {
                 "from {older}"
             );
         }
+    }
+
+    /// The tool results v23 wrote (its wire snapshot's) read unchanged once
+    /// v24's step ran: a whole output stays the blob or loss it was.
+    #[test]
+    fn v24_reads_the_tool_results_v23_wrote() {
+        use skywave_proto::{EventKind, Full, ToolResult};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        let v23 = [
+            r#"{"type":"tool_result","call":"01920000-0000-7000-8000-000000000007","is_error":false,"status":"exit 0","preview":"running","lines":40,"output":{"blob":{"id":"01920000-0000-7000-8000-000000000005","size":48213,"sha256":"7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"}}}"#,
+            r#"{"type":"tool_result","call":null,"is_error":false,"status":null,"preview":"running","lines":40,"output":"lost"}"#,
+            r#"{"type":"tool_result","call":null,"is_error":true,"status":"exit 1","preview":"no such file","lines":1,"output":null}"#,
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (seq, kind) in (1i64..).zip(v23) {
+                conn.execute(
+                    "INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (?1, 's', 't', 'c', ?2)",
+                    rusqlite::params![seq, kind],
+                )
+                .unwrap();
+            }
+        }
+        restamp(&path, 23);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), 24);
+        let kinds: Vec<EventKind> = db
+            .conn()
+            .prepare("SELECT kind FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|kind| serde_json::from_str(&kind.unwrap()).unwrap())
+            .collect();
+        let outputs: Vec<Option<Full>> = kinds
+            .into_iter()
+            .map(|kind| match kind {
+                EventKind::ToolResult(ToolResult { output, .. }) => output,
+                other => panic!("not a result: {other:?}"),
+            })
+            .collect();
+        assert!(matches!(outputs[0], Some(Full::Blob(ref b)) if b.size == 48213));
+        assert_eq!(outputs[1..], [Some(Full::Lost), None]);
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records
