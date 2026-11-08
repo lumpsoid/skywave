@@ -14,16 +14,16 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, FullView, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq,
-    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
-    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq, ServerAddress,
+    SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId,
+    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::blob_actions::{entry_target, run_target};
 use skywave_present::format::{
     BackgroundRow, StopAction, background_rows, bytes, mode_needs_confirmation, move_refusal,
     offered_modes,
 };
-use skywave_present::output::output_download;
+use skywave_present::output::{WholeOutput, output_download, whole_output};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
     ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
@@ -1401,6 +1401,9 @@ pub struct UiState {
     /// A copy to the terminal's clipboard, for the event loop to send
     /// ([`App::take_copy`]).
     pub copy: Option<Clip>,
+    /// What the notice adds once [`UiState::copy`] is sent, e.g. that it
+    /// was only a run's kept tail ([`WholeOutput::copy_note`]).
+    pub copy_note: Option<String>,
     /// Watches the core's [`alerts`](skywave_core::Attention::alerts)
     /// count; the first snapshot's needs no alert.
     pub alerts: AlertWatcher,
@@ -1454,6 +1457,7 @@ impl App {
                 error: None,
                 notice: None,
                 copy: None,
+                copy_note: None,
                 alerts: AlertWatcher::new(&view.attention),
                 shell_alerts: ShellAlertWatcher::new(),
                 alert: None,
@@ -1664,10 +1668,12 @@ impl App {
     /// Records the outcome of sending a [`App::take_copy`] copy: how many
     /// bytes went to the terminal, or why none did.
     pub fn copied(&mut self, result: Result<usize, CopyError>) {
+        let note = self.ui.copy_note.take();
         match result {
             Ok(n) => {
+                let note = note.map(|note| format!(" · {note}")).unwrap_or_default();
                 self.ui.notice = Some(format!(
-                    "copied {} · sent to terminal clipboard",
+                    "copied {} · sent to terminal clipboard{note}",
                     bytes(n as u64)
                 ));
             }
@@ -1706,16 +1712,19 @@ impl App {
         self.copy_blob(key, blob, |path| Clip::File { path, strip })
     }
 
-    /// `y` on a shell run: its whole output once downloaded, ANSI
-    /// stripped; until then the preview, which holds all of it when there
-    /// is no blob and is stripped already.
+    /// `y` on a shell run: its whole output ([`whole_output`]). Its blob,
+    /// ANSI stripped, once downloaded, else downloaded first (never just
+    /// the preview); without one, the run's own text, stripped already,
+    /// and the notice says when that is only the kept tail.
     fn copy_run(&mut self, run: &ShellRun) -> Option<Action> {
-        match run.output.as_ref().and_then(FullView::blob) {
-            Some(blob) if matches!(blob.state, BlobState::Available { .. }) => {
-                self.copy_blob('y', blob.clone(), |path| Clip::Output { path })
+        let whole = whole_output(run);
+        match &whole {
+            WholeOutput::Blob(blob) => {
+                self.copy_blob('y', (*blob).clone(), |path| Clip::Output { path })
             }
-            _ => {
-                self.ui.copy = Some(Clip::Text(run.tail_or_preview.clone()));
+            WholeOutput::Here(text) | WholeOutput::Partial { text, .. } => {
+                self.ui.copy = Some(Clip::Text((*text).to_owned()));
+                self.ui.copy_note = whole.copy_note();
                 None
             }
         }

@@ -33,6 +33,19 @@ pub enum WholeOutput<'a> {
     },
 }
 
+impl WholeOutput<'_> {
+    /// What a head adds to its "copied" notice for a copy of this output's
+    /// text: for [`WholeOutput::Partial`], that only the kept tail went
+    /// and why (`only the kept tail · Deleted by laptop`), so a copy of
+    /// part of an output never passes for all of it. `None` otherwise.
+    pub fn copy_note(&self) -> Option<String> {
+        match self {
+            WholeOutput::Partial { note, .. } => Some(format!("only the kept tail · {note}")),
+            WholeOutput::Here(_) | WholeOutput::Blob(_) => None,
+        }
+    }
+}
+
 /// The note on a running run's output: its whole output is a blob only
 /// once it finished.
 pub const OUTPUT_SO_FAR: &str = "the newest lines so far; the whole output once it finishes";
@@ -178,6 +191,18 @@ mod tests {
                 note: "Deleted by laptop".into()
             }
         );
+        // A copy of it says it is only the tail, and why.
+        assert_eq!(
+            whole_output(&long).copy_note().as_deref(),
+            Some("only the kept tail · Deleted by laptop")
+        );
+        assert_eq!(whole_output(&short).copy_note(), None);
+        let blob_run = {
+            let mut r = run(DONE, "y\nz", 40);
+            r.output = Some(FullView::Blob(blob.clone()));
+            r
+        };
+        assert_eq!(whole_output(&blob_run).copy_note(), None);
 
         // Running: the tail is all of it only while no line is left out.
         let going = run(ShellRunState::Running, "a\nb", 2);
