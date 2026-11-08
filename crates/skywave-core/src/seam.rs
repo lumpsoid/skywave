@@ -196,9 +196,11 @@ impl Seam {
         &self,
         id: BlobId,
     ) -> Result<Option<(BlobRecord, BlobLease)>, CoreError> {
-        let state = lock(&self.core.shared.state);
-        let lease = state.blob_lease(id);
-        Ok(state.store.blob(id)?.map(|record| (record, lease)))
+        let mut state = lock(&self.core.shared.state);
+        let Some(record) = state.store.blob(id)? else {
+            return Ok(None);
+        };
+        Ok(Some((record, state.blob_lease(id))))
     }
 
     /// The crops this device still makes itself, in log order
@@ -228,11 +230,11 @@ impl Seam {
         &self,
         crop: PendingCrop,
     ) -> Result<Option<(BlobRecord, BlobLease, Option<CropSource>)>, CoreError> {
-        let state = lock(&self.core.shared.state);
-        let lease = state.blob_lease(crop.into);
+        let mut state = lock(&self.core.shared.state);
         let Some(record) = state.store.blob(crop.into)? else {
             return Ok(None);
         };
+        let lease = state.blob_lease(crop.into);
         let path = match state.store.blob(crop.from)? {
             Some(BlobRecord {
                 status: BlobStatus::Available { path },
@@ -571,6 +573,7 @@ impl Seam {
                 let blobs = state.store.reset_for_server(address)?;
                 state.server_epoch += 1;
                 state.model.replica_reset(state.store.load()?);
+                state.blobs_purged(&blobs);
                 remove_all_blob_files(&data_dir);
                 if !blobs.is_empty() {
                     requests.push(Request::BlobsPurged(blobs));
@@ -717,7 +720,7 @@ impl Seam {
 /// id now.
 fn check_lease(state: &State, id: BlobId, lease: Option<BlobLease>) -> Result<(), CoreError> {
     match lease {
-        Some(lease) if lease != state.blob_lease(id) => Err(StoreError::UnknownBlob(id).into()),
+        Some(lease) if !state.lease_current(id, lease) => Err(StoreError::UnknownBlob(id).into()),
         _ => Ok(()),
     }
 }

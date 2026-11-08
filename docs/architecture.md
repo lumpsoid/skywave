@@ -838,7 +838,9 @@ logs) an event that no longer decodes rather than failing.
   pulls the log from seq 0. The GUI's banner offers "Reset local data"
   after a confirmation; the TUI says to restart with `--reset-replica`.
 - **Blobs** (D6): `OnDemand` by default, or `Eager`. Downloaded beside the
-  link, two at a time, into `blobs/<id>.part`, resumed with `Range` from
+  link by three workers (two take any blob, the third only blobs the user
+  asked for, so a request never waits behind eager downloads), into
+  `blobs/<id>.part`, resumed with `Range` from
   the recorded progress (decoded bytes, D45; each progress report follows an fsync, so a
   power loss never resumes past durable bytes), verified by size and by
   the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
@@ -855,8 +857,9 @@ logs) an event that no longer decodes rather than failing.
   report the replica refuses with `SQLITE_FULL`, is no local file error:
   deleting the `.part` would only free room for the next eager blob to
   fill and lose in turn. The blob keeps its `.part` and recorded progress
-  (still `Downloading`; a failed write records only what the synced file
-  holds), waits at the front of the queue, and
+  (still `Downloading`, or `NotDownloaded` if no report made it; a failed
+  write records only what the synced file holds), waits at the front of
+  the queue, and
   every download pauses (no worker takes a blob) until a download is
   asked for or the app restarts; nothing measures free space, and a disk
   still full pauses again at the first write. The queue reports the
@@ -870,8 +873,9 @@ logs) an event that no longer decodes rather than failing.
   `.part` and recorded progress as `BlobStatus::Stopped` (stored as
   `not_downloaded` with `got` and `path` set), which the views show as
   `NotDownloaded`; asking for it, or `Eager` again, resumes from there. A
-  restart queues `Downloading` rows but not `Stopped` ones, so it never
-  resumes under `OnDemand` what nobody asked for; only a kill between the
+  restart queues `Downloading` rows, and `Stopped` ones only under
+  `Eager`, so it never resumes under `OnDemand` what nobody asked for;
+  only a kill between the
   switch and the stop leaves a row `Downloading`. The store keeps no
   "asked for" mark, so the restored policy decides how a `Downloading`
   row resumes: as asked for under `OnDemand` (only a request starts one
@@ -883,8 +887,11 @@ logs) an event that no longer decodes rather than failing.
   policy: only asking for one downloads it. Their ids recur (the server
   names content by hash), so a refresh can purge a blob a download holds
   and the next one register it again: each try reads the blob with a lease
-  (its purge count, beside the replica under the same lock), and a report
-  under an older lease fails as for an unknown blob. A request for a blob a
+  (a number for that registration, beside the replica under the same
+  lock, never reused), and a report under a lease the blob no longer has
+  fails as for an unknown blob. Purging a blob drops its lease, so leases
+  are kept only for blobs in the replica that a download read, however
+  many refreshes come and go. A request for a blob a
   download holds is kept and queued once it lets go. The core hands
   requests to the engine under the state lock, in the order of the changes
   that made them, so a purge never overtakes a later request for the same
@@ -900,7 +907,7 @@ logs) an event that no longer decodes rather than failing.
   it from. A crop's `into` registers like any referenced blob; a blob
   with a fate never registers again (so its lease is never needed to tell
   a new row apart). `Applied::purged` names the purged blobs, and the
-  seam handles them as a workdir refresh does: leases bumped, files
+  seam handles them as a workdir refresh does: leases dropped, files
   (complete and `.part`) removed, `Request::BlobsPurged` sent; a download
   holding one stops at its next report. `Applied::blobs`, the eager
   queue's input, leaves out what the same batch purged: a crop of a crop
