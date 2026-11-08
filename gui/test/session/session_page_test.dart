@@ -2009,7 +2009,7 @@ void main() {
     expect(sent.last, const GuiIntentToggleConversationOnly());
   });
 
-  testWidgets('the usage summary and the More menu open the usage limits', (
+  testWidgets('the usage summary and the More menu open the session info', (
     tester,
   ) async {
     final sent = <GuiIntent>[];
@@ -2019,17 +2019,19 @@ void main() {
       timeline: holding([]),
       sent: sent,
     );
-    const limits = GuiIntentAct(
-      action: ActionIntentNavigate(route: RouteView.usageLimits),
+    final info = GuiIntentAct(
+      action: ActionIntentOpenSessionInfo(
+        sessionId: screenWith(usage: []).sessionId,
+      ),
     );
     await tester.tap(find.byKey(const Key('status-usage')));
-    expect(sent.last, limits);
+    expect(sent.last, info);
     sent.clear();
     await tester.tap(find.byTooltip('More'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Usage limits'));
+    await tester.tap(find.text('Session info'));
     await tester.pumpAndSettle();
-    expect(sent, [limits]);
+    expect(sent, [info]);
   });
 
   testWidgets('header actions and the rename prompt', (tester) async {

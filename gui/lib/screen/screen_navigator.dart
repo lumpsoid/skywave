@@ -7,6 +7,7 @@ import 'package:skywave_gui/pairing/pairing_page.dart';
 import 'package:skywave_gui/pairing/qr_scan.dart';
 import 'package:skywave_gui/screen/repair_page.dart';
 import 'package:skywave_gui/session/session_page.dart';
+import 'package:skywave_gui/session/info_page.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
 import 'package:skywave_gui/settings/settings_page.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -135,6 +136,11 @@ class ScreenNavigator extends StatelessWidget {
           send: send,
         ),
         final ScreenViewUsageLimits screen => LimitsPage(
+          screen: screen,
+          canGoBack: update.canGoBack,
+          send: send,
+        ),
+        final ScreenViewSessionInfo screen => InfoPage(
           screen: screen,
           canGoBack: update.canGoBack,
           send: send,

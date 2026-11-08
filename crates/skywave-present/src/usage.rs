@@ -104,7 +104,7 @@ pub struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, usage: &TurnUsage) {
+    pub(crate) fn add(&mut self, usage: &TurnUsage) {
         self.turns += 1;
         match usage.cost_usd {
             Some(cost) => self.cost_usd += cost,
@@ -191,7 +191,7 @@ fn day_label(day: NaiveDate) -> String {
 }
 
 const NO_WORKDIR: &str = "unknown directory";
-const NO_MODEL: &str = "unknown model";
+pub(crate) const NO_MODEL: &str = "unknown model";
 
 impl Report {
     /// Totals the turns of `view` over `span`, ending on `now`'s day.

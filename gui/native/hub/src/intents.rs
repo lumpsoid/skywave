@@ -145,6 +145,9 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
         ActionIntent::OpenWorkdir { session_id } => Action::OpenWorkdir {
             session_id: id("session", &session_id)?,
         },
+        ActionIntent::OpenSessionInfo { session_id } => Action::OpenSessionInfo {
+            session_id: id("session", &session_id)?,
+        },
         ActionIntent::ShowWorkdir {
             pane,
             path,
