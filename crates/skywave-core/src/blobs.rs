@@ -4,8 +4,8 @@
 //! **What gets downloaded.** [`BlobQueue`] holds the blobs waiting for a
 //! download. A blob the user asks for (`Action::DownloadBlob`) goes to the
 //! front. With [`BlobPolicy::Eager`], every blob a pulled batch registers
-//! goes to the back, as does every blob not yet available when the policy
-//! switches to `Eager`; switching back to `OnDemand` drops the waiting
+//! goes to the back, as does every blob neither available nor failed when
+//! the policy switches to `Eager` (on startup too); switching back to `OnDemand` drops the waiting
 //! blobs nobody asked for (a download in progress finishes, but is not
 //! queued again if the downloader stops first). On startup a blob left
 //! `Downloading` in the replica is queued again, under either policy: the
@@ -48,8 +48,10 @@
 //! over. The content must have exactly the size the event's `BlobRef`
 //! gave, and the server must agree on it; a mismatch, an unknown blob or a
 //! local file error deletes the `.part` file, logs an error and leaves the
-//! blob `NotDownloaded`, failed with that reason, until it is asked for
-//! again.
+//! blob `BlobStatus::Failed` with that reason until it is asked for again.
+//! The store keeps it, so a restart neither resumes it nor, with `Eager`,
+//! queues it: a blob that keeps failing its hash or is gone from the server
+//! costs nothing more until someone asks.
 //!
 //! **Checked by hash.** The complete `.part` file must hash to the
 //! `BlobRef`'s `sha256` before it is renamed; nothing else checks the
@@ -338,9 +340,13 @@ impl BlobQueue {
             BlobPolicy::OnDemand => queue.waiting.retain(Queued::kept_on_demand),
             BlobPolicy::Eager => {
                 // Newest first: ids are time-ordered. Workdir blobs only
-                // download when asked for.
+                // download when asked for, as does a blob that failed.
                 for blob in blobs.iter().rev() {
-                    if !blob.workdir && !matches!(blob.status, BlobStatus::Available { .. }) {
+                    let eager = matches!(
+                        blob.status,
+                        BlobStatus::NotDownloaded | BlobStatus::Downloading { .. }
+                    );
+                    if !blob.workdir && eager {
                         queue.push_back(blob.id);
                     }
                 }
@@ -751,8 +757,9 @@ impl FetchError {
     }
 }
 
-/// Deletes what was fetched of a blob and leaves it `NotDownloaded`, with
-/// the reason shown until it is asked for again.
+/// Deletes what was fetched of a blob and leaves it `Failed`, stored with
+/// its reason, until it is asked for again: a restart does not queue it,
+/// nor does `Eager`.
 async fn give_up(ctx: &BlobCtx, id: BlobId, lease: Option<BlobLease>, error: &FetchError) {
     tracing::error!(?id, %error, "blob download failed");
     let part = part_path(&blob_dir(&ctx.seam.data_dir()), id);
@@ -903,7 +910,7 @@ async fn fetch(
     // data; the excess is truncated below.
     let recorded = match &record.status {
         BlobStatus::Downloading { got, .. } => *got,
-        BlobStatus::NotDownloaded | BlobStatus::Available { .. } => 0,
+        BlobStatus::NotDownloaded | BlobStatus::Failed { .. } | BlobStatus::Available { .. } => 0,
     };
     let from = match tokio::fs::metadata(&part).await {
         Ok(meta) => recorded.min(meta.len()),
@@ -1327,6 +1334,36 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("blob status stuck at {:?}", self.status()));
             downloader.abort();
+            // Gone once this returns, with the core handle it held.
+            let _ = downloader.await;
+        }
+
+        /// The device restarts: the core opens the same data directory
+        /// again and the blob queue is restored from it, as the engine does.
+        /// The server stays.
+        fn restarted(self) -> Fixture {
+            let Fixture {
+                _dir: dir,
+                core,
+                seam,
+                session_id,
+                blob,
+                server,
+                queue,
+            } = self;
+            drop((core, seam, queue));
+            let core = Core::open_detached(dir.path()).unwrap();
+            let seam = core.seam();
+            let queue = Arc::new(BlobQueue::restore(&seam));
+            Fixture {
+                _dir: dir,
+                core,
+                seam,
+                session_id,
+                blob,
+                server,
+                queue,
+            }
         }
 
         /// The blob as the open session shows it.
@@ -1728,18 +1765,18 @@ mod tests {
             [0, 0],
             "two tries, no more"
         );
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        let actual = ContentHash::of(&content(5000));
+        let reason = format!("blob content hash mismatch: expected {promised}, got {actual}");
+        assert_eq!(
+            f.status(),
+            BlobStatus::Failed {
+                reason: reason.clone()
+            }
+        );
         assert!(!f.part().exists());
         let done = blob_dir(&f.seam.data_dir()).join(f.blob.id.0.to_string());
         assert!(!done.exists(), "never renamed");
-        let actual = ContentHash::of(&content(5000));
-        assert_eq!(
-            f.shown(),
-            BlobState::Failed {
-                size: 5000,
-                reason: format!("blob content hash mismatch: expected {promised}, got {actual}"),
-            }
-        );
+        assert_eq!(f.shown(), BlobState::Failed { size: 5000, reason });
         // Asking again starts over with a fresh allowance.
         f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
         assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
@@ -1752,7 +1789,7 @@ mod tests {
         f.queue.want(f.blob.id);
         f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
             .await;
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(matches!(f.status(), BlobStatus::Failed { .. }));
         assert!(!f.part().exists());
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 1, "not retried");
         // It says why it stopped, until asked for again.
@@ -1767,6 +1804,82 @@ mod tests {
         assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
     }
 
+    /// The reason a blob of the fixture's fails with: the server has more
+    /// than the event promised.
+    const TOO_BIG: &str = "blob size mismatch: expected 5000 bytes, the server has 6000";
+
+    /// A fixture whose blob was asked for and given up on at the first try.
+    async fn failed_fixture() -> Fixture {
+        let f = Fixture::new(5000, content(6000), 6000);
+        f.queue.want(f.blob.id);
+        f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
+            .await;
+        let failed = BlobStatus::Failed {
+            reason: TOO_BIG.into(),
+        };
+        assert_eq!(f.status(), failed);
+        f
+    }
+
+    /// A blob given up on stays `Failed`, with its reason, over a restart,
+    /// and `Eager` does not queue it again, on startup or when switched
+    /// to; a blob that never failed is queued as ever.
+    #[tokio::test]
+    async fn a_failed_blob_stays_failed_over_a_restart() {
+        let f = failed_fixture().await;
+        let [never_tried] = f.held_blobs(3, 1, Hold::Offline)[..] else {
+            unreachable!()
+        };
+        f.core
+            .dispatch(Action::SetBlobPolicy(BlobPolicy::Eager))
+            .unwrap();
+
+        let f = f.restarted();
+        let failed = BlobStatus::Failed {
+            reason: TOO_BIG.into(),
+        };
+        assert_eq!(f.status(), failed);
+        assert_eq!(waiting(&f.queue), [(never_tried, false)]);
+        f.queue
+            .set_policy(BlobPolicy::Eager, &f.seam.blobs().unwrap());
+        assert_eq!(waiting(&f.queue), [(never_tried, false)], "nor switched to");
+        assert_eq!(
+            f.server.calls.load(Ordering::SeqCst),
+            1,
+            "never tried again"
+        );
+    }
+
+    /// Only asking again tries a blob that failed before a restart: it is
+    /// fetched once more, and fails again for the same reason.
+    #[tokio::test]
+    async fn asking_for_a_failed_blob_after_a_restart_tries_it_again() {
+        let f = failed_fixture().await.restarted();
+        assert!(waiting(&f.queue).is_empty(), "nothing queued it");
+        assert_eq!(
+            f.shown(),
+            BlobState::Failed {
+                size: 5000,
+                reason: TOO_BIG.into()
+            },
+            "and it still says why"
+        );
+
+        f.core.dispatch(Action::DownloadBlob(f.blob.id)).unwrap();
+        assert_eq!(f.shown(), BlobState::Requested { size: 5000 });
+        // The engine's part: the request reaches the queue.
+        f.queue.want(f.blob.id);
+        f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 2)
+            .await;
+        assert_eq!(*f.server.froms.lock().unwrap(), [0, 0]);
+        assert_eq!(
+            f.status(),
+            BlobStatus::Failed {
+                reason: TOO_BIG.into()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_body_longer_than_the_blob_is_refused() {
         // The server claims the right size but sends more bytes.
@@ -1774,7 +1887,7 @@ mod tests {
         f.queue.want(f.blob.id);
         f.run_until(|_| f.server.calls.load(Ordering::SeqCst) >= 1)
             .await;
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(matches!(f.status(), BlobStatus::Failed { .. }));
         assert!(!f.part().exists());
     }
 
@@ -1805,16 +1918,16 @@ mod tests {
         f.queue.want(f.blob.id);
         f.run_until(|_| matches!(f.shown(), BlobState::Failed { .. }))
             .await;
-        assert_eq!(f.status(), BlobStatus::NotDownloaded);
-        assert!(!f.part().exists());
         let actual = ContentHash::of(b"");
+        let reason = format!("blob content hash mismatch: expected {promised}, got {actual}");
         assert_eq!(
-            f.shown(),
-            BlobState::Failed {
-                size: 0,
-                reason: format!("blob content hash mismatch: expected {promised}, got {actual}"),
+            f.status(),
+            BlobStatus::Failed {
+                reason: reason.clone()
             }
         );
+        assert!(!f.part().exists());
+        assert_eq!(f.shown(), BlobState::Failed { size: 0, reason });
         assert_eq!(f.server.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2316,6 +2429,9 @@ mod tests {
         let a = record(BlobStatus::NotDownloaded);
         let b = record(BlobStatus::Available { path: "/x".into() });
         let c = record(BlobStatus::NotDownloaded);
+        let failed = record(BlobStatus::Failed {
+            reason: "gone".into(),
+        });
 
         // OnDemand: registered blobs wait for the user.
         queue.registered(&[a.id]);
@@ -2323,9 +2439,12 @@ mod tests {
         queue.want(a.id);
         assert_eq!(waiting(&queue), [(a.id, true)]);
 
-        // Eager: everything not available, newest first, no duplicates;
-        // a user request jumps the queue.
-        queue.set_policy(BlobPolicy::Eager, &[a.clone(), b.clone(), c.clone()]);
+        // Eager: everything neither available nor failed, newest first, no
+        // duplicates; a user request jumps the queue.
+        queue.set_policy(
+            BlobPolicy::Eager,
+            &[a.clone(), b.clone(), c.clone(), failed.clone()],
+        );
         assert_eq!(waiting(&queue), [(a.id, true), (c.id, false)]);
         let d = ProtoBlobId::new();
         queue.registered(&[d, c.id]);

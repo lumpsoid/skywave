@@ -628,8 +628,9 @@ impl Seam {
         })
     }
 
-    /// The download of `id` was given up for `reason`: back to
-    /// `NotDownloaded`, the reason shown until it is asked for again.
+    /// The download of `id` was given up for `reason`: it is
+    /// [`BlobStatus::Failed`], stored, so it stays so across restarts and
+    /// shows the reason until it is asked for again.
     pub fn blob_failed(&self, id: BlobId, reason: impl Into<String>) -> Result<(), CoreError> {
         self.fail_blob(id, None, reason.into())
     }
@@ -652,10 +653,9 @@ impl Seam {
     ) -> Result<(), CoreError> {
         self.update(|state| {
             check_lease(state, id, lease)?;
-            state
-                .store
-                .set_blob_status(id, &BlobStatus::NotDownloaded)?;
-            state.model.blob_failed(id, reason);
+            let status = BlobStatus::Failed { reason };
+            state.store.set_blob_status(id, &status)?;
+            state.model.blob_status(id, status);
             Ok(((), Vec::new()))
         })
     }

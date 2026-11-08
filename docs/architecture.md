@@ -800,8 +800,11 @@ logs) an event that no longer decodes rather than failing.
   worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is
   the server's (every byte came from it since) and leaves the blob
-  `Failed` until it is asked for again; `Link` ignores them (synced
-  metadata counts as synced). Workdir blobs (diffs and file contents a
+  `Failed` until it is asked for again, as does a size mismatch, an
+  unknown blob or a local file error. The replica keeps the failure and
+  its reason (`blob_failures`), so a restart neither resumes it nor, under
+  `Eager`, queues it; only asking for it tries again. `Link` ignores them
+  (synced metadata counts as synced). Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server
   names content by hash), so a refresh can purge a blob a download holds
