@@ -114,8 +114,9 @@
 //! names content by its hash, so a refresh can drop a blob and the next
 //! one name it again while a worker still writes the old download. A row
 //! with that id existing again is no proof the download is current, so
-//! each try reads the blob's record together with a lease (the blob's
-//! purge count, kept beside the replica under the same lock), and every
+//! each try reads the blob's record together with a lease (a number for
+//! that registration, kept beside the replica under the same lock and
+//! dropped when the blob is purged, never reused), and every
 //! report carries it: once the blob was purged, the report fails as for
 //! an unknown blob, whatever row has the id now, and the worker lets go
 //! as above. A request for the blob made while a worker holds it is kept

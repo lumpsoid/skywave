@@ -11072,6 +11072,78 @@ mod tests {
             );
         }
 
+        /// Workdir refreshes purge and register blob ids without end; each
+        /// purge drops the blob's lease, so the leases kept stay those of
+        /// blobs in the replica, however long the run. A lease read before
+        /// any of those purges still fails once the same id is back, and
+        /// the current registration's lease still reports.
+        #[test]
+        fn workdir_refreshes_keep_only_the_leases_of_blobs_still_there() {
+            let live = Live::new();
+            let recurring = blob(3);
+            let (req, ask) = live.asked(Action::OpenWorkdir {
+                session_id: live.session,
+            });
+            let diff = |blob: &BlobRef| {
+                changes(vec![changed(
+                    "a.rs",
+                    FileChange::Modified,
+                    DiffBody::Blob(blob.clone()),
+                )])
+            };
+            live.seam
+                .workdir_answered(req, ask.clone(), Ok(diff(&recurring)))
+                .unwrap();
+            let (_, first) = live.seam.leased_blob(recurring.id).unwrap().unwrap();
+            let held = || crate::client::lock(&live.core.shared.state).leases_held();
+            assert_eq!(held(), 1);
+
+            for round in 0..50 {
+                // Another blob, then the recurring id named again: each
+                // answer purges the one before, and a download reads each.
+                let other = blob(4);
+                for current in [&other, &recurring] {
+                    let (req, _) = live.asked(Action::RefreshWorkdir);
+                    live.seam
+                        .workdir_answered(req, ask.clone(), Ok(diff(current)))
+                        .unwrap();
+                    assert_eq!(live.requests().len(), 1, "one blob purged");
+                    live.seam.leased_blob(current.id).unwrap().unwrap();
+                    assert_eq!(held(), 1, "round {round}: only the blob shown has a lease");
+                }
+            }
+
+            let downloading = BlobStatus::Downloading {
+                got: 1,
+                path: "/blobs/a.part".into(),
+            };
+            assert!(
+                matches!(
+                    live.seam
+                        .leased_blob_status(recurring.id, first, downloading.clone()),
+                    Err(crate::CoreError::Store(
+                        crate::store::StoreError::UnknownBlob(_)
+                    ))
+                ),
+                "the first registration's download is refused"
+            );
+            assert_eq!(
+                live.seam.blob(recurring.id).unwrap().unwrap().status,
+                BlobStatus::NotDownloaded
+            );
+            let (_, current) = live.seam.leased_blob(recurring.id).unwrap().unwrap();
+            live.seam
+                .leased_blob_status(recurring.id, current, downloading.clone())
+                .unwrap();
+            assert_eq!(
+                live.seam.blob(recurring.id).unwrap().unwrap().status,
+                downloading
+            );
+            // An id nothing registers gets no lease at all.
+            assert!(live.seam.leased_blob(blob(5).id).unwrap().is_none());
+            assert_eq!(held(), 1);
+        }
+
         /// The tool outputs of the session on screen, in log order.
         fn outputs(view: crate::ViewState) -> Vec<FullView> {
             let Screen::Session(session) = view.screen else {
