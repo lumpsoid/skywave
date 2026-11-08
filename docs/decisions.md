@@ -1253,3 +1253,26 @@ restart).
 **Rejected:** free text only (the options and previews are the point on a
 phone); answering with labels on the wire (indexes are what the user
 picked; labels may be cut to the limits).
+
+## D48. Agent messages render as markdown in the GUI, parsed in Rust
+An agent message (live or imported) is parsed as CommonMark with GitHub's
+tables, strikethrough and task lists by present's `markdown` module, and the
+Flutter head draws the blocks. User messages, tool output and the TUI stay
+plain text.
+- **Parsed in Rust.** Flutter only renders (D23–D28): the hub sends flat
+  blocks of styled spans beside the raw text, so a later head can reuse
+  them. Every span is cleaned after parsing, since an entity decodes to the
+  characters `text::clean` escapes.
+- **No wire change.** Markdown is how a head reads a message, not a property
+  of the event; nothing is stored or sent differently.
+- **Search shows raw text.** Search ranges point into the raw text; a row or
+  section with matches shows that text marked rather than mapping ranges
+  through the parse. Search is to be reworked; this costs nothing to drop.
+- **Nothing fetched, few links.** Images show as their alt text. Only `http`,
+  `https` and `mailto` links (with nothing cleaning would change) are
+  tappable, and open only after a dialog shows the whole URL: link text may
+  say anything.
+**Rejected:** a Dart markdown package (a second parser deciding what a
+message says, outside Rust); a `BodyFormat::Markdown` on the wire (every
+agent the server runs writes markdown today); syntax highlighting in code
+blocks (later, if wanted).

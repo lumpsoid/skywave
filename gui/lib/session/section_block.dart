@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
+import 'package:skywave_gui/session/markdown_body.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 /// One section of an item's content: its lines in monospace with their
@@ -69,7 +70,15 @@ class SectionBlock extends StatelessWidget {
             padding: const EdgeInsets.only(bottom: 4),
             child: Text(label, style: small?.copyWith(color: colors.warning)),
           ),
-        if (lines.isNotEmpty)
+        // A long message's whole, unless search marks lines in it.
+        if (section.markdown.isNotEmpty && hits.isEmpty)
+          MarkdownBody(
+            blocks: section.markdown,
+            style: theme.textTheme.bodyMedium!.copyWith(
+              color: theme.colorScheme.onSurface,
+            ),
+          )
+        else if (lines.isNotEmpty)
           Container(
             decoration: BoxDecoration(
               color: theme.colorScheme.surfaceContainerHighest.withValues(

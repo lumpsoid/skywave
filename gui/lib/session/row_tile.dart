@@ -3,6 +3,7 @@ import 'package:skywave_gui/crop/blob_menu.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/highlight.dart';
 import 'package:skywave_gui/session/look.dart';
+import 'package:skywave_gui/session/markdown_body.dart';
 import 'package:skywave_gui/session/section_block.dart';
 import 'package:skywave_gui/session/snippets.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
@@ -449,6 +450,7 @@ class _Message extends StatelessWidget {
     final outgoing = row.outgoing;
     final small = theme.textTheme.labelSmall?.copyWith(color: colors.muted);
     final pending = row.kind == RowKind.pendingMessage;
+    final body = theme.textTheme.bodyMedium!.copyWith(color: foreground);
 
     final bubble = Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
@@ -479,14 +481,20 @@ class _Message extends StatelessWidget {
               copyMessage: row.selectable
                   ? () => send(GuiIntentCopy(key: row.key, what: CopyWhat.main))
                   : null,
-              child: Text.rich(
-                TextSpan(
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: foreground,
-                  ),
-                  children: highlighted(row.text, hit?.text ?? const [], mark),
-                ),
-              ),
+              // Search marks land in the raw text, so a message with
+              // matches shows it raw.
+              child: row.markdown.isNotEmpty && (hit?.text ?? const []).isEmpty
+                  ? MarkdownBody(blocks: row.markdown, style: body)
+                  : Text.rich(
+                      TextSpan(
+                        style: body,
+                        children: highlighted(
+                          row.text,
+                          hit?.text ?? const [],
+                          mark,
+                        ),
+                      ),
+                    ),
             ),
         ],
       ),

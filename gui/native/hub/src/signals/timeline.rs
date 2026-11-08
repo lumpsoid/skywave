@@ -52,6 +52,9 @@ pub struct TimelineRow {
     /// (`interrupted · the agent stopped its turn`, `turn · 12.4s ·
     /// $0.04`). Empty for tool items: see `tool`.
     pub text: String,
+    /// An agent message's `text` as markdown blocks; empty for every other
+    /// row. Drawn in place of `text` unless a search marks matches in it.
+    pub markdown: Vec<MarkdownBlock>,
     /// What the row is marked with beside its author or name: `imported`
     /// on the imported kinds; `None` for every other.
     pub mark: Option<String>,
@@ -219,6 +222,10 @@ pub struct SectionView {
     /// say (the input an approval asked about, differing from the call's).
     pub label: Option<String>,
     pub lines: Vec<SectionLine>,
+    /// The whole of a long agent message, expanded, as markdown blocks:
+    /// drawn in place of `lines` unless a search marks matches in them.
+    /// Empty for every other section.
+    pub markdown: Vec<MarkdownBlock>,
     /// What the lines leave out: `… +12 lines` collapsed, `cut short: 400
     /// lines of 1.2 MiB shown` expanded. Never the blob's state: that is
     /// [`BlobFacts::label`], shown beside it.
@@ -256,6 +263,72 @@ pub enum LineStyle {
     Hunk,
     /// What a failed tool said.
     Error,
+}
+
+/// One block of a message as markdown (present's `markdown::Block`): a
+/// list item's or a quote's content sits `depth` lists and `quote` quotes
+/// deep, the first block of an item carrying its `marker`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct MarkdownBlock {
+    pub kind: MarkdownKind,
+    pub depth: u8,
+    pub quote: u8,
+    /// `•`, `3.`, `☐` or `☑`.
+    pub marker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub enum MarkdownKind {
+    Paragraph {
+        spans: Vec<MarkdownSpan>,
+    },
+    /// `level` 1 to 6.
+    Heading {
+        level: u8,
+        spans: Vec<MarkdownSpan>,
+    },
+    /// `text`'s lines joined by `\n`; `lang` from the fence, for its label.
+    Code {
+        lang: Option<String>,
+        text: String,
+    },
+    Rule,
+    /// One `align` per column; a row may have fewer cells.
+    Table {
+        align: Vec<MarkdownAlign>,
+        head: Vec<MarkdownCell>,
+        rows: Vec<MarkdownRow>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SignalPiece)]
+pub enum MarkdownAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct MarkdownRow {
+    pub cells: Vec<MarkdownCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct MarkdownCell {
+    pub spans: Vec<MarkdownSpan>,
+}
+
+/// A run of text in one style; `text` may hold `\n`, a hard line break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct MarkdownSpan {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// Inline code.
+    pub code: bool,
+    pub strike: bool,
+    /// A web or mail link the GUI may open, after showing where it goes.
+    pub link: Option<String>,
 }
 
 /// A blob behind a section.
