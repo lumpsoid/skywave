@@ -623,7 +623,7 @@ fn tool_call_content(view: &ToolView) -> Content {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use skywave_core::{BlobId, CallId};
+    use skywave_core::{BlobId, CallId, Pause};
 
     use super::*;
 
@@ -865,12 +865,12 @@ mod tests {
             BlobState::Downloading {
                 got: 1024,
                 size,
-                paused: false,
+                paused: None,
             },
             BlobState::Downloading {
                 got: 1024,
                 size,
-                paused: true,
+                paused: Some(Pause::Offline),
             },
             BlobState::Failed {
                 size,
@@ -929,6 +929,15 @@ mod tests {
                 "full 4.0 KiB · download failed",
                 "downloaded",
             ]
+        );
+        let full = BlobState::Downloading {
+            got: 1024,
+            size: 4096,
+            paused: Some(Pause::DiskFull),
+        };
+        assert_eq!(
+            collapsed_download(&full),
+            "downloading 25% · paused, device disk full"
         );
     }
 

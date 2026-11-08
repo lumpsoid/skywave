@@ -1011,10 +1011,12 @@ pub(super) fn blob_note(state: &BlobState) -> Option<Span<'static>> {
         BlobState::NotDownloaded { .. } => {
             Span::raw(format!("{words} · press d to download")).dark_gray()
         }
-        BlobState::Requested { .. } | BlobState::Downloading { paused: false, .. } => {
+        BlobState::Requested { .. } | BlobState::Downloading { paused: None, .. } => {
             Span::raw(words).cyan()
         }
-        BlobState::Downloading { paused: true, .. } => Span::raw(words).yellow(),
+        BlobState::Downloading {
+            paused: Some(_), ..
+        } => Span::raw(words).yellow(),
         BlobState::Failed { .. } => Span::raw(format!("{words} · d retries")).red(),
     })
 }

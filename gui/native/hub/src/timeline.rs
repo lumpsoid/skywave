@@ -809,8 +809,10 @@ pub fn blob_facts(blob: &BlobView) -> BlobFacts {
     let state = match &blob.state {
         BlobState::NotDownloaded { .. } => BlobStateKind::NotDownloaded,
         BlobState::Requested { .. } => BlobStateKind::Requested,
-        BlobState::Downloading { paused: true, .. } => BlobStateKind::Paused,
-        BlobState::Downloading { paused: false, .. } => BlobStateKind::Downloading,
+        BlobState::Downloading {
+            paused: Some(_), ..
+        } => BlobStateKind::Paused,
+        BlobState::Downloading { paused: None, .. } => BlobStateKind::Downloading,
         BlobState::Failed { .. } => BlobStateKind::Failed,
         BlobState::Available { .. } => BlobStateKind::Available,
     };
@@ -869,7 +871,7 @@ pub fn content_lines(text: &str) -> Vec<&str> {
 mod tests {
     use chrono::{TimeZone, Utc};
     use skywave_core::{
-        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, PermissionMode,
+        AgentSetting, AgentView, CommandId, ContextId, DeviceId, FullView, Pause, PermissionMode,
         SessionId, SessionState,
     };
     use skywave_present::sections::CONTENT_LOST;
@@ -1195,9 +1197,17 @@ mod tests {
                 BlobState::Downloading {
                     got: size / 2,
                     size,
-                    paused: true,
+                    paused: Some(Pause::Offline),
                 },
                 "downloading · 35.0 KiB of 70.0 KiB (50%) · paused, offline",
+            ),
+            (
+                BlobState::Downloading {
+                    got: size / 2,
+                    size,
+                    paused: Some(Pause::DiskFull),
+                },
+                "downloading · 35.0 KiB of 70.0 KiB (50%) · paused, device disk full",
             ),
             (
                 BlobState::Failed {

@@ -494,6 +494,30 @@ impl StoreError {
             _ => false,
         }
     }
+
+    /// Whether the write failed because the device's disk (or the user's
+    /// quota) is full: SQLite's `SQLITE_FULL`, or a file the store writes
+    /// failing as [`io_disk_full`] says.
+    pub fn disk_full(&self) -> bool {
+        match self {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => {
+                failure.code == rusqlite::ErrorCode::DiskFull
+            }
+            StoreError::DataDir { source, .. } | StoreError::Replace { source, .. } => {
+                io_disk_full(source)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether an I/O error says the device's disk is full: `ENOSPC`
+/// (`StorageFull`) or a quota (`EDQUOT`, `QuotaExceeded`).
+pub(crate) fn io_disk_full(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }
 
 /// Whether blobs download alongside metadata or on explicit intent (D6).

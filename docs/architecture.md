@@ -814,7 +814,19 @@ logs) an event that no longer decodes rather than failing.
   `Failed` until it is asked for again, as does a size mismatch, an
   unknown blob or a local file error. The replica keeps the failure and
   its reason (`blob_failures`), so a restart neither resumes it nor, under
-  `Eager`, queues it; only asking for it tries again. `Link` ignores them
+  `Eager`, queues it; only asking for it tries again. A file write that
+  finds the device's disk full (`ENOSPC`, or a quota), or a progress
+  report the replica refuses with `SQLITE_FULL`, is no local file error:
+  deleting the `.part` would only free room for the next eager blob to
+  fill and lose in turn. The blob keeps its `.part` and recorded progress
+  (still `Downloading`; a failed write records only what the synced file
+  holds), waits at the front of the queue, and
+  every download pauses (no worker takes a blob) until a download is
+  asked for or the app restarts; nothing measures free space, and a disk
+  still full pauses again at the first write. The queue reports the
+  pause to the views under its lock: `BlobState::Downloading { paused:
+  Some(Pause::DiskFull) }` (over `Offline`) and
+  `SettingsView::blobs_disk_full`. `Link` ignores them
   (synced metadata counts as synced). Workdir blobs (diffs and file contents a
   stored workdir answer names) are never fetched eagerly, whatever the
   policy: only asking for one downloads it. Their ids recur (the server
@@ -1045,7 +1057,7 @@ enum SessionState {
 enum BlobState {
     NotDownloaded { size: u64 },
     Requested { size: u64 },                         // asked for, waiting for a slot
-    Downloading { got: u64, size: u64, paused: bool }, // paused: the link is down
+    Downloading { got: u64, size: u64, paused: Option<Pause> }, // Offline | DiskFull
     Failed { size: u64, reason: String },            // given up; asking again retries
     Available { path: PathBuf },
 }
@@ -1071,6 +1083,7 @@ enum CropContent {
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |
 | `Rejected(HistoryLost)` | Banner: server lost history (had N, server at M) · sync stopped; local data stays readable. GUI: "Reset local data" after a confirmation; TUI: restart with `--reset-replica`. |
 | Blob `NotDownloaded` | Placeholder with size and a download action. |
+| Blob `Downloading` with `paused` | Its progress, then `format::pause_note`: "paused, offline" or "paused, device disk full". |
 | `FullView::Deleted { by }` | The preview, and under it "Deleted by <device>" (`sections::deleted_note`); no download action. |
 | Blob with `change: Cropped` | Its state as any blob's, and beside it "Cropped by <device>: kept K of M lines" (`sections::change_note`). Every count of lines left out ("+N lines", "N earlier lines") counts the K kept lines, not the original's M (`sections::whole_lines`, `output::output_lines`). |
 | Crop page `NotHere` / `Counting` / `Ready` / `Gone` | Not here: says the output isn't on this device, with its size and one Download action, then the blob's progress or failure. Counting: a counting note. Ready: the lines from `LineIndex`, presets, "keeps K of M lines", and Crop only while `crop::crop_enabled`, after `crop_confirmation`. Gone: nothing to crop, back only. |

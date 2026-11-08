@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use skywave_core::{
     AgentSetting, AgentView, AgentWork, BackgroundTask, BlobState, CallId, ContextView,
     ConversationItem, ConversationPicker, ConversationsStatus, ConversationsUnavailable, Decision,
-    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, PendingSession,
+    Delivery, DeviceRef, Effort, FailReason, ImportOutcome, Outgoing, Pause, PendingSession,
     PermissionMode, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule, SessionId,
     SessionRef, SessionView, ShellEnd, ShellRun, ShellRunState, SubagentStatus, TaskId, TaskKind,
 };
@@ -99,7 +99,8 @@ pub fn blob_size(state: &BlobState) -> Option<u64> {
 /// content that is not here (an expanded section, the crop page, a workdir
 /// file): `not downloaded · 4.0 KiB`, `requested · waiting for a slot ·
 /// 4.0 KiB`, `downloading · 1.0 KiB of 4.0 KiB (25%)`, with ` · paused,
-/// offline` while the link is down, `download failed: {reason} · 4.0 KiB`,
+/// offline` while the link is down (or another [`pause_note`]),
+/// `download failed: {reason} · 4.0 KiB`,
 /// `downloaded`. A head adds its own hint (how to download, to retry).
 pub fn download_state(state: &BlobState) -> String {
     match state {
@@ -140,8 +141,17 @@ pub fn download_brief(state: &BlobState) -> Option<String> {
     }
 }
 
-fn paused_word(paused: bool) -> &'static str {
-    if paused { " · paused, offline" } else { "" }
+fn paused_word(paused: Option<Pause>) -> String {
+    paused.map_or(String::new(), |pause| format!(" · {}", pause_note(pause)))
+}
+
+/// What a paused download waits for, as every head words it after its
+/// progress: "paused, offline", "paused, device disk full".
+pub fn pause_note(pause: Pause) -> &'static str {
+    match pause {
+        Pause::Offline => "paused, offline",
+        Pause::DiskFull => "paused, device disk full",
+    }
 }
 
 /// `got` of `size` as a whole percentage, at most 100; an empty size is
