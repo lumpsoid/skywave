@@ -43,11 +43,12 @@ pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
-    CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
-    PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView,
-    RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView,
-    SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
-    StorageTotalView, SubagentHeaderView, TaskRow, UsageGroupingView, UsageRowView, UsageSpanView,
+    CreatePrompt, CreatingView, EffortOption, EffortView, LimitRowView, ListKindView, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView,
+    StorageRowView, StorageTotalView, SubagentHeaderView, TaskRow, UsageGroupingView, UsageRowView,
+    UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

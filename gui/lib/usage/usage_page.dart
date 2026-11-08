@@ -53,6 +53,15 @@ class UsagePage extends StatelessWidget {
           onBack: () => send.act(const ActionIntentBack()),
         ),
         title: const Text('Usage'),
+        actions: [
+          IconButton(
+            tooltip: 'Usage limits',
+            icon: const Icon(Icons.speed),
+            onPressed: () => send.act(
+              const ActionIntentNavigate(route: RouteView.usageLimits),
+            ),
+          ),
+        ],
       ),
       body: ReadableWidth(
         child: ListView(

@@ -1,0 +1,8 @@
+{"dir":"note","text":"skywave-claude-compat scenario get_usage, claude 2.1.310 (Claude Code)"}
+{"dir":"note","text":"t+0s argv: claude -p --input-format stream-json --output-format stream-json --verbose --permission-prompt-tool stdio --settings {\"cleanupPeriodDays\":36500} --model haiku --setting-sources project --strict-mcp-config --session-id e46facf1-e99d-463c-bcae-e4454b94a91d"}
+{"dir":"in","msg":{"request":{"skip_behaviors":true,"subtype":"get_usage"},"request_id":"skywave_usage","type":"control_request"}}
+{"dir":"out","msg":{"response":{"request_id":"skywave_usage","response":{"behaviors":null,"rate_limits":{"limits":[{"group":"session","is_active":true,"kind":"session","percent":80,"resets_at":"2026-11-08T20:20:00.111701+00:00","scope":null,"severity":"warning"},{"group":"weekly","is_active":false,"kind":"weekly_all","percent":22,"resets_at":"2026-11-15T00:00:00.111721+00:00","scope":null,"severity":"normal"},{"group":"weekly","is_active":false,"kind":"weekly_scoped","percent":0,"resets_at":"2026-11-15T00:00:00+00:00","scope":{"model":{"display_name":"Fable","id":null},"surface":null},"severity":"normal"}]},"rate_limits_available":true},"subtype":"success"},"type":"control_response"}}
+{"dir":"note","text":"t+0s closing stdin"}
+{"dir":"note","text":"t+1s stdout closed"}
+{"dir":"note","text":"t+1s closing stdin"}
+{"dir":"note","text":"t+1s exit status: 0"}

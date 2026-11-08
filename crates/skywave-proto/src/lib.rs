@@ -156,7 +156,11 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `EventKind::QuestionAsked` ([`Question`]) and `QuestionAnswered`
 /// ([`QuestionAnswer`]), sharing an approval's ids and life;
 /// `CommandKind::AnswerQuestion` and `RejectReason::BadAnswer`.
-pub const PROTOCOL_VERSION: u32 = 26;
+///
+/// v27: the agent's usage limits. `GET` [`path::USAGE_LIMITS`] answering
+/// [`UsageLimitsResult`] (with [`UsageLimit`], [`LimitWindow`] and
+/// [`LimitSeverity`]).
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -2501,6 +2505,57 @@ pub struct ShellRunStorage {
     pub output_blob: Option<BlobId>,
 }
 
+/// Response to `GET /v1/usage-limits` (no query), always 200: every outcome
+/// is a domain answer. The limits belong to the account the server's agent
+/// runs as, not to a session.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum UsageLimitsResult {
+    /// The limits the agent reported at `at`, in its order; empty when the
+    /// account is under none.
+    Read {
+        at: DateTime<Utc>,
+        limits: Vec<UsageLimit>,
+    },
+    /// The server's agent cannot report usage limits.
+    Unavailable,
+    /// Asking the agent failed; `reason` is bounded text
+    /// ([`limits::REFUSAL_MAX_CHARS`]).
+    Failed { reason: String },
+}
+
+/// One limit of a [`UsageLimitsResult::Read`]. A figure the agent did not
+/// report is `None`, never 0.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct UsageLimit {
+    pub window: LimitWindow,
+    /// What the limit covers when it is not all use, e.g. one model's name,
+    /// cut to [`limits::TITLE_MAX_CHARS`].
+    pub scope: Option<String>,
+    /// How much of it is used, in percent; past 100 when overdrawn.
+    pub percent: Option<u32>,
+    pub severity: Option<LimitSeverity>,
+    /// When the window starts over.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// The span a [`UsageLimit`] counts use over.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitWindow {
+    /// A few hours from the first use in it.
+    Session,
+    Weekly,
+}
+
+/// How close the agent says a [`UsageLimit`] is to stopping it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitSeverity {
+    Normal,
+    Warning,
+}
+
 /// Query string of `GET /v1/workdir/{changes,list,file}`. Names a session,
 /// not a raw path: the server resolves the root from the session's workdir,
 /// so a device reads only workdirs that sessions run in.
@@ -2701,6 +2756,8 @@ pub mod path {
     pub const CONVERSATIONS: &str = "/v1/conversations";
     /// What the server's data takes on its disk: [`crate::StorageReport`].
     pub const STORAGE: &str = "/v1/storage";
+    /// The agent's usage limits: [`crate::UsageLimitsResult`].
+    pub const USAGE_LIMITS: &str = "/v1/usage-limits";
     /// What changed in a session's workdir: [`crate::ChangesResult`].
     pub const WORKDIR_CHANGES: &str = "/v1/workdir/changes";
     /// One directory of a session's workdir: [`crate::ListResult`].

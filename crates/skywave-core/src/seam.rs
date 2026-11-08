@@ -28,7 +28,10 @@ use crate::store::{
     StoreError,
 };
 use crate::transport::TransportError;
-use crate::view::{ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId};
+use crate::view::{
+    ApprovalId, BlobId, CommandId, DeviceId, Link, Seq, SessionId, UsageLimitsResult,
+    UsageLimitsUnavailable,
+};
 use crate::workdir::{WorkdirAnswer, WorkdirAsk};
 
 /// The bytes a local crop is made from ([`Seam::local_crop`]).
@@ -91,6 +94,13 @@ pub enum Request {
     Workdir {
         req: u64,
         ask: WorkdirAsk,
+    },
+    /// Ask the server for its agent's usage limits, for the usage limits
+    /// page, within [`USAGE_LIMITS_TIMEOUT`](crate::USAGE_LIMITS_TIMEOUT).
+    /// The engine answers with [`Seam::usage_limits_answered`], naming
+    /// `req`.
+    UsageLimits {
+        req: u64,
     },
     /// Count the lines of the downloaded blob at `path`, for the crop page,
     /// as a crop counts them ([`skywave_proto::crop::count`]), off the
@@ -525,6 +535,47 @@ impl Seam {
                 Ok(((), Vec::new()))
             })
             .unwrap_or_else(|never| match never {});
+    }
+
+    /// The answer to [`Request::UsageLimits`] `req`. In one update: an
+    /// answer to an older request than the latest touches neither the
+    /// replica nor the model; a domain answer other than `Failed` is stored
+    /// ([`Store::put_usage_limits`](crate::Store::put_usage_limits)) and
+    /// shown. A transport error or a `Failed` stays in memory as the read's
+    /// failure, and the stored answer stays.
+    pub fn usage_limits_answered(
+        &self,
+        req: u64,
+        result: Result<UsageLimitsResult, TransportError>,
+    ) -> Result<(), CoreError> {
+        self.update(|state| {
+            if !state.model.usage_limits_awaited(req) {
+                return Ok(((), Vec::new()));
+            }
+            let answer = match result {
+                Err(error) => {
+                    state
+                        .model
+                        .usage_limits_failed(UsageLimitsUnavailable::from(error));
+                    return Ok(((), Vec::new()));
+                }
+                Ok(UsageLimitsResult::Failed { reason }) => {
+                    state
+                        .model
+                        .usage_limits_failed(UsageLimitsUnavailable::Failed(reason));
+                    return Ok(((), Vec::new()));
+                }
+                Ok(answer) => answer,
+            };
+            if let Err(error) = state.store.put_usage_limits(&answer) {
+                state
+                    .model
+                    .usage_limits_failed(UsageLimitsUnavailable::Failed(error.to_string()));
+                return Err(error.into());
+            }
+            state.model.usage_limits_stored(answer);
+            Ok(((), Vec::new()))
+        })
     }
 
     /// The answer to [`Request::CountLines`] `req`, an error when the file

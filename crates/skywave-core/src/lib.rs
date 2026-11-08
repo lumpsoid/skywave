@@ -35,6 +35,7 @@ mod encoding;
 mod engine;
 mod https;
 pub mod identity;
+mod limits;
 mod lines;
 pub mod lock;
 mod model;
@@ -57,7 +58,7 @@ pub use blobs::{blob_dir, read_head};
 pub use client::{Core, CoreError, ShutdownError, SubscriptionId};
 pub use engine::{
     CONVERSATIONS_TIMEOUT, Connector, DEFAULT_WAIT_SECS, EngineConfig, MAX_SERVER_ERRORS,
-    STORAGE_TIMEOUT, WALL_CHECK, WallClock, default_device_name,
+    STORAGE_TIMEOUT, USAGE_LIMITS_TIMEOUT, WALL_CHECK, WallClock, default_device_name,
 };
 pub use https::{HttpsTransport, TransportConfig};
 pub use identity::{DeviceKey, FileIdentity, Identity, IdentityError, PairedCredentials};
@@ -100,4 +101,8 @@ pub use view::{
 pub use view::{
     ChangeSet, ChangedFile, ChangesResult, DiffBody, DirEntry, EntryKind, FileBody, FileChange,
     FileResult, LinkTarget, ListResult,
+};
+pub use view::{
+    LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResult, UsageLimitsStatus,
+    UsageLimitsUnavailable, UsageLimitsView,
 };

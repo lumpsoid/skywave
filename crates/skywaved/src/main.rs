@@ -5,6 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
+use skywaved::agent::claude_code::limits::ClaudeUsageLimits;
 use skywaved::agent::claude_code::transcripts::{self, ClaudeTranscripts};
 use skywaved::agent::{NoOutsideConversations, OutsideConversations};
 use skywaved::config::{Config, ProcessEnv};
@@ -287,8 +288,16 @@ async fn serve(
             Arc::new(NoOutsideConversations)
         }
     };
+    // The account's usage limits, read by a process of the agent's own,
+    // run where sessions run (the data dir when no root is configured).
+    let limits_workdir = config.roots.first().unwrap_or(&config.data_dir).clone();
+    let usage_limits = Arc::new(ClaudeUsageLimits::new(
+        ClaudeCodeAdapter::new(config.agent.clone()),
+        limits_workdir,
+    ));
     let options = ServerOptions {
         outside,
+        usage_limits,
         log_file: config.log_file.clone(),
         ..ServerOptions::default()
     };

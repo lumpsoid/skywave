@@ -11,7 +11,7 @@ import 'package:skywave_gui/src/bindings/bindings.dart';
 /// turns them red; on a phone one chip shows the model and a tap lists
 /// them all), the rules granted here (a tap lists them), and the
 /// usage summary at the end, its fields dropped from the front when the
-/// line is short of room.
+/// line is short of room; a tap on it opens the usage limits.
 class StatusLine extends StatelessWidget {
   const StatusLine({required this.screen, required this.send, super.key});
 
@@ -236,7 +236,30 @@ class StatusLine extends StatelessWidget {
               ],
               const Spacer(),
               if (usage.isNotEmpty)
-                Text(usage, style: muted, maxLines: 1, softWrap: false),
+                Tooltip(
+                  message: 'Usage limits',
+                  child: InkWell(
+                    key: const Key('status-usage'),
+                    borderRadius: BorderRadius.circular(4),
+                    onTap: () => send.act(
+                      const ActionIntentNavigate(route: RouteView.usageLimits),
+                    ),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(
+                        minHeight: kMinInteractiveDimension,
+                      ),
+                      child: Center(
+                        widthFactor: 1,
+                        child: Text(
+                          usage,
+                          style: muted,
+                          maxLines: 1,
+                          softWrap: false,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
             ],
           ),
         );

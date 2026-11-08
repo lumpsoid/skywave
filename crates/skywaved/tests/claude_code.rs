@@ -14,6 +14,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use skywave_proto::{ContextId, Decision, SessionId};
+use skywaved::agent::claude_code::limits::{
+    ClaudeUsageLimits, USAGE_REQUEST_ID, get_usage_request, usage_answer,
+};
 use skywaved::agent::claude_code::protocol::{
     self, INTERRUPT_REASON, Output, PINNED_VERSION, Protocol,
 };
@@ -29,6 +32,7 @@ use skywaved::agent::{
     ResultDisplay, ResumeHandle, RuleScope, RuleSuggestion, StartSpec, SubagentFigures,
     ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
 };
+use skywaved::agent::{LimitSeverity, LimitWindow, LimitsError, UsageLimitsSource};
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
 
@@ -5496,4 +5500,132 @@ fn an_approval_from_no_live_task_is_the_turns() {
             AdapterEvent::TurnEnded(TurnOutcome::Completed),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Usage limits
+
+/// Waits until the fake CLI in `workdir` got its SIGTERM: a usage read
+/// stops its process once it has its answer.
+async fn terminated(workdir: &Path) {
+    let term = workdir.join("term.txt");
+    tokio::time::timeout(WAIT, async {
+        while !term.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no SIGTERM came");
+}
+
+#[tokio::test]
+async fn usage_limits_come_from_a_process_of_their_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = ClaudeUsageLimits::new(adapter(), tmp.path().to_owned());
+    let limits = source.read(std::time::Instant::now() + WAIT).await.unwrap();
+    let windows: Vec<_> = limits
+        .iter()
+        .map(|l| (l.window, l.scope.clone(), l.percent, l.severity))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            (
+                LimitWindow::Session,
+                None,
+                Some(75),
+                Some(LimitSeverity::Warning)
+            ),
+            (
+                LimitWindow::Weekly,
+                Some("Fable".to_owned()),
+                Some(0),
+                Some(LimitSeverity::Normal)
+            ),
+        ]
+    );
+    // A new conversation of its own, never a session's, and no handshake.
+    let argv = argv(tmp.path());
+    assert!(argv.iter().any(|a| a == "--session-id"));
+    assert!(!argv.iter().any(|a| a == "--resume"));
+    terminated(tmp.path()).await;
+}
+
+#[tokio::test]
+async fn a_refused_or_failed_usage_read_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = ClaudeUsageLimits::new(adapter(), tmp.path().to_owned());
+    let read = || source.read(std::time::Instant::now() + WAIT);
+
+    std::fs::write(tmp.path().join("usage-refused"), "").unwrap();
+    assert_eq!(
+        read().await,
+        Err(LimitsError::Failed("Not logged in".into()))
+    );
+    std::fs::remove_file(tmp.path().join("usage-refused")).unwrap();
+
+    std::fs::write(tmp.path().join("usage-crash"), "").unwrap();
+    let Err(LimitsError::Failed(why)) = read().await else {
+        panic!("expected a failure");
+    };
+    assert!(why.contains("Invalid API key"), "{why}");
+}
+
+#[tokio::test]
+async fn a_usage_read_gives_up_at_its_deadline_and_stops_the_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("usage-silent"), "").unwrap();
+    let source = ClaudeUsageLimits::new(adapter(), tmp.path().to_owned());
+    let read = source
+        .read(std::time::Instant::now() + Duration::from_millis(500))
+        .await;
+    assert!(matches!(read, Err(LimitsError::Failed(_))), "{read:?}");
+    terminated(tmp.path()).await;
+}
+
+/// The recorded `get_usage`: the adapter writes what was recorded, and
+/// reads every limit of the answer.
+#[test]
+fn replay_get_usage() {
+    let records = fixture("get_usage");
+    let written: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["dir"] == "in")
+        .map(|r| &r["msg"])
+        .collect();
+    assert_eq!(written, [&get_usage_request(USAGE_REQUEST_ID)]);
+    let answer = records
+        .iter()
+        .filter(|r| r["dir"] == "out")
+        .find_map(|r| usage_answer(&r["msg"], USAGE_REQUEST_ID))
+        .expect("an answer to the request")
+        .unwrap();
+    let read: Vec<_> = answer
+        .iter()
+        .map(|l| (l.window, l.scope.as_deref(), l.percent, l.severity))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (
+                LimitWindow::Session,
+                None,
+                Some(80),
+                Some(LimitSeverity::Warning)
+            ),
+            (
+                LimitWindow::Weekly,
+                None,
+                Some(22),
+                Some(LimitSeverity::Normal)
+            ),
+            (
+                LimitWindow::Weekly,
+                Some("Fable"),
+                Some(0),
+                Some(LimitSeverity::Normal)
+            ),
+        ]
+    );
+    assert!(answer.iter().all(|l| l.resets_at.is_some()));
 }

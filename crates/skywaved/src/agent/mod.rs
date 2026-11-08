@@ -111,12 +111,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use futures_util::future::BoxFuture;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{ContextId, Decision, SessionId, SessionOrigin};
 pub use skywave_proto::{
-    Effort, ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, RuleScope,
-    RuleSuggestion, TaskKind, TurnUsage,
+    Effort, LimitSeverity, LimitWindow, ModelChoice, PermissionMode, Question, QuestionAnswer,
+    QuestionOption, RuleScope, RuleSuggestion, TaskKind, TurnUsage, UsageLimit,
 };
 use tokio::sync::mpsc;
 
@@ -644,6 +645,43 @@ pub enum SourceError {
     Unavailable,
     #[error("listing the agent's conversations failed: {0}")]
     Failed(String),
+}
+
+/// The usage limits of the account the agent runs as, read when a device
+/// asks (`GET /v1/usage-limits`). They belong to the account, not to a
+/// session, so this is a shared source the API calls, apart from
+/// [`AgentAdapter`].
+pub trait UsageLimitsSource: Send + Sync + 'static {
+    /// The limits as the agent reports them now, in its order, uncut;
+    /// empty when the account is under none. Gives up at `deadline`.
+    fn read(
+        &self,
+        deadline: Instant,
+    ) -> BoxFuture<'_, std::result::Result<Vec<UsageLimit>, LimitsError>>;
+}
+
+/// Why [`UsageLimitsSource::read`] has no limits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LimitsError {
+    /// This agent cannot report usage limits.
+    #[error("the agent cannot report usage limits")]
+    Unavailable,
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// A source for an agent that reports no usage limits: every read is
+/// [`LimitsError::Unavailable`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoUsageLimits;
+
+impl UsageLimitsSource for NoUsageLimits {
+    fn read(
+        &self,
+        _deadline: Instant,
+    ) -> BoxFuture<'_, std::result::Result<Vec<UsageLimit>, LimitsError>> {
+        Box::pin(async { Err(LimitsError::Unavailable) })
+    }
 }
 
 /// One step of a conversation's history, as [`OutsideConversations::history`]

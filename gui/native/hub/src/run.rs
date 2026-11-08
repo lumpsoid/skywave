@@ -445,6 +445,7 @@ fn screen_kind(update: &ScreenUpdate) -> &'static str {
         ScreenView::Settings { .. } => "settings",
         ScreenView::Usage { .. } => "usage",
         ScreenView::Storage { .. } => "storage",
+        ScreenView::UsageLimits { .. } => "usage limits",
         ScreenView::Workdir { .. } => "workdir",
         ScreenView::Crop { .. } => "crop",
     }
