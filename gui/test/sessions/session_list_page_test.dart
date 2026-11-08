@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/rendering.dart';
 import 'package:skywave_gui/sessions/session_list_page.dart';
+import 'package:skywave_gui/sessions/session_row.dart';
 import 'package:skywave_gui/src/bindings/bindings.dart';
 
 SessionRowView sessionRow(
@@ -9,10 +11,12 @@ SessionRowView sessionRow(
   bool archived = false,
   bool deletable = false,
   String? blocked,
+  String? title,
 }) => SessionRowView(
   sessionId: id,
-  title: 'title $id',
-  workdir: '/srv/$id',
+  title: title ?? 'title $id',
+  workdir: '/srv/proj-$id',
+  workdirName: 'proj-$id',
   state: AgentState.awaitingApproval,
   badgeLabel: 'approval',
   unread: 3,
@@ -62,7 +66,7 @@ void main() {
     await pump(tester, list(rows: [sessionRow('a')]));
     for (final text in [
       'approval',
-      '/srv/a',
+      '/srv/proj-a',
       '3',
       '1 approval pending',
       'draft',
@@ -305,7 +309,7 @@ void main() {
       matchesSemantics(
         label:
             r'title a, rename queued, 3 unread, needs approval, '
-            r'1 approval pending, draft saved, /srv/a, $1.27, '
+            r'1 approval pending, draft saved, /srv/proj-a, $1.27, '
             'last active 2026-10-31 14:02 UTC',
         isButton: true,
         isFocusable: true,
@@ -366,5 +370,177 @@ void main() {
       findsOneWidget,
     );
     semantics.dispose();
+  });
+
+  testWidgets('a wide row keeps the badge, one title line and the path', (
+    tester,
+  ) async {
+    await pump(tester, list(rows: [sessionRow('a')]));
+    expect(find.byType(StateBadge), findsOneWidget);
+    expect(find.byKey(const Key('row-state-a')), findsNothing);
+    expect(find.text('/srv/proj-a'), findsOneWidget);
+    expect(find.text('proj-a'), findsNothing);
+    expect(tester.widget<Text>(find.textContaining('title a')).maxLines, 1);
+  });
+
+  group('on a phone', () {
+    Future<void> phone(
+      WidgetTester tester,
+      ScreenViewSessionList screen,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(360, 780)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pump(tester, screen);
+    }
+
+    Future<void> openSheet(WidgetTester tester) async {
+      await tester.tap(find.byKey(const Key('row-menu-a')));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsOneWidget);
+    }
+
+    Future<void> tapInSheet(WidgetTester tester, String text) async {
+      await tester.tap(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text(text),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a row shows a state dot, two title lines and the folder '
+        'name, with nothing clipped', (tester) async {
+      final semantics = tester.ensureSemantics();
+      // Wider than the title's room on a phone, not twice as wide.
+      const long = 'too long for one';
+      await phone(tester, list(rows: [sessionRow('a', title: long)]));
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const Key('row-state-a')), findsOneWidget);
+      expect(find.byType(StateBadge), findsNothing);
+      expect(find.text('approval'), findsNothing);
+      expect(find.text('proj-a'), findsOneWidget);
+      expect(find.text('/srv/proj-a'), findsNothing);
+      for (final text in [
+        '3',
+        '1 approval pending',
+        'draft',
+        r'$1.27 · 2026-10-31 14:02 UTC',
+      ]) {
+        expect(find.text(text), findsOneWidget, reason: text);
+      }
+      final title = find.textContaining(long);
+      expect(tester.widget<Text>(title).maxLines, 2);
+      expect(tester.getSize(title).height, greaterThan(30));
+      expect(
+        tester
+            .renderObject<RenderParagraph>(
+              find.descendant(of: title, matching: find.byType(RichText)),
+            )
+            .didExceedMaxLines,
+        isFalse,
+      );
+      // The screen reader still hears the state and the whole path.
+      expect(
+        find.bySemanticsLabel(RegExp('^$long, rename queued, .*/srv/proj-a, ')),
+        findsOneWidget,
+      );
+      semantics.dispose();
+    });
+
+    testWidgets('the menu is a sheet with the full name and path; a tap '
+        'closes it and runs the action', (tester) async {
+      await phone(tester, list(rows: [sessionRow('a')]));
+      await openSheet(tester);
+      expect(find.widgetWithText(SelectableText, 'title a'), findsOneWidget);
+      expect(
+        find.widgetWithText(SelectableText, '/srv/proj-a'),
+        findsOneWidget,
+      );
+      expect(find.text('Delete from this device'), findsNothing);
+      await tapInSheet(tester, 'Rename');
+      expect(find.byType(BottomSheet), findsNothing);
+
+      await openSheet(tester);
+      await tapInSheet(tester, 'Archive');
+      expect(find.byType(BottomSheet), findsNothing);
+
+      await pump(
+        tester,
+        list(
+          kind: ListKindView.archived,
+          rows: [sessionRow('a', archived: true)],
+        ),
+      );
+      await openSheet(tester);
+      await tapInSheet(tester, 'Unarchive');
+      expect(sent, [
+        const GuiIntentRenameOpen(sessionId: 'a'),
+        const GuiIntentAct(
+          action: ActionIntentSetSessionArchived(
+            sessionId: 'a',
+            archived: true,
+          ),
+        ),
+        const GuiIntentAct(
+          action: ActionIntentSetSessionArchived(
+            sessionId: 'a',
+            archived: false,
+          ),
+        ),
+      ]);
+    });
+
+    testWidgets('delete from the sheet asks first, then deletes', (
+      tester,
+    ) async {
+      await phone(
+        tester,
+        list(
+          kind: ListKindView.archived,
+          rows: [sessionRow('a', archived: true, deletable: true)],
+        ),
+      );
+      await openSheet(tester);
+      final delete = tester.widget<Text>(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text('Delete from this device'),
+        ),
+      );
+      expect(
+        delete.style?.color,
+        Theme.of(tester.element(find.byType(BottomSheet))).colorScheme.error,
+      );
+      await tapInSheet(tester, 'Delete from this device');
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(find.textContaining('It stays on the server'), findsOneWidget);
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+      expect(sent, [
+        const GuiIntentAct(
+          action: ActionIntentDeleteSessionLocally(sessionId: 'a'),
+        ),
+      ]);
+    });
+
+    testWidgets('a blocked delete from the sheet says why', (tester) async {
+      const why = 'cannot delete title a yet: answer or cancel first';
+      await phone(
+        tester,
+        list(
+          kind: ListKindView.archived,
+          rows: [sessionRow('a', archived: true, blocked: why)],
+        ),
+      );
+      await openSheet(tester);
+      await tapInSheet(tester, 'Delete from this device');
+      expect(find.text(why), findsOneWidget);
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      expect(sent, isEmpty);
+    });
   });
 }

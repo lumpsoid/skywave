@@ -226,6 +226,8 @@ pub struct SessionRowView {
     pub session_id: String,
     pub title: String,
     pub workdir: Option<String>,
+    /// The workdir's last component, `skywave`, for a narrow list.
+    pub workdir_name: Option<String>,
     pub state: AgentState,
     /// `idle`, `working`, `approval`, `error`, `stopped`.
     pub badge_label: String,
