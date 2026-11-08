@@ -2037,6 +2037,100 @@ void main() {
     expect(sent.last, const GuiIntentRenameSubmit(name: 'better'));
   });
 
+  group('on a phone', () {
+    Future<void> phone(
+      WidgetTester tester,
+      SessionScreen screen,
+      List<GuiIntent> sent,
+    ) async {
+      tester.view
+        ..physicalSize = const Size(360, 780)
+        ..devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await pumpSession(
+        tester,
+        screen: screen,
+        timeline: holding([]),
+        sent: sent,
+      );
+    }
+
+    testWidgets('the header keeps the title, the workdir name, interrupt '
+        'and More', (tester) async {
+      await phone(tester, screenWith(), <GuiIntent>[]);
+      expect(find.text('work'), findsOneWidget);
+      expect(find.text('skywave'), findsOneWidget);
+      expect(find.text('/home/me/skywave'), findsNothing);
+      expect(find.byTooltip('Interrupt (Ctrl+X)'), findsOneWidget);
+      expect(find.byTooltip('More'), findsOneWidget);
+      for (final tooltip in [
+        'Workdir',
+        'Search (Ctrl+F)',
+        'Conversation only: hide tool calls',
+      ]) {
+        expect(find.byTooltip(tooltip), findsNothing, reason: tooltip);
+      }
+    });
+
+    testWidgets('More opens a sheet with the name, the path and every '
+        'action; a tap closes it', (tester) async {
+      final sent = <GuiIntent>[];
+      await phone(tester, screenWith(), sent);
+      Future<void> more() async {
+        await tester.tap(find.byTooltip('More'));
+        await tester.pumpAndSettle();
+      }
+
+      await more();
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(find.widgetWithText(SelectableText, 'work'), findsOneWidget);
+      expect(find.text('/home/me/skywave'), findsOneWidget);
+      for (final title in [
+        'New session here',
+        'New context',
+        'Contexts…',
+        'Background work',
+        'Stop agent',
+      ]) {
+        expect(find.text(title), findsOneWidget, reason: title);
+      }
+
+      for (final (label, intent) in [
+        (
+          'Workdir',
+          const GuiIntentAct(action: ActionIntentOpenWorkdir(sessionId: 's1')),
+        ),
+        ('Rename', const GuiIntentRenameOpen(sessionId: 's1')),
+        ('Conversation only', const GuiIntentToggleConversationOnly()),
+        ('Search', const GuiIntentSearchTyped(query: '')),
+      ]) {
+        await tester.tap(find.byTooltip(label));
+        await tester.pumpAndSettle();
+        expect(sent.last, intent, reason: label);
+        expect(find.byType(BottomSheet), findsNothing, reason: label);
+        await more();
+      }
+
+      await tester.tap(find.text('Stop agent'));
+      await tester.pumpAndSettle();
+      expect(
+        sent.last,
+        const GuiIntentAct(action: ActionIntentStopSession(sessionId: 's1')),
+      );
+      expect(find.byType(BottomSheet), findsNothing);
+    });
+
+    testWidgets('the sheet shows conversation only as on', (tester) async {
+      await phone(tester, screenWith(conversationOnly: true), <GuiIntent>[]);
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      final toggle = tester.widget<IconButton>(
+        find.widgetWithIcon(IconButton, Icons.forum),
+      );
+      expect(toggle.isSelected, isTrue);
+    });
+  });
+
   group('the status line', () {
     testWidgets('a mode is picked; bypass only once confirmed', (tester) async {
       final sent = <GuiIntent>[];
@@ -2312,7 +2406,7 @@ void main() {
       final bar = tester.getRect(find.byType(AppBar));
       final title = tester.getRect(find.text('work'));
       final workdir = tester.getRect(
-        find.textContaining('/home/me/work', findRichText: true),
+        find.textContaining('skywave', findRichText: true),
       );
       final state = tester.getRect(
         find.textContaining('idle', findRichText: true),
@@ -2410,7 +2504,7 @@ void main() {
       await tester.pump();
       expect(find.textContaining('working', findRichText: true), findsOne);
       expect(find.byTooltip('agent working'), findsOneWidget);
-      expect(find.text('/home/me/work'), findsOneWidget);
+      expect(find.text('/home/me/skywave'), findsOneWidget);
     });
 
     testWidgets('on a wide window the header keeps to the timeline column', (
@@ -2905,7 +2999,7 @@ void main() {
       );
       expect(find.text('Explore sync'), findsOneWidget);
       expect(find.text('work'), findsOneWidget);
-      expect(find.text('/home/me/work'), findsNothing);
+      expect(find.text('/home/me/skywave'), findsNothing);
       expect(
         find.text('running · 3 steps · Write src/sync.rs'),
         findsOneWidget,

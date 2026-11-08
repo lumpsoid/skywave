@@ -10,6 +10,10 @@ double lineHeightOf(BuildContext context, TextStyle style) =>
     MediaQuery.textScalerOf(context).scale(style.fontSize ?? 14) *
     (style.height ?? 1.2);
 
+/// Whether the window is phone-narrow (Material's compact width, under
+/// 600 dp): a header there keeps its title and only its urgent actions.
+bool isCompact(BuildContext context) => MediaQuery.sizeOf(context).width < 600;
+
 /// A tool kind's icon.
 IconData toolIcon(ToolKindView kind) => switch (kind) {
   ToolKindView.fileWrite => Icons.edit_document,
