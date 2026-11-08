@@ -20,6 +20,7 @@ use skywave_present::format::{
     delivery_label, dollars, download_state, fail_reason, import_finished_line, moved_from_line,
     outgoing_label, seconds, subagent_status, took_label, turn_time,
 };
+use skywave_present::markdown as md;
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, change_note, delivery, sections, selectable, starts_turn,
     unseen_blob,
@@ -28,8 +29,9 @@ use skywave_present::text::{clean_line, clean_text};
 
 use crate::crop::target_view;
 use crate::signals::{
-    BlobFacts, BlobStateKind, LineStyle, OutgoingState, OutgoingView, RowKind, SectionFormat,
-    SectionLine, SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
+    BlobFacts, BlobStateKind, LineStyle, MarkdownAlign, MarkdownBlock, MarkdownCell, MarkdownKind,
+    MarkdownRow, MarkdownSpan, OutgoingState, OutgoingView, RowKind, SectionFormat, SectionLine,
+    SectionView, TimelineRow, TimelineUpdate, ToolFacts, ToolKindView, ToolState,
 };
 
 /// Most of a blob an expanded section shows.
@@ -193,6 +195,7 @@ fn row(
         author: None,
         own: false,
         text: String::new(),
+        markdown: Vec::new(),
         mark: None,
         time_label: None,
         at_ms: None,
@@ -250,6 +253,7 @@ fn row(
         }
         Entry::AgentMessage { text, .. } => {
             set(&mut row, RowKind::AgentMessage, clean_text(text));
+            row.markdown = markdown(text);
             row.author = Some("agent".to_owned());
         }
         Entry::AgentErrored { message } => {
@@ -305,6 +309,7 @@ fn row(
                 }
                 ImportedEntry::AgentMessage { text, .. } => {
                     set(&mut row, RowKind::ImportedAgentMessage, clean_text(text));
+                    row.markdown = markdown(text);
                     row.author = Some("agent".to_owned());
                 }
                 ImportedEntry::Tool(view) => {
@@ -765,7 +770,10 @@ fn section_view(section: &Section, expanded: bool, heads: &mut BlobHeads) -> Opt
         };
         shown
     };
-    Some(view_of(section, lines, note, cut_short))
+    let whole = (expanded && section.message).then(|| markdown(&lines.join("\n")));
+    let mut view = view_of(section, lines, note, cut_short);
+    view.markdown = whole.unwrap_or_default();
+    Some(view)
 }
 
 /// A section's head as the approval panel shows it: at most `max` lines of
@@ -799,9 +807,66 @@ fn view_of(
                 text,
             })
             .collect(),
+        markdown: Vec::new(),
         note,
         blob: section.blob().map(blob_facts),
         cut_short,
+    }
+}
+
+/// An agent message's `text` as the GUI's markdown blocks.
+fn markdown(text: &str) -> Vec<MarkdownBlock> {
+    let spans = |spans: Vec<md::Span>| spans.into_iter().map(span).collect();
+    md::blocks(text)
+        .into_iter()
+        .map(|block| MarkdownBlock {
+            kind: match block.kind {
+                md::BlockKind::Paragraph(s) => MarkdownKind::Paragraph { spans: spans(s) },
+                md::BlockKind::Heading { level, spans: s } => MarkdownKind::Heading {
+                    level,
+                    spans: spans(s),
+                },
+                md::BlockKind::Code { lang, text } => MarkdownKind::Code { lang, text },
+                md::BlockKind::Rule => MarkdownKind::Rule,
+                md::BlockKind::Table { align, head, rows } => {
+                    let cells = |cells: Vec<Vec<md::Span>>| {
+                        cells
+                            .into_iter()
+                            .map(|s| MarkdownCell { spans: spans(s) })
+                            .collect()
+                    };
+                    MarkdownKind::Table {
+                        align: align
+                            .into_iter()
+                            .map(|a| match a {
+                                md::Align::Left => MarkdownAlign::Left,
+                                md::Align::Center => MarkdownAlign::Center,
+                                md::Align::Right => MarkdownAlign::Right,
+                            })
+                            .collect(),
+                        head: cells(head),
+                        rows: rows
+                            .into_iter()
+                            .map(|row| MarkdownRow { cells: cells(row) })
+                            .collect(),
+                    }
+                }
+            },
+            depth: block.depth,
+            quote: block.quote,
+            marker: block.marker,
+        })
+        .collect()
+}
+
+fn span(span: md::Span) -> MarkdownSpan {
+    MarkdownSpan {
+        text: span.text,
+        bold: span.style.bold,
+        italic: span.style.italic,
+        code: span.style.code,
+        strike: span.style.strike,
+        link: span.link,
     }
 }
 
@@ -1293,6 +1358,92 @@ mod tests {
         ] {
             assert_eq!(shown(state, true), (None, label.to_owned()));
         }
+    }
+
+    #[test]
+    fn an_agent_message_comes_as_markdown_and_others_do_not() {
+        let id = CommandId::new();
+        let rows = rows_of(vec![
+            agent(1, 0, "**Done**: see `a.rs`"),
+            logged_message(2, id, "**not** markdown"),
+        ])
+        .rows;
+        let span = |text: &str, bold, code| MarkdownSpan {
+            text: text.to_owned(),
+            bold,
+            italic: false,
+            code,
+            strike: false,
+            link: None,
+        };
+        assert_eq!(
+            rows[0].markdown,
+            [MarkdownBlock {
+                kind: MarkdownKind::Paragraph {
+                    spans: vec![
+                        span("Done", true, false),
+                        span(": see ", false, false),
+                        span("a.rs", false, true),
+                    ]
+                },
+                depth: 0,
+                quote: 0,
+                marker: None,
+            }]
+        );
+        // The raw text stays, for a copy and for a search's marks.
+        assert_eq!(rows[0].text, "**Done**: see `a.rs`");
+        assert_eq!(rows[1].markdown, []);
+    }
+
+    #[test]
+    fn a_long_messages_whole_is_markdown_only_when_expanded() {
+        let whole = FullView::Inline("# Title\n\nbody".to_owned());
+        let section = Section {
+            text: "",
+            lines: None,
+            format: BodyFormat::Text,
+            numbered: false,
+            error: false,
+            full: Some(&whole),
+            hidden: false,
+            input: false,
+            message: true,
+            asked: false,
+        };
+        let expanded = section_view(&section, true, &mut BlobHeads::default()).unwrap();
+        assert_eq!(
+            expanded
+                .markdown
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>(),
+            [
+                &MarkdownKind::Heading {
+                    level: 1,
+                    spans: vec![MarkdownSpan {
+                        text: "Title".to_owned(),
+                        bold: false,
+                        italic: false,
+                        code: false,
+                        strike: false,
+                        link: None,
+                    }]
+                },
+                &MarkdownKind::Paragraph {
+                    spans: vec![MarkdownSpan {
+                        text: "body".to_owned(),
+                        bold: false,
+                        italic: false,
+                        code: false,
+                        strike: false,
+                        link: None,
+                    }]
+                },
+            ]
+        );
+        let collapsed = section_view(&section, false, &mut BlobHeads::default()).unwrap();
+        assert_eq!(collapsed.markdown, []);
     }
 
     #[test]
