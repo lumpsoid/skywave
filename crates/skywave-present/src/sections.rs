@@ -412,18 +412,28 @@ pub fn match_hidden(entry: &Entry, query: &Query) -> bool {
     !head.iter().any(|text| query.matches(text))
 }
 
-/// The first blob behind `entry` that nobody asked for yet, or whose
-/// download failed; what a download request fetches.
-pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
+/// Every blob behind `entry` that nobody asked for yet, in section order:
+/// what expanding it fetches. A failed one is not among them, it waits for
+/// an explicit retry ([`wanted_blob`]); nor does it hold back the others.
+pub fn unasked_blobs(entry: &Entry) -> Vec<&BlobView> {
     sections(entry)
         .into_iter()
         .filter_map(|s| s.blob())
-        .find(|blob| {
-            matches!(
-                blob.state,
-                BlobState::NotDownloaded { .. } | BlobState::Failed { .. }
-            )
-        })
+        .filter(|blob| matches!(blob.state, BlobState::NotDownloaded { .. }))
+        .collect()
+}
+
+/// What one download request on `entry` fetches: the first blob nobody
+/// asked for yet, else the first whose download failed (a retry). Blobs
+/// nobody asked for go first, so a blob that keeps failing never keeps
+/// another from being fetched.
+pub fn wanted_blob(entry: &Entry) -> Option<&BlobView> {
+    unasked_blobs(entry).into_iter().next().or_else(|| {
+        sections(entry)
+            .into_iter()
+            .filter_map(|s| s.blob())
+            .find(|blob| matches!(blob.state, BlobState::Failed { .. }))
+    })
 }
 
 /// What a copy takes from an item: text at hand, or a blob's whole
