@@ -198,10 +198,9 @@ pub(crate) struct Model {
     /// through it ([`Model::full_view`]).
     fates: HashMap<BlobId, BlobFate>,
     /// Blobs asked for and not yet taken by a download; in memory only, as
-    /// the blob queue forgets un-started requests on a restart too.
+    /// the blob queue forgets un-started requests on a restart too. A
+    /// `Failed` blob asked for again shows as requested.
     wanted: HashSet<BlobId>,
-    /// Why the last download of a blob was given up; in memory only.
-    failed: HashMap<BlobId, String>,
     /// This device's unsent messages and shell commands, as stored.
     drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// What each session's composer writes where it is not the agent, as
@@ -295,7 +294,6 @@ impl Model {
             blobs: BTreeMap::new(),
             fates: HashMap::new(),
             wanted: HashSet::new(),
-            failed: HashMap::new(),
             drafts: HashMap::new(),
             composer_modes: HashMap::new(),
             draft_rev: 0,
@@ -746,10 +744,12 @@ impl Model {
                 None | Some(BlobStatus::Available { .. }) => Vec::new(),
                 Some(status) => {
                     // A download already running shows its progress instead.
-                    if *status == BlobStatus::NotDownloaded {
+                    if matches!(
+                        status,
+                        BlobStatus::NotDownloaded | BlobStatus::Failed { .. }
+                    ) {
                         self.wanted.insert(id);
                     }
-                    self.failed.remove(&id);
                     vec![Effect::Request(Request::DownloadBlob(id))]
                 }
             },
@@ -1006,10 +1006,7 @@ impl Model {
     fn want_shown_blob(&mut self) -> Option<Request> {
         let id = self.shown_blob()?.id;
         let record = self.blobs.get(&id)?;
-        if record.status != BlobStatus::NotDownloaded
-            || self.wanted.contains(&id)
-            || self.failed.contains_key(&id)
-        {
+        if record.status != BlobStatus::NotDownloaded || self.wanted.contains(&id) {
             return None;
         }
         self.wanted.insert(id);
@@ -1730,7 +1727,6 @@ impl Model {
         let had_drafts = !self.drafts.is_empty();
         self.reload(snapshot);
         self.wanted.clear();
-        self.failed.clear();
         self.alerted.clear();
         self.alerted_at.clear();
         self.completer = Completer::default();
@@ -1763,12 +1759,10 @@ impl Model {
         }
     }
 
-    /// The blob left the replica: its record goes, with the request for it
-    /// and why it last failed.
+    /// The blob left the replica: its record goes, with the request for it.
     fn forget_blob(&mut self, id: BlobId) {
         self.blobs.remove(&id);
         self.wanted.remove(&id);
-        self.failed.remove(&id);
     }
 
     /// The `from` of each crop pending to produce `into`: a `Cropped` fate
@@ -1818,18 +1812,8 @@ impl Model {
 
     pub(crate) fn blob_status(&mut self, id: BlobId, status: BlobStatus) {
         self.wanted.remove(&id);
-        self.failed.remove(&id);
         if let Some(blob) = self.blobs.get_mut(&id) {
             blob.status = status;
-        }
-    }
-
-    /// The download of `id` was given up: it is `NotDownloaded` again, and
-    /// says why until it is asked for again.
-    pub(crate) fn blob_failed(&mut self, id: BlobId, reason: String) {
-        self.blob_status(id, BlobStatus::NotDownloaded);
-        if self.blobs.contains_key(&id) {
-            self.failed.insert(id, reason);
         }
     }
 
@@ -3353,13 +3337,15 @@ impl Model {
         };
         let size = record.size;
         let state = match &record.status {
-            BlobStatus::NotDownloaded => match self.failed.get(&blob.id) {
-                Some(reason) => BlobState::Failed {
-                    size,
-                    reason: reason.clone(),
-                },
-                None if self.wanted.contains(&blob.id) => BlobState::Requested { size },
-                None => BlobState::NotDownloaded { size },
+            BlobStatus::NotDownloaded | BlobStatus::Failed { .. }
+                if self.wanted.contains(&blob.id) =>
+            {
+                BlobState::Requested { size }
+            }
+            BlobStatus::NotDownloaded => BlobState::NotDownloaded { size },
+            BlobStatus::Failed { reason } => BlobState::Failed {
+                size,
+                reason: reason.clone(),
             },
             BlobStatus::Downloading { got, .. } => BlobState::Downloading {
                 got: *got,
@@ -5909,8 +5895,12 @@ mod tests {
         assert_eq!(output_state(&f), BlobState::Requested { size: 10_000 });
 
         // A given-up download says why; asking again requests it again.
-        f.model
-            .blob_failed(output.id, "blob size mismatch".to_owned());
+        f.model.blob_status(
+            output.id,
+            BlobStatus::Failed {
+                reason: "blob size mismatch".to_owned(),
+            },
+        );
         assert_eq!(
             output_state(&f),
             BlobState::Failed {
@@ -10371,7 +10361,12 @@ mod tests {
             f.dispatch(Action::ShowWorkdir(WorkdirPane::Changes));
             assert!(f.dispatch(Action::ShowWorkdir(pane.clone())).is_empty());
             // A failed download is asked for again by hand only.
-            f.model.blob_failed(diff.id, "size mismatch".into());
+            f.model.blob_status(
+                diff.id,
+                BlobStatus::Failed {
+                    reason: "size mismatch".into(),
+                },
+            );
             f.dispatch(Action::Back);
             assert!(f.dispatch(Action::ShowWorkdir(pane)).is_empty());
 

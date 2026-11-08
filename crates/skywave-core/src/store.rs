@@ -363,6 +363,22 @@ CREATE TABLE IF NOT EXISTS blob_fates (
     seq INTEGER NOT NULL
 );
 "#,
+    r#"
+-- Why the download of a `not_downloaded` blob was given up
+-- (BlobStatus::Failed), so a restart keeps it failed and `Eager` leaves it
+-- until it is asked for again. Any other status written deletes the row,
+-- as does the trigger with the blob's row. A table, not a state, so the
+-- `blobs` CHECK stays and this reruns over a current schema; a replica
+-- from before this kept failures in memory only: nothing to backfill.
+CREATE TABLE IF NOT EXISTS blob_failures (
+    blob_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS blob_failures_go_with_blobs AFTER DELETE ON blobs
+BEGIN
+    DELETE FROM blob_failures WHERE blob_id = old.id;
+END;
+"#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -619,6 +635,12 @@ impl OutboxEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlobStatus {
     NotDownloaded,
+    /// Not downloaded: the download was given up for `reason`. It stays
+    /// so, across restarts and whatever the [`BlobPolicy`], until it is
+    /// asked for again.
+    Failed {
+        reason: String,
+    },
     /// `got` bytes of the content are in the partial file at `path`.
     Downloading {
         got: u64,
@@ -1524,21 +1546,33 @@ impl Store {
             .optional()?)
     }
 
+    /// Writes `status` as `id`'s; a failure's reason goes to
+    /// `blob_failures`, and any other status clears it, in one transaction.
     pub fn set_blob_status(&self, id: BlobId, status: &BlobStatus) -> Result<(), StoreError> {
         let (state, got, path) = match status {
-            BlobStatus::NotDownloaded => ("not_downloaded", None, None),
+            BlobStatus::NotDownloaded | BlobStatus::Failed { .. } => ("not_downloaded", None, None),
             BlobStatus::Downloading { got, path } => {
                 ("downloading", Some(u64_sql(*got)?), Some(path_sql(path)?))
             }
             BlobStatus::Available { path } => ("available", None, Some(path_sql(path)?)),
         };
-        let changed = self.conn.execute(
+        let id_sql = id.0.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE blobs SET state = ?2, got = ?3, path = ?4 WHERE id = ?1",
-            params![id.0.to_string(), state, got, path],
+            params![id_sql, state, got, path],
         )?;
         if changed == 0 {
             return Err(StoreError::UnknownBlob(id));
         }
+        tx.execute("DELETE FROM blob_failures WHERE blob_id = ?1", [&id_sql])?;
+        if let BlobStatus::Failed { reason } = status {
+            tx.execute(
+                "INSERT INTO blob_failures (blob_id, reason) VALUES (?1, ?2)",
+                params![id_sql, reason],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2436,14 +2470,19 @@ fn register_blob(tx: &Transaction<'_>, blob: &BlobRef) -> Result<bool, StoreErro
 /// Columns [`blob_from_row`] reads, from `blobs`.
 const BLOB_COLUMNS: &str = "id, size, state, got, path,
     EXISTS (SELECT 1 FROM workdir_blob_refs r WHERE r.blob_id = blobs.id),
-    (SELECT h.sha256 FROM blob_hashes h WHERE h.blob_id = blobs.id)";
+    (SELECT h.sha256 FROM blob_hashes h WHERE h.blob_id = blobs.id),
+    (SELECT f.reason FROM blob_failures f WHERE f.blob_id = blobs.id)";
 
 fn blob_from_row(row: &Row<'_>) -> rusqlite::Result<BlobRecord> {
     let state: String = row.get(2)?;
     let got: Option<i64> = row.get(3)?;
     let path: Option<String> = row.get(4)?;
+    let failed: Option<String> = row.get(7)?;
     let status = match (state.as_str(), got, path) {
-        ("not_downloaded", _, _) => BlobStatus::NotDownloaded,
+        ("not_downloaded", _, _) => match failed {
+            Some(reason) => BlobStatus::Failed { reason },
+            None => BlobStatus::NotDownloaded,
+        },
         ("downloading", Some(got), Some(path)) => BlobStatus::Downloading {
             got: u64::try_from(got).map_err(|e| bad_value(3, Type::Integer, e))?,
             path: path.into(),
