@@ -48,13 +48,25 @@ pub use read::{READ_MARK_EVERY, ReadMarker};
 pub use search::{Jump, TimelineSearch};
 pub use shell::shell_stop;
 
-use skywave_core::{AgentWork, ApprovalPrompt, Outgoing, PendingSession, SessionListView};
+use skywave_core::{
+    AgentWork, Answer, ApprovalPrompt, Outgoing, PendingSession, QuestionPrompt, SessionListView,
+};
 
 /// This device has not answered `prompt`, or its answer was refused in a
 /// way that leaves it open to another: it may be answered (again), and a
 /// rule list opened for it stays up.
 pub fn unanswered(prompt: &ApprovalPrompt) -> bool {
-    prompt.answer.as_ref().is_none_or(|answer| answer.retryable)
+    open_to(prompt.answer.as_ref())
+}
+
+/// [`unanswered`] for a question prompt: it may be answered (again), and
+/// its picker stays up.
+pub fn question_unanswered(prompt: &QuestionPrompt) -> bool {
+    open_to(prompt.answer.as_ref())
+}
+
+fn open_to(answer: Option<&Answer>) -> bool {
+    answer.is_none_or(|answer| answer.retryable)
 }
 
 /// The refused session creation a dismissal takes off the list: the
@@ -142,6 +154,7 @@ pub(crate) mod tests {
             state: SessionState::Idle,
             timeline,
             pending_approval: None,
+            pending_question: None,
             rules: Vec::new(),
             usage: None,
             agent: Default::default(),

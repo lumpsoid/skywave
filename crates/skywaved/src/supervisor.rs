@@ -1127,6 +1127,22 @@ impl<A: AgentAdapter> Supervisor<A> {
                     tracing::warn!(session = %session_id.0, %error, "cannot answer approval");
                 }
             }
+            EventKind::QuestionAnswered { id, answers, .. } => {
+                let Some(running) = self.running.get_mut(&session_id) else {
+                    return Ok(());
+                };
+                // `None` as for an approval: its agent run is gone.
+                let Some(request) = running.mapper.take_approval(*id) else {
+                    return Ok(());
+                };
+                if let Err(error) = running
+                    .session
+                    .answer_question(request, answers.clone())
+                    .await
+                {
+                    tracing::warn!(session = %session_id.0, %error, "cannot answer question");
+                }
+            }
             EventKind::TurnInterrupted => {
                 let Some(running) = self.running.get_mut(&session_id) else {
                     return Ok(());
@@ -1960,6 +1976,7 @@ fn reacts(kind: &EventKind) -> bool {
         kind,
         EventKind::UserMessage { .. }
             | EventKind::ApprovalResolved { .. }
+            | EventKind::QuestionAnswered { .. }
             | EventKind::TurnInterrupted
             | EventKind::SessionStopped
             | EventKind::ContextStarted { .. }

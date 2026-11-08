@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use skywave_proto::{
     BackgroundTask, BlobRef, Command, CommandKind, CommandResult, ConversationsResult, DeviceInfo,
-    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, RejectReason,
-    RuleSuggestion, SessionOrigin, SessionState as LogState, TaskId, ToolCall, ToolKind,
-    ToolResult,
+    DirsResult, Event, EventBatch, EventKind, Fingerprint, Full, ImportedItem, QuestionAnswer,
+    RejectReason, RuleSuggestion, SessionOrigin, SessionState as LogState, TaskId, ToolCall,
+    ToolKind, ToolResult, answers_fit,
 };
 
 use crate::action::{Action, Route};
@@ -41,12 +41,12 @@ use crate::view::{
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
     LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
-    PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
-    SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
-    SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
-    StorageReport, StorageView, SubagentHeader, SubagentStatus, SubagentUsage, TimelineItem,
-    ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView, ViewState, WorkdirBody,
-    WorkdirPane, WorkdirView,
+    PendingApprovalRef, PendingSession, QUESTION_TOOL, Question, QuestionPrompt, RunWhen,
+    SHELL_ALERT_AFTER, Screen, Seq, SessionId, SessionListView, SessionRef, SessionRow,
+    SessionState, SessionView, SettingChange, SettingsView, ShellAlert, ShellRun, ShellRunState,
+    ShellView, Snippet, SnippetId, StorageReport, StorageView, SubagentHeader, SubagentStatus,
+    SubagentUsage, TimelineItem, ToolApproval, ToolOutcome, ToolView, UsageSession, UsageView,
+    ViewState, WorkdirBody, WorkdirPane, WorkdirView,
 };
 use crate::workdir::{WorkdirAnswer, WorkdirAsk, Workdirs, parent};
 
@@ -585,10 +585,21 @@ impl Model {
             Action::EditQueued(id) => self.withdraw(id, true),
             Action::ResolveApproval { id, decision, rule } => {
                 let granted = |rule| decision == Decision::Approve && self.offers(id, rule);
-                if !self.can_answer(id) || rule.is_some_and(|rule| !granted(rule)) {
+                // A question takes answers; only a denial declines it.
+                let asks = decision == Decision::Approve && self.asked(id).is_some();
+                if !self.can_answer(id) || asks || rule.is_some_and(|rule| !granted(rule)) {
                     return Vec::new();
                 }
                 self.enqueue(CommandKind::ResolveApproval { id, decision, rule })
+            }
+            Action::AnswerQuestion { id, answers } => {
+                let fits = self
+                    .asked(id)
+                    .is_some_and(|questions| answers_fit(questions, &answers));
+                if !self.can_answer(id) || !fits {
+                    return Vec::new();
+                }
+                self.enqueue(CommandKind::AnswerQuestion { id, answers })
             }
             Action::Interrupt { session_id } => {
                 if self.summary(session_id).is_none() {
@@ -1297,6 +1308,23 @@ impl Model {
                     if *requested == id && usize::from(rule) < suggestions.len())
             })
         })
+    }
+
+    /// The questions of question `id`, asked in the open session; `None`
+    /// for a plain approval or one asked elsewhere.
+    fn asked(&self, id: ApprovalId) -> Option<&[Question]> {
+        self.open
+            .as_ref()?
+            .events
+            .iter()
+            .find_map(|(_, event)| match &event.kind {
+                EventKind::QuestionAsked {
+                    id: asked,
+                    questions,
+                    ..
+                } if *asked == id => Some(questions.as_slice()),
+                _ => None,
+            })
     }
 
     /// The session of the approval [`Action::OpenNextApproval`] goes to.
@@ -2198,6 +2226,26 @@ impl Model {
                 _ => None,
             })
         });
+        let pending_question = summary.pending_approval().and_then(|approval| {
+            events.iter().find_map(|(_, event)| match &event.kind {
+                EventKind::QuestionAsked {
+                    id,
+                    call,
+                    questions,
+                } if *id == approval => Some(QuestionPrompt {
+                    id: *id,
+                    call: *call,
+                    from: call
+                        .and_then(|call| tool_item(&timeline, call)?.0)
+                        .and_then(|outer| subagent_item(&timeline, outer))
+                        .map(|(_, view)| view.title.clone()),
+                    questions: questions.clone(),
+                    answer: self.local_answer(*id, &[], true),
+                    answers: self.local_answers(*id),
+                }),
+                _ => None,
+            })
+        });
         let state = session_state(summary);
         let interrupt = self
             .latest_outgoing(
@@ -2274,6 +2322,7 @@ impl Model {
             state,
             timeline,
             pending_approval,
+            pending_question,
             rules,
             usage: summary.usage.clone(),
             agent: self.agent_view(summary),
@@ -2867,7 +2916,8 @@ impl Model {
                 EventKind::AgentMessage { parent, .. }
                 | EventKind::ToolCall(ToolCall { parent, .. }) => *parent,
                 EventKind::ToolResult(ToolResult { call, .. })
-                | EventKind::ApprovalRequested { call, .. } => tools.parent(&items, *call),
+                | EventKind::ApprovalRequested { call, .. }
+                | EventKind::QuestionAsked { call, .. } => tools.parent(&items, *call),
                 _ => None,
             };
             tools.step(&event.kind);
@@ -2952,6 +3002,7 @@ impl Model {
                     Some((item, view, _)) if view.approval.is_none() => {
                         view.approval = Some(ToolApproval {
                             id: *id,
+                            question: false,
                             status: ApprovalStatus::Pending,
                             answer: None,
                             input: input.as_ref().map(|f| self.full_view(f)),
@@ -2971,6 +3022,44 @@ impl Model {
                         })
                     }
                 },
+                EventKind::QuestionAsked {
+                    id,
+                    call,
+                    questions,
+                } => match tools.call(&mut items, *call) {
+                    Some((item, view, _)) if view.approval.is_none() => {
+                        view.approval = Some(ToolApproval {
+                            id: *id,
+                            question: true,
+                            status: ApprovalStatus::Pending,
+                            answer: None,
+                            input: None,
+                        });
+                        tools.approvals.insert(*id, item);
+                        None
+                    }
+                    _ => {
+                        tools.approvals.insert(*id, items.len());
+                        Some(Entry::Approval {
+                            id: *id,
+                            tool: QUESTION_TOOL.to_owned(),
+                            summary: questions
+                                .first()
+                                .map(|q| q.text.clone())
+                                .unwrap_or_default(),
+                            input: None,
+                            status: ApprovalStatus::Pending,
+                            answer: None,
+                        })
+                    }
+                },
+                EventKind::QuestionAnswered { id, by, .. } => {
+                    let status = ApprovalStatus::Answered {
+                        by: self.device_ref(*by),
+                    };
+                    tools.settle(&mut items, *id, status, None);
+                    None
+                }
                 EventKind::ApprovalResolved {
                     id,
                     decision,
@@ -3324,8 +3413,34 @@ impl Model {
                         && matches!(outgoing, Outgoing::Failed(r) if !r.rules_out_answers()),
                 })
             }
+            CommandKind::AnswerQuestion { id, .. } if id == approval => {
+                let outgoing = Outgoing::from(&e.status);
+                Some(Answer {
+                    decision: Decision::Approve,
+                    rule: None,
+                    outgoing,
+                    delivery: Delivery::of(e),
+                    retryable: pending
+                        && matches!(outgoing, Outgoing::Failed(r) if !r.rules_out_answers()),
+                })
+            }
             _ => None,
         })
+    }
+
+    /// The answers of this device's latest answer to question `question`;
+    /// empty when it gave none, or its latest declined.
+    fn local_answers(&self, question: ApprovalId) -> Vec<QuestionAnswer> {
+        let latest = self.outbox.iter().rev().find(|e| match &e.command.kind {
+            CommandKind::ResolveApproval { id, .. } | CommandKind::AnswerQuestion { id, .. } => {
+                *id == question
+            }
+            _ => false,
+        });
+        match latest.map(|e| &e.command.kind) {
+            Some(CommandKind::AnswerQuestion { answers, .. }) => answers.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// Whether a command's effect has reached the replica.
@@ -3793,6 +3908,7 @@ fn command_session(kind: &CommandKind) -> Option<SessionId> {
         | CommandKind::StopShell { session_id, .. } => Some(*session_id),
         CommandKind::CreateSession { .. }
         | CommandKind::ResolveApproval { .. }
+        | CommandKind::AnswerQuestion { .. }
         | CommandKind::DeleteBlob { .. }
         | CommandKind::CropBlob { .. } => None,
     }
@@ -4364,6 +4480,190 @@ mod tests {
                 }),
             } if *command_id == command.id && text == "x"
         ));
+    }
+
+    #[test]
+    fn question_prompt_takes_answers_that_fit_or_a_denial() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let question = ApprovalId::new();
+        let call = CallId::new();
+        let option = |label: &str| skywave_proto::QuestionOption {
+            label: label.into(),
+            description: format!("{label} bread"),
+            preview: None,
+        };
+        let questions = vec![Question {
+            header: "Bread".into(),
+            text: "Which bread?".into(),
+            options: vec![option("Rye"), option("Spelt")],
+            multi_select: false,
+        }];
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::Other, "Which bread?"),
+                EventKind::QuestionAsked {
+                    id: question,
+                    call: Some(call),
+                    questions: questions.clone(),
+                },
+            ],
+        );
+        f.open(sid);
+        let view = f.session_view();
+        assert_eq!(view.state, SessionState::AwaitingApproval(question));
+        assert_eq!(view.pending_approval, None);
+        assert_eq!(
+            view.pending_question,
+            Some(QuestionPrompt {
+                id: question,
+                call: Some(call),
+                from: None,
+                questions: questions.clone(),
+                answer: None,
+                answers: Vec::new(),
+            })
+        );
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+            panic!("no tool entry");
+        };
+        let approval = tool.approval.unwrap();
+        assert!(approval.question);
+        assert_eq!(approval.status, ApprovalStatus::Pending);
+
+        // A question takes no plain approval, nor answers that do not fit.
+        let approve = Action::ResolveApproval {
+            id: question,
+            decision: Decision::Approve,
+            rule: None,
+        };
+        assert!(f.dispatch(approve).is_empty());
+        let answer = |picked: Vec<u8>| skywave_proto::QuestionAnswer {
+            picked,
+            other: None,
+        };
+        for answers in [vec![], vec![answer(vec![0, 1])], vec![answer(vec![3])]] {
+            assert!(
+                f.dispatch(Action::AnswerQuestion {
+                    id: question,
+                    answers,
+                })
+                .is_empty()
+            );
+        }
+        let answered = Action::AnswerQuestion {
+            id: question,
+            answers: vec![answer(vec![1])],
+        };
+        let command = queued(&f.dispatch(answered.clone()));
+        assert_eq!(
+            command.kind,
+            CommandKind::AnswerQuestion {
+                id: question,
+                answers: vec![answer(vec![1])],
+            }
+        );
+        // Answered once; a denial no longer applies either.
+        assert!(f.dispatch(answered).is_empty());
+        let deny = Action::ResolveApproval {
+            id: question,
+            decision: Decision::Deny,
+            rule: None,
+        };
+        assert!(f.dispatch(deny.clone()).is_empty());
+        let prompt = f.session_view().pending_question.unwrap();
+        let mine = prompt.answer.unwrap();
+        assert_eq!(mine.decision, Decision::Approve);
+        assert_eq!(prompt.answers, [answer(vec![1])]);
+        assert_eq!(mine.outgoing, Outgoing::Queued);
+
+        // A refusal of the answer itself leaves the question open.
+        f.model.command_result(
+            command.id,
+            CommandResult::Rejected {
+                reason: RejectReason::BadAnswer,
+            },
+            Utc::now(),
+        );
+        assert!(
+            f.session_view()
+                .pending_question
+                .unwrap()
+                .answer
+                .unwrap()
+                .retryable
+        );
+        queued(&f.dispatch(deny));
+
+        let phone = DeviceId::new();
+        f.log(
+            sid,
+            vec![
+                EventKind::QuestionAnswered {
+                    id: question,
+                    by: phone,
+                    answers: vec![answer(vec![0])],
+                },
+                tool_result(Some(call), false, "Which bread? → Rye"),
+                EventKind::SessionStateChanged(LogState::Idle),
+            ],
+        );
+        let view = f.session_view();
+        assert_eq!(view.pending_question, None);
+        assert_eq!(view.state, SessionState::Idle);
+        let Some(Entry::Tool(tool)) = entries(&f).into_iter().next() else {
+            panic!("no tool entry");
+        };
+        assert!(matches!(
+            tool.approval.unwrap().status,
+            ApprovalStatus::Answered { by } if by.id == phone
+        ));
+        assert!(matches!(
+            tool.outcome,
+            ToolOutcome::Done {
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_question_with_no_logged_call_stands_alone() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let question = ApprovalId::new();
+        f.log(
+            sid,
+            vec![EventKind::QuestionAsked {
+                id: question,
+                call: None,
+                questions: vec![Question {
+                    header: String::new(),
+                    text: "Which bread?".into(),
+                    options: vec![skywave_proto::QuestionOption {
+                        label: "Rye".into(),
+                        description: String::new(),
+                        preview: None,
+                    }],
+                    multi_select: true,
+                }],
+            }],
+        );
+        assert_eq!(f.list_view().sessions[0].pending_approvals, 1);
+        f.open(sid);
+        assert_eq!(
+            entries(&f),
+            [Entry::Approval {
+                id: question,
+                tool: QUESTION_TOOL.into(),
+                summary: "Which bread?".into(),
+                input: None,
+                status: ApprovalStatus::Pending,
+                answer: None,
+            }]
+        );
     }
 
     #[test]
@@ -7346,6 +7646,7 @@ mod tests {
             input: Some(blob(&input)),
             approval: Some(ToolApproval {
                 id: approval,
+                question: false,
                 status: ApprovalStatus::Pending,
                 answer: None,
                 input: None,
@@ -7381,6 +7682,7 @@ mod tests {
         let done = ToolView {
             approval: Some(ToolApproval {
                 id: approval,
+                question: false,
                 status: ApprovalStatus::Resolved {
                     decision: Decision::Approve,
                     by: DeviceRef {
@@ -7545,6 +7847,7 @@ mod tests {
             view.approval,
             Some(ToolApproval {
                 id: approval,
+                question: false,
                 status: ApprovalStatus::Resolved {
                     decision: Decision::Deny,
                     by: DeviceRef {

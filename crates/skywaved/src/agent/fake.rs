@@ -120,8 +120,8 @@ use uuid::Uuid;
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentCallId, AgentError, AgentRequestId,
     AgentSchedule, AgentSession, AgentTask, Conversation, Effort, Grants, HistoryRead, Listed,
-    ModelChoice, OutsideConversations, PermissionMode, ResultDisplay, ResumeHandle, RuleScope,
-    RuleSuggestion, SourceError, StartSpec, TurnOutcome,
+    ModelChoice, OutsideConversations, PermissionMode, Question, QuestionAnswer, ResultDisplay,
+    ResumeHandle, RuleScope, RuleSuggestion, SourceError, StartSpec, TurnOutcome,
 };
 
 /// Capacity of a fake session's event channel.
@@ -250,6 +250,15 @@ pub enum Step {
         on_approve: Vec<Step>,
         on_deny: Vec<Step>,
     },
+    /// Emits `QuestionAsked` and blocks until it is answered; an answer
+    /// runs `on_answer`, a denial `on_deny`.
+    Question {
+        request: AgentRequestId,
+        call: Option<AgentCallId>,
+        questions: Vec<Question>,
+        on_answer: Vec<Step>,
+        on_deny: Vec<Step>,
+    },
     /// Blocks until interrupted.
     Hang,
     /// Blocks until the gate is open.
@@ -363,6 +372,18 @@ impl Step {
         }
     }
 
+    /// A question with no follow-up steps; add them with
+    /// [`Step::on_approve`] (run once answered) / [`Step::on_deny`].
+    pub fn question(request: &str, questions: Vec<Question>) -> Step {
+        Step::Question {
+            request: request.into(),
+            call: None,
+            questions,
+            on_answer: Vec::new(),
+            on_deny: Vec::new(),
+        }
+    }
+
     /// Schedules a turn of `steps` the agent starts on its own `after` from
     /// now ([`Step::Wake`]).
     pub fn wake(after: Duration, steps: impl IntoIterator<Item = Step>) -> Step {
@@ -415,7 +436,8 @@ impl Step {
             Step::Emit(
                 AdapterEvent::ToolCall { call, .. } | AdapterEvent::ToolResult { call, .. },
             )
-            | Step::Approval { call, .. } => *call = Some(id.into()),
+            | Step::Approval { call, .. }
+            | Step::Question { call, .. } => *call = Some(id.into()),
             _ => {}
         }
         self
@@ -434,17 +456,24 @@ impl Step {
         self
     }
 
-    /// Steps run after an approval is approved. No effect on other steps.
+    /// Steps run after an approval is approved or a question answered. No
+    /// effect on other steps.
     pub fn on_approve(mut self, steps: impl IntoIterator<Item = Step>) -> Step {
-        if let Step::Approval { on_approve, .. } = &mut self {
+        if let Step::Approval { on_approve, .. }
+        | Step::Question {
+            on_answer: on_approve,
+            ..
+        } = &mut self
+        {
             *on_approve = steps.into_iter().collect();
         }
         self
     }
 
-    /// Steps run after an approval is denied. No effect on other steps.
+    /// Steps run after an approval or a question is denied. No effect on
+    /// other steps.
     pub fn on_deny(mut self, steps: impl IntoIterator<Item = Step>) -> Step {
-        if let Step::Approval { on_deny, .. } = &mut self {
+        if let Step::Approval { on_deny, .. } | Step::Question { on_deny, .. } = &mut self {
             *on_deny = steps.into_iter().collect();
         }
         self
@@ -533,6 +562,8 @@ pub enum FakeInput {
     Message(String),
     /// An answer and the rule it grants, if any.
     Answer(AgentRequestId, Decision, Option<u8>),
+    /// A question's answers.
+    AnswerQuestion(AgentRequestId, Vec<QuestionAnswer>),
     Interrupt,
     /// A repeated interrupt. The fake answers every interrupt as it comes,
     /// so it never finds one unanswered: this does nothing.
@@ -800,6 +831,14 @@ impl AgentSession for FakeSession {
         self.request(FakeInput::Answer(request, decision, rule))
     }
 
+    async fn answer_question(
+        &mut self,
+        request: AgentRequestId,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(), AgentError> {
+        self.request(FakeInput::AnswerQuestion(request, answers))
+    }
+
     async fn interrupt(&mut self) -> Result<(), AgentError> {
         self.request(FakeInput::Interrupt)
     }
@@ -971,6 +1010,7 @@ impl Runner {
                             FakeInput::Interrupt
                             | FakeInput::EscalateInterrupt
                             | FakeInput::Answer(..)
+                            | FakeInput::AnswerQuestion(..)
                             | FakeInput::Started { .. }
                             | FakeInput::SetPermissionMode(_)
                             | FakeInput::SetModel(_)
@@ -1075,30 +1115,31 @@ impl Runner {
                         suggestions,
                         task: None,
                     };
-                    if !self.emit(asked).await {
-                        return Flow::Exit(None);
+                    if let Err(flow) = self
+                        .ask(asked, request, on_approve, on_deny, &mut work)
+                        .await
+                    {
+                        return flow;
                     }
-                    match self.wait_answer(&request).await {
-                        Ok(decision) => {
-                            let branch = match decision {
-                                Decision::Approve => on_approve,
-                                Decision::Deny => on_deny,
-                            };
-                            for step in branch.into_iter().rev() {
-                                work.push_front(step);
-                            }
-                        }
-                        Err(Stop::Interrupt) => {
-                            let cancelled = AdapterEvent::ApprovalCancelled {
-                                request,
-                                reason: INTERRUPT_REASON.to_owned(),
-                            };
-                            if !self.emit(cancelled).await {
-                                return Flow::Exit(None);
-                            }
-                            return Stop::Interrupt.flow();
-                        }
-                        Err(stop) => return stop.flow(),
+                }
+                Step::Question {
+                    request,
+                    call,
+                    questions,
+                    on_answer,
+                    on_deny,
+                } => {
+                    let asked = AdapterEvent::QuestionAsked {
+                        request: request.clone(),
+                        call,
+                        questions,
+                        task: None,
+                    };
+                    if let Err(flow) = self
+                        .ask(asked, request, on_answer, on_deny, &mut work)
+                        .await
+                    {
+                        return flow;
                     }
                 }
                 Step::Hang => {
@@ -1148,12 +1189,55 @@ impl Runner {
         }
     }
 
-    /// Blocks until `request` is answered.
+    /// Emits `asked` and blocks until `request` is answered, then queues
+    /// the branch the answer takes in front of `work`; an interrupt cancels
+    /// the request. `Err` is how the turn ends instead.
+    async fn ask(
+        &mut self,
+        asked: AdapterEvent,
+        request: AgentRequestId,
+        on_approve: Vec<Step>,
+        on_deny: Vec<Step>,
+        work: &mut VecDeque<Step>,
+    ) -> Result<(), Flow> {
+        if !self.emit(asked).await {
+            return Err(Flow::Exit(None));
+        }
+        match self.wait_answer(&request).await {
+            Ok(decision) => {
+                let branch = match decision {
+                    Decision::Approve => on_approve,
+                    Decision::Deny => on_deny,
+                };
+                for step in branch.into_iter().rev() {
+                    work.push_front(step);
+                }
+                Ok(())
+            }
+            Err(Stop::Interrupt) => {
+                let cancelled = AdapterEvent::ApprovalCancelled {
+                    request,
+                    reason: INTERRUPT_REASON.to_owned(),
+                };
+                if !self.emit(cancelled).await {
+                    return Err(Flow::Exit(None));
+                }
+                Err(Stop::Interrupt.flow())
+            }
+            Err(stop) => Err(stop.flow()),
+        }
+    }
+
+    /// Blocks until `request` is answered: by a decision, or (a question)
+    /// by its answers, which count as an approval.
     async fn wait_answer(&mut self, request: &AgentRequestId) -> Result<Decision, Stop> {
         loop {
             match self.commands.recv().await {
                 Some(FakeInput::Answer(answered, decision, _)) if answered == *request => {
                     return Ok(decision);
+                }
+                Some(FakeInput::AnswerQuestion(answered, _)) if answered == *request => {
+                    return Ok(Decision::Approve);
                 }
                 input => self.during_turn(input)?,
             }
@@ -1200,6 +1284,7 @@ impl Runner {
                 // this turn is a later one.
                 FakeInput::EscalateInterrupt
                 | FakeInput::Answer(..)
+                | FakeInput::AnswerQuestion(..)
                 | FakeInput::Started { .. }
                 | FakeInput::SetPermissionMode(_)
                 | FakeInput::SetModel(_)

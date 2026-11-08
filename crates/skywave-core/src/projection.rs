@@ -286,12 +286,14 @@ impl SessionSummary {
                 self.importing = self.adopted.is_some();
             }
             EventKind::SessionStateChanged(state) => self.state = state.clone(),
-            EventKind::ApprovalRequested { id, .. } => {
+            EventKind::ApprovalRequested { id, .. } | EventKind::QuestionAsked { id, .. } => {
                 if !self.pending_approvals.contains(id) {
                     self.pending_approvals.push(*id);
                 }
             }
-            EventKind::ApprovalResolved { id, .. } | EventKind::ApprovalCancelled { id, .. } => {
+            EventKind::ApprovalResolved { id, .. }
+            | EventKind::QuestionAnswered { id, .. }
+            | EventKind::ApprovalCancelled { id, .. } => {
                 self.pending_approvals.retain(|pending| pending != id);
             }
             // The next message starts the agent again.
@@ -394,13 +396,16 @@ pub(crate) fn first_line(text: &str, max: usize) -> Option<String> {
 /// backfill migration counts the same kinds (its rows had no subagents).
 pub fn is_notable(kind: &EventKind) -> bool {
     match kind {
-        EventKind::AgentMessage { parent: None, .. } | EventKind::ApprovalRequested { .. } => true,
+        EventKind::AgentMessage { parent: None, .. }
+        | EventKind::ApprovalRequested { .. }
+        | EventKind::QuestionAsked { .. } => true,
         EventKind::SessionStateChanged(state) => matches!(state, SessionState::Errored { .. }),
         EventKind::SessionCreated { .. }
         | EventKind::UserMessage { .. }
         | EventKind::ToolCall(_)
         | EventKind::ToolResult(_)
         | EventKind::ApprovalResolved { .. }
+        | EventKind::QuestionAnswered { .. }
         | EventKind::ApprovalCancelled { .. }
         | EventKind::TurnInterrupted
         | EventKind::SessionStopped

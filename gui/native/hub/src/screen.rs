@@ -6,9 +6,9 @@ use chrono::{DateTime, Local, Utc};
 use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
-    Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, RuleSuggestion, Screen,
-    SessionId, SessionListView, SessionRow, SessionState, SessionView, SettingsView, Snippet,
-    StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
+    Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, QuestionPrompt,
+    RuleSuggestion, Screen, SessionId, SessionListView, SessionRow, SessionState, SessionView,
+    SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -21,7 +21,8 @@ use skywave_present::format::{
     session_usage_fields, stop_heading, stop_warning, subagent_status, task_kind_word, trail,
     viewing_hint, work_summary,
 };
-use skywave_present::policy::{CompletionSettle, dismissable, unanswered};
+use skywave_present::policy::{CompletionSettle, dismissable, question_unanswered, unanswered};
+use skywave_present::question::reply_text;
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
@@ -33,12 +34,13 @@ use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
     CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
-    PairForm, PairingState, PermissionModeView, RenamePrompt, RepairNotice, RuleOption,
-    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, SnippetView,
-    StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView, SubagentHeaderView,
-    TaskRow, ToolKindView, UsageGroupingView, UsageRowView, UsageSpanView,
+    PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView,
+    RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView,
+    SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
+    StorageTotalView, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
+    UsageSpanView,
 };
-use skywave_present::text::clean_line;
+use skywave_present::text::{clean, clean_line};
 
 use crate::timeline::{key_string, outgoing_view, preview_view, tool_kind};
 use crate::{crop, workdir};
@@ -340,6 +342,9 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
         agent_label: match &session.state {
             SessionState::Idle => "agent idle".to_owned(),
             SessionState::AgentWorking => "agent working".to_owned(),
+            SessionState::AwaitingApproval(_) if session.pending_question.is_some() => {
+                "agent waiting for an answer".to_owned()
+            }
             SessionState::AwaitingApproval(_) => "agent waiting for an approval".to_owned(),
             SessionState::Errored(info) => format!("agent error: {}", clean_line(&info.message)),
             SessionState::Stopped => "agent stopped · a message restarts it".to_owned(),
@@ -446,6 +451,10 @@ fn session_view(session: &SessionView, view: &ViewState, ui: Ui) -> SessionScree
             .pending_approval
             .as_ref()
             .map(|prompt| approval_panel(prompt, session)),
+        question: session
+            .pending_question
+            .as_ref()
+            .map(|prompt| question_panel(prompt, session)),
         subagent: session
             .subagent
             .as_ref()
@@ -766,6 +775,57 @@ fn approval_panel(prompt: &ApprovalPrompt, session: &SessionView) -> ApprovalPan
     }
 }
 
+fn question_panel(prompt: &QuestionPrompt, session: &SessionView) -> QuestionPanel {
+    let call_key = prompt.call.and_then(|call| {
+        session.timeline.iter().find_map(|item| match item {
+            TimelineItem::Logged {
+                entry: Entry::Tool(view),
+                ..
+            } if view.call == call => Some(key_string(ItemKey::of(item))),
+            _ => None,
+        })
+    });
+    let answer_label = prompt.answer.as_ref().map(|answer| {
+        let label = match (&answer.outgoing, &answer.delivery) {
+            (Outgoing::Queued | Outgoing::Sending, Some(delivery)) => {
+                delivery_label(delivery, &answer.outgoing)
+            }
+            _ => outgoing_label(&answer.outgoing),
+        };
+        let words = clean_line(&reply_text(prompt).unwrap_or_default());
+        format!("{words} · {label}")
+    });
+    QuestionPanel {
+        approval_id: prompt.id.0.to_string(),
+        from: prompt
+            .from
+            .as_deref()
+            .map(|from| clean_line(&format!("from subagent: {from}"))),
+        call_key,
+        questions: prompt
+            .questions
+            .iter()
+            .map(|q| QuestionView {
+                header: clean_line(&q.header),
+                text: clean(&q.text),
+                options: q
+                    .options
+                    .iter()
+                    .map(|o| QuestionOptionView {
+                        label: clean_line(&o.label),
+                        description: clean(&o.description),
+                        preview: o.preview.as_deref().map(clean),
+                    })
+                    .collect(),
+                multi_select: q.multi_select,
+            })
+            .collect(),
+        can_answer: question_unanswered(prompt),
+        answer_label,
+        answer: prompt.answer.as_ref().map(|a| outgoing_view(&a.outgoing)),
+    }
+}
+
 fn settings_view(settings: &SettingsView, stay_connected: Option<bool>) -> ScreenView {
     let (blob_policy, blob_policy_label) = match settings.blob_policy {
         BlobPolicy::Eager => (
@@ -961,6 +1021,7 @@ mod tests {
             state: SessionState::Idle,
             timeline: Vec::new(),
             pending_approval: None,
+            pending_question: None,
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
@@ -982,6 +1043,71 @@ mod tests {
             last_seq: Seq(0),
             unread_from: None,
         }
+    }
+
+    /// A question's panel carries every question and option as asked, and
+    /// once this device answered, what it picked, not how it is sent.
+    #[test]
+    fn a_question_panel_shows_the_options_and_this_devices_answer() {
+        let session = session_view(AgentWork::default(), Vec::new());
+        let option = |label: &str, preview: Option<&str>| skywave_core::QuestionOption {
+            label: label.into(),
+            description: format!("{label} bread"),
+            preview: preview.map(str::to_owned),
+        };
+        let mut prompt = QuestionPrompt {
+            id: skywave_core::ApprovalId::new(),
+            call: None,
+            from: Some("Explore".into()),
+            questions: vec![skywave_core::Question {
+                header: "Bread".into(),
+                text: "Which bread?".into(),
+                options: vec![option("Rye", None), option("Spelt", Some("| LOAF |"))],
+                multi_select: false,
+            }],
+            answer: None,
+            answers: Vec::new(),
+        };
+        let panel = question_panel(&prompt, &session);
+        assert!(panel.can_answer);
+        assert_eq!(panel.from.as_deref(), Some("from subagent: Explore"));
+        assert_eq!(panel.answer_label, None);
+        assert_eq!(
+            panel.questions,
+            [QuestionView {
+                header: "Bread".into(),
+                text: "Which bread?".into(),
+                options: vec![
+                    QuestionOptionView {
+                        label: "Rye".into(),
+                        description: "Rye bread".into(),
+                        preview: None,
+                    },
+                    QuestionOptionView {
+                        label: "Spelt".into(),
+                        description: "Spelt bread".into(),
+                        preview: Some("| LOAF |".into()),
+                    },
+                ],
+                multi_select: false,
+            }]
+        );
+
+        prompt.answer = Some(skywave_core::Answer {
+            decision: skywave_core::Decision::Approve,
+            rule: None,
+            outgoing: Outgoing::Sending,
+            delivery: None,
+            retryable: false,
+        });
+        prompt.answers = vec![skywave_core::QuestionAnswer {
+            picked: vec![1],
+            other: None,
+        }];
+        let panel = question_panel(&prompt, &session);
+        assert!(!panel.can_answer);
+        let label = panel.answer_label.unwrap();
+        assert!(label.starts_with("you answered: Spelt · "), "{label}");
     }
 
     #[test]
@@ -1107,6 +1233,7 @@ mod tests {
                     input: None,
                     approval: Some(skywave_core::ToolApproval {
                         id,
+                        question: false,
                         status: ApprovalStatus::Pending,
                         answer: None,
                         input: asked.clone(),

@@ -284,6 +284,12 @@ pub enum ActionIntent {
         decision: DecisionView,
         rule: Option<u32>,
     },
+    /// Answer a question, one answer per question in order; the core
+    /// drops answers that do not fit.
+    AnswerQuestion {
+        approval_id: String,
+        answers: Vec<QuestionAnswerView>,
+    },
     Interrupt {
         session_id: String,
     },
@@ -427,6 +433,15 @@ pub enum ActionIntent {
         route: RouteView,
     },
     Back,
+}
+
+/// One question's answer: the options picked, by index, and text of the
+/// user's own (`None`, or not blank). Not `other`: the generated Dart
+/// `==` names its argument so.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SignalPiece)]
+pub struct QuestionAnswerView {
+    pub picked: Vec<u32>,
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, SignalPiece)]

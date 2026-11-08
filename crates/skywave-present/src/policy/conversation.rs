@@ -115,6 +115,7 @@ mod tests {
                 input: None,
                 approval: status.map(|status| ToolApproval {
                     id: ApprovalId::new(),
+                    question: false,
                     status,
                     answer: None,
                     input: None,

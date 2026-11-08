@@ -35,16 +35,19 @@ pub use crop::{
     CropScreen, LineSpanView,
 };
 pub use effects::PlatformEffect;
-pub use intents::{ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, RouteView};
+pub use intents::{
+    ActionIntent, BlobPolicyChoice, CopyWhat, DecisionView, GuiIntent, QuestionAnswerView,
+    RouteView,
+};
 pub use link::{LinkState, LinkUpdate};
 pub use screen::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
     CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
-    PairForm, PairingState, PermissionModeView, RenamePrompt, RepairNotice, RuleOption,
-    ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen, ShellPromptView,
-    SnippetView, StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView,
-    SubagentHeaderView, TaskRow, UsageGroupingView, UsageRowView, UsageSpanView,
+    PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView,
+    RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView,
+    SessionScreen, ShellPromptView, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
+    StorageTotalView, SubagentHeaderView, TaskRow, UsageGroupingView, UsageRowView, UsageSpanView,
 };
 pub use search::{LineHit, SearchHit, SearchUpdate, Utf16Range};
 pub use shell::{ShellRunKind, ShellRunRow, ShellUpdate};

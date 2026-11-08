@@ -115,7 +115,8 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use skywave_proto::{ContextId, Decision, SessionId, SessionOrigin};
 pub use skywave_proto::{
-    Effort, ModelChoice, PermissionMode, RuleScope, RuleSuggestion, TaskKind, TurnUsage,
+    Effort, ModelChoice, PermissionMode, Question, QuestionAnswer, QuestionOption, RuleScope,
+    RuleSuggestion, TaskKind, TurnUsage,
 };
 use tokio::sync::mpsc;
 
@@ -362,6 +363,17 @@ pub enum AdapterEvent {
         suggestions: Vec<RuleSuggestion>,
         task: Option<String>,
     },
+    /// The agent asks the user `questions` and is blocked until
+    /// [`AgentSession::answer_question`] for `request`, or a denial with
+    /// [`AgentSession::answer_approval`] (D8). Otherwise as
+    /// `ApprovalRequested`: `call` is the call asking, `task` the
+    /// background task, cancelled the same ways. Uncut.
+    QuestionAsked {
+        request: AgentRequestId,
+        call: Option<AgentCallId>,
+        questions: Vec<Question>,
+        task: Option<String>,
+    },
     /// The agent withdrew `request`; an answer to it is no longer read.
     ApprovalCancelled {
         request: AgentRequestId,
@@ -511,6 +523,15 @@ pub trait AgentSession: Send + 'static {
         request: AgentRequestId,
         decision: Decision,
         rule: Option<u8>,
+    ) -> impl Future<Output = Result<(), AgentError>> + Send;
+
+    /// Answers question `request` with `answers`, one per question in
+    /// order (the log only holds answers that fit). Dropped by the adapter
+    /// like an approval's answer once the request is no longer pending.
+    fn answer_question(
+        &mut self,
+        request: AgentRequestId,
+        answers: Vec<QuestionAnswer>,
     ) -> impl Future<Output = Result<(), AgentError>> + Send;
 
     /// Stops the current turn, if any; a no-op when idle.

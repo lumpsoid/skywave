@@ -6,7 +6,9 @@ use serde_json::Value;
 use skywave_proto::limits::{
     AGENT_VERSION_MAX_CHARS, DETAIL_MAX_CHARS, INLINE_MAX_BYTES, MESSAGE_PREVIEW_MAX_BYTES,
     MESSAGE_WHOLE_MAX_BYTES, MODEL_DETAIL_MAX_CHARS, MODEL_LABEL_MAX_CHARS, MODEL_MAX_CHARS,
-    MODELS_MAX, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
+    MODELS_MAX, OPTION_DESCRIPTION_MAX_CHARS, OPTION_LABEL_MAX_CHARS, OPTION_PREVIEW_MAX_BYTES,
+    PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, QUESTION_HEADER_MAX_CHARS, QUESTION_OPTIONS_MAX,
+    QUESTION_TEXT_MAX_CHARS, QUESTIONS_MAX, REFUSAL_MAX_CHARS, RULE_LABEL_MAX_CHARS,
     RULE_SUGGESTIONS_MAX, SCHEDULE_WHEN_MAX_CHARS, SCHEDULES_MAX, STATUS_MAX_CHARS,
     TASK_ID_MAX_CHARS, TASKS_MAX, TITLE_MAX_CHARS,
 };
@@ -42,6 +44,7 @@ const AGENT_EXITED: &str = "agent exited";
 /// | `ToolCall` | `ToolCall` with a new [`CallId`] and a bounded display, `parent` linked to its call |
 /// | `ToolResult` | `ToolResult` linked to its call, with a bounded preview |
 /// | `ApprovalRequested` | `ApprovalRequested` with a new [`ApprovalId`], linked to its call; a task's (`task` set) is kept apart from the turn's |
+/// | `QuestionAsked` | `QuestionAsked` with a new [`ApprovalId`], linked to its call, cut to the limits; kept and cancelled as an approval |
 /// | `ApprovalCancelled` | `ApprovalCancelled` (if still pending) |
 /// | `TurnUsage` | `TurnUsage`, as is (only in an open turn, and not empty) |
 /// | `TurnEnded(Completed \| Interrupted)` | the turn's leftover approvals cancelled (not a task's), `CallsUnanswered` for the turn's open calls, `SessionStateChanged(Idle)` |
@@ -430,6 +433,26 @@ impl EventMapper {
                         suggestions: bounded_suggestions(suggestions),
                     },
                 )?);
+                self.approvals.push(LoggedApproval {
+                    request,
+                    id,
+                    of_task: task.is_some(),
+                });
+            }
+            AdapterEvent::QuestionAsked {
+                request,
+                call,
+                questions,
+                task,
+            } => {
+                let call = self.linked(call.as_ref()).map(|logged| logged.id);
+                let id = ApprovalId::new();
+                let kind = EventKind::QuestionAsked {
+                    id,
+                    call,
+                    questions: bounded_questions(questions),
+                };
+                seqs.push(self.append(log, storage, kind)?);
                 self.approvals.push(LoggedApproval {
                     request,
                     id,
@@ -1135,6 +1158,48 @@ fn bounded_suggestions(mut suggestions: Vec<proto::RuleSuggestion>) -> Vec<proto
         suggestion.label = cut_line(&suggestion.label, RULE_LABEL_MAX_CHARS).0;
     }
     suggestions
+}
+
+/// The first [`QUESTIONS_MAX`] questions, each with its first
+/// [`QUESTION_OPTIONS_MAX`] options, every text cut to its cap: header and
+/// label to one line, question and description whole up to their caps, a
+/// preview at its last line break within [`OPTION_PREVIEW_MAX_BYTES`].
+fn bounded_questions(mut questions: Vec<proto::Question>) -> Vec<proto::Question> {
+    questions.truncate(QUESTIONS_MAX);
+    for question in &mut questions {
+        question.header = cut_line(&question.header, QUESTION_HEADER_MAX_CHARS).0;
+        question.text = cut_text(&question.text, QUESTION_TEXT_MAX_CHARS);
+        question.options.truncate(QUESTION_OPTIONS_MAX);
+        for option in &mut question.options {
+            option.label = cut_line(&option.label, OPTION_LABEL_MAX_CHARS).0;
+            option.description = cut_text(&option.description, OPTION_DESCRIPTION_MAX_CHARS);
+            if let Some(preview) = &mut option.preview
+                && preview.len() > OPTION_PREVIEW_MAX_BYTES
+            {
+                let mut end = OPTION_PREVIEW_MAX_BYTES;
+                while !preview.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if let Some(at) = preview[..end].rfind('\n') {
+                    end = at;
+                }
+                preview.truncate(end);
+            }
+        }
+    }
+    questions
+}
+
+/// `text` trimmed, at most `max_chars` chars, its lines kept; a cut one
+/// ends in `…` (within `max_chars`).
+fn cut_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
 }
 
 /// The first [`MODELS_MAX`] models, each field cut to one line of its cap

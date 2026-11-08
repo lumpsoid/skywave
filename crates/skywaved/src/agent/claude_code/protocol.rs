@@ -111,7 +111,8 @@ use super::{display, rules, usage};
 use crate::agent::mapper::cut_line;
 use crate::agent::{
     AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
-    PermissionMode, ResumeHandle, SubagentFigures, TaskKind, TurnOutcome,
+    PermissionMode, Question, QuestionAnswer, QuestionOption, ResumeHandle, SubagentFigures,
+    TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -359,6 +360,76 @@ pub fn deny_response(request_id: &str, message: &str) -> Value {
         request_id,
         json!({ "behavior": "deny", "message": message }),
     )
+}
+
+/// The tool through which the model asks the user questions with options
+/// (docs/agents/claude-code.md §3.14). Its `can_use_tool` is reported as
+/// `QuestionAsked`, not as an approval.
+pub const ASK_TOOL: &str = "AskUserQuestion";
+
+/// The questions of an [`ASK_TOOL`] call's `input`, uncut. `None` when the
+/// input holds none, or a question with no text or no options: such a
+/// call is asked as a plain approval instead.
+pub fn questions(input: &Value) -> Option<Vec<Question>> {
+    let questions = input.get("questions")?.as_array()?;
+    let questions: Option<Vec<Question>> = questions
+        .iter()
+        .map(|q| {
+            let options: Vec<QuestionOption> = q
+                .get("options")?
+                .as_array()?
+                .iter()
+                .map(|o| QuestionOption {
+                    label: str_field(o, "label").to_owned(),
+                    description: str_field(o, "description").to_owned(),
+                    preview: o.get("preview").and_then(Value::as_str).map(str::to_owned),
+                })
+                .collect();
+            let text = str_field(q, "question");
+            (!text.is_empty() && !options.is_empty()).then(|| Question {
+                header: str_field(q, "header").to_owned(),
+                text: text.to_owned(),
+                options,
+                multi_select: q.get("multiSelect").and_then(Value::as_bool) == Some(true),
+            })
+        })
+        .collect();
+    questions.filter(|questions| !questions.is_empty())
+}
+
+/// The `updatedInput` that answers an [`ASK_TOOL`] call's `input` with
+/// `answers`, one per question in order: the input with an `answers` map
+/// from each question's text to the labels picked, in the options' order,
+/// then the user's own text, joined by `", "` as the CLI's own picker does
+/// for a multi-select question (§3.14). An answer with no question, or a
+/// pick with no option, adds nothing.
+pub fn answered_input(input: &Value, answers: &[QuestionAnswer]) -> Value {
+    let questions = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let map: serde_json::Map<String, Value> = questions
+        .iter()
+        .zip(answers)
+        .map(|(q, answer)| {
+            let options = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            let picked = answer
+                .picked
+                .iter()
+                .filter_map(|&i| options.get(usize::from(i)))
+                .map(|o| str_field(o, "label"));
+            let text: Vec<&str> = picked.chain(answer.other.as_deref()).collect();
+            (str_field(q, "question").to_owned(), json!(text.join(", ")))
+        })
+        .collect();
+    let mut input = input.clone();
+    if let Some(fields) = input.as_object_mut() {
+        fields.insert("answers".into(), Value::Object(map));
+    }
+    input
 }
 
 /// Answers hook callback `request_id` with nothing to say: the CLI goes on
@@ -656,6 +727,26 @@ impl Protocol {
         };
         out.writes.push(write);
         out
+    }
+
+    /// Answers question `request` with `answers` (an allow whose
+    /// `updatedInput` carries them, [`answered_input`]); nothing if it is no
+    /// longer pending.
+    pub fn answer_question(
+        &mut self,
+        request: &AgentRequestId,
+        answers: &[QuestionAnswer],
+    ) -> Output {
+        let Some(index) = self.pending.iter().position(|p| p.request == *request) else {
+            tracing::debug!(request = %request.0, "dropping an answer to a question that is not pending");
+            return Output::default();
+        };
+        let pending = self.pending.remove(index);
+        let input = answered_input(&pending.input, answers);
+        Output {
+            writes: vec![allow_response(&pending.request.0, &input)],
+            events: Vec::new(),
+        }
     }
 
     /// Stops the current turn; nothing when idle or already interrupting.
@@ -1180,6 +1271,7 @@ impl Protocol {
             .map(str::to_owned);
         let request = AgentRequestId(request_id.to_owned());
         let call = tool_use_id.as_deref().map(AgentCallId::from);
+        let asked = (tool == ASK_TOOL).then(|| questions(&input)).flatten();
         self.pending.push(Pending {
             request: request.clone(),
             tool_use_id,
@@ -1187,6 +1279,15 @@ impl Protocol {
             updates,
             task: task.clone(),
         });
+        if let Some(questions) = asked {
+            out.events.push(AdapterEvent::QuestionAsked {
+                request,
+                call,
+                questions,
+                task,
+            });
+            return;
+        }
         out.events.push(AdapterEvent::ApprovalRequested {
             request,
             call,

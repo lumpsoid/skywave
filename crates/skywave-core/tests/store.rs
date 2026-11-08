@@ -1549,6 +1549,57 @@ fn v25_reads_the_turn_usage_a_v24_replica_holds() {
     assert_eq!(events[1], EventKind::TurnUsage(usage));
 }
 
+/// A v25 replica's pending approval (its event and the session's pending
+/// list) reads as the same plain approval once v26's step ran.
+#[test]
+fn v26_reads_the_pending_approval_a_v25_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let approval = ApprovalId::new();
+    let requested = EventKind::ApprovalRequested {
+        id: approval,
+        call: None,
+        tool: "exec".into(),
+        summary: "rm -rf target".into(),
+        input: None,
+        suggestions: Vec::new(),
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                id,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/x".into(),
+                    context_name: "start".into(),
+                    from: None,
+                },
+            ),
+            event(id, 1, requested.clone()),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch("UPDATE protocol_stamp SET version = 25;")
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let session = store.session(id).unwrap().unwrap();
+    assert_eq!(session.pending_approvals, [approval]);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events[1], requested);
+}
+
 #[test]
 fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_cannot_migrate() {
     let (_tmp, dir) = data_dir();
