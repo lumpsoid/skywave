@@ -795,7 +795,8 @@ logs) an event that no longer decodes rather than failing.
   the recorded progress (each progress report follows an fsync, so a
   power loss never resumes past durable bytes), verified by size and by
   the `BlobRef`'s SHA-256 (the replica keeps it in `blob_hashes`), and
-  renamed when complete. A wrong hash deletes the file; the first one a
+  renamed when complete. A blob already whole on disk (an empty one always
+  is) is checked the same way without a request. A wrong hash deletes the file; the first one a
   worker sees while it holds the blob refetches it from zero at once (the
   bytes may be the device's own, kept from an earlier try), a second is
   the server's (every byte came from it since) and leaves the blob

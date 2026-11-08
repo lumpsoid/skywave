@@ -910,9 +910,13 @@ async fn fetch(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
+    // A whole kept file needs no request, only its check. An empty blob is
+    // whole before any byte arrives, with no `.part` file yet: create it.
     if from == size {
         let file = tokio::fs::OpenOptions::new()
+            .create(true)
             .write(true)
+            .truncate(false)
             .open(&part)
             .await?;
         file.set_len(size).await?;
@@ -1772,6 +1776,46 @@ mod tests {
             .await;
         assert_eq!(f.status(), BlobStatus::NotDownloaded);
         assert!(!f.part().exists());
+    }
+
+    /// An empty blob (the server makes them, e.g. a conflicted file's diff)
+    /// is whole before any byte arrives: it settles without a request,
+    /// through the same size and hash check, as an empty file.
+    #[tokio::test]
+    async fn an_empty_blob_settles_available_without_a_request() {
+        let f = Fixture::new(0, Vec::new(), 0);
+        f.queue.want(f.blob.id);
+        f.run_until(|s| matches!(s, BlobStatus::Available { .. }))
+            .await;
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0);
+        let BlobStatus::Available { path } = f.status() else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert!(!f.part().exists());
+        assert_eq!(f.shown(), BlobState::Available { path });
+    }
+
+    /// The empty blob still goes through the hash check: one promising
+    /// other content fails rather than settling.
+    #[tokio::test]
+    async fn an_empty_blob_promising_other_content_fails() {
+        let promised = ContentHash::of(b"other content");
+        let f = Fixture::hashed(0, promised, Vec::new(), 0);
+        f.queue.want(f.blob.id);
+        f.run_until(|_| matches!(f.shown(), BlobState::Failed { .. }))
+            .await;
+        assert_eq!(f.status(), BlobStatus::NotDownloaded);
+        assert!(!f.part().exists());
+        let actual = ContentHash::of(b"");
+        assert_eq!(
+            f.shown(),
+            BlobState::Failed {
+                size: 0,
+                reason: format!("blob content hash mismatch: expected {promised}, got {actual}"),
+            }
+        );
+        assert_eq!(f.server.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
