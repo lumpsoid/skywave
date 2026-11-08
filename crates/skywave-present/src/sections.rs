@@ -12,7 +12,7 @@ use skywave_core::{
     ToolKind, ToolOutcome, ToolView,
 };
 
-use crate::format::device_word;
+use crate::format::{bytes, device_word, percent};
 
 /// Most preview lines an item shows while collapsed.
 pub const PREVIEW_LINES: usize = 8;
@@ -244,6 +244,44 @@ pub fn change_note(blob: &BlobView) -> Option<String> {
             if *of == 1 { "line" } else { "lines" }
         )),
     }
+}
+
+/// While collapsed, the state of an item's blob when no section on screen
+/// carries one (a hidden input or output, an empty preview), so a download
+/// on it shows what it did: `input 4.2 KiB`, `output 1.0 MiB · requested`;
+/// that it was deleted ([`deleted_note`]): `input · Deleted by laptop`; or
+/// that the server could not keep it: `input not stored`. `None` once the
+/// blob is here or a shown section carries it.
+pub fn unseen_blob(entry: &Entry) -> Option<String> {
+    let sections = sections(entry);
+    let shown = |s: &Section| !s.hidden && !s.text.strip_suffix('\n').unwrap_or(s.text).is_empty();
+    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
+        return None;
+    }
+    let section = sections.iter().find(|s| s.full.is_some())?;
+    let what = match (section.input, section.hidden) {
+        (true, _) => "input",
+        (false, true) => "output",
+        (false, false) => "full",
+    };
+    let blob = match section.full? {
+        FullView::Blob(blob) => blob,
+        FullView::Deleted { by } => return Some(format!("{what} · {}", deleted_note(by))),
+        FullView::Lost => return Some(format!("{what} not stored")),
+    };
+    let state = match &blob.state {
+        BlobState::NotDownloaded { size } => bytes(*size),
+        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
+        BlobState::Downloading { got, size, paused } => format!(
+            "{} · downloading {}%{}",
+            bytes(*size),
+            percent(*got, *size),
+            if *paused { " · paused, offline" } else { "" }
+        ),
+        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
+        BlobState::Available { .. } => return None,
+    };
+    Some(format!("{what} {state}"))
 }
 
 /// The first of `sections` whose whole content the server could not keep,
@@ -666,6 +704,32 @@ mod tests {
         let shown = tool_sections(&view);
         assert_eq!(shown.len(), 2);
         assert_eq!(shown[1].note().as_deref(), Some("Deleted by laptop"));
+    }
+
+    #[test]
+    fn a_collapsed_unseen_input_says_deleted_apart_from_lost() {
+        // A call with no body: its input is the only section, hidden.
+        let entry = |input: FullView| {
+            let mut view = call(None, Some(input));
+            view.body = None;
+            Entry::Tool(Box::new(view))
+        };
+        let deleted = FullView::Deleted {
+            by: device("laptop", false),
+        };
+        assert_eq!(
+            unseen_blob(&entry(deleted)).as_deref(),
+            Some("input · Deleted by laptop")
+        );
+        assert_eq!(
+            unseen_blob(&entry(FullView::Lost)).as_deref(),
+            Some("input not stored")
+        );
+        // Control: a kept input says its download state.
+        assert_eq!(
+            unseen_blob(&entry(kept_blob())).as_deref(),
+            Some("input 10 B")
+        );
     }
 
     #[test]
