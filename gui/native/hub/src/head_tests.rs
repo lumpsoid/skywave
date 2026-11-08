@@ -4279,7 +4279,7 @@ mod workdir {
 
 mod blob_actions {
     use skywave_core::{BlobId, LineSpan};
-    use skywave_present::blob_actions::{DELETE_CONFIRMATION, crop_confirmation};
+    use skywave_present::blob_actions::crop_confirmation;
 
     use super::*;
     use crate::signals::{
@@ -4351,7 +4351,11 @@ mod blob_actions {
             Some(BlobTargetView {
                 blob_id: blob.0.to_string(),
                 can_crop: true,
-                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                delete_question: Some(
+                    "Delete this shell output from the server and from every device? \
+                     This can't be undone."
+                        .into()
+                ),
                 pending_note: None,
                 discard_id: None,
                 session_id: rig.session.0.to_string(),
@@ -4572,7 +4576,7 @@ mod blob_actions {
                     size: 4096,
                     session: rig.session,
                     seq: Seq(7),
-                    holds: skywave_proto::BlobUse::ToolOutput,
+                    holds: skywave_proto::BlobUse::ToolInput,
                 }],
                 shell_runs: Vec::new(),
             }),
@@ -4593,13 +4597,17 @@ mod blob_actions {
             target,
             BlobTargetView {
                 blob_id: blob.0.to_string(),
-                can_crop: true,
-                delete_question: Some(DELETE_CONFIRMATION.to_owned()),
+                can_crop: false,
+                delete_question: Some(
+                    "Delete this tool input from the server and from every device? \
+                     This can't be undone."
+                        .into()
+                ),
                 pending_note: None,
                 discard_id: None,
                 session_id: rig.session.0.to_string(),
-                holds: BlobUseView::ToolOutput,
-                title: format!("{} · tool output", rows(&rig)[0].label),
+                holds: BlobUseView::ToolInput,
+                title: format!("{} · tool input", rows(&rig)[0].label),
             }
         );
     }
