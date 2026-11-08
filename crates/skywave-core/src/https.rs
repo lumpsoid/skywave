@@ -18,6 +18,10 @@
 //! write means bytes left the host. Elsewhere the kernel's send buffer
 //! still counts as sent, and the wait for the reply also covers draining
 //! it.
+//!
+//! Every request accepts zstd, and a reply marked so is decoded here
+//! ([`encoding`], D45): whole for JSON replies, chunk by chunk for blobs,
+//! whose per-chunk timeout still applies to the compressed chunks.
 
 use std::io;
 use std::pin::Pin;
@@ -29,11 +33,12 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
-use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use serde::de::DeserializeOwned;
+use skywave_proto::encoding::{DECODED_LENGTH_HEADER, ZSTD};
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
     EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, RUN_HEADER, RunId,
@@ -45,6 +50,7 @@ use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 
 use crate::address::ServerAddress;
+use crate::encoding::{self, ZstdBody};
 use crate::identity::Identity;
 use crate::tls;
 use crate::transport::{BlobBody, BlobDownload, BoxFuture, ExpectedRun, Transport, TransportError};
@@ -385,7 +391,10 @@ impl Http {
             let mut req = Request::builder()
                 .method(method.clone())
                 .uri(uri)
-                .header(header::HOST, self.authority.clone());
+                .header(header::HOST, self.authority.clone())
+                // Event batches and blobs come compressed (D45); every
+                // reply is decoded ([`encoding`]), so every request asks.
+                .header(header::ACCEPT_ENCODING, ZSTD);
             if !body.is_empty() {
                 req = req.header(header::CONTENT_TYPE, "application/json");
             }
@@ -453,9 +462,9 @@ impl Http {
                 .to_bytes();
             self.put_idle(head.conn);
             Ok(Reply {
+                body: encoding::decoded(&head.headers, body)?,
                 status: head.status,
                 headers: head.headers,
-                body,
             })
         };
         let ended = tokio::time::timeout(timeout, exchange)
@@ -519,9 +528,9 @@ impl Http {
         }
         self.put_idle(head.conn);
         Ok(Reply {
+            body: encoding::decoded(&head.headers, read.into())?,
             status: head.status,
             headers: head.headers,
-            body: read.into(),
         })
     }
 
@@ -798,11 +807,20 @@ impl HttpsTransport {
             .http
             .request_head(Method::GET, &path::blob(id), &headers)
             .await?;
+        let compressed = encoding::is_zstd(&head.headers)?;
+        // A compressed body's length is the frame's, not the blob's: the
+        // server names the decoded length instead. A range counts decoded
+        // bytes either way.
+        let length = if compressed {
+            HeaderName::from_static(DECODED_LENGTH_HEADER)
+        } else {
+            header::CONTENT_LENGTH
+        };
         let (offset, total) = match head.status {
             StatusCode::OK => {
-                let total = header_str(&head.headers, header::CONTENT_LENGTH)
+                let total = header_str(&head.headers, length.clone())
                     .and_then(|v| v.trim().parse().ok())
-                    .ok_or_else(|| TransportError::Decode("blob without Content-Length".into()))?;
+                    .ok_or_else(|| TransportError::Decode(format!("blob without {length}")))?;
                 (0, total)
             }
             StatusCode::PARTIAL_CONTENT => header_str(&head.headers, header::CONTENT_RANGE)
@@ -810,13 +828,19 @@ impl HttpsTransport {
                 .ok_or_else(|| TransportError::Decode("bad Content-Range".into()))?,
             status => return Err(status_error(status, &head.headers)),
         };
+        let body = TimedBody {
+            body: Some(head.body),
+            timeout: self.http.request_timeout(),
+        };
+        let body: Box<dyn BlobBody> = if compressed {
+            Box::new(ZstdBody::new(body)?)
+        } else {
+            Box::new(body)
+        };
         Ok(BlobDownload {
             offset,
             total,
-            body: Box::new(TimedBody {
-                body: Some(head.body),
-                timeout: self.http.request_timeout(),
-            }),
+            body,
         })
     }
 }

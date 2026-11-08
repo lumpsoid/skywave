@@ -31,6 +31,7 @@ mod blobs;
 mod client;
 mod completion;
 mod conversations;
+mod encoding;
 mod engine;
 mod https;
 pub mod identity;

@@ -26,6 +26,11 @@
 //! ranges, other units or malformed ranges are ignored and the full blob is
 //! sent (RFC 9110 lets a server do that). Content is streamed from the file.
 //!
+//! **Compression** (D45, [`crate::encoding`]): an event batch or blob body
+//! of at least `COMPRESS_MIN_BYTES` goes as one zstd frame when the request
+//! accepts zstd. A blob's range counts decoded bytes, so a resumed download
+//! gets a fresh frame of the rest.
+//!
 //! **Dirs** (`GET /v1/dirs?dir=`, workdir completion): every outcome is a
 //! 200 [`DirsResult`](skywave_proto::DirsResult), since 401/403 would read
 //! as a revoked device. The listing ([`crate::dirs`]) runs on a blocking
@@ -94,7 +99,7 @@
 //! 412 another run expected, 500 server fault.
 
 use std::collections::HashMap;
-use std::io::SeekFrom;
+use std::io::{Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -115,7 +120,7 @@ use skywave_proto::{
     LineSpan, PROTOCOL_VERSION, RUN_HEADER, RunId, ServerId, WorkdirQuery, check_conversation_id,
     limits, path,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::agent::import::{self, Prepared};
@@ -128,6 +133,7 @@ use crate::data_dir::DataDir;
 use crate::db::Db;
 use crate::devices;
 use crate::dirs;
+use crate::encoding;
 use crate::error::{Error, Result};
 use crate::event_log::{self, DEFAULT_BATCH_LIMIT, MAX_SEQ, head_in};
 use crate::server::{JoinedHook, ServerOptions};
@@ -159,8 +165,6 @@ pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FS_PERMITS: usize = 8;
 /// Longest such a request waits for a permit before the reply is a 503.
 pub const FS_PERMIT_WAIT: Duration = Duration::from_millis(500);
-/// Read size when streaming a blob.
-const BLOB_CHUNK: usize = 64 * 1024;
 
 /// The client certificate (leaf) the peer presented in the TLS handshake,
 /// if any. The connection loop attaches it to every request.
@@ -638,10 +642,12 @@ async fn prepare_import(
 async fn events(
     State(api): State<Arc<Api>>,
     query: std::result::Result<Query<EventsQuery>, QueryRejection>,
+    headers: HeaderMap,
 ) -> Response {
     let Ok(Query(query)) = query else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let compress = encoding::wants_zstd(&headers);
     let after = query.after;
     if after > MAX_SEQ {
         return StatusCode::BAD_REQUEST.into_response();
@@ -660,7 +666,8 @@ async fn events(
         .blocking(move |api, db| api.log.read(db, after, limit))
         .await
     {
-        Ok(batch) => Json(batch).into_response(),
+        // Encoded off the API's connection, which the read alone holds.
+        Ok(batch) => encoding::json(batch, compress).await,
         Err(status) => status.into_response(),
     }
 }
@@ -899,25 +906,45 @@ async fn blob(
         }
     };
 
-    let mut file = tokio::fs::File::from_std(file.into_file());
-    if let Err(e) = file.seek(SeekFrom::Start(start)).await {
+    let mut file = file.into_file();
+    // A seek moves the file offset and reads nothing, so it does not block.
+    if let Err(e) = file.seek(SeekFrom::Start(start)) {
         tracing::error!(blob = %id.0, error = %e, "seeking blob");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let chunks = futures_util::stream::try_unfold(file.take(len), |mut reader| async move {
-        let mut buf = BytesMut::with_capacity(BLOB_CHUNK);
-        let n = reader.read_buf(&mut buf).await?;
-        Ok::<_, std::io::Error>((n > 0).then(|| (buf.freeze(), reader)))
-    });
+    let compress = encoding::wants_zstd(&headers) && encoding::worth_compressing(len);
+    let body = if compress {
+        encoding::blob_frame(file, len)
+    } else {
+        let file = tokio::fs::File::from_std(file);
+        let chunks = futures_util::stream::try_unfold(file.take(len), |mut reader| async move {
+            let mut buf = BytesMut::with_capacity(encoding::BLOB_CHUNK);
+            let n = reader.read_buf(&mut buf).await?;
+            Ok::<_, std::io::Error>((n > 0).then(|| (buf.freeze(), reader)))
+        });
+        Body::from_stream(chunks)
+    };
 
-    let mut resp = Response::new(Body::from_stream(chunks));
+    let mut resp = Response::new(body);
     *resp.status_mut() = status;
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if compress {
+        // The frame's length is known only once it is made: chunked.
+        h.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(skywave_proto::encoding::ZSTD),
+        );
+        h.insert(
+            header::HeaderName::from_static(skywave_proto::encoding::DECODED_LENGTH_HEADER),
+            HeaderValue::from(len),
+        );
+    } else {
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if status == StatusCode::PARTIAL_CONTENT {
         let last = start + len - 1;

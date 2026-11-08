@@ -1147,3 +1147,49 @@ show the same size again and again), or compaction (task
 **Rejected:** looking up event blobs by hash like workdir blobs (a delete
 or crop on one item would reach every item sharing the bytes); sharing
 across workdir and event blobs (D36 keeps them apart for the same reason).
+
+## D45. Event batches and blobs travel zstd-compressed; ranges count decoded bytes
+Most of what a device downloads is text (tool output, diffs, file
+contents, the log's JSON), which shrinks several times, and the link is
+the cost on a bad network. So `GET /v1/events` and `GET /v1/blobs/{id}`
+send a body as one zstd frame (`Content-Encoding: zstd`, level 3) to a
+request that sends `Accept-Encoding: zstd`; the device's transport sends
+it on every request and decodes every reply that is marked
+(`skywave_proto::encoding`).
+- **A blob range counts decoded bytes.** Plain HTTP ranges a
+  `Content-Encoding` by its encoded bytes, which per-response compression
+  makes useless for resuming (another response's frame differs). Here
+  `Range` and `Content-Range` count the blob's own bytes: the server seeks
+  to the decoded offset and compresses the rest as a fresh frame, the
+  device decodes and appends. Downloads resume from `.part` files as
+  before, progress (`Downloading { got, size }`) and the SHA-256 check stay
+  on decoded bytes, and nothing compressed is stored. A compressed blob
+  response names its decoded length (`skywave-decoded-length`) instead of
+  a `Content-Length`. Only Skywave's own client reads these responses, so
+  departing from RFC 9110 here costs nothing.
+- **One simple skip rule:** bodies under 1 KiB (`COMPRESS_MIN_BYTES`)
+  travel as they are, an empty long-poll answer among them. There is no
+  sniffing for content already compressed: binary workdir files are never
+  blobs (`FileBody::Binary`), event blobs are text, and zstd stores
+  incompressible blocks raw at a few bytes' cost.
+- **Asked for, not assumed.** The wire is exact-match versioned, so the
+  header is not version negotiation; it keeps a request that does not ask
+  (curl while debugging, the server's API tests) reading plain bytes, at
+  the cost of one header check.
+- **Modest CPU.** Level 3 is zstd's default: hundreds of MB/s on a desktop
+  and still far above any link on a small server; decoding is faster
+  still, with a window of at most 2 MiB per download at this level. The
+  server encodes on blocking threads (a batch after its read, off the
+  database connection; a blob a piece at a time), never on a connection's
+  task.
+- **zstd through the `zstd` crate**, which builds the C library with
+  `cc`, as rusqlite's bundled SQLite already is on every target the hub
+  builds for (Android included).
+**Rejected:** storing blobs compressed (the store, its hashes, crops and
+the storage report would all change, for a CPU saving the server does not
+need); tower-http's compression layer (it knows nothing of ranges counting
+decoded bytes or of the decoded-length header, and adds
+`async-compression`); gzip (`flate2` is pure
+Rust, but compresses text worse and slower than zstd); compressing
+commands and the other JSON replies (small, or rare; the device would
+decode them already, so the server could start any time).
