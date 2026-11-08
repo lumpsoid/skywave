@@ -1,7 +1,7 @@
 {
-  "protocol_version": 24,
+  "protocol_version": 25,
   "hello": {
-    "protocol_version": 24,
+    "protocol_version": 25,
     "server_id": "01920000-0000-7000-8000-000000000006",
     "device_id": "01920000-0000-7000-8000-000000000003",
     "head": 16,
@@ -605,7 +605,9 @@
           "tokens_in": 3100,
           "tokens_out": 812,
           "cost_usd": 0.04,
-          "model": "model-a"
+          "model": "model-a",
+          "context_tokens": 19337,
+          "context_window": 1000000
         }
       },
       {
@@ -619,7 +621,22 @@
           "tokens_in": null,
           "tokens_out": null,
           "cost_usd": null,
-          "model": null
+          "model": null,
+          "context_tokens": null,
+          "context_window": null
+        }
+      },
+      {
+        "session_id": "01920000-0000-7000-8000-000000000001",
+        "at": "2026-10-29T12:00:00Z",
+        "command_id": null,
+        "context": "01920000-0000-7000-8000-000000000008",
+        "kind": {
+          "type": "subagent_usage",
+          "call": "01920000-0000-7000-8000-000000000007",
+          "duration_ms": 4284,
+          "tool_uses": 1,
+          "context_tokens": 11850
         }
       },
       {

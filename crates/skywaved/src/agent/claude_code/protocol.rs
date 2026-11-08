@@ -111,7 +111,7 @@ use super::{display, rules, usage};
 use crate::agent::mapper::cut_line;
 use crate::agent::{
     AdapterEvent, AgentCallId, AgentRequestId, AgentSchedule, AgentTask, Effort, ModelChoice,
-    PermissionMode, ResumeHandle, TaskKind, TurnOutcome,
+    PermissionMode, ResumeHandle, SubagentFigures, TaskKind, TurnOutcome,
 };
 
 /// The CLI version the protocol was confirmed against (T07). Another version
@@ -790,6 +790,9 @@ impl Protocol {
             "system" if str_field(message, "subtype") == "task_started" => {
                 self.on_task_started(message, &mut out);
             }
+            "system" if str_field(message, "subtype") == "task_notification" => {
+                self.on_task_notification(message, &mut out);
+            }
             "command_lifecycle" => self.on_lifecycle(message, &mut out),
             "assistant" => self.on_assistant(message, &mut out),
             "user" => self.on_user(message, &mut out),
@@ -799,9 +802,10 @@ impl Protocol {
             "result" => self.on_result(message, &mut out),
             // rate_limit_event, stream_event, other system subtypes: progress
             // signals only. That includes the other edge events of tasks
-            // (task_updated, task_progress, task_notification): the task set
-            // comes from background_tasks_changed alone, task_started only
-            // names a subagent task's call.
+            // (task_updated, task_progress): the task set comes from
+            // background_tasks_changed alone, task_started only names a
+            // subagent task's call, task_notification only gives a finished
+            // subagent's figures.
             _ => {}
         }
         out
@@ -1040,6 +1044,34 @@ impl Protocol {
         if known.as_deref() != Some(call) && self.tasks.iter().any(|t| t.id == task) {
             self.report_tasks(out);
         }
+    }
+
+    /// `system/task_notification` of a subagent task that `completed`: its
+    /// `usage` (`total_tokens` is its context at its end, §2.6) for the call
+    /// its `task_started` named. A stopped task's has no `usage`, and a
+    /// shell task was never mapped to a call.
+    fn on_task_notification(&mut self, message: &Value, out: &mut Output) {
+        if str_field(message, "status") != "completed" {
+            return;
+        }
+        let (Some(call), Some(usage)) = (
+            message
+                .get("task_id")
+                .and_then(Value::as_str)
+                .and_then(|task| self.task_calls.get(task)),
+            message.get("usage").filter(|u| u.is_object()),
+        ) else {
+            return;
+        };
+        let figure = |key| usage.get(key).and_then(Value::as_u64);
+        out.events.push(AdapterEvent::SubagentUsage {
+            call: AgentCallId::from(call.as_str()),
+            usage: SubagentFigures {
+                duration_ms: figure("duration_ms"),
+                tool_uses: figure("tool_uses"),
+                context_tokens: figure("total_tokens"),
+            },
+        });
     }
 
     /// Reports the last task set, each subagent task with its call as far

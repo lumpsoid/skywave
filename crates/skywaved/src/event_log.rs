@@ -434,6 +434,7 @@ impl EventLog {
             | EventKind::ApprovalRequested { .. }
             | EventKind::SessionStateChanged(_)
             | EventKind::TurnUsage(_)
+            | EventKind::SubagentUsage(_)
             | EventKind::PermissionModeChanged { .. }
             | EventKind::PermissionModeRefused { .. }
             | EventKind::ModelChanged { .. }
@@ -951,6 +952,7 @@ pub(crate) fn append_in(
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::TurnUsage(_)
+        | EventKind::SubagentUsage(_)
         | EventKind::ModelsOffered { .. }
         | EventKind::AgentVersionUnconfirmed { .. }
         | EventKind::TaskStopRequested { .. }
@@ -1435,6 +1437,7 @@ fn kind_name(kind: &EventKind) -> &'static str {
         EventKind::SessionArchived { .. } => "SessionArchived",
         EventKind::SessionStateChanged(_) => "SessionStateChanged",
         EventKind::TurnUsage(_) => "TurnUsage",
+        EventKind::SubagentUsage(_) => "SubagentUsage",
         EventKind::PermissionModeRequested { .. } => "PermissionModeRequested",
         EventKind::PermissionModeChanged { .. } => "PermissionModeChanged",
         EventKind::PermissionModeRefused { .. } => "PermissionModeRefused",

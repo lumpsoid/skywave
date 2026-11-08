@@ -400,9 +400,9 @@ pub struct SessionScreen {
     pub rules_label: Option<String>,
     /// The agent's mode and model, and what switches them.
     pub agent: AgentSettingsView,
-    /// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `session $1.27`,
-    /// `<model>` until the agent names its model in `agent`: drop from
-    /// the front when short of room.
+    /// `last turn 12.4s`, `3.1k in / 812 out`, `$0.04`, `ctx 19k/1M · 2%`
+    /// (`ctx ?` while unknown), `session $1.27`, `<model>` until the agent
+    /// names its model in `agent`: drop from the front when short of room.
     pub usage: Vec<String>,
     /// The approval the agent is blocked on.
     pub approval: Option<ApprovalPanel>,

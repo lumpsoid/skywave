@@ -301,10 +301,18 @@ fn all_event_kinds() -> Vec<EventKind> {
             tokens_out: Some(812),
             cost_usd: Some(0.04),
             model: Some("model-a".into()),
+            context_tokens: Some(19_337),
+            context_window: Some(1_000_000),
         }),
         EventKind::TurnUsage(TurnUsage {
             duration_ms: Some(2_590),
             ..TurnUsage::default()
+        }),
+        EventKind::SubagentUsage(SubagentUsage {
+            call: call(),
+            duration_ms: Some(4_284),
+            tool_uses: Some(1),
+            context_tokens: Some(11_850),
         }),
         EventKind::PermissionModeRequested {
             mode: PermissionMode::Plan,
@@ -1466,8 +1474,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v24() {
-    assert_eq!(PROTOCOL_VERSION, 24);
+fn protocol_is_v25() {
+    assert_eq!(PROTOCOL_VERSION, 25);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);

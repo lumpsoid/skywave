@@ -397,7 +397,8 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// bump moves its log. Every bump adds one, a no-op saying so if nothing
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
-const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
+    [v23_to_v24, v24_to_v25];
 
 /// v23 to v24, as the server's step of the same name. What v24 changed of
 /// what is stored, and how each is moved:
@@ -411,6 +412,19 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 ///   `.part` file and its recorded progress count decoded bytes, as they
 ///   did, so a v23 download resumes unchanged; nothing stored changes.
 fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
+
+/// v24 to v25, as the server's step of the same name. What v25 changed of
+/// what is stored, and how each is moved:
+/// - `context_tokens` and `context_window` on `TurnUsage` (in `TurnUsage`
+///   events, `turns.usage` and `sessions.usage`): new optional fields,
+///   which v24 JSON lacks and reads as `None`, so nothing is rewritten.
+/// - `context` on the `SessionUsage` in `sessions.usage`: an optional field
+///   v24 lacks, read as `None`, the unknown fill a session shows until its
+///   next turn reports one.
+/// - `EventKind::SubagentUsage`: new, so no v24 event is one.
+fn v24_to_v25(_tx: &Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 

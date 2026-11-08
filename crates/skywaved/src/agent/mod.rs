@@ -173,6 +173,16 @@ pub struct AgentTask {
     pub ambient: bool,
 }
 
+/// What a finished subagent ran, as its agent reported it; the
+/// [`EventMapper`] logs it by the call's [`skywave_proto::CallId`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentFigures {
+    pub duration_ms: Option<u64>,
+    pub tool_uses: Option<u64>,
+    /// Its context when it ended, not what it spent.
+    pub context_tokens: Option<u64>,
+}
+
 /// One scheduled wakeup of the agent: a prompt it runs on its own when
 /// `when` comes. Uncut, its id the agent's own and opaque; the
 /// [`EventMapper`] cuts the rest for the log. Information only: nothing
@@ -361,6 +371,13 @@ pub enum AdapterEvent {
     /// once a turn, just before its `TurnEnded`, and only with something in
     /// it. Optional: an agent that measures nothing never sends it.
     TurnUsage(TurnUsage),
+    /// The subagent `call` ran finished, and this is what it ran; at most
+    /// once a subagent, inside a turn or outside any. Optional: an agent
+    /// that reports nothing never sends it, nor for a stopped subagent.
+    SubagentUsage {
+        call: AgentCallId,
+        usage: SubagentFigures,
+    },
     /// The current turn is over.
     TurnEnded(TurnOutcome),
     /// The handle to persist for resuming this context; replaces any earlier.

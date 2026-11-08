@@ -710,6 +710,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
                     tokens_out: Some(800),
                     cost_usd: Some(0.25),
                     model: Some("model-a".into()),
+                    ..TurnUsage::default()
                 },
             ),
             turn(
@@ -739,6 +740,7 @@ fn turn_usage_is_summed_kept_and_starts_empty_after_the_migration() {
             tokens_out: Some(800),
             cost_usd: Some(0.75),
             model: Some("model-a".into()),
+            ..TurnUsage::default()
         }
     );
     drop(store);
@@ -1394,7 +1396,7 @@ fn v24_reads_the_tool_results_a_v23_replica_holds() {
     drop(conn);
 
     let store = Store::open(&dir).unwrap();
-    assert_eq!(stamp(&dir), vec![24]);
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
     let id = SessionId(session.parse().unwrap());
     let outputs: Vec<Option<Full>> = store
         .session_events(id)
@@ -1443,7 +1445,7 @@ fn v24_reads_the_messages_a_v23_replica_holds() {
     drop(conn);
 
     let store = Store::open(&dir).unwrap();
-    assert_eq!(stamp(&dir), vec![24]);
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
     let id = SessionId(session.parse().unwrap());
     let texts: Vec<(String, bool)> =
         store
@@ -1469,6 +1471,82 @@ fn v24_reads_the_messages_a_v23_replica_holds() {
             ("In crates/skywaved/src/event_log.rs.".to_owned(), true),
         ]
     );
+}
+
+/// The turn usage a v24 replica holds (its events, `turns` rows and the
+/// session's `SessionUsage`, all without the context fields) reads once
+/// v25's step ran: no fill, an unknown one in the session's usage.
+#[test]
+fn v25_reads_the_turn_usage_a_v24_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let usage = TurnUsage {
+        duration_ms: Some(12_400),
+        tokens_in: Some(3_100),
+        tokens_out: Some(812),
+        cost_usd: Some(0.04),
+        model: Some("model-a".into()),
+        ..TurnUsage::default()
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![
+            event(
+                id,
+                0,
+                EventKind::SessionCreated {
+                    workdir: "/srv/x".into(),
+                    context_name: "start".into(),
+                    from: None,
+                },
+            ),
+            event(id, 1, EventKind::TurnUsage(usage.clone())),
+        ],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v24 wrote: the same JSON without the fields v25 added.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "UPDATE events SET event = json_remove(event,
+             '$.kind.context_tokens', '$.kind.context_window');
+         UPDATE turns SET usage = json_remove(usage, '$.context_tokens', '$.context_window');
+         UPDATE sessions SET usage = json_remove(usage,
+             '$.context', '$.last_turn.context_tokens', '$.last_turn.context_window',
+             '$.total.context_tokens', '$.total.context_window');
+         UPDATE protocol_stamp SET version = 24;",
+    )
+    .unwrap();
+    let left: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE usage LIKE '%context%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "v24's JSON has no context fields");
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    let session = store.session(id).unwrap().unwrap().usage.unwrap();
+    assert_eq!(session.last_turn, usage);
+    assert_eq!(session.context, None);
+    let turns: Vec<TurnUsage> = store
+        .turns()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.usage)
+        .collect();
+    assert_eq!(turns, std::slice::from_ref(&usage));
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events[1], EventKind::TurnUsage(usage));
 }
 
 #[test]

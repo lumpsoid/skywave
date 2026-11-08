@@ -7309,6 +7309,8 @@ fn two_turns(id: SessionId) -> Vec<Event> {
         tokens_out: Some(812),
         cost_usd: Some(0.04),
         model: None,
+        context_tokens: Some(19_337),
+        context_window: Some(1_000_000),
     };
     turn(1, first).into_iter().chain(turn(2, second)).collect()
 }
@@ -7330,17 +7332,19 @@ fn the_status_line_drops_usage_fields_from_the_left_as_it_narrows() {
 
     let wide = status_line(&h, 140);
     assert!(
-        wide.ends_with("last turn 12.4s · 3.1k in / 812 out · $0.04 · session $1.27 · model-a"),
+        wide.ends_with(
+            "last turn 12.4s · 3.1k in / 812 out · $0.04 · ctx 19k/1M · 2% · session $1.27 · model-a"
+        ),
         "{wide:?}"
     );
     assert!(wide.contains("agent idle   "), "right-aligned: {wide:?}");
 
     let narrow = status_line(&h, 60);
     assert!(
-        narrow.ends_with(" $0.04 · session $1.27 · model-a"),
+        narrow.ends_with(" ctx 19k/1M · 2% · session $1.27 · model-a"),
         "{narrow:?}"
     );
-    assert!(!narrow.contains("in /"), "{narrow:?}");
+    assert!(!narrow.contains("$0.04"), "{narrow:?}");
 
     let narrower = status_line(&h, 30);
     assert!(narrower.ends_with(" model-a"), "{narrower:?}");
