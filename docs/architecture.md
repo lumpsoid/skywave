@@ -539,7 +539,8 @@ the daemon's appends, which would otherwise stop `serve` (below).
   503 for list and file; changes answers `Failed { "timed out" }`, its git
   children killed). The outer timeout is 20 s. Content blobs are
   deduplicated by `(sha256, size)` in `workdir_blobs`, so an unchanged file
-  keeps its blob across refreshes; event blobs are never reused for them.
+  keeps its blob across refreshes; event blobs are never reused for them,
+  nor deduplicated among themselves (D44).
   **Blob GC**: a workdir blob lives while the latest answer to some read
   names it, any session: `workdir_answer_blobs` keeps the blobs of each
   read's latest answer, keyed as the core keys its stored answers

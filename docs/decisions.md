@@ -1111,3 +1111,39 @@ wire compatibility layer, much larger, not needed while one person runs
 both sides); resetting the replica instead of migrating it (it would drop
 unsent commands); migrating only from the previous version (a skipped
 release would again mean deleting data).
+
+## D44. Event blobs are not deduplicated by content
+Every event blob is its own: the server mints a fresh `BlobId` for each
+one, even when another event already stored the same bytes. Reading one
+large file ten times stores ten blobs, and `Eager` downloads all ten.
+Workdir blobs are deduplicated by `(sha256, size)` (D36); event blobs are
+not, and this is an accepted cost:
+- **A blob id is one item's content.** `DeleteBlob` and `CropBlob` (D42)
+  act on a blob id, and every device applies `BlobDeleted` and
+  `BlobCropped` by that id: it purges the row and keeps the fate
+  (`blob_fates`, keyed by blob id; a blob with a fate never registers
+  again). With one blob per event, deleting or cropping one item's
+  content touches only that item, which is what the user chose.
+- **Sharing would cost refcounts and cross-item effects.** If two events
+  named one blob, a delete on one would remove the other's content, and a
+  crop would rewrite it. Keeping the effect per item would need refcounted
+  `event_blobs` rows on the server, delete and crop commands and events
+  that name the item (event, field) and not only the blob, a fate per
+  item rather than per id on every device, and the file removed only when
+  its last item lets go: a wire and storage change through the server,
+  the replica, the eager queue and every head, for a saving only repeated
+  large content gets.
+- **The common case is already small.** A tool output of at most
+  `limits::INLINE_MAX_BYTES` (4 KiB) travels inline with no blob, and a
+  call's input is no blob when its body's blob already holds it whole, so
+  a big Write, Edit or command is stored once. What still repeats is large
+  content the agent produces more than once: the same big file read
+  again, the same long command output. The storage view (v22) shows it,
+  and `DeleteBlob` or `CropBlob` frees it per item.
+**Reopen if:** repeated large outputs are a real share of the server's
+disk or of eager traffic in use (the storage view's largest event blobs
+show the same size again and again), or compaction (task
+899242) changes how event content is kept anyway.
+**Rejected:** looking up event blobs by hash like workdir blobs (a delete
+or crop on one item would reach every item sharing the bytes); sharing
+across workdir and event blobs (D36 keeps them apart for the same reason).
