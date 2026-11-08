@@ -33,4 +33,19 @@ void main() {
     );
     expect(find.text('not downloaded · 70 B'), findsNWidgets(2));
   });
+
+  testWidgets('a label shows above the lines, only when the hub gives one', (
+    tester,
+  ) async {
+    const label = "approval input: differs from the call's";
+    await pump(tester, lines(['rm -rf /'], label: label));
+    expect(find.text(label), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text(label)).dy,
+      lessThan(tester.getTopLeft(find.textContaining('rm -rf /')).dy),
+    );
+
+    await pump(tester, lines(['rm -rf /']));
+    expect(find.text(label), findsNothing);
+  });
 }

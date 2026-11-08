@@ -778,6 +778,7 @@ fn view_of(
         numbered: section.numbered,
         first_line: 1,
         input: section.input,
+        label: section.label().map(str::to_owned),
         lines: lines
             .into_iter()
             .map(|text| SectionLine {
@@ -1140,6 +1141,57 @@ mod tests {
         );
     }
 
+    /// The input an approval asked about, other than its call's, shows
+    /// labelled once the call is expanded, and not before.
+    #[test]
+    fn an_approvals_own_input_shows_labelled_when_expanded() {
+        let asked = FullView::Blob(BlobView {
+            id: BlobId::new(),
+            state: BlobState::NotDownloaded { size: 2048 },
+            change: None,
+            pending: None,
+        });
+        let view = session(vec![TimelineItem::Logged {
+            parent: None,
+            seq: Seq(1),
+            at: Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            context: ContextId::new(),
+            entry: Entry::Tool(Box::new(ToolView {
+                call: skywave_core::CallId::new(),
+                name: "Bash".into(),
+                kind: skywave_core::ToolKind::Shell,
+                title: "$ make".into(),
+                detail: None,
+                body: None,
+                input: None,
+                approval: Some(skywave_core::ToolApproval {
+                    id: skywave_core::ApprovalId::new(),
+                    status: skywave_core::ApprovalStatus::Pending,
+                    answer: None,
+                    input: Some(asked),
+                }),
+                outcome: ToolOutcome::Running { since: Utc::now() },
+                subagent: None,
+            })),
+        }]);
+        let labels = |expanded: &HashSet<Seq>| {
+            let rows = rows(&view, expanded, &mut BlobHeads::default(), 0).rows;
+            rows[0]
+                .sections
+                .iter()
+                .map(|s| (s.label.clone(), s.blob.is_some()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&HashSet::new()), []);
+        assert_eq!(
+            labels(&HashSet::from([Seq(1)])),
+            [(
+                Some("approval input: differs from the call's".to_owned()),
+                true
+            )]
+        );
+    }
+
     #[test]
     fn the_unread_rule_stands_in_for_the_turn_separator() {
         let mut view = session(vec![
@@ -1178,6 +1230,7 @@ mod tests {
                 hidden: false,
                 input: false,
                 message: false,
+                asked: false,
             };
             let view = section_view(&section, expanded, &mut BlobHeads::default()).unwrap();
             (view.note, view.blob.unwrap().label)
@@ -1241,6 +1294,7 @@ mod tests {
             hidden: false,
             input: false,
             message: false,
+            asked: false,
         };
         let view = |full, expanded| {
             section_view(&section(full), expanded, &mut BlobHeads::default()).unwrap()

@@ -2954,6 +2954,7 @@ impl Model {
                             id: *id,
                             status: ApprovalStatus::Pending,
                             answer: None,
+                            input: input.as_ref().map(|f| self.full_view(f)),
                         });
                         tools.approvals.insert(*id, item);
                         None
@@ -7339,6 +7340,7 @@ mod tests {
                 id: approval,
                 status: ApprovalStatus::Pending,
                 answer: None,
+                input: None,
             }),
             outcome: ToolOutcome::Running { since: minute(2) },
         };
@@ -7381,6 +7383,7 @@ mod tests {
                     rule: None,
                 },
                 answer: None,
+                input: None,
             }),
             outcome: ToolOutcome::Done {
                 is_error: false,
@@ -7394,6 +7397,63 @@ mod tests {
         };
         assert_eq!(entries(&f), vec![Entry::Tool(Box::new(done))]);
         assert_eq!(f.session_view().pending_approval, None);
+    }
+
+    #[test]
+    fn an_approval_folded_into_its_call_keeps_its_own_input() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (call, approval, plain) = (CallId::new(), ApprovalId::new(), ApprovalId::new());
+        let asked = BlobRef {
+            id: BlobId::new(),
+            size: 5000,
+            sha256: skywave_proto::ContentHash::of(b""),
+        };
+        let other = CallId::new();
+        f.log(
+            sid,
+            vec![
+                EventKind::SessionStateChanged(LogState::AgentWorking),
+                tool_call(Some(call), ToolKind::Shell, "make"),
+                EventKind::ApprovalRequested {
+                    id: approval,
+                    call: Some(call),
+                    tool: "agent-tool".into(),
+                    summary: "make".into(),
+                    input: Some(Full::Blob(asked.clone())),
+                    suggestions: Vec::new(),
+                },
+                // Positive control: one asking what its call holds.
+                tool_call(Some(other), ToolKind::Shell, "ls"),
+                approval_requested(plain, Some(other)),
+                EventKind::ApprovalResolved {
+                    id: approval,
+                    decision: Decision::Approve,
+                    by: f.me,
+                    rule: None,
+                },
+            ],
+        );
+        f.open(sid);
+        let approvals: Vec<_> = tools(&f)
+            .into_iter()
+            .map(|v| (v.call, v.approval.and_then(|a| a.input)))
+            .collect();
+        assert_eq!(
+            approvals,
+            vec![
+                (
+                    call,
+                    Some(FullView::Blob(BlobView {
+                        id: asked.id,
+                        state: BlobState::NotDownloaded { size: asked.size },
+                        change: None,
+                        pending: None,
+                    }))
+                ),
+                (other, None),
+            ]
+        );
     }
 
     #[test]
@@ -7487,6 +7547,7 @@ mod tests {
                     rule: None,
                 },
                 answer: None,
+                input: None,
             })
         );
     }

@@ -882,6 +882,14 @@ impl Layout<'_> {
 
         let bar = || vec![indent(LEAD), Span::styled("│ ", gutter)];
         let mut out: Vec<Line<'static>> = Vec::new();
+        if let Some(label) = section.label() {
+            out.extend(wrap(
+                bar(),
+                bar(),
+                vec![Span::raw(label).yellow()],
+                self.width,
+            ));
+        }
         if skipped > 0 {
             let above = format!(
                 "… {skipped} {} above",

@@ -2036,6 +2036,54 @@ fn an_approval_of_a_call_warns_of_its_own_lost_input() {
     assert!(!screen.contains("could not store"), "{screen}");
 }
 
+/// An approval asking with an input other than its call's offers that
+/// input: the panel names it, and the call, revealed, shows it labelled.
+#[test]
+fn an_approval_offers_its_own_input_when_it_differs() {
+    let ask = |input: Option<Full>| {
+        let (mut h, id, _) = open_session();
+        let call_id = CallId::new();
+        let tool = call(call_id, "Bash", ToolKind::Shell, "make");
+        pull(
+            &mut h,
+            vec![
+                event(id, 1, EventKind::ToolCall(tool)),
+                event(
+                    id,
+                    2,
+                    EventKind::ApprovalRequested {
+                        id: ApprovalId::new(),
+                        call: Some(call_id),
+                        tool: "Bash".into(),
+                        summary: "make".into(),
+                        input,
+                        suggestions: Vec::new(),
+                    },
+                ),
+            ],
+        );
+        h
+    };
+    let label = "approval input: differs from the call's";
+
+    let mut h = ask(Some(Full::Blob(blob(4096).1)));
+    let screen = h.screen();
+    assert_contains(&screen, &format!("{label} · 4.0 KiB · v to see it"));
+    // Collapsed, the timeline does not show it.
+    assert!(!screen.contains(&format!("│ {label}")), "{screen}");
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('v'));
+    assert_contains(&h.screen(), &format!("│ {label}"));
+
+    // Control: asking what the call holds offers nothing extra.
+    let mut h = ask(None);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Char('v'));
+    let screen = h.screen();
+    assert_contains(&screen, "Approval needed");
+    assert!(!screen.contains(label), "{screen}");
+}
+
 /// A cut result whose output the server could not keep says so under its
 /// preview, where a kept one says where its blob stands.
 #[test]
