@@ -1,7 +1,7 @@
 //! Full scenarios about turns: messages, approvals, interrupts.
 
 use serde_json::json;
-use skywave_proto::Decision;
+use skywave_proto::{Decision, Question, QuestionAnswer};
 use skywaved::agent::claude_code::CliSession;
 use skywaved::agent::claude_code::protocol::INTERRUPT_REASON;
 use skywaved::agent::{
@@ -594,6 +594,122 @@ pub fn interrupt_pending(ctx: &mut Ctx) -> Result<(), Stop> {
         ensure(cancelled.is_some(), || "not cancelled".into()),
     );
     Ok(())
+}
+
+/// AskUserQuestion, answered four ways in one process: an option of a
+/// single-select question, two options of a multi-select one, text of the
+/// user's own, and a denial that declines. Each is reported as
+/// `QuestionAsked` with the call that asks; an answer ends in a result
+/// that is no error, the denial in an error result, and every turn goes
+/// on. Its recording is the fixture `ask_user_question.ndjson`
+/// (docs/agents/claude-code.md §3.14).
+pub fn ask_user_question(ctx: &mut Ctx) -> Result<(), Stop> {
+    let mut s = ctx.session(Setup::default())?;
+    s.auto_approve = false;
+    let asks: [(&str, &str, Reply); 4] = [
+        (
+            "single",
+            "I'm choosing tomorrow's bread. Use the AskUserQuestion tool to ask me one \
+             single-choice question: which bread, with the options Rye and Sourdough. Then tell \
+             me in one line what I picked.",
+            |_| Some(pick(&[0], None)),
+        ),
+        (
+            "multi",
+            "Now the toppings. Use the AskUserQuestion tool to ask me one multi-select question \
+             (multiSelect true): which toppings, with the options Seeds, Oats and Salt. Then tell \
+             me in one line what I picked.",
+            |q| q.multi_select.then(|| pick(&[0, 1], None)),
+        ),
+        (
+            "other",
+            "And the jam for the counter. Use the AskUserQuestion tool to ask me one question: \
+             which jam, with the options Apricot and Plum. Then tell me in one line what I \
+             picked.",
+            |_| Some(pick(&[], Some("Marmalade, homemade"))),
+        ),
+        (
+            "decline",
+            "Last one, the tea for the staff. Use the AskUserQuestion tool to ask me one \
+             question: which tea, with the options Green and Black. Then tell me in one line \
+             what happened.",
+            |_| None,
+        ),
+    ];
+    for (step, text, answer) in asks {
+        s.note(&format!("step {step}"));
+        let from = s.mark();
+        s.send(text);
+        let (_, asked) = s.wait_event("question or end of the turn", TURN, from, |e| match e {
+            AdapterEvent::QuestionAsked {
+                request,
+                call,
+                questions,
+                ..
+            } => Some(Some((request.clone(), call.clone(), questions.clone()))),
+            AdapterEvent::ApprovalRequested { request, tool, .. } => Some(Some((
+                request.clone(),
+                None,
+                vec![Question {
+                    header: String::new(),
+                    text: format!("not a question: {tool}"),
+                    options: Vec::new(),
+                    multi_select: false,
+                }],
+            ))),
+            AdapterEvent::TurnEnded(_) => Some(None),
+            _ => None,
+        })?;
+        let Some((request, call, questions)) = asked else {
+            return Err(Stop::Inconclusive(format!(
+                "{step}: the turn ended without a question"
+            )));
+        };
+        if questions.iter().any(|q| q.options.is_empty()) || questions.len() != 1 {
+            answer_with(&mut s, &request, None);
+            return Err(Stop::Inconclusive(format!(
+                "{step}: not one question with options: {questions:?}"
+            )));
+        }
+        ctx.checks.contract(
+            "a question names its tool call",
+            ensure(call.is_some(), || "no tool_use_id".into()),
+        );
+        let reply = answer(&questions[0]);
+        if reply.is_none() && step != "decline" {
+            answer_with(&mut s, &request, None);
+            return Err(Stop::Inconclusive(format!(
+                "{step}: the question was not as asked: {questions:?}"
+            )));
+        }
+        let declined = reply.is_none();
+        answer_with(&mut s, &request, reply);
+        let (_, outcome) = s.turn_end(from, TURN)?;
+        ctx.checks.contract(
+            "an answered question ends in a result, a declined one in an error, and the turn goes on",
+            ran(&s, from, &call, declined).and_then(|()| completed(&outcome)),
+        );
+    }
+    Ok(())
+}
+
+/// How a scene answers the question it asked; `None` declines.
+type Reply = fn(&Question) -> Option<QuestionAnswer>;
+
+fn pick(picked: &[u8], other: Option<&str>) -> QuestionAnswer {
+    QuestionAnswer {
+        picked: picked.to_vec(),
+        other: other.map(str::to_owned),
+    }
+}
+
+/// Answers question `request` with `answer`, or declines it with `None`.
+fn answer_with(s: &mut Session, request: &AgentRequestId, answer: Option<QuestionAnswer>) {
+    let out = match answer {
+        Some(answer) => s.protocol.answer_question(request, &[answer]),
+        None => s.protocol.answer(request, Decision::Deny, None),
+    };
+    s.apply(out);
 }
 
 /// An approval as the adapter reported it.

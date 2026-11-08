@@ -27,6 +27,8 @@
 //! - [`utf16`]: code-point cursors and byte ranges as UTF-16 code units.
 //! - [`policy`]: clock-free controllers for draft saves, read marks,
 //!   alerts, prompt history, workdir completion and timeline search.
+//! - [`question`]: answering a question the agent asks: the draft a head
+//!   keeps while the user picks, and how an answer reads.
 //! - [`workdir`]: a session's workdir: diff line kinds, change marks and
 //!   counts, entry order and labels, and every empty or failed read's
 //!   wording.
@@ -40,6 +42,7 @@ pub mod format;
 pub mod link;
 pub mod output;
 pub mod policy;
+pub mod question;
 pub mod sections;
 pub mod storage;
 pub mod text;

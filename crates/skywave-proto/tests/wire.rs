@@ -272,6 +272,53 @@ fn all_event_kinds() -> Vec<EventKind> {
             id: approval(),
             reason: "daemon restarted".into(),
         },
+        EventKind::QuestionAsked {
+            id: approval(),
+            call: Some(call()),
+            questions: vec![
+                Question {
+                    header: "Bread".into(),
+                    text: "Which bread for tomorrow?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Rye".into(),
+                            description: "Dense and earthy".into(),
+                            preview: None,
+                        },
+                        QuestionOption {
+                            label: "Sourdough".into(),
+                            description: String::new(),
+                            preview: Some("+------+\n| LOAF |\n+------+".into()),
+                        },
+                    ],
+                    multi_select: false,
+                },
+                Question {
+                    header: String::new(),
+                    text: "Which toppings?".into(),
+                    options: vec![QuestionOption {
+                        label: "Seeds".into(),
+                        description: String::new(),
+                        preview: None,
+                    }],
+                    multi_select: true,
+                },
+            ],
+        },
+        EventKind::QuestionAnswered {
+            id: approval(),
+            by: device(),
+            answers: vec![
+                QuestionAnswer {
+                    picked: vec![1],
+                    other: None,
+                },
+                QuestionAnswer {
+                    picked: vec![0],
+                    other: Some("and a little salt".into()),
+                },
+            ],
+        },
         EventKind::TurnInterrupted,
         EventKind::SessionStopped,
         EventKind::SessionRenamed {
@@ -715,6 +762,13 @@ fn all_command_kinds() -> Vec<CommandKind> {
             decision: Decision::Deny,
             rule: None,
         },
+        CommandKind::AnswerQuestion {
+            id: approval(),
+            answers: vec![QuestionAnswer {
+                picked: Vec::new(),
+                other: Some("marmalade".into()),
+            }],
+        },
         CommandKind::Interrupt {
             session_id: session(),
         },
@@ -806,6 +860,7 @@ fn all_command_results() -> Vec<CommandResult> {
             RejectReason::ApprovalCancelled,
             RejectReason::NoActiveTurn,
             RejectReason::UnknownRule,
+            RejectReason::BadAnswer,
             RejectReason::UnknownModel,
             RejectReason::ContextExists,
             RejectReason::UnknownContext,
@@ -1474,8 +1529,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v25() {
-    assert_eq!(PROTOCOL_VERSION, 25);
+fn protocol_is_v26() {
+    assert_eq!(PROTOCOL_VERSION, 26);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1483,6 +1538,54 @@ fn protocol_is_v25() {
     assert_eq!(limits::FIRST_PROMPT_MAX_CHARS, 200);
     // A session's first context has the session's own id.
     assert_eq!(ContextId::first_of(session()).0, session().0);
+}
+
+#[test]
+fn answers_fit_their_questions() {
+    let option = |label: &str| QuestionOption {
+        label: label.into(),
+        description: String::new(),
+        preview: None,
+    };
+    let question = |multi_select| Question {
+        header: String::new(),
+        text: "Which?".into(),
+        options: vec![option("a"), option("b"), option("c")],
+        multi_select,
+    };
+    let answer = |picked: &[u8], other: Option<&str>| QuestionAnswer {
+        picked: picked.to_vec(),
+        other: other.map(str::to_owned),
+    };
+    let single = question(false);
+    assert!(single.takes(&answer(&[2], None)));
+    assert!(single.takes(&answer(&[], Some("d"))));
+    assert!(!single.takes(&answer(&[], None)), "nothing picked");
+    assert!(!single.takes(&answer(&[0, 1], None)), "two picked");
+    assert!(
+        !single.takes(&answer(&[0], Some("d"))),
+        "an option and text"
+    );
+    assert!(!single.takes(&answer(&[3], None)), "no such option");
+    assert!(!single.takes(&answer(&[], Some("  "))), "blank text");
+    let long = "x".repeat(limits::ANSWER_TEXT_MAX_BYTES + 1);
+    assert!(!single.takes(&answer(&[], Some(&long))), "text too long");
+    let multi = question(true);
+    assert!(multi.takes(&answer(&[0, 2], Some("d"))));
+    assert!(multi.takes(&answer(&[], Some("d"))));
+    assert!(!multi.takes(&answer(&[], None)), "nothing picked");
+    assert!(!multi.takes(&answer(&[2, 0], None)), "not ascending");
+    assert!(!multi.takes(&answer(&[1, 1], None)), "picked twice");
+    let both = [single, multi];
+    assert!(answers_fit(
+        &both,
+        &[answer(&[0], None), answer(&[1], None)]
+    ));
+    assert!(!answers_fit(&both, &[answer(&[0], None)]), "one missing");
+    assert!(!answers_fit(
+        &both,
+        &[answer(&[1], None), answer(&[], None)]
+    ));
 }
 
 /// Events must carry their context: no default for a v8 shape.

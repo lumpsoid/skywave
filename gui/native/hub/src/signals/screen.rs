@@ -406,6 +406,9 @@ pub struct SessionScreen {
     pub usage: Vec<String>,
     /// The approval the agent is blocked on.
     pub approval: Option<ApprovalPanel>,
+    /// The question the agent is blocked on; at most one of it and
+    /// `approval` is set.
+    pub question: Option<QuestionPanel>,
     /// The subagent whose own steps the timeline shows; `None` in the main
     /// view.
     pub subagent: Option<SubagentHeaderView>,
@@ -653,6 +656,47 @@ pub struct ApprovalPanel {
     /// This device's answer: `you approved · queued 14:02:11`.
     pub answer_label: Option<String>,
     pub answer: Option<OutgoingView>,
+}
+
+/// The pending question's panel: the agent asks the user to pick from
+/// options, or to write their own answer. The picks stay in the GUI until
+/// it sends them all with `ActionIntent::AnswerQuestion`; a denial
+/// (`ResolveApproval`) declines.
+#[derive(Debug, Clone, PartialEq, Serialize, SignalPiece)]
+pub struct QuestionPanel {
+    pub approval_id: String,
+    /// `from subagent: Explore`; `None` for the main agent's.
+    pub from: Option<String>,
+    /// The timeline row of the call that asks (to reveal it).
+    pub call_key: Option<String>,
+    /// At least one.
+    pub questions: Vec<QuestionView>,
+    /// This device may answer (again).
+    pub can_answer: bool,
+    /// This device's answer: `you answered: Rye · queued 14:02:11`, `you
+    /// declined · sent`.
+    pub answer_label: Option<String>,
+    pub answer: Option<OutgoingView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct QuestionView {
+    /// Short, one line; may be empty.
+    pub header: String,
+    pub text: String,
+    pub options: Vec<QuestionOptionView>,
+    /// Any number of options may be picked, and text besides; otherwise
+    /// exactly one of an option or text.
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct QuestionOptionView {
+    pub label: String,
+    /// May be empty.
+    pub description: String,
+    /// Several lines shown as written (monospace), e.g. a mockup.
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]

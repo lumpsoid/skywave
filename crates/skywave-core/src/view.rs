@@ -16,8 +16,9 @@ pub use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BodyFormat, CallId, ChangeSet, ChangedFile,
     ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
     FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, ModelChoice,
-    PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
-    ScheduleId, Seq, SessionId, ShellEnd, SubagentUsage, TaskId, TaskKind, ToolKind, TurnUsage,
+    PermissionMode, Question, QuestionAnswer, QuestionOption, Refusal, RejectReason, RuleScope,
+    RuleSuggestion, RunWhen, Schedule, ScheduleId, Seq, SessionId, ShellEnd, SubagentUsage, TaskId,
+    TaskKind, ToolKind, TurnUsage,
 };
 pub use skywave_proto::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
@@ -934,6 +935,9 @@ pub struct SessionView {
     pub switch: Option<Outgoing>,
     /// The approval the agent is blocked on, if any.
     pub pending_approval: Option<ApprovalPrompt>,
+    /// The question the agent is blocked on, if any: an approval whose
+    /// answer is a choice. At most one of the two is set.
+    pub pending_question: Option<QuestionPrompt>,
     /// The lasting rules granted with approvals in this session, by any
     /// device, in log order. Only what was granted through Skywave: rules
     /// the agent keeps elsewhere are not seen.
@@ -1600,6 +1604,9 @@ pub struct BodyView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolApproval {
     pub id: ApprovalId,
+    /// A question (`QuestionAsked`), answered with a choice, not an
+    /// approval.
+    pub question: bool,
     pub status: ApprovalStatus,
     /// This device's answer, if it gave one. Once the approval is settled,
     /// this is where an answer that did not apply stays in sight: refused
@@ -1650,6 +1657,11 @@ pub enum ApprovalStatus {
         by: DeviceRef,
         rule: Option<RuleSuggestion>,
     },
+    /// A question's answer won (D5); `by` is who answered. What was picked
+    /// shows in the call's result.
+    Answered {
+        by: DeviceRef,
+    },
     Cancelled {
         reason: String,
     },
@@ -1676,6 +1688,31 @@ pub struct ApprovalPrompt {
     /// This device's answer, if it gave one; queued like any command.
     pub answer: Option<Answer>,
 }
+
+/// The question prompt of a blocked session: the agent asks the user to
+/// pick from options ([`Action::AnswerQuestion`](crate::Action::AnswerQuestion)),
+/// or to decline with a denial.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuestionPrompt {
+    pub id: ApprovalId,
+    /// The tool call that asks, an [`Entry::Tool`] in the timeline; `None`
+    /// for a question with no logged call.
+    pub call: Option<CallId>,
+    /// The title of the subagent asking, as [`ApprovalPrompt::from`].
+    pub from: Option<String>,
+    /// At least one.
+    pub questions: Vec<Question>,
+    /// This device's answer, if it gave one: an approval with
+    /// `answers`, or a denial that declines; queued like any command.
+    pub answer: Option<Answer>,
+    /// The answers of this device's `answer`, one per question; empty with
+    /// none or a denial.
+    pub answers: Vec<QuestionAnswer>,
+}
+
+/// The `tool` of an [`Entry::Approval`] that is a question, with no logged
+/// call to fold into.
+pub const QUESTION_TOOL: &str = "question";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -1776,6 +1813,7 @@ mod tests {
                 pending("queued"),
             ],
             pending_approval: None,
+            pending_question: None,
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),

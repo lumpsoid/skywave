@@ -770,6 +770,7 @@ mod tests {
         let (input, asked) = (blob(path()), blob(path()));
         let approval = |own: &BlobView| ToolApproval {
             id: crate::view::ApprovalId::new(),
+            question: false,
             status: crate::view::ApprovalStatus::Pending,
             answer: None,
             input: Some(FullView::Blob(own.clone())),

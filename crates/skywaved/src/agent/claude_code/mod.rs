@@ -138,7 +138,7 @@ use self::lines::{Line, LineReader, MAX_LINE};
 use self::protocol::{Output, Protocol, mode_name};
 use super::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSession,
-    Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, StartSpec,
+    Conversation, Effort, INTERRUPT_UNANSWERED, PermissionMode, QuestionAnswer, StartSpec,
 };
 use crate::config::AgentConfig;
 use crate::process::{self, DEFAULT_TERM_GRACE, Group};
@@ -601,6 +601,14 @@ impl AgentSession for ClaudeCodeSession {
         self.request(Request::Answer(request, decision, rule))
     }
 
+    async fn answer_question(
+        &mut self,
+        request: AgentRequestId,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(), AgentError> {
+        self.request(Request::AnswerQuestion(request, answers))
+    }
+
     async fn interrupt(&mut self) -> Result<(), AgentError> {
         self.request(Request::Interrupt)
     }
@@ -639,6 +647,7 @@ impl AgentSession for ClaudeCodeSession {
 enum Request {
     Message(String),
     Answer(AgentRequestId, Decision, Option<u8>),
+    AnswerQuestion(AgentRequestId, Vec<QuestionAnswer>),
     Interrupt,
     EscalateInterrupt,
     Mode(PermissionMode),
@@ -885,6 +894,9 @@ impl Driver {
                         Some(Request::Message(text)) => self.protocol.send_message(text),
                         Some(Request::Answer(request, decision, rule)) => {
                             self.protocol.answer(&request, decision, rule)
+                        }
+                        Some(Request::AnswerQuestion(request, answers)) => {
+                            self.protocol.answer_question(&request, &answers)
                         }
                         Some(Request::Interrupt) => self.protocol.interrupt(),
                         // The interrupt is unanswered while its turn's

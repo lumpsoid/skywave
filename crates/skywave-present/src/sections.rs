@@ -818,6 +818,7 @@ mod tests {
         let gated = |view: ToolView, asked: Option<FullView>| ToolView {
             approval: Some(skywave_core::ToolApproval {
                 id: skywave_core::ApprovalId::new(),
+                question: false,
                 status: skywave_core::ApprovalStatus::Pending,
                 answer: None,
                 input: asked,

@@ -3,7 +3,8 @@
 use crate::store::BlobPolicy;
 use crate::view::{
     ApprovalId, BlobId, BlobUse, CallId, CommandId, ComposerMode, ContextId, Decision, Effort,
-    LineSpan, PermissionMode, RunWhen, Seq, SessionId, SnippetId, TaskId, WorkdirPane,
+    LineSpan, PermissionMode, QuestionAnswer, RunWhen, Seq, SessionId, SnippetId, TaskId,
+    WorkdirPane,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,14 @@ pub enum Action {
         id: ApprovalId,
         decision: Decision,
         rule: Option<u8>,
+    },
+    /// Answer a question ([`QuestionPrompt`](crate::QuestionPrompt)), one
+    /// answer per question in order. A no-op unless the open session asks
+    /// it and the answers fit ([`skywave_proto::answers_fit`]); decline it
+    /// with a denial ([`Action::ResolveApproval`]).
+    AnswerQuestion {
+        id: ApprovalId,
+        answers: Vec<QuestionAnswer>,
     },
     /// Stop the agent's current turn.
     Interrupt {

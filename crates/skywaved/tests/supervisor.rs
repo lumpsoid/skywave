@@ -13,9 +13,10 @@ use serde_json::json;
 use skywave_proto::limits::TASKS_MAX;
 use skywave_proto::{
     AgentWork, ApprovalId, CallId, Command, CommandId, CommandKind, CommandResult, ContextId,
-    Decision, DeviceId, Effort, Event, EventKind, Full, ModelChoice, PermissionMode, RejectReason,
-    RuleScope, RuleSuggestion, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState,
-    TaskId, ToolCall, ToolDisplay, ToolKind, ToolResult,
+    Decision, DeviceId, Effort, Event, EventKind, Full, ModelChoice, PermissionMode, Question,
+    QuestionAnswer, QuestionOption, RejectReason, RuleScope, RuleSuggestion, Schedule, ScheduleId,
+    Seq, SessionId, SessionOrigin, SessionState, TaskId, ToolCall, ToolDisplay, ToolKind,
+    ToolResult,
 };
 use skywaved::agent::claude_code::ClaudeCodeAdapter;
 use skywaved::agent::fake::{
@@ -698,6 +699,197 @@ async fn first_of_two_devices_answering_wins() {
         answers,
         [FakeInput::Answer("req-1".into(), Decision::Deny, None)]
     );
+    supervisor.shutdown().await.unwrap();
+}
+
+fn bread_question() -> Vec<Question> {
+    let option = |label: &str| QuestionOption {
+        label: label.into(),
+        description: String::new(),
+        preview: None,
+    };
+    vec![Question {
+        header: "Bread".into(),
+        text: "Which bread?".into(),
+        options: vec![option("Rye"), option("Sourdough")],
+        multi_select: false,
+    }]
+}
+
+fn question_script() -> FakeScript {
+    FakeScript::new().turn([Step::question("req-1", bread_question())
+        .on_approve([Step::text("Rye it is.")])
+        .on_deny([Step::text("No bread then.")])])
+}
+
+fn question_id(f: &Fixture) -> ApprovalId {
+    f.kinds()
+        .iter()
+        .find_map(|k| match k {
+            EventKind::QuestionAsked { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("a question was asked")
+}
+
+fn is_question_asked(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::QuestionAsked { .. })
+}
+
+/// A question is answered once, with answers that fit it; an answer that
+/// does not, or a plain approval of it, is refused and leaves it open.
+#[tokio::test]
+async fn a_question_takes_answers_that_fit_and_they_reach_the_agent() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(question_script());
+    let supervisor = f.start(&agent).await;
+    let device = DeviceId::new();
+
+    f.send("bake something");
+    let kinds = f.wait_count("question", 1, is_question_asked).await;
+    assert!(kinds.iter().any(
+        |k| matches!(k, EventKind::QuestionAsked { questions, .. } if *questions == bread_question())
+    ));
+    let id = question_id(&f);
+    let answer = |picked: Vec<u8>, other: Option<&str>| QuestionAnswer {
+        picked,
+        other: other.map(str::to_owned),
+    };
+    let refused = CommandResult::Rejected {
+        reason: RejectReason::BadAnswer,
+    };
+    assert_eq!(f.resolve(device, id, Decision::Approve), refused);
+    let answer_with =
+        |f: &mut Fixture, answers| f.handle(device, CommandKind::AnswerQuestion { id, answers });
+    assert_eq!(answer_with(&mut f, vec![answer(vec![2], None)]), refused);
+    assert_eq!(answer_with(&mut f, vec![answer(vec![0, 1], None)]), refused);
+    assert_eq!(answer_with(&mut f, Vec::new()), refused);
+    accepted(answer_with(&mut f, vec![answer(vec![0], None)]));
+    assert_eq!(
+        answer_with(&mut f, vec![answer(Vec::new(), Some("spelt"))]),
+        CommandResult::Rejected {
+            reason: RejectReason::ApprovalAlreadyResolved
+        }
+    );
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.contains(&EventKind::QuestionAnswered {
+        id,
+        by: device,
+        answers: vec![answer(vec![0], None)],
+    }));
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "Rye it is.".into(),
+        full: None,
+    }));
+    let answers: Vec<_> = agent
+        .inputs(f.session_id)
+        .into_iter()
+        .filter(|i| matches!(i, FakeInput::Answer(..) | FakeInput::AnswerQuestion(..)))
+        .collect();
+    assert_eq!(
+        answers,
+        [FakeInput::AnswerQuestion(
+            "req-1".into(),
+            vec![answer(vec![0], None)]
+        )]
+    );
+    // A plain approval takes no answers.
+    let plain = f.handle(
+        device,
+        CommandKind::AnswerQuestion {
+            id: ApprovalId::new(),
+            answers: Vec::new(),
+        },
+    );
+    assert_eq!(
+        plain,
+        CommandResult::Rejected {
+            reason: RejectReason::UnknownApproval
+        }
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A denial declines a question, and answers it no more.
+#[tokio::test]
+async fn a_denied_question_is_declined() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(question_script());
+    let supervisor = f.start(&agent).await;
+
+    f.send("bake something");
+    f.wait_count("question", 1, is_question_asked).await;
+    let id = question_id(&f);
+    accepted(f.resolve(DeviceId::new(), id, Decision::Deny));
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.contains(&EventKind::AgentMessage {
+        parent: None,
+        text: "No bread then.".into(),
+        full: None,
+    }));
+    let late = f.handle(
+        DeviceId::new(),
+        CommandKind::AnswerQuestion {
+            id,
+            answers: vec![QuestionAnswer {
+                picked: vec![0],
+                other: None,
+            }],
+        },
+    );
+    assert_eq!(
+        late,
+        CommandResult::Rejected {
+            reason: RejectReason::ApprovalAlreadyResolved
+        }
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// An answer to a plain approval is refused, the approval left open.
+#[tokio::test]
+async fn an_approval_takes_no_answers() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(approval_script());
+    let supervisor = f.start(&agent).await;
+
+    f.send("write notes");
+    f.wait_count("approval", 1, is_approval_requested).await;
+    let id = f.approval_id();
+    let answered = f.handle(
+        DeviceId::new(),
+        CommandKind::AnswerQuestion {
+            id,
+            answers: Vec::new(),
+        },
+    );
+    assert_eq!(
+        answered,
+        CommandResult::Rejected {
+            reason: RejectReason::BadAnswer
+        }
+    );
+    accepted(f.resolve(DeviceId::new(), id, Decision::Approve));
+    f.wait_count("idle", 1, is_idle).await;
+    supervisor.shutdown().await.unwrap();
+}
+
+/// An interrupt cancels a pending question as it does an approval.
+#[tokio::test]
+async fn interrupt_cancels_a_pending_question() {
+    let mut f = Fixture::new();
+    let agent = FakeAgent::new(question_script());
+    let supervisor = f.start(&agent).await;
+
+    f.send("bake something");
+    f.wait_count("question", 1, is_question_asked).await;
+    let id = question_id(&f);
+    accepted(f.interrupt());
+    let kinds = f.wait_count("idle", 1, is_idle).await;
+    assert!(kinds.iter().any(
+        |k| matches!(k, EventKind::ApprovalCancelled { id: cancelled, .. } if *cancelled == id)
+    ));
     supervisor.shutdown().await.unwrap();
 }
 

@@ -170,6 +170,12 @@ pub const ALL: &[Scenario] = &[
         run: turns::rules_granted,
     },
     Scenario {
+        name: "ask_user_question",
+        tier: Tier::Full,
+        about: "AskUserQuestion: an option, several, the user's own text, and a decline",
+        run: turns::ask_user_question,
+    },
+    Scenario {
         name: "interrupt_pending",
         tier: Tier::Full,
         about: "interrupt while an approval waits, and stdin closed while one waits",

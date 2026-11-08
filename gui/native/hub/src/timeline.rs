@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use skywave_core::{
     Answer, ApprovalStatus, BlobId, BlobState, BlobView, BodyFormat, Decision, DeviceRef, Entry,
-    ImportedEntry, Outgoing, RuleSuggestion, Seq, SessionId, SessionView, TimelineItem, ToolKind,
-    ToolOutcome, ToolView, read_head,
+    ImportedEntry, Outgoing, QUESTION_TOOL, RuleSuggestion, Seq, SessionId, SessionView,
+    TimelineItem, ToolKind, ToolOutcome, ToolView, read_head,
 };
 use skywave_present::blob_actions::entry_target;
 use skywave_present::format::{
@@ -385,6 +385,9 @@ fn row(
         } => {
             row.kind = RowKind::Approval;
             let (state, mut label) = approval_state(status);
+            if tool == QUESTION_TOOL && *status == ApprovalStatus::Pending {
+                label = "needs an answer".to_owned();
+            }
             if let Some(note) = unapplied(status, answer.as_ref()) {
                 label = format!("{label} · {note}");
             }
@@ -564,12 +567,19 @@ fn tool_state(view: &ToolView, wall_ms: i64) -> (ToolState, String) {
         Some(ApprovalStatus::Resolved { decision, by, rule }) => {
             Some(resolved_label(*decision, by, rule.as_ref()))
         }
+        Some(ApprovalStatus::Answered { by }) => Some(format!("answered {}", where_(by))),
         Some(ApprovalStatus::Cancelled { .. }) => Some("approval cancelled".to_owned()),
         Some(ApprovalStatus::Pending) | None => None,
     };
+    let asks = view.approval.as_ref().is_some_and(|a| a.question);
     match &view.outcome {
         ToolOutcome::Running { .. } if approval == Some(&ApprovalStatus::Pending) => {
-            (ToolState::NeedsApproval, "needs approval".to_owned())
+            let words = if asks {
+                "needs an answer"
+            } else {
+                "needs approval"
+            };
+            (ToolState::NeedsApproval, words.to_owned())
         }
         ToolOutcome::Running { since } => {
             let elapsed = u64::try_from(wall_ms - since.timestamp_millis()).unwrap_or(0);
@@ -632,6 +642,7 @@ fn approval_state(status: &ApprovalStatus) -> (ToolState, String) {
             },
             resolved_label(*decision, by, rule.as_ref()),
         ),
+        ApprovalStatus::Answered { by } => (ToolState::Done, format!("answered {}", where_(by))),
         ApprovalStatus::Cancelled { reason } => (
             ToolState::Cancelled,
             format!("cancelled: {}", clean_line(reason)),
@@ -645,7 +656,9 @@ fn unapplied(status: &ApprovalStatus, answer: Option<&Answer>) -> Option<String>
     let answer = answer?;
     match (status, answer.outgoing) {
         (
-            ApprovalStatus::Resolved { .. } | ApprovalStatus::Cancelled { .. },
+            ApprovalStatus::Resolved { .. }
+            | ApprovalStatus::Answered { .. }
+            | ApprovalStatus::Cancelled { .. },
             Outgoing::Failed(reason),
         ) => Some(format!(
             "you {} · not applied: {}",
@@ -893,6 +906,7 @@ mod tests {
             state: SessionState::Idle,
             timeline,
             pending_approval: None,
+            pending_question: None,
             rules: Vec::new(),
             usage: None,
             agent: AgentView::default(),
@@ -1166,6 +1180,7 @@ mod tests {
                 input: None,
                 approval: Some(skywave_core::ToolApproval {
                     id: skywave_core::ApprovalId::new(),
+                    question: false,
                     status: skywave_core::ApprovalStatus::Pending,
                     answer: None,
                     input: Some(asked),

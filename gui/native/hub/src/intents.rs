@@ -2,15 +2,15 @@
 //! sends. A malformed id is an error for Dart to show, never a panic.
 
 use skywave_core::{
-    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, PermissionMode, Route, ServerAddress,
-    TaskId, WorkdirPane,
+    Action, BlobPolicy, BlobUse, Decision, Effort, LineSpan, PermissionMode, QuestionAnswer, Route,
+    ServerAddress, TaskId, WorkdirPane,
 };
 use skywave_present::crop::normalise;
 use uuid::Uuid;
 
 use crate::signals::{
     ActionIntent, BlobPolicyChoice, BlobUseView, DecisionView, EffortView, LineSpanView,
-    PermissionModeView, RouteView, WorkdirPaneKind,
+    PermissionModeView, QuestionAnswerView, RouteView, WorkdirPaneKind,
 };
 
 /// `intent` as a core action, or why it is not one.
@@ -31,6 +31,26 @@ pub fn action(intent: ActionIntent) -> Result<Action, String> {
             rule: rule
                 .map(|rule| u8::try_from(rule).map_err(|_| format!("no rule {rule}")))
                 .transpose()?,
+        },
+        ActionIntent::AnswerQuestion {
+            approval_id,
+            answers,
+        } => Action::AnswerQuestion {
+            id: id("approval", &approval_id)?,
+            answers: answers
+                .into_iter()
+                .map(|answer: QuestionAnswerView| {
+                    let picked = answer
+                        .picked
+                        .into_iter()
+                        .map(|i| u8::try_from(i).map_err(|_| format!("no option {i}")))
+                        .collect::<Result<_, _>>()?;
+                    Ok(QuestionAnswer {
+                        picked,
+                        other: answer.text,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
         },
         ActionIntent::Interrupt { session_id } => Action::Interrupt {
             session_id: id("session", &session_id)?,
@@ -380,6 +400,31 @@ mod tests {
                 approval_id: uuid::Uuid::now_v7().to_string(),
                 decision: DecisionView::Approve,
                 rule: Some(300),
+            })
+            .is_err()
+        );
+        let question = uuid::Uuid::now_v7();
+        let answer = |picked: Vec<u32>, text: Option<&str>| QuestionAnswerView {
+            picked,
+            text: text.map(str::to_owned),
+        };
+        assert_eq!(
+            action(ActionIntent::AnswerQuestion {
+                approval_id: question.to_string(),
+                answers: vec![answer(vec![0, 2], Some("salt"))],
+            }),
+            Ok(Action::AnswerQuestion {
+                id: skywave_core::ApprovalId(question),
+                answers: vec![QuestionAnswer {
+                    picked: vec![0, 2],
+                    other: Some("salt".into()),
+                }],
+            })
+        );
+        assert!(
+            action(ActionIntent::AnswerQuestion {
+                approval_id: question.to_string(),
+                answers: vec![answer(vec![300], None)],
             })
             .is_err()
         );

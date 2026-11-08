@@ -14,9 +14,9 @@ use skywave_core::search::BlobText;
 use skywave_core::{
     Action, AgentView, ApprovalId, BlobId, BlobPolicy, BlobState, BlobView, CallId, CommandId,
     Completion, ComposerMode, ContextId, ConversationItem, ConversationPicker, CoreError, Decision,
-    Entry, Link, ListKind, PairUri, PairingView, Route, RunWhen, Screen, Seq, ServerAddress,
-    SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState, TaskId,
-    TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
+    Entry, Link, ListKind, PairUri, PairingView, Question, Route, RunWhen, Screen, Seq,
+    ServerAddress, SessionId, SessionListView, SessionRow, SessionView, ShellRun, ShellRunState,
+    TaskId, TimelineItem, ToolOutcome, ViewState, parse_pair_uri,
 };
 use skywave_present::blob_actions::{entry_target, run_target};
 use skywave_present::format::{
@@ -27,8 +27,9 @@ use skywave_present::output::{WholeOutput, output_download, whole_output};
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
     ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
-    shell_stop, stop_needs_confirmation, unanswered,
+    question_unanswered, shell_stop, stop_needs_confirmation, unanswered,
 };
+use skywave_present::question::QuestionDraft;
 use skywave_present::sections::{
     Content, ItemKey, call_content, discardable, find, gated_item, main_content, sections,
     selectable, starts_turn, wanted_blob,
@@ -500,6 +501,12 @@ pub enum Picker {
     },
     /// An action that stops the agent while it has work, waiting for `y`.
     Stop(StopKind),
+    /// The question the agent asks, opened by `a`: one question in view,
+    /// `selected` its row, the options and then the user's own text.
+    Question {
+        draft: QuestionDraft,
+        selected: usize,
+    },
 }
 
 /// What waits for `y` in [`Picker::Stop`].
@@ -739,6 +746,15 @@ impl Picker {
                     (false, None)
                 }
                 _ => (false, None),
+            },
+            // Gone once the question is answered or withdrawn.
+            Picker::Question { draft, selected } => match view
+                .pending_question
+                .as_ref()
+                .filter(|p| p.id == draft.id() && question_unanswered(p))
+            {
+                Some(prompt) => question_key(draft, selected, &prompt.questions, key, ctrl),
+                None => (true, None),
             },
             // y/N, as the mode picker asks: only `y` stops.
             Picker::Stop(kind) => match key.code {
@@ -2675,7 +2691,7 @@ impl App {
                     let target = run_target(session.selected_run(view)?, view.id)?;
                     self.blob_key(key_on(target, key.code))
                 }
-                KeyCode::Char('a') => answer(view, Decision::Approve),
+                KeyCode::Char('a') => approve_or_pick(session, view),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
                 KeyCode::Char('w') => Some(Action::OpenWorkdir {
                     session_id: view.id,
@@ -2768,7 +2784,7 @@ impl App {
                     let target = entry_target(session.selected_entry(view)?, view.id)?;
                     self.blob_key(key_on(target, key.code))
                 }
-                KeyCode::Char('a') => answer(view, Decision::Approve),
+                KeyCode::Char('a') => approve_or_pick(session, view),
                 KeyCode::Char('x') => answer(view, Decision::Deny),
                 // Shifted, so a stray key does not grant a lasting rule.
                 KeyCode::Char('A') => session.allow_always(view),
@@ -2882,15 +2898,118 @@ impl App {
     }
 }
 
-/// Answers the approval the session is blocked on, if any. Whether it may
-/// still be answered is the core's call.
+/// Answers the approval the session is blocked on, if any; a question
+/// only takes a denial, which declines it (`a` opens its picker instead).
+/// Whether it may still be answered is the core's call.
 fn answer(view: &SessionView, decision: Decision) -> Option<Action> {
-    let prompt = view.pending_approval.as_ref()?;
+    let id = match (&view.pending_approval, &view.pending_question) {
+        (Some(prompt), _) => prompt.id,
+        (None, Some(prompt)) if decision == Decision::Deny => prompt.id,
+        _ => return None,
+    };
     Some(Action::ResolveApproval {
-        id: prompt.id,
+        id,
         decision,
         rule: None,
     })
+}
+
+/// `a`: answers the approval, or opens the picker of the question waiting
+/// unanswered here.
+fn approve_or_pick(session: &mut SessionUi, view: &SessionView) -> Option<Action> {
+    match view
+        .pending_question
+        .as_ref()
+        .filter(|p| question_unanswered(p))
+    {
+        Some(prompt) => {
+            session.picker = Some(Picker::Question {
+                draft: QuestionDraft::new(prompt),
+                selected: 0,
+            });
+            None
+        }
+        None => answer(view, Decision::Approve),
+    }
+}
+
+/// Keys of the question picker. ↑↓ move through the options and the row
+/// for the user's own text, where typing writes it; Space picks (toggles
+/// for multi-select); Enter picks on a single-select question, then goes
+/// to the next question with no answer, or, with every one answered,
+/// sends them; ←→ step between questions; Esc closes, the question still
+/// waiting.
+fn question_key(
+    draft: &mut QuestionDraft,
+    selected: &mut usize,
+    questions: &[Question],
+    key: KeyEvent,
+    ctrl: bool,
+) -> (bool, Option<Action>) {
+    let index = draft.current();
+    let Some(question) = questions.get(index) else {
+        return (true, None);
+    };
+    // The row after the options is the user's own text.
+    let own = question.options.len();
+    let typing = *selected == own;
+    let text = || {
+        draft
+            .answer(index)
+            .and_then(|a| a.other.clone())
+            .unwrap_or_default()
+    };
+    match key.code {
+        KeyCode::Esc => return (true, None),
+        KeyCode::Up => *selected = selected.saturating_sub(1),
+        KeyCode::Char('k') if !typing => *selected = selected.saturating_sub(1),
+        KeyCode::Down => *selected = (*selected + 1).min(own),
+        KeyCode::Char('j') if !typing => *selected = (*selected + 1).min(own),
+        KeyCode::Left | KeyCode::Right => {
+            let step = if key.code == KeyCode::Left {
+                index.saturating_sub(1)
+            } else {
+                index + 1
+            };
+            draft.show(step);
+            *selected = 0;
+        }
+        KeyCode::Char(' ') if !typing => draft.toggle(questions, index, *selected),
+        KeyCode::Enter => {
+            if !typing && !question.multi_select {
+                draft.toggle(questions, index, *selected);
+            }
+            if !draft.is_answered(questions, index) {
+                return (false, None);
+            }
+            match draft.first_unanswered(questions) {
+                Some(next) => {
+                    draft.show(next);
+                    *selected = 0;
+                }
+                None => {
+                    let id = draft.id();
+                    let action = draft
+                        .answers(questions)
+                        .map(|answers| Action::AnswerQuestion { id, answers });
+                    return (true, action);
+                }
+            }
+        }
+        KeyCode::Backspace if typing => {
+            let mut own = text();
+            own.pop();
+            draft.write(questions, index, &own);
+        }
+        KeyCode::Char('u') if ctrl && typing => draft.write(questions, index, ""),
+        KeyCode::Char(c) if typing && !ctrl && !c.is_control() => {
+            let mut own = text();
+            own.push(c);
+            draft.write(questions, index, &own);
+        }
+        _ => {}
+    }
+    (false, None)
 }
 
 impl SessionUi {
