@@ -391,7 +391,14 @@ the daemon's appends, which would otherwise stop `serve` (below).
   start a new context. A clear or switch stops a running agent like `StopSession`.
   The session's grants pass to every start of its contexts, never to
   another session. An approval waits with no timeout but ends with the agent
-  process. An `Interrupt` repeated before the agent ends the interrupted
+  process. A question the agent asks with options (`QuestionAsked`, D47)
+  is an approval in all but its answer: the same ids, pending list,
+  cancels and first answer wins. `AnswerQuestion` answers it with one
+  `QuestionAnswer` per question, checked against the questions in the
+  `approvals` row (`answers_fit`, else `BadAnswer`), and logs
+  `QuestionAnswered`, which the supervisor hands the agent as it does an
+  `ApprovalResolved`. A denial declines it, and approving one without
+  answers is `BadAnswer`. An `Interrupt` repeated before the agent ends the interrupted
   turn is accepted and stops an agent that has not answered the first
   (no timer: the turn's end is the answer); the turn ends `Errored`
   ("agent did not answer the interrupt; stopped it") and the next
@@ -454,7 +461,7 @@ the daemon's appends, which would otherwise stop `serve` (below).
   - Commands that start new work are `DiskLow` before anything else is
     checked: `CreateSession`, `SendMessage`, `SetPermissionMode`,
     `SetModel`, `SetEffort`, `ClearContext`, `MoveContext` and `RunShell`.
-    Control is taken as usual (`ResolveApproval`, `Interrupt`,
+    Control is taken as usual (`ResolveApproval`, `AnswerQuestion`, `Interrupt`,
     `StopSession`, `StopTask`, `StopShell`), and so is what logs one small
     event and starts nothing (`RenameSession`, `SetSessionArchived`,
     `SwitchContext`, `DeleteBlob`, `CropBlob`). Reads and long-polls are untouched. The refusal is
@@ -1159,6 +1166,7 @@ enum CropContent {
 | `CatchingUp` | Render local replica immediately, subtle syncing indicator. |
 | `AwaitingApproval` while offline | Show request; the answer is queued like any command. |
 | Approval answered elsewhere | "Approved on <device>", controls removed. |
+| Question pending (`SessionView::pending_question`) | A question panel instead of the approval prompt: each question with its options, their descriptions and previews, and the user's own answer. The picks stay in the head (TUI: `skywave_present::question::QuestionDraft` behind `a`; GUI: the panel's state) until every question has an answer, then go as one `Action::AnswerQuestion`; `x` / Decline is a denial. Its call's row reads "needs an answer", then "answered here / on <device>" (`ApprovalStatus::Answered`), with what was picked in its result. |
 | New approval while `Online` (`attention.alerts` grows) | Bell or desktop notification naming the session, once; never at start, after a catch-up that resolved it, or for one answered here. The GUI keeps one notification per session (ids from the hub, `PlatformEffect::Notify { id }`) and takes it down (`Dismiss`) once that session has no approval pending, however it went (`AlertUpdate::cleared`); a terminal bell has nothing to take down. |
 | Approvals pending in other sessions (`attention.elsewhere`) | Banner: N approvals elsewhere; one key opens the next. |
 | `Rejected(Revoked \| ServerChanged \| NameMismatch \| BadIdentity)` (`needs_repair`) | Full-screen state saying which, with re-pair action (and retry where `can_retry`); local data stays readable. |

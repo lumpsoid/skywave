@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:skywave_gui/intents.dart';
 import 'package:skywave_gui/session/approval_panel.dart';
+import 'package:skywave_gui/session/question_panel.dart';
 import 'package:skywave_gui/session/background_sheet.dart';
 import 'package:skywave_gui/session/composer.dart';
 import 'package:skywave_gui/session/context_picker.dart';
@@ -535,6 +536,18 @@ class _SessionPageState extends State<SessionPage> {
                 ),
                 // Flexible: with the keyboard up the panel shrinks to what
                 // the timeline leaves and scrolls, instead of overflowing.
+                if (screen.question case final question?)
+                  Flexible(
+                    child: _Column(
+                      child: QuestionPanelView(
+                        question: question,
+                        send: widget.send,
+                        onShowCall: question.callKey == null
+                            ? null
+                            : () => _showCall(question.callKey!),
+                      ),
+                    ),
+                  ),
                 if (screen.approval case final approval?)
                   Flexible(
                     child: _Column(

@@ -687,6 +687,149 @@ void main() {
     expect(find.text(hint), findsNothing);
   });
 
+  group('question', () {
+    QuestionView question(String text, {bool multi = false}) => QuestionView(
+      header: 'Bread',
+      text: text,
+      multiSelect: multi,
+      options: const [
+        QuestionOptionView(label: 'Rye', description: 'dense'),
+        QuestionOptionView(
+          label: 'Spelt',
+          description: '',
+          preview: '+------+\n| LOAF |\n+------+',
+        ),
+      ],
+    );
+
+    QuestionPanel panel(List<QuestionView> questions, {String? answer}) =>
+        QuestionPanel(
+          approvalId: 'q1',
+          questions: questions,
+          canAnswer: answer == null,
+          answerLabel: answer,
+        );
+
+    GuiIntent answered(List<QuestionAnswerView> answers) => GuiIntentAct(
+      action: ActionIntentAnswerQuestion(approvalId: 'q1', answers: answers),
+    );
+
+    // The panel scrolls: what a tap aims at is brought into view first.
+    Future<void> tapIn(WidgetTester tester, Finder finder) async {
+      await tester.ensureVisible(finder);
+      await tester.pump();
+      await tester.tap(finder);
+      await tester.pump();
+    }
+
+    FilledButton send(WidgetTester tester) =>
+        tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Send'));
+
+    testWidgets(
+      'one option picked, then sent; descriptions and previews show',
+      (tester) async {
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(question: panel([question('Which bread?')])),
+          timeline: holding([]),
+          sent: sent,
+        );
+        expect(find.text('Which bread?'), findsOneWidget);
+        expect(find.text('dense'), findsOneWidget);
+        expect(find.textContaining('| LOAF |'), findsOneWidget);
+        expect(send(tester).onPressed, isNull, reason: 'nothing picked yet');
+        await tapIn(tester, find.text('Rye'));
+        await tapIn(tester, find.text('Spelt'));
+        await tester.pump();
+        sent.clear();
+        await tapIn(tester, find.text('Send'));
+        expect(sent, [
+          answered(const [
+            QuestionAnswerView(picked: [1]),
+          ]),
+        ]);
+      },
+    );
+
+    testWidgets(
+      'several picked and words of the user\'s own, on every question',
+      (tester) async {
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(
+            question: panel([
+              question('Which bread?'),
+              question('Which toppings?', multi: true),
+            ]),
+          ),
+          timeline: holding([]),
+          sent: sent,
+        );
+        // The single-select one: text replaces the option picked.
+        await tapIn(tester, find.text('Rye').first);
+        await tester.enterText(
+          find.widgetWithText(TextField, 'Or your own answer'),
+          'Barley',
+        );
+        await tester.pump();
+        expect(send(tester).onPressed, isNull, reason: 'one still unanswered');
+        await tapIn(tester, find.text('Spelt').last);
+        await tapIn(tester, find.text('Rye').last);
+        await tester.enterText(
+          find.widgetWithText(TextField, 'Also, in your own words'),
+          'seeds',
+        );
+        await tester.pump();
+        sent.clear();
+        await tapIn(tester, find.text('Send'));
+        expect(sent, [
+          answered(const [
+            QuestionAnswerView(picked: [], text: 'Barley'),
+            QuestionAnswerView(picked: [0, 1], text: 'seeds'),
+          ]),
+        ]);
+      },
+    );
+
+    testWidgets(
+      'declined with a denial; once answered, only the answer shows',
+      (tester) async {
+        final sent = <GuiIntent>[];
+        await pumpSession(
+          tester,
+          screen: screenWith(question: panel([question('Which bread?')])),
+          timeline: holding([]),
+          sent: sent,
+        );
+        sent.clear();
+        await tapIn(tester, find.text('Decline'));
+        expect(sent, [
+          const GuiIntentAct(
+            action: ActionIntentResolveApproval(
+              approvalId: 'q1',
+              decision: DecisionView.deny,
+            ),
+          ),
+        ]);
+        await pumpSession(
+          tester,
+          screen: screenWith(
+            question: panel([
+              question('Which bread?'),
+            ], answer: 'you answered: Spelt · queued'),
+          ),
+          timeline: holding([]),
+          sent: sent,
+        );
+        expect(find.text('you answered: Spelt · queued'), findsOneWidget);
+        expect(find.text('Send'), findsNothing);
+        expect(find.text('Decline'), findsNothing);
+      },
+    );
+  });
+
   group('approval', () {
     ApprovalPanel panel(List<RuleOption> suggestions) => ApprovalPanel(
       approvalId: 'a1',

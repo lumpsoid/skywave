@@ -435,6 +435,14 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE event_blobs_v21 RENAME TO event_blobs;
     CREATE INDEX event_blobs_seq ON event_blobs (seq);
     "#,
+    // v22: what `AnswerQuestion` is checked against (protocol v26).
+    // Additive: no question was asked before it.
+    r#"
+    -- The questions of a QuestionAsked (JSON Vec<Question>); NULL for a
+    -- plain approval.
+    ALTER TABLE approvals ADD COLUMN
+        questions TEXT CHECK (questions IS NULL OR json_valid(questions));
+    "#,
 ];
 
 /// First schema version with `protocol_stamp`.
@@ -453,7 +461,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// saying so if nothing stored changed; the length makes a bump without one
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25];
+    [v23_to_v24, v24_to_v25, v25_to_v26];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
 /// - `Full::Inline` (a small tool output carried in its event): new, so no
@@ -477,6 +485,14 @@ fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 ///   is rewritten; a v24 turn reports no fill.
 /// - `EventKind::SubagentUsage`: new, so no v24 event is one.
 fn v24_to_v25(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v25 to v26. What v26 changed of what is stored, and how each is moved:
+/// - `EventKind::QuestionAsked` and `QuestionAnswered`: new, so no v25
+///   event is one. Their `approvals.questions` came with schema migration
+///   v22, NULL for every approval v25 logged: each was a plain one.
+fn v25_to_v26(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1126,6 +1142,63 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// An approval a v25 build logged (its wire snapshot's request), on the
+    /// v21 schema it ran on, reads as a plain approval once v26's step ran:
+    /// v22 gives its row no questions.
+    #[test]
+    fn v26_reads_the_approval_v25_logged_as_plain() {
+        use skywave_proto::{ApprovalId, EventKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let id = "01920000-0000-7000-8000-000000000004";
+        let v25 = format!(
+            r#"{{"type":"approval_requested","id":"{id}","call":null,"tool":"exec","summary":"rm -rf target","input":null,"suggestions":[]}}"#
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..21] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 21).unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 25)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [&v25],
+            )
+            .unwrap();
+            // No sessions row: only the approval's own is read.
+            conn.pragma_update(None, "foreign_keys", false).unwrap();
+            conn.execute(
+                "INSERT INTO approvals (id, session_id, context, rules) VALUES (?1, ?2, ?2, 0)",
+                [id, "01920000-0000-7000-8000-000000000001"],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::ApprovalRequested { .. }
+        ));
+        let id = ApprovalId(id.parse().unwrap());
+        let row = crate::event_log::approval_in(db.conn(), id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.questions, None);
+        assert_eq!(row.closed, None);
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records

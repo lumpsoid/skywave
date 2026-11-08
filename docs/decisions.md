@@ -1224,3 +1224,32 @@ out the system prompt and tools); asking the agent for its effective limit
 after each turn (an extra round trip on an undocumented request, for the
 rare user who lowered the compaction point; the window shown is the model's
 own).
+
+## D47. A question is an approval whose answer is a choice
+When the agent asks the user to pick (Claude Code's `AskUserQuestion`),
+the log holds a `QuestionAsked { id, call, questions }`: each question
+with its header, text, options (label, description, optional preview)
+and whether several may be picked. It is an approval in every way but its
+answer: it shares `ApprovalId`, the session's pending list
+(`AwaitingApproval`), the indefinite wait (D8), first answer wins (D5),
+and every cancel (`ApprovalCancelled`: interrupt, turn end, exit, daemon
+restart).
+- **Its own events, not a field on `ApprovalRequested`.** Heads draw a
+  picker, not Approve/Deny, and an approval's rule suggestions and input
+  blob mean nothing for a question; a separate variant keeps both kinds
+  free of fields the other cannot use.
+- **Answers by index.** `AnswerQuestion { id, answers }` gives one
+  `QuestionAnswer { picked, other }` per question: option indexes,
+  ascending, and the user's own text. A single-select question takes
+  exactly one of an option or text; a multi-select one at least one of
+  either. The server checks the shape against the question it logged
+  (`answers_fit`, else `BadAnswer`) and logs `QuestionAnswered`; the
+  adapter turns indexes back into the agent's own words.
+- **Declining is a denial.** `ResolveApproval` with `Deny` declines a
+  question; approving one without answers is `BadAnswer`.
+- **The answer shows as the call's result.** The `AskUserQuestion` call
+  is an ordinary tool row; what was picked reads in its result, from the
+  agent's own report, not from the answer event.
+**Rejected:** free text only (the options and previews are the point on a
+phone); answering with labels on the wire (indexes are what the user
+picked; labels may be cut to the limits).
