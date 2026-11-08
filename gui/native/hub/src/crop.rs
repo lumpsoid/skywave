@@ -15,7 +15,7 @@ use skywave_core::{
 use skywave_present::blob_actions::{
     BlobAction, BlobTarget, DELETE_CONFIRMATION, crop_confirmation, pending_note, run_target,
 };
-use skywave_present::crop::{crop_enabled, keeps_label, kept, normalise, presets};
+use skywave_present::crop::{crop_enabled, keeps_label, kept, presets};
 use skywave_present::format::{blob_size, bytes};
 use skywave_present::output::output_text;
 use skywave_present::text::{clean, clean_line};
@@ -148,35 +148,6 @@ pub fn screen(view: &CropView) -> ScreenView {
     }
 }
 
-/// `keep` with lines `first..=last` toggled: taken out when all are kept,
-/// else added; normalised. The TUI's `v` range does the same.
-pub fn toggle(keep: &[LineSpan], first: u32, last: u32) -> Vec<LineSpan> {
-    let (first, last) = (first.min(last), first.max(last));
-    let keep = normalise(keep);
-    let end = |s: &LineSpan| s.first.saturating_add(s.count);
-    let to = last.saturating_add(1);
-    let span = |from: u32, to: u32| LineSpan {
-        first: from,
-        count: to.saturating_sub(from),
-    };
-    // Normalised spans merge when they touch, so lines all kept lie in one.
-    if keep.iter().any(|s| s.first <= first && end(s) >= to) {
-        let out: Vec<LineSpan> = keep
-            .iter()
-            .flat_map(|s| {
-                [
-                    span(s.first, end(s).min(first)),
-                    span(s.first.max(to), end(s)),
-                ]
-            })
-            .collect();
-        return normalise(&out);
-    }
-    let mut out = keep;
-    out.push(span(first, to));
-    normalise(&out)
-}
-
 /// The crop page's line window: the [`LineIndex`] of the content shown,
 /// opened once per file (opening reads it whole), and the lines of the
 /// window Dart last asked for, read once per window.
@@ -303,23 +274,4 @@ fn kept_line(spans: &[LineSpan], n: u32) -> bool {
     spans
         .iter()
         .any(|s| n >= s.first && u64::from(n) < u64::from(s.first) + u64::from(s.count))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn span(first: u32, count: u32) -> LineSpan {
-        LineSpan { first, count }
-    }
-
-    #[test]
-    fn toggle_adds_lines_not_all_kept_and_takes_out_lines_all_kept() {
-        assert_eq!(toggle(&[], 3, 5), [span(3, 3)]);
-        assert_eq!(toggle(&[], 5, 3), [span(3, 3)], "either order");
-        assert_eq!(toggle(&[span(0, 4)], 3, 5), [span(0, 6)]);
-        assert_eq!(toggle(&[span(0, 10)], 3, 5), [span(0, 3), span(6, 4)]);
-        assert_eq!(toggle(&[span(2, 3)], 2, 4), []);
-        assert_eq!(toggle(&[span(4, 1)], 4, 4), []);
-    }
 }
