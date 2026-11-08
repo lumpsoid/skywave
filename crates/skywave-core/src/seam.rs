@@ -660,6 +660,19 @@ impl Seam {
         })
     }
 
+    /// The blob queue paused every download on a full device disk, or
+    /// resumed them; the views say so. Nothing is stored: a restart
+    /// resumes.
+    pub(crate) fn blobs_disk_full(&self, full: bool) {
+        self.core
+            .shared
+            .update::<(), Infallible>(|state| {
+                state.model.set_blobs_disk_full(full);
+                Ok(((), Vec::new()))
+            })
+            .unwrap_or_else(|never| match never {});
+    }
+
     /// Runs a change that persists before touching the model, so a failed
     /// write leaves the model as it was. A handle bound to an older server
     /// changes nothing ([`CoreError::Superseded`]).

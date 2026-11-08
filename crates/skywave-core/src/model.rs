@@ -40,7 +40,7 @@ use crate::view::{
     ChangedFile, ChangesResult, CommandId, ComposerMode, ContextId, ContextView, CropContent,
     CropView, Decision, Delivery, DeviceId, DeviceRef, DiffBody, Draft, Entry, ErrorInfo,
     FailReason, FileBody, FileChange, FileResult, FullView, ImportedEntry, LineSpan, Link,
-    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView,
+    LinkRejection, ListKind, ModelChoice, Outgoing, PairedInfo, PairingStatus, PairingView, Pause,
     PendingApprovalRef, PendingSession, RunWhen, SHELL_ALERT_AFTER, Screen, Seq, SessionId,
     SessionListView, SessionRef, SessionRow, SessionState, SessionView, SettingChange,
     SettingsView, ShellAlert, ShellRun, ShellRunState, ShellView, Snippet, SnippetId,
@@ -201,6 +201,9 @@ pub(crate) struct Model {
     /// the blob queue forgets un-started requests on a restart too. A
     /// `Failed` blob asked for again shows as requested.
     wanted: HashSet<BlobId>,
+    /// The blob queue paused every download on a full device disk; the
+    /// queue decides and reports it ([`Model::set_blobs_disk_full`]).
+    blobs_disk_full: bool,
     /// This device's unsent messages and shell commands, as stored.
     drafts: HashMap<(SessionId, ComposerMode), Draft>,
     /// What each session's composer writes where it is not the agent, as
@@ -294,6 +297,7 @@ impl Model {
             blobs: BTreeMap::new(),
             fates: HashMap::new(),
             wanted: HashSet::new(),
+            blobs_disk_full: false,
             drafts: HashMap::new(),
             composer_modes: HashMap::new(),
             draft_rev: 0,
@@ -1817,6 +1821,12 @@ impl Model {
         }
     }
 
+    /// The blob queue paused (or resumed) every download because the
+    /// device's disk is full; the views say so.
+    pub(crate) fn set_blobs_disk_full(&mut self, full: bool) {
+        self.blobs_disk_full = full;
+    }
+
     fn outbox_entry(&mut self, id: CommandId) -> Option<&mut OutboxEntry> {
         self.outbox.iter_mut().find(|e| e.command.id == id)
     }
@@ -1868,6 +1878,7 @@ impl Model {
             Place::Pairing => Screen::Pairing(self.pairing_view()),
             Place::Settings => Screen::Settings(SettingsView {
                 blob_policy: self.settings.blob_policy,
+                blobs_disk_full: self.blobs_disk_full,
                 server_address: self.settings.server_address.clone(),
                 device_id: self.device(),
                 server_fingerprint: self.paired.and_then(|p| p.server),
@@ -3359,9 +3370,16 @@ impl Model {
             BlobStatus::Downloading { got, .. } => BlobState::Downloading {
                 got: *got,
                 size,
-                // Blob traffic needs the server too; while the link is down
-                // the download waits for it.
-                paused: !matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }),
+                // A full disk first: only the user can end it. Blob traffic
+                // needs the server too; while the link is down the download
+                // waits for it.
+                paused: if self.blobs_disk_full {
+                    Some(Pause::DiskFull)
+                } else if matches!(self.link, Link::Online { .. } | Link::CatchingUp { .. }) {
+                    None
+                } else {
+                    Some(Pause::Offline)
+                },
             },
             BlobStatus::Available { path } => BlobState::Available { path: path.clone() },
         };
@@ -5939,25 +5957,33 @@ mod tests {
             size: 10_000,
             paused,
         };
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
         f.model.set_link(Link::Reconnecting {
             attempt: 1,
             retry_at: chrono::Utc::now() + chrono::TimeDelta::seconds(1),
             offline_since: chrono::Utc::now(),
             reason: crate::view::LinkFailure::Unreachable,
         });
-        assert_eq!(output_state(&f), downloading(true));
+        assert_eq!(output_state(&f), downloading(Some(Pause::Offline)));
+        // A full disk says so over the link being down, until resumed.
+        f.model.set_blobs_disk_full(true);
+        assert_eq!(output_state(&f), downloading(Some(Pause::DiskFull)));
+        f.model.set_blobs_disk_full(false);
+        assert_eq!(output_state(&f), downloading(Some(Pause::Offline)));
         f.model.set_link(Link::CatchingUp {
             have: Seq(1),
             server: Seq(2),
         });
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
+        f.model.set_blobs_disk_full(true);
+        assert_eq!(output_state(&f), downloading(Some(Pause::DiskFull)));
+        f.model.set_blobs_disk_full(false);
         // A running download asked for again keeps showing its progress.
         assert_eq!(
             f.dispatch(Action::DownloadBlob(output.id)),
             vec![Effect::Request(Request::DownloadBlob(output.id))]
         );
-        assert_eq!(output_state(&f), downloading(false));
+        assert_eq!(output_state(&f), downloading(None));
         f.model
             .blob_status(output.id, BlobStatus::Available { path: path.clone() });
         assert_eq!(output_state(&f), BlobState::Available { path });

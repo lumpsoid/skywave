@@ -353,11 +353,11 @@ pub enum BlobState {
     Requested {
         size: u64,
     },
-    /// `paused` while the link is down: the download waits for it.
+    /// `paused` names what the download waits for, if anything.
     Downloading {
         got: u64,
         size: u64,
-        paused: bool,
+        paused: Option<Pause>,
     },
     /// The last download was given up (e.g. the sizes disagree); asking
     /// again retries it.
@@ -369,6 +369,16 @@ pub enum BlobState {
     Available {
         path: PathBuf,
     },
+}
+
+/// What a download in progress waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pause {
+    /// The link is down; it resumes once the link is back.
+    Offline,
+    /// This device's disk is full: every blob download stopped, keeping
+    /// what it got, until a download is asked for (or the app restarts).
+    DiskFull,
 }
 
 /// A blob referenced from the timeline, with its download state.
@@ -1683,6 +1693,9 @@ pub struct Answer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsView {
     pub blob_policy: BlobPolicy,
+    /// Blob downloads, `Eager` ones included, are paused because this
+    /// device's disk is full ([`Pause::DiskFull`]).
+    pub blobs_disk_full: bool,
     pub server_address: Option<String>,
     pub device_id: Option<DeviceId>,
     /// The fingerprint of the server CA pinned at pairing, to compare with

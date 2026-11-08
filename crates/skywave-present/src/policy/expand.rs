@@ -240,7 +240,7 @@ mod tests {
             BlobState::Downloading {
                 got: 1,
                 size: 10,
-                paused: false,
+                paused: None,
             },
             BlobState::Failed {
                 size: 10,

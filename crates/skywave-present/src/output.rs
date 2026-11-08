@@ -254,7 +254,7 @@ mod tests {
             with(BlobState::Downloading {
                 got: 1,
                 size: 9,
-                paused: false
+                paused: None
             }),
             None
         );

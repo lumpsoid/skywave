@@ -613,7 +613,7 @@ mod tests {
             result(blob(BlobState::Downloading {
                 got: 1,
                 size: 10,
-                paused: true,
+                paused: Some(crate::view::Pause::Offline),
             })),
             result(blob(BlobState::Failed {
                 size: 10,

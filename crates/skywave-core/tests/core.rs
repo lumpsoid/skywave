@@ -10,8 +10,9 @@ use chrono::{TimeZone, Utc};
 use skywave_core::{
     Action, Attention, BlobState, BlobStatus, ComposerMode, Core, CoreError, Delivery, DeviceRef,
     Draft, Entry, FailReason, Fingerprint, FullView, Link, Outgoing, PairedCredentials,
-    PairingStatus, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView, ShellAlert,
-    ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem, ViewState,
+    PairingStatus, Pause, Request, Route, RunWhen, Screen, Seam, SessionView, SettingsView,
+    ShellAlert, ShellEnd, ShellRun, ShellRunState, ShellView, Store, StoreError, TimelineItem,
+    ViewState,
 };
 use skywave_proto::{
     ApprovalId, BlobId, BlobRef, CommandId, CommandKind, CommandResult, ContextId, Decision,
@@ -642,7 +643,7 @@ fn blob_progress_is_persisted_and_shown() {
             got: 1000,
             size: 9000,
             // A detached core has no link.
-            paused: true,
+            paused: Some(Pause::Offline),
         }
     );
     assert!(
@@ -659,7 +660,7 @@ fn blob_progress_is_persisted_and_shown() {
             got: 1000,
             size: 9000,
             // A detached core has no link.
-            paused: true,
+            paused: Some(Pause::Offline),
         }
     );
 }
