@@ -22,6 +22,7 @@ use skywave_present::format::{
 };
 use skywave_present::sections::{
     ItemKey, PREVIEW_LINES, Section, change_note, delivery, sections, selectable, starts_turn,
+    unseen_blob,
 };
 use skywave_present::text::{clean_line, clean_text};
 
@@ -677,39 +678,6 @@ pub fn outgoing_view(outgoing: &Outgoing) -> OutgoingView {
         },
         label: outgoing_label(outgoing),
     }
-}
-
-/// While collapsed, the state of a blob no visible section shows: `input
-/// 4.2 KiB`, `output 1.0 MiB · requested`; or that the server could not
-/// keep it: `input not stored`.
-fn unseen_blob(entry: &Entry) -> Option<String> {
-    let sections = sections(entry);
-    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
-        return None;
-    }
-    let section = sections.iter().find(|s| s.full.is_some())?;
-    let what = match (section.input, section.hidden) {
-        (true, _) => "input",
-        (false, true) => "output",
-        (false, false) => "full",
-    };
-    let Some(blob) = section.blob() else {
-        return Some(format!("{what} not stored"));
-    };
-    let state = match &blob.state {
-        BlobState::NotDownloaded { size } => bytes(*size),
-        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
-        BlobState::Downloading { got, size, paused } => format!(
-            "{} · downloading {}%{}",
-            bytes(*size),
-            percent(*got, *size),
-            if *paused { " · paused, offline" } else { "" }
-        ),
-        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
-        BlobState::Available { .. } => return None,
-    };
-    Some(format!("{what} {state}"))
 }
 
 /// One section as shown: collapsed, its preview's head and what more

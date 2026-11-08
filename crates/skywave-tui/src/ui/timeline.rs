@@ -31,7 +31,8 @@ use skywave_present::format::{
 };
 use skywave_present::policy::in_conversation;
 use skywave_present::sections::{
-    ItemKey, PREVIEW_LINES, Section, change_note, delivery, find, sections, selectable, starts_turn,
+    ItemKey, PREVIEW_LINES, Section, change_note, delivery, find, sections, selectable,
+    starts_turn, unseen_blob,
 };
 use skywave_present::text::clean;
 use unicode_width::UnicodeWidthChar;
@@ -1015,40 +1016,6 @@ fn head_of(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// While collapsed, the state of an item's blob when no section on screen
-/// carries one (a hidden input or output, an empty preview), so `d` on it
-/// shows what it did: `input 4.2 KiB`, `output 4.2 KiB · requested`; or
-/// that the server could not keep it: `input not stored`.
-fn unseen_blob(entry: &Entry) -> Option<String> {
-    let sections = sections(entry);
-    let shown = |s: &Section| !s.hidden && !content_lines(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
-        return None;
-    }
-    let section = sections.iter().find(|s| s.full.is_some())?;
-    let what = match (section.input, section.hidden) {
-        (true, _) => "input",
-        (false, true) => "output",
-        (false, false) => "full",
-    };
-    let Some(blob) = section.blob() else {
-        return Some(format!("{what} not stored"));
-    };
-    let state = match &blob.state {
-        BlobState::NotDownloaded { size } => bytes(*size),
-        BlobState::Requested { size } => format!("{} · requested", bytes(*size)),
-        BlobState::Downloading { got, size, paused } => format!(
-            "{} · downloading {}%{}",
-            bytes(*size),
-            percent(*got, *size),
-            if *paused { " · paused, offline" } else { "" }
-        ),
-        BlobState::Failed { size, .. } => format!("{} · download failed", bytes(*size)),
-        BlobState::Available { .. } => return None,
-    };
-    Some(format!("{what} {state}"))
 }
 
 /// A section's head as the approval panel shows it: its preview's lines
