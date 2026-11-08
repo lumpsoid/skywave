@@ -1086,7 +1086,8 @@ skywave-core                 all logic, sync, replica
   hub opens the content's `LineIndex` once per page and file, reads the
   window once, and sends it (`CropLinesUpdate`, each line stripped and
   marked kept) again when the window or the selection changes. A line
-  toggle (`CropToggle`) is turned into `SetCropKeep` by the hub, from the
+  toggle (`CropToggle`) is turned into `SetCropKeep` by the hub (present's
+  `crop::toggle`, the rule the TUI's `v` range uses too), from the
   selection it sent last, so two taps faster than a snapshot do not lose
   one. Timeline rows, shell runs and storage rows carry a
   `BlobTargetView` (present's `BlobTarget`, worded), so Dart's delete and

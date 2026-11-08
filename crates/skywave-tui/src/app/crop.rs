@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use skywave_core::{Action, BlobId, BlobState, CropContent, CropView, LineIndex, LineSpan, Screen};
+use skywave_core::{Action, BlobId, BlobState, CropContent, CropView, LineIndex, Screen};
 use skywave_present::blob_actions::pending_note;
-use skywave_present::crop::{crop_enabled, kept, normalise, presets};
+use skywave_present::crop::{crop_enabled, kept, presets, toggle};
 
 use super::{App, BlobConfirm};
 
@@ -64,34 +64,6 @@ impl CropUi {
         let anchor = self.anchor?;
         Some((anchor.min(self.cursor), anchor.max(self.cursor)))
     }
-}
-
-/// `keep` with lines `first..=last` toggled: taken out when all are kept,
-/// else added; normalised.
-fn toggle(keep: &[LineSpan], first: u32, last: u32) -> Vec<LineSpan> {
-    let keep = normalise(keep);
-    let end = |s: &LineSpan| s.first.saturating_add(s.count);
-    let to = last.saturating_add(1);
-    let span = |from: u32, to: u32| LineSpan {
-        first: from,
-        count: to.saturating_sub(from),
-    };
-    // Normalised spans merge when they touch, so lines all kept lie in one.
-    if keep.iter().any(|s| s.first <= first && end(s) >= to) {
-        let out: Vec<LineSpan> = keep
-            .iter()
-            .flat_map(|s| {
-                [
-                    span(s.first, end(s).min(first)),
-                    span(s.first.max(to), end(s)),
-                ]
-            })
-            .collect();
-        return normalise(&out);
-    }
-    let mut out = keep;
-    out.push(span(first, to));
-    normalise(&out)
 }
 
 impl App {
@@ -177,29 +149,5 @@ impl App {
             _ => {}
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn span(first: u32, count: u32) -> LineSpan {
-        LineSpan { first, count }
-    }
-
-    #[test]
-    fn toggle_adds_lines_not_all_kept_and_takes_out_lines_all_kept() {
-        assert_eq!(toggle(&[], 3, 5), [span(3, 3)]);
-        // Partly kept: the whole range is added.
-        assert_eq!(toggle(&[span(0, 4)], 3, 5), [span(0, 6)]);
-        // All kept: taken out, splitting the span.
-        assert_eq!(toggle(&[span(0, 10)], 3, 5), [span(0, 3), span(6, 4)]);
-        assert_eq!(toggle(&[span(2, 3)], 2, 4), []);
-        // Kept across two spans that touch is all kept.
-        assert_eq!(
-            toggle(&[span(0, 3), span(3, 3)], 1, 4),
-            [span(0, 1), span(5, 1)]
-        );
     }
 }

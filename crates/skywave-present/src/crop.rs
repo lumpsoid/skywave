@@ -82,6 +82,35 @@ pub fn normalise(spans: &[LineSpan]) -> Vec<LineSpan> {
     merged
 }
 
+/// `keep` with lines `first..=last` toggled, given in either order: taken
+/// out when all are kept, else added; normalised. A head's range toggle
+/// (the TUI's `v`, the GUI's drag) sends this as its selection.
+pub fn toggle(keep: &[LineSpan], first: u32, last: u32) -> Vec<LineSpan> {
+    let (first, last) = (first.min(last), first.max(last));
+    let keep = normalise(keep);
+    let to = u64::from(last) + 1;
+    let span = |from: u64, to: u64| LineSpan {
+        first: u32::try_from(from).unwrap_or(u32::MAX),
+        count: u32::try_from(to.saturating_sub(from)).unwrap_or(u32::MAX),
+    };
+    // Normalised spans merge when they touch, so lines all kept lie in one.
+    let out: Vec<LineSpan> = if keep.iter().any(|s| s.first <= first && end(s) >= to) {
+        keep.iter()
+            .flat_map(|s| {
+                [
+                    span(u64::from(s.first), end(s).min(u64::from(first))),
+                    span(u64::from(s.first).max(to), end(s)),
+                ]
+            })
+            .collect()
+    } else {
+        keep.into_iter()
+            .chain([span(u64::from(first), to)])
+            .collect()
+    };
+    normalise(&out)
+}
+
 /// How many lines `spans` keep, counting overlaps twice: normalise first.
 pub fn kept(spans: &[LineSpan]) -> u64 {
     spans.iter().map(|s| u64::from(s.count)).sum()
@@ -211,6 +240,34 @@ mod tests {
         assert_eq!(normalise(&[span(0, 10), span(2, 3)]), [span(0, 10)]);
         assert!(normalise(&[]).is_empty());
         assert!(check_spans(&normalise(&[span(5, 1), span(0, 6)])));
+    }
+
+    #[test]
+    fn toggle_adds_lines_not_all_kept_and_takes_out_lines_all_kept() {
+        assert_eq!(toggle(&[], 3, 5), [span(3, 3)]);
+        assert_eq!(toggle(&[], 5, 3), [span(3, 3)], "either order");
+        // Partly kept: the whole range is added.
+        assert_eq!(toggle(&[span(0, 4)], 3, 5), [span(0, 6)]);
+        // All kept: taken out, splitting the span.
+        assert_eq!(toggle(&[span(0, 10)], 3, 5), [span(0, 3), span(6, 4)]);
+        assert_eq!(toggle(&[span(2, 3)], 2, 4), []);
+        assert_eq!(toggle(&[span(4, 1)], 4, 4), []);
+        // Kept across two spans that touch is all kept.
+        assert_eq!(
+            toggle(&[span(0, 3), span(3, 3)], 1, 4),
+            [span(0, 1), span(5, 1)]
+        );
+        // Spans apart from the range are left as they are.
+        assert_eq!(
+            toggle(&[span(0, 2), span(10, 2)], 4, 5),
+            [span(0, 2), span(4, 2), span(10, 2)]
+        );
+        assert_eq!(
+            toggle(&[span(0, 2), span(4, 2), span(10, 2)], 4, 5),
+            [span(0, 2), span(10, 2)]
+        );
+        // The last line there can be.
+        assert_eq!(toggle(&[], u32::MAX, u32::MAX), [span(u32::MAX, 1)]);
     }
 
     #[test]

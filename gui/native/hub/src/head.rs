@@ -13,6 +13,7 @@ use skywave_core::{
     Action, BlobState, CallId, CommandId, ComposerMode, Entry, PairUri, PairingView, RunWhen,
     Screen, Seq, SessionId, SessionView, SnippetId, TimelineItem, ViewState, parse_pair_uri,
 };
+use skywave_present::crop::toggle;
 use skywave_present::policy::{
     AlertWatcher, CompletionSettle, ConversationOnly, DraftSaver, ExpandFetch, PromptHistory,
     ReadMarker, Recall, ShellAlertWatcher, TimelineSearch, looks_like_pair_uri, message_refusal,
@@ -24,7 +25,7 @@ use skywave_present::usage::{Grouping, Span};
 use skywave_present::utf16::{chars_to_utf16, utf16_to_chars};
 
 use crate::clip::{COPY_MAX, Copied, copy, copy_output};
-use crate::crop::{CropLines, toggle};
+use crate::crop::CropLines;
 use crate::dispatcher::{Dispatched, Tag};
 #[cfg(test)]
 use crate::lifecycle::Target;
