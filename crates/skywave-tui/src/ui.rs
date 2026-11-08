@@ -7,6 +7,7 @@
 //! I/O is reading downloaded blobs to show them.
 
 mod crop;
+mod info;
 mod limits;
 mod session;
 mod shell;
@@ -94,6 +95,7 @@ pub fn render_at(frame: &mut Frame, app: &App, wall: SystemTime) {
             Screen::Usage(usage) => usage::render(frame, body, app, usage, wall),
             Screen::Storage(view) => storage::render(frame, body, app, view),
             Screen::UsageLimits(view) => limits::render(frame, body, view, DateTime::from(wall)),
+            Screen::SessionInfo(view) => info::render(frame, body, app, view, DateTime::from(wall)),
             Screen::Workdir(workdir) => workdir::render(frame, body, app, workdir, wall),
             Screen::Crop(view) => crop::render(frame, body, app, view),
         }
@@ -937,6 +939,7 @@ fn footer_keys(app: &App) -> &'static str {
             "r range · Tab group · ↑↓ scroll · L limits · Esc back · ? help · q quit"
         }
         Screen::UsageLimits(_) => "r refresh · Esc back · ? help · q quit",
+        Screen::SessionInfo(_) => "r refresh limits · ↑↓ scroll · Esc back · ? help · q quit",
         Screen::Storage(_) => {
             "↑↓ select · D delete · K crop · r refresh · Tab list · Esc back · ? help · q quit"
         }
@@ -1163,7 +1166,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("K", "crop its output: choose the lines every device keeps"),
                     key("a / x", "approve / deny the pending approval"),
                     key("w", "the session's workdir: git changes and files"),
-                    key("L", "usage limits of the agent's account"),
+                    key("I", "session info: usage, agent, subagents, usage limits"),
                     key("Esc", "back to sessions"),
                 ]),
                 _ if shell => lines.extend([
@@ -1237,7 +1240,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     key("", "x drops a refused move; Enter on a moved one opens it)"),
                     key("R", "rename the session"),
                     key("w", "the session's workdir: git changes and files"),
-                    key("L", "usage limits of the agent's account"),
+                    key("I", "session info: usage, agent, subagents, usage limits"),
                     key("Home g/End G", "oldest / newest (End follows new items)"),
                     key("/", "search; an upper-case letter matches case"),
                     key("n / N", "older / newer match, round the ends"),
@@ -1295,6 +1298,15 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from("  The last limits read are kept on this device, so they show offline."),
             Line::from("  Opening the page asks only when none were read yet."),
+        ]),
+        Screen::SessionInfo(_) => lines.extend([
+            section("Session info"),
+            key("r", "ask the agent for its usage limits again"),
+            key("↑↓ / k j", "scroll"),
+            key("Esc", "back to the session"),
+            Line::from(""),
+            Line::from("  All but the usage limits come from this device's replica."),
+            Line::from("  The last limits read are kept, so they show offline."),
         ]),
         Screen::Storage(_) => lines.extend([
             section("Storage"),

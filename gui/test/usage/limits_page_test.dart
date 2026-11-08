@@ -12,18 +12,20 @@ void main() {
       MaterialApp(
         home: LimitsPage(
           screen: const ScreenViewUsageLimits(
-            statusLabel: 'Refreshing…',
-            readLabel: 'Read 12 min ago',
-            rows: [
-              LimitRowView(
-                label: 'Session',
-                percentLabel: '75%',
-                fillPercent: 75,
-                warning: true,
-                resetsLabel: 'resets in 2 h 13 min',
-              ),
-              LimitRowView(label: 'Weekly · Fable', warning: false),
-            ],
+            limits: LimitsView(
+              statusLabel: 'Refreshing…',
+              readLabel: 'Read 12 min ago',
+              rows: [
+                LimitRowView(
+                  label: 'Session',
+                  percentLabel: '75%',
+                  fillPercent: 75,
+                  warning: true,
+                  resetsLabel: 'resets in 2 h 13 min',
+                ),
+                LimitRowView(label: 'Weekly · Fable', warning: false),
+              ],
+            ),
           ),
           canGoBack: true,
           send: sent.add,
@@ -59,8 +61,10 @@ void main() {
       MaterialApp(
         home: LimitsPage(
           screen: const ScreenViewUsageLimits(
-            rows: [],
-            emptyLabel: 'No usage limits read yet.',
+            limits: LimitsView(
+              rows: [],
+              emptyLabel: 'No usage limits read yet.',
+            ),
           ),
           send: (_) {},
         ),

@@ -103,6 +103,6 @@ pub use view::{
     FileResult, LinkTarget, ListResult,
 };
 pub use view::{
-    LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResult, UsageLimitsStatus,
+    LimitSeverity, LimitWindow, SessionInfoView, UsageLimit, UsageLimitsResult, UsageLimitsStatus,
     UsageLimitsUnavailable, UsageLimitsView,
 };

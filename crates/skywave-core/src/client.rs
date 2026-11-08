@@ -784,7 +784,7 @@ impl State {
             return;
         };
         self.model.reload(snapshot);
-        let open = self.model.open_session();
+        let open = self.model.loaded_session();
         if let Some((id, Ok(events))) = open.map(|id| (id, self.store.session_events(id))) {
             self.model.session_loaded(id, events);
         }

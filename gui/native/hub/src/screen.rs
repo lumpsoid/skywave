@@ -7,9 +7,9 @@ use skywave_core::{
     AgentView, ApprovalPrompt, ApprovalStatus, BlobPolicy, CandidateSource, Completion,
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, QuestionPrompt,
-    RuleSuggestion, Screen, SessionId, SessionListView, SessionRow, SessionState, SessionView,
-    SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView,
-    ViewState,
+    RuleSuggestion, Screen, SessionId, SessionInfoView, SessionListView, SessionRow, SessionState,
+    SessionView, SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageLimitsView,
+    UsageView, ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -28,6 +28,7 @@ use skywave_present::question::reply_text;
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
 };
+use skywave_present::session_info;
 use skywave_present::storage::{self, Grouping as StorageGrouping};
 use skywave_present::usage::{Grouping, NO_TURNS, Report, Span, Totals};
 
@@ -35,11 +36,12 @@ use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
-    CreatePrompt, CreatingView, EffortOption, EffortView, LimitRowView, ListKindView, ModeOption,
-    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
-    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
-    SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
-    StorageTotalView, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
+    CreatePrompt, CreatingView, EffortOption, EffortView, InfoFieldView, InfoSectionView,
+    LimitRowView, LimitsView, ListKindView, ModeOption, ModelOption, PairForm, PairingState,
+    PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView, RenamePrompt,
+    RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView, SessionScreen,
+    SnippetView, StopHeadings, StorageGroupingView, StorageRowView, StorageTotalView,
+    SubagentHeaderView, SubagentRowView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
     UsageSpanView,
 };
 use skywave_present::text::{clean, clean_line};
@@ -97,7 +99,10 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
-        Screen::UsageLimits(view) => usage_limits_view(view, ui.wall_ms),
+        Screen::UsageLimits(view) => ScreenView::UsageLimits {
+            limits: limits_view(view, ui.wall_ms),
+        },
+        Screen::SessionInfo(view) => session_info_view(view, ui.wall_ms),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
         Screen::Crop(crop) => crop::screen(crop),
     };
@@ -936,13 +941,49 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
     }
 }
 
-fn usage_limits_view(view: &UsageLimitsView, wall_ms: i64) -> ScreenView {
+fn session_info_view(view: &SessionInfoView, wall_ms: i64) -> ScreenView {
+    let subagents: Vec<SubagentRowView> = session_info::subagents(view)
+        .into_iter()
+        .map(|row| SubagentRowView {
+            title: clean_line(&row.title),
+            detail: row.detail.as_deref().map(clean_line),
+            trail: clean_line(&row.trail),
+            status_label: clean_line(&row.status),
+            live: row.live,
+        })
+        .collect();
+    ScreenView::SessionInfo {
+        session_id: view.id.0.to_string(),
+        sections: session_info::sections(view)
+            .into_iter()
+            .map(|section| InfoSectionView {
+                title: section.title.to_owned(),
+                fields: section
+                    .fields
+                    .into_iter()
+                    .map(|field| InfoFieldView {
+                        label: clean_line(&field.label),
+                        // A workdir is shown whole; nothing here is multi-line.
+                        value: clean_line(&field.value),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        limits: limits_view(&view.limits, wall_ms),
+        subagents_empty_label: subagents
+            .is_empty()
+            .then(|| session_info::NO_SUBAGENTS.to_owned()),
+        subagents,
+    }
+}
+
+fn limits_view(view: &UsageLimitsView, wall_ms: i64) -> LimitsView {
     let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
     let (read_label, rows, empty_label) = match limits::body(view.answer.as_ref(), now) {
         limits::Body::Limits { read, rows } => (Some(read), rows, None),
         limits::Body::Empty(text) => (None, Vec::new(), Some(text)),
     };
-    ScreenView::UsageLimits {
+    LimitsView {
         status_label: limits::status_line(view),
         read_label,
         rows: rows

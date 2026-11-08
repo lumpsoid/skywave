@@ -64,7 +64,7 @@ pub enum Action {
     /// screen is `Unavailable` at once and nothing is asked later.
     RefreshStorage,
     /// Ask the server for its agent's usage limits again, on the usage
-    /// limits page (paired only). The stored answer stays shown until the
+    /// limits page or a session's info page (paired only). The stored answer stays shown until the
     /// new one; offline the page is `Unavailable` at once and nothing is
     /// asked later.
     RefreshUsageLimits,
@@ -288,6 +288,14 @@ pub enum Action {
     /// ([`Screen::Workdir`](crate::Screen::Workdir)). A no-op for an
     /// unknown session.
     OpenWorkdir {
+        session_id: SessionId,
+    },
+    /// Show the session's particulars
+    /// ([`Screen::SessionInfo`](crate::Screen::SessionInfo)): its usage,
+    /// the agent's settings, every subagent it ran and the agent account's
+    /// usage limits, asked for on opening only when none are stored. Back
+    /// returns to the session. A no-op for an unknown session.
+    OpenSessionInfo {
         session_id: SessionId,
     },
     /// Show another pane of the workdir on screen. A pane whose read has no

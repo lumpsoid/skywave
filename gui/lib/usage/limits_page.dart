@@ -21,13 +21,6 @@ class LimitsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final muted = theme.textTheme.bodySmall?.copyWith(
-      color: theme.colorScheme.onSurfaceVariant,
-    );
-    final statusLabel = screen.statusLabel;
-    final readLabel = screen.readLabel;
-    final emptyLabel = screen.emptyLabel;
     return Scaffold(
       appBar: AppBar(
         leading: backButton(
@@ -46,28 +39,39 @@ class LimitsPage extends StatelessWidget {
       body: ReadableWidth(
         child: ListView(
           padding: const EdgeInsets.symmetric(vertical: 12),
-          children: [
-            if (statusLabel != null)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Text(statusLabel, style: muted),
-              ),
-            if (readLabel != null)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Text(readLabel, style: muted),
-              ),
-            if (emptyLabel != null)
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(emptyLabel, style: muted),
-              ),
-            for (final row in screen.rows) _LimitTile(row: row),
-          ],
+          children: limitsChildren(context, screen.limits),
         ),
       ),
     );
   }
+}
+
+/// The limits as a list's children: where a read stands, when they were
+/// read or why there are none, then one tile per limit. Shared by this
+/// page and a session's info page.
+List<Widget> limitsChildren(BuildContext context, LimitsView limits) {
+  final theme = Theme.of(context);
+  final muted = theme.textTheme.bodySmall?.copyWith(
+    color: theme.colorScheme.onSurfaceVariant,
+  );
+  return [
+    if (limits.statusLabel case final status?)
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: Text(status, style: muted),
+      ),
+    if (limits.readLabel case final read?)
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: Text(read, style: muted),
+      ),
+    if (limits.emptyLabel case final empty?)
+      Padding(
+        padding: const EdgeInsets.all(16),
+        child: Text(empty, style: muted),
+      ),
+    for (final row in limits.rows) _LimitTile(row: row),
+  ];
 }
 
 /// One limit: its label and use on a line, the bar, then when it resets.
