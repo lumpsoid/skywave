@@ -2226,6 +2226,50 @@ fn a_deleted_or_cropped_output_says_so_under_its_preview() {
     );
 }
 
+/// Expanding a cropped output keeps saying what the crop kept, beside
+/// where its new blob stands.
+#[test]
+fn an_expanded_cropped_output_still_says_what_the_crop_kept() {
+    let (mut h, id, me) = open_session();
+    let (kept, (_, into)) = (blob(9_000), blob(300));
+    pull(
+        &mut h,
+        vec![
+            event(id, 1, output_result(40, kept.1)),
+            blob_cropped(id, 2, kept.0, into, me),
+        ],
+    );
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    // Control: expanded, so the collapsed summary is gone.
+    assert!(!screen.contains("full 300 B"), "{screen}");
+    assert_contains(
+        &screen,
+        "│ requested · waiting for a slot · 300 B · Cropped by you: kept 2 of 40 lines",
+    );
+}
+
+/// Expanding an output whose delete is pending keeps saying so under it.
+#[test]
+fn an_expanded_output_still_says_its_delete_is_pending() {
+    let (mut h, id, _) = open_session();
+    let (_, output) = blob(10_000);
+    pull(&mut h, vec![event(id, 1, output_result(40, output))]);
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Char('D'));
+    h.key(KeyCode::Char('y'));
+    h.key(KeyCode::Enter);
+    let screen = h.screen();
+    assert!(!screen.contains("full 9.8 KiB"), "{screen}");
+    assert_contains(
+        &screen,
+        "│ requested · waiting for a slot · 9.8 KiB · Delete queued",
+    );
+}
+
 #[test]
 fn approval_prompt_answer_and_resolutions() {
     let (mut h, id, me) = open_session();
