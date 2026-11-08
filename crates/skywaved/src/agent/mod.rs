@@ -201,8 +201,9 @@ pub struct ToolDisplay {
     /// Content worth showing beneath the title, e.g. a diff, in full.
     pub body: Option<DisplayBody>,
     /// Title, detail and body together show all of the call's input. When
-    /// false (the display leaves fields out), or when the mapper cuts any of
-    /// them, the input is kept as a blob.
+    /// false (the display leaves fields out), or when the mapper cuts the
+    /// detail or a title beside a body, the input is kept as a blob. A cut
+    /// body is not: its own blob holds it whole.
     pub shows_all_input: bool,
 }
 

@@ -1287,7 +1287,9 @@ mapper summarises by the call's title) shows the same thing, an edit's diff
 included, before the tool runs. Content is handed over uncut; the mapper cuts
 it and blobs what was cut. `shows_all_input` is false when the input has a
 non-null field the display does not show (e.g. Bash `timeout`), so the mapper
-keeps the input as a blob.
+keeps the input as a blob. Otherwise a big `Write` content, `Edit` diff or
+long command is stored once, as the body's blob (or the cut title's stand-in
+body), not again as the input.
 
 | tool | kind | title | detail | body |
 |------|------|-------|--------|------|
