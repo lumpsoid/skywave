@@ -2204,9 +2204,10 @@ fn a_malformed_context_id_is_an_error_not_an_action() {
     assert_eq!(errors(&outs), ["not a context id: \"not-an-id\""]);
 }
 
-/// An edit's call and result as skywaved logs them for the stub agent:
-/// a diff body whole in its preview, the input as a blob, and a result
-/// with no preview whose whole text is a 70 B blob.
+/// An edit's call and result: a diff body whole in its preview, the input
+/// as a blob, and a result with no preview whose whole text is a 70 B
+/// blob (skywaved now carries one that small inline, `an_inline_edit`
+/// below; a blob stands for any larger output).
 fn an_edit() -> (Vec<EventKind>, skywave_proto::BlobId) {
     use skywave_proto::{BlobId, BlobRef, Body, CallId, Full, ToolCall, ToolDisplay, ToolResult};
     let call = CallId::new();
@@ -2318,6 +2319,58 @@ fn an_edit_expanded_before_its_result_downloads_the_output_when_it_comes() {
     rig.results();
     rig.view();
     assert_eq!(rig.actions.len(), 1, "dispatched {:?}", rig.actions);
+}
+
+#[test]
+fn an_inline_edit_output_expands_whole_without_a_download() {
+    use skywave_proto::{EventKind, Full, ToolResult};
+    let mut rig = Rig::new();
+    let (mut kinds, _) = an_edit();
+    let note = "The file /srv/work/demo.txt has been updated.";
+    if let Some(EventKind::ToolResult(ToolResult { output, .. })) = kinds.last_mut() {
+        *output = Some(Full::Inline(note.into()));
+    }
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    let row = rig.rows().last().unwrap();
+    assert!(row.expanded);
+    let lines: Vec<&str> = row.sections[1]
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(lines, [note]);
+    assert_eq!(row.sections[1].blob, None);
+    assert_eq!(row.sections[1].note, None);
+    assert!(
+        !rig.actions
+            .iter()
+            .any(|a| matches!(a, Action::DownloadBlob(_))),
+        "dispatched {:?}",
+        rig.actions
+    );
+}
+
+#[test]
+fn an_inline_output_expanded_is_cut_short_like_a_blob() {
+    use skywave_proto::{EventKind, Full, ToolResult};
+    let mut rig = Rig::new();
+    let (mut kinds, _) = an_edit();
+    let whole: String = (0..500).map(|i| format!("l{i:03}\n")).collect();
+    if let Some(EventKind::ToolResult(ToolResult { output, .. })) = kinds.last_mut() {
+        *output = Some(Full::Inline(whole));
+    }
+    rig.log(kinds);
+    let key = rig.rows().last().unwrap().key.clone();
+    rig.intent(GuiIntent::ExpandItem { key });
+    let section = &rig.rows().last().unwrap().sections[1];
+    assert_eq!(section.lines.len(), crate::timeline::SHOW_LINES);
+    assert!(section.cut_short);
+    assert_eq!(
+        section.note.as_deref(),
+        Some("cut short: 400 lines of 2.4 KiB shown")
+    );
 }
 
 #[test]

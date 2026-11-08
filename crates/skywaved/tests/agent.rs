@@ -1457,7 +1457,7 @@ fn content_shown_whole_makes_no_blob() {
 }
 
 #[test]
-fn omitted_input_and_a_separate_preview_are_blobs() {
+fn omitted_input_is_a_blob_and_a_separate_preview_keeps_the_output_whole() {
     let mut f = Fixture::new();
     let mut mapper = EventMapper::new(
         f.session_id,
@@ -1511,12 +1511,13 @@ fn omitted_input_and_a_separate_preview_are_blobs() {
         serde_json::from_str::<serde_json::Value>(&f.blob(&kinds[1])).unwrap(),
         input
     );
-    // The preview is the adapter's text; the output keeps the note.
+    // The preview is the adapter's text; the output keeps the note, inline
+    // as it is small (a large one is a blob: the mapper's unit tests).
     let EventKind::ToolResult(result) = &kinds[2] else {
         panic!("expected ToolResult, got {:?}", kinds[2]);
     };
     assert_eq!((result.preview.as_str(), result.lines), ("built", 2));
-    assert_eq!(f.blob(&kinds[2]), note);
+    assert_eq!(result.output, Some(Full::Inline(note.into())));
     // A preview equal to the output is no reason for a blob.
     let EventKind::ToolResult(result) = &kinds[3] else {
         panic!("expected ToolResult, got {:?}", kinds[3]);

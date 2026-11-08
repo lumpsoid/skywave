@@ -1338,8 +1338,6 @@ fn stamp(dir: &Path) -> Vec<u32> {
 }
 
 #[test]
-// Empty until the first bump after MIGRATED_SINCE.
-#[allow(clippy::reversed_empty_ranges)]
 fn a_replica_of_every_migrated_protocol_version_opens_restamped() {
     let (_tmp, dir) = data_dir();
     drop(Store::open(&dir).unwrap());
@@ -1355,6 +1353,58 @@ fn a_replica_of_every_migrated_protocol_version_opens_restamped() {
             "from {older}"
         );
     }
+}
+
+/// The tool results a v23 replica holds (as its wire snapshot wrote them)
+/// read unchanged once v24's step ran: a whole output stays the blob or
+/// loss it was.
+#[test]
+fn v24_reads_the_tool_results_a_v23_replica_holds() {
+    let (_tmp, dir) = data_dir();
+    drop(Store::open(&dir).unwrap());
+    let session = "01920000-0000-7000-8000-000000000001";
+    let event = |kind: &str| {
+        format!(
+            r#"{{"session_id":"{session}","at":"2026-10-29T12:00:00Z","command_id":null,"context":"{session}","kind":{kind}}}"#
+        )
+    };
+    let v23 = [
+        event(
+            r#"{"type":"tool_result","call":"01920000-0000-7000-8000-000000000007","is_error":false,"status":"exit 0","preview":"running","lines":40,"output":{"blob":{"id":"01920000-0000-7000-8000-000000000005","size":48213,"sha256":"7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"}}}"#,
+        ),
+        event(
+            r#"{"type":"tool_result","call":null,"is_error":false,"status":null,"preview":"running","lines":40,"output":"lost"}"#,
+        ),
+        event(
+            r#"{"type":"tool_result","call":null,"is_error":true,"status":"exit 1","preview":"no such file","lines":1,"output":null}"#,
+        ),
+    ];
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    for (seq, json) in (1i64..).zip(&v23) {
+        conn.execute(
+            "INSERT INTO events (seq, session_id, event) VALUES (?1, ?2, ?3)",
+            rusqlite::params![seq, session, json],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE protocol_stamp SET version = 23", [])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![24]);
+    let id = SessionId(session.parse().unwrap());
+    let outputs: Vec<Option<Full>> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| match event.kind {
+            EventKind::ToolResult(ToolResult { output, .. }) => output,
+            other => panic!("not a result: {other:?}"),
+        })
+        .collect();
+    assert!(matches!(&outputs[0], Some(Full::Blob(b)) if b.size == 48213));
+    assert_eq!(outputs[1..], [Some(Full::Lost), None]);
 }
 
 #[test]

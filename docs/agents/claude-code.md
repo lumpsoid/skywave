@@ -1311,8 +1311,9 @@ shows all old lines removed and all new ones added.
 (when the message holds one `tool_result`, as the CLI sends them), by the
 tool its `tool_use_id` named. The model-facing `tool_result` content is
 always the whole `output`; the display sets a separate `preview` (and the
-mapper then blobs the output) so notes such as "file state is current in your
-context" or "STOP what you are doing" stay out of the preview.
+mapper then keeps the whole output beside it, inline up to 4 KiB, else as a
+blob) so notes such as "file state is current in your context" or "STOP what
+you are doing" stay out of the preview.
 
 | `tool_use_result` | status | preview |
 |-------------------|--------|---------|

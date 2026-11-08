@@ -801,10 +801,30 @@ impl Layout<'_> {
                     note = blob_note(state);
                     preview.into_iter().map(clean).collect()
                 }
-                None => {
-                    note = section.note().map(|note| Span::raw(note).yellow());
-                    preview.into_iter().map(clean).collect()
-                }
+                None => match section.inline() {
+                    // Capped like a downloaded blob's head.
+                    Some(whole) => {
+                        let shown = head_of(whole, SHOW_BYTES as usize);
+                        let lines = content_lines(shown);
+                        note = (lines.len() > SHOW_LINES || shown.len() < whole.len()).then(|| {
+                            Span::raw(format!(
+                                "… cut short: {} of {} shown",
+                                if lines.len() > SHOW_LINES {
+                                    format!("{SHOW_LINES} lines")
+                                } else {
+                                    bytes(SHOW_BYTES)
+                                },
+                                bytes(whole.len() as u64)
+                            ))
+                            .dark_gray()
+                        });
+                        lines.into_iter().take(SHOW_LINES).map(clean).collect()
+                    }
+                    None => {
+                        note = section.note().map(|note| Span::raw(note).yellow());
+                        preview.into_iter().map(clean).collect()
+                    }
+                },
             }
         } else if preview.is_empty() {
             // Nothing worth a line, e.g. a write's output beside its status;

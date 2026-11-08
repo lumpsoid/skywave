@@ -397,7 +397,15 @@ type ProtocolStep = fn(&Transaction<'_>) -> Result<(), StoreError>;
 /// bump moves its log. Every bump adds one, a no-op saying so if nothing
 /// stored changed; the length makes a bump without one fail to compile.
 /// Append; never edit a released one.
-const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [];
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+
+/// v23 to v24, as the server's step of the same name. What v24 changed of
+/// what is stored, and how each is moved:
+/// - `Full::Inline` (a small tool output carried in its event): new, so no
+///   v23 event has one; v23's `Full::Blob` and `Full::Lost` read unchanged.
+fn v23_to_v24(_tx: &Transaction<'_>) -> Result<(), StoreError> {
+    Ok(())
+}
 
 /// The files SQLite keeps beside [`DB_FILE`] in WAL mode.
 const WAL_FILES: [&str; 2] = ["core.db-wal", "core.db-shm"];

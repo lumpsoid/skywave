@@ -191,6 +191,19 @@ impl<'a> Section<'a> {
         self.full.and_then(FullView::blob)
     }
 
+    /// The whole content when it came inline in the event: what an
+    /// expanded section shows and a copy takes in place of `text`.
+    pub fn inline(&self) -> Option<&'a str> {
+        self.full.and_then(FullView::inline)
+    }
+
+    /// The whole content is somewhere this device has to fetch or cannot
+    /// have: a blob, or word it was lost or deleted. Not for inline
+    /// content, which is here.
+    pub fn elsewhere(&self) -> bool {
+        self.full.is_some() && self.inline().is_none()
+    }
+
     /// What to say beside this section when the server could not keep its
     /// whole content ([`INPUT_LOST`], [`CONTENT_LOST`]); `None` otherwise.
     pub fn lost(&self) -> Option<&'static str> {
@@ -251,14 +264,15 @@ pub fn change_note(blob: &BlobView) -> Option<String> {
 /// on it shows what it did: `input 4.2 KiB`, `output 1.0 MiB · requested`;
 /// that it was deleted ([`deleted_note`]): `input · Deleted by laptop`; or
 /// that the server could not keep it: `input not stored`. `None` once the
-/// blob is here or a shown section carries it.
+/// blob is here or a shown section carries it. Inline content is here
+/// already: it is never what this names.
 pub fn unseen_blob(entry: &Entry) -> Option<String> {
     let sections = sections(entry);
     let shown = |s: &Section| !s.hidden && !s.text.strip_suffix('\n').unwrap_or(s.text).is_empty();
-    if sections.iter().any(|s| shown(s) && s.full.is_some()) {
+    if sections.iter().any(|s| shown(s) && s.elsewhere()) {
         return None;
     }
-    let section = sections.iter().find(|s| s.full.is_some())?;
+    let section = sections.iter().find(|s| s.elsewhere())?;
     let what = match (section.input, section.hidden) {
         (true, _) => "input",
         (false, true) => "output",
@@ -268,6 +282,8 @@ pub fn unseen_blob(entry: &Entry) -> Option<String> {
         FullView::Blob(blob) => blob,
         FullView::Deleted { by } => return Some(format!("{what} · {}", deleted_note(by))),
         FullView::Lost => return Some(format!("{what} not stored")),
+        // Not `elsewhere`.
+        FullView::Inline(_) => return None,
     };
     let size = bytes(blob_size(&blob.state)?);
     Some(match download_brief(&blob.state) {
@@ -344,7 +360,8 @@ pub fn sections(entry: &Entry) -> Vec<Section<'_>> {
 /// A grouped call: its body (e.g. the file written or the diff), then its
 /// output. Output beside a body is shown only when it is an error or the
 /// body is a shell command; the rest waits for the item to expand. The
-/// whole input is offered when nothing else has a blob, and a lost input
+/// whole input is offered when nothing else has a blob or an inline
+/// output, and a lost input
 /// always stands, so the loss is said.
 pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
     let mut out = Vec::new();
@@ -384,9 +401,13 @@ pub fn tool_sections(view: &ToolView) -> Vec<Section<'_>> {
         });
     }
     // A lost or deleted input always stands, so the loss is said: no other
-    // section's blob holds the input.
+    // section's blob holds the input. An inline output counts as the blob
+    // it would be were it larger: the input is not offered beside it.
     if let Some(input) = &view.input
-        && (input.blob().is_none() || out.iter().all(|s| s.blob().is_none()))
+        && (input.blob().is_none()
+            || out
+                .iter()
+                .all(|s| s.blob().is_none() && s.inline().is_none()))
     {
         out.push(Section::input(input));
     }
@@ -502,7 +523,7 @@ impl Content {
                 blob: blob.clone(),
                 strip: None,
             },
-            None => Content::Text(section.text.to_owned()),
+            None => Content::Text(section.inline().unwrap_or(section.text).to_owned()),
         }
     }
 }
@@ -770,6 +791,60 @@ mod tests {
         // Control: uncropped, the event's own count.
         let view = call(Some(kept_blob()), None);
         assert_eq!(tool_sections(&view)[0].lines, Some(40));
+    }
+
+    #[test]
+    fn an_inline_output_is_content_at_hand_not_a_blob() {
+        let read = |output: FullView| {
+            let mut view = call(None, None);
+            view.name = "Read".into();
+            view.kind = ToolKind::FileRead;
+            view.body = None;
+            view.outcome = ToolOutcome::Done {
+                is_error: false,
+                status: Some("2 lines".into()),
+                preview: "alpha\n".into(),
+                lines: 2,
+                output: Some(output),
+                took: std::time::Duration::ZERO,
+            };
+            Entry::Tool(Box::new(view))
+        };
+        let item = |entry: Entry| TimelineItem::Logged {
+            parent: None,
+            seq: Seq(1),
+            at: Utc::now(),
+            context: skywave_core::ContextId::first_of(skywave_core::SessionId::new()),
+            entry,
+        };
+
+        let entry = read(FullView::Inline("1\talpha\n2\t".into()));
+        let shown = sections(&entry);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].text, "alpha\n");
+        assert_eq!(shown[0].inline(), Some("1\talpha\n2\t"));
+        assert_eq!((shown[0].blob(), shown[0].note()), (None, None));
+        assert!(!shown[0].elsewhere(), "nothing to fetch or say");
+        assert_eq!(wanted_blob(&entry), None);
+        assert_eq!(unseen_blob(&entry), None, "no `not stored` label");
+        // A copy takes the whole output, not the preview.
+        assert_eq!(
+            main_content(&item(entry.clone())),
+            Some(Content::Text("1\talpha\n2\t".into()))
+        );
+        // Text only in the whole output shows once expanded.
+        assert!(match_hidden(&entry, &Query::new("1\talpha")));
+        assert!(!match_hidden(&entry, &Query::new("alpha")));
+
+        // Control: a blob output is fetched, and a copy takes the blob.
+        let entry = read(kept_blob());
+        let shown = sections(&entry);
+        assert!(shown[0].elsewhere());
+        assert_eq!(shown[0].inline(), None);
+        assert!(matches!(
+            main_content(&item(entry.clone())),
+            Some(Content::Blob { .. })
+        ));
     }
 
     fn kept_blob() -> FullView {

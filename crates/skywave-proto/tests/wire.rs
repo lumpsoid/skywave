@@ -177,6 +177,16 @@ fn all_event_kinds() -> Vec<EventKind> {
         }),
         EventKind::ToolResult(ToolResult {
             call: Some(call()),
+            is_error: false,
+            status: Some("updated +1 -1".into()),
+            preview: String::new(),
+            lines: 1,
+            output: Some(Full::Inline(
+                "The file a.txt has been updated. file state is current in your context".into(),
+            )),
+        }),
+        EventKind::ToolResult(ToolResult {
+            call: Some(call()),
             is_error: true,
             status: Some("exit 1".into()),
             preview: "error: no such file".into(),
@@ -1433,8 +1443,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v23() {
-    assert_eq!(PROTOCOL_VERSION, 23);
+fn protocol_is_v24() {
+    assert_eq!(PROTOCOL_VERSION, 24);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1460,6 +1470,7 @@ fn display_caps() {
     assert_eq!(limits::STATUS_MAX_CHARS, 60);
     assert_eq!(limits::PREVIEW_MAX_LINES, 8);
     assert_eq!(limits::PREVIEW_MAX_BYTES, 512);
+    assert_eq!(limits::INLINE_MAX_BYTES, 4096);
     assert_eq!(limits::RULE_LABEL_MAX_CHARS, 120);
     assert_eq!(limits::RULE_SUGGESTIONS_MAX, 8);
     assert_eq!(limits::TASKS_MAX, 32);

@@ -4823,7 +4823,8 @@ fn tool_events(kinds: &[EventKind]) -> (Vec<ToolCall>, Vec<ToolResult>) {
 #[tokio::test]
 async fn a_blob_that_cannot_be_written_is_marked_lost_and_the_turn_goes_on() {
     let mut f = Fixture::new();
-    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    // Past `INLINE_MAX_BYTES`, so the output is meant to be a blob.
+    let long: String = (0..100).map(|i| format!("line {i:<40}\n")).collect();
     let turn = || {
         [
             Step::tool_call("shell", json!({ "command": long.clone() })),
@@ -4990,7 +4991,8 @@ async fn a_write_lock_held_for_seconds_only_delays_the_supervisor() {
 #[tokio::test]
 async fn a_restart_while_blobs_cannot_be_stored_recovers_and_runs() {
     let mut f = Fixture::new();
-    let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    // Past `INLINE_MAX_BYTES`, so the output is meant to be a blob.
+    let long: String = (0..100).map(|i| format!("line {i:<40}\n")).collect();
     let gate = Gate::new();
     let agent = FakeAgent::new(
         FakeScript::new()

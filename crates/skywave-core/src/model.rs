@@ -3367,6 +3367,7 @@ impl Model {
     fn full_view(&self, full: &Full) -> FullView {
         match full {
             Full::Blob(blob) => self.fated_view(blob),
+            Full::Inline(text) => FullView::Inline(text.clone()),
             Full::Lost => FullView::Lost,
         }
     }

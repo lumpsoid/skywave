@@ -137,7 +137,10 @@ pub use fingerprint::{Fingerprint, InvalidFingerprint};
 /// `LineSpan`s) logged as `EventKind::BlobCropped`; the refusals
 /// `UnknownBlob`, `BlobGone`, `NotCroppable` and `BadCrop`; and
 /// `output_blob` on [`ShellRunStorage`], the run's blob a device acts on.
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// v24: [`Full::Inline`]: a tool result's whole output of at most
+/// [`limits::INLINE_MAX_BYTES`] travels in the event instead of a blob.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// The oldest [`PROTOCOL_VERSION`] whose stored data (the server's database,
 /// a device's replica) this build migrates (D43). Each later version has
@@ -273,7 +276,7 @@ impl Seq {
     }
 }
 
-/// Reference to large content. Content is always referenced, never inlined.
+/// Reference to content kept as a blob, outside the event.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BlobRef {
     pub id: BlobId,
@@ -291,17 +294,20 @@ pub struct BlobRef {
 pub enum Full {
     /// Kept as a blob.
     Blob(BlobRef),
+    /// Carried here, in the event: at most [`limits::INLINE_MAX_BYTES`],
+    /// too small to be worth a blob.
+    Inline(String),
     /// The server could not store it (a full disk): only the preview or
     /// summary is left, and heads say so.
     Lost,
 }
 
 impl Full {
-    /// The blob holding the whole content, unless it was lost.
+    /// The blob holding the whole content, unless it is inline or lost.
     pub fn blob(&self) -> Option<&BlobRef> {
         match self {
             Full::Blob(blob) => Some(blob),
-            Full::Lost => None,
+            Full::Inline(_) | Full::Lost => None,
         }
     }
 }
@@ -889,7 +895,8 @@ impl EventKind {
     /// The blobs the event references, with what each holds: a tool call's
     /// input and the whole of its display body, a result's output, an
     /// approval's input, a finished shell run's whole output; the same for
-    /// an imported call or result. A [`Full::Lost`] references none. A
+    /// an imported call or result. A [`Full::Inline`] or [`Full::Lost`]
+    /// references none. A
     /// `BlobCropped` yields its `into`, the blob it made, with what it holds.
     pub fn blobs(&self) -> impl Iterator<Item = (BlobUse, &BlobRef)> {
         fn full(holds: BlobUse, full: &Option<Full>) -> Option<(BlobUse, &BlobRef)> {
@@ -993,6 +1000,16 @@ pub mod limits {
     pub const PREVIEW_MAX_LINES: usize = 8;
     /// Most UTF-8 bytes in a preview.
     pub const PREVIEW_MAX_BYTES: usize = 512;
+    /// Most UTF-8 bytes of a tool result's whole output carried in its
+    /// event ([`Full::Inline`](crate::Full::Inline)) rather than as a blob.
+    /// A blob costs a file, two fsyncs and a row on the server, and under
+    /// the eager policy a request per device, each with a round trip on a
+    /// bad link and headers worth hundreds of bytes; below a few KiB that
+    /// costs more than the bytes it keeps out of the log. 4 KiB holds the
+    /// common small results whole (an edit's note to the model, a short
+    /// read, a grep's file list) while capping what every device pulls per
+    /// result at eight previews' worth.
+    pub const INLINE_MAX_BYTES: usize = 4096;
     /// Longest session name (`RenameSession`, `SessionRenamed`), in chars.
     pub const SESSION_NAME_MAX_CHARS: usize = 80;
     /// Longest context name (`SessionCreated::context_name`,
@@ -1531,7 +1548,8 @@ pub struct ToolResult {
     pub preview: String,
     /// Line count of the whole output.
     pub lines: u32,
-    /// The whole output, when `preview` does not hold all of it.
+    /// The whole output, when `preview` does not hold all of it: inline
+    /// when it is at most [`limits::INLINE_MAX_BYTES`], else a blob.
     pub output: Option<Full>,
 }
 
