@@ -61,7 +61,8 @@
 //!
 //! The CLI's stored transcripts, outside conversations included, are read
 //! by [`transcripts::ClaudeTranscripts`]; [`own_conversations`] names the
-//! ones Skywave's contexts run.
+//! ones Skywave's contexts run. The account's usage limits are read by
+//! [`limits::ClaudeUsageLimits`], with a process of its own.
 //!
 //! **Shutdown.** [`AgentSession::shutdown`] with a turn that was interrupted
 //! waits up to the grace period for its `result`. A turn still running
@@ -112,6 +113,7 @@
 //! ([`protocol::Protocol::exit_error`]).
 
 pub mod display;
+pub mod limits;
 mod lines;
 pub mod protocol;
 pub mod rules;

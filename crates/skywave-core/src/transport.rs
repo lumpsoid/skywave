@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
-    EventsQuery, FileResult, HelloResponse, ListResult, RunId, StorageReport, WorkdirQuery,
+    EventsQuery, FileResult, HelloResponse, ListResult, RunId, StorageReport, UsageLimitsResult,
+    WorkdirQuery,
 };
 
 use crate::view::{LinkFailure, LinkRejection};
@@ -91,6 +92,13 @@ pub trait Transport: Send + Sync {
     /// the storage screen. Defaults to [`TransportError::NotFound`] like
     /// [`list_dirs`](Transport::list_dirs).
     fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
+        Box::pin(async { Err(TransportError::NotFound) })
+    }
+
+    /// `GET /v1/usage-limits`: the usage limits of the account the
+    /// server's agent runs as, for the usage limits page. Defaults to
+    /// [`TransportError::NotFound`] like [`list_dirs`](Transport::list_dirs).
+    fn usage_limits(&self) -> BoxFuture<'_, Result<UsageLimitsResult, TransportError>> {
         Box::pin(async { Err(TransportError::NotFound) })
     }
 

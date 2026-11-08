@@ -2,13 +2,17 @@
 //! no tokens.
 
 use serde_json::{Value, json};
-use skywaved::agent::claude_code::ALLOW_BYPASS_ARG;
+use skywaved::agent::claude_code::limits::{
+    USAGE_REQUEST_ID, get_usage_request, parse_severity, parse_window, usage_limits,
+};
 use skywaved::agent::claude_code::protocol::{mode_name, parse_effort};
+use skywaved::agent::claude_code::{ALLOW_BYPASS_ARG, CliSession};
 use skywaved::agent::{AdapterEvent, Effort, ModelChoice, PermissionMode};
+use uuid::Uuid;
 
 use super::Ctx;
 use crate::report::{Stop, ensure};
-use crate::session::{Session, Setup};
+use crate::session::{Session, Setup, Workdir};
 use crate::shape::clip;
 
 /// How long one control request may take to be answered.
@@ -241,6 +245,93 @@ pub fn effort_switch(ctx: &mut Ctx) -> Result<(), Stop> {
             Ok(Ok(level)) => Err(format!("read {level:?}")),
             Err(stop) => Err(stalled(stop)),
         },
+    );
+    Ok(())
+}
+
+/// What the usage limits page reads: the one `get_usage` a process that had
+/// no handshake and no message is sent (docs/agents/claude-code.md §3.15).
+pub fn get_usage(ctx: &mut Ctx) -> Result<(), Stop> {
+    let workdir = Workdir::new(None)?;
+    let id = Uuid::new_v4();
+    let mut s = ctx.session(Setup {
+        session: Some(CliSession::New(id)),
+        workdir: Some(workdir.clone()),
+        no_handshake: true,
+        ..Setup::default()
+    })?;
+    s.raw(get_usage_request(USAGE_REQUEST_ID));
+    let answer = s.response(USAGE_REQUEST_ID, ANSWER);
+    let checks = &mut ctx.checks;
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(stop) => {
+            checks.contract(
+                "get_usage is answered without a handshake",
+                Err(stalled(stop)),
+            );
+            return Ok(());
+        }
+    };
+    checks.contract(
+        "get_usage is answered without a handshake",
+        ensure(answer["subtype"] == "success", || describe(&answer)),
+    );
+    let body = &answer["response"];
+    let read = usage_limits(body);
+    checks.contract(
+        "the answer lists limits the adapter reads",
+        match &read {
+            Ok(limits) if limits.is_empty() && body["rate_limits_available"] != false => {
+                Err("no limit the adapter reads".into())
+            }
+            Ok(_) => Ok(()),
+            Err(why) => Err(why.clone()),
+        },
+    );
+    let raw: Vec<&Value> = body
+        .pointer("/rate_limits/limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let unknown: Vec<String> = raw
+        .iter()
+        .flat_map(|limit| {
+            let group = limit["group"]
+                .as_str()
+                .filter(|g| parse_window(g).is_none());
+            let severity = limit["severity"]
+                .as_str()
+                .filter(|s| parse_severity(s).is_none());
+            group.into_iter().chain(severity).map(str::to_owned)
+        })
+        .collect();
+    checks.watch(
+        "every limit's group and severity is one the adapter knows",
+        "skywave_proto::LimitWindow and LimitSeverity, limits::parse_window and parse_severity (docs/agents/claude-code.md §3.15)",
+        ensure(unknown.is_empty(), || format!("new values {unknown:?}")),
+    );
+    checks.contract(
+        "the answer leaves out the advice skip_behaviors skips",
+        ensure(body["behaviors"].is_null(), || {
+            clip(&body["behaviors"].to_string())
+        }),
+    );
+    s.close_stdin();
+    let closed = s.wait_closed(ANSWER);
+    checks.contract(
+        "a closed stdin ends the process",
+        closed.map_err(|stop| stop_text(&stop)),
+    );
+    let transcript = workdir
+        .project_dir()
+        .map(|dir| dir.join(format!("{id}.jsonl")));
+    checks.contract(
+        "the process leaves no conversation behind",
+        ensure(!transcript.as_ref().is_some_and(|t| t.exists()), || {
+            format!("{} exists", transcript.unwrap().display())
+        }),
     );
     Ok(())
 }

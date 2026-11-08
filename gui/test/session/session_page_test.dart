@@ -2009,6 +2009,29 @@ void main() {
     expect(sent.last, const GuiIntentToggleConversationOnly());
   });
 
+  testWidgets('the usage summary and the More menu open the usage limits', (
+    tester,
+  ) async {
+    final sent = <GuiIntent>[];
+    await pumpSession(
+      tester,
+      screen: screenWith(usage: [r'$0.04', r'session $1.27']),
+      timeline: holding([]),
+      sent: sent,
+    );
+    const limits = GuiIntentAct(
+      action: ActionIntentNavigate(route: RouteView.usageLimits),
+    );
+    await tester.tap(find.byKey(const Key('status-usage')));
+    expect(sent.last, limits);
+    sent.clear();
+    await tester.tap(find.byTooltip('More'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Usage limits'));
+    await tester.pumpAndSettle();
+    expect(sent, [limits]);
+  });
+
   testWidgets('header actions and the rename prompt', (tester) async {
     final sent = <GuiIntent>[];
     await pumpSession(

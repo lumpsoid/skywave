@@ -23,6 +23,7 @@ pub use skywave_proto::{
 pub use skywave_proto::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
 };
+pub use skywave_proto::{LimitSeverity, LimitWindow, UsageLimit, UsageLimitsResult};
 
 pub use crate::projection::{SessionUsage, TurnRecord};
 
@@ -470,6 +471,7 @@ pub enum Screen {
     Settings(SettingsView),
     Usage(UsageView),
     Storage(StorageView),
+    UsageLimits(UsageLimitsView),
     Workdir(WorkdirView),
     Crop(CropView),
 }
@@ -861,6 +863,41 @@ pub enum StorageUnavailable {
     /// Not connected: nothing was asked.
     Offline,
     /// The request failed, worded by the transport.
+    Failed(String),
+}
+
+/// The usage limits of the account the server's agent runs as
+/// ([`Route::UsageLimits`](crate::Route::UsageLimits)): the latest answer
+/// the replica keeps, shown offline too, and where a read of a fresh one
+/// stands. Opening the page asks only when nothing is stored;
+/// [`Action::RefreshUsageLimits`](crate::Action::RefreshUsageLimits) asks
+/// again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageLimitsView {
+    pub status: UsageLimitsStatus,
+    /// The latest stored answer, never a `Failed`; `None` until one came.
+    /// A `Read` names when the agent reported it.
+    pub answer: Option<UsageLimitsResult>,
+}
+
+/// Where a read of the usage limits stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageLimitsStatus {
+    /// Nothing asked, or the last ask was answered: `answer` is the latest.
+    Idle,
+    /// Asked; `answer`, if any, is the one before.
+    Loading,
+    /// The last ask got no answer; `answer`, if any, is older.
+    Unavailable(UsageLimitsUnavailable),
+}
+
+/// Why the last read of the usage limits got no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageLimitsUnavailable {
+    /// Not connected: nothing was asked.
+    Offline,
+    /// The request failed, worded by the transport, or the agent could not
+    /// say, in the server's words.
     Failed(String),
 }
 

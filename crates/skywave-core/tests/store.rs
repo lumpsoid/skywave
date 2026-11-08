@@ -15,8 +15,9 @@ use skywave_proto::{
     AgentWork, ApprovalId, BackgroundTask, BlobId, BlobRef, BlobUse, ChangeSet, ChangedFile,
     ChangesResult, Command, CommandId, CommandKind, CommandResult, ContentHash, ContextId,
     Decision, DeviceId, DeviceInfo, DiffBody, Event, EventBatch, EventKind, FileBody, FileChange,
-    FileResult, Full, ImportOutcome, ImportedItem, LineSpan, RejectReason, Schedule, ScheduleId,
-    Seq, SessionId, SessionOrigin, SessionState, TaskId, TaskKind, ToolResult, TurnUsage,
+    FileResult, Full, ImportOutcome, ImportedItem, LimitSeverity, LimitWindow, LineSpan,
+    RejectReason, Schedule, ScheduleId, Seq, SessionId, SessionOrigin, SessionState, TaskId,
+    TaskKind, ToolResult, TurnUsage, UsageLimit, UsageLimitsResult,
 };
 
 fn event(session_id: SessionId, minute: u32, kind: EventKind) -> Event {
@@ -822,7 +823,7 @@ fn turns_are_kept_by_seq_dropped_with_their_session_and_backfilled() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(turns(&store), both);
     assert_eq!(
@@ -952,7 +953,7 @@ fn background_work_folds_quietly_survives_a_reopen_and_starts_empty_after_the_mi
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
     let store = Store::open(&dir).unwrap();
     let summary = store.session(id).unwrap().unwrap();
     assert_eq!(summary.work, AgentWork::default());
@@ -1600,6 +1601,83 @@ fn v26_reads_the_pending_approval_a_v25_replica_holds() {
     assert_eq!(events[1], requested);
 }
 
+/// A v26 replica opens as v27 with no usage limits stored: v26 never
+/// asked for them.
+#[test]
+fn v27_opens_a_v26_replica_without_usage_limits() {
+    let (_tmp, dir) = data_dir();
+    let id = SessionId::new();
+    let created = EventKind::SessionCreated {
+        workdir: "/srv/x".into(),
+        context_name: "start".into(),
+        from: None,
+    };
+    let batch = EventBatch {
+        from: Seq(1),
+        events: vec![event(id, 0, created.clone())],
+    };
+    let mut store = Store::open(&dir).unwrap();
+    store.apply_batch(&batch, Utc::now()).unwrap();
+    drop(store);
+    // What v26 left: no `usage_limits` table, stamped 26.
+    let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
+    conn.execute_batch(
+        "DROP TABLE usage_limits;
+         UPDATE protocol_stamp SET version = 26;",
+    )
+    .unwrap();
+    drop(conn);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
+    assert_eq!(store.usage_limits().unwrap(), None);
+    let events: Vec<EventKind> = store
+        .session_events(id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e.kind)
+        .collect();
+    assert_eq!(events, [created]);
+    let read = usage_limits_read();
+    store.put_usage_limits(&read).unwrap();
+    assert_eq!(store.usage_limits().unwrap(), Some(read));
+}
+
+fn usage_limits_read() -> UsageLimitsResult {
+    UsageLimitsResult::Read {
+        at: Utc.with_ymd_and_hms(2026, 11, 8, 12, 0, 0).unwrap(),
+        limits: vec![UsageLimit {
+            window: LimitWindow::Session,
+            scope: None,
+            percent: Some(75),
+            severity: Some(LimitSeverity::Warning),
+            resets_at: None,
+        }],
+    }
+}
+
+/// The latest answer replaces the one before, reads back after a reopen
+/// and in the snapshot, and goes with the replica.
+#[test]
+fn the_usage_limits_answer_is_kept_until_the_replica_is_reset() {
+    let (_tmp, dir) = data_dir();
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(store.load().unwrap().usage_limits, None);
+    store
+        .put_usage_limits(&UsageLimitsResult::Unavailable)
+        .unwrap();
+    store.put_usage_limits(&usage_limits_read()).unwrap();
+    drop(store);
+    let mut store = Store::open(&dir).unwrap();
+    assert_eq!(
+        store.load().unwrap().usage_limits,
+        Some(usage_limits_read())
+    );
+    store.reset_for_server("other:7443").unwrap();
+    assert_eq!(store.usage_limits().unwrap(), None);
+}
+
 #[test]
 fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_cannot_migrate() {
     let (_tmp, dir) = data_dir();
@@ -1628,7 +1706,7 @@ fn the_replica_is_stamped_with_its_protocol_version_and_refused_under_one_it_can
     // A replica from before the stamp takes this build's.
     conn.execute_batch("DROP TABLE protocol_stamp").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 5);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
     drop(Store::open(&dir).unwrap());
     assert_eq!(stamp(&dir), vec![skywave_core::PROTOCOL_VERSION]);
 }
@@ -2523,7 +2601,7 @@ fn a_v8_replica_moves_into_first_contexts() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 12);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 13);
 
     let store = Store::open(&dir).unwrap();
     let events = store.session_events(session).unwrap();
@@ -3033,7 +3111,7 @@ fn the_migration_makes_existing_drafts_and_snippets_the_agents() {
     drop_turns(&dir);
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 10);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 11);
 
     let store = Store::open(&dir).unwrap();
     let snapshot = store.load().unwrap();
@@ -3315,7 +3393,7 @@ fn the_workdir_migration_keeps_a_populated_replica() {
 
     drop_workdir(&dir);
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 9);
     let mut store = Store::open(&dir).unwrap();
     let after = store.load().unwrap();
     assert_eq!(after, before, "nothing else changes");
@@ -3442,7 +3520,7 @@ fn the_importing_migration_keeps_a_populated_replica() {
     drop(store);
 
     drop_import_columns(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 8);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "nothing changes");
     assert!(after.sessions.iter().all(|s| !s.importing));
@@ -3481,7 +3559,7 @@ fn the_adopted_migration_backfills_from_the_session_created() {
     drop(store);
 
     drop_adopted(&dir);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 6);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 7);
     let after = Store::open(&dir).unwrap().load().unwrap();
     assert_eq!(after, before, "backfilled from the stored log");
 }
@@ -3894,7 +3972,7 @@ fn the_fates_migration_keeps_a_populated_replica() {
     let conn = rusqlite::Connection::open(dir.join(skywave_core::store::DB_FILE)).unwrap();
     conn.execute_batch("DROP TABLE blob_fates;").unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 3);
 
     let mut store = Store::open(&dir).unwrap();
     assert!(store.blob_fates().unwrap().is_empty());
@@ -4022,7 +4100,7 @@ fn the_failures_migration_keeps_a_populated_replica() {
     )
     .unwrap();
     drop(conn);
-    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 1);
+    set_user_version(&dir, skywave_core::store::SCHEMA_VERSION - 2);
 
     let mut store = Store::open(&dir).unwrap();
     assert_eq!(store.blobs().unwrap(), before);

@@ -461,7 +461,7 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// saying so if nothing stored changed; the length makes a bump without one
 /// fail to compile. Append; never edit a released one.
 const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
-    [v23_to_v24, v24_to_v25, v25_to_v26];
+    [v23_to_v24, v24_to_v25, v25_to_v26, v26_to_v27];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
 /// - `Full::Inline` (a small tool output carried in its event): new, so no
@@ -493,6 +493,13 @@ fn v24_to_v25(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
 ///   event is one. Their `approvals.questions` came with schema migration
 ///   v22, NULL for every approval v25 logged: each was a plain one.
 fn v25_to_v26(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v26 to v27. v27 added `GET /v1/usage-limits`, whose answer the server
+/// reads from the agent when asked and never stores: nothing stored
+/// changes.
+fn v26_to_v27(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -1199,6 +1206,46 @@ mod tests {
             .unwrap();
         assert_eq!(row.questions, None);
         assert_eq!(row.closed, None);
+    }
+
+    /// A database a v26 build wrote reads unchanged once v27's step ran.
+    #[test]
+    fn v27_reads_what_v26_wrote() {
+        use skywave_proto::EventKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        let v26 = r#"{"type":"agent_message","text":"Done.","parent":null,"full":null}"#;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO protocol_stamp (id, version) VALUES (1, 26)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (seq, session_id, at, context, kind)
+                 VALUES (1, 's', 't', 'c', ?1)",
+                [v26],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let kind: String = db
+            .conn()
+            .query_row("SELECT kind FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, v26);
+        assert!(matches!(
+            serde_json::from_str(&kind).unwrap(),
+            EventKind::AgentMessage { .. }
+        ));
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records

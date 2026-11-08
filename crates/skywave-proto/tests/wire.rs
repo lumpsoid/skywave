@@ -693,6 +693,45 @@ fn storage_report() -> StorageReport {
     }
 }
 
+fn all_usage_limits_results() -> Vec<UsageLimitsResult> {
+    vec![
+        UsageLimitsResult::Read {
+            at: at(),
+            limits: vec![
+                UsageLimit {
+                    window: LimitWindow::Session,
+                    scope: None,
+                    percent: Some(75),
+                    severity: Some(LimitSeverity::Warning),
+                    resets_at: Some(at()),
+                },
+                UsageLimit {
+                    window: LimitWindow::Weekly,
+                    scope: Some("Fable".into()),
+                    percent: Some(0),
+                    severity: Some(LimitSeverity::Normal),
+                    resets_at: None,
+                },
+                UsageLimit {
+                    window: LimitWindow::Weekly,
+                    scope: None,
+                    percent: None,
+                    severity: None,
+                    resets_at: None,
+                },
+            ],
+        },
+        UsageLimitsResult::Read {
+            at: at(),
+            limits: vec![],
+        },
+        UsageLimitsResult::Unavailable,
+        UsageLimitsResult::Failed {
+            reason: "not logged in".into(),
+        },
+    ]
+}
+
 fn all_shell_ends() -> Vec<ShellEnd> {
     vec![
         ShellEnd::Exited { code: 0 },
@@ -1496,6 +1535,13 @@ fn a_storage_report_round_trips() {
 }
 
 #[test]
+fn every_usage_limits_result_round_trips() {
+    for result in all_usage_limits_results() {
+        round_trip(&result);
+    }
+}
+
+#[test]
 fn every_conversations_result_round_trips() {
     for result in all_conversations_results() {
         round_trip(&result);
@@ -1529,8 +1575,8 @@ fn conversation_caps() {
 }
 
 #[test]
-fn protocol_is_v26() {
-    assert_eq!(PROTOCOL_VERSION, 26);
+fn protocol_is_v27() {
+    assert_eq!(PROTOCOL_VERSION, 27);
     assert_eq!(limits::CONTEXT_NAME_MAX_CHARS, 40);
     assert_eq!(limits::CONVERSATION_ID_MAX_CHARS, 128);
     assert_eq!(limits::SHELL_COMMAND_MAX_BYTES, 8192);
@@ -1764,6 +1810,7 @@ fn api_paths() {
     assert_eq!(path::EVENTS, "/v1/events");
     assert_eq!(path::CONVERSATIONS, "/v1/conversations");
     assert_eq!(path::STORAGE, "/v1/storage");
+    assert_eq!(path::USAGE_LIMITS, "/v1/usage-limits");
     assert_eq!(path::WORKDIR_CHANGES, "/v1/workdir/changes");
     assert_eq!(path::WORKDIR_LIST, "/v1/workdir/list");
     assert_eq!(path::WORKDIR_FILE, "/v1/workdir/file");
@@ -1813,6 +1860,7 @@ fn wire_format_snapshot() {
         workdir_file: Vec<FileResult>,
         conversations: Vec<ConversationsResult>,
         storage: StorageReport,
+        usage_limits: Vec<UsageLimitsResult>,
     }
     let actual = serde_json::to_string_pretty(&Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -1845,6 +1893,7 @@ fn wire_format_snapshot() {
         workdir_file: all_file_results(),
         conversations: all_conversations_results(),
         storage: storage_report(),
+        usage_limits: all_usage_limits_results(),
     })
     .unwrap();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/wire.json");

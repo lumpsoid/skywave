@@ -420,6 +420,8 @@ pub enum ActionIntent {
     RetryNow,
     /// Ask the server for its storage report again (the storage screen).
     RefreshStorage,
+    /// Ask the agent for its usage limits again (the usage limits page).
+    RefreshUsageLimits,
     /// After the server lost history ([`LinkState::HistoryLost`](crate::signals::LinkState)),
     /// start the replica over from its log; ignored otherwise.
     ResetReplica,
@@ -464,6 +466,7 @@ pub enum RouteView {
     Pairing,
     Usage,
     Storage,
+    UsageLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, SignalPiece)]

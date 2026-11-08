@@ -8,7 +8,8 @@ use skywave_core::{
     CompletionStatus, ConversationPicker, ConversationsStatus, Effort, Entry, Link, ListKind,
     Outgoing, PairingStatus, PairingView, PendingSession, PermissionMode, QuestionPrompt,
     RuleSuggestion, Screen, SessionId, SessionListView, SessionRow, SessionState, SessionView,
-    SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageView, ViewState,
+    SettingsView, Snippet, StorageView, SubagentHeader, TimelineItem, UsageLimitsView, UsageView,
+    ViewState,
 };
 use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, IMPORTING_HISTORY, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER,
@@ -21,6 +22,7 @@ use skywave_present::format::{
     session_usage_fields, stop_heading, stop_warning, subagent_status, task_kind_word, trail,
     viewing_hint, work_summary,
 };
+use skywave_present::limits;
 use skywave_present::policy::{CompletionSettle, dismissable, question_unanswered, unanswered};
 use skywave_present::question::reply_text;
 use skywave_present::sections::{
@@ -33,10 +35,10 @@ use crate::link::count;
 use crate::signals::{
     AgentSettingsView, AgentState, ApprovalPanel, BlobPolicyView, CandidateView, CompletionPopup,
     ComposerModeView, ComposerView, ContextRow, ConversationRowView, ConversationsView,
-    CreatePrompt, CreatingView, EffortOption, EffortView, ListKindView, ModeOption, ModelOption,
-    PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel, QuestionView,
-    RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView, SessionRowView,
-    SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
+    CreatePrompt, CreatingView, EffortOption, EffortView, LimitRowView, ListKindView, ModeOption,
+    ModelOption, PairForm, PairingState, PermissionModeView, QuestionOptionView, QuestionPanel,
+    QuestionView, RenamePrompt, RepairNotice, RuleOption, ScheduleRow, ScreenUpdate, ScreenView,
+    SessionRowView, SessionScreen, SnippetView, StopHeadings, StorageGroupingView, StorageRowView,
     StorageTotalView, SubagentHeaderView, TaskRow, ToolKindView, UsageGroupingView, UsageRowView,
     UsageSpanView,
 };
@@ -95,6 +97,7 @@ pub fn update(view: &ViewState, ui: Ui) -> ScreenUpdate {
         Screen::Settings(settings) => settings_view(settings, ui.stay_connected),
         Screen::Usage(usage) => usage_view(usage, ui.usage, ui.wall_ms),
         Screen::Storage(view) => storage_view(view, ui.storage),
+        Screen::UsageLimits(view) => usage_limits_view(view, ui.wall_ms),
         Screen::Workdir(workdir) => workdir::screen(workdir, ui.workdir_text, ui.wall_ms),
         Screen::Crop(crop) => crop::screen(crop),
     };
@@ -930,6 +933,29 @@ fn storage_view(view: &StorageView, grouping: StorageGrouping) -> ScreenView {
         empty_label: (rows.is_empty() && view.report.is_some())
             .then(|| grouping.empty_label().to_owned()),
         rows,
+    }
+}
+
+fn usage_limits_view(view: &UsageLimitsView, wall_ms: i64) -> ScreenView {
+    let now = DateTime::from_timestamp_millis(wall_ms).unwrap_or_default();
+    let (read_label, rows, empty_label) = match limits::body(view.answer.as_ref(), now) {
+        limits::Body::Limits { read, rows } => (Some(read), rows, None),
+        limits::Body::Empty(text) => (None, Vec::new(), Some(text)),
+    };
+    ScreenView::UsageLimits {
+        status_label: limits::status_line(view),
+        read_label,
+        rows: rows
+            .into_iter()
+            .map(|row| LimitRowView {
+                label: clean_line(&row.label),
+                percent_label: row.percent,
+                fill_percent: row.fill.map(|fill| (fill * 100.0).round() as u32),
+                warning: row.warning,
+                resets_label: row.resets,
+            })
+            .collect(),
+        empty_label,
     }
 }
 

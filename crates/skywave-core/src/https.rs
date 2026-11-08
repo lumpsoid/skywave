@@ -42,7 +42,7 @@ use skywave_proto::encoding::{DECODED_LENGTH_HEADER, ZSTD};
 use skywave_proto::{
     BlobId, ChangesResult, Command, CommandResult, ConversationsResult, DirsResult, EventBatch,
     EventsQuery, FileResult, HelloResponse, ListResult, PROTOCOL_VERSION, RUN_HEADER, RunId,
-    StorageReport, WorkdirQuery, path,
+    StorageReport, UsageLimitsResult, WorkdirQuery, path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -769,6 +769,21 @@ impl HttpsTransport {
         ok_json(reply)
     }
 
+    /// `GET /v1/usage-limits`, which takes no query.
+    async fn usage_limits(&self) -> Result<UsageLimitsResult, TransportError> {
+        let reply = self
+            .http
+            .request(
+                Method::GET,
+                path::USAGE_LIMITS,
+                &self.run_header(),
+                Bytes::new(),
+                self.http.request_timeout(),
+            )
+            .await?;
+        ok_json(reply)
+    }
+
     /// `GET <endpoint>?session=<id>&path=<path>`, bounded by
     /// [`WORKDIR_TIMEOUT`] rather than the request timeout: the server may
     /// take its full 20 s.
@@ -936,6 +951,10 @@ impl Transport for HttpsTransport {
 
     fn storage_report(&self) -> BoxFuture<'_, Result<StorageReport, TransportError>> {
         Box::pin(HttpsTransport::storage_report(self))
+    }
+
+    fn usage_limits(&self) -> BoxFuture<'_, Result<UsageLimitsResult, TransportError>> {
+        Box::pin(HttpsTransport::usage_limits(self))
     }
 
     fn workdir_changes<'a>(

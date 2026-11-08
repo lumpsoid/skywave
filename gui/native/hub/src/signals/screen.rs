@@ -124,6 +124,18 @@ pub enum ScreenView {
         /// no report.
         empty_label: Option<String>,
     },
+    /// The usage limits of the account the server's agent runs as: the
+    /// stored ones, asked for on opening only when none are stored.
+    UsageLimits {
+        /// Asking, offline or failed; `None` otherwise.
+        status_label: Option<String>,
+        /// `Read 12 min ago`; `None` without limits to list.
+        read_label: Option<String>,
+        /// In the agent's order.
+        rows: Vec<LimitRowView>,
+        /// Why there is nothing to list; `None` when there are rows.
+        empty_label: Option<String>,
+    },
     /// A session's workdir, read on request and kept for offline reading.
     Workdir {
         workdir: WorkdirScreen,
@@ -178,6 +190,21 @@ pub struct StorageRowView {
     /// The blob a blob or shell run row stands for, and what may be done
     /// to it; `None` for a session row and a run kept as no blob.
     pub target: Option<BlobTargetView>,
+}
+
+/// One limit of the usage limits page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SignalPiece)]
+pub struct LimitRowView {
+    /// `Session`, `Weekly`, `Weekly · Fable`.
+    pub label: String,
+    /// `75%`; `None` when the agent did not say.
+    pub percent_label: Option<String>,
+    /// How full its bar is, 0 to 100; `None` without a percent.
+    pub fill_percent: Option<u32>,
+    /// The agent warns that this limit is close.
+    pub warning: bool,
+    /// `resets in 2 h 13 min`; `None` when the agent did not say.
+    pub resets_label: Option<String>,
 }
 
 /// One line of the usage screen: a day, session, directory or model, or
