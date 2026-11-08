@@ -226,6 +226,7 @@ fn row_view(row: &SessionRow, archived: bool) -> SessionRowView {
     SessionRowView {
         session_id: row.id.0.to_string(),
         workdir: row.workdir.as_deref().map(clean_line),
+        workdir_name: row.workdir.as_deref().map(|w| clean_line(dir_name(w))),
         state: agent_state(&row.state),
         badge_label: badge(&row.state).to_owned(),
         unread: u32::try_from(row.unread).unwrap_or(u32::MAX),

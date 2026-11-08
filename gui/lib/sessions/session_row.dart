@@ -32,6 +32,8 @@ class StateBadge extends StatelessWidget {
 
 /// One session on the list. A tap opens it; its menu renames, archives or
 /// unarchives, and deletes an archived one from this device after asking.
+/// On a phone the state is a dot, the title takes two lines, the workdir
+/// is its last component and the menu is a sheet.
 class SessionRow extends StatelessWidget {
   const SessionRow({required this.row, required this.send, super.key});
 
@@ -46,13 +48,26 @@ class SessionRow extends StatelessWidget {
       color: colors.onSurfaceVariant,
     );
     final renameFailed = row.rename?.state == OutgoingState.failed;
+    final compact = isCompact(context);
+    // A phone shows the project folder, which the path's end would hide.
+    final workdir = compact ? row.workdirName : row.workdir;
     // A screen reader reads the row as one sentence, title first; the
     // parts it is drawn from stay out of it. The menu keeps its own node.
     return Semantics(
       label: rowSemanticsLabel(row),
       child: ListTile(
         leading: ExcludeSemantics(
-          child: StateBadge(state: row.state, label: row.badgeLabel),
+          child: compact
+              ? Tooltip(
+                  message: row.badgeLabel,
+                  child: Icon(
+                    Icons.circle,
+                    key: Key('row-state-${row.sessionId}'),
+                    size: 12,
+                    color: SkyColors.of(context).agent(row.state),
+                  ),
+                )
+              : StateBadge(state: row.state, label: row.badgeLabel),
         ),
         title: ExcludeSemantics(
           child: Text.rich(
@@ -71,7 +86,7 @@ class SessionRow extends StatelessWidget {
                   ),
               ],
             ),
-            maxLines: 1,
+            maxLines: compact ? 2 : 1,
             overflow: TextOverflow.ellipsis,
           ),
         ),
@@ -79,7 +94,7 @@ class SessionRow extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (row.workdir case final workdir?)
+              if (workdir != null)
                 Text(
                   workdir,
                   maxLines: 1,
@@ -137,7 +152,7 @@ class SessionRow extends StatelessWidget {
             ],
           ),
         ),
-        isThreeLine: row.workdir != null,
+        isThreeLine: workdir != null,
         trailing: _RowMenu(row: row, send: send),
         onTap: () =>
             send.act(ActionIntentOpenSession(sessionId: row.sessionId)),
@@ -221,7 +236,22 @@ class _Marker extends StatelessWidget {
   }
 }
 
-enum _RowAction { rename, archive, delete }
+/// A row action: an item of the menu, or a row of the phone's sheet.
+class _RowAction {
+  const _RowAction({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.destructive = false,
+  });
+
+  final IconData icon;
+  final String title;
+  final VoidCallback onTap;
+
+  /// Drawn in the error colour in the sheet.
+  final bool destructive;
+}
 
 class _RowMenu extends StatelessWidget {
   const _RowMenu({required this.row, required this.send});
@@ -231,47 +261,113 @@ class _RowMenu extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<_RowAction>(
+    void archive() => send.act(
+      ActionIntentSetSessionArchived(
+        sessionId: row.sessionId,
+        archived: !row.archived,
+      ),
+    );
+    final actions = [
+      _RowAction(
+        icon: Icons.edit,
+        title: 'Rename',
+        onTap: () => send(GuiIntentRenameOpen(sessionId: row.sessionId)),
+      ),
+      if (row.archived)
+        _RowAction(icon: Icons.unarchive, title: 'Unarchive', onTap: archive)
+      else
+        _RowAction(icon: Icons.archive, title: 'Archive', onTap: archive),
+      if (row.deletable || row.deleteBlockedLabel != null)
+        _RowAction(
+          icon: Icons.delete_forever,
+          title: 'Delete from this device',
+          destructive: true,
+          onTap: () => _delete(context),
+        ),
+    ];
+    if (isCompact(context)) {
+      return IconButton(
+        key: Key('row-menu-${row.sessionId}'),
+        tooltip: 'Session actions',
+        onPressed: () => _showActions(context, actions),
+        icon: const Icon(Icons.more_vert),
+      );
+    }
+    return PopupMenuButton<VoidCallback>(
       key: Key('row-menu-${row.sessionId}'),
       tooltip: 'Session actions',
-      onSelected: (action) => switch (action) {
-        _RowAction.rename => send(
-          GuiIntentRenameOpen(sessionId: row.sessionId),
-        ),
-        _RowAction.archive => send.act(
-          ActionIntentSetSessionArchived(
-            sessionId: row.sessionId,
-            archived: !row.archived,
-          ),
-        ),
-        _RowAction.delete => _delete(context),
-      },
+      onSelected: (action) => action(),
       itemBuilder: (context) => [
-        const PopupMenuItem(
-          value: _RowAction.rename,
-          child: ListTile(leading: Icon(Icons.edit), title: Text('Rename')),
-        ),
-        PopupMenuItem(
-          value: _RowAction.archive,
-          child: row.archived
-              ? const ListTile(
-                  leading: Icon(Icons.unarchive),
-                  title: Text('Unarchive'),
-                )
-              : const ListTile(
-                  leading: Icon(Icons.archive),
-                  title: Text('Archive'),
-                ),
-        ),
-        if (row.deletable || row.deleteBlockedLabel != null)
-          const PopupMenuItem(
-            value: _RowAction.delete,
+        for (final action in actions)
+          PopupMenuItem(
+            value: action.onTap,
             child: ListTile(
-              leading: Icon(Icons.delete_forever),
-              title: Text('Delete from this device'),
+              leading: Icon(action.icon),
+              title: Text(action.title),
             ),
           ),
       ],
+    );
+  }
+
+  /// The phone's sheet: the session's name and workdir in full, then
+  /// [actions]. Each tap closes it first.
+  void _showActions(BuildContext context, List<_RowAction> actions) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheet) {
+        final theme = Theme.of(sheet);
+        final error = theme.colorScheme.error;
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SelectableText(
+                        row.title,
+                        style: theme.textTheme.titleMedium,
+                      ),
+                      if (row.workdir case final workdir?)
+                        SelectableText(
+                          workdir,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: SkyColors.of(sheet).muted,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 24),
+                for (final action in actions)
+                  ListTile(
+                    leading: Icon(
+                      action.icon,
+                      color: action.destructive ? error : null,
+                    ),
+                    title: Text(
+                      action.title,
+                      style: action.destructive
+                          ? TextStyle(color: error)
+                          : null,
+                    ),
+                    onTap: () {
+                      Navigator.of(sheet).pop();
+                      action.onTap();
+                    },
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
