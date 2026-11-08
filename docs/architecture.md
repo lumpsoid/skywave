@@ -907,6 +907,18 @@ logs) an event that no longer decodes rather than failing.
   pulled in one batch by a device not holding the original registers and
   purges the middle blob there.
 
+  Every purge (a batch's fates, a workdir refresh, a local session
+  delete) commits the rows first and removes the files after, so a crash
+  in between leaves files without a row. As the server does (Blob GC),
+  the device sweeps them on startup, before the downloader runs
+  (`BlobQueue::restore`, from the one read of every blob row, event and
+  workdir alike): a row owns `blobs/<id>` when `Available` and
+  `blobs/<id>.part` when `Downloading` or `Stopped`; every other `<id>`
+  or `<id>.part` goes, a `.part` beside a `NotDownloaded` or `Failed`
+  row included (no recorded progress points into it, so a try would
+  truncate it anyway). Any other name in `blobs/` is left alone and
+  logged.
+
   **Local crop.** A crop of a blob this device *holds* (its row
   `available`, or itself the `into` of a pending crop: a crop of a crop)
   keeps the old row instead, and the device makes `into` from those bytes

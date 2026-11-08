@@ -102,6 +102,14 @@
 //! retry, when its next report finds the blob unknown, and removes what it
 //! wrote meanwhile.
 //!
+//! **Startup sweep.** A purge commits the rows first and removes the files
+//! after, so a crash in between leaves files no row owns. On startup,
+//! before the downloader runs, [`BlobQueue::restore`] removes them
+//! ([`sweep_blob_files`]), from the rows it reads anyway: a row owns its
+//! complete file when `Available`, its `.part` when `Downloading` or
+//! `Stopped`. A `.part` beside a `NotDownloaded` or `Failed` row goes too:
+//! no recorded progress points into it, so a try would truncate it.
+//!
 //! **Purged, then registered again.** Workdir blob ids recur: the server
 //! names content by its hash, so a refresh can drop a blob and the next
 //! one name it again while a worker still writes the old download. A row
@@ -415,6 +423,8 @@ impl BlobQueue {
     /// `OnDemand`, and workdir ones always; under `Eager` an event blob's
     /// as the background's), then, with `Eager`, every event blob not
     /// downloaded yet. It reports a disk-full pause to `seam`'s views.
+    /// First it sweeps the blob files no row owns ([`sweep_blob_files`]):
+    /// it runs once per engine, before the downloader starts.
     pub(crate) fn restore(seam: &Seam) -> BlobQueue {
         let this = BlobQueue {
             view: Some(seam.clone()),
@@ -430,6 +440,9 @@ impl BlobQueue {
                 return this;
             }
         };
+        // Before any worker writes a blob file: the rows just read say
+        // which files are owned.
+        sweep_blob_files(&seam.data_dir(), &blobs);
         {
             let mut queue = lock(&this.queue);
             // The store does not say who started a download. Under
@@ -1112,6 +1125,117 @@ pub(crate) fn remove_all_blob_files(data_dir: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(%error, "cannot remove the blob files"),
     }
+}
+
+/// A file name in the blob directory, as the downloader and local crops
+/// write them: `<id>` or `<id>.part`, the id hyphenated as `Display` gives
+/// it. Anything else is not ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobFile {
+    Complete(BlobId),
+    Part(BlobId),
+}
+
+impl BlobFile {
+    fn parse(name: &str) -> Option<BlobFile> {
+        let (stem, part) = match name.strip_suffix(".part") {
+            Some(stem) => (stem, true),
+            None => (name, false),
+        };
+        let id = uuid::Uuid::try_parse(stem).ok()?;
+        // Only the exact spelling we write: `try_parse` also takes the
+        // simple, braced and URN forms, and upper case.
+        if id.to_string() != stem {
+            return None;
+        }
+        let id = BlobId(id);
+        Some(if part {
+            BlobFile::Part(id)
+        } else {
+            BlobFile::Complete(id)
+        })
+    }
+
+    /// Whether a row in `status` owns this file: an `Available` blob its
+    /// complete file, a `Downloading` or `Stopped` one its `.part`, which
+    /// holds the recorded progress. `NotDownloaded` and `Failed` own none:
+    /// a try for them starts from zero and truncates any `.part`, so one
+    /// left beside them (a disk-full pause before the first report, a crash
+    /// before a failure's delete) holds nothing anybody resumes from. A
+    /// complete file whose row is not `Available` (a crash between the
+    /// rename and the report) is fetched again over.
+    fn owned_by(self, status: &BlobStatus) -> bool {
+        matches!(
+            (self, status),
+            (BlobFile::Complete(_), BlobStatus::Available { .. })
+                | (
+                    BlobFile::Part(_),
+                    BlobStatus::Downloading { .. } | BlobStatus::Stopped { .. }
+                )
+        )
+    }
+}
+
+/// Removes every file in `data_dir`'s blob directory that no row in
+/// `blobs` (the whole replica's, event and workdir blobs alike) owns
+/// ([`BlobFile::owned_by`]): what a crash between a purge's commit and its
+/// file removal leaves, as the server's `BlobStore::sweep` does on its
+/// side. Returns how many went. Startup only, before the downloader runs:
+/// a download or a crop in flight writes exactly such files. A purge
+/// meanwhile only removes files, and a row registered meanwhile has none.
+/// A name that is not a blob file's, or a directory, is left alone and
+/// logged.
+pub(crate) fn sweep_blob_files(data_dir: &Path, blobs: &[BlobRecord]) -> usize {
+    let dir = blob_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            tracing::warn!(%error, "cannot list the blob files; none swept");
+            return 0;
+        }
+    };
+    let statuses: std::collections::HashMap<BlobId, &BlobStatus> =
+        blobs.iter().map(|b| (b.id, &b.status)).collect();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "cannot list the blob files; sweep cut short");
+                break;
+            }
+        };
+        let path = entry.path();
+        let file = entry.file_name().to_str().and_then(BlobFile::parse);
+        let Some(file) = file.filter(|_| entry.file_type().is_ok_and(|t| t.is_file())) else {
+            tracing::info!(path = %path.display(), "not a blob file; left alone");
+            continue;
+        };
+        let id = match file {
+            BlobFile::Complete(id) | BlobFile::Part(id) => id,
+        };
+        if statuses
+            .get(&id)
+            .is_some_and(|status| file.owned_by(status))
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::debug!(path = %path.display(), "removed a blob file no row owns");
+                removed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot remove a blob file")
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "swept blob files no row owns");
+    }
+    removed
 }
 
 /// Whether a blob whose local crop did not make it is fetched: when wanted
@@ -3304,6 +3428,179 @@ mod tests {
             waiting(&queue),
             [(diff_blob.id, true), (event_blob.id, false)]
         );
+    }
+
+    /// Startup removes the blob files no row owns, by the row's status,
+    /// workdir blobs included, and leaves names that are no blob file's.
+    #[test]
+    fn restore_sweeps_the_blob_files_no_row_owns() {
+        use crate::store::Store;
+        use crate::workdir::{WorkdirAnswer, WorkdirAsk};
+        use skywave_proto::{FileBody, FileResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = blob_dir(dir.path());
+        let session_id = SessionId::new();
+        let blob = |size| BlobRef {
+            id: ProtoBlobId::new(),
+            size,
+            sha256: ContentHash::of(b""),
+        };
+        let [available, downloading, stopped, failed, not_downloaded] = [1, 2, 3, 4, 5].map(blob);
+        let workdir = blob(6);
+        let orphan = blob(7);
+        let done = |b: &BlobRef| blobs.join(b.id.0.to_string());
+        let part = |b: &BlobRef| part_path(&blobs, b.id);
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            let event = |kind: EventKind| Event {
+                session_id,
+                at: Utc::now(),
+                command_id: None,
+                context: skywave_proto::ContextId::first_of(session_id),
+                kind,
+            };
+            let mut events = vec![event(EventKind::SessionCreated {
+                workdir: "/srv".into(),
+                context_name: "start".into(),
+                from: None,
+            })];
+            for b in [&available, &downloading, &stopped, &failed, &not_downloaded] {
+                events.push(event(EventKind::ToolResult(ToolResult {
+                    call: None,
+                    is_error: false,
+                    status: None,
+                    preview: "big".into(),
+                    lines: 1,
+                    output: Some(Full::Blob(b.clone())),
+                })));
+            }
+            store
+                .apply_batch(
+                    &EventBatch {
+                        from: Seq(1),
+                        events,
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            let file = FileResult::File {
+                at: Utc::now(),
+                path: "a.txt".into(),
+                size: 6,
+                content: FileBody::Blob(workdir.clone()),
+            };
+            let ask = WorkdirAsk::File {
+                session: session_id,
+                path: "a.txt".into(),
+            };
+            store
+                .put_workdir(&ask, &WorkdirAnswer::File(file))
+                .unwrap()
+                .unwrap();
+            for (b, status) in [
+                (
+                    &available,
+                    BlobStatus::Available {
+                        path: done(&available),
+                    },
+                ),
+                (
+                    &downloading,
+                    BlobStatus::Downloading {
+                        got: 1,
+                        path: part(&downloading),
+                    },
+                ),
+                (
+                    &stopped,
+                    BlobStatus::Stopped {
+                        got: 1,
+                        path: part(&stopped),
+                    },
+                ),
+                (
+                    &failed,
+                    BlobStatus::Failed {
+                        reason: "gone".into(),
+                    },
+                ),
+                (
+                    &workdir,
+                    BlobStatus::Available {
+                        path: done(&workdir),
+                    },
+                ),
+            ] {
+                store.set_blob_status(b.id, &status).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&blobs).unwrap();
+        let every = [
+            &available,
+            &downloading,
+            &stopped,
+            &failed,
+            &not_downloaded,
+            &workdir,
+            &orphan,
+        ];
+        for b in every {
+            std::fs::write(done(b), b"x").unwrap();
+            std::fs::write(part(b), b"x").unwrap();
+        }
+        let others = [
+            blobs.join("notes.txt"),
+            blobs.join(orphan.id.0.to_string().to_uppercase()),
+            blobs.join(orphan.id.0.simple().to_string()),
+            blobs.join(format!("{}.part.tmp", orphan.id.0)),
+        ];
+        for path in &others {
+            std::fs::write(path, b"x").unwrap();
+        }
+        // A directory under a blob's name is no blob file either.
+        let subdir = blobs.join(ProtoBlobId::new().0.to_string());
+        std::fs::create_dir(&subdir).unwrap();
+
+        let core = Core::open_detached(dir.path()).unwrap();
+        let _queue = BlobQueue::restore(&core.seam());
+
+        let kept = |path: &PathBuf| path.exists();
+        let expect = [
+            (done(&available), true),
+            (part(&available), false),
+            (done(&downloading), false),
+            (part(&downloading), true),
+            (done(&stopped), false),
+            (part(&stopped), true),
+            (done(&failed), false),
+            (part(&failed), false),
+            (done(&not_downloaded), false),
+            (part(&not_downloaded), false),
+            (done(&workdir), true),
+            (part(&workdir), false),
+            (done(&orphan), false),
+            (part(&orphan), false),
+        ];
+        for (path, want) in &expect {
+            assert_eq!(kept(path), *want, "{}", path.display());
+        }
+        for path in &others {
+            assert!(kept(path), "{} is no blob file", path.display());
+        }
+        assert!(subdir.is_dir());
+        // The statuses the sweep read are untouched.
+        assert!(matches!(
+            core.seam().blob(stopped.id).unwrap().unwrap().status,
+            BlobStatus::Stopped { got: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_missing_blob_directory_sweeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_blob_files(dir.path(), &[]), 0);
+        assert!(!blob_dir(dir.path()).exists());
     }
 
     impl Fixture {
