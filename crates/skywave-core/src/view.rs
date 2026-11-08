@@ -17,7 +17,7 @@ pub use skywave_proto::{
     ChangesResult, CommandId, ContextId, Decision, DeviceId, DiffBody, DirEntry, Effort, EntryKind,
     FileBody, FileChange, FileResult, ImportOutcome, LinkTarget, ListResult, ModelChoice,
     PermissionMode, Refusal, RejectReason, RuleScope, RuleSuggestion, RunWhen, Schedule,
-    ScheduleId, Seq, SessionId, ShellEnd, TaskId, TaskKind, ToolKind, TurnUsage,
+    ScheduleId, Seq, SessionId, ShellEnd, SubagentUsage, TaskId, TaskKind, ToolKind, TurnUsage,
 };
 pub use skywave_proto::{
     BlobStorage, BlobUse, LineSpan, SessionStorage, ShellRunStorage, StorageReport,
@@ -1562,6 +1562,9 @@ pub struct SubagentStatus {
     /// What it did last: its newest tool call's title, or its newest
     /// message's first line, whichever came later.
     pub last: Option<String>,
+    /// What its agent reported it ran once it finished (D46); `None` while
+    /// it runs, and for one stopped or never reported on.
+    pub usage: Option<SubagentUsage>,
 }
 
 /// The subagent a [`SessionView`] shows.

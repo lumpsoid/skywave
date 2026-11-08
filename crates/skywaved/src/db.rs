@@ -452,7 +452,8 @@ type ProtocolStep = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// `MIGRATED_SINCE + i` to the next (D43). Every bump adds one, a no-op
 /// saying so if nothing stored changed; the length makes a bump without one
 /// fail to compile. Append; never edit a released one.
-const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] = [v23_to_v24];
+const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usize] =
+    [v23_to_v24, v24_to_v25];
 
 /// v23 to v24. What v24 changed of what is stored, and how each is moved:
 /// - `Full::Inline` (a small tool output carried in its event): new, so no
@@ -467,6 +468,15 @@ const PROTOCOL_STEPS: [ProtocolStep; (PROTOCOL_VERSION - MIGRATED_SINCE) as usiz
 /// - Compressed event batches and blob bodies (D45): transport only. Blobs
 ///   are stored as they were, uncompressed; nothing stored changes.
 fn v23_to_v24(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// v24 to v25. What v25 changed of what is stored, and how each is moved:
+/// - `context_tokens` and `context_window` on `TurnUsage` events: new
+///   optional fields, which v24 JSON lacks and reads as `None`, so no event
+///   is rewritten; a v24 turn reports no fill.
+/// - `EventKind::SubagentUsage`: new, so no v24 event is one.
+fn v24_to_v25(_tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -939,7 +949,7 @@ mod tests {
         }
         restamp(&path, 23);
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.protocol_version().unwrap(), 24);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
         let kinds: Vec<EventKind> = db
             .conn()
             .prepare("SELECT kind FROM events ORDER BY seq")
@@ -1010,7 +1020,7 @@ mod tests {
             );
         }
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.protocol_version().unwrap(), 24);
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         let kinds: Vec<EventKind> = db
             .conn()
@@ -1058,6 +1068,64 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    /// The turn usage v24 wrote (its wire snapshot's) reads once v25's
+    /// step ran, with no context fill: a v24 turn reported none.
+    #[test]
+    fn v25_reads_the_turn_usage_v24_wrote() {
+        use skywave_proto::{EventKind, TurnUsage};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skywave.db");
+        drop(Db::open(&path).unwrap());
+        let v24 = [
+            r#"{"type":"turn_usage","duration_ms":12400,"tokens_in":3100,"tokens_out":812,"cost_usd":0.04,"model":"model-a"}"#,
+            r#"{"type":"turn_usage","duration_ms":2590,"tokens_in":null,"tokens_out":null,"cost_usd":null,"model":null}"#,
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (seq, kind) in (1i64..).zip(v24) {
+                conn.execute(
+                    "INSERT INTO events (seq, session_id, at, context, kind)
+                     VALUES (?1, 's', 't', 'c', ?2)",
+                    rusqlite::params![seq, kind],
+                )
+                .unwrap();
+            }
+        }
+        restamp(&path, 24);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.protocol_version().unwrap(), PROTOCOL_VERSION);
+        let usages: Vec<TurnUsage> = db
+            .conn()
+            .prepare("SELECT kind FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|kind| match serde_json::from_str(&kind.unwrap()).unwrap() {
+                EventKind::TurnUsage(usage) => usage,
+                other => panic!("not a turn's usage: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            usages,
+            [
+                TurnUsage {
+                    duration_ms: Some(12_400),
+                    tokens_in: Some(3_100),
+                    tokens_out: Some(812),
+                    cost_usd: Some(0.04),
+                    model: Some("model-a".into()),
+                    context_tokens: None,
+                    context_window: None,
+                },
+                TurnUsage {
+                    duration_ms: Some(2_590),
+                    ..TurnUsage::default()
+                },
+            ]
+        );
     }
 
     /// Steps for [`protocol_steps_run_from_the_stamp_on`]: each records

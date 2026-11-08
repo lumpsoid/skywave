@@ -2282,6 +2282,54 @@ fn unanswered(kinds: &[EventKind]) -> Vec<Vec<CallId>> {
 }
 
 #[test]
+fn a_subagents_figures_are_logged_by_its_call_inside_a_turn_or_outside_any() {
+    use skywaved::agent::SubagentFigures;
+
+    let mut f = Fixture::new();
+    let mut mapper = task_mapper(&f, AgentWork::default());
+    let reported = |call: &str, context_tokens| AdapterEvent::SubagentUsage {
+        call: call.into(),
+        usage: SubagentFigures {
+            duration_ms: Some(2_770),
+            tool_uses: Some(1),
+            context_tokens: Some(context_tokens),
+        },
+    };
+    apply_all(
+        &mut f,
+        &mut mapper,
+        vec![
+            AdapterEvent::TurnStarted { message: true },
+            named_call("fg", None),
+            reported("fg", 11_850),
+            answer("fg"),
+            named_call("bg", None),
+            answer("bg"),
+            subagents(&[("t1", Some("bg"))]),
+            AdapterEvent::TurnEnded(TurnOutcome::Completed),
+            // Outside any turn, after its launching turn ended.
+            reported("bg", 10_592),
+            AdapterEvent::BackgroundTasks(vec![]),
+            // A call never logged: nothing to show it under.
+            reported("unknown", 1),
+        ],
+    );
+    let kinds = f.kinds();
+    let calls = logged_calls(&kinds);
+    let logged: Vec<_> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::SubagentUsage(usage) => Some((usage.call, usage.context_tokens)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        logged,
+        [(calls["fg"].0, Some(11_850)), (calls["bg"].0, Some(10_592)),]
+    );
+}
+
+#[test]
 fn a_subagent_links_to_its_agent_call_across_turns_and_runs() {
     let mut f = Fixture::new();
     let mut mapper = task_mapper(&f, AgentWork::default());

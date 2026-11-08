@@ -72,8 +72,33 @@ pub struct SessionUsage {
     /// The newest turn that reported usage, as reported.
     pub last_turn: TurnUsage,
     /// Each figure summed over the turns that reported it; `None` while no
-    /// turn has. `model` is the newest one named.
+    /// turn has. `model` is the newest one named. The context figures are
+    /// never summed and stay `None` here.
     pub total: TurnUsage,
+    /// How full the current context is, as of the newest turn's end
+    /// (D46). `None` (unknown) after a turn that reported no fill, and
+    /// once a context starts or is switched to, until a turn reports one.
+    #[serde(default)]
+    pub context: Option<ContextFill>,
+}
+
+/// How full a context is: what its next request will read, of what its
+/// model holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFill {
+    pub tokens: u64,
+    /// `None` when the agent did not say.
+    pub window: Option<u64>,
+}
+
+impl ContextFill {
+    /// The fill `turn` reported, if any.
+    fn of(turn: &TurnUsage) -> Option<ContextFill> {
+        Some(ContextFill {
+            tokens: turn.context_tokens?,
+            window: turn.context_window,
+        })
+    }
 }
 
 impl SessionUsage {
@@ -81,7 +106,12 @@ impl SessionUsage {
     pub fn new(turn: &TurnUsage) -> Self {
         SessionUsage {
             last_turn: turn.clone(),
-            total: turn.clone(),
+            total: TurnUsage {
+                context_tokens: None,
+                context_window: None,
+                ..turn.clone()
+            },
+            context: ContextFill::of(turn),
         }
     }
 
@@ -97,6 +127,7 @@ impl SessionUsage {
             }
         }
         self.last_turn = turn.clone();
+        self.context = ContextFill::of(turn);
         let total = &mut self.total;
         total.duration_ms = sum(total.duration_ms, turn.duration_ms);
         total.tokens_in = sum(total.tokens_in, turn.tokens_in);
@@ -200,6 +231,12 @@ impl SessionSummary {
                 return;
             }
             EventKind::ContextStarted { .. } | EventKind::ContextSwitched { .. } => {
+                // Another context's fill is not known until its next turn.
+                if self.context != event.context
+                    && let Some(usage) = &mut self.usage
+                {
+                    usage.context = None;
+                }
                 self.context = event.context;
                 return;
             }
@@ -270,6 +307,7 @@ impl SessionSummary {
                 None => self.usage = Some(SessionUsage::new(turn)),
             },
             EventKind::AgentMessage { .. }
+            | EventKind::SubagentUsage(_)
             | EventKind::ToolCall { .. }
             | EventKind::ToolResult { .. }
             | EventKind::TurnInterrupted
@@ -369,6 +407,7 @@ pub fn is_notable(kind: &EventKind) -> bool {
         | EventKind::SessionRenamed { .. }
         | EventKind::SessionArchived { .. }
         | EventKind::TurnUsage(_)
+        | EventKind::SubagentUsage(_)
         | EventKind::PermissionModeRequested { .. }
         | EventKind::PermissionModeChanged { .. }
         | EventKind::PermissionModeRefused { .. }
@@ -526,6 +565,69 @@ mod tests {
             &in_context(first, EventKind::ContextSwitched { by }),
         );
         assert_eq!(summary.context, first);
+    }
+
+    #[test]
+    fn the_context_fill_is_the_newest_turns_and_unknown_after_a_context_change() {
+        let sid = SessionId::new();
+        let first = ContextId::first_of(sid);
+        let created = EventKind::SessionCreated {
+            workdir: "/srv/x".into(),
+            context_name: "start".into(),
+            from: None,
+        };
+        let mut summary = SessionSummary::new(Seq(1), &event(sid, 0, created));
+        let turn = |tokens: Option<u64>| {
+            EventKind::TurnUsage(TurnUsage {
+                duration_ms: Some(1_000),
+                context_tokens: tokens,
+                context_window: tokens.map(|_| 1_000_000),
+                ..TurnUsage::default()
+            })
+        };
+        let fill = |summary: &SessionSummary| summary.usage.as_ref().unwrap().context;
+        let at = |context, kind| Event {
+            context,
+            ..event(sid, 1, kind)
+        };
+        summary.apply(Seq(2), &event(sid, 1, turn(Some(19_300))));
+        let known = Some(ContextFill {
+            tokens: 19_300,
+            window: Some(1_000_000),
+        });
+        assert_eq!(fill(&summary), known);
+        // Never summed.
+        let usage = summary.usage.clone().unwrap();
+        assert_eq!(
+            (usage.total.context_tokens, usage.total.context_window),
+            (None, None)
+        );
+        summary.apply(Seq(3), &event(sid, 2, turn(Some(20_000))));
+        let usage = summary.usage.clone().unwrap();
+        assert_eq!(usage.context.unwrap().tokens, 20_000);
+        assert_eq!(usage.total.context_tokens, None);
+        // A turn that reports no fill (`/compact`'s): unknown.
+        summary.apply(Seq(4), &event(sid, 3, turn(None)));
+        assert_eq!(fill(&summary), None);
+        summary.apply(Seq(5), &event(sid, 4, turn(Some(19_300))));
+        assert_eq!(fill(&summary), known);
+
+        // A switch back to the current context changes nothing.
+        let by = DeviceId::new();
+        summary.apply(Seq(6), &at(first, EventKind::ContextSwitched { by }));
+        assert_eq!(fill(&summary), known);
+        // A new context, and a switch to another: unknown until a turn.
+        let fresh = ContextId::new();
+        let started = EventKind::ContextStarted {
+            by,
+            name: "fresh".into(),
+        };
+        summary.apply(Seq(7), &at(fresh, started));
+        assert_eq!(fill(&summary), None);
+        summary.apply(Seq(8), &at(fresh, turn(Some(9_000))));
+        assert_eq!(fill(&summary).unwrap().tokens, 9_000);
+        summary.apply(Seq(9), &at(first, EventKind::ContextSwitched { by }));
+        assert_eq!(fill(&summary), None);
     }
 
     #[test]
@@ -829,6 +931,7 @@ mod tests {
             tokens_out: Some(812),
             cost_usd: Some(0.25),
             model: Some("model-a".into()),
+            ..TurnUsage::default()
         };
         let kind = EventKind::TurnUsage(first.clone());
         assert!(!is_notable(&kind));
@@ -863,6 +966,7 @@ mod tests {
                 tokens_out: Some(1_000),
                 cost_usd: Some(0.75),
                 model: Some("model-b".into()),
+                ..TurnUsage::default()
             }
         );
     }

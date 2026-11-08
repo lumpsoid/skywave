@@ -315,6 +315,15 @@ model, categories, …}`.
     middle of a turn's tool loop was not seen.
   - `post_tokens` (about 3k in both) leaves out the system prompt and
     tools: the next fill was about 19k. It is not the fill.
+- **What the adapter reads** (`usage.rs`, `protocol.rs`): the fill as the
+  sum above of the last `iterations` entry (`None` for an empty array) as
+  `TurnUsage.context_tokens`; the `contextWindow` under the turn's
+  `system/init` model as `context_window`; and a `completed`
+  `task_notification`'s `usage` as `SubagentUsage` (`total_tokens` as
+  `context_tokens`, `tool_uses`, `duration_ms`) for the call its
+  `task_started` named. Not read: `get_context_usage` (the effective limit
+  below), `compact_boundary`, `task_progress`, and the Agent result's own
+  figures and `resolvedModel`.
 - **A subagent's own figures**, when it ends:
   - Every completed `local_agent` task's `system/task_notification` carries
     `usage: {total_tokens, tool_uses, duration_ms}`, foreground or
@@ -329,6 +338,11 @@ model, categories, …}`.
     `totalToolUseCount`, `toolStats` and `resolvedModel`. A background
     call's result (`status: "async_launched"`) has only `resolvedModel`.
   - `system/task_progress` carries the same `usage` shape while it runs.
+  - A foreground subagent's notification comes inside its turn, before the
+    Agent `tool_result`. A background one's comes after the turn that
+    launched it ended: in `subagent_context` the first of the two came
+    outside any turn, then the CLI started a turn on its own, and the
+    second came inside that turn.
 
 ## 3. Permission prompts
 
@@ -757,7 +771,8 @@ and `ambient?`. Notes:
   cannot (the next one replaces it). `task_started` is used for `local_agent`
   only, to map the task id to its `Agent` call (`tool_use_id`); the set is
   then reported again with `call` filled. The level set stays the only source
-  of which tasks are live.
+  of which tasks are live. A `completed` `task_notification` of a task
+  `task_started` named gives that subagent's figures (§2.6), nothing else.
 - A foreground Bash gets edge events but never enters the level.
 
 **Subagent messages.** A subagent's `assistant` and `user` messages carry
@@ -1304,7 +1319,15 @@ notes above:
   listed (a foreground subagent) is the turn's.
 - **The turn's usage** (§2.5) is reported as `TurnUsage` just before
   `TurnEnded`, per-turn figures only; nothing is carried between turns or
-  processes, so a restart needs no reset. Core sums them per session.
+  processes, so a restart needs no reset. Core sums them per session. The
+  turn's context fill and window (§2.6) ride on it as `context_tokens` and
+  `context_window`, never summed: core keeps the newest as the session's
+  fill (D46).
+- **A finished subagent's figures** (§2.6) are reported as `SubagentUsage`
+  for its `Agent` call, inside a turn or outside any, from a `completed`
+  `task_notification` of a task `task_started` mapped to the call. A
+  restart forgets that mapping, so a background subagent that finishes in
+  the next process reports none.
 - **Turn outcome:** `success` and not `is_error` → completed; otherwise
   interrupted if an interrupt was sent this turn or `terminal_reason` starts
   with `aborted`; otherwise failed with `errors` (or `result`) as message.

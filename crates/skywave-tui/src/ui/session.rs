@@ -18,9 +18,9 @@ use skywave_present::format::{
     AMBIENT_WORD, BackgroundRow, LOOPS_NOTE, NOTHING_RUNNING, SAVED_IN_FOLDER, StopAction,
     TRAIL_SEPARATOR, agent_effort_label, agent_mode_label, agent_model_label, agent_refusal,
     answer_words, approval_origin, background_rows, blob_size, bytes, context_moved_label,
-    context_row, delivery_label, dollars, effort_label, mode_detail, mode_label, offered_modes,
-    outgoing_label, repeat_word, shell_prompt, stop_heading, stop_warning, subagent_status,
-    task_kind_word, tokens, trail, turn_time, viewing_hint, work_summary,
+    context_row, delivery_label, effort_label, mode_detail, mode_label, offered_modes,
+    outgoing_label, repeat_word, session_usage_fields, shell_prompt, stop_heading, stop_warning,
+    subagent_status, task_kind_word, trail, viewing_hint, work_summary,
 };
 use skywave_present::sections::{
     ItemKey, Section, approval_lost, asked_note, gated_item, sections, tool_sections,
@@ -229,36 +229,12 @@ fn status_line(session: &SessionView, ui: &SessionUi, width: usize) -> Line<'sta
     Line::from(spans)
 }
 
-/// `last turn 12.4s · 3.1k in / 812 out · $0.04 · session $1.27 · <model>`,
-/// with the figures the agent did not report left out (and the model unless
-/// `model`), and fields dropped from the left until it fits in `room`
-/// columns; `None` if nothing does.
+/// The footer's usage fields (`session_usage_fields`), `last turn 12.4s ·
+/// 3.1k in / 812 out · $0.04 · ctx 19k/1M · 2% · session $1.27 · <model>`
+/// (the model unless `model`), with fields dropped from the left until it
+/// fits in `room` columns; `None` if nothing does.
 fn usage_summary(usage: &SessionUsage, model: bool, room: usize) -> Option<String> {
-    let turn = &usage.last_turn;
-    let mut fields = Vec::new();
-    if let Some(ms) = turn.duration_ms {
-        fields.push(turn_time(ms));
-    }
-    match (turn.tokens_in, turn.tokens_out) {
-        (Some(read), Some(written)) => {
-            fields.push(format!("{} in / {} out", tokens(read), tokens(written)));
-        }
-        (Some(read), None) => fields.push(format!("{} in", tokens(read))),
-        (None, Some(written)) => fields.push(format!("{} out", tokens(written))),
-        (None, None) => {}
-    }
-    if let Some(cost) = turn.cost_usd {
-        fields.push(dollars(cost));
-    }
-    if let Some(first) = fields.first_mut() {
-        *first = format!("last turn {first}");
-    }
-    if let Some(cost) = usage.total.cost_usd {
-        fields.push(format!("session {}", dollars(cost)));
-    }
-    if let Some(model) = usage.total.model.as_ref().filter(|_| model) {
-        fields.push(clean(model));
-    }
+    let fields = session_usage_fields(usage, model);
     (0..fields.len())
         .map(|first| fields[first..].join(" · "))
         .find(|summary| summary.chars().count() <= room)

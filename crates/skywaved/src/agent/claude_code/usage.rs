@@ -13,8 +13,15 @@
 //!   no delta taken within one process is safe for its first turn;
 //! - model: the one `system/init` named for the turn.
 //!
+//! How full the context is (§2.6) is not a sum: it is the turn's last
+//! request, the one entry of `usage.iterations`, counted whole (input, both
+//! caches and output). Its window is the `contextWindow` of the turn's model
+//! in `model_usage_since_last_result`, looked up by name: a subagent's model
+//! can be listed there too.
+//!
 //! A turn the CLI did not measure (an interrupt while text streamed) reports
 //! zero tokens and no models; those figures are left out, not logged as 0.
+//! It and `/compact`'s turn have no `iterations`, so no fill.
 
 use serde_json::Value;
 
@@ -24,13 +31,35 @@ use crate::agent::TurnUsage;
 /// turn's `system/init` named.
 pub fn turn_usage(result: &Value, model: Option<&str>) -> TurnUsage {
     let (tokens_in, tokens_out) = tokens(result.get("usage"));
+    let model = model.filter(|m| !m.is_empty());
+    let models = result.get("model_usage_since_last_result");
     TurnUsage {
         duration_ms: result.get("duration_ms").and_then(Value::as_u64),
         tokens_in,
         tokens_out,
-        cost_usd: cost(result.get("model_usage_since_last_result")),
-        model: model.filter(|m| !m.is_empty()).map(str::to_owned),
+        cost_usd: cost(models),
+        model: model.map(str::to_owned),
+        context_tokens: fill(result.get("usage")),
+        context_window: model
+            .and_then(|m| models?.get(m)?.get("contextWindow")?.as_u64())
+            .filter(|&w| w > 0),
     }
+}
+
+/// The context as the next request will read it: the sum of the turn's last
+/// request; `None` with no request listed.
+fn fill(usage: Option<&Value>) -> Option<u64> {
+    let last = usage?.get("iterations")?.as_array()?.last()?;
+    let count = |key| last.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let fill = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ]
+    .into_iter()
+    .fold(0u64, |sum, key| sum.saturating_add(count(key)));
+    (fill > 0).then_some(fill)
 }
 
 /// Tokens read (cache included) and written; neither when the turn counted
@@ -93,6 +122,51 @@ mod tests {
         assert_eq!(usage.tokens_out, Some(17));
         assert!((usage.cost_usd.unwrap() - 0.001).abs() < 1e-12);
         assert_eq!(usage.model.as_deref(), Some("model-a"));
+        // No iterations, no contextWindow: no fill, no window.
+        assert_eq!((usage.context_tokens, usage.context_window), (None, None));
+    }
+
+    #[test]
+    fn the_fill_is_the_last_request_and_the_window_the_turn_model_s() {
+        let result = json!({
+            "usage": {
+                "input_tokens": 6,
+                "cache_read_input_tokens": 50000,
+                "cache_creation_input_tokens": 6000,
+                "output_tokens": 49,
+                "iterations": [{
+                    "input_tokens": 2,
+                    "cache_read_input_tokens": 18000,
+                    "cache_creation_input_tokens": 700,
+                    "output_tokens": 21
+                }]
+            },
+            "model_usage_since_last_result": {
+                "sub-model": { "costUSD": 0.01, "contextWindow": 200000 },
+                "main-model": { "costUSD": 0.05, "contextWindow": 1000000 }
+            }
+        });
+        let usage = turn_usage(&result, Some("main-model"));
+        assert_eq!(usage.context_tokens, Some(18_723));
+        assert_eq!(usage.context_window, Some(1_000_000));
+        // A model the turn does not list: no window, the fill all the same.
+        let usage = turn_usage(&result, Some("other"));
+        assert_eq!(
+            (usage.context_tokens, usage.context_window),
+            (Some(18_723), None)
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_request_listed_has_no_fill() {
+        let result = json!({
+            "duration_ms": 30000,
+            "usage": { "input_tokens": 0, "output_tokens": 0, "iterations": [] },
+            "model_usage_since_last_result": {}
+        });
+        let usage = turn_usage(&result, Some("main-model"));
+        assert_eq!(usage.context_tokens, None);
+        assert_eq!(usage.duration_ms, Some(30000));
     }
 
     #[test]

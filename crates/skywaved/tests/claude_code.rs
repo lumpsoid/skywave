@@ -26,7 +26,8 @@ use skywaved::agent::{
     AdapterEvent, AdapterEvents, AgentAdapter, AgentError, AgentRequestId, AgentSchedule,
     AgentSession, AgentTask, BodyFormat, CONVERSATION_GONE, Conversation, DisplayBody, Effort,
     Grants, INTERRUPT_UNANSWERED, ModelChoice, PermissionMode, ResultDisplay, ResumeHandle,
-    RuleScope, RuleSuggestion, StartSpec, ToolDisplay, ToolKind, TurnOutcome, TurnUsage,
+    RuleScope, RuleSuggestion, StartSpec, SubagentFigures, ToolDisplay, ToolKind, TurnOutcome,
+    TurnUsage,
 };
 use skywaved::config::AgentConfig;
 use uuid::Uuid;
@@ -327,7 +328,9 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             !observes_settings(event)
                 && !matches!(
                     event,
-                    AdapterEvent::BackgroundTasks(_) | AdapterEvent::Schedules(_)
+                    AdapterEvent::BackgroundTasks(_)
+                        | AdapterEvent::Schedules(_)
+                        | AdapterEvent::SubagentUsage { .. }
                 )
         })
         .map(|event| match event {
@@ -380,6 +383,7 @@ fn describe(events: &[AdapterEvent]) -> Vec<String> {
             // Filtered out above: [`timeline`] lists the task sets.
             AdapterEvent::BackgroundTasks(tasks) => format!("tasks: {}", tasks.len()),
             AdapterEvent::Schedules(schedules) => format!("schedules: {}", schedules.len()),
+            AdapterEvent::SubagentUsage { call, .. } => format!("subagent usage: {}", call.0),
             AdapterEvent::TaskStopAnswered { task } => format!("stop answered: {task}"),
             AdapterEvent::TaskStopRefused { task, reason } => {
                 format!("stop refused {task}: {}", cut(reason))
@@ -624,14 +628,16 @@ fn recorded_totals(name: &str) -> Vec<f64> {
 
 const HAIKU: &str = "claude-haiku-5-5";
 
-/// A measured turn, cost apart.
-fn haiku_turn(duration_ms: u64, tokens_in: u64, tokens_out: u64) -> TurnUsage {
+/// A measured turn, cost apart, on a context of `fill` tokens.
+fn haiku_turn(duration_ms: u64, tokens_in: u64, tokens_out: u64, fill: u64) -> TurnUsage {
     TurnUsage {
         duration_ms: Some(duration_ms),
         tokens_in: Some(tokens_in),
         tokens_out: Some(tokens_out),
         cost_usd: None,
         model: Some(HAIKU.to_owned()),
+        context_tokens: Some(fill),
+        context_window: Some(1_000_000),
     }
 }
 
@@ -651,14 +657,14 @@ fn replay_usage_is_per_turn_across_turns_and_a_resume() {
     assert_eq!(
         basic,
         [
-            haiku_turn(1479, 2 + 12_799 + 6_541, 5),
-            haiku_turn(1489, 2 + 15_881 + 3_521, 4),
+            haiku_turn(1479, 2 + 12_799 + 6_541, 5, 19_347),
+            haiku_turn(1489, 2 + 15_881 + 3_521, 4, 19_408),
         ]
     );
     assert_costs(&costs, &[first, second]);
 
     let (resume, costs) = usages(&replay_process("basic", 1));
-    assert_eq!(resume, [haiku_turn(1294, 2 + 19_377 + 85, 22)]);
+    assert_eq!(resume, [haiku_turn(1294, 2 + 19_377 + 85, 22, 19_486)]);
     assert_costs(&costs, &[third]);
 }
 
@@ -771,6 +777,134 @@ fn replay_an_unmeasured_interrupted_turn_reports_only_its_time() {
     );
     assert_eq!(costs[0], None);
     assert_costs(&costs[1..], &[0.00114902, 0.00136454 - 0.00114902]);
+}
+
+const OPUS: &str = "claude-opus-5-5";
+
+/// The context fill and window of each turn's usage, in order.
+fn fills(events: &[AdapterEvent]) -> Vec<(Option<u64>, Option<u64>)> {
+    usages(events)
+        .0
+        .into_iter()
+        .map(|u| (u.context_tokens, u.context_window))
+        .collect()
+}
+
+#[test]
+fn replay_the_fill_is_the_last_request_and_none_after_compact() {
+    let events = replay_subagent("context_fill");
+    let (usages, _) = usages(&events);
+    assert!(usages.iter().all(|u| u.model.as_deref() == Some(OPUS)));
+    assert_eq!(
+        fills(&events),
+        [
+            // PONG: its one request.
+            (Some(18_495), Some(1_000_000)),
+            // Three requests: `tokens_in` sums them, the fill is the last.
+            (Some(18_723), Some(1_000_000)),
+            // `/compact`: no request listed, so no fill.
+            (None, Some(1_000_000)),
+            // The recall after it, from the summary.
+            (Some(19_475), Some(1_000_000)),
+        ]
+    );
+    assert!(
+        usages[1].tokens_in.unwrap() > 3 * 18_000,
+        "a sum: {usages:?}"
+    );
+}
+
+#[test]
+fn replay_an_auto_compacting_turn_reports_the_fill_after_compaction() {
+    let events = replay_subagent("context_autocompact");
+    assert_eq!(
+        fills(&events),
+        [
+            (Some(25_093), Some(1_000_000)),
+            (Some(32_733), Some(1_000_000)),
+            // Compacted before its first request: the fill dropped.
+            (Some(26_836), Some(1_000_000)),
+            (Some(26_947), Some(1_000_000)),
+        ]
+    );
+}
+
+/// The subagent figures reported, by the call's id, in order.
+fn subagent_figures(events: &[AdapterEvent]) -> Vec<(String, SubagentFigures)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::SubagentUsage { call, usage } => Some((call.0.clone(), usage.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn figures(duration_ms: u64, tool_uses: u64, context_tokens: u64) -> SubagentFigures {
+    SubagentFigures {
+        duration_ms: Some(duration_ms),
+        tool_uses: Some(tool_uses),
+        context_tokens: Some(context_tokens),
+    }
+}
+
+#[test]
+fn replay_each_finished_subagent_reports_its_own_figures() {
+    let events = replay_subagent("subagent_context");
+    assert_eq!(
+        subagent_figures(&events),
+        [
+            (
+                "toolu_01Jb9gDoiqWXkAa4Mec9NHQT".to_owned(),
+                figures(4_284, 1, 11_850)
+            ),
+            (
+                "toolu_01BTY5m6DaBJ594mRBjFVRsY".to_owned(),
+                figures(2_770, 1, 10_592)
+            ),
+            (
+                "toolu_013XKpYmvXcoDkYcVPDwo5Co".to_owned(),
+                figures(2_631, 1, 10_567)
+            ),
+        ]
+    );
+    // The foreground one's come inside its turn, before its Agent result.
+    // The background ones' come after the turn that launched them ended:
+    // the first outside any turn, the second inside the turn the CLI then
+    // started on its own.
+    const FOREGROUND: &str = "toolu_01Jb9gDoiqWXkAa4Mec9NHQT";
+    let figures_of = |id: &str| {
+        events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::SubagentUsage { call, .. } if call.0 == id))
+            .unwrap()
+    };
+    let result = events
+        .iter()
+        .position(
+            |e| matches!(e, AdapterEvent::ToolResult { call: Some(c), .. } if c.0 == FOREGROUND),
+        )
+        .unwrap();
+    let ends: Vec<usize> = (0..events.len())
+        .filter(|&i| matches!(events[i], AdapterEvent::TurnEnded(_)))
+        .collect();
+    let own_turn = (0..events.len())
+        .filter(|&i| matches!(events[i], AdapterEvent::TurnStarted { message: false }))
+        .collect::<Vec<_>>()[0];
+    assert!(figures_of(FOREGROUND) < result && result < ends[0]);
+    let (left, right) = (
+        figures_of("toolu_01BTY5m6DaBJ594mRBjFVRsY"),
+        figures_of("toolu_013XKpYmvXcoDkYcVPDwo5Co"),
+    );
+    assert!(ends[1] < left && left < own_turn && own_turn < right && right < ends[2]);
+    // The main fill is the main thread's alone, whatever the subagents read.
+    assert_eq!(fills(&events)[0], (Some(18_976), Some(1_000_000)));
+}
+
+#[test]
+fn replay_a_stopped_subagent_reports_no_figures() {
+    let events = replay_subagent("subagent_foreground_stop");
+    assert_eq!(subagent_figures(&events), []);
 }
 
 #[test]
@@ -4208,9 +4342,9 @@ fn steps(events: &[AdapterEvent]) -> Vec<String> {
 }
 
 /// Fixture `name` without the stdin lines the recording driver wrote on
-/// its own (a `send_task_message` or `background_tasks` control request, a
-/// user message to a subagent) and the CLI's answers to them: the adapter
-/// writes none of those.
+/// its own (a `send_task_message`, `background_tasks` or
+/// `get_context_usage` control request, a user message to a subagent) and
+/// the CLI's answers to them: the adapter writes none of those.
 fn without_probe_writes(name: &str) -> Vec<Value> {
     let records = fixture(name);
     let probe: Vec<Value> = records
@@ -4219,7 +4353,7 @@ fn without_probe_writes(name: &str) -> Vec<Value> {
         .filter(|r| {
             matches!(
                 r["msg"]["request"]["subtype"].as_str(),
-                Some("send_task_message" | "background_tasks")
+                Some("send_task_message" | "background_tasks" | "get_context_usage")
             ) || (r["msg"]["type"] == "user" && !r["msg"]["parent_tool_use_id"].is_null())
         })
         .map(|r| r["msg"]["request_id"].clone())
@@ -4231,7 +4365,7 @@ fn without_probe_writes(name: &str) -> Vec<Value> {
             let probe_request = r["dir"] == "in"
                 && (matches!(
                     request.as_str(),
-                    Some("send_task_message" | "background_tasks")
+                    Some("send_task_message" | "background_tasks" | "get_context_usage")
                 ) || (r["msg"]["type"] == "user" && !r["msg"]["parent_tool_use_id"].is_null()));
             let probe_answer = r["dir"] == "out"
                 && r["msg"]["type"] == "control_response"

@@ -1228,7 +1228,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                 Line::from(""),
                 Line::from("  Status line, left: the agent's state, mode, model, a refusal"),
                 Line::from(
-                    "  Status line, right: last turn's time, tokens, cost; session cost; model",
+                    "  Status line, right: last turn's time, tokens, cost; context fill; session cost; model",
                 ),
             ]);
         }

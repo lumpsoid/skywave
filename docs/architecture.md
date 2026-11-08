@@ -1024,6 +1024,17 @@ logs) an event that no longer decodes rather than failing.
   by local day, session, workdir or model. A turn with no cost is unpriced,
   never $0. Archived sessions count; a session deleted from this device took
   its turns with it, and the screen says so.
+- **Context fill and subagent figures** (D46): two separate numbers, never
+  added. The session's `SessionUsage::context` is the newest `TurnUsage`'s
+  `context_tokens` of `context_window`, set at each turn's end; it is
+  unknown after a turn that reported none and once a `ContextStarted` or
+  `ContextSwitched` (to another context) is folded. Heads put it in the
+  session footer as `skywave_present::format::context_label` (`ctx
+  19k/1M · 2%`, `ctx ?`), among `session_usage_fields`. A
+  `SubagentUsage` event folds into its call's `SubagentStatus::usage`, which
+  `subagent_status` shows once the subagent finished (`finished · 1 step ·
+  4.3s · ctx 12k`): its own context at its end, not what it spent. A
+  stopped subagent has none.
 
 - **Storage screen** (`Route::Storage`): opening it asks
   `GET /v1/storage` on the side transport within `STORAGE_TIMEOUT` (12 s,
