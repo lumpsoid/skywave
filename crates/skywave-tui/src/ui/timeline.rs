@@ -892,8 +892,30 @@ impl Layout<'_> {
             }
             out.extend(rows);
         }
-        if let Some(note) = note {
-            out.extend(wrap(bar(), bar(), vec![note], self.width));
+        // Expanded, what the server did to the blob and a crop or delete
+        // still pending stay said, as they are collapsed, after the note.
+        let facts: Vec<String> = section
+            .blob()
+            .filter(|_| expanded)
+            .map(|blob| {
+                change_note(blob)
+                    .into_iter()
+                    .chain(blob.pending.as_ref().map(pending_note))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let note: Vec<Span<'static>> = match (note, facts.is_empty()) {
+            (note, true) => note.into_iter().collect(),
+            (Some(note), false) => {
+                vec![
+                    note,
+                    Span::raw(format!(" · {}", facts.join(" · "))).dark_gray(),
+                ]
+            }
+            (None, false) => vec![Span::raw(format!("… {}", facts.join(" · "))).dark_gray()],
+        };
+        if !note.is_empty() {
+            out.extend(wrap(bar(), bar(), note, self.width));
         }
         (out, row)
     }
