@@ -959,7 +959,12 @@ logs) an event that no longer decodes rather than failing.
   the blob is pending, refused included: `BlobView.pending` and
   `StorageView.pending` carry it as a `BlobPending` (command id, kind,
   delivery, `discardable`), so a head can take it back with `Discard`,
-  after which the offers return.
+  after which the offers return. A storage row also offers nothing once
+  the replica's log holds a fate for its blob (`StorageView.gone`: a
+  delete or crop by any device), since the report may predate it: another
+  device's delete pulled while the screen is open, or this device's own
+  settled in the log before the refresh it asked for answers. The fate
+  decides the row; nothing asks the server again for it.
 - **Crop screen** (`Action::OpenCrop { blob, session, holds, title }`,
   `Screen::Crop(CropView)`): chooses which lines of a tool's or shell
   run's output to keep. The head opening it names the blob as `CropBlob`

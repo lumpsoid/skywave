@@ -2130,11 +2130,20 @@ impl Model {
             .flat_map(|report| report.sessions.iter().map(|s| s.session))
             .filter_map(|id| Some((id, self.title(self.summary(id)?).text)))
             .collect();
+        let gone = report
+            .iter()
+            .flat_map(|report| {
+                let runs = report.shell_runs.iter().filter_map(|r| r.output_blob);
+                report.blobs.iter().map(|b| b.id).chain(runs)
+            })
+            .filter(|blob| self.fates.contains_key(blob))
+            .collect();
         StorageView {
             status,
             report,
             titles,
             pending: self.blob_pendings(),
+            gone,
         }
     }
 
@@ -8724,6 +8733,102 @@ mod tests {
         f.dispatch(Action::Navigate(Route::Settings));
         let closed = queued(&f.dispatch(Action::DeleteBlob(BlobId::new())));
         assert_eq!(accept(&mut f, closed.id, 8), None);
+    }
+
+    #[test]
+    fn the_storage_screen_marks_gone_each_listed_blob_the_log_deletes_or_crops() {
+        let mut f = Fixture::paired();
+        let sid = f.session("/srv/a");
+        let (theirs, mine, run, kept, unlisted) = (
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+            BlobId::new(),
+        );
+        let first = storage_req(&f.dispatch(Action::Navigate(Route::Storage))).unwrap();
+        let mut report = storage_report(&[sid]);
+        report.blobs = [theirs, mine, kept]
+            .map(|id| skywave_proto::BlobStorage {
+                id,
+                size: 10,
+                session: sid,
+                seq: Seq(1),
+                holds: BlobUse::ToolOutput,
+            })
+            .into();
+        report.shell_runs = vec![skywave_proto::ShellRunStorage {
+            run: CommandId::new(),
+            session: sid,
+            command_line: "make".into(),
+            event_bytes: 10,
+            output: 10,
+            output_blob: Some(run),
+        }];
+        f.model.storage_reported(first, Ok(report));
+        assert_eq!(storage_view(&f).gone, HashSet::new());
+
+        // Another device deletes one blob and crops the run's output, and
+        // a blob the report doesn't list goes too; no request of this
+        // device is involved, and nothing asks the server again.
+        let other = DeviceId::new();
+        f.log(
+            sid,
+            vec![
+                EventKind::BlobDeleted {
+                    blob: theirs,
+                    holds: BlobUse::ToolOutput,
+                    by: other,
+                },
+                EventKind::BlobCropped {
+                    blob: run,
+                    holds: BlobUse::ShellOutput,
+                    into: BlobRef {
+                        id: BlobId::new(),
+                        size: 5,
+                        sha256: skywave_proto::ContentHash::of(b""),
+                    },
+                    kept: vec![skywave_proto::LineSpan { first: 0, count: 1 }],
+                    lines: 2,
+                    by: other,
+                },
+                EventKind::BlobDeleted {
+                    blob: unlisted,
+                    holds: BlobUse::ToolOutput,
+                    by: other,
+                },
+            ],
+        );
+        let view = storage_view(&f);
+        assert_eq!(view.status, StorageStatus::Ready);
+        assert_eq!(view.gone, HashSet::from([theirs, run]));
+
+        // This device's own delete, accepted: the refresh it asks for is
+        // still out when the log brings the delete, which ends its
+        // pending; the row stays gone until the new report.
+        let delete = queued(&f.dispatch(Action::DeleteBlob(mine)));
+        let at = f.events.len() as u64 + 1;
+        assert!(matches!(
+            accept(&mut f, delete.id, at),
+            Some(Request::Storage { .. })
+        ));
+        assert!(storage_view(&f).pending.contains_key(&mine));
+        f.log_commands(
+            sid,
+            vec![(
+                Some(delete.id),
+                EventKind::BlobDeleted {
+                    blob: mine,
+                    holds: BlobUse::ToolOutput,
+                    by: f.me,
+                },
+            )],
+        );
+        let view = storage_view(&f);
+        assert_eq!(view.status, StorageStatus::Loading);
+        assert!(!view.pending.contains_key(&mine));
+        assert_eq!(view.gone, HashSet::from([theirs, run, mine]));
+        assert!(!view.gone.contains(&kept));
     }
 
     #[test]

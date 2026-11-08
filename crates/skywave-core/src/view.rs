@@ -827,6 +827,10 @@ pub struct StorageView {
     /// This device's own delete or crop of each blob that has one, as a
     /// [`BlobView::pending`] shows it, so a row of it offers nothing more.
     pub pending: std::collections::HashMap<BlobId, BlobPending>,
+    /// Each blob the report lists that this replica's log has already
+    /// deleted or cropped, by any device: the report predates that, so a
+    /// row of it offers nothing.
+    pub gone: std::collections::HashSet<BlobId>,
 }
 
 /// Where the storage screen's report stands.

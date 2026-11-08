@@ -89,10 +89,12 @@ impl RowActions {
     /// when its session is in this device's replica, whose timeline holds
     /// the lines a crop is chosen from. Nothing while this device's own
     /// delete or crop of it is pending, as
-    /// [`item_offers`](crate::blob_actions::item_offers).
+    /// [`item_offers`](crate::blob_actions::item_offers), nor once the
+    /// replica's log holds a delete or crop of it ([`StorageView::gone`]),
+    /// which the report may predate.
     fn of(view: &StorageView, blob: BlobId, holds: BlobUse, session: SessionId) -> RowActions {
         let pending = view.pending.get(&blob).copied();
-        let offers = if pending.is_some() {
+        let offers = if pending.is_some() || view.gone.contains(&blob) {
             Vec::new()
         } else if view.titles.contains_key(&session) {
             offers_for(holds)
@@ -278,7 +280,7 @@ fn count(n: u64, what: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use skywave_core::{
         Action, BlobId, BlobStorage, CommandId, Seq, SessionStorage, ShellRunStorage,
@@ -307,6 +309,7 @@ mod tests {
             report,
             titles: HashMap::new(),
             pending: HashMap::new(),
+            gone: HashSet::new(),
         }
     }
 
@@ -560,6 +563,35 @@ mod tests {
         assert_eq!(
             (run.blob, run.offers, run.pending),
             (ran, Vec::new(), Some(queued))
+        );
+    }
+
+    #[test]
+    fn a_row_whose_blob_the_log_already_deleted_or_cropped_offers_nothing() {
+        use BlobAction::{Crop, Delete};
+        let here = SessionId::new();
+        let (gone_run, kept_run) = (BlobId::new(), BlobId::new());
+        let mut report = report();
+        report.blobs = vec![
+            blob(here, BlobUse::ToolOutput),
+            blob(here, BlobUse::ToolOutput),
+        ];
+        report.shell_runs = vec![run(here, Some(gone_run)), run(here, Some(kept_run))];
+        let (gone_blob, kept_blob) = (report.blobs[0].id, report.blobs[1].id);
+        let mut view = view(Some(report), StorageStatus::Ready);
+        view.titles.insert(here, "Fix the log".into());
+        view.gone.extend([gone_blob, gone_run]);
+
+        let blobs = rows(&view, Grouping::Blobs);
+        assert_eq!(offers(&blobs[0]), Some((gone_blob, Vec::new())));
+        assert_eq!(offers(&blobs[1]), Some((kept_blob, vec![Crop, Delete])));
+        assert_eq!(blobs[0].actions.as_ref().unwrap().pending, None);
+        let runs = rows(&view, Grouping::ShellRuns);
+        assert_eq!(offers(&runs[0]), Some((gone_run, Vec::new())));
+        assert_eq!(offers(&runs[1]), Some((kept_run, vec![Crop, Delete])));
+        assert_eq!(
+            row_target(&view, Grouping::Blobs, 0).map(|t| t.offers),
+            Some(Vec::new())
         );
     }
 
