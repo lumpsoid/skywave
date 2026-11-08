@@ -18,6 +18,8 @@
 //!   download and failure wording.
 //! - [`link`]: why the link is reconnecting, and the re-pair notice for
 //!   a rejection only pairing again fixes.
+//! - [`markdown`]: an agent message as flat blocks of styled spans, and
+//!   which of its links a head may open.
 //! - [`output`]: where a shell run's whole output is, the download it
 //!   needs, and how a head reads a downloaded one.
 //! - [`usage`]: cost and tokens totalled across sessions for the usage
@@ -40,6 +42,7 @@ pub mod clip;
 pub mod crop;
 pub mod format;
 pub mod link;
+pub mod markdown;
 pub mod output;
 pub mod policy;
 pub mod question;
